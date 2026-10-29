@@ -2,21 +2,27 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.0.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.1.0 (program register C8, Phase 2)
 ================================================================================
+v1.1.0 (29 Oct 2026, global markets page): table functions (CREATE OR REPLACE
+TABLE FUNCTION - the Looker date range reaches them through a custom query)
+and market_series_daily (scripts/archive_market_series.py) as a source
+table, for v_market_daily, f_market_window and f_market_summary. Scalar
+functions still come before every view and table function.
 WHY (owner request 29 Oct 2026, "can we also build Google Looker Studio"):
 the nightly archive (scripts/archive_to_bigquery.py, C8 Phase 1) keeps each
 learning tab as raw rows - cells[] plus record_json - one partition per day.
 Looker Studio needs typed columns, one row per record and stated units. The
 SQL in sql/bigquery/ turns the raw rows into those columns (three helper
-functions, ten views); this script is how that SQL reaches BigQuery and
+functions, views, table functions); this script is how that SQL reaches BigQuery and
 how anyone can prove the live objects are the reviewed ones.
 
 WHAT:
-  --dry-run (default)  checks every file (one CREATE OR REPLACE VIEW or
-                       FUNCTION, the {{DS}} placeholder, no data-changing
-                       statement, functions before views, every referenced
-                       object defined earlier or an archive table) and prints
+  --dry-run (default)  checks every file (one CREATE OR REPLACE VIEW, FUNCTION
+                       or TABLE FUNCTION, the {{DS}} placeholder, no data-
+                       changing statement, scalar functions before views,
+                       every referenced object defined earlier or a source
+                       table) and prints
                        the plan with each object's body hash. When the
                        service-account key is configured it also asks
                        BigQuery to dry-run each statement (a broken key
@@ -24,7 +30,8 @@ WHAT:
                        Nothing is created.
   --write              creates or replaces every object in file order.
   --verify             reads the live definitions (INFORMATION_SCHEMA VIEWS
-                       and ROUTINES) and compares their SHA-256 with the files;
+                       and ROUTINES, table functions included) and compares
+                       their SHA-256 with the files;
                        exit 1 on any missing or different object.
 Views and functions only: no table is created, changed or deleted, nothing
 is written to the workbook, and the live system never reads BigQuery.
@@ -49,7 +56,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -63,13 +70,16 @@ ARCHIVE_TABLES = frozenset({
     "calendar_events", "signal_history", "performance_log", "my_portfolio",
     "portfolio_decision", "run_log",
 })
+# the table scripts/archive_market_series.py v1.0.0 loads (global markets page)
+MARKET_TABLES = frozenset({"market_series_daily"})
+SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES
 _CREATE = re.compile(
-    r"CREATE OR REPLACE (VIEW|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
+    r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _FORBIDDEN = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+`|DELETE\s+FROM|MERGE\s+`|TRUNCATE\s+TABLE|"
     r"DROP\s+(?:TABLE|VIEW|SCHEMA|FUNCTION)|ALTER\s+(?:TABLE|VIEW|SCHEMA)|"
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|SCHEMA|MATERIALIZED)|GRANT|REVOKE|"
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE(?!\s+FUNCTION)|SCHEMA|MATERIALIZED)|GRANT|REVOKE|"
     r"EXPORT\s+DATA|LOAD\s+DATA|CALL)\b", re.IGNORECASE)
 
 
@@ -113,13 +123,14 @@ def render(template: str, project: str, dataset: str) -> str:
 
 
 def object_body(rendered: str, kind: str) -> str:
-    """The text BigQuery keeps as the definition: for a view the query after
-    the line 'AS' (INFORMATION_SCHEMA.VIEWS.view_definition), for a SQL
+    """The text BigQuery keeps as the definition: for a view or a table
+    function the query after the line 'AS' (INFORMATION_SCHEMA.VIEWS
+    .view_definition / ROUTINES.routine_definition), for a scalar SQL
     function the expression inside 'AS ( ... )' before OPTIONS, stripped
     (INFORMATION_SCHEMA.ROUTINES.routine_definition)."""
-    if kind == "VIEW":
+    if kind in ("VIEW", "TABLE FUNCTION"):
         if "\nAS\n" not in rendered:
-            raise ValueError("view without an 'AS' line")
+            raise ValueError(f"{kind.lower()} without an 'AS' line")
         body = rendered.split("\nAS\n", 1)[1].rstrip()
         return body[:-1] if body.endswith(";") else body
     start = rendered.index("\nAS (") + len("\nAS (")
@@ -138,7 +149,7 @@ def load_objects(sql_dir: Path = SQL_DIR) -> List[SqlObject]:
         found = _CREATE.findall(_code(text))
         if len(found) != 1:
             raise ValueError(f"{path.name}: expected exactly one CREATE OR REPLACE "
-                             f"VIEW|FUNCTION, found {len(found)}")
+                             f"VIEW|FUNCTION|TABLE FUNCTION, found {len(found)}")
         kind, name = found[0]
         objs.append(SqlObject(path, kind, name, text))
     return objs
@@ -166,11 +177,11 @@ def check_objects(objs: Sequence[SqlObject]) -> List[str]:
         if code.count(";") != 1 or not code.rstrip().endswith(";"):
             problems.append(f"{label}: exactly one statement ending in ';'")
         if o.kind == "FUNCTION" and seen_view:
-            problems.append(f"{label}: functions must come before every view")
-        if o.kind == "VIEW":
+            problems.append(f"{label}: functions must come before every view and table function")
+        if o.kind in ("VIEW", "TABLE FUNCTION"):
             seen_view = True
             if "\nAS\n" not in o.template:
-                problems.append(f"{label}: the view body must follow a line 'AS'")
+                problems.append(f"{label}: the {o.kind.lower()} body must follow a line 'AS'")
         else:
             if "\nAS (" not in o.template or ")\nOPTIONS" not in o.template:
                 problems.append(f"{label}: function layout must be 'AS (' ... ')' then 'OPTIONS'")
@@ -179,7 +190,7 @@ def check_objects(objs: Sequence[SqlObject]) -> List[str]:
         for ref in _REF.findall(code):
             if ref == o.name:
                 continue
-            if ref not in ARCHIVE_TABLES and ref not in defined:
+            if ref not in SOURCE_TABLES and ref not in defined:
                 problems.append(f"{label}: references {ref} before it is defined")
         defined[o.name] = label
     return problems
@@ -280,7 +291,7 @@ def main(argv: Optional[Sequence[str]] = None, session: Any = None,
             _out(f"FAIL {p}")
         return 1
     for o in objs:
-        _out(f"plan {o.kind.lower():8s} {o.name:22s} sha {sha256(o.body(project, dataset))[:12]}")
+        _out(f"plan {o.kind.lower():14s} {o.name:22s} sha {sha256(o.body(project, dataset))[:12]}")
 
     if args.write or args.verify:
         if session is None:

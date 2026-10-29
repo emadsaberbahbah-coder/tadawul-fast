@@ -3,7 +3,9 @@
 # =============================================================================
 # VERSION 1.0.0 (2026-10-29) -- program register C8, Phase 2 (Looker Studio).
 # scripts/apply_bq_views.py v1.0.0 applies sql/bigquery/*.sql (three helper
-#       functions, ten views) to BigQuery dataset tfb_archive
+#       functions, ten views; since v1.1.0 also v_market_daily and the table
+#       functions f_market_window / f_market_summary over market_series_daily,
+#       the global markets page) to BigQuery dataset tfb_archive
 #       (project-2e3530e6-2311-4aa3-b36, US), or proves the live definitions
 #       equal the files. Views and functions only: no table is created,
 #       changed or deleted, nothing is written to the workbook, and the live

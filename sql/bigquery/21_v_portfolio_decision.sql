@@ -1,7 +1,10 @@
 -- v_portfolio_decision: the holdings decision table of Portfolio_Decision as
 -- archived each night (one row per holding and snapshot). SAR columns are
 -- valuations in SAR; P&L % / Weight % / ROI columns are percent points as
--- the page prints them. pd_* columns come from the page's status line.
+-- the page prints them. pd_* columns come from the page's status line;
+-- pd_ibkr_evidence reads the note pdIbkrNote_ (apps_script/10_My_Portfolio.gs)
+-- appends: SENT / NOT SENT in enforce mode, WOULD SEND / WOULD NOT SEND
+-- (observe) in observe mode, NULL when the line carries no IBKR note.
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_decision`
 OPTIONS (description = "TFB Looker v1: nightly Portfolio_Decision holdings table per snapshot")
 AS
@@ -64,7 +67,12 @@ SELECT
   `{{DS}}.f_cell`(h, c, 'Conf') AS confidence,
   `{{DS}}.f_cell`(h, c, 'Advisor Note') AS advisor_note,
   REGEXP_EXTRACT(st.status_text, r'status:\s*([A-Za-z_]+)') AS pd_status,
-  REGEXP_EXTRACT(st.status_text, r'ibkr evidence ([A-Z ]+?)[:|]') AS pd_ibkr_evidence,
+  CASE
+    WHEN REGEXP_CONTAINS(st.status_text, r'ibkr evidence NOT SENT') THEN 'NOT SENT'
+    WHEN REGEXP_CONTAINS(st.status_text, r'ibkr evidence SENT') THEN 'SENT'
+    WHEN REGEXP_CONTAINS(st.status_text, r'\[ibkr-observe\] would not send') THEN 'WOULD NOT SEND (observe)'
+    WHEN REGEXP_CONTAINS(st.status_text, r'\[ibkr-observe\] would send') THEN 'WOULD SEND (observe)'
+  END AS pd_ibkr_evidence,
   `{{DS}}.f_ts`(REGEXP_EXTRACT(st.status_text, r'Last run\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')) AS pd_rendered_at
 FROM body AS b
 LEFT JOIN table_end AS e USING (snapshot_date)

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.0.0 and the SQL in sql/bigquery/
-(C8 Phase 2: typed BigQuery views for Looker Studio). Offline: the BigQuery
-session is a fake, no google library is imported.
+Harness for scripts/apply_bq_views.py v1.1.0 and the SQL in sql/bigquery/
+(C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
+page). Offline: the BigQuery session is a fake, no google library is
+imported.
 
-  V1  the 13 objects load in apply order (3 functions, then 10 views) and the
-      static checks pass
+  V1  the 16 objects load in apply order (3 functions, 11 views, then 2 table
+      functions) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
   V3  render: the placeholder is fully replaced; bad project / dataset ids
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
-      back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins)
+      back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
+      a table function keeps the query after its 'AS' line
   V5  the static checks refuse a data-changing statement, a hard-coded
-      project, a forward reference, two statements, a function after a view
-      and a misnamed file
+      project, a forward reference, two statements, a function after a view,
+      a misnamed file, a CREATE TABLE and an unknown source table; they accept
+      a table function after the view it reads
   V6  main(): dry run creates nothing; --write without credentials exits 2;
       --write applies every file in order then verifies; --verify reports a
       changed or missing object with exit 1
@@ -27,6 +30,18 @@ session is a fake, no google library is imported.
       _reco_trade_sign (read from its source): STRONG SELL is bearish
   V10 dry run: offline without a key; with a key every statement is sent as
       a BigQuery dry run in order; a broken key exits 2
+  V11 the market objects: v_market_daily reads only columns that
+      scripts/archive_market_series.py SCHEMA declares, from that table only;
+      the table functions take (start_date DATE, end_date DATE) and read only
+      the objects before them
+  V12 v_performance_log scores the CALL as track_performance's summary does
+      (_directional_outcome on records loaded with a HOLD default): the
+      8 tiers' signs read from its source, HOLD and aliases neutral,
+      is_scored = decided, win_flag only for decided calls, one record per
+      Key; fails on the first cut's price-direction flags
+  V13 v_portfolio_decision.pd_ibkr_evidence recognizes every note
+      pdIbkrNote_ (apps_script/10_My_Portfolio.gs) writes - SENT (...) too;
+      fails on the first cut's pattern
 """
 from __future__ import annotations
 
@@ -52,7 +67,11 @@ DATASET = bv.DEFAULT_DATASET
 # Read back on 2026-10-29 from INFORMATION_SCHEMA.VIEWS / ROUTINES of
 # project-2e3530e6-2311-4aa3-b36.tfb_archive right after the objects were
 # created: TO_HEX(SHA256(view_definition | routine_definition));
-# v_performance_log re-applied after the Codex review (STRONG SELL bearish).
+# v_performance_log re-applied after the Codex review (STRONG SELL bearish);
+# v_market_daily / f_market_window / f_market_summary created the same day
+# (apply_bq_views 1.1.0) and read back the same way; v_performance_log and
+# v_portfolio_decision re-applied after the Codex review of #879 (call-scored
+# learning flags; the SENT evidence note) and read back again.
 INSTALLED = {
     "f_cell": "25c3a65640088f2a000cd3c0a9f8c792a7129a546e5189f6a39ec08cf2315e7d",
     "f_num": "135ec9de4bf03c52499f4edf6e2a1d9caaf7cf6df1f1b6989a426968c663189a",
@@ -60,19 +79,23 @@ INSTALLED = {
     "v_archive_health": "9932e59c56f917b3691ff63eae0b24581049d1a25d0bed91f9eecd71d37dcb72",
     "v_board_episodes": "76a6a240891eca669a574fd50b6d61b3d41439e502d9107aaefeb3c43d386048",
     "v_my_portfolio": "3fade0a8611cd65e9106643e753c454bb01c13a4c1743caa2a98403e7ef7c5dd",
-    "v_performance_log": "164916ee9201f26f865e84b846ca9770151c9bf0e206bbe7b5efacf7102f8d98",
-    "v_portfolio_decision": "a44c112595437f6b0a7a3ece94b142dd34fbb6d20459139a031c73fd43f3bfb7",
+    "v_performance_log": "c8f644b51d60100f062824d4a7edd19898fedd89005e122ecce8d515d02635dc",
+    "v_portfolio_decision": "98b6090df20eb1244dc9dd6d0a0054ace85ed9036eedc4679fc86e85fd87b4ce",
     "v_run_log": "4b06dfa258072044b7a8a7fd162dc9b0407879e9238f5d6b9eada60a2e5a824c",
     "v_selection_log": "3a9400566a6bdbeab9087a8950ea18dbf22150b98efc80d7a27de9af7846a234",
     "v_signal_history": "b0f74c3f849376e969ea5637993f33fa24a06e799537b8f112aed35d04a43ff7",
     "v_top10_board": "dde854ba2022d754bb9398ca4405133ae8a9c7dedce618cca8746ee5aaa30144",
     "v_top10_status": "ec55e82d26bfeae7e043cdce6a66a6c0fa5fe86fa6f2668ad5a4758cc8b36945",
+    "v_market_daily": "9c541c587ec6b06a2abd5c11542a60c6356fc7e98e7d5cdf77c99f6571e34a04",
+    "f_market_window": "64f1a45c397a3f8f0c66fd1495ed54be4447cd26193aab56f21363bf8e428750",
+    "f_market_summary": "06c5ec61c824be4019428bc36212230f94b0fea6a3394b63c8b007cd01cda808",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts",
     "v_board_episodes", "v_performance_log", "v_selection_log", "v_signal_history",
     "v_top10_board", "v_portfolio_decision", "v_my_portfolio", "v_top10_status",
     "v_run_log", "v_archive_health",
+    "v_market_daily", "f_market_window", "f_market_summary",
 ]
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
@@ -127,7 +150,7 @@ def case_v1():
     objs = bv.load_objects()
     assert [o.name for o in objs] == EXPECTED_ORDER, [o.name for o in objs]
     kinds = [o.kind for o in objs]
-    assert kinds == ["FUNCTION"] * 3 + ["VIEW"] * 10, kinds
+    assert kinds == ["FUNCTION"] * 3 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2, kinds
     assert bv.check_objects(objs) == [], bv.check_objects(objs)
 
 
@@ -168,6 +191,9 @@ def case_v4():
     assert bv.object_body(view, "VIEW") == "SELECT 1 AS a\nFROM t"
     fn = "CREATE OR REPLACE FUNCTION `p.d.f`(s STRING)\nRETURNS STRING\nAS (\n  TRIM(s)\n)\nOPTIONS (description = \"d\");\n"
     assert bv.object_body(fn, "FUNCTION") == "TRIM(s)"
+    tvf = ("CREATE OR REPLACE TABLE FUNCTION `p.d.t`(a DATE, b DATE)\nOPTIONS (description = \"d\")\nAS\n"
+           "SELECT a AS x\nFROM u;\n")
+    assert bv.object_body(tvf, "TABLE FUNCTION") == "SELECT a AS x\nFROM u"
 
 
 def _write(tmp: Path, files: dict) -> Path:
@@ -182,10 +208,22 @@ GOOD_VIEW = ("CREATE OR REPLACE VIEW `{{DS}}.v_a`\nOPTIONS (description = \"a\")
              "SELECT `{{DS}}.f_a`(tab) AS t FROM `{{DS}}.run_log`;\n")
 
 
+GOOD_TVF = ("CREATE OR REPLACE TABLE FUNCTION `{{DS}}.t_a`(start_date DATE, end_date DATE)\n"
+            "OPTIONS (description = \"a\")\nAS\nSELECT t FROM `{{DS}}.v_a` WHERE start_date <= end_date;\n")
+
+
 def case_v5():
     with tempfile.TemporaryDirectory() as d:
         ok = bv.check_objects(bv.load_objects(_write(Path(d), {"00_f_a.sql": GOOD_FN, "10_v_a.sql": GOOD_VIEW})))
         assert ok == [], ok
+    with tempfile.TemporaryDirectory() as d:
+        objs = bv.load_objects(_write(Path(d), {"00_f_a.sql": GOOD_FN, "10_v_a.sql": GOOD_VIEW,
+                                                "20_t_a.sql": GOOD_TVF}))
+        assert [o.kind for o in objs] == ["FUNCTION", "VIEW", "TABLE FUNCTION"]
+        assert bv.check_objects(objs) == [], bv.check_objects(objs)
+    with tempfile.TemporaryDirectory() as d:
+        src = GOOD_VIEW.replace("`{{DS}}.run_log`", "`{{DS}}.market_series_daily`")
+        assert bv.check_objects(bv.load_objects(_write(Path(d), {"00_f_a.sql": GOOD_FN, "10_v_a.sql": src}))) == []
     bad_sets = {
         "forbidden": {"00_f_a.sql": GOOD_FN,
                       "10_v_a.sql": GOOD_VIEW.replace("SELECT", "DELETE FROM `{{DS}}.run_log` WHERE TRUE; SELECT")},
@@ -197,6 +235,14 @@ def case_v5():
         "functions must come before": {"00_v_a.sql": GOOD_VIEW.replace("`{{DS}}.f_a`(tab)", "tab"),
                                        "10_f_a.sql": GOOD_FN},
         "file name says": {"00_f_a.sql": GOOD_FN, "10_v_b.sql": GOOD_VIEW},
+        "forbidden statement 'CREATE OR REPLACE TABLE'": {
+            "00_f_a.sql": GOOD_FN,
+            "10_v_a.sql": GOOD_VIEW.replace("CREATE OR REPLACE VIEW `{{DS}}.v_a`",
+                                            "CREATE OR REPLACE VIEW `{{DS}}.v_a`\n-- x\nCREATE OR REPLACE TABLE `{{DS}}.t` AS SELECT 1;")},
+        "references nope_table before it is defined": {
+            "00_f_a.sql": GOOD_FN, "10_v_a.sql": GOOD_VIEW.replace("`{{DS}}.run_log`", "`{{DS}}.nope_table`")},
+        "functions must come before every view and table function": {
+            "00_v_a.sql": GOOD_VIEW.replace("`{{DS}}.f_a`(tab)", "tab"), "10_t_a.sql": GOOD_TVF, "20_f_a.sql": GOOD_FN},
     }
     for needle, files in bad_sets.items():
         with tempfile.TemporaryDirectory() as d:
@@ -292,7 +338,7 @@ def case_v8():
     script = (ROOT / "scripts" / "apply_bq_views.py").read_text(encoding="utf-8")
     assert "sheets.googleapis" not in script and "spreadsheets" not in script.replace("GOOGLE_SHEETS_CREDENTIALS", "")
     for o in bv.load_objects():
-        assert o.kind in ("VIEW", "FUNCTION")
+        assert o.kind in ("VIEW", "FUNCTION", "TABLE FUNCTION")
         assert "sheets.googleapis" not in o.template
 
 
@@ -352,7 +398,91 @@ def case_v10():
         _restore_env(saved)
 
 
-CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10]
+def case_v11():
+    import re
+    import archive_market_series as ms
+    objs = {o.name: o for o in bv.load_objects()}
+    schema = [f["name"] for f in ms.SCHEMA]
+    daily = objs["v_market_daily"].template
+    first = daily.split("WITH s AS (", 1)[1].split("LOGICAL_AND", 1)[0]
+    cols = [c.strip() for c in first.replace("SELECT", "").split(",") if c.strip()]
+    assert cols and set(cols) <= set(schema), sorted(set(cols) - set(schema))
+    assert set(bv._REF.findall(bv._code(daily))) == {"market_series_daily", "v_market_daily"}
+    assert ms.TABLE == "market_series_daily" and ms.TABLE in bv.SOURCE_TABLES
+    order = [o.name for o in bv.load_objects()]
+    for name in ("f_market_window", "f_market_summary"):
+        tpl = objs[name].template
+        assert objs[name].kind == "TABLE FUNCTION"
+        assert re.search(r"`\{\{DS\}\}\." + name + r"`\(start_date DATE, end_date DATE\)", tpl), name
+        refs = set(bv._REF.findall(bv._code(tpl))) - {name}
+        assert refs and all(order.index(r) < order.index(name) for r in refs), (name, refs)
+        assert "@DS_START_DATE" in tpl and "@DS_END_DATE" in tpl   # the Looker custom query, documented
+
+
+def case_v12():
+    import re
+    src = (ROOT / "scripts" / "track_performance.py").read_text(encoding="utf-8")
+    # the summary path loads Entry Recommendation with a HOLD default, so the
+    # EXIT / TRIM aliases of _reco_trade_sign never reach its scoring
+    assert "rec = _parse_enum_value(RecommendationType, rec_raw, RecommendationType.HOLD)" in src
+    assert "return _directional_outcome(getattr(r, \"entry_recommendation\", None)," in src
+    block = src.split("_RECO_TRADE_SIGN: Dict[str, int] = {", 1)[1].split("}", 1)[0]
+    sign = {name.replace("_", ""): int(v) for name, v in
+            re.findall(r"RecommendationType\.([A-Z_]+)\.value:\s*(-?\d+)", block)}
+    assert sign["STRONGSELL"] == -1 and sign["HOLD"] == 0 and len(sign) == 8, sign
+    tpl = [o for o in bv.load_objects() if o.name == "v_performance_log"][0].template
+    code = bv._code(tpl)
+    lists = {}
+    for won, label in (("> 0", "long"), ("< 0", "short")):
+        m = re.search(r"IN \(([^)]*)\)\s*THEN CASE WHEN realized_roi_pp " + re.escape(won) + r" THEN 'WIN'", code)
+        assert m, label
+        lists[label] = set(re.findall(r"'([^']+)'", m.group(1)))
+    assert lists["long"] == {k for k, v in sign.items() if v == 1}, lists
+    assert lists["short"] == {k for k, v in sign.items() if v == -1}, lists
+    assert not ({"HOLD", "EXIT", "TRIM"} & (lists["long"] | lists["short"]))
+    assert "WHEN IFNULL(status, '') != 'matured' OR realized_roi_pp IS NULL THEN NULL" in code
+    assert "IFNULL(call_outcome IN ('WIN', 'LOSS'), FALSE) AS is_scored" in code
+    assert "CASE WHEN call_outcome = 'WIN' THEN 1 WHEN call_outcome = 'LOSS' THEN 0 END AS win_flag" in code
+    assert "PARTITION BY record_key, matured_valid" in code
+    # golden negative: the first cut scored the sheet's PRICE label
+    assert "outcome IN ('WIN', 'LOSS', 'BREAKEVEN') AS is_scored" not in code
+    assert "WHEN outcome = 'WIN' THEN 1" not in code
+
+
+def case_v13():
+    import re
+    gs = (ROOT / "apps_script" / "10_My_Portfolio.gs").read_text(encoding="utf-8")
+    fn = gs.split("function pdIbkrNote_(", 1)[1].split("\nfunction ", 1)[0]
+    notes = {
+        "SENT": "' | ibkr evidence SENT ('",
+        "NOT SENT": "' | ibkr evidence NOT SENT: '",
+        "WOULD SEND (observe)": "' | [ibkr-observe] would send ('",
+        "WOULD NOT SEND (observe)": "' | [ibkr-observe] would not send: '",
+    }
+    for literal in notes.values():
+        assert literal in fn, literal
+    tpl = [o for o in bv.load_objects() if o.name == "v_portfolio_decision"][0].template
+    rules = re.findall(r"WHEN REGEXP_CONTAINS\(st\.status_text, r'([^']+)'\) THEN '([^']+)'", tpl)
+    assert len(rules) == 4, rules
+
+    def label(text):
+        for pattern, value in rules:
+            if re.search(pattern, text):
+                return value
+        return None
+
+    head = "Portfolio Decision | status: ok | Last run 2026-10-29 10:00:00"
+    for want, literal in notes.items():
+        text = head + literal.strip("'") + "capture 2026-10-29 09:58 age 2m; linked 9/9; cash 1,234.00 SAR; USD 3.75)"
+        assert label(text) == want, (want, label(text))
+    assert label(head) is None
+    # golden negative: the first cut's pattern never matched the SENT note
+    sent = head + notes["SENT"].strip("'") + "capture 2026-10-29 09:58 age 2m)"
+    assert re.search(r"ibkr evidence ([A-Z ]+?)[:|]", sent) is None
+
+
+CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
+         case_v12, case_v13]
 
 
 def test_v1(): case_v1()
@@ -365,6 +495,9 @@ def test_v7(): case_v7()
 def test_v8(): case_v8()
 def test_v9(): case_v9()
 def test_v10(): case_v10()
+def test_v11(): case_v11()
+def test_v12(): case_v12()
+def test_v13(): case_v13()
 
 
 if __name__ == "__main__":

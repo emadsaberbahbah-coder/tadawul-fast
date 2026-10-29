@@ -2,6 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.60 (2026-10-29) -- BIGQUERY MARKET SERIES (C8 PHASE 2b)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877; 1.1.59 is #878.)
+#
+# v1.1.60: run tests/test_archive_market_series.py (scripts/
+# archive_market_series.py v1.0.0: nightly Yahoo daily bars of 48 reference
+# market series into tfb_archive.market_series_daily, one partition per
+# series, for the global markets page; workflow bq_markets.yml) in the
+# blocking lean lane right after tests/test_bq_views.py (which now also
+# covers apply_bq_views 1.1.0: v_market_daily and the two table functions).
+# Offline: the opener and the BigQuery session are fakes, no google library
+# is imported, PyYAML (already in the lane) reads the workflow. Nothing is
+# removed and no existing entry moves.
+#
 # VERSION 1.1.59 (2026-10-29) -- BIGQUERY LOOKER VIEWS (C8 PHASE 2)
 # (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877.)
 #
@@ -1004,6 +1017,7 @@ jobs:
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
             tests/test_bq_views.py \
+            tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
