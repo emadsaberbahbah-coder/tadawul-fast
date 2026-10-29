@@ -291,6 +291,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_calendar_sync", "1.2.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
     ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
+    # scripts/apply_bq_views.py, the typed Looker views over the archive.
+    ("apply_bq_views", "1.0.0", "bigquery looker views"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
