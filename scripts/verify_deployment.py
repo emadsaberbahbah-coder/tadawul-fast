@@ -257,6 +257,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
+    # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
+    # (TFB_RELEASE_AFTER_SYNC, default off; workflow-scoped, never on Render).
+    ("await_cockpit_receipts", "1.0.0", "after-sync release dispatch (read-only wait)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
