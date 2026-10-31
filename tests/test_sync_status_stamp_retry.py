@@ -220,9 +220,9 @@ def test_s8_gate_off_means_no_calls(monkeypatch):
 
 def test_version_pin():
     # 6.71.0 (2026-10-29): FW2-STALE-PE (default off); STAMP-RETRY unchanged.
-    # merge note (2026-10-31, #778): FW-2 SCOPE is 6.72.0 over it; floor kept.
+    # merge note (2026-10-31, #778): FW-2 SCOPE is 6.72.0 over it; the floor is main's 6.71.0.
     # merge note (2026-10-21, #778): FW-2 SCOPE builds on this as 6.71.0, so this is a
     # version floor and the manifest pin is read from the source constant.
-    assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 70, 2)
+    assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 71, 0)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert f'("run_dashboard_sync", "{sync.SCRIPT_VERSION}", "dashboard sync")' in src

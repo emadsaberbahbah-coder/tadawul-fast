@@ -28,7 +28,12 @@ strip, and under enforce it blanks P/E and EPS of each witnessed row
 untestable: it is kept with only P/E and EPS cleared and is not BLOCKED.
 Every other tripped row meets FW-2 SCOPE as before (drift fielded and
 BLOCKED under enforce, gross stripped). Either gate off leaves the other
-exactly as authored; both off is v6.70.2's FW-2 call.
+exactly as authored; both off is v6.70.2's FW-2 call. One addition (review of
+this merge): under FW-2 SCOPE enforce the probe's changed rows include fielded
+ones, so FW2-STALE-PE's report gains scope_fielded and its log line says 'FW-2
+trip(s) (N fielded and BLOCKED by FW-2 SCOPE, M stripped)' and 'not kept' instead
+of 'strip(s)' and 'still stripped'. Without that key (SCOPE off or observe) the
+report and the line are main's.
 WHY. The 2026-10-14 export (run 38486122061) shows the FW-2 outgoing row
 firewall stripping 114 Global_Markets rows in one leg (60 and 102 in the two
 legs before it, Q3 earnings season). 38 came back from last-good; 76 stayed
@@ -6624,16 +6629,20 @@ def _fw2_stale_pe_plan(headers: list, rows_matrix: list, report: Dict[str, Any],
     replaces a stripped row with a new list and never mutates the row it
     read, so 'probe[i] is not rows_matrix[i]' is exactly its decision."""
     probe = list(rows_matrix)
-    _row_identity_firewall(headers, probe)
+    _probe_out, _probe_stripped = _row_identity_firewall(headers, probe)
     cols = _fw2_row_cols(headers)
     if min(cols["sym"], cols["px"], cols["eps"], cols["pe"]) < 0:
         return []
     lo, hi = _FW2_STALE_PE_BAND
     band: List[Tuple[int, str, float]] = []
+    _scope_fielded: set = set()   # v6.72.0 (#778): rows FW-2 SCOPE enforce fielded, not stripped
+    _stripped_set = set(_probe_stripped)
     for r_i, row in enumerate(rows_matrix):
         if probe[r_i] is row:
             continue
         report["fw2_strips"] += 1
+        if str(row[cols["sym"]]).strip().upper() not in _stripped_set:
+            _scope_fielded.add(str(row[cols["sym"]]).strip().upper())
         px = _coh_float(row[cols["px"]])
         eps = _coh_float(row[cols["eps"]])
         pe = _coh_float(row[cols["pe"]])
@@ -6642,6 +6651,11 @@ def _fw2_stale_pe_plan(headers: list, rows_matrix: list, report: Dict[str, Any],
         ratio = (px / eps) / pe          # the same two divisions as FW-2
         if lo <= ratio <= hi:
             band.append((r_i, str(row[cols["sym"]]).strip().upper(), ratio))
+    if _scope_fielded:
+        # v6.72.0 (#778 merge 2026-10-31): only under TFB_SYNC_FW2_SCOPE=enforce,
+        # whose FW-2 keeps drift rows BLOCKED instead of stripping them; the
+        # log line then names them as fielded (absent key = main's report).
+        report["scope_fielded"] = sorted(_scope_fielded)
     report["band"] = len(band)
     if not band:
         return []
@@ -6719,7 +6733,19 @@ def _fw2_stale_pe_line(page: str, report: Dict[str, Any]) -> str:
         rows += f" (+{len(kept) - 20} more)"
     tail = (f" | band {report.get('band', 0)} of {report.get('fw2_strips', 0)} "
             f"FW-2 strip(s)")
-    if rej:
+    _sf = set(report.get("scope_fielded") or [])
+    if _sf:
+        # v6.72.0 (#778 merge 2026-10-31): under FW-2 SCOPE enforce a drift row is
+        # fielded and BLOCKED, not stripped; say so instead of "strip(s)".
+        tail = (f" | band {report.get('band', 0)} of {report.get('fw2_strips', 0)} "
+                f"FW-2 trip(s) ({len(_sf)} fielded and BLOCKED by FW-2 SCOPE, "
+                f"{report.get('fw2_strips', 0) - len(_sf)} stripped)")
+    if rej and _sf:
+        tail += (f"; not kept {len(rej)}: "
+                 + ", ".join(f"{s}({w}, {'fielded' if s in _sf else 'stripped'})"
+                             for s, w in rej[:15])
+                 + (" ..." if len(rej) > 15 else ""))
+    elif rej:
         tail += (f"; still stripped {len(rej)}: "
                  + ", ".join(f"{s}({w})" for s, w in rej[:15])
                  + (" ..." if len(rej) > 15 else ""))
