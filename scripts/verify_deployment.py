@@ -289,7 +289,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # (a post-earnings-tagged seat is held back from the picks and named).
     # 2026-10-28 (audit; pin only): 1.19.0 -> 1.20.0 (send-time label and
     # session hours from the IANA zones).
-    ("run_daily_brief", "1.20.0", "daily brief"),
+    # 2026-10-31 (daily; pin only, SCRIPT_VERSION unchanged): 1.20.0 -> 1.21.0
+    # (TFB_BRIEF_UNSIZED_ADD, default off; daily_brief.yml step env only).
+    ("run_daily_brief", "1.21.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
