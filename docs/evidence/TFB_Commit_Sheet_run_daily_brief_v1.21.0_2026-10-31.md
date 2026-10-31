@@ -23,20 +23,22 @@ So an unsized ADD's "amount" is its TP2 or stop LEVEL, and a sukuk's is 0. The v
 | --- | --- |
 | ADD 1120.SR 10 sh ~1,250 SAR + unsized 2222.SR (TP2 66.40) | ticket **1,316.4 SAR / 11 sh** with "+66 SAR from 2222.SR"; 2222.SR in no group |
 | Unsized ADD whose TP2 is 262.50 | a phantom **ADD ticket of ~262 SAR** |
-| Held sukuk 5023.SR, unsized ADD, MV 10,000 / cost 9,950 | **"0 holdings"** over a 10,000 SAR book (`dropped_small`, which no renderer prints) |
+| Two unsized ADDs with sub-floor levels 120 + 110 | one phantom **ADD ticket of ~230 SAR** (the rule promotes the larger and folds the other into it) |
+| Held sukuk 5023.SR, unsized ADD, MV 10,000 / cost 9,950 | **"0 holdings"** over a 10,000 SAR book: every ADD is under the floor and the folded total still misses it, so the rows go to `dropped_small`, which no renderer prints |
 | Sized ADDs of 120 + 50 SAR | both dropped; 0 holdings |
 | Sunday fold 14 + 98 + 1,992 SAR | one 2,104 SAR ticket (cash right), but 3030.SR and 4040.SR leave the holdings count, the hold table and the PDF portfolio tables |
 
-Live context: brief run 40220333814 (25 Oct 18:15Z) printed "0 holdings" while 5023.SR was held; #842 attributed it to Portfolio_Decision omitting the line. Today's final-job validator (job 124524928800) reads My_Portfolio with 2 rows while the 28 Oct brief listed 1. That is consistent with, but does not prove, a dropped line: the live sheet cannot be read from this container, which is why observe exists.
+Live context: #842 (commit cbdb8f6e) reports the brief of 25 Oct 18:15Z / 21:15 Riyadh (run 40220333814) printing "0 holdings" while 5023.SR was held, and attributes it to Portfolio_Decision omitting the line. Today's final-job validator (job 124524928800) reads My_Portfolio with 2 rows while the 28 Oct brief listed 1. That is consistent with, but does not prove, a dropped line: the live sheet cannot be read from this container, which is why observe exists.
 
 ## S2 - Change
 
 | Site | Change |
 | --- | --- |
-| `scripts/run_daily_brief.py` | v1.21.0 WHY block above `__version__`; `__version__ = "1.21.0"`. Added `_unsized_add_mode`, `_sized_add`, `_plan_unsized_adds`, `_log_unsized_add_observe`, `_unplaced_label`. Zero removals. |
-| `extract_decision` tail | off: the v1.20.0 call. observe: one stderr line per affected row, then the v1.20.0 call. enforce: `_plan_unsized_adds`. |
-| `_plan_unsized_adds` (enforce) | amount and shares only from the leading clause `ADD <n> sh (~<amt> SAR`; a row without it is unsized (0 SAR, never a ticket, never folded). Sized rows meet the unchanged v1.8.0 floor and fold on copies (that rule rewrites its target before it decides to drop everything). Every ADD row that is not a ticket stays in the hold group with 0 SAR, `unplaced_add` = unsized / folded / below_floor and a note suffix. |
-| Hold surfaces | `_hold_mix` counts `unplaced` (key present only when such a row exists); hold-section intro and Book-snapshot phrase name it; HTML hold row adds "ADD not placed: <reason>"; the text email prints "ADD NOT PLACED TODAY (still held): ...". All unchanged when no row carries `unplaced_add`. |
+| `scripts/run_daily_brief.py` | v1.21.0 WHY block above `__version__`; `__version__ = "1.21.0"`. Added `_unsized_add_mode`, `_sized_add`, `_plan_unsized_adds`, `_log_unsized_add_observe`, `_unplaced_label`, `_settle_unplaced`, `_unplaced_phrase` (seven, module level). Zero removals. |
+| `extract_decision` tail | off: the v1.20.0 call. observe: one stderr line per affected input ADD row (paired by input position, not by symbol, so a duplicated symbol gets one line per row), then the v1.20.0 call. enforce: `_plan_unsized_adds`. |
+| `_plan_unsized_adds` (enforce) | amount and shares only from the leading clause `ADD <n> sh (~<amt> SAR`; a row without it is never a ticket and never folded: `unsized` when the note says so, `unparsed` otherwise (BUY row, blank or hand-edited note). Sized rows meet the unchanged v1.8.0 floor and fold on copies (that rule rewrites its target before it decides to drop everything). Every ADD row that is not a ticket stays in the hold group with 0 SAR and `unplaced_add` = unsized / unparsed / below_floor / folded; folded and under-floor rows get a note suffix, unsized rows keep their own note (it already says so). |
+| `_settle_unplaced` (build_model, after the veto and coherence passes) | a folded row whose target ticket is later withheld (final-feed veto) or demoted to VERIFY is relabelled `folded_withheld`: "its cash was to join the X ticket, which is not placed today". |
+| Hold surfaces | `_hold_mix` counts `unplaced` (key present only when such a row exists); hold-section intro (counts by reason via `_unplaced_phrase`), Book-snapshot phrase, chip "ADD NOT PLACED TODAY - SEE NOTES" when every held row is one; HTML hold row adds "ADD not placed: <reason>"; hero and the text ONE MOVE line say "No ADD can be placed today" when no ticket is left; the text email prints "ADD NOT PLACED TODAY (still held): SYM (reason); ...". The same copy holds with `TFB_BRIEF_HOLD_NARRATIVE_V2=0` (the legacy "data too weak" copy is never applied to these rows). The PDF lists each row with its note. All unchanged when no row carries `unplaced_add`. |
 | `.github/workflows/daily_brief.yml` | `TFB_BRIEF_UNSIZED_ADD: ${{ vars.TFB_BRIEF_UNSIZED_ADD \|\| 'off' }}` in the "Render & send brief" step env (not job env). |
 | `scripts/verify_deployment.py` | pin run_daily_brief 1.21.0 (pin only). |
 | `.github/workflows/ci.yml` | 1.1.64 (1.1.62 / 1.1.63 claimed by open #778): the new harness in the daily brief step, and a SHA fetch of `05b51ebe` so its golden leg runs on CI. |
@@ -46,21 +48,22 @@ Unchanged in every mode: the floor (`TFB_MIN_TICKET_SAR`), folding of sized cash
 
 ## S3 - Tests
 
-`tests/test_daily_brief_unsized_add.py`: **PASS 35/35** (script) and 35 passed (pytest); stable under PYTHONHASHSEED 0 / 1 / 77.
+`tests/test_daily_brief_unsized_add.py`: **PASS 43/43** (script) and 43 passed (pytest); stable under PYTHONHASHSEED 0 / 1 / 77. The ADD notes of the WORKS fixtures come from the real `portfolio_actions._advisor_sentence`.
 
-- WORKS W1-W7 (enforce): sized ticket keeps 1,250 SAR / 10 sh; sukuk stays in the count ("1 holdings") and on every surface; no phantom ticket; under-floor rows held with the reason; Sunday fold keeps the 2,104 SAR / 42 sh ticket and holds the two folded lines; the "no TP ladder" note; observe prints exactly one line per affected row and changes nothing.
-- NEVER N1-N7: off under 11 spellings equals v1.20.0 on 8 fixtures (decision dict, HTML, text: OFF_GOLDEN digests, proven against the base copy); observe == off; sized tickets at or above the floor, freed cash, BLOCK, totals unchanged; floor disabled; no input mutation; the parser table; the gate words.
-- GOLD G1: every WORKS check fails on the untouched v1.20.0 (`git show 05b51ebe`), which also reproduces 1,316.4 / 11 sh and "0 holdings".
-- V1: version floor, verifier pin, step-env mapping, CI lane, ASCII added lines, exactly five functions added and none removed.
-- Golden negative of the file (`TFB_TEST_BRIEF_DELIVERED=<v1.20.0 copy>`): 33 failed, 2 passed (observe == off and G1, by construction).
+- WORKS W1-W12 (enforce unless noted): W1 sized ticket keeps 1,250 SAR / 10 sh, the unsized row keeps its own note; W2 sukuk stays in the count ("1 holdings") and on the hold intro, Book snapshot, chip, hero, HTML row and text; W3 no phantom ticket from one level or two summed; W4 under-floor rows held with the reason and no fold text; W5 Sunday fold keeps the 2,104 SAR / 42 sh ticket and holds the two folded lines; W6 the "no TP ladder" note; W7 observe prints exactly the expected line per affected input row on all 11 fixtures (none on sized-only); W8 a folded row whose target is withheld by the final-feed veto says so; W9 the narrative kill-switch keeps the true copy; W10 BUY / blank rows read "no ticket size in its note"; W11 mixed book text lines (EXIT / TRIM / BLOCK / HOLD / ADD); W12 the PDF lists the held row (reportlab + pypdf).
+- NEVER N1-N7: off under 11 spellings equals v1.20.0 on 11 fixtures (decision dict, HTML, text: OFF_GOLDEN digests) and logs nothing; observe == off; sized tickets at or above the floor, freed cash, BLOCK, totals unchanged; floor disabled; no input mutation; the parser table; the gate words.
+- BASE N1b / N1c: the OFF_GOLDEN digests are the v1.20.0 base copy's; the PDF text equals the base's (footer version normalised).
+- GOLD G1: every WORKS check (W1-W11) fails on the untouched v1.20.0 (`git show 05b51ebe`), which also reproduces 1,316.4 SAR / 11 sh, the ~230 SAR phantom and "0 holdings".
+- V1 / V1b: version floor, verifier pin, step-env mapping (step env only), the pytest line in ci.yml; against the base: ASCII added lines, no def removed (nested included), exactly the seven module-level functions added.
+- Golden negative of the file (`TFB_TEST_BRIEF_DELIVERED=<v1.20.0 copy>`): 38 failed, 4 passed (N1b, N1c, N2 and G1, which compare against the base by construction), 1 skipped (V1b applies to 1.21.0 only).
 
-Other: daily brief, pin and flag suites 78 passed; compileall clean; workflow audit errors=0; render_env_contract `--check` OK.
+Other: daily brief, pin, flag and env-contract suites 139 passed, 1 skipped (R11 base leg, env unset); compileall clean; workflow audit errors=0; render_env_contract `--check` OK.
 
 ## S4 - Operator steps
 
 1. Merge (GitHub Actions only; no deploy).
 2. Set the repository Variable `TFB_BRIEF_UNSIZED_ADD=observe`. On the next brief run, the "Render & send brief" log shows `[UNSIZED-ADD v1.21.0 observe] ...` lines when a row would change; the email is unchanged.
-3. If the lines match the book (for example 5023.SR "would stay in the book ... v1.20.0 drops it from the holdings"), set `enforce`.
+3. If the lines match the book (for example `5023.SR: would stay in the book (ADD not placed: unsized - no deployable capital) - v1.20.0 drops it from the holdings`), set `enforce`.
 
 Rollback: unset the Variable.
 
@@ -69,3 +72,4 @@ Rollback: unset the Variable.
 - The note contract lives in `portfolio_actions._advisor_sentence`. If its leading `ADD <n> sh (~<amt> SAR` clause ever changes, enforce treats a sized ADD as unsized: no ticket rather than a wrong one (fail-safe direction). The harness builds its notes with the real function, so such a change turns it red.
 - Draft #842 edits the same extract/snapshot area. Its reconcile would label an ADD that the min-ticket rule drops as "Portfolio_Decision omits it"; with this change armed the line is listed, so #842 should be rebased after this lands.
 - The live occurrence is inferred, not read; observe is there to confirm it before arming.
+- A five-lens review (correctness, regression, tests, docs, operator copy) of the first cut found: observe paired rows by symbol (a duplicated symbol logged the wrong row), two sub-floor levels could still sum into a phantom, a withheld fold target was not named, the kill-switch path fell back to "data too weak" copy, BUY / blank rows were labelled unsized, and the WHY block's (b)/(c) wording and #842 citation were loose. All are fixed in this commit and pinned by W3, W7, W8, W9, W10 and the n_dup_symbol / w3b fixtures.

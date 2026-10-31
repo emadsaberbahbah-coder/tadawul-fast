@@ -600,40 +600,52 @@ from __future__ import annotations
 #   TP2 or stop LEVEL; a sukuk ADD (D-9 ladder note) has no figure and reads
 #   0. _enforce_min_ticket (v1.8.0) then treats each as a ticket:
 #   (a) the level is FOLDED into another ADD as cash: ADD 1120.SR 10 sh
-#       ~1,250 SAR + unsized 2222.SR (TP2 66.40) published "~1,316 SAR /
-#       11 sh" with "+66 SAR from 2222.SR";
-#   (b) a TP2 of 200 SAR or more becomes a phantom ADD ticket of that size;
-#   (c) when every ADD is under the 200 SAR floor the rows go to
-#       out["dropped_small"], which no renderer prints, while their MV and
-#       cost stay in the totals: a held sukuk with an unsized ADD (MV 10,000
-#       / cost 9,950) printed "0 holdings" over a 10,000 SAR book, the shape
-#       of the 25 Oct 21:15 brief (run 40220333814) that #842 blamed on
-#       Portfolio_Decision.
+#       ~1,250 SAR + unsized 2222.SR (TP2 66.40) is published as a ~1,316 SAR
+#       / 11 sh ticket (the "+66 SAR from 2222.SR" fold text sits in that
+#       ticket's note, which only the PDF prints);
+#   (b) a level of 200 SAR or more becomes a phantom ADD ticket of that size,
+#       and so do several sub-floor levels whose sum reaches the floor (the
+#       rule promotes the largest and folds the rest into it);
+#   (c) when every ADD is under the floor AND their folded total still misses
+#       it, the rows go to out["dropped_small"], which no renderer prints,
+#       while their MV and cost stay in the totals: a held sukuk with an
+#       unsized ADD (MV 10,000 / cost 9,950) prints "0 holdings" over a
+#       10,000 SAR book. #842 (commit cbdb8f6e) reports the same symptom on
+#       the 25 Oct 21:15 brief (run 40220333814) and blamed Portfolio_Decision;
+#       that live occurrence is not re-read here.
 #   The same rule also drops a SIZED small ADD whose cash folds into a bigger
-#   ticket (live Sunday case 14 + 98 + 1,992 SAR -> one 2,104 SAR ticket): the
+#   ticket (Sunday case 14 + 98 + 1,992 SAR -> one 2,104 SAR ticket): the
 #   cash is right, but the two held lines left the holdings count, the hold
 #   table and the PDF portfolio tables.
 # CHANGE, TFB_BRIEF_UNSIZED_ADD = off (default; unset or any other word) |
 #   observe | enforce, read when the brief is built:
-#   off      v1.20.0 byte for byte (extract_decision output and every surface).
-#   observe  the same outputs; one stderr line per affected row, prefixed
+#   off      v1.20.0 byte for byte (extract_decision output, every surface,
+#            stderr).
+#   observe  the same outputs; one stderr line per affected input ADD row
+#            (paired by position, not symbol), prefixed
 #            "[UNSIZED-ADD v1.21.0 observe]", naming what enforce would do.
 #   enforce  an ADD's amount and shares come only from its leading clause
-#            "ADD <n> sh (~<amt> SAR" (_sized_add). A row without it is
-#            UNSIZED: 0 SAR, never a ticket, never folded. Sized ADDs go
-#            through the unchanged v1.8.0 floor and fold, on copies (that
-#            rule rewrites its target before it decides to drop everything).
-#            Every ADD row that does not end up a ticket - unsized, folded
-#            into another ticket, or under the floor even after folding -
-#            stays in the book in the hold group with 0 SAR, its reason in
-#            r["unplaced_add"] and a note suffix; the hold copy, the HTML
-#            row, the PDF note and the text line name it ("ADD not placed
-#            today"). Tickets, freed cash, BLOCK rows, MV/cost totals, the
-#            floor (TFB_MIN_TICKET_SAR) and cash conservation of the fold
-#            are unchanged.
+#            "ADD <n> sh (~<amt> SAR" (_sized_add). A row without it is never
+#            a ticket and never folded: "unsized" when the note says so,
+#            "unparsed" otherwise (BUY row, blank or hand-edited note). Sized
+#            ADDs go through the unchanged v1.8.0 floor and fold, on copies
+#            (that rule rewrites its target before it decides to drop
+#            everything). Every ADD row that does not end up a ticket stays
+#            in the book in the hold group with 0 SAR and its reason in
+#            r["unplaced_add"]; folded and under-floor rows get a note suffix
+#            (unsized rows keep their own note, which already says so), and a
+#            folded row whose target is later withheld or demoted to VERIFY
+#            says so (_settle_unplaced, after the veto and coherence passes).
+#            The hero / ONE MOVE line, the hold intro (counts by reason), the
+#            Book-snapshot phrase, the HTML hold row and the text line name
+#            them - also with TFB_BRIEF_HOLD_NARRATIVE_V2=0; the PDF lists the
+#            row with its note. Tickets, freed cash, BLOCK rows, MV/cost
+#            totals, the floor (TFB_MIN_TICKET_SAR) and cash conservation of
+#            the fold are unchanged.
 # ROLLBACK: unset the repository variable TFB_BRIEF_UNSIZED_ADD.
 # ZERO functions removed. Added: _unsized_add_mode, _sized_add,
-#   _plan_unsized_adds, _log_unsized_add_observe, _unplaced_label.
+#   _plan_unsized_adds, _log_unsized_add_observe, _unplaced_label,
+#   _settle_unplaced, _unplaced_phrase.
 __version__ = "1.21.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
@@ -1106,7 +1118,11 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
         z = _sized_add(r.get("note") or "")
         if z is None:
             u = dict(r)
-            u["sar"], u["shares"], u["unplaced_add"] = 0.0, None, "unsized"
+            u["sar"], u["shares"] = 0.0, None
+            # the builder's own words when it says so; otherwise the note carries
+            # no ticket size at all (BUY row, blank or hand-edited note)
+            u["unplaced_add"] = ("unsized" if "unsized" in (r.get("note") or "").lower()
+                                 else "unparsed")
             unplaced.append(u)
         else:
             c = dict(r)
@@ -1130,6 +1146,7 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
             continue
         u = dict(orig)
         u["unplaced_add"] = "folded"
+        u["fold_into"] = into.get(orig.get("symbol") or "?", "?")
         u["note"] = ((u.get("note") or "").rstrip() +
                      f" | v1.21.0: its ~{(orig.get('sar') or 0.0):,.0f} SAR joins the "
                      f"{into.get(orig.get('symbol') or '?', '?')} ticket "
@@ -1140,27 +1157,44 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
 
 
 def _log_unsized_add_observe(adds: List[Dict[str, Any]]) -> None:
-    """v1.21.0 observe: one stderr line per row whose ticket or place in the
-    book enforce would change. Reads copies; never alters the outputs."""
+    """v1.21.0 observe: one stderr line per input ADD row whose ticket or
+    place in the book enforce would change, paired by input position (not
+    by symbol). Works on tagged copies; never alters the outputs."""
     try:
-        v120, _f, v120_dropped = _enforce_min_ticket([dict(r) for r in adds])
-        tickets, _f2, unplaced = _plan_unsized_adds(adds)
-        new = {r.get("symbol"): r for r in tickets}
-        for r in v120:
+        def _state_v120():
+            tagged = [dict(r, _ua_i=i) for i, r in enumerate(adds)]
+            kept, _f, dropped = _enforce_min_ticket(tagged)
+            st = {i: ("gone", None, None) for i in range(len(adds))}
+            for r in kept:
+                st[r["_ua_i"]] = ("ticket", r.get("sar") or 0.0, r.get("shares"))
+            return st
+
+        def _state_v121():
+            tagged = [dict(r, _ua_i=i) for i, r in enumerate(adds)]
+            tickets, _f, unplaced = _plan_unsized_adds(tagged)
+            st = {}
+            for r in tickets:
+                st[r["_ua_i"]] = ("ticket", r.get("sar") or 0.0, r.get("shares"))
+            for r in unplaced:
+                st[r["_ua_i"]] = ("held", r, None)
+            return st
+
+        old, new = _state_v120(), _state_v121()
+        tag = f"[UNSIZED-ADD v{__version__} observe]"
+        for i, r in enumerate(adds):
             sym = r.get("symbol")
-            n = new.get(sym)
-            if n is None:
-                print(f"[UNSIZED-ADD v{__version__} observe] {sym}: v1.20.0 ADD ticket "
-                      f"~{(r.get('sar') or 0.0):,.0f} SAR would not be a ticket", file=sys.stderr)
-            elif (round(n.get("sar") or 0.0, 2), n.get("shares")) != (round(r.get("sar") or 0.0, 2), r.get("shares")):
-                print(f"[UNSIZED-ADD v{__version__} observe] {sym}: ticket ~{(r.get('sar') or 0.0):,.0f} SAR / "
-                      f"{r.get('shares')} sh would be ~{(n.get('sar') or 0.0):,.0f} SAR / {n.get('shares')} sh",
-                      file=sys.stderr)
-        for u in unplaced:
-            print(f"[UNSIZED-ADD v{__version__} observe] {u.get('symbol')}: would stay in the book "
-                  f"(ADD not placed: {_unplaced_label(u)})"
-                  f"{' - v1.20.0 drops it from the holdings' if u.get('symbol') not in {r.get('symbol') for r in v120} else ''}",
-                  file=sys.stderr)
+            o, n = old.get(i), new.get(i)
+            if o is None or n is None:
+                continue
+            if o[0] == "ticket" and n[0] == "ticket":
+                if (round(o[1], 2), o[2]) != (round(n[1], 2), n[2]):
+                    print(f"{tag} {sym}: ticket ~{o[1]:,.0f} SAR / {o[2]} sh would be "
+                          f"~{n[1]:,.0f} SAR / {n[2]} sh", file=sys.stderr)
+            elif n[0] == "held":
+                was = (f"v1.20.0 shows it as an ADD ticket of ~{o[1]:,.0f} SAR"
+                       if o[0] == "ticket" else "v1.20.0 drops it from the holdings")
+                print(f"{tag} {sym}: would stay in the book (ADD not placed: "
+                      f"{_unplaced_label(n[1])}) - {was}", file=sys.stderr)
     except Exception as exc:   # observe must never break a brief
         print(f"[UNSIZED-ADD v{__version__} observe] skipped ({type(exc).__name__})", file=sys.stderr)
 
@@ -1170,11 +1204,29 @@ def _unplaced_label(r: Dict[str, Any]) -> str:
     why = r.get("unplaced_add")
     if why == "unsized":
         return "unsized - no deployable capital"
+    if why == "unparsed":
+        return "no ticket size in its note"
     if why == "below_floor":
         return f"under the {_min_ticket_sar():,.0f} SAR minimum ticket"
     if why == "folded":
-        return "its cash joins another ADD ticket"
+        return f"its cash joins the {r.get('fold_into') or '?'} ticket"
+    if why == "folded_withheld":
+        return f"its cash was to join the {r.get('fold_into') or '?'} ticket, which is not placed today"
     return "not in today's plan"
+
+
+def _settle_unplaced(d: Dict[str, Any]) -> None:
+    """v1.21.0 enforce: after the final-feed veto and the coherence guard, a
+    folded row whose target ticket left today's ADD plan (withheld into
+    BLOCK or demoted to VERIFY) says so instead of 'joins the X ticket'.
+    No-op when no row carries unplaced_add (always, with the gate off)."""
+    live = {r.get("symbol") for r in d.get("add") or []}
+    for r in d.get("hold") or []:
+        if r.get("unplaced_add") == "folded" and r.get("fold_into") not in live:
+            r["unplaced_add"] = "folded_withheld"
+            tgt = r.get("fold_into") or "?"
+            r["note"] = str(r.get("note") or "").replace(
+                f"joins the {tgt} ticket", f"was to join the {tgt} ticket, which is not placed today")
 
 
 
@@ -2266,6 +2318,7 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     # v1.10.0 (BR-1): send-time coherence guard — demote ADD/EXIT recs whose
     # decision-layer signal disagrees with the freshest per-symbol reading.
     _apply_signal_coherence(decision, metrics)
+    _settle_unplaced(decision)   # v1.21.0 [UNSIZED-ADD]: no-op unless enforce held a row
     held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify", "block") for r in decision[grp]}
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held, final_feed=final_feed)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
@@ -2741,6 +2794,23 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         hero_body = ('Nothing in your book meets the high-confidence bar for action this morning, and '
                      'no buy clears it either. Your holdings stay as they are; the opportunity list '
                      'below is for monitoring.')
+    # v1.21.0 [UNSIZED-ADD] enforce only: ADD signals exist but none is a ticket.
+    _n_unpl = sum(1 for r in d.get("hold") or [] if r.get("unplaced_add"))
+    if _n_unpl and not d["add"]:
+        if freed_sentence:
+            preheader = preheader.replace(
+                "no buy clears the bar today.",
+                f"no ADD can be placed today ({_n_unpl} not placed - see Hold).")
+            hero_body = hero_body.replace(
+                "<strong>No buy clears the engine\'s high-confidence bar today</strong>",
+                f"<strong>No ADD can be placed today</strong> ({_n_unpl} not placed - see Hold)")
+        else:
+            preheader = (f"No ADD can be placed today - {_n_unpl} ADD signal(s) not placed "
+                         f"(see Hold).")
+            hero_title = 'No ADD can be placed today'
+            hero_body = (f'{_n_unpl} ADD signal(s) in your book could not be placed today; '
+                         f'each reason is on its row under Hold. Your holdings stay as they '
+                         f'are; the opportunity list below is for monitoring.')
 
     input_notice = _decision_input_notice(d)
     if (d.get("execution_veto") or d.get("block")) and not (d["sell"] or d["trim"] or d["add"]):
@@ -3006,8 +3076,10 @@ def _hold_section_copy(d: Dict[str, Any]) -> Tuple[str, str]:
     when the mix is all-capped/empty or the kill-switch is off."""
     mix = _hold_mix(d)
     total = sum(mix.values())
-    if (not _hold_narrative_enabled()) or total == 0 \
-            or mix["capped"] == total:
+    # v1.21.0: a held ADD that was not placed is never "data too weak" copy,
+    # even with the narrative kill-switch off (no such row exists when off).
+    if not mix.get("unplaced") and ((not _hold_narrative_enabled()) or total == 0
+                                    or mix["capped"] == total):
         return _LEGACY_HOLD_CHIP, _LEGACY_HOLD_INTRO
     parts = []
     if mix["pending"]:
@@ -3021,13 +3093,27 @@ def _hold_section_copy(d: Dict[str, Any]) -> Tuple[str, str]:
     if mix["other"]:
         parts.append("%d holding for the reason on its row" % mix["other"])
     if mix.get("unplaced"):   # v1.21.0 [UNSIZED-ADD] enforce
-        parts.append("%d ADD not placed today (no deployable capital, its cash "
-                     "folded into another ticket, or under the minimum ticket)"
-                     % mix["unplaced"])
+        parts.append(_unplaced_phrase(d))
     intro = ("Each name is held for its own stated reason: "
              + " · ".join(parts)
              + ". Nothing here is a bearish call unless its note says so.")
+    if mix.get("unplaced") and mix["unplaced"] == total:   # v1.21.0
+        return "ADD NOT PLACED TODAY \u2014 SEE NOTES", intro
     return "MIXED REASONS — SEE NOTES", intro
+
+
+def _unplaced_phrase(d: Dict[str, Any]) -> str:
+    """v1.21.0: '<n> ADD not placed today (<count> <reason>; ...)' from the
+    rows' own reasons, in a fixed order."""
+    rows = [r for r in d.get("hold") or [] if r.get("unplaced_add")]
+    order = ("unsized", "unparsed", "below_floor", "folded", "folded_withheld")
+    words = {"unsized": "no deployable capital", "unparsed": "no ticket size in the note",
+             "below_floor": f"under the {_min_ticket_sar():,.0f} SAR minimum ticket",
+             "folded": "cash folded into another ADD ticket",
+             "folded_withheld": "cash was to join a ticket that is not placed today"}
+    counts = [(k, sum(1 for r in rows if r.get("unplaced_add") == k)) for k in order]
+    detail = "; ".join(f"{n} {words[k]}" for k, n in counts if n)
+    return f"{len(rows)} ADD not placed today ({detail})"
 
 
 def _book_snapshot_hold_phrase(d: Dict[str, Any]) -> str:
@@ -3037,8 +3123,8 @@ def _book_snapshot_hold_phrase(d: Dict[str, Any]) -> str:
     total = sum(mix.values())
     legacy = ("%d positions are <em>held only because the data is too weak "
               "to act</em> — not comfort holds." % len(d.get("hold") or []))
-    if (not _hold_narrative_enabled()) or total == 0 \
-            or mix["capped"] == total:
+    if not mix.get("unplaced") and ((not _hold_narrative_enabled()) or total == 0
+                                    or mix["capped"] == total):   # v1.21.0 guard
         return legacy
     bits = []
     if mix["pending"]:
@@ -3594,6 +3680,9 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         lines.append("  Portfolio inputs require review/reconciliation; do not execute blocked holdings.")
     elif d.get("mv") is None and not (d["sell"] or d["trim"] or d["hold"] or d.get("verify")):
         lines.append("  Portfolio decision unavailable; refresh/reconcile inputs before acting.")
+    elif any(r.get("unplaced_add") for r in d["hold"]):   # v1.21.0 enforce only
+        lines.append("  No ADD can be placed today: %d ADD signal(s) not placed (see ADD NOT "
+                     "PLACED TODAY below)." % sum(1 for r in d["hold"] if r.get("unplaced_add")))
     else:
         lines.append("  No high-confidence portfolio action today.")
     lines += ["", f"BOOK: {_pct(d.get('pl_pct'))} overall ({_book_money(d.get('mv'))} vs {_book_money(d.get('cost'))} SAR)", ""]
