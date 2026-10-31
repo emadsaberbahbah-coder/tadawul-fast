@@ -265,7 +265,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
     # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
-    ("release_decision_feed", "1.3.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-31 (#831 merge of main #877; pin only): this branch's scheduled-slot
+    # deferral (TFB_RELEASE_INFLIGHT_DEFER, default off; authored 2026-10-24 as
+    # 1.2.1) is renumbered 1.3.1 over main's 1.3.0.
+    ("release_decision_feed", "1.3.1", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
