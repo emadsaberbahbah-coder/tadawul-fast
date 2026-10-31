@@ -2,9 +2,9 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.57 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.55) -- DT10 v1.18.1 HELD-SEAT HARNESS
+# VERSION 1.1.63 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27, 2026-10-28 and 2026-10-31; merged over main's 1.1.61) -- DT10 v1.18.1 HELD-SEAT HARNESS
 #
-# v1.1.57 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.55 first, 1.1.30-1.1.55 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869 and #870; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# v1.1.63 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.61 first, 1.1.30-1.1.61 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869, #870, #874, #875, #876, #877, #878 and #879; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
 # native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.18.1
 # adds Script Property DT10_AUDIT_KEEP (default off), which sends the
 # stability-held seats as criteria.audit_keep_symbols so opportunity_builder
@@ -13,14 +13,80 @@
 # refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
 # DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
 # (1.1.21). Nothing is removed and no existing entry moves.
-# VERSION 1.1.56 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27 and 2026-10-28; merged over main's 1.1.55) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+# VERSION 1.1.62 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27, 2026-10-28 and 2026-10-31; merged over main's 1.1.61) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
 #
-# v1.1.56 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.55 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869 and #870; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
-# v6.71.0 FW-2 SCOPE: off == v6.70.2, observe census, enforce keeps drift
+# v1.1.62 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.61 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869, #870, #874, #875, #876, #877, #878 and #879; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v6.72.0 FW-2 SCOPE: off == v6.71.0, observe census, enforce keeps drift
 # rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
 # right after the WP-6 sync harness. WHY: the gate edits the outgoing row
 # firewall, so its default-off identity must stay proven on every push.
 # Nothing is removed.
+#
+# VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
+#
+# v1.1.61 (ported from open PR #860 through #874; its first numbers went to
+# #859 (1.1.50) and #875-#879 (1.1.56-1.1.60)): run
+# tests/test_daily_brief_send_window.py (run_daily_brief v1.20.0: the
+# send-time label and the US / Europe session hours come from the IANA
+# zones instead of "before market open" and fixed hours that go wrong when
+# US daylight time ends on 1 Nov 2026) in the daily brief step.
+#
+# VERSION 1.1.60 (2026-10-29) -- BIGQUERY MARKET SERIES (C8 PHASE 2b)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877; 1.1.59 is #878.)
+#
+# v1.1.60: run tests/test_archive_market_series.py (scripts/
+# archive_market_series.py v1.0.0: nightly Yahoo daily bars of 48 reference
+# market series into tfb_archive.market_series_daily, one partition per
+# series, for the global markets page; workflow bq_markets.yml) in the
+# blocking lean lane right after tests/test_bq_views.py (which now also
+# covers apply_bq_views 1.1.0: v_market_daily and the two table functions).
+# Offline: the opener and the BigQuery session are fakes, no google library
+# is imported, PyYAML (already in the lane) reads the workflow. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.59 (2026-10-29) -- BIGQUERY LOOKER VIEWS (C8 PHASE 2)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877.)
+#
+# v1.1.59: run tests/test_bq_views.py (scripts/apply_bq_views.py v1.0.0 +
+# sql/bigquery/*.sql: three helper functions and ten typed views over the
+# nightly tfb_archive tables for Looker Studio; workflow bq_views.yml,
+# dispatch-only, verify by default) in the blocking lean lane next to
+# tests/test_bq_archive.py. Offline: the BigQuery session is a fake, no
+# google library is imported, PyYAML (already in the lane) reads the
+# workflow. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.58 (2026-10-29) -- RELEASE RENDER SETTLE (release_decision_feed 1.3.0)
+#
+# v1.1.58: run tests/test_release_render_settle.py (release_decision_feed
+# v1.3.0: a cockpit caught mid-render settles and is re-audited instead of
+# failing, which today withdraws a live release for good;
+# TFB_RELEASE_RENDER_SETTLE default off, mapped by release_decision_feed.yml
+# 1.2.0) in the blocking lean lane next to the two P0-1 release harnesses.
+# Offline fakes only; its base-identity case reads the untouched 729a316e
+# with `git show` and SKIPs on a shallow checkout. Nothing is removed and
+# no existing entry moves.
+#
+# VERSION 1.1.57 (2026-10-29) -- RELEASE AFTER SYNC (await_cockpit_receipts 1.0.0)
+# (1.1.56 is #875.)
+#
+# v1.1.57: run tests/test_await_cockpit_receipts.py (scripts/
+# await_cockpit_receipts.py v1.0.0 + release_after_sync.yml v1.0.0: after a
+# completed production sync, a read-only bounded wait for both cockpit
+# receipts, then one dispatch of the unchanged release workflow;
+# TFB_RELEASE_AFTER_SYNC default off) in the blocking lean lane, next to the
+# two P0-1 release harnesses. Offline fakes only (numpy/pytest/PyYAML lane).
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.56 (2026-10-29) -- FW-2 STALE P/E (run_dashboard_sync 6.71.0)
+#
+# v1.1.56: run tests/test_fw2_stale_pe.py (run_dashboard_sync v6.71.0
+# FW2-STALE-PE, TFB_SYNC_FW2_STALE_PE default off = the v6.70.2 FW-2 call: a
+# row FW-2 would strip for a mildly stale P/E keeps its fresh quote with P/E
+# and EPS cleared once its last-good row witnesses the instrument; mapped by
+# daily_sync.yml 1.0.8) in the blocking lean lane next to the other sync
+# suites. Offline fakes only; its base-identity legs read the untouched
+# 729a316e with `git show` and SKIP on a shallow checkout. Nothing is removed
+# and no existing entry moves.
 #
 # VERSION 1.1.55 (2026-10-28) -- POST-EARNINGS INVALID EVIDENCE (portfolio_actions 1.17.1)
 #
@@ -979,6 +1045,8 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
+            tests/test_bq_views.py \
+            tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -1000,6 +1068,7 @@ jobs:
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
             tests/test_daily_sync_stamp_budget.py \
+            tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
@@ -1029,6 +1098,7 @@ jobs:
             tests/test_final_publication_workflow.py \
             tests/test_matrix_validation_scope.py \
             tests/test_release_decision_feed.py \
+            tests/test_release_render_settle.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
@@ -1080,6 +1150,7 @@ jobs:
             tests/test_ycp_loopguard_b6.py \
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
+            tests/test_await_cockpit_receipts.py \
             tests/test_ob_conviction_sizing.py $EXTRA
           echo "::endgroup::"
 
@@ -1294,7 +1365,7 @@ jobs:
           # shallow checkout (a failed fetch only turns that leg into a SKIP).
           git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
             || echo "::notice::brief golden base not fetched - its golden leg will SKIP"
-          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
+          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py tests/test_daily_brief_send_window.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py tests/test_decision_v2_cash_presentation.py

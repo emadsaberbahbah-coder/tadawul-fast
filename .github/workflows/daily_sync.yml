@@ -1,5 +1,8 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.8 (2026-10-29) -- FW2-STALE-PE ENV MAPPING (run_dashboard_sync 6.71.0)
+# Both page-writing jobs map TFB_SYNC_FW2_STALE_PE, default 'off' (the 6.70.2
+# FW-2 call, byte-identical). WHY: the v6.71.0 block in run_dashboard_sync.py.
 # VERSION 1.0.7 (2026-10-28) -- _Status STAMP RETRY BUDGET 300 S
 # (1.0.5 and 1.0.6 are claimed by open PRs #778 and #779.)
 # WHY (run 40556442682, 27 Oct 2026 18:03Z): the Global_Markets leg wrote
@@ -25,6 +28,9 @@ name: 🏦 Tadawul Dashboard Advanced Sync
 # alone fails the 99% name gate. Mapped in sync-dashboard AND
 # recover-missing-market-pages so recovery cannot undo the primary leg.
 # Unset Variable -> 'off' -> nothing moves. Rollback: unset the Variable.
+# Merge note 2026-10-31: main's #875 took run_dashboard_sync v6.71.0
+# (FW2-STALE-PE, mapped by 1.0.8 above), so FW-2 SCOPE is v6.72.0; the two
+# Variables are independent and each job maps both.
 # VERSION 1.0.4 (2026-10-21) -- TRUTHFUL BACKEND 401/403 SUMMARY
 # WHY (run 39513589733, #4998): the leg warned "batches recovered, SYNC DONE
 # failed=0" because ONE of its two SYNC DONE lines said failed=0 while the
@@ -487,6 +493,10 @@ jobs:
       # the default 4 attempts run even when each read takes its full 60 s
       # (run 40556442682 lost the Global_Markets stamp after 2 attempts at 90).
       TFB_SYNC_STATUS_STAMP_DEADLINE_S: ${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}
+      # v1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE. off keeps
+      # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
+      # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
+      TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
@@ -1788,6 +1798,10 @@ jobs:
       # the default 4 attempts run even when each read takes its full 60 s
       # (run 40556442682 lost the Global_Markets stamp after 2 attempts at 90).
       TFB_SYNC_STATUS_STAMP_DEADLINE_S: ${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}
+      # v1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE. off keeps
+      # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
+      # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
+      TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}

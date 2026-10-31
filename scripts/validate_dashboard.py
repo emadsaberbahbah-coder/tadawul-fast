@@ -2,12 +2,22 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.3)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.4)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.4 (2026-10-28) — FULL FEED BANNER IN THE EVIDENCE
+--------------------------------------------------------------------------------
+WHY (audit 2026-10-28): decision.feed_banner_present kept only the first 120
+characters of the cockpit FEED banner, so every withheld verdict in the
+19 failed daily_sync runs since 21 Oct reached the log, Dashboard_Audit and
+final_dashboard_validation.json cut mid-reason ("... pool receipt cohort
+unverified; Glob"), and the blocking reason had to be reconstructed from
+other artifacts. WHAT: the detail keeps up to FEED_BANNER_DETAIL_MAX (1,000)
+characters. Statuses, exit codes and every other check are unchanged.
+
 v1.3.3 (2026-10-24) — SUPPORTED INSIGHTS REPORT CONTRACTS
 --------------------------------------------------------------------------------
 Match the sync writer's current and legacy seven-column Insights reports,
@@ -302,7 +312,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.3"
+SCRIPT_VERSION = "1.3.4"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -1087,6 +1097,10 @@ def _cockpit_status_age_min(line: str, now_utc: Optional[datetime] = None) -> Op
     return (now - stamp_utc).total_seconds() / 60.0
 
 
+# v1.3.4: the banner is the cockpit's own blocking reason; keep it whole.
+FEED_BANNER_DETAIL_MAX = 1000
+
+
 def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
     """Decision-surface checks for the Top_10 cockpit — the backend-side
     P0-5 tripwire. FAIL here exits 2 and daily_sync goes RED by design."""
@@ -1107,7 +1121,7 @@ def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
     banner = _find_feed_banner(grid, hr)
     out.append(CheckResult(page, "decision.feed_banner_present",
                            "PASS" if banner else "FAIL",
-                           detail=banner[:120] if banner
+                           detail=banner[:FEED_BANNER_DETAIL_MAX] if banner
                            else "no FEED verdict line above the data grid"))
     blocked = "NOT ACTIONABLE" in banner.upper()
 
