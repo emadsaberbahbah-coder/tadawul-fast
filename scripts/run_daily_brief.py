@@ -631,7 +631,8 @@ from __future__ import annotations
 #            ADDs go through the unchanged v1.8.0 floor and fold, on copies
 #            (that rule rewrites its target before it decides to drop
 #            everything). Every ADD row that does not end up a ticket stays
-#            in the book in the hold group with 0 SAR and its reason in
+#            in the book in the hold group (Portfolio_Decision order) with
+#            0 SAR and its reason in
 #            r["unplaced_add"]; folded and under-floor rows get a note suffix
 #            (unsized rows keep their own note, which already says so), and a
 #            folded row whose target is later withheld or demoted to VERIFY
@@ -1110,11 +1111,13 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
     Unsized rows never reach the floor rule; sized rows meet the unchanged
     v1.8.0 _enforce_min_ticket on copies; every row that is not a ticket
     comes back as a 0-SAR hold copy with r["unplaced_add"] and a note
-    suffix, so it stays in the holdings count and tables."""
+    suffix, so it stays in the holdings count and tables. Unplaced rows keep
+    their Portfolio_Decision (input) order."""
     floor = _min_ticket_sar()
     sized: List[Dict[str, Any]] = []
-    unplaced: List[Dict[str, Any]] = []
-    for r in adds:
+    sized_pos: List[int] = []
+    unplaced: List[Tuple[int, Dict[str, Any]]] = []
+    for pos, r in enumerate(adds):
         z = _sized_add(r.get("note") or "")
         if z is None:
             u = dict(r)
@@ -1123,25 +1126,26 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
             # no ticket size at all (BUY row, blank or hand-edited note)
             u["unplaced_add"] = ("unsized" if "unsized" in (r.get("note") or "").lower()
                                  else "unparsed")
-            unplaced.append(u)
+            unplaced.append((pos, u))
         else:
             c = dict(r)
             c["shares"], c["sar"] = z
             sized.append(c)
+            sized_pos.append(pos)
     work = [dict(r) for r in sized]
     kept, folded, dropped = _enforce_min_ticket(work)
     if dropped:
-        for r in sized:
+        for pos, r in zip(sized_pos, sized):
             u = dict(r)
             u["sar"], u["unplaced_add"] = 0.0, "below_floor"
             u["note"] = ((u.get("note") or "").rstrip() +
                          f" | v1.21.0: under the {floor:,.0f} SAR minimum ticket - "
                          f"not in today's plan").strip(" |")
-            unplaced.append(u)
-        return [], [], unplaced
+            unplaced.append((pos, u))
+        return [], [], [u for _p, u in sorted(unplaced, key=lambda t: t[0])]
     kept_ids = {id(r) for r in kept}
     into = {sym: dst for sym, _s, dst in folded}
-    for orig, w in zip(sized, work):
+    for pos, orig, w in zip(sized_pos, sized, work):
         if id(w) in kept_ids:
             continue
         u = dict(orig)
@@ -1152,8 +1156,8 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
                      f"{into.get(orig.get('symbol') or '?', '?')} ticket "
                      f"({floor:,.0f} SAR minimum ticket)").strip(" |")
         u["sar"] = 0.0
-        unplaced.append(u)
-    return kept, folded, unplaced
+        unplaced.append((pos, u))
+    return kept, folded, [u for _p, u in sorted(unplaced, key=lambda t: t[0])]
 
 
 def _log_unsized_add_observe(adds: List[Dict[str, Any]]) -> None:
@@ -1190,6 +1194,11 @@ def _log_unsized_add_observe(adds: List[Dict[str, Any]]) -> None:
                 if (round(o[1], 2), o[2]) != (round(n[1], 2), n[2]):
                     print(f"{tag} {sym}: ticket ~{o[1]:,.0f} SAR / {o[2]} sh would be "
                           f"~{n[1]:,.0f} SAR / {n[2]} sh", file=sys.stderr)
+            elif n[0] == "ticket":
+                # v1.20.0 folded or dropped this row; enforce makes it the
+                # ticket (another row's level no longer outranks it).
+                print(f"{tag} {sym}: would be an ADD ticket of ~{n[1]:,.0f} SAR / {n[2]} sh"
+                      f" - v1.20.0 drops it from the holdings", file=sys.stderr)
             elif n[0] == "held":
                 was = (f"v1.20.0 shows it as an ADD ticket of ~{o[1]:,.0f} SAR"
                        if o[0] == "ticket" else "v1.20.0 drops it from the holdings")

@@ -163,6 +163,11 @@ FIXTURES = {
                        row("ADD", "1180.SR", sized(40, 1992))],
     "w6_no_tp_ladder": [row("ADD", "1150.SR", sized(8, 900)),
                         row("ADD", "7020.SR", unsized(tp1=None, tp2=None))],
+    # all under the floor; the unsized level (150) outranks the sized rows in
+    # v1.20.0, so enforce moves the ticket to 1111.SR (Codex review, PR #882)
+    "w3c_ticket_moves_to_a_sized_row": [row("ADD", "1111.SR", sized(1, 120)),
+                                        row("ADD", "2020.SR", sized(1, 100)),
+                                        row("ADD", "9090.SR", unsized(stop=130.0, tp1=140.0, tp2=150.0))],
     "n_mixed_book": [row("EXIT", "2380.SR", "EXIT full position (~3,100 SAR); valuation ROI -4%."),
                      row("TRIM", "1010.SR", "TRIM ~800 SAR; over the position cap."),
                      row("BLOCK", "4002.SR", "BLOCKED; RECONCILIATION_REQUIRED ~9,999 SAR"),
@@ -265,6 +270,10 @@ def check_w3(mod):
         assert d["add"] == [] and _syms(d["hold"]) == syms, name
         assert "ADD:" not in text and "~262" not in html and "~230" not in html, name
         assert _count(html) == len(syms), name
+    d = _decision(mod, FIXTURES["w3c_ticket_moves_to_a_sized_row"])
+    assert [(r["symbol"], r["sar"], r.get("shares")) for r in d["add"]] == [("1111.SR", 220.0, 2)]
+    assert d["folded"] == [("2020.SR", 100.0, "1111.SR")]
+    assert [(r["symbol"], r["unplaced_add"]) for r in d["hold"]] == [("2020.SR", "folded"), ("9090.SR", "unsized")]
 
 
 def check_w4(mod):
@@ -327,6 +336,12 @@ OBSERVE_LINES = {
               " - v1.20.0 drops it from the holdings",
         OBS + "4040.SR: would stay in the book (ADD not placed: its cash joins the 1180.SR ticket)"
               " - v1.20.0 drops it from the holdings"],
+    "w3c_ticket_moves_to_a_sized_row": [
+        OBS + "1111.SR: would be an ADD ticket of ~220 SAR / 2 sh - v1.20.0 drops it from the holdings",
+        OBS + "2020.SR: would stay in the book (ADD not placed: its cash joins the 1111.SR ticket)"
+              " - v1.20.0 drops it from the holdings",
+        OBS + "9090.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 shows it as an ADD ticket of ~370 SAR"],
     "w6_no_tp_ladder": [
         OBS + "1150.SR: ticket ~952 SAR / 8 sh would be ~900 SAR / 8 sh",
         OBS + "7020.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
@@ -477,6 +492,7 @@ OFF_GOLDEN = {
     "w4_two_under_floor": "a4bc61cb10907819",
     "w5_sunday_fold": "437e2feab0418682",
     "w6_no_tp_ladder": "688dd2d8aa55f006",
+    "w3c_ticket_moves_to_a_sized_row": "03ef48a8fc74eaa1",
     "n_mixed_book": "8de6e73b6d3a534a",
     "n_sized_only": "83383584a214cb10",
     "n_buy_and_blank": "95861ea3e1eec63c",
