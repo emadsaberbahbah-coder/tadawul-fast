@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
-VERSION 1.2.1 (2026-10-24) -- A SCHEDULED SLOT THAT LANDS INSIDE A SYNC DEFERS
-(gate TFB_RELEASE_INFLIGHT_DEFER, default OFF = v1.2.0 byte-identical apart
-from script_version). Nothing removed; every acceptance rule, gate, write and
-exit code of v1.2.0 is unchanged when the gate is off.
+VERSION 1.3.1 (2026-10-24, renumbered 2026-10-31; authored as 1.2.1) -- A
+SCHEDULED SLOT THAT LANDS INSIDE A SYNC DEFERS (gate
+TFB_RELEASE_INFLIGHT_DEFER, default OFF = v1.3.0 byte-identical apart from
+script_version). Nothing removed; every acceptance rule, gate, write and
+exit code of v1.3.0 is unchanged when the gate is off.
+
+RENUMBERED 2026-10-31 (merge of main #873-#881): main #877 shipped 1.3.0
+(render settle, TFB_RELEASE_RENDER_SETTLE, default off) and reserved 1.2.1
+for this PR. Because the merged module carries 1.3.0's code, this build is
+1.3.1 over it; its block sits above main's 1.3.0 block, which is verbatim.
+The two gates touch different steps: this one only steps 1, 4 and 5 (before
+any audit), the render settle only step 6b (after the strict audits). With
+both off the module is v1.3.0. The text below is as authored on 2026-10-24
+(its 'v1.2.0' is the off base it had then).
+
 
 WHY (2026-10-24)
 ----------------
@@ -55,6 +66,70 @@ words AND mode=release AND source=auto AND GITHUB_EVENT_NAME=schedule):
   checked, whether it was busy, any probe error) only when the gate applies.
 ROLLBACK: unset the repository variable TFB_RELEASE_INFLIGHT_DEFER (or set
 it to anything outside 1/true/yes/on).
+VERSION 1.3.0 (2026-10-29) -- A COCKPIT CAUGHT MID-RENDER SETTLES INSTEAD OF
+FAILING (gate TFB_RELEASE_RENDER_SETTLE, default OFF = v1.2.0 byte-identical
+apart from script_version). Nothing removed; every acceptance rule, gate,
+write and exit code is unchanged when the gate is off. (1.2.1 is claimed by
+open PR #831.)
+
+WHY (2026-10-29, independent review of PR #876, reproduced on this file's
+own test fixtures)
+----------------------------------------------------------------------------
+Both cockpits overwrite their status cell (B2) with 'Last run <now> |
+status: running...' as the FIRST write of every render
+(16_Decision_Top10.gs dt10StatusLine_, 10_My_Portfolio.gs pdStatusLine_)
+and restore the full line with the receipt only at the end. A release run
+whose strict audit reads B2 during that window sees T10_STATUS_NOT_OK (or
+PF_STATUS_NOT_OK) 'Embedded status is RUNNING, not OK.', the consumption
+finding and the pool-count findings that follow from the short line, and:
+- re-verifying a LIVE release of SOURCE (every slot after a promotion does
+  this, and the decision chain re-renders Top_10 right after every
+  promotion; the 4-hourly wrapper and the IBKR capture watcher render too),
+  armed, it WITHDRAWS the release:
+    NOT_ACTIONABLE(final_publication) | run=N | ... | decision_failed |
+    release=<this run>
+  and classify_prior then refuses every later release of N
+  (release_window_consumed) until the next sync - hours of a verified
+  cohort lost to a two-minute render;
+- a FIRST release of a consumed cohort simply fails (exit 2); a dispatched
+  attempt ends red and the cohort waits for the next late slot.
+The render is a transient state the cockpit itself declares, not a verdict.
+
+WHAT CHANGED (only when TFB_RELEASE_RENDER_SETTLE is armed with the _ARMED
+words; mode=release only - sweep and kill run no audit):
+- step 6b, new PURE settle_candidates(result): the cockpits whose strict
+  decision finding is exactly T10_STATUS_NOT_OK / PF_STATUS_NOT_OK on its
+  own surface with 'Embedded status is RUNNING, not OK.' - and only when
+  the coverage audit passed AND EVERY decision finding is one that the
+  running line itself produces on a running cockpit (Top_10: STATUS_NOT_OK,
+  SOURCE_CONSUMPTION_UNPROVEN, POOL_COUNT_MISSING, POOL_RECONCILIATION_
+  UNPROVEN; Portfolio_Decision: STATUS_NOT_OK, SOURCE_CONSUMPTION_UNPROVEN;
+  measured on this file's fixtures). Any other finding (a stale board, a
+  failed status, a cohort, membership or structure finding) settles
+  nothing, so the attempt is judged exactly as today.
+- When the strict audits fail and the render explains every finding: wait
+  RENDER_SETTLE_S (150 s, once: RENDER_SETTLE_MAX = 1), re-run the in-flight
+  probe (busy or probe error -> exit 1 deferred, zero writes: a live
+  release that failed ONLY on the render stays live, the next slot
+  re-verifies), then re-run the SAME strict audits (fresh reads, the clock
+  read again) and judge that result instead. A cockpit still mid-render is
+  judged exactly as today (fail closed: an armed re-verification still
+  withdraws).
+- out gains 'render_settle' (attempt, cockpits, wait, the first attempt's
+  reasons) only when a settle happened; out['reasons'] then carries the
+  final attempt's audit reasons. The printed line is unchanged; the
+  workflow summary prints a render_settle row only when that key exists.
+REVIEW FIXES (2026-10-29, independent review, same unreleased v1.3.0)
+- The first cut settled on ANY RUNNING finding, so a live release that also
+  carried a real failure could be KEPT when a writer started or the probe
+  failed during the settle (reproduced: 1.2.0 withdrew it, the first cut
+  deferred and kept it). Now every finding must be explained by the render.
+- One settle instead of two: TFB_DECISION_RELEASE and the sticky KILL are
+  read when the run starts, so each settle extends the time a newly set
+  KILL is not seen by this run; one 150 s settle bounds it to about three
+  minutes.
+ROLLBACK: unset the repository variable TFB_RELEASE_RENDER_SETTLE (or set it
+to anything outside 1/true/yes/on).
 
 VERSION 1.2.0 (2026-10-19) -- SOURCE DISCOVERY FOR SCHEDULED ATTEMPTS.
 Nothing removed; every acceptance rule, gate, write and exit code of v1.1.0
@@ -199,7 +274,7 @@ EXIT CODES
   0 released, already released, dry-run accepted, swept or killed;
     supersede: nothing to supersede, or the downgrade is confirmed
   1 deferred (in-flight run or probe/provenance unavailable) or warning-only
-    (v1.2.1, gate on: also a scheduled auto attempt that lands inside the
+    (v1.3.1, gate on: also a scheduled auto attempt that lands inside the
     sync that superseded or produced its cohort)
   2 audits failed
   3 refused, compare-and-set/readback failure, layout fault or fatal error;
@@ -227,9 +302,22 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.1"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
-# v1.2.1: scheduled-slot deferral and read retry (default off).
+# v1.3.0: a cockpit caught mid-render settles instead of failing (default off).
+RENDER_SETTLE_ENV = "TFB_RELEASE_RENDER_SETTLE"
+RENDER_SETTLE_S = 150
+RENDER_SETTLE_MAX = 1
+_RENDER_STATUS_CODES = {"T10_STATUS_NOT_OK": "Top_10_Investments",
+                        "PF_STATUS_NOT_OK": "Portfolio_Decision"}
+_RENDER_RUNNING_MESSAGE = "Embedded status is RUNNING, not OK."
+# The findings a 'status: running...' line itself produces on its cockpit.
+_RENDER_EXPLAINED = {
+    "Top_10_Investments": frozenset({"T10_STATUS_NOT_OK", "T10_SOURCE_CONSUMPTION_UNPROVEN",
+                                     "T10_POOL_COUNT_MISSING", "T10_POOL_RECONCILIATION_UNPROVEN"}),
+    "Portfolio_Decision": frozenset({"PF_STATUS_NOT_OK", "PF_SOURCE_CONSUMPTION_UNPROVEN"}),
+}
+# v1.3.1 (authored as v1.2.1): scheduled-slot deferral and read retry (default off).
 INFLIGHT_DEFER_ENV = "TFB_RELEASE_INFLIGHT_DEFER"
 KEY_READ_RETRIES = 2
 _INFLIGHT_PROVENANCE = frozenset({"source_not_completed", "final_job_not_executed"})
@@ -299,13 +387,19 @@ def release_killed() -> bool:
     return (os.getenv(KILL_ENV) or "0").strip().lower() in _ARMED
 
 
+def render_settle_enabled() -> bool:
+    """v1.3.0 TFB_RELEASE_RENDER_SETTLE, default OFF: on => a cockpit caught
+    mid-render is re-audited after a bounded settle instead of failing."""
+    return (os.getenv(RENDER_SETTLE_ENV) or "0").strip().lower() in _ARMED
+
+
 def inflight_defer_enabled() -> bool:
-    """v1.2.1 TFB_RELEASE_INFLIGHT_DEFER, default OFF (see the WHY)."""
+    """v1.3.1 TFB_RELEASE_INFLIGHT_DEFER, default OFF (see the WHY)."""
     return (os.getenv(INFLIGHT_DEFER_ENV) or "0").strip().lower() in _ARMED
 
 
 def _defer_for_run(out: dict, probe: Callable[[], Any], run_id: str) -> bool:
-    """v1.2.1: True only when the in-flight probe succeeds and lists run_id
+    """v1.3.1: True only when the in-flight probe succeeds and lists run_id
     as busy. Records what it checked in out['inflight_defer']."""
     count, busy, error = _probe_inflight(probe)
     hit = error is None and any(isinstance(item, dict) and str(item.get("id")) == run_id
@@ -566,6 +660,39 @@ def accepted(result: Any, source: str) -> tuple[bool, list[str]]:
     return not reasons, reasons
 
 
+def settle_candidates(result: Any) -> list[str]:
+    """PURE (v1.3.0). The cockpits whose own status line says a render is in
+    progress (T10_STATUS_NOT_OK / PF_STATUS_NOT_OK on its own surface with
+    'Embedded status is RUNNING, not OK.'), returned only when the coverage
+    audit passed and EVERY decision finding is one that running line itself
+    produces on a running cockpit (_RENDER_EXPLAINED). Anything else (another
+    state, any other finding, a malformed payload, a failed coverage audit)
+    -> [] (no settle: judged exactly as v1.2.0)."""
+    if not isinstance(result, dict):
+        return []
+    codes = result.get("audit_exit_codes")
+    if not isinstance(codes, list) or len(codes) != 2 or type(codes[0]) is not int or codes[0] != 0:
+        return []
+    audits = result.get("audits")
+    decision = audits.get("decision") if isinstance(audits, dict) else None
+    findings = decision.get("findings") if isinstance(decision, dict) else None
+    if not isinstance(findings, list) or not findings:
+        return []
+    running = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            return []
+        surface = _RENDER_STATUS_CODES.get(finding.get("code"))
+        if (surface and finding.get("message") == _RENDER_RUNNING_MESSAGE
+                and finding.get("surface") == surface and surface not in running):
+            running.append(surface)
+    for finding in findings:
+        surface = finding.get("surface")
+        if surface not in running or finding.get("code") not in _RENDER_EXPLAINED[surface]:
+            return []
+    return running
+
+
 def release_window(result: dict, now: datetime) -> tuple[Optional[dict], list[str]]:
     """Expiry anchor = OLDEST audited decision input; refuse when spent."""
     decision = result.get("audits", {}).get("decision", {})
@@ -749,7 +876,8 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
               registry=None, service=None, now_utc: Any = None,
               inflight: Optional[Callable[[], Any]] = None,
               provenance: Optional[Callable[[str], Any]] = None,
-              release_run_id: Optional[str] = None, finalize: Any = None) -> dict:
+              release_run_id: Optional[str] = None, finalize: Any = None,
+              settle_sleep: Optional[Callable[[float], Any]] = None) -> dict:
     fin = finalize or final
     if callable(now_utc):
         clock = now_utc
@@ -800,7 +928,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         # gate spelling that would leave that step skipped.
         return _finish(out, 3, "refused", "release_gate_not_canonical")
 
-    # v1.2.1: the gate applies to scheduled source=auto release attempts only.
+    # v1.3.1: the gate applies to scheduled source=auto release attempts only.
     slot_defer = (inflight_defer_enabled() and mode == "release" and auto
                   and (os.getenv("GITHUB_EVENT_NAME") or "").strip() == "schedule")
 
@@ -873,7 +1001,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
     out["prior_class"] = prior_class
     if prior_class == "refused":
         if slot_defer and why == "superseded_by_run":
-            # v1.2.1: the superseding sync is still writing; the next slot
+            # v1.3.1: the superseding sync is still writing; the next slot
             # reads its cohort. Exact supersede grammar only, and only while
             # SOURCE is OLDER than the superseding run (a re-release, or a
             # superseding run that is not newer than the cohort, stays 3).
@@ -895,7 +1023,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         if (slot_defer and "source_not_completed" in prov["reasons"]
                 and set(prov["reasons"]) <= _INFLIGHT_PROVENANCE
                 and _defer_for_run(out, probe, source)):
-            # v1.2.1: SOURCE itself is still running (its final job pending).
+            # v1.3.1: SOURCE itself is still running (its final job pending).
             return _finish(out, 1, "deferred", *prov["reasons"], "production_run_in_flight")
         return _finish(out, 3, "refused", *prov["reasons"])
     count, busy, error = _probe_inflight(probe)
@@ -907,9 +1035,14 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         return _finish(out, 1, "deferred", "probe_unavailable" if error is not None else "production_run_in_flight")
 
     # 6. the REAL strict audits, bound to SOURCE (never GITHUB_RUN_ID, never 'local')
+    pre_audit_reasons = list(out["reasons"])   # v1.3.0: the base for a settled re-audit
+
+    async def strict_audits():
+        # v1.3.0: the ONE call site (case_n22), shared by the step-6b re-audit.
+        return await fin.run(sheet_id, reader=reader, registry=registry, publish=False,
+                             max_rows=20000, run_id=source)
     try:
-        result = await fin.run(sheet_id, reader=reader, registry=registry, publish=False,
-                               max_rows=20000, run_id=source)
+        result = await strict_audits()
     except Exception as exc:  # noqa: BLE001
         out["fatal"] = safe_error_text(exc)
         return _finish(out, 3, "fatal", "finalize_error")
@@ -926,6 +1059,49 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         ok = not window_reasons
     out["accepted"] = ok
     out["reasons"] += [reason for reason in reasons if reason not in out["reasons"]]
+
+    # 6b. v1.3.0 (TFB_RELEASE_RENDER_SETTLE, default off): a cockpit caught
+    #     mid-render is a transient state it declares itself, not a verdict.
+    #     Bounded: at most RENDER_SETTLE_MAX settles, each followed by a fresh
+    #     in-flight probe and the SAME strict audits; then judged as today.
+    settles = 0
+    while not ok and settles < RENDER_SETTLE_MAX and render_settle_enabled():
+        running = settle_candidates(result)
+        if not running:
+            break
+        settles += 1
+        out.setdefault("render_settle", []).append({
+            "attempt": settles, "cockpits": running, "wait_s": RENDER_SETTLE_S,
+            "reasons": [reason for reason in reasons]})
+        await (settle_sleep or asyncio.sleep)(RENDER_SETTLE_S)
+        count, busy, error = _probe_inflight(probe)
+        if error is not None or count:
+            out["in_flight"] = busy
+            out["deferred"] = True
+            out["reasons"] = list(pre_audit_reasons)
+            if error is not None:
+                out["probe_error"] = error
+            return _finish(out, 1, "deferred",
+                           "probe_unavailable" if error is not None else "production_run_in_flight")
+        try:
+            result = await strict_audits()
+        except Exception as exc:  # noqa: BLE001
+            out["fatal"] = safe_error_text(exc)
+            return _finish(out, 3, "fatal", "finalize_error")
+        for key, item in result.items():
+            if key in ("script_version", "exit_code"):
+                out["finalize_" + key] = item
+            elif key not in ("feed_promoted", "blocker_published"):
+                out[key] = item
+        ok, reasons = accepted(result, source)
+        window = None
+        if ok:
+            window, window_reasons = release_window(result, clock())
+            reasons += window_reasons
+            ok = not window_reasons
+        out["accepted"] = ok
+        out["reasons"] = pre_audit_reasons + [reason for reason in reasons
+                                              if reason not in pre_audit_reasons]
 
     # 7. not accepted: never promote; retract this run's own release when armed
     #    (gate off: report it as would_downgrade, zero writes)

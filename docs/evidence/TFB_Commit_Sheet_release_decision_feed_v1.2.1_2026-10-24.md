@@ -1,5 +1,7 @@
 # TFB Commit Sheet - release_decision_feed v1.2.1 [SCHEDULED SLOT DEFERRAL]
 
+Renumbered 2026-10-31 (merge of main #873-#881): main #877 shipped release_decision_feed **1.3.0** (render settle, `TFB_RELEASE_RENDER_SETTLE`, default off) and its workflow 1.2.0, reserving 1.2.1 / 1.1.1 for this PR. The merged module carries 1.3.0's code, so this build is **1.3.1** (workflow **1.2.1**), with its WHY blocks above main's, which are verbatim. The two gates touch different steps: this one steps 1, 4 and 5 (before any audit), the render settle step 6b (after the strict audits); with both off the module is v1.3.0. `verify_deployment` pins 1.3.1. `tests/test_release_inflight_defer.py` now takes main's v1.3.0 (`05b51ebe`) as its off base: OFF_GOLDEN is unchanged, PASS 8/8 (N2 now runs against 05b51ebe), and the golden negative with v1.3.0 delivered fails 6 cases as before. `tests/test_release_render_settle.py` (#877) passes unchanged. No default changed. The figures below are as measured on 2026-10-24 against v1.2.0.
+
 | Item | Value |
 | --- | --- |
 | Date | 2026-10-24 (daily improvement routine; the 2026-10-23 firing arrived a day late and is folded in) |

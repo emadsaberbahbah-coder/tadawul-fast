@@ -1,0 +1,104 @@
+# =============================================================================
+# 🗄️ BigQuery Archive — read-only daily copy of the decision workbook
+# =============================================================================
+# 2026-10-27 (program register C8, Phase 1): scripts/archive_to_bigquery.py
+#       v1.0.0 reads the learning tabs (Top_10_Investments, _Selection_Log,
+#       _Shadow_Rank_Log, _Board_Scorecard, Calendar_Events, Signal_History,
+#       Performance_Log, My_Portfolio, Portfolio_Decision, _Run_Log) and loads
+#       one partition per UTC day into BigQuery dataset tfb_archive
+#       (project-2e3530e6-2311-4aa3-b36, US). WRITE_TRUNCATE per day: a re-run
+#       replaces only that day. NOTHING is written to the workbook and the live
+#       system never reads BigQuery.
+# AUTH: the sync's service account (GOOGLE_SHEETS_CREDENTIALS) with BigQuery
+#       Data Editor + BigQuery Job User granted on the project by the owner.
+# GATE: armed here (TFB_BQ_ARCHIVE defaults to on); kill with the repository
+#       Variable TFB_BQ_ARCHIVE=off. TFB_BQ_PROJECT / TFB_BQ_DATASET Variables
+#       override the defaults below.
+# SCHEDULE: 23:05 UTC daily (after the US close and the 22:23 UTC nightly
+#       board scorecard). A manual dispatch is a dry run unless write=true.
+# =============================================================================
+name: 🗄️ BigQuery Archive
+
+on:
+  schedule:
+    # 23:05 UTC == 02:05 Asia/Riyadh (next calendar day), daily.
+    - cron: "5 23 * * *"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Load into BigQuery? (default: dry-run — reads the tabs and prints what it would load)"
+        required: false
+        default: false
+        type: boolean
+      tabs:
+        description: "Comma-separated tab names (blank = the standard list)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  archive:
+    name: 🗄️ Archive the workbook to BigQuery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 🗄️ Run the archive
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BQ_ARCHIVE: ${{ vars.TFB_BQ_ARCHIVE || 'on' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: "US"
+          INPUT_TABS: ${{ github.event.inputs.tabs }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — reading the tabs, loading nothing (tick write=true to load)."
+          fi
+          python scripts/archive_to_bigquery.py $MODE --tabs "${INPUT_TABS:-}"

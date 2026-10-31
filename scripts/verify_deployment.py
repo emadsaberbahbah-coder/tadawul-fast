@@ -155,6 +155,20 @@ sys.path.insert(0, _ROOT)
 # run_dashboard_sync 6.70.0 -> 6.70.2 (KLG-READ from PR #809 + STAMP-RETRY) and
 # data_engine_v2 5.154.0 -> 5.155.0 (PR #809 subunit-safe portfolio weight FX);
 # FLAGS declares TFB_SR_THREAD_LOCAL_SERVICE. No verifier logic changed.
+# 2026-10-28 (D2, same rule): eodhd_provider 4.18.5 -> 4.19.0 and
+# data_engine_v2 5.158.0 -> 5.159.0 (TFB_EODHD_ANALYST_TARGET: the EODHD
+# analyst target through the fundamentals fallback and the fund cache,
+# default off); FLAGS declares the flag. No verifier logic changed.
+# 2026-10-28 (same rule): data_engine_v2 5.159.0 -> 5.159.1 (the fund-cache
+# hit gate also runs on the 12M forecast; Codex review on #865).
+# 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
+# 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
+# requested; Commodities_FX name coverage). No verifier logic changed.
+# 2026-10-29 (same rule): run_dashboard_sync 6.70.2 -> 6.71.0 (FW2-STALE-PE,
+# TFB_SYNC_FW2_STALE_PE, default off: a row FW-2 would strip for a mildly
+# stale P/E keeps its fresh quote with P/E and EPS cleared once its last-good
+# row witnesses the instrument). Workflow-scoped like TFB_SYNC_COH_HK_*, so
+# FLAGS is unchanged. No verifier logic changed.
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -164,10 +178,10 @@ SCRIPT_VERSION = "1.0.61"  # v1.0.49 (2026-10-11) - pins data_engine_v2 5.152.0-
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.7', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.8', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
-    ('core.symbols.normalize', '__version__', '5.6.0', 'symbol normalization'),
+    ('core.symbols.normalize', '__version__', '5.7.1', 'symbol normalization'),
     ('core.analysis.identity_guard', 'IDENTITY_GUARD_VERSION', '1.3.1', 'surface identity guard'),
     ('core.surface_action_invariants', '__version__', '1.4.2', 'surface unit/action invariants'),
     ('scripts.performance_math', '__version__', '1.0.0', 'pure performance statistics'),
@@ -190,11 +204,15 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.data_validity", "DATA_VALIDITY_VERSION", "1.0.2", "price acquisition evidence"),
     ("integrations.google_sheets_service", "SERVICE_VERSION", "6.2.2", "Sheets publication writer"),
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
+    # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
+    # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.27.2", "opportunity builder"),
+     "1.28.0", "opportunity builder"),
+    # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
+    # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.16.1", "portfolio actions"),
-    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.18.2",
+     "1.17.1", "portfolio actions"),
+    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
      "analysis sheet publication route"),
@@ -204,16 +222,21 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "insights builder"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.15.1",
      "yahoo chart provider"),
-    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.18.5',
+    ("core.providers.eodhd_provider", "PROVIDER_VERSION", '4.19.0',
      "eodhd provider"),
     ("core.providers.yahoo_fundamentals_provider", "PROVIDER_VERSION", "6.9.1",
      "yahoo fundamentals provider"),
-    ("core.providers.calendar_provider", "__version__", "1.2.2",
+    # 2026-10-27 (A4; manifest pin only, SCRIPT_VERSION unchanged as in the
+    # 2026-10-21 note): 1.2.2 -> 1.3.0 (fetch_last_earnings_map, additive).
+    # 2026-10-27 (same rule): 1.3.0 -> 1.3.1 (404 batch split, gated).
+    # 2026-10-27 (same rule): 1.3.1 -> 1.3.2 (venue batches + EODHD exchange
+    # codes for the calendar, both gated).
+    ("core.providers.calendar_provider", "__version__", "1.3.2",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.158.0", "data engine"),
+    ("core.data_engine_v2", "__version__", "5.159.2", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -222,7 +245,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
-    ("validate_dashboard", "1.3.3", "scoped literal contract and native cockpit validation"),
+    # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
+    # (the FEED banner detail keeps up to 1,000 characters).
+    ("validate_dashboard", "1.3.4", "scoped literal contract and native cockpit validation"),
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.4", "nightly offline workbook DQ audit"),
@@ -238,27 +263,58 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
-    # 2026-10-24 (daily; manifest pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.2.1
-    # (TFB_RELEASE_INFLIGHT_DEFER, default off; release_decision_feed.yml step env only).
-    ("release_decision_feed", "1.2.1", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
+    # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
+    # 2026-10-31 (#831 merge of main #877; pin only): this branch's scheduled-slot
+    # deferral (TFB_RELEASE_INFLIGHT_DEFER, default off; authored 2026-10-24 as
+    # 1.2.1) is renumbered 1.3.1 over main's 1.3.0.
+    ("release_decision_feed", "1.3.1", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
-    ("run_shadow_board", "1.5.0", "shadow board"),
+    ("run_shadow_board", "1.6.0", "shadow board"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
+    # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
+    # (TFB_RELEASE_AFTER_SYNC, default off; workflow-scoped, never on Render).
+    ("await_cockpit_receipts", "1.0.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
-    ("track_performance", "6.48.0", "track performance"),
+    ("track_performance", "6.49.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.70.2", "dashboard sync"),
+    ("run_dashboard_sync", "6.71.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
-    ("run_daily_brief", "1.18.1", "daily brief"),
+    # 2026-10-27 (A4 part 2; pin only, SCRIPT_VERSION unchanged): 1.18.1 -> 1.19.0
+    # (a post-earnings-tagged seat is held back from the picks and named).
+    # 2026-10-28 (audit; pin only): 1.19.0 -> 1.20.0 (send-time label and
+    # session hours from the IANA zones).
+    ("run_daily_brief", "1.20.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
-    ("run_calendar_sync", "1.1.4", "calendar sync"),
+    # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
+    ("run_calendar_sync", "1.2.0", "calendar sync"),
+    # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
+    ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
+    # scripts/apply_bq_views.py, the typed Looker views over the archive.
+    # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
+    # the market_series_daily source for the global markets page), plus NEW
+    # scripts/archive_market_series.py, the daily bars of the reference markets.
+    ("apply_bq_views", "1.1.0", "bigquery looker views"),
+    # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
+    # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
+    # still shorter than MIN_BARS fails and keeps its rows).
+    # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
+    # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
+    ("archive_market_series", "1.1.1", "bigquery market series"),
+    # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
+    # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
+    ("news_macro_gate", "1.0.2", "news macro gate"),
+    # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
+    ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
@@ -313,6 +369,8 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ('TFB_OPP_FX_USX_SUBUNIT', '0', 'US-cent currency parent conversion', False),
     ('TFB_EODHD_CRYPTO_MAP', '0', 'native EODHD explicit crypto pairs', False),
     ('TFB_CRYPTO_NAME_GATE', 'off', 'Yahoo fundamentals crypto-name screen', False),
+    ('TFB_YAHOO_ID_ALIAS', '0', 'verified Yahoo ids for dead or colliding page tickers', False),
+    ('TFB_EODHD_ANALYST_TARGET', '0', 'EODHD analyst target through the fallback and fund cache', False),
 
     ("TFB_COMPLIANCE_GATE_ENABLED", "0", "compliance gate evaluates", False),
     ("TFB_SHADOW_COMPLIANCE", "0", "selector logs [SHADOW-GATE]", False),

@@ -137,7 +137,7 @@ test('dated scoped approval supersedes old properties; unscoped properties may o
 test('embedded dated scope counts/hashes exactly match the approved manifest without an embedded raw roster',()=> {
   const ctx=load({}, {nativeHashes:true});
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../../config/approved_universe_scope_v1.json'),'utf8'));
-  assert.equal(ctx.DT10_VERSION,'1.13.11');assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
+  assert.equal(ctx.DT10_VERSION,'1.18.0');   /* 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved */assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
   assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.approved_on,manifest.approved_on);
   for(const page of SCOPE_PAGES) {
     const declared=ctx.DT10_SOURCE_APPROVED_SCOPE.pages[page],approved=manifest.pages[page];

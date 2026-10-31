@@ -5,6 +5,12 @@ inside the daily_sync which superseded or produced its cohort defers (exit 1)
 instead of refusing (exit 3), and the one key-block read retries transport
 faults. Off (default) is v1.2.0 byte for byte apart from script_version.
 
+Renumbered 2026-10-31 (merge of main #873-#881): the module is v1.3.1 over
+main's v1.3.0 (#877, render settle, default off). The off base is now
+main's v1.3.0 at 05b51ebe; with both gates unset it returns the same
+results as v1.2.0, so OFF_GOLDEN is unchanged (I5 proves it against that
+base copy).
+
 WHY (2026-10-24)
 ----------------
 4 of the 5 red release runs since 19 Oct were this collision, not a
@@ -46,7 +52,8 @@ Cases
 
 Golden negative: TFB_TEST_RDF_DELIVERED=<base copy> runs every case against
 v1.2.0 as the delivered module (all but I5 fail; N2 skips). Base copy: TFB_TEST_RDF_BASE=<path>, else
-`git show 83283c61:scripts/release_decision_feed.py`.
+`git show 05b51ebe:scripts/release_decision_feed.py` (v1.3.0 since the
+2026-10-31 merge; 83283c61, v1.2.0, before it).
 
 Run:  python3 -m pytest -q tests/test_release_inflight_defer.py
   or  python3 tests/test_release_inflight_defer.py   (PASS k/k + digest)
@@ -75,7 +82,7 @@ from scripts import finalize_decision_publication as final  # noqa: E402
 
 SCRIPT = ROOT / "scripts/release_decision_feed.py"
 DELIVERED = Path(os.getenv("TFB_TEST_RDF_DELIVERED", "").strip() or SCRIPT)
-BASE_SHA = "83283c61"   # main 2026-10-24; release_decision_feed.py is v1.2.0 there
+BASE_SHA = "05b51ebe"   # main 2026-10-31; release_decision_feed.py is v1.3.0 there (was 83283c61, v1.2.0)
 GATE = "TFB_RELEASE_INFLIGHT_DEFER"
 ENV_NAMES = (GATE, "GITHUB_EVENT_NAME", "TFB_DECISION_RELEASE", "TFB_DECISION_RELEASE_KILL",
              "GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_ACTIONS", "GITHUB_RUN_ID",
@@ -507,15 +514,17 @@ def test_n1_workflow_mapping_version_and_pin():
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '("release_decision_feed", "%s",' % R.SCRIPT_VERSION in vd
     src = DELIVERED.read_text(encoding="utf-8")
-    assert src.index("VERSION 1.2.1 (2026-10-24)") < src.index("VERSION 1.2.0 (2026-10-19)")
+    # 2026-10-31: authored as 1.2.1; renumbered 1.3.1 above main's 1.3.0 block.
+    assert (src.index("VERSION 1.3.1 (2026-10-24") < src.index("VERSION 1.3.0 (2026-10-29)")
+            < src.index("VERSION 1.2.0 (2026-10-19)"))
     assert R.INFLIGHT_DEFER_ENV == GATE and R.KEY_READ_RETRIES == 2
 
 
 # ---------------------------------------------------------------- N2 -----
 def test_n2_added_lines_are_ascii_and_nothing_removed():
     b = base()
-    if R.SCRIPT_VERSION != "1.2.1":
-        pytest.skip("exact 83283c61 -> 1.2.1 diff checks apply to 1.2.1 only")
+    if R.SCRIPT_VERSION != "1.3.1":   # 2026-10-31: was 1.2.1 over 83283c61
+        pytest.skip("exact 05b51ebe -> 1.3.1 diff checks apply to 1.3.1 only")
     import ast
     import difflib
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
@@ -526,7 +535,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
                and ln[1:].strip()]
     assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()][:3]
     assert removed == [
-        'SCRIPT_VERSION = "1.2.0"',
+        'SCRIPT_VERSION = "1.3.0"',
         '        grid = service.spreadsheets().values().get(',
         '            valueRenderOption="UNFORMATTED_VALUE").execute().get("values")',
     ], removed
