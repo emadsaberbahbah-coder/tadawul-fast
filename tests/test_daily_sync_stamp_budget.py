@@ -223,6 +223,10 @@ def _strip_added(doc):
             env = holder.get("env")
             if isinstance(env, dict):
                 env.pop(KEY, None)
+                # merge note 2026-10-28 (#778): this branch also maps the FW-2 SCOPE
+                # Variable (daily_sync 1.0.5, TFB_SYNC_FW2_SCOPE) in the same two
+                # jobs; it is not part of this change, so it is set aside here too.
+                env.pop("TFB_SYNC_FW2_SCOPE", None)
                 for later in LATER_KEYS:
                     env.pop(later, None)
     return out

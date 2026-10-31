@@ -41,7 +41,15 @@ const history = require('./js/dt10_cash_utc_history');
 
 const SRC = process.argv[2] || path.join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs');
 const src = fs.readFileSync(SRC, 'utf8');
-const base = history.v1171Source(src);
+// merge note 2026-10-28 (#778): the delivered file is main's v1.18.0 plus #778's
+// held-seat regions (v1.18.1; tests/js/dt10_audit_keep_regions.js). Behaviour
+// runs on the delivered file; the v1.17.1 rebuild, the lint and the inventory
+// start from main's v1.18.0 layer: the delivered file with exactly those regions
+// removed (stripDesigned throws on any other shape).
+const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
+const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
+const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
+const base = history.v1171Source(layerSrc);
 const NOW = Date.UTC(2026, 9, 27, 7, 0, 0);   // Tue 27 Oct 2026 10:00 Riyadh
 
 let pass = 0;
@@ -324,7 +332,7 @@ for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
     ok(n.note === b.note + ' | post-earn ' + WARN + '5/9', 'P2 status token ' + label + ': ' + n.note);
     ok(n.calReads.length === b.calReads.length + 1 && n.calReads[n.calReads.length - 1] === '1x1x' + (CAL_ROWS.length + 1) + 'x10',
        'P2 one extra Calendar_Events read (A1, all 10 columns) ' + label + ': ' + n.calReads.join(' '));
-    ok(n.ctx.__logs.some(l => l === '[DT10 v1.18.0] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),
+    ok(n.ctx.__logs.some(l => l === '[DT10 v' + deliveredVersion + '] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),   // merge note 2026-10-28 (#778): the delivered version
        'P2 Logger line ' + label);
   }
 }
@@ -526,14 +534,17 @@ for (const [props, mode] of [[{}, 'off'], [{ DT10_POST_EARN: 'observe' }, 'obser
 console.log('P6 PASS self-test');
 
 // ------------------------------------------------------------ P7 static
-ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]),
-   'P7 version lockstep 1.18.0');
+ok((layerSrc.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]),
+   'P7 version lockstep 1.18.0 (layer)');
+ok(dt10Floor(deliveredVersion, [1, 18, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+   src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
+   'P7 delivered version floor 1.18.0 in lockstep: ' + deliveredVersion);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
 const why = src.slice(src.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'));
 ok(why.length > 2000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'P7 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'))) > 0,
    'P7 the v1.17.1 WHY block verbatim');
 const baseLines = new Set(base.split('\n'));
-const added = src.split('\n').filter((l) => !baseLines.has(l));
+const added = layerSrc.split('\n').filter((l) => !baseLines.has(l));   // merge note 2026-10-28 (#778): the layer, not the delivered file
 ok(added.length >= 140 && added.length <= 240, 'P7 added lines ' + added.length);
 for (const l of added) {
   if (/^ \* Version: 1\.18\.0 /.test(l)) continue;   // the version line keeps its pre-existing em dash
@@ -542,8 +553,8 @@ for (const l of added) {
   ok(!/\b(let|const|class)\s|=>|`|\.\.\./.test(code) || /^\s*(\*|\/\*)/.test(l), 'P7 ES5 added line: ' + l);
 }
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
-const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(src, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
-const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(src, /^var\s+([A-Za-z_$][\w$]*)/mg);
+const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(layerSrc, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);   // merge note 2026-10-28 (#778): the layer
+const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(layerSrc, /^var\s+([A-Za-z_$][\w$]*)/mg);
 ok([...fb].every((f) => fn.has(f)) && [...vb].every((v) => vn.has(v)), 'P7 zero functions / vars removed');
 ok(deep([...fn].filter((f) => !fb.has(f)).sort(), ['dt10ApplyPostEarnTags_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_',
    'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10WeekdaysBetween_']) &&

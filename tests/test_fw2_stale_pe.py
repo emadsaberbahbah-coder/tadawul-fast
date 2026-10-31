@@ -83,7 +83,10 @@ from core.data_validity import _INVALID_WARNINGS, row_acquisition  # noqa: E402
 from core.sheets.schema_registry import get_sheet_headers  # noqa: E402
 from scripts import run_dashboard_sync as sync  # noqa: E402
 
-BASE_SHA = "729a316e"  # main before v6.71.0 (run_dashboard_sync 6.70.2)
+BASE_SHA = "7473d06e"  # merge note 2026-10-31 (#778): the bundle head before main #875
+# (main 729a316e + FW-2 SCOPE, run_dashboard_sync 6.71.0 there); on main the base is
+# 729a316e (6.70.2). Every base case then proves exactly FW2-STALE-PE's change, as on main.
+BASE_VERSION = "6.71.0"  # the base copy's SCRIPT_VERSION (6.70.2 at 729a316e)
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
 TAG = "pe_stale_cleared:fw2:v6.71.0"
 ENV = "TFB_SYNC_FW2_STALE_PE"
@@ -587,7 +590,7 @@ def base(tmp_path_factory):
     if src is None:
         pytest.skip("base %s not available (shallow checkout)" % BASE_SHA)
     mod = _load_copy("rds_base_" + BASE_SHA, src, tmp_path_factory)
-    assert mod.SCRIPT_VERSION == "6.70.2"
+    assert mod.SCRIPT_VERSION == BASE_VERSION
     return mod
 
 
@@ -595,7 +598,8 @@ def base(tmp_path_factory):
 def fresh(tmp_path_factory):
     src = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")
     mod = _load_copy("rds_fresh_v6_71_0", src, tmp_path_factory)
-    assert mod.SCRIPT_VERSION == "6.71.0"
+    # merge note 2026-10-31 (#778): FW-2 SCOPE is 6.72.0 over this 6.71.0; a floor.
+    assert tuple(int(x) for x in mod.SCRIPT_VERSION.split(".")) >= (6, 71, 0)
     return mod
 
 
@@ -806,7 +810,7 @@ def test_a1b_added_lines_are_ascii():
     added = [ln for ln in diff.stdout.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
     # The title line keeps the em dash it has carried since v6.0 (only the version changes).
     bad = [ln for ln in added if any(ord(c) > 127 for c in ln)
-           and "DASHBOARD SYNC RUNNER (v6.71.0)" not in ln]
+           and "DASHBOARD SYNC RUNNER (v%s)" % sync.SCRIPT_VERSION not in ln]
     assert bad == []
     assert all(ord(c) < 128 for c in Path(__file__).read_text(encoding="utf-8"))
 
@@ -858,10 +862,13 @@ def test_w1c_ci_runs_this_file_in_the_lean_lane():
 
 # ---------------------------------------------------------------- V1 -------
 def test_v1_version_pins():
-    assert sync.SCRIPT_VERSION == "6.71.0"
+    # merge note 2026-10-31 (#778): FW-2 SCOPE is 6.72.0 over this 6.71.0, so the pin
+    # is a floor, the manifest pin follows the source, and the 6.71.0 block sits
+    # below the bundle's 6.72.0 block (searched in the first 12000 characters).
+    assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 71, 0)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.71.0", "dashboard sync")' in src
-    head = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")[:4000]
+    assert '("run_dashboard_sync", "%s", "dashboard sync")' % sync.SCRIPT_VERSION in src
+    head = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")[:12000]
     assert "v6.71.0 - FW-2 keeps a witnessed row whose P/E is only stale (2026-10-29)" in head
 
 

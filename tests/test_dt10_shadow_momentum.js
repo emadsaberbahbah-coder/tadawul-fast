@@ -34,8 +34,18 @@ const history = require('./js/dt10_cash_utc_history');
 
 const SRC = process.argv[2] || path.join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs');
 const src = fs.readFileSync(SRC, 'utf8');
+// merge note 2026-10-27 (#778): the delivered file is main's v1.17.1 plus #778's
+// held-seat regions (v1.17.2; tests/js/dt10_audit_keep_regions.js). Behaviour
+// runs on the delivered file; the base oracle, the lint and the inventory
+// compare main's v1.17.1 layer: the delivered file with exactly those regions
+// removed (stripDesigned throws on any other shape).
+// merge note 2026-10-28 (#778): the delivered file is now main's v1.18.0 plus the
+// v1.18.1 held-seat regions, so the layer is main's v1.18.0 byte for byte.
+const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
+const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
+const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
 const OB = path.join(__dirname, '..', 'core', 'analysis', 'opportunity_builder.py');
-const base = history.v1170Source(src);
+const base = history.v1170Source(layerSrc);
 
 let pass = 0;
 function ok(cond, msg) {
@@ -232,10 +242,15 @@ console.log('M7 PASS embedded self-test lines');
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked on this change; pins moved. The delivered file
 // is v1.18.0; the added-lines lint and the census compare the v1.17.1 file rebuilt from it
 // (v1.18.0 edits reversed, SHA-256 pinned) with v1.17.0.
-const s1171 = history.v1171Source(src);
-ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
+// merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0: the rebuild starts from the layer (the
+// delivered file with this bundle's regions stripped = main's v1.18.0); the delivered file sits above it.
+const s1171 = history.v1171Source(layerSrc);
+ok((layerSrc.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]) &&
    (s1171.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(s1171.split('\n')[3]),
-   'M8 version lockstep 1.18.0 (delivered) and 1.17.1 (rebuilt)');
+   'M8 version lockstep 1.18.0 (layer) and 1.17.1 (rebuilt)');
+ok(dt10Floor(deliveredVersion, [1, 18, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+   src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
+   'M8 delivered version floor 1.18.0 in lockstep: ' + deliveredVersion);
 const why = src.slice(src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), src.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'));
 ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'M8 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'), base.indexOf(' * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE]'))) > 0,

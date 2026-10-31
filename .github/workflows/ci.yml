@@ -2,6 +2,26 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.63 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27, 2026-10-28 and 2026-10-31; merged over main's 1.1.61) -- DT10 v1.18.1 HELD-SEAT HARNESS
+#
+# v1.1.63 (authored as v1.1.22 in #770/#778; main took 1.1.21-1.1.61 first, 1.1.30-1.1.61 for #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869, #870, #874, #875, #876, #877, #878 and #879; 1.1.39 is claimed by open #846): run tests/js/dt10_audit_keep.test.js in the blocking lean lane's
+# native Apps Script step. WHY (2026-10-14): 16_Decision_Top10.gs v1.18.1
+# adds Script Property DT10_AUDIT_KEEP (default off), which sends the
+# stability-held seats as criteria.audit_keep_symbols so opportunity_builder
+# 1.28.1 (TFB_OPP_AUDIT_KEEP) keeps them in the capped written audit. The
+# harness runs the full .gs in a node vm (K1-K5: reader, pure list, REAL
+# refreshDecisionTop10 off/on/empty state); its base-copy cases D1-D2 need
+# DT10_BASE and skip in CI. Numbered after #775 (1.1.20) and the open #773
+# (1.1.21). Nothing is removed and no existing entry moves.
+# VERSION 1.1.62 (2026-10-14, renumbered 2026-10-19, twice 2026-10-20, 2026-10-21, twice 2026-10-22, twice 2026-10-24, 2026-10-25, twice 2026-10-27, 2026-10-28 and 2026-10-31; merged over main's 1.1.61) -- FW-2 SCOPE HARNESS IN THE LEAN LANE
+#
+# v1.1.62 (authored as v1.1.21 in #773/#778; main took 1.1.26-1.1.61 for #802, #806, #809, #810, #815, #816, #817, #829, #819, #833, #837, #838, #844, #848, #849, #850, #851, #852, #853, #854, #855, #856, #858, #859, #863, #864, #865, #869, #870, #874, #875, #876, #877, #878 and #879; 1.1.39 is claimed by open #846): enrol tests/test_sync_fw2_scope.py (run_dashboard_sync
+# v6.72.0 FW-2 SCOPE: off == v6.71.0, observe census, enforce keeps drift
+# rows BLOCKED with P/E, EPS and PEG cleared) in the blocking lean job,
+# right after the WP-6 sync harness. WHY: the gate edits the outgoing row
+# firewall, so its default-off identity must stay proven on every push.
+# Nothing is removed.
+#
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
@@ -1054,6 +1074,7 @@ jobs:
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
+            tests/test_sync_fw2_scope.py \
             tests/test_intraday_quote_refresh_contract.py \
             tests/test_calendar_completeness.py \
             tests/test_calendar_atomic_publication.py \
@@ -1211,6 +1232,7 @@ jobs:
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
           node tests/js/dt10_feed_cohort_binding.test.js
+          node tests/js/dt10_audit_keep.test.js
           node tests/js/gas_ledger_fx_failed_state.test.js
           node tests/js/dt10_bulk_format.test.js
           node tests/js/decision_chain.test.js
