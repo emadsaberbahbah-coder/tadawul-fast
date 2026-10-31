@@ -1,10 +1,12 @@
--- v_top10_insight: the latest archived Top-10 board with the evidence a
--- decision needs beside each row: the engine's newest market-page view of
+-- v_top10_insight: the latest archived Top-10 board (the snapshot of the
+-- newest v_top10_status row, so an empty board shows as empty, not as the
+-- last full one) with the evidence a decision needs beside each row: the engine's newest market-page view of
 -- the name (mkt_*: price, forecast, risk, signals, data age), its next
 -- earnings and ex-dividend dates, its news of the last 7 days and how its
 -- earlier board episodes ended. caution_flags lists, in plain words, what
 -- argues for a second look before acting (earnings or ex-dividend within 5
--- days, market data older than 36 h, negative or high-severity news, below
+-- days, market data older than 36 h when archived, a market copy more than
+-- a day old (a missed nightly archive), negative or high-severity news, below
 -- the reliability / data-quality floors, a block reason, a negative 12-month
 -- forecast, no market-page row); caution_count counts them. Percent points.
 CREATE OR REPLACE VIEW `{{DS}}.v_top10_insight`
@@ -14,7 +16,7 @@ WITH board AS (
   SELECT b.*
   FROM `{{DS}}.v_top10_board` AS b
   WHERE b.symbol IS NOT NULL
-  QUALIFY b.snapshot_date = MAX(b.snapshot_date) OVER ()
+    AND b.snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_top10_status`)
 ),
 cal AS (
   SELECT symbol, next_earnings_date, days_to_earnings_now, next_exdiv_date, days_to_exdiv_now,
@@ -83,6 +85,7 @@ j AS (
     u.top_factors AS mkt_top_factors,
     u.top_risks AS mkt_top_risks,
     u.data_age_hours AS mkt_data_age_hours,
+    u.snapshot_age_days AS mkt_snapshot_age_days,
     c.next_earnings_date,
     c.days_to_earnings_now,
     c.next_exdiv_date,
@@ -106,6 +109,7 @@ j AS (
         IF(c.days_to_earnings_now BETWEEN 0 AND 5, 'earnings within 5 days', NULL),
         IF(c.days_to_exdiv_now BETWEEN 0 AND 5, 'ex-dividend within 5 days', NULL),
         IF(u.data_age_hours > 36, 'market data older than 36 h', NULL),
+        IF(u.snapshot_age_days > 1, CONCAT('market copy ', CAST(u.snapshot_age_days AS STRING), ' days old'), NULL),
         IF(n.news_negative_7d > 0, 'negative news in 7 days', NULL),
         IF(n.news_high_severity_7d > 0, 'high-severity news in 7 days', NULL),
         IF(u.symbol IS NOT NULL AND NOT u.meets_floors, 'below reliability / data-quality floors', NULL),

@@ -1,13 +1,15 @@
 -- v_portfolio_insight: the latest archived My_Portfolio holdings, each with
--- the evidence a hold / trim / exit decision needs: the latest
--- Portfolio_Decision row for the name (pd_*: action, SAR P&L, weight, stop
--- and targets, advisor note), the engine's newest market-page view (mkt_*),
+-- the evidence a hold / trim / exit decision needs: the Portfolio_Decision
+-- row for the name from the same nightly snapshot (pd_*: action, SAR P&L,
+-- weight, stop and targets, advisor note - NULL when that night's decision
+-- had no row for it, never an older night's), the engine's newest market-page view (mkt_*),
 -- the next earnings and ex-dividend dates and the news of the last 7 days.
 -- caution_flags lists, in plain words, what argues for a review (the price
 -- at or below the stop, at or above the first target, earnings or
 -- ex-dividend within 5 days, negative or high-severity news, a bearish
--- engine call, a negative 12-month forecast, data older than 36 h, below
--- the floors); caution_count counts them. Percent points.
+-- engine call, a negative 12-month forecast, data older than 36 h when
+-- archived, a market copy more than a day old, below the floors);
+-- caution_count counts them. Percent points.
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_insight`
 OPTIONS (description = "TFB Looker v2: the latest holdings with the portfolio decision, market-page evidence, events, 7-day news and plain-word caution flags per holding")
 AS
@@ -21,8 +23,7 @@ pd AS (
   SELECT d.*
   FROM `{{DS}}.v_portfolio_decision` AS d
   WHERE d.symbol IS NOT NULL
-  QUALIFY d.snapshot_date = MAX(d.snapshot_date) OVER ()
-    AND ROW_NUMBER() OVER (PARTITION BY d.symbol ORDER BY d.snapshot_date DESC) = 1
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY d.snapshot_date, d.symbol ORDER BY d.captured_at DESC) = 1
 ),
 cal AS (
   SELECT symbol, next_earnings_date, days_to_earnings_now, next_exdiv_date, days_to_exdiv_now,
@@ -88,6 +89,7 @@ j AS (
     u.final_action AS mkt_final_action,
     u.top_risks AS mkt_top_risks,
     u.data_age_hours AS mkt_data_age_hours,
+    u.snapshot_age_days AS mkt_snapshot_age_days,
     c.next_earnings_date,
     c.days_to_earnings_now,
     c.next_exdiv_date,
@@ -111,12 +113,13 @@ j AS (
            CONCAT('engine says ', UPPER(u.recommendation)), NULL),
         IF(u.expected_roi_12m_pct < 0, 'negative 12-month forecast', NULL),
         IF(u.data_age_hours > 36, 'market data older than 36 h', NULL),
+        IF(u.snapshot_age_days > 1, CONCAT('market copy ', CAST(u.snapshot_age_days AS STRING), ' days old'), NULL),
         IF(u.symbol IS NOT NULL AND NOT u.meets_floors, 'below reliability / data-quality floors', NULL)
       ]) AS f
       WHERE f IS NOT NULL
     ) AS flags
   FROM hold AS h
-  LEFT JOIN pd AS d ON d.symbol = h.symbol
+  LEFT JOIN pd AS d ON d.symbol = h.symbol AND d.snapshot_date = h.snapshot_date
   LEFT JOIN `{{DS}}.v_universe_latest` AS u ON u.symbol = h.symbol
   LEFT JOIN cal AS c ON c.symbol = h.symbol
   LEFT JOIN news AS n ON n.symbol = h.symbol

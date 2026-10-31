@@ -83,6 +83,12 @@ The tables they read are exactly the archive's new tabs.
 - a picker limit of 200;
 - a different forecast horizon (caught by the hash pin).
 
+## Codex review on #883: two P2 findings, both fixed in the second commit
+| Finding | Fix | Golden |
+|---|---|---|
+| 4432595884: `data_age_hours` stays at its capture-time value when `v_universe_latest` serves an older copy. The "older than 36 h" caution is then never raised during an archive outage. | `v_universe_latest` adds two columns:<br>- `snapshot_age_days` (CURRENT_DATE minus snapshot)<br>- `data_age_now_hours`<br><br>Both evidence views flag "market copy N days old" when `snapshot_age_days` > 1, meaning a nightly archive was missed. The 36 h caution stays on the quote's age at capture (provider lag), so weekends don't raise false alarms. | V17: `snapshot_age_days` must be the date difference, and both views must flag it. A constant 0 fails. |
+| 4432595887: when the newest Portfolio_Decision night has no actions, `MAX(snapshot_date)` over the typed rows picked an older night's actions. | The decision row now joins on the holdings' own night (`d.snapshot_date = h.snapshot_date`). An empty decision night gives NULL `pd_*` columns, never stale ones. **Same defect on the board, fixed too:** `v_top10_insight` takes its night from `v_top10_status`, which keeps empty-board nights, so an empty board stays empty. | V17: removing the night join fails, and so does the old `MAX(...) OVER ()`. |
+
 ## Post-merge order (agent)
 1. Dispatch `bq-archive` with `write=true` and `tabs=Market_Leaders,Global_Markets,Mutual_Funds,Commodities_FX,_News_Items,_News_Gate,_Econ_Events`. This is read-only for the workbook.
 2. Dispatch `bq-views` in write mode, then in verify mode.

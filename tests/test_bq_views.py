@@ -59,7 +59,11 @@ imported.
       objects and document their Looker custom queries
   V17 the evidence views read typed views only (no raw archive table), the
       portfolio's bearish calls are v_performance_log's, f_col / f_at pair
-      exactly as f_cell, and every caution flag has a plain-word label
+      exactly as f_cell, and every caution flag has a plain-word label; the
+      board is the newest v_top10_status night (an empty board stays empty),
+      the decision row comes from the holdings' own night, and a market
+      copy older than a day is flagged (Codex P2 x2 on #883 - fail on the
+      first cut)
 """
 from __future__ import annotations
 
@@ -116,14 +120,14 @@ PENDING = {
     "f_at": "0778d85d64b36c5c40183dbd19b6ef16edeb539e246443bc083bdaca71671108",
     "f_ts_utc": "2a97c7875166cc6548e2d5443bc831405d56b9069ceb91bbee6ebadd120173be",
     "v_universe": "eeb532b232eb1269e5246139004ef9eb68feb622e91ef6948ff319d3529b140a",
-    "v_universe_latest": "0705c098a94352de9e7a2ecdcdee1669be1834cc0d2c7bcc95a0431b00c76ebe",
+    "v_universe_latest": "981638d8da391f7bee9e237739cd7311c98cbc0b365b5db3ca9c61fb65303260",
     "f_universe_return": "f3a7153aa93cb74570c523ab549db903274ac9290c68be8a1c2d048ca0e7e09d",
     "v_news_items": "98d76e754284969f91c457d84c4ea59df01402bc3ce593053d0425e444aade47",
     "v_econ_events": "88f79df71ae3a0d2be5973b8d6e99af77d7d6cbed3c816443d3ad93d1a0842d6",
     "v_news_gate": "ba73984a770ff9e343fbc477ecae62cd5317dbea9d24880559ca33c3ad7a6c6f",
     "v_calendar_events": "982b2d62ea7254759c320d3af87220543ec01405b72c2e2bf99938c639f4e6f0",
-    "v_top10_insight": "a1638f8d5f93167bb13b537205d4a0e362714952332e527f8871daf4df148755",
-    "v_portfolio_insight": "6dda2f09c116d73584a1938385d90f68e07a335a99e7f5c2ea2f92baa1b16ccb",
+    "v_top10_insight": "249d3254e726a05d355345b36bdff9e035bca3b07bd531300a63d22a296485d6",
+    "v_portfolio_insight": "08e4274869567fe2679d6198379b0e3636d59fd285bdfa3fa99005a5a134512d",
     "f_symbol_pick": "32777aa976c7220b789a103de61a027892173c98c731cfb3a7dedc467affb877",
 }
 EXPECTED_ORDER = [
@@ -668,6 +672,14 @@ def case_v17():
         assert len(labels) >= 8 and all(re.fullmatch(r"[a-z0-9 /.-]+", x) for x in labels), labels
         assert "ARRAY_TO_STRING(j.flags, ' · ') AS caution_flags" in code
         assert "ARRAY_LENGTH(j.flags) AS caution_count" in code
+        assert "IF(u.snapshot_age_days > 1, CONCAT('market copy '" in code
+    latest = bv._code(objs["v_universe_latest"].template)
+    assert "DATE_DIFF(CURRENT_DATE(), r.snapshot_date, DAY) AS snapshot_age_days" in latest
+    t10 = bv._code(objs["v_top10_insight"].template)
+    assert "AND b.snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_top10_status`)" in t10
+    assert "MAX(b.snapshot_date) OVER ()" not in t10          # golden: the last FULL board
+    assert "LEFT JOIN pd AS d ON d.symbol = h.symbol AND d.snapshot_date = h.snapshot_date" in pf
+    assert "MAX(d.snapshot_date) OVER ()" not in pf           # golden: an older night's actions
 
 
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
