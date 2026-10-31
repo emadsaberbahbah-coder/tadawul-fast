@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.1.0 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.2.0 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
-page). Offline: the BigQuery session is a fake, no google library is
+page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
+pages). Offline: the BigQuery session is a fake, no google library is
 imported.
 
-  V1  the 16 objects load in apply order (3 functions, 11 views, then 2 table
-      functions) and the static checks pass
+  V1  the 29 objects load in apply order (6 functions, then the views and
+      table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
   V3  render: the placeholder is fully replaced; bad project / dataset ids
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      a table function keeps the query after its 'AS' line
+      the 13 objects of v1.2.0 hash to their reviewed files (pending pins,
+      confirmed by bq_views --verify after the first --write); a table
+      function keeps the query after its 'AS' line
   V5  the static checks refuse a data-changing statement, a hard-coded
       project, a forward reference, two statements, a function after a view,
       a misnamed file, a CREATE TABLE and an unknown source table; they accept
@@ -42,6 +45,21 @@ imported.
   V13 v_portfolio_decision.pd_ibkr_evidence recognizes every note
       pdIbkrNote_ (apps_script/10_My_Portfolio.gs) writes - SENT (...) too;
       fails on the first cut's pattern
+  V14 every header a v1.2.0 view looks up is one its writer declares:
+      v_universe on all four market pages (core/sheets/schema_registry.py),
+      the news views on scripts/news_macro_gate.py's three headers,
+      v_calendar_events on scripts/run_calendar_sync.py's; and the tables
+      they read are exactly what archive_to_bigquery v1.1.0 adds (header row 1)
+  V15 v_universe units and regions: a registry pct column (a fraction) is
+      read x 100 or recomputed from prices, a points column never is; every
+      listing suffix on the live pages (31 Oct) has exactly one region and a
+      listing country; the market-series regions are reused by name
+  V16 the new table functions: f_universe_return(start_date DATE, end_date
+      DATE) and f_symbol_pick(q STRING, market STRING) read only earlier
+      objects and document their Looker custom queries
+  V17 the evidence views read typed views only (no raw archive table), the
+      portfolio's bearish calls are v_performance_log's, f_col / f_at pair
+      exactly as f_cell, and every caution flag has a plain-word label
 """
 from __future__ import annotations
 
@@ -90,13 +108,36 @@ INSTALLED = {
     "f_market_window": "64f1a45c397a3f8f0c66fd1495ed54be4447cd26193aab56f21363bf8e428750",
     "f_market_summary": "06c5ec61c824be4019428bc36212230f94b0fea6a3394b63c8b007cd01cda808",
 }
+# The 13 objects apply_bq_views 1.2.0 adds (31 Oct 2026), hashed from the
+# reviewed files: bq_views --verify after the first --write must find these
+# exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
+PENDING = {
+    "f_col": "bdc2111efe102498cb71de7287bbd54f04060720c72a12055ba169850c9d0e13",
+    "f_at": "0778d85d64b36c5c40183dbd19b6ef16edeb539e246443bc083bdaca71671108",
+    "f_ts_utc": "2a97c7875166cc6548e2d5443bc831405d56b9069ceb91bbee6ebadd120173be",
+    "v_universe": "eeb532b232eb1269e5246139004ef9eb68feb622e91ef6948ff319d3529b140a",
+    "v_universe_latest": "0705c098a94352de9e7a2ecdcdee1669be1834cc0d2c7bcc95a0431b00c76ebe",
+    "f_universe_return": "f3a7153aa93cb74570c523ab549db903274ac9290c68be8a1c2d048ca0e7e09d",
+    "v_news_items": "98d76e754284969f91c457d84c4ea59df01402bc3ce593053d0425e444aade47",
+    "v_econ_events": "88f79df71ae3a0d2be5973b8d6e99af77d7d6cbed3c816443d3ad93d1a0842d6",
+    "v_news_gate": "ba73984a770ff9e343fbc477ecae62cd5317dbea9d24880559ca33c3ad7a6c6f",
+    "v_calendar_events": "982b2d62ea7254759c320d3af87220543ec01405b72c2e2bf99938c639f4e6f0",
+    "v_top10_insight": "a1638f8d5f93167bb13b537205d4a0e362714952332e527f8871daf4df148755",
+    "v_portfolio_insight": "6dda2f09c116d73584a1938385d90f68e07a335a99e7f5c2ea2f92baa1b16ccb",
+    "f_symbol_pick": "32777aa976c7220b789a103de61a027892173c98c731cfb3a7dedc467affb877",
+}
 EXPECTED_ORDER = [
-    "f_cell", "f_num", "f_ts",
+    "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
     "v_board_episodes", "v_performance_log", "v_selection_log", "v_signal_history",
     "v_top10_board", "v_portfolio_decision", "v_my_portfolio", "v_top10_status",
     "v_run_log", "v_archive_health",
     "v_market_daily", "f_market_window", "f_market_summary",
+    "v_universe", "v_universe_latest", "f_universe_return",
+    "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events",
+    "v_top10_insight", "v_portfolio_insight", "f_symbol_pick",
 ]
+EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 6 + ["TABLE FUNCTION"])
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -150,7 +191,7 @@ def case_v1():
     objs = bv.load_objects()
     assert [o.name for o in objs] == EXPECTED_ORDER, [o.name for o in objs]
     kinds = [o.kind for o in objs]
-    assert kinds == ["FUNCTION"] * 3 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2, kinds
+    assert kinds == EXPECTED_KINDS, kinds
     assert bv.check_objects(objs) == [], bv.check_objects(objs)
 
 
@@ -185,8 +226,10 @@ def case_v3():
 
 def case_v4():
     got = {n: bv.sha256(b) for n, b in _bodies().items()}
-    assert got == INSTALLED, {n: (got.get(n), INSTALLED.get(n)) for n in set(got) | set(INSTALLED)
-                              if got.get(n) != INSTALLED.get(n)}
+    pins = {**INSTALLED, **PENDING}
+    assert not set(INSTALLED) & set(PENDING)
+    assert got == pins, {n: (got.get(n), pins.get(n)) for n in set(got) | set(pins)
+                         if got.get(n) != pins.get(n)}
     view = "x\nCREATE OR REPLACE VIEW `p.d.v`\nOPTIONS (description = \"d\")\nAS\nSELECT 1 AS a\nFROM t;\n"
     assert bv.object_body(view, "VIEW") == "SELECT 1 AS a\nFROM t"
     fn = "CREATE OR REPLACE FUNCTION `p.d.f`(s STRING)\nRETURNS STRING\nAS (\n  TRIM(s)\n)\nOPTIONS (description = \"d\");\n"
@@ -481,8 +524,154 @@ def case_v13():
     assert re.search(r"ibkr evidence ([A-Z ]+?)[:|]", sent) is None
 
 
+def _py_list(path, name):
+    """A module-level list literal (NAME = [...]) read with ast - no import."""
+    import ast
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            return list(ast.literal_eval(node.value))
+    raise AssertionError(f"{name} not in {path}")
+
+
+MARKET_PAGES = ("Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX")
+HELPERS = {"f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc"}
+NEW_SOURCES = {
+    "v_universe": {"market_leaders", "global_markets", "mutual_funds", "commodities_fx"},
+    "v_news_items": {"news_items"}, "v_econ_events": {"econ_events"},
+    "v_news_gate": {"news_gate"}, "v_calendar_events": {"calendar_events"},
+}
+# listing suffixes on the four market pages of the live workbook, 31 Oct 2026
+LIVE_SUFFIXES_20261031 = (
+    "US", "T", "HK", "L", "TO", "AX", "DE", "NS", "PA", "KS", "ST", "TW", "IS", "BK", "JK", "SW", "MI",
+    "MC", "MX", "AS", "OL", "VN", "SI", "JO", "CO", "KL", "SN", "AT", "BR", "WA", "HE", "QA", "NZ",
+    "BA", "VI", "LS", "AE", "BH", "SR")
+
+
+def _registry():
+    sys.path.insert(0, str(ROOT))
+    from core.sheets import schema_registry as reg
+    return reg
+
+
+def case_v14():
+    import archive_to_bigquery as arc
+    reg = _registry()
+    objs = {o.name: o for o in bv.load_objects()}
+    gate = "scripts/news_macro_gate.py"
+    writers = {
+        "v_news_items": _py_list(gate, "ITEMS_HEADER"),
+        "v_news_gate": _py_list(gate, "GATE_HEADER"),
+        "v_econ_events": _py_list(gate, "ECON_HEADER"),
+        "v_calendar_events": (_py_list("scripts/run_calendar_sync.py", "HEADERS")
+                              + _py_list("scripts/run_calendar_sync.py", "LAST_REPORT_HEADERS")),
+    }
+    pages = [reg.get_sheet_headers(p) for p in MARKET_PAGES]
+    assert all(h == pages[0] for h in pages) and len(pages[0]) == 115
+    used = bv.header_names_used(objs["v_universe"].template)
+    assert len(used) == len(set(used)) == 115, len(used)        # every column, looked up once
+    assert sorted(used) == sorted(pages[0])
+    for name, header in writers.items():
+        got = bv.header_names_used(objs[name].template)
+        assert got and not set(got) - set(header), (name, sorted(set(got) - set(header)))
+    # the tables they read: exactly the tabs archive v1.1.0 adds, header row 1
+    added = {arc.table_name(t): h for t, h in arc.TABS[10:]}
+    assert set(added) == {"market_leaders", "global_markets", "mutual_funds", "commodities_fx",
+                          "news_items", "news_gate", "econ_events"} and set(added.values()) == {1}
+    assert {arc.table_name(t) for t, _ in arc.TABS} == bv.ARCHIVE_TABLES
+    for name, tables in NEW_SOURCES.items():
+        refs = set(bv._REF.findall(bv._code(objs[name].template))) - {name}
+        assert refs - HELPERS == tables, (name, refs)
+
+
+def case_v15():
+    import re
+    import archive_market_series as ms
+    reg = _registry()
+    code = bv._code({o.name: o for o in bv.load_objects()}["v_universe"].template)
+    alias_of = dict(re.findall(r"\.f_col`\(h, '([^']+)'\) AS i_([a-z0-9_]+)", code))
+    times100 = set(re.findall(
+        r"ROUND\(`\{\{DS\}\}\.f_num`\(`\{\{DS\}\}\.f_at`\(s\.cells, i_([a-z0-9_]+)\)\) \* 100, 4\)", code))
+    dtype = {c.header: c.dtype for c in reg.get_sheet_columns("Global_Markets")}
+    derived = {"Percent Change": "change_pct", "52W Position %": "position_52w_pct",
+               "Expected ROI 1M": "expected_roi_1m_pct", "Expected ROI 3M": "expected_roi_3m_pct",
+               "Expected ROI 12M": "expected_roi_12m_pct", "Upside %": "intrinsic_upside_pct",
+               "Upside/Downside %": "target_upside_pct"}
+    pct = {h for h, d in dtype.items() if d == "pct"}
+    assert len(pct) == 17, sorted(pct)
+    for h in pct:               # a fraction column is read x 100 or recomputed from prices
+        assert alias_of[h] in times100 or h in derived, h
+    for h, col in derived.items():
+        assert f" AS {col}" in code, col
+    for h, a in alias_of.items():
+        if a in times100:       # golden negative: a 0-100 points column is never x 100
+            assert dtype[h] == "pct", (h, dtype[h])
+    assert alias_of["Data Quality Score"] == "data_quality" and "data_quality" not in times100
+    region_of = {}
+    for body, region in re.findall(r"WHEN k\.market_code IN \(([^)]*)\) THEN '([^']+)'", code):
+        for sfx in re.findall(r"'([^']+)'", body):
+            assert sfx not in region_of, sfx
+            region_of[sfx] = region
+    countries = dict(re.findall(r"WHEN '([A-Z]+)' THEN '([^']+)'", code))
+    for sfx in LIVE_SUFFIXES_20261031:
+        assert sfx in region_of and sfx in countries, sfx
+    assert set(region_of) == set(countries)
+    assert (region_of["SR"], region_of["US"], region_of["T"], region_of["HK"], region_of["L"]) == \
+        ("Gulf", "US", "Japan", "China", "Europe")
+    named = set(region_of.values()) | set(re.findall(r"THEN '([A-Za-z]+)'\n", code))
+    assert set(ms.REGIONS) - {"World"} <= named, set(ms.REGIONS) - named   # same names as the market series
+
+
+def case_v16():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    order = [o.name for o in bv.load_objects()]
+    for name, sig, docs in (
+            ("f_universe_return", "(start_date DATE, end_date DATE)", ("@DS_START_DATE", "@DS_END_DATE")),
+            ("f_symbol_pick", "(q STRING, market STRING)", ("(@q, @market)", "WHERE pick_order = 1)"))):
+        tpl = objs[name].template
+        assert objs[name].kind == "TABLE FUNCTION"
+        assert f"`{{{{DS}}}}.{name}`{sig}" in tpl, name
+        refs = set(bv._REF.findall(bv._code(tpl))) - {name}
+        assert refs and all(order.index(r) < order.index(name) for r in refs), (name, refs)
+        for doc in docs:
+            assert doc in tpl, (name, doc)
+    pick = bv._code(objs["f_symbol_pick"].template)
+    assert [int(x) for x in re.findall(r"THEN (\d)\n", pick)] == [1, 2, 3, 4, 5, 6, 7]
+    assert re.search(r"QUALIFY pick_order <= 20;?$", pick.strip()) and "a.um IN ('', 'ALL', 'ANY')" in pick
+    ret = bv._code(objs["f_universe_return"].template)
+    assert "snapshot_date < start_date" in ret and "snapshot_date <= end_date" in ret
+    assert "before_start IS NOT NULL AS covers_window" in ret
+
+
+def case_v17():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    for name in ("v_universe_latest", "f_universe_return", "v_top10_insight", "v_portfolio_insight",
+                 "f_symbol_pick"):
+        refs = set(bv._REF.findall(bv._code(objs[name].template))) - {name}
+        assert refs and not refs & bv.SOURCE_TABLES, (name, refs & bv.SOURCE_TABLES)   # typed views only
+    perf = bv._code(objs["v_performance_log"].template)
+    bearish = set(re.findall(r"'([^']+)'", re.search(
+        r"WHEN entry_recommendation IN \(([^)]*)\) THEN 'bearish'", perf).group(1)))
+    pf = bv._code(objs["v_portfolio_insight"].template)
+    said = set(re.findall(r"'([^']+)'", re.search(r"IF\(UPPER\(u\.recommendation\) IN \(([^)]*)\)", pf).group(1)))
+    assert said == bearish, (said, bearish)
+    cell, col, at = (bv._code(objs[n].template) for n in ("f_cell", "f_col", "f_at"))
+    for frag in ("FROM UNNEST(h) AS x WITH OFFSET AS o", "WHERE TRIM(x) = name", "ORDER BY o", "LIMIT 1"):
+        assert frag in cell and frag in col, frag
+    assert "NULLIF(NULLIF(TRIM(c[SAFE_OFFSET(o)]), ''), '—')" in cell
+    assert "NULLIF(NULLIF(TRIM(c[SAFE_OFFSET(i)]), ''), '—')" in at
+    for name in ("v_top10_insight", "v_portfolio_insight"):
+        code = bv._code(objs[name].template)
+        labels = re.findall(r", '([^']+)', NULL\)", code)
+        assert len(labels) >= 8 and all(re.fullmatch(r"[a-z0-9 /.-]+", x) for x in labels), labels
+        assert "ARRAY_TO_STRING(j.flags, ' · ') AS caution_flags" in code
+        assert "ARRAY_LENGTH(j.flags) AS caution_count" in code
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
-         case_v12, case_v13]
+         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17]
 
 
 def test_v1(): case_v1()
@@ -498,6 +687,10 @@ def test_v10(): case_v10()
 def test_v11(): case_v11()
 def test_v12(): case_v12()
 def test_v13(): case_v13()
+def test_v14(): case_v14()
+def test_v15(): case_v15()
+def test_v16(): case_v16()
+def test_v17(): case_v17()
 
 
 if __name__ == "__main__":
