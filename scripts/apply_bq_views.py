@@ -2,8 +2,17 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.2.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.3.0 (program register C8, Phase 2)
 ================================================================================
+v1.3.0 (31 Oct 2026, owner request: candles, news and an IBKR-like rating
+in My Portfolio and on the one-symbol page): the three tables of
+scripts/archive_symbol_deep.py (symbol_bars_daily, symbol_analyst_daily,
+symbol_news) are source tables, for v_symbol_candles, v_symbol_analyst,
+v_symbol_news, v_symbol_rating (the TFB rating) and the symbol-picker views
+v_dive_signals / v_dive_board / v_dive_events; v_top10_insight and
+v_portfolio_insight (now files 67 / 68, after the rating) carry the rating
+and an 'analyst consensus below Hold' caution, and the portfolio's
+bearish-call flag reads the market pages' STRONG_SELL spelling too.
 v1.2.0 (31 Oct 2026, Looker pages 3-6): the seven tabs archive_to_bigquery
 v1.1.0 adds (four market pages, three news gate tabs) are source tables, for
 v_universe / v_universe_latest / f_universe_return (World Top-25 ROI),
@@ -67,7 +76,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -86,7 +95,9 @@ ARCHIVE_TABLES = frozenset({
 })
 # the table scripts/archive_market_series.py v1.0.0 loads (global markets page)
 MARKET_TABLES = frozenset({"market_series_daily"})
-SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES
+# the tables scripts/archive_symbol_deep.py v1.0.0 loads (v1.3.0)
+DEEP_TABLES = frozenset({"symbol_bars_daily", "symbol_analyst_daily", "symbol_news"})
+SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")

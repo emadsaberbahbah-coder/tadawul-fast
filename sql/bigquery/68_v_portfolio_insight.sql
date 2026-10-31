@@ -3,12 +3,14 @@
 -- row for the name from the same nightly snapshot (pd_*: action, SAR P&L,
 -- weight, stop and targets, advisor note - NULL when that night's decision
 -- had no row for it, never an older night's), the engine's newest market-page view (mkt_*),
--- the next earnings and ex-dividend dates and the news of the last 7 days.
+-- the next earnings and ex-dividend dates, the news of the last 7 days and
+-- the TFB rating with the analyst consensus (v_symbol_rating, 1.3.0).
 -- caution_flags lists, in plain words, what argues for a review (the price
 -- at or below the stop, at or above the first target, earnings or
 -- ex-dividend within 5 days, negative or high-severity news, a bearish
 -- engine call, a negative 12-month forecast, data older than 36 h when
--- archived, a market copy more than a day old, below the floors);
+-- archived, a market copy more than a day old, below the floors, an
+-- analyst consensus below Hold);
 -- caution_count counts them. Percent points.
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_insight`
 OPTIONS (description = "TFB Looker v2: the latest holdings with the portfolio decision, market-page evidence, events, 7-day news and plain-word caution flags per holding")
@@ -101,6 +103,14 @@ j AS (
     COALESCE(n.news_positive_7d, 0) AS news_positive_7d,
     COALESCE(n.news_high_severity_7d, 0) AS news_high_severity_7d,
     n.last_headline,
+    rt.tfb_rating_score,
+    rt.tfb_rating_label,
+    rt.tfb_rating_stars,
+    rt.rating_confidence,
+    rt.rating_parts,
+    rt.analyst_consensus_label,
+    rt.analyst_consensus_score,
+    rt.analysts,
     ARRAY(
       SELECT f FROM UNNEST([
         IF(d.price_sar <= d.stop_sar, 'at or below the stop', NULL),
@@ -109,12 +119,13 @@ j AS (
         IF(c.days_to_exdiv_now BETWEEN 0 AND 5, 'ex-dividend within 5 days', NULL),
         IF(n.news_negative_7d > 0, 'negative news in 7 days', NULL),
         IF(n.news_high_severity_7d > 0, 'high-severity news in 7 days', NULL),
-        IF(UPPER(u.recommendation) IN ('REDUCE', 'SELL', 'STRONG SELL', 'AVOID', 'EXIT', 'TRIM'),
-           CONCAT('engine says ', UPPER(u.recommendation)), NULL),
+        IF(UPPER(REPLACE(u.recommendation, '_', ' ')) IN ('REDUCE', 'SELL', 'STRONG SELL', 'AVOID', 'EXIT', 'TRIM'),
+           CONCAT('engine says ', UPPER(REPLACE(u.recommendation, '_', ' '))), NULL),
         IF(u.expected_roi_12m_pct < 0, 'negative 12-month forecast', NULL),
         IF(u.data_age_hours > 36, 'market data older than 36 h', NULL),
         IF(u.snapshot_age_days > 1, CONCAT('market copy ', CAST(u.snapshot_age_days AS STRING), ' days old'), NULL),
-        IF(u.symbol IS NOT NULL AND NOT u.meets_floors, 'below reliability / data-quality floors', NULL)
+        IF(u.symbol IS NOT NULL AND NOT u.meets_floors, 'below reliability / data-quality floors', NULL),
+        IF(rt.analyst_consensus_score < 2.5, 'analyst consensus below Hold', NULL)
       ]) AS f
       WHERE f IS NOT NULL
     ) AS flags
@@ -123,6 +134,7 @@ j AS (
   LEFT JOIN `{{DS}}.v_universe_latest` AS u ON u.symbol = h.symbol
   LEFT JOIN cal AS c ON c.symbol = h.symbol
   LEFT JOIN news AS n ON n.symbol = h.symbol
+  LEFT JOIN `{{DS}}.v_symbol_rating` AS rt ON rt.symbol = h.symbol
 )
 SELECT
   j.* EXCEPT (flags),
