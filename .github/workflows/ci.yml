@@ -2,6 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
+#
+# v1.1.61 (ported from open PR #860 through #874; its first numbers went to
+# #859 (1.1.50) and #875-#879 (1.1.56-1.1.60)): run
+# tests/test_daily_brief_send_window.py (run_daily_brief v1.20.0: the
+# send-time label and the US / Europe session hours come from the IANA
+# zones instead of "before market open" and fixed hours that go wrong when
+# US daylight time ends on 1 Nov 2026) in the daily brief step.
+#
 # VERSION 1.1.60 (2026-10-29) -- BIGQUERY MARKET SERIES (C8 PHASE 2b)
 # (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877; 1.1.59 is #878.)
 #
@@ -1334,7 +1343,7 @@ jobs:
           # shallow checkout (a failed fetch only turns that leg into a SKIP).
           git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
             || echo "::notice::brief golden base not fetched - its golden leg will SKIP"
-          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py
+          python -m pytest -q tests/test_daily_brief_blocked_inputs.py tests/test_daily_brief_post_earnings_tag.py tests/test_daily_brief_send_window.py
 
       - name: 💵 Run exported-workbook cash certification regressions
         run: python -m pytest -q tests/test_cash_snapshot_certification.py tests/test_decision_v2_cash_presentation.py
