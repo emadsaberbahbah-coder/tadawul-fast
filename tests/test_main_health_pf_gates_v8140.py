@@ -115,8 +115,12 @@ def main():
     # v8.14.1 (2026-10-06): +3 PF keys (P-183 add-loser veto) and +4 OB keys
     # (P-181 52W timing) closed Improvement Register item 7.
     # v8.14.4 (2026-10-13): +1 PF key (TFB_PF_RESEARCH_VIEW, P0-6) -> 25.
-    T("H3 env list complete", len(pa) == len(fix._PF_GATE_ENVS) == 25 and len(pg["opportunity_builder"]) == len(fix._OB_GATE_ENVS) == 9)
+    # v8.14.8 (2026-10-28): +5 PF keys (D1b post-earnings, D1c ticket cap) -> 30.
+    T("H3 env list complete", len(pa) == len(fix._PF_GATE_ENVS) == 30 and len(pg["opportunity_builder"]) == len(fix._OB_GATE_ENVS) == 9)
     T("H3 P0-6 research view key present", "TFB_PF_RESEARCH_VIEW" in pa)
+    T("H3 D1b/D1c guard keys present", all(k in pa for k in (
+        "TFB_PF_ADD_POST_EARN", "TFB_PF_POST_EARN_SESSIONS", "TFB_PF_POST_EARN_SESSIONS_NEG",
+        "TFB_PF_MAX_OPEN_TICKETS_MODE", "TFB_PF_MAX_OPEN_TICKETS")))
     T("H3 register item 7 keys present", "TFB_T10_W52_TIMING" in pg["opportunity_builder"] and "TFB_PF_ADD_LOSER_VETO" in pa)
     os.environ["TFB_PF_SWITCH_SCAN"] = "  1  "
     T("H3 call-time read + strip", fix._pf_gates_snapshot()["portfolio_actions"]["TFB_PF_SWITCH_SCAN"] == "1")

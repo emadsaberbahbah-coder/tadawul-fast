@@ -26,6 +26,8 @@ SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
+    # daily_sync.yml 1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE.
+    "TFB_SYNC_FW2_STALE_PE": "off",
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
 

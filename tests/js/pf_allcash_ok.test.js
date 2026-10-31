@@ -18,6 +18,12 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const GAS = process.env.PF_GAS || path.join(__dirname, '../../apps_script/10_My_Portfolio.gs');
+/* 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); the
+ * Logger version token follows PD_VERSION of the file under test. */
+function ctxVersion() {
+  const m = require('fs').readFileSync(process.env.PF_GAS || GAS, 'utf8').match(/var PD_VERSION = '([^']+)';/);
+  return m ? m[1] : '1.5.15';
+}
 const GOLDEN = path.join(__dirname, '../fixtures/pf_allcash_v1_5_14_golden.json');
 const SOURCE = fs.readFileSync(GAS, 'utf8');
 const RUN = '6363636363';
@@ -292,7 +298,7 @@ check('T2 v1.5.15 enforce (default): status ok, the all-cash token, the receipt;
     assert.equal(sha(r.writes), G.allcash.writes_sha256, 'the render is the v1.5.14 render');
     assert.equal(r.ret, 'empty', 'the return value is the backend status');
     assert.deepEqual(r.logs.filter((l) => l.indexOf('done status=') > 0),
-                     G.allcash.logs.map((l) => l.replace('v1.5.14', 'v1.5.15')), 'Logger line unchanged in form');
+                     G.allcash.logs.map((l) => l.replace('v1.5.14', 'v' + ctxVersion())), 'Logger line unchanged in form');
     assert.equal(w.drive.length, 1);
   }
   /* a zero-quantity closed line in the capture is not a position (pdIbkrPlan_ counts qty > 0) */
