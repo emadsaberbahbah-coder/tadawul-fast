@@ -46,7 +46,7 @@ Loads 2 and 3 write one partition per day.
 | 62 | v_symbol_news | EODHD headlines (positive at polarity >= 0.25, negative at <= -0.25) plus the news gate's items, each with a `source_kind`. |
 | 63 | v_symbol_rating | **The TFB rating** (described below the table). |
 | 64-66 | v_dive_signals / v_dive_board / v_dive_events | The signal history, the board episodes and the newest calendar row, each with `symbol_label` so one picker filters every section. |
-| 67, 68 (were 57, 58) | v_top10_insight / v_portfolio_insight | Both now carry the rating and its parts, the analyst consensus, and an "analyst consensus below Hold" caution. The portfolio's bearish-call flag now also matches the market pages' `STRONG_SELL` spelling. Before, "engine says STRONG SELL" never fired for it. |
+| 67, 68 (were 57, 58) | v_top10_insight / v_portfolio_insight | Both now carry the rating and its parts, the analyst consensus, an "analyst consensus below Hold" caution, and `symbol_label`. With that key, a holdings or board picker also filters the candle, news and analyst charts. The portfolio's bearish-call flag now also matches the market pages' `STRONG_SELL` spelling. Before, "engine says STRONG SELL" never fired for it. |
 
 **One candle per trading session.**
 - **Symbols with Yahoo bars** (the deep set) use those bars only. The bars are reloaded every night after the archive, so a nightly snapshot can never add a second copy of a session.

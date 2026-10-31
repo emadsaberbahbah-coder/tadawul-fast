@@ -151,8 +151,8 @@ PENDING = {
     "v_dive_signals": "70f12d9f52f86dda605931c4ddb5011382d51658cb725e51012302cba4836ed8",
     "v_dive_board": "3af206fc77283b1c9fbdff585d61d997f577c444ad5bc86088a0b33ac5ecdfaf",
     "v_dive_events": "bfcf61db2425619a8fe2f18778d573d0b506ba55a59f3f4850af067b5904f693",
-    "v_top10_insight": "1d6b88d83804ea0909ae57bfa44d6daf57b2a7eec422ab174dc86e227c73f680",
-    "v_portfolio_insight": "8dca71de1f07e4995723f3f7f3bfdef27096d98a002ae478d9feb03fdcc3fd26",
+    "v_top10_insight": "c197b1021774a7b23718019a13657d7395f5693cf2939c0f8cb696dd607cefd4",
+    "v_portfolio_insight": "46505fd209702b7eb4291040fe07f20acac654325108f3e32993093ab0efb5c9",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -728,7 +728,7 @@ def case_v18():
         "v_symbol_news": {"symbol_news"}}, used
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
-              "v_dive_signals", "v_dive_board", "v_dive_events"):
+              "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):
         assert re.search(r"\bsymbol_label\b", code[n]), n
     # the TFB rating: six weights summing to 1, in the score and the coverage alike
     rating = code["v_symbol_rating"]

@@ -10,7 +10,8 @@
 -- a day old (a missed nightly archive), negative or high-severity news, below
 -- the reliability / data-quality floors, a block reason, a negative 12-month
 -- forecast, an analyst consensus below Hold, no market-page row);
--- caution_count counts them. Percent points.
+-- caution_count counts them. Percent points. symbol_label keys the
+-- symbol picker shared with the candle, news and analyst views.
 CREATE OR REPLACE VIEW `{{DS}}.v_top10_insight`
 OPTIONS (description = "TFB Looker v2: the latest Top-10 board with market-page evidence, events, 7-day news, past episodes and plain-word caution flags per row")
 AS
@@ -55,6 +56,7 @@ past AS (
 j AS (
   SELECT
     b.*,
+    COALESCE(u.symbol_label, b.symbol) AS symbol_label,
     u.symbol IS NOT NULL AS on_market_page,
     u.source_page AS mkt_page,
     u.region AS mkt_region,

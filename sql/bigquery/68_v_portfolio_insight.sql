@@ -11,7 +11,8 @@
 -- engine call, a negative 12-month forecast, data older than 36 h when
 -- archived, a market copy more than a day old, below the floors, an
 -- analyst consensus below Hold);
--- caution_count counts them. Percent points.
+-- caution_count counts them. Percent points. symbol_label keys the
+-- symbol picker shared with the candle, news and analyst views.
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_insight`
 OPTIONS (description = "TFB Looker v2: the latest holdings with the portfolio decision, market-page evidence, events, 7-day news and plain-word caution flags per holding")
 AS
@@ -50,6 +51,7 @@ news AS (
 j AS (
   SELECT
     h.*,
+    COALESCE(u.symbol_label, h.symbol) AS symbol_label,
     DATE_DIFF(h.snapshot_date, h.buy_date, DAY) AS days_held,
     d.action AS pd_action,
     d.price_sar AS pd_price_sar,
