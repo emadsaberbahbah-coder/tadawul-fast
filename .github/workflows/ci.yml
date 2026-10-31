@@ -2,6 +2,63 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.60 (2026-10-29) -- BIGQUERY MARKET SERIES (C8 PHASE 2b)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877; 1.1.59 is #878.)
+#
+# v1.1.60: run tests/test_archive_market_series.py (scripts/
+# archive_market_series.py v1.0.0: nightly Yahoo daily bars of 48 reference
+# market series into tfb_archive.market_series_daily, one partition per
+# series, for the global markets page; workflow bq_markets.yml) in the
+# blocking lean lane right after tests/test_bq_views.py (which now also
+# covers apply_bq_views 1.1.0: v_market_daily and the two table functions).
+# Offline: the opener and the BigQuery session are fakes, no google library
+# is imported, PyYAML (already in the lane) reads the workflow. Nothing is
+# removed and no existing entry moves.
+#
+# VERSION 1.1.59 (2026-10-29) -- BIGQUERY LOOKER VIEWS (C8 PHASE 2)
+# (1.1.56 is #875; 1.1.57 is #876; 1.1.58 is #877.)
+#
+# v1.1.59: run tests/test_bq_views.py (scripts/apply_bq_views.py v1.0.0 +
+# sql/bigquery/*.sql: three helper functions and ten typed views over the
+# nightly tfb_archive tables for Looker Studio; workflow bq_views.yml,
+# dispatch-only, verify by default) in the blocking lean lane next to
+# tests/test_bq_archive.py. Offline: the BigQuery session is a fake, no
+# google library is imported, PyYAML (already in the lane) reads the
+# workflow. Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.58 (2026-10-29) -- RELEASE RENDER SETTLE (release_decision_feed 1.3.0)
+#
+# v1.1.58: run tests/test_release_render_settle.py (release_decision_feed
+# v1.3.0: a cockpit caught mid-render settles and is re-audited instead of
+# failing, which today withdraws a live release for good;
+# TFB_RELEASE_RENDER_SETTLE default off, mapped by release_decision_feed.yml
+# 1.2.0) in the blocking lean lane next to the two P0-1 release harnesses.
+# Offline fakes only; its base-identity case reads the untouched 729a316e
+# with `git show` and SKIPs on a shallow checkout. Nothing is removed and
+# no existing entry moves.
+#
+# VERSION 1.1.57 (2026-10-29) -- RELEASE AFTER SYNC (await_cockpit_receipts 1.0.0)
+# (1.1.56 is #875.)
+#
+# v1.1.57: run tests/test_await_cockpit_receipts.py (scripts/
+# await_cockpit_receipts.py v1.0.0 + release_after_sync.yml v1.0.0: after a
+# completed production sync, a read-only bounded wait for both cockpit
+# receipts, then one dispatch of the unchanged release workflow;
+# TFB_RELEASE_AFTER_SYNC default off) in the blocking lean lane, next to the
+# two P0-1 release harnesses. Offline fakes only (numpy/pytest/PyYAML lane).
+# Nothing is removed and no existing entry moves.
+#
+# VERSION 1.1.56 (2026-10-29) -- FW-2 STALE P/E (run_dashboard_sync 6.71.0)
+#
+# v1.1.56: run tests/test_fw2_stale_pe.py (run_dashboard_sync v6.71.0
+# FW2-STALE-PE, TFB_SYNC_FW2_STALE_PE default off = the v6.70.2 FW-2 call: a
+# row FW-2 would strip for a mildly stale P/E keeps its fresh quote with P/E
+# and EPS cleared once its last-good row witnesses the instrument; mapped by
+# daily_sync.yml 1.0.8) in the blocking lean lane next to the other sync
+# suites. Offline fakes only; its base-identity legs read the untouched
+# 729a316e with `git show` and SKIP on a shallow checkout. Nothing is removed
+# and no existing entry moves.
+#
 # VERSION 1.1.55 (2026-10-28) -- POST-EARNINGS INVALID EVIDENCE (portfolio_actions 1.17.1)
 #
 # v1.1.55: the isolated protective step also fetches the merged v1.17.0
@@ -959,6 +1016,8 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
+            tests/test_bq_views.py \
+            tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -980,6 +1039,7 @@ jobs:
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
             tests/test_daily_sync_stamp_budget.py \
+            tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
@@ -1008,6 +1068,7 @@ jobs:
             tests/test_final_publication_workflow.py \
             tests/test_matrix_validation_scope.py \
             tests/test_release_decision_feed.py \
+            tests/test_release_render_settle.py \
             tests/test_sync_fetchfail_truth_p162.py \
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
@@ -1059,6 +1120,7 @@ jobs:
             tests/test_ycp_loopguard_b6.py \
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
+            tests/test_await_cockpit_receipts.py \
             tests/test_ob_conviction_sizing.py $EXTRA
           echo "::endgroup::"
 
