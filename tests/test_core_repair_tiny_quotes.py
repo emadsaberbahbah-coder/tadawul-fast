@@ -16,23 +16,23 @@ from scripts import verify_core_repair_readback as probe
 COMMIT = "a" * 40
 WORKFLOW_COMMIT = COMMIT
 OTHER_COMMIT = "f" * 40
-# 2026-10-21: data_engine_v2 5.156.0 (suffix locale fallback, default off; main's
-# #810 took 5.155.0); the CLI compares this with the source constant, so the
-# pin moves in place.
-# 2026-10-22: renumbered 5.157.0 after main's #816 took 5.156.0 (PF weight
-# fail-closed fixes); still an in-place pin, compared with the source constant.
-# 2026-10-22 (second merge): renumbered 5.159.0 after main's #817 took 5.157.0
-# (F-7 v2) and open #818 claims 5.158.0; an in-place pin as above.
-# 2026-10-24: main moved to 5.157.3 (#821-#829); this branch keeps 5.159.0.
-# 2026-10-24 (second merge): main is 5.158.0 (#819); this branch keeps 5.159.0.
+# 2026-10-21: data_engine_v2 5.157.0 (suffix locale fallback default on; main's #810
+# took 5.155.0 and the bundle's fallback is 5.156.0); the CLI compares this with
+# the source constant, so the pin moves in place.
+# 2026-10-22: 5.158.0 after main's #816 took 5.156.0 and the bundle's fallback
+# moved to 5.157.0; still an in-place pin, compared with the source constant.
+# 2026-10-22 (second merge): 5.160.0 after main's #817 took 5.157.0, the bundle's
+# fallback moved to 5.159.0 and open #818 claims 5.158.0; an in-place pin.
+# 2026-10-24: main moved to 5.157.3 (#821-#829); this build keeps 5.160.0.
+# 2026-10-24 (second merge): main is 5.158.0 (#819); this build keeps 5.160.0.
 # 2026-10-28: data_engine_v2 5.159.1 (#865 EODHD analyst target + its
 # follow-up); the CLI compares this with the source constant, like ROUTE.
-# 2026-10-28 (#778 merge of main #865 and #867): main is 5.159.1; this branch
-# carries 5.159.2 (suffix locale fallback renumbered over them).
+# 2026-10-28: main is 5.159.1 (#865, #867) and the bundle's fallback 5.159.2;
+# this build keeps 5.160.0.
 # 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
-# 2026-10-28 (#778 merge of main #870 and #871): main is 5.159.2 (#871); this
-# branch carries 5.159.3 (suffix locale fallback renumbered over it).
-ENGINE = "5.159.3"
+# 2026-10-28 (second merge): main is 5.159.2 (#871) and the bundle's fallback
+# 5.159.3; this build keeps 5.160.0.
+ENGINE = "5.160.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"
@@ -398,7 +398,7 @@ class TinyQuoteReadbackTests(unittest.TestCase):
 
 class TinyQuoteCliTests(unittest.TestCase):
     def invoke(self, token="local-test-token", tiny=False, core=None, version_reader=None,
-               workflow_sha=WORKFLOW_COMMIT):
+               workflow_sha=WORKFLOW_COMMIT, research_view=None):
         request = FakeRequest()
         stream = io.StringIO()
         environment = {"BACKEND_TOKEN": token, "GITHUB_SHA": workflow_sha,
@@ -408,6 +408,8 @@ class TinyQuoteCliTests(unittest.TestCase):
             args = ["readback", "--expected-commit", COMMIT, "--output", str(output)]
             if tiny:
                 args.append("--tiny-quote-readback")
+            if research_view is not None:
+                args.extend(["--expect-pf-research-view", research_view])
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.dict(os.environ, environment))
                 stack.enter_context(patch("sys.argv", args))
@@ -463,8 +465,9 @@ class TinyQuoteCliTests(unittest.TestCase):
     def test_quoted_and_backslashed_credential_is_redacted_recursively_before_encoding(self):
         token = 'quoted"\\credential-sentinel'
         nested = {"ok": True, "public": {"notes": [{"opaque": "before " + token + " after"}]}}
+        # 2026-10-15: default armed in code; this case tests the legacy/off path
         code, artifact, stdout, _, _, _, _ = self.invoke(
-            token=token, core=lambda *_args: copy.deepcopy(nested))
+            token=token, core=lambda *_args: copy.deepcopy(nested), research_view="off")
         self.assertEqual(code, 0)
         for payload in (artifact, stdout):
             text = payload["public"]["notes"][0]["opaque"]
@@ -485,8 +488,9 @@ class TinyQuoteCliTests(unittest.TestCase):
             request("/health")
             return {"ok": True}
 
+        # 2026-10-15: default armed in code; this case tests the legacy/off path
         code, artifact, stdout, request, _, _, tiny = self.invoke(
-            tiny=True, core=core, version_reader=source_version)
+            tiny=True, core=core, version_reader=source_version, research_view="off")
         self.assertEqual(code, 1)
         self.assertIs(artifact["ok"], False)
         self.assertEqual(artifact["tiny_quote_readback"]["status"], "failed")

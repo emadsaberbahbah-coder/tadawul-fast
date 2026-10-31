@@ -25,7 +25,9 @@ SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
-    "TFB_SYNC_FW2_SCOPE": "off",  # v6.72.0 FW-2 SCOPE (2026-10-14; v6.71.0 until 2026-10-31)
+    # v6.72.0 FW-2 SCOPE (2026-10-14; v6.71.0 until 2026-10-31); 2026-10-15: owner armed
+    # the workflow fallback to enforce in both writer jobs (Variable still overrides).
+    "TFB_SYNC_FW2_SCOPE": "enforce",
     # daily_sync.yml 1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE.
     "TFB_SYNC_FW2_STALE_PE": "off",
 }

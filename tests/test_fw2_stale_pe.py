@@ -83,9 +83,10 @@ from core.data_validity import _INVALID_WARNINGS, row_acquisition  # noqa: E402
 from core.sheets.schema_registry import get_sheet_headers  # noqa: E402
 from scripts import run_dashboard_sync as sync  # noqa: E402
 
-BASE_SHA = "7473d06e"  # merge note 2026-10-31 (#778): the bundle head before main #875
-# (main 729a316e + FW-2 SCOPE, run_dashboard_sync 6.71.0 there); on main the base is
-# 729a316e (6.70.2). Every base case then proves exactly FW2-STALE-PE's change, as on main.
+BASE_SHA = "4bc9e6a5"  # merge note 2026-10-31 (#779): this PR's head before main #875
+# (main 729a316e + the #778 bundle + the defaults; run_dashboard_sync 6.71.0 there). On
+# #778 the base is the bundle head 7473d06e, on main 729a316e (6.70.2). Every base case
+# then proves exactly FW2-STALE-PE's change, as on main.
 BASE_VERSION = "6.71.0"  # the base copy's SCRIPT_VERSION (6.70.2 at 729a316e)
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
 TAG = "pe_stale_cleared:fw2:v6.71.0"
