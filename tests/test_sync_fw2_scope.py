@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tests/test_sync_fw2_scope.py
-run_dashboard_sync v6.71.0 FW-2 SCOPE (gate TFB_SYNC_FW2_SCOPE = off | observe |
-enforce). Dual-tree, REAL-module harness: drives the REAL
+run_dashboard_sync v6.72.0 FW-2 SCOPE (v6.71.0 until 2026-10-31; gate
+TFB_SYNC_FW2_SCOPE = off | observe | enforce). Dual-tree, REAL-module harness: drives the REAL
 _row_identity_firewall, _fw2_* helpers, _idfw_selftest and
 _append_runlog_idfirewall. The only non-real object is a Sheets append
 RECORDER. Fixture rows are real Global_Markets rows copied verbatim from the
@@ -435,6 +435,11 @@ def test_t12_composition_with_fw2_stale_pe():
     assert s == ["7010.SR"] and by["2010.SR"] == fresh[4]
     assert [k[0] for k in rep["kept"]] == ["1120.SR"]
     assert (c["drift"], c["gross"], c["fielded"]) == (2, 1, 2)
+    # the FW2-STALE-PE line names the fielded rows as fielded, never "still stripped"
+    line = mod._fw2_stale_pe_line("Global_Markets", rep)
+    assert rep["scope_fielded"] == ["1010.SR", "1120.SR", "2222.SR"]
+    assert ("band 2 of 4 FW-2 trip(s) (3 fielded and BLOCKED by FW-2 SCOPE, 1 stripped)" in line
+            and "; not kept 1: 1010.SR(name, fielded)" in line and "still stripped" not in line), line
     # FW-2 SCOPE enforce alone (the v6.70.2 call): the witnessed row is fielded too
     with _Env(TFB_SYNC_FW2_SCOPE="enforce"):
         alone, s_alone = mod._row_identity_firewall(list(h), copy.deepcopy(fresh))
@@ -448,9 +453,12 @@ def test_t12_composition_with_fw2_stale_pe():
     a_n = {r[0]: r for r in out_n}["1120.SR"]
     assert not blocked(a_n) and a_n[ix["P/E (TTM)"]] == "" and a_n[ix["PEG"]] == 1.5
     assert sorted(s_n) == ["1010.SR", "2222.SR", "7010.SR"]
+    # SCOPE off: main #875's report and line exactly (no scope_fielded key)
+    line_n = mod._fw2_stale_pe_line("Global_Markets", rep_n)
+    assert "scope_fielded" not in rep_n and "still stripped 1: 1010.SR(name)" in line_n, line_n
     # FW-2 SCOPE observe + FW2-STALE-PE enforce: rows as STALE-PE alone; the census is the real pass
-    out_b, s_b, _rep_b, c_b = go("observe", "enforce")
-    assert out_b == out_n and s_b == s_n
+    out_b, s_b, rep_b, c_b = go("observe", "enforce")
+    assert out_b == out_n and s_b == s_n and rep_b == rep_n   # SCOPE observe strips: main's report
     assert (c_b["drift"], c_b["gross"], c_b["fielded"]) == (2, 1, 0)
 
 

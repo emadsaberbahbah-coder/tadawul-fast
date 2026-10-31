@@ -487,7 +487,7 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
-      # v6.71.0 FW-2 SCOPE (2026-10-14): off = v6.70.0; observe adds the
+      # v6.72.0 FW-2 SCOPE (2026-10-14; v6.71.0 until 2026-10-31): off = v6.71.0; observe adds the
       # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
       # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
       # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.
@@ -1793,7 +1793,7 @@ jobs:
       TFB_SYNC_RETIRE_TAB: ${{ vars.TFB_SYNC_RETIRE_TAB || 'off' }}
       TFB_SYNC_RETIRE_TAB_NAME: ${{ vars.TFB_SYNC_RETIRE_TAB_NAME || '_Retired_Symbols' }}
       TFB_SYNC_RETIRE_MAX_PCT: ${{ vars.TFB_SYNC_RETIRE_MAX_PCT || '20' }}
-      # v6.71.0 FW-2 SCOPE (2026-10-14): off = v6.70.0; observe adds the
+      # v6.72.0 FW-2 SCOPE (2026-10-14; v6.71.0 until 2026-10-31): off = v6.71.0; observe adds the
       # drift/gross census to the [ID-FIREWALL] _Run_Log line; enforce keeps
       # drift rows (ratio 0.5-2.0) with P/E, EPS and PEG cleared and BLOCKED.
       # Read-back: ' | fw2=<mode> drift=D gross=G fielded=F'. Rollback: off.
