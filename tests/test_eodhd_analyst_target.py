@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import types
@@ -425,14 +426,16 @@ def test_e8_l2_round_trip_carries_the_block_only_while_armed(monkeypatch):
 
 
 def test_e9_versions_pins_flag_registration_and_ci_lane():
-    assert ep.PROVIDER_VERSION == "4.19.0"
+    # 2026-10-28 (eodhd_provider v4.20.0, TFB_EODHD_FUND_SUFFIX_MAP): the provider
+    # pin is a 4.19.0 floor; the manifest pin follows the module.
+    assert tuple(int(x) for x in ep.PROVIDER_VERSION.split(".")[:3]) >= (4, 19, 0), ep.PROVIDER_VERSION
     # 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
     assert de.__version__ == "5.159.2"
     assert de._EODHD_ANALYST_TAG == TAG
     for bad in ("cap", "forecast", "target", "roi", "drop", "reject"):
         assert bad not in TAG
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert "(\"core.providers.eodhd_provider\", \"PROVIDER_VERSION\", '4.19.0'," in vd
+    assert ("(\"core.providers.eodhd_provider\", \"PROVIDER_VERSION\", '%s'," % ep.PROVIDER_VERSION) in vd
     assert "(\"core.data_engine_v2\", \"__version__\", \"5.159.2\"," in vd
     assert "('TFB_EODHD_ANALYST_TARGET', '0'," in vd
     contract = (_REPO / "docs" / "render_env_contract.md").read_text(encoding="utf-8")
@@ -474,6 +477,43 @@ def test_e10_publish_off_snapshot_is_still_gated_on_the_12m_forecast(monkeypatch
     assert de._fill_carries_eodhd_target({"target_mean_price": 125.0})
     assert not de._fill_carries_eodhd_target({"debt_to_equity": 0.3})
     assert not de._fill_carries_eodhd_target(None)
+
+
+# ----------------------------------------------------------------------------- v4.20.0 guards
+# eodhd_provider v4.20.0 (TFB_EODHD_FUND_SUFFIX_MAP, default off): the full
+# harness is tests/test_eodhd_fund_suffix_map.py; these two keep its off
+# identity and its armed request in this blocking lane.
+def _klse_payload():
+    payload = json.loads(json.dumps(PAYLOAD))
+    payload["General"].update({"Code": "1295", "Exchange": "KLSE", "CurrencyCode": "MYR"})
+    return payload
+
+
+@pytest.mark.parametrize("value", [None, "", "off", "on", "1", "true"])
+def test_g20_fund_suffix_map_off_keeps_the_v4190_request(monkeypatch, caplog, value):
+    if value is None:
+        monkeypatch.delenv("TFB_EODHD_FUND_SUFFIX_MAP", raising=False)
+    else:
+        monkeypatch.setenv("TFB_EODHD_FUND_SUFFIX_MAP", value)
+    ep._FUND_SUFFIX_MAP_SEEN.clear()
+    client, calls = _client(monkeypatch, _klse_payload())
+    with caplog.at_level(logging.DEBUG, logger="core.providers.eodhd_provider"):
+        asyncio.run(client.fetch_fundamentals("1295.KL"))
+        asyncio.run(client.fetch_fundamentals("SON.LS"))
+    assert calls == ["fundamentals/1295.KL", "fundamentals/SON.LS.US"]
+    assert ep._fund_suffix_map_mode() == "off"
+    assert not [r for r in caplog.records if "FUND-SUFFIX-MAP" in r.getMessage()]
+    assert all(k.endswith((":1295.KL", ":SON.LS.US")) for k in _cache_keys(client))
+
+
+def test_g20_fund_suffix_map_enforce_requests_the_eodhd_codes(monkeypatch):
+    monkeypatch.setenv("TFB_EODHD_FUND_SUFFIX_MAP", "enforce")
+    client, calls = _client(monkeypatch, _klse_payload())
+    patch, err = asyncio.run(client.fetch_fundamentals("1295.KL"))
+    asyncio.run(client.fetch_fundamentals("SON.LS"))
+    assert calls == ["fundamentals/1295.KLSE", "fundamentals/SON.LS"]
+    assert err is None and patch["symbol"] == "1295.KL" and patch["symbol_normalized"] == "1295.KLSE"
+    assert patch["eps_ttm"] == 4.0 and patch["currency"] == "MYR"
 
 
 if __name__ == "__main__":
