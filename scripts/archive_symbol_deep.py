@@ -25,8 +25,8 @@ WHAT - three loads, nightly after the workbook archive:
               most 600. symbol_bars_daily is replaced as a whole (WRITE_TRUNCATE,
               clustered by symbol) only when at least MIN_BARS_SHARE of the set
               answered; otherwise yesterday's table stays. Every other symbol
-              still gets one candle per night from the archived market pages
-              (v_symbol_candles).
+              still gets one candle per trading session from the archived
+              market pages (v_symbol_candles).
   2. analyst: EODHD fundamentals, filter AnalystRatings (consensus 1-5, target
               price, Strong Buy / Buy / Hold / Sell / Strong Sell counts) for
               the CORE set: the holdings, the Top-10 names of the last 30 days,
@@ -40,7 +40,10 @@ sync and was exhausted once (5 Jul 2026). Before loads 2 and 3 the job reads
 /api/user (free) and skips BOTH when the calls already used today plus this
 run's cost (10 per fundamentals call, 5 per news call) would pass
 TFB_DEEP_EODHD_MAX_SHARE (default 0.60) of the daily limit, or when the
-limit cannot be read (fail closed). The bars never touch EODHD.
+limit cannot be read (fail closed). The provider resets its counter lazily,
+so a counter dated before today (apiRequestsDate) is yesterday's and counts
+as 0 (as in run_dashboard_sync; Codex review of #884). The bars never touch
+EODHD.
 NOTHING is written to the workbook; the live system never reads BigQuery; no
 decision, gate or count depends on these tables. The token never reaches a
 log line.
@@ -296,21 +299,34 @@ def eodhd_get(path: str, params: Dict[str, Any], token: str,
                                   token)) from None
 
 
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def budget_check(token: str, planned: int, share: float,
-                 opener: Callable[..., Any]) -> Tuple[bool, str]:
-    """(ok, why): ok only when used + planned <= share x the daily limit."""
+                 opener: Callable[..., Any], *, today: str) -> Tuple[bool, str]:
+    """(ok, why): ok only when today's used + planned <= share x the daily limit.
+    EODHD resets the counter lazily (on the first request after midnight GMT),
+    so at 00:20 UTC /api/user can still report yesterday's calls: a counter
+    dated before `today` (UTC, YYYY-MM-DD) counts as 0 used - the rule of
+    run_dashboard_sync._eodhd_quota_parse. A missing, malformed or later date
+    counts as today's (fail closed)."""
     try:
         user = eodhd_get("user", {}, token, opener)
         used = int(float(user.get("apiRequests") or 0))
         limit = int(float(user.get("dailyRateLimit") or 0))
+        dated = str(user.get("apiRequestsDate") or "").strip()[:10]
     except Exception as exc:  # noqa: BLE001 - fail closed
         return False, f"EODHD usage unreadable ({_scrub(exc, token)[:120]})"
     if limit <= 0:
         return False, "EODHD daily limit unknown"
+    note = ""
+    if _DAY.fullmatch(dated) and _DAY.fullmatch(today or "") and dated < today:
+        note = f"; counter dated {dated} not reset yet, its {used} not counted"
+        used = 0
     ceiling = int(share * limit)
     if used + planned > ceiling:
-        return False, f"EODHD {used} + {planned} planned > {ceiling} ({share:.0%} of {limit})"
-    return True, f"EODHD {used} + {planned} planned <= {ceiling} ({share:.0%} of {limit})"
+        return False, f"EODHD {used} + {planned} planned > {ceiling} ({share:.0%} of {limit}){note}"
+    return True, f"EODHD {used} + {planned} planned <= {ceiling} ({share:.0%} of {limit}){note}"
 
 
 def _int(v: Any) -> Optional[int]:
@@ -591,7 +607,7 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
             rc = max(rc, 1)
         else:
             planned = len(core) * ((COST_FUNDAMENTALS if "analyst" in eod else 0) + (COST_NEWS if "news" in eod else 0))
-            ok, why = budget_check(token, planned, max_share(), opener)
+            ok, why = budget_check(token, planned, max_share(), opener, today=day)
             if not ok:
                 _out(f"analyst/news: skipped by the budget guard - {why}")
             else:

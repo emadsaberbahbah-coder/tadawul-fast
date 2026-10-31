@@ -15,7 +15,10 @@ D4 analyst parsing: counts, provider rating range, no-coverage -> None
 D5 news parsing: title required, one row per link, polarity range, newest
    first, limit
 D6 budget guard: proceeds under the share, skips over it, skips when the
-   usage cannot be read (fail closed)
+   usage cannot be read (fail closed); a counter dated before today is
+   yesterday's (EODHD resets lazily) and counts as 0, so the 00:20 UTC run
+   still loads - a missing, malformed or later date is counted (Codex P2 on
+   #884 - fails on the first cut)
 D7 dry run: every source read, nothing created or loaded, exit 0
 D8 write: tables created with schema, partitioning and clustering; bars
    replace the whole table, analyst / news their day partition; rows as read
@@ -125,7 +128,7 @@ class HTTPErr(Exception):
         self.code = code
 
 
-def make_opener(used=1000, limit=100000, user_fail=False, data_fail=False, calls=None):
+def make_opener(used=1000, limit=100000, user_fail=False, data_fail=False, calls=None, dated="2026-11-01"):
     def opener(req, timeout):
         url = req.full_url
         if calls is not None:
@@ -136,7 +139,10 @@ def make_opener(used=1000, limit=100000, user_fail=False, data_fail=False, calls
         if path.endswith("/api/user"):
             if user_fail:
                 raise HTTPErr(500)
-            return _Body(json.dumps({"apiRequests": used, "dailyRateLimit": limit}).encode())
+            user = {"apiRequests": used, "dailyRateLimit": limit}
+            if dated is not None:
+                user["apiRequestsDate"] = dated
+            return _Body(json.dumps(user).encode())
         if data_fail:
             raise HTTPErr(403)
         if "/api/fundamentals/" in path:
@@ -261,14 +267,40 @@ def test_d5_news():
 
 # --------------------------------------------------------------------- D6
 def test_d6_budget_guard():
-    ok, why = asd.budget_check(TOKEN, 1500, 0.6, make_opener(used=10000))
+    day = "2026-11-01"
+    ok, why = asd.budget_check(TOKEN, 1500, 0.6, make_opener(used=10000), today=day)
     assert ok and "11500" not in why and "10000 + 1500" in why
-    ok, why = asd.budget_check(TOKEN, 1500, 0.6, make_opener(used=59000))
+    ok, why = asd.budget_check(TOKEN, 1500, 0.6, make_opener(used=59000), today=day)
     assert not ok and "60000" in why
-    ok, why = asd.budget_check(TOKEN, 10, 0.6, make_opener(user_fail=True))
+    ok, why = asd.budget_check(TOKEN, 10, 0.6, make_opener(user_fail=True), today=day)
     assert not ok and "unreadable" in why and TOKEN not in why
-    ok, why = asd.budget_check(TOKEN, 10, 0.6, make_opener(limit=0))
+    ok, why = asd.budget_check(TOKEN, 10, 0.6, make_opener(limit=0), today=day)
     assert not ok
+
+
+def test_d6_budget_counter_date():
+    """Codex P2 on #884: EODHD resets the counter lazily, so just after
+    midnight /api/user still shows yesterday's calls - they are not today's."""
+    day = "2026-11-01"
+    ok, why = asd.budget_check(TOKEN, 1800, 0.6, make_opener(used=99000, dated="2026-10-31"), today=day)
+    assert ok and "0 + 1800 planned <= 60000" in why and "counter dated 2026-10-31" in why
+    # today's counter, a missing, malformed or later date: counted (fail closed)
+    for dated in ("2026-11-01", None, "", "10/31/2026", "2026-1-5", "2026-11-02"):
+        ok, why = asd.budget_check(TOKEN, 1800, 0.6, make_opener(used=99000, dated=dated), today=day)
+        assert not ok and "99000 + 1800 planned > 60000" in why, (dated, why)
+    ok, _ = asd.budget_check(TOKEN, 1800, 0.6, make_opener(used=99000, dated="2026-10-31"), today="")
+    assert not ok
+
+
+def test_d6_after_midnight_run(env, capsys):
+    """The scheduled 00:20 UTC run with yesterday's busy counter still loads."""
+    bq = FakeBQ()
+    calls = []
+    assert _main(["--write"], bq, opener=make_opener(used=99000, dated="2026-10-31", calls=calls)) == 0
+    assert {ld["table"] for ld in bq.loads} == {"symbol_bars_daily", "symbol_analyst_daily$20261101",
+                                               "symbol_news$20261101"}
+    assert sum("/fundamentals/" in c for c in calls) == 6
+    assert "counter dated 2026-10-31" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------- D7

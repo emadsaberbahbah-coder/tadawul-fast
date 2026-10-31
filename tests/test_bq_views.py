@@ -72,6 +72,13 @@ imported.
       the score and the coverage, its labels and stars fall with the
       score, and both evidence views carry the rating and read the market
       pages' STRONG_SELL spelling
+  V19 v_symbol_candles keeps one candle per trading session: a symbol with
+      Yahoo bars never gets a snapshot candle, a snapshot's session is the
+      venue-local date of its Last Updated stamp less the opening time,
+      stepped back over that venue's weekend (simulated for every weekday),
+      one candle per session; the venue table covers every market_country
+      v_universe can produce, with real time zones and the Sunday-Thursday
+      markets (Codex P2 on #884 - fails on the first cut)
 """
 from __future__ import annotations
 
@@ -137,7 +144,7 @@ INSTALLED = {
 # the reviewed files: bq_views --verify after the first --write must find these
 # exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
 PENDING = {
-    "v_symbol_candles": "928bca7faf0806ed5b68b7eb17dc426b912b8ed50f8be7a02fdc983c00df304b",
+    "v_symbol_candles": "ed95728198f695a1829ccdf4f2f18d49f507f86743d934186241c1e9750d0cec",
     "v_symbol_analyst": "32958e9e3e16cc6e52fafb4b784d12ab362f04bc4b8272739a04c1b06570a855",
     "v_symbol_news": "1e48d645856426b096cd9dc04ba594e0146f58b9a79de89bcb3b4e44a41c9bfd",
     "v_symbol_rating": "4b46dc88f64b9360e3abfb0898dc5680870fc5aa634c8b5b5bc86c492146ce04",
@@ -725,8 +732,8 @@ def case_v18():
         assert re.search(r"\bsymbol_label\b", code[n]), n
     # the TFB rating: six weights summing to 1, in the score and the coverage alike
     rating = code["v_symbol_rating"]
-    present = dict((k, float(w)) for w, k in re.findall(r"([0-9.]+) \* IF\(c\.part_([a-z]+) IS NULL", rating))
-    summed = dict((k, float(w)) for w, k in re.findall(r"([0-9.]+) \* IFNULL\(c\.part_([a-z]+), 0\)", rating))
+    present = {k: float(w) for w, k in re.findall(r"([0-9.]+) \* IF\(c\.part_([a-z]+) IS NULL", rating)}
+    summed = {k: float(w) for w, k in re.findall(r"([0-9.]+) \* IFNULL\(c\.part_([a-z]+), 0\)", rating)}
     assert present == summed and set(present) == {"engine", "analysts", "target", "momentum", "news", "risk"}
     assert abs(sum(present.values()) - 1.0) < 1e-9, present
     cuts = [float(x) for x in re.findall(r"WHEN r\.tfb_rating_score >= (\d+) THEN '", rating)]
@@ -743,8 +750,53 @@ def case_v18():
     assert "UPPER(u.recommendation) IN" not in code["v_portfolio_insight"]    # golden: STRONG_SELL missed
 
 
+SUN_THU = {"Saudi Arabia", "Qatar", "Kuwait", "Bahrain", "Oman", "Egypt"}
+
+
+def case_v19():
+    import datetime as dt
+    import re
+    import zoneinfo
+    objs = {o.name: o for o in bv.load_objects()}
+    candles = bv._code(objs["v_symbol_candles"].template)
+    universe = bv._code(objs["v_universe"].template)
+    # 1. a symbol with bars takes no snapshot candle at all (not only on the bars' dates)
+    anti = re.findall(r"NOT EXISTS \(SELECT 1 FROM bars AS b WHERE ([^)]*)\)", candles)
+    assert anti == ["b.symbol = u.symbol"], anti
+    assert "u.snapshot_date AS date" not in candles                  # golden: the capture date
+    # 2. the venue table covers every country v_universe names, once, with real zones
+    block = re.search(r"CASE k\.market_code\n(.*?)END AS market_country", universe, re.DOTALL).group(1)
+    countries = set(re.findall(r"THEN '([^']+)'", block))
+    venue = re.findall(r"\('([A-Za-z ]+)', '([A-Za-z_/]+)', (\d+), (TRUE|FALSE)\)", candles)
+    names = [v[0] for v in venue]
+    assert len(names) == len(set(names)) and set(names) == countries, sorted(set(names) ^ countries)
+    for name, tz, minute, sun_thu in venue:
+        zoneinfo.ZoneInfo(tz)                                         # raises on an unknown zone
+        assert 420 <= int(minute) <= 720, (name, minute)              # 07:00 .. 12:00 local
+    assert {v[0] for v in venue if v[3] == "TRUE"} == SUN_THU
+    # 3. the session date: the venue-local Last Updated stamp less the opening minute
+    assert ("DATE(DATETIME_SUB(DATETIME(COALESCE(u.last_updated_at, u.captured_at), COALESCE(v.tz, 'UTC')),"
+            "\n                      INTERVAL COALESCE(v.open_min, 0) MINUTE)) AS local_day") in candles
+    # 4. the weekend step-back, simulated for every day of the week (BigQuery DAYOFWEEK 1 = Sunday)
+    step = {int(d): (int(a), int(b)) for d, a, b in
+            re.findall(r"WHEN (\d) THEN IF\(s\.sun_thu, (\d), (\d)\)", candles)}
+    assert set(step) == {1, 6, 7}, step
+    for sun_thu, trading in ((True, {6, 0, 1, 2, 3}), (False, {0, 1, 2, 3, 4})):   # Python weekday()
+        for day in range(1, 8):
+            local = dt.date(2026, 11, day)                            # Sun 1 .. Sat 7 Nov 2026
+            bq_dow = local.isoweekday() % 7 + 1
+            back = step.get(bq_dow, (0, 0))[0 if sun_thu else 1]
+            session = local - dt.timedelta(days=back)
+            assert session.weekday() in trading, (sun_thu, local, session)
+            if local.weekday() in trading:
+                assert session == local, (sun_thu, local)
+    # 5. one candle per session - the latest refresh - then the holiday copies drop
+    assert "PARTITION BY symbol, date ORDER BY quoted_at DESC, captured_at DESC, source_page) = 1" in candles
+    assert "FROM snap2 AS s" in candles and "WHERE prev_k IS NULL OR k != prev_k" in candles
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
-         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18]
+         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19]
 
 
 def test_v1(): case_v1()
@@ -765,6 +817,7 @@ def test_v15(): case_v15()
 def test_v16(): case_v16()
 def test_v17(): case_v17()
 def test_v18(): case_v18()
+def test_v19(): case_v19()
 
 
 if __name__ == "__main__":

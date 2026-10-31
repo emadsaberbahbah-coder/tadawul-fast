@@ -34,16 +34,28 @@ Loads 2 and 3 write one partition per day.
 - **Skip.** It skips both loads, and so fails closed, when either holds:
   - usage so far plus the planned calls would pass 60 % of the daily limit;
   - the usage cannot be read.
+- **Counter date.** EODHD resets its counter lazily, on the first request after midnight GMT. So at 00:20 UTC, `/api/user` can still show yesterday's calls.
+  - A counter dated before today (`apiRequestsDate`) counts as 0 used. This is the rule `run_dashboard_sync._eodhd_quota_parse` already applies.
+  - A missing, malformed or later date is counted as today's (fail closed).
 
 ## SQL objects (sql/bigquery)
 | File | Object | What |
 |---|---|---|
-| 60 | v_symbol_candles | Daily candles, combining Yahoo bars with one nightly-snapshot candle per symbol. Nights identical to the previous one are dropped (weekends and holidays). Adds SMA 20/50/200 (NULL until full), change % and a 20-day average volume. |
+| 60 | v_symbol_candles | Daily candles, one per trading session (rule below the table). Adds SMA 20/50/200 (NULL until full), change % and a 20-day average volume. |
 | 61 | v_symbol_analyst | The latest consensus: the five counts and their shares. The score is recomputed from the counts (5 Strong Buy .. 1 Strong Sell), so its direction never depends on the provider's scale. Also the label, the target upside, and the change over about a month. |
 | 62 | v_symbol_news | EODHD headlines (positive at polarity >= 0.25, negative at <= -0.25) plus the news gate's items, each with a `source_kind`. |
 | 63 | v_symbol_rating | **The TFB rating** (described below the table). |
 | 64-66 | v_dive_signals / v_dive_board / v_dive_events | The signal history, the board episodes and the newest calendar row, each with `symbol_label` so one picker filters every section. |
 | 67, 68 (were 57, 58) | v_top10_insight / v_portfolio_insight | Both now carry the rating and its parts, the analyst consensus, and an "analyst consensus below Hold" caution. The portfolio's bearish-call flag now also matches the market pages' `STRONG_SELL` spelling. Before, "engine says STRONG SELL" never fired for it. |
+
+**One candle per trading session.**
+- **Symbols with Yahoo bars** (the deep set) use those bars only. The bars are reloaded every night after the archive, so a nightly snapshot can never add a second copy of a session.
+- **Every other symbol** gets one candle per session from the archived market pages:
+  - The session is the venue's: the local date of the row's Last Updated stamp, less the venue's opening time. A refresh before the open still shows the previous session.
+  - That date is stepped back over the venue's weekend: Saturday and Sunday, or Friday and Saturday for the Sunday-Thursday markets (Saudi Arabia, Qatar, Kuwait, Bahrain, Oman, Egypt).
+  - The latest refresh of a session is its candle.
+  - A session identical to the one before (a holiday, with no new trades) is dropped.
+- The venue table covers all 48 countries `v_universe` names, each with its time zone and opening minute. Listings without a country (FX, commodities, funds) count in UTC from midnight, with the Saturday-Sunday weekend.
 
 **The TFB rating.** Six parts, each scored 0-100 and weighted over the parts that have data:
 
@@ -70,10 +82,17 @@ Loads 2 and 3 write one partition per day.
   - the insight joins resolved.
 - **Read-back.** INFORMATION_SCHEMA hashes of the 13 objects from v1.2.0 (installed by bq-views run 41227078785) equal the reviewed files. They are now INSTALLED pins. The nine objects added or changed here are PENDING pins.
 - **Tests.**
-  - The suites ran 121 passed: views, archive, symbol deep, market series, manifest pins, CI verdict and the two workflow audits.
+  - The suites ran 124 passed after the review fixes: views, archive, symbol deep, market series, manifest pins, CI verdict and the two workflow audits.
   - `audit_repository_workflows.py`: errors=0, warnings=0.
   - CI ruff rules: clean.
   - `apply_bq_views --dry-run`: 36 objects, static checks pass.
+- **Candle check after the review fix.** The new candle view ran against the real archive of 31 Oct, a Saturday, with two stub AAPL bars:
+  - 9,718 candles, with 0 duplicate (symbol, day) pairs;
+  - no candle dated Saturday 31 Oct (the first cut dated every snapshot that night 31 Oct);
+  - AAPL showed its two bars only;
+  - Saudi Arabia (256) and Qatar (17) fell on Thursday 29 Oct;
+  - the United States (7,445), United Kingdom (146) and Australia (89) fell on Friday 30 Oct;
+  - 152 US rows refreshed before Friday's open fell on Thursday 29 Oct.
 - **Golden negatives.** Each mutant below fails the suite:
   - in the loader:
     - the guard removed;
@@ -88,6 +107,27 @@ Loads 2 and 3 write one partition per day.
     - an undeclared bars column;
     - the old STRONG_SELL test;
     - a dive view without `symbol_label`.
+  - after the review, 13 more mutants. All fail the suite, and so does the first cut of both files:
+    - in the guard:
+      - the counter date ignored;
+      - a later date zeroed;
+      - no date-format check;
+      - today not passed;
+    - in the candles:
+      - the bars exclusion by date only;
+      - a missing venue row;
+      - a misspelt time zone;
+      - Saudi Arabia on Monday-Friday;
+      - a wrong Sunday or Friday step;
+      - the capture date;
+      - the earliest refresh winning;
+      - the opening minute ignored.
+
+## Review fixes (Codex, 31 Oct)
+| Finding | Fix | Tests |
+|---|---|---|
+| P2: the budget guard ignored `apiRequestsDate`, so after midnight yesterday's usage could skip the 00:20 run | A counter dated before today counts as 0, as in `run_dashboard_sync._eodhd_quota_parse` | D6 (counter date, after-midnight run) |
+| P2: a first snapshot on a weekend or holiday survived, and the UTC capture date is not the session date, so a duplicate session distorted the SMAs | Bars-backed symbols use their bars only. Snapshots are keyed by the venue session date (above) and kept once per session. | V19 |
 
 ## Post-merge order (agent)
 1. Dispatch `bq_symbol_deep` with write=true and check the log: set sizes, bars n/n, the guard line, and the analyst and news rows.
