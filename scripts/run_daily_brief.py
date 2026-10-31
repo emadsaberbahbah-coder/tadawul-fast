@@ -621,9 +621,12 @@ from __future__ import annotations
 #   observe | enforce, read when the brief is built:
 #   off      v1.20.0 byte for byte (extract_decision output, every surface,
 #            stderr).
-#   observe  the same outputs; one stderr line per affected input ADD row
-#            (paired by position, not symbol), prefixed
-#            "[UNSIZED-ADD v1.21.0 observe]", naming what enforce would do.
+#   observe  the same outputs; one stderr line, prefixed
+#            "[UNSIZED-ADD v1.21.0 observe]", per input ADD row whose
+#            published place differs between v1.20.0 and enforce (ticket and
+#            its size, BLOCK, VERIFY or held), read after the final-feed veto,
+#            the coherence guard and the settle pass; rows are paired by input
+#            position, not symbol (_log_unsized_add_observe, from build_model).
 #   enforce  an ADD's amount and shares come only from its leading clause
 #            "ADD <n> sh (~<amt> SAR" (_sized_add). A row without it is never
 #            a ticket and never folded: "unsized" when the note says so,
@@ -632,17 +635,23 @@ from __future__ import annotations
 #            (that rule rewrites its target before it decides to drop
 #            everything). Every ADD row that does not end up a ticket stays
 #            in the book in the hold group (Portfolio_Decision order) with
-#            0 SAR and its reason in
-#            r["unplaced_add"]; folded and under-floor rows get a note suffix
-#            (unsized rows keep their own note, which already says so), and a
+#            0 SAR and its reason in r["unplaced_add"]; folded and under-floor
+#            rows get a note suffix (unsized rows keep their own note, which
+#            already says so), and a
 #            folded row whose target is later withheld or demoted to VERIFY
 #            says so (_settle_unplaced, after the veto and coherence passes).
-#            The hero / ONE MOVE line, the hold intro (counts by reason), the
-#            Book-snapshot phrase, the HTML hold row and the text line name
-#            them - also with TFB_BRIEF_HOLD_NARRATIVE_V2=0; the PDF lists the
-#            row with its note. Tickets, freed cash, BLOCK rows, MV/cost
-#            totals, the floor (TFB_MIN_TICKET_SAR) and cash conservation of
-#            the fold are unchanged.
+#            The hold intro (counts by reason), the Book-snapshot phrase, the
+#            HTML hold row and the text "ADD NOT PLACED TODAY" line name them -
+#            also with TFB_BRIEF_HOLD_NARRATIVE_V2=0 - and the PDF lists each
+#            row with its note; the hero and the text ONE MOVE line say "No
+#            ADD can be placed today" when no ticket is left and neither a
+#            BLOCK row nor the final-feed veto is present (the existing
+#            execution-withheld copy wins then). A ticket changes only where
+#            v1.20.0 had read an unsized or unparsed row's level as cash
+#            (folded into it, promoted to a phantom ticket, or outranking the
+#            sized rows). TRIM/EXIT freed cash, BLOCK rows, MV/cost totals,
+#            the floor (TFB_MIN_TICKET_SAR) and the folding of sized cash and
+#            its conservation are unchanged.
 # ROLLBACK: unset the repository variable TFB_BRIEF_UNSIZED_ADD.
 # ZERO functions removed. Added: _unsized_add_mode, _sized_add,
 #   _plan_unsized_adds, _log_unsized_add_observe, _unplaced_label,
@@ -926,8 +935,11 @@ def read_pages_xlsx(path: str, pages: List[str]) -> Dict[str, List[List[Any]]]:
 # ----------------------------------------------------------------------------- #
 # Extractors
 # ----------------------------------------------------------------------------- #
-def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
+def extract_decision(rows: List[List[Any]], _ua_probe: Optional[str] = None) -> Dict[str, Any]:
     """Parse Portfolio_Decision -> {actions, totals, freed_cash, add}."""
+    # v1.21.0: _ua_probe ("off" / "enforce") is the observe probe only: it
+    # forces that [UNSIZED-ADD] mode and tags each ADD record with its input
+    # position (r["_ua_i"]). Never set on the published decision.
     rows = _pad(rows)
     h = _find_header(rows, ("action", "symbol"))
     out: Dict[str, Any] = {"sell": [], "trim": [], "add": [], "hold": [], "block": [],
@@ -1004,6 +1016,8 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
             out["freed_cash"] += rec["sar"] or 0.0
         elif action in ADD_ACTIONS:
             rec["shares"] = _note_shares(note)
+            if _ua_probe:   # v1.21.0 observe probe only (never on the published decision)
+                rec["_ua_i"] = len(out["add"])
             out["add"].append(rec)  # v1.8.0: floored post-loop by _enforce_min_ticket
         else:
             out["hold"].append(rec)
@@ -1013,14 +1027,13 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
         out["pl_pct"] = (out["mv"] - out["cost"]) / out["cost"] * 100.0
     # v1.8.0: minimum executable ticket (default 200 SAR; TFB_MIN_TICKET_SAR=0 disables)
     out["min_ticket"] = _min_ticket_sar()
-    _ua_mode = _unsized_add_mode()   # v1.21.0 [UNSIZED-ADD], default off
+    # v1.21.0 [UNSIZED-ADD], default off; observe logs from build_model
+    _ua_mode = _unsized_add_mode() if _ua_probe is None else _ua_probe
     if _ua_mode == "enforce":
         out["add"], out["folded"], _unplaced = _plan_unsized_adds(out["add"])
         out["dropped_small"] = []
         out["hold"].extend(_unplaced)
         return out
-    if _ua_mode == "observe":
-        _log_unsized_add_observe(out["add"])
     out["add"], out["folded"], out["dropped_small"] = _enforce_min_ticket(out["add"])
     return out
 
@@ -1160,52 +1173,67 @@ def _plan_unsized_adds(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
     return kept, folded, [u for _p, u in sorted(unplaced, key=lambda t: t[0])]
 
 
-def _log_unsized_add_observe(adds: List[Dict[str, Any]]) -> None:
-    """v1.21.0 observe: one stderr line per input ADD row whose ticket or
-    place in the book enforce would change, paired by input position (not
-    by symbol). Works on tagged copies; never alters the outputs."""
+def _log_unsized_add_observe(rows: List[List[Any]], final_feed: str,
+                             metrics: Dict[str, Dict[str, Any]]) -> None:
+    """v1.21.0 observe: one stderr line per input ADD row whose PUBLISHED
+    place differs between v1.20.0 and enforce - ticket (and its size),
+    BLOCK (final-feed veto), VERIFY (coherence guard) or held - read after
+    the same veto, coherence and settle passes build_model runs. Rows are
+    paired by input position, not by symbol. Builds its own two decisions
+    from the page rows; never alters the published one."""
+    tag = f"[UNSIZED-ADD v{__version__} observe]"
     try:
-        def _state_v120():
-            tagged = [dict(r, _ua_i=i) for i, r in enumerate(adds)]
-            kept, _f, dropped = _enforce_min_ticket(tagged)
-            st = {i: ("gone", None, None) for i in range(len(adds))}
-            for r in kept:
-                st[r["_ua_i"]] = ("ticket", r.get("sar") or 0.0, r.get("shares"))
-            return st
-
-        def _state_v121():
-            tagged = [dict(r, _ua_i=i) for i, r in enumerate(adds)]
-            tickets, _f, unplaced = _plan_unsized_adds(tagged)
+        def _published(mode):
+            d = extract_decision(rows, _ua_probe=mode)
+            _apply_final_feed_veto(d, final_feed)
+            _apply_signal_coherence(d, metrics)
+            _settle_unplaced(d)
             st = {}
-            for r in tickets:
-                st[r["_ua_i"]] = ("ticket", r.get("sar") or 0.0, r.get("shares"))
-            for r in unplaced:
-                st[r["_ua_i"]] = ("held", r, None)
+            for grp in ("add", "hold", "block", "verify"):
+                for r in d.get(grp) or []:
+                    if "_ua_i" in r:
+                        st[r["_ua_i"]] = (grp, r)
             return st
 
-        old, new = _state_v120(), _state_v121()
-        tag = f"[UNSIZED-ADD v{__version__} observe]"
-        for i, r in enumerate(adds):
+        old, new = _published("off"), _published("enforce")
+
+        def _was(o):
+            if o is None:
+                return "drops it from the holdings"
+            grp, r = o
+            if grp == "add":
+                return f"shows it as an ADD ticket of ~{(r.get('sar') or 0.0):,.0f} SAR"
+            if grp == "block":
+                return "lists it under BLOCK (final feed withheld)"
+            if grp == "verify":
+                return "lists it under VERIFY (re-check)"
+            return "holds it"
+
+        for i in sorted(new):
+            grp, r = new[i]
             sym = r.get("symbol")
-            o, n = old.get(i), new.get(i)
-            if o is None or n is None:
+            o = old.get(i)
+            if o is not None and o[0] == grp:
+                if grp != "add":
+                    continue   # same BLOCK / VERIFY / hold place in both versions
+                a, b = o[1], r
+                if (round(a.get("sar") or 0.0, 2), a.get("shares")) != \
+                        (round(b.get("sar") or 0.0, 2), b.get("shares")):
+                    print(f"{tag} {sym}: ticket ~{(a.get('sar') or 0.0):,.0f} SAR / {a.get('shares')} sh "
+                          f"would be ~{(b.get('sar') or 0.0):,.0f} SAR / {b.get('shares')} sh",
+                          file=sys.stderr)
                 continue
-            if o[0] == "ticket" and n[0] == "ticket":
-                if (round(o[1], 2), o[2]) != (round(n[1], 2), n[2]):
-                    print(f"{tag} {sym}: ticket ~{o[1]:,.0f} SAR / {o[2]} sh would be "
-                          f"~{n[1]:,.0f} SAR / {n[2]} sh", file=sys.stderr)
-            elif n[0] == "ticket":
-                # v1.20.0 folded or dropped this row; enforce makes it the
-                # ticket (another row's level no longer outranks it).
-                print(f"{tag} {sym}: would be an ADD ticket of ~{n[1]:,.0f} SAR / {n[2]} sh"
-                      f" - v1.20.0 drops it from the holdings", file=sys.stderr)
-            elif n[0] == "held":
-                was = (f"v1.20.0 shows it as an ADD ticket of ~{o[1]:,.0f} SAR"
-                       if o[0] == "ticket" else "v1.20.0 drops it from the holdings")
-                print(f"{tag} {sym}: would stay in the book (ADD not placed: "
-                      f"{_unplaced_label(n[1])}) - {was}", file=sys.stderr)
+            if grp == "add":
+                now = f"would be an ADD ticket of ~{(r.get('sar') or 0.0):,.0f} SAR / {r.get('shares')} sh"
+            elif grp == "hold":
+                now = f"would stay in the book (ADD not placed: {_unplaced_label(r)})"
+            elif grp == "block":
+                now = "would be listed under BLOCK (final feed withheld)"
+            else:
+                now = "would be listed under VERIFY (re-check)"
+            print(f"{tag} {sym}: {now} - v1.20.0 {_was(o)}", file=sys.stderr)
     except Exception as exc:   # observe must never break a brief
-        print(f"[UNSIZED-ADD v{__version__} observe] skipped ({type(exc).__name__})", file=sys.stderr)
+        print(f"{tag} skipped ({type(exc).__name__})", file=sys.stderr)
 
 
 def _unplaced_label(r: Dict[str, Any]) -> str:
@@ -2328,6 +2356,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     # decision-layer signal disagrees with the freshest per-symbol reading.
     _apply_signal_coherence(decision, metrics)
     _settle_unplaced(decision)   # v1.21.0 [UNSIZED-ADD]: no-op unless enforce held a row
+    if _unsized_add_mode() == "observe":   # v1.21.0 [UNSIZED-ADD]: stderr only
+        _log_unsized_add_observe(pages_data.get(PAGE_DECISION, []), final_feed, metrics)
     held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify", "block") for r in decision[grp]}
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held, final_feed=final_feed)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}

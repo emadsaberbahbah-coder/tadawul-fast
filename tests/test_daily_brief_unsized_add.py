@@ -19,26 +19,33 @@ other actions' notes, the BUY / blank rows and the N6 parser strings are
 hand-written. Offline: no network, no credentials.
 
 Cases
-WORKS   W1-W12  enforce: a sized ticket keeps its own amount; a sukuk with an
+WORKS   W1-W13  enforce: a sized ticket keeps its own amount; a sukuk with an
                 unsized ADD stays in the count and on every surface (HTML,
                 text, hold intro, Book snapshot, hero, PDF); no phantom
                 ticket (one level, or two summed); under-floor and folded rows
                 stay held with their reasons; the "no TP ladder" note; observe
-                prints one line per affected input row on every fixture; a
-                folded row whose target is withheld says so; the narrative
-                kill-switch keeps the true copy; BUY / blank rows read "no
-                ticket size in its note".
+                prints one line per affected input row on every fixture and
+                compares the PUBLISHED places after the final-feed veto and
+                the coherence guard (W7b); a folded row whose target is
+                withheld (W8) or demoted to VERIFY (W8b) says so; the
+                narrative kill-switch keeps the true copy; BUY / blank rows
+                read "no ticket size in its note"; the hero never says "No ADD
+                can be placed" over a real ticket, and the freed-cash hero
+                names the held ADD (W13).
 NEVER   N1-N7   off (11 spellings) == v1.20.0 on every fixture (decision dict,
                 HTML, text: OFF_GOLDEN digests) and logs nothing; observe ==
                 off; sized tickets at or above the floor unchanged; the floor
                 disabled; never mutates its input; the parser table; the gate
                 words.
-BASE    N1b N1c off == the v1.20.0 base copy (digests; PDF text when reportlab
-                and pypdf are installed).
+BASE    N1b-N1e off == the v1.20.0 base copy: digests, PDF text (when
+                reportlab and pypdf are installed), the full stderr, and all
+                of it again with TFB_BRIEF_HOLD_NARRATIVE_V2=0 (observe == off
+                there too).
 GOLD    G1      every WORKS check fails on the untouched v1.20.0 base (main
                 05b51ebe) with the gate set, which also reproduces the defects.
 V       V1 V1b  version floor, verifier pin, step-env mapping, the pytest line
-                in ci.yml; against the base: ASCII added lines, no function
+                in ci.yml; against the base: ASCII added lines, exactly the
+                six removed lines (prior WHY blocks verbatim), no function
                 removed, exactly the seven added.
 
 Base copy: TFB_TEST_BRIEF_BASE=<path>, else `git show
@@ -46,7 +53,8 @@ Base copy: TFB_TEST_BRIEF_BASE=<path>, else `git show
 V1b SKIP (visibly). Golden negative of the whole file:
 TFB_TEST_BRIEF_DELIVERED=<base copy> runs every case against v1.20.0: the
 WORKS cases fail on behaviour, N1 and N3-N7 and V1 fail because the helpers
-and the version do not exist there.
+and the version do not exist there; N1b-N1e and G1 compare against the base
+by construction, and N2 passes trivially (v1.20.0 ignores the gate).
 
 Run: pytest -q tests/test_daily_brief_unsized_add.py
   or python3 tests/test_daily_brief_unsized_add.py   (prints PASS k/k)
@@ -82,6 +90,16 @@ WHEN = dt.datetime(2026, 10, 31, 10, 30)
 DASH = "\u2014"
 HEADER = ["Action", "Symbol", "Name", "P&L %", "Weight %", "Engine ROI %",
           "Rel", "Conf", "Advisor Note", "MV SAR", "Cost SAR"]
+VETO = [["TFB Decision Feed", "NOT_ACTIONABLE(final_publication) | run=1 | x | coverage_failed"]]
+# a live reliability of 10 against Rel 60 on the row demotes 1180.SR to VERIFY
+DEMOTE_1180 = [["Symbol", "Name", "Forecast Reliability Score"], ["1180.SR", "Synthetic 1180.SR", 10]]
+REMOVED = ['__version__ = "1.20.0"',
+           'def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:',
+           '    if (not _hold_narrative_enabled()) or total == 0 \\',
+           '            or mix["capped"] == total:',
+           '    if (not _hold_narrative_enabled()) or total == 0 \\',
+           '            or mix["capped"] == total:',
+           '    if d["hold"]:']
 ADDED = {"_unsized_add_mode", "_sized_add", "_plan_unsized_adds", "_log_unsized_add_observe",
          "_unplaced_label", "_settle_unplaced", "_unplaced_phrase"}
 
@@ -177,26 +195,46 @@ FIXTURES = {
     "n_sized_only": [row("ADD", "1120.SR", sized(10, 1250)), row("ADD", "1150.SR", sized(4, 480))],
     "n_buy_and_blank": [row("BUY", "6001.SR", "BUY on breakout; stop 20 SAR"), row("ADD", "6002.SR", "")],
     "n_dup_symbol": [row("ADD", "2222.SR", sized(3, 300)), row("ADD", "2222.SR", unsized())],
+    # every hold bucket of _hold_mix (hand-written notes with the builder's key words)
+    "n_mixed_holds": [row("HOLD", "4280.SR", "HOLD; capped low confidence."),
+                      row("HOLD", "2010.SR", "HOLD; ADD pending confirmation (day 1/2); engine BUY."),
+                      row("HOLD", "7010.SR", "HOLD; valuation/forecast conflict: valuation ROI -12% vs "
+                                             "engine 12M +8% (reliability 55) - manual review."),
+                      row("HOLD", "4300.SR", "HOLD; inside the target band."),
+                      row("ADD", "1120.SR", sized(10, 1250)),
+                      row("ADD", "2222.SR", unsized())],
+    "w13_exit_and_only_unplaced_adds": [
+        row("EXIT", "2380.SR", "EXIT full position (~3,100 SAR); valuation ROI -4%."),
+        row("ADD", "5023.SR", SUKUK, mv=10_000.0, cost=9_950.0, pl=0.5)],
 }
+
+
+def _scrub_env(monkeypatch):
+    for name in (GATE, "TFB_MIN_TICKET_SAR", "TFB_BRIEF_HOLD_NARRATIVE_V2", "TFB_BRIEF_LEVELS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TFB_BRIEF_NEWS_CONTEXT", "0")
 
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    for name in (GATE, "TFB_MIN_TICKET_SAR", "TFB_BRIEF_HOLD_NARRATIVE_V2", "TFB_BRIEF_LEVELS"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("TFB_BRIEF_NEWS_CONTEXT", "0")
+    _scrub_env(monkeypatch)
 
 
 def _decision(mod, rows):
     return mod.extract_decision([list(HEADER)] + copy.deepcopy(rows))
 
 
-def _model(mod, rows):
-    return mod.build_model({mod.PAGE_DECISION: [list(HEADER)] + copy.deepcopy(rows)})
+def _model(mod, rows, status=None, portfolio=None):
+    pages = {mod.PAGE_DECISION: [list(HEADER)] + copy.deepcopy(rows)}
+    if status is not None:
+        pages[mod.PAGE_STATUS] = copy.deepcopy(status)
+    if portfolio is not None:
+        pages[mod.PAGE_PORTFOLIO] = copy.deepcopy(portfolio)
+    return mod.build_model(pages)
 
 
-def _surfaces(mod, rows):
-    m = _model(mod, rows)
+def _surfaces(mod, rows, status=None, portfolio=None):
+    m = _model(mod, rows, status, portfolio)
     return (m["decision"], mod.render_html(m, "Synthetic owner", WHEN),
             mod.render_text(m, "Synthetic owner", WHEN))
 
@@ -229,18 +267,30 @@ def _pdf_text(mod, model):
     return "\n".join(p.extract_text() for p in reader(io.BytesIO(pdf)).pages)
 
 
-def _observe_lines(mod, rows, capsys):
+def _stderr(mod, rows, capsys, status=None, portfolio=None):
+    """Every stderr line of one full build + HTML + text render."""
     capsys.readouterr()
-    _decision(mod, rows)
-    return [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("[UNSIZED-ADD")]
+    _surfaces(mod, rows, status, portfolio)
+    return capsys.readouterr().err.splitlines()
+
+
+def _observe_split(mod, rows, monkeypatch, capsys, status=None, portfolio=None):
+    """(observe lines, the other stderr lines under observe, stderr when off)."""
+    monkeypatch.delenv(GATE, raising=False)
+    off = _stderr(mod, rows, capsys, status, portfolio)
+    monkeypatch.setenv(GATE, "observe")
+    err = _stderr(mod, rows, capsys, status, portfolio)
+    return ([ln for ln in err if ln.startswith("[UNSIZED-ADD")],
+            [ln for ln in err if not ln.startswith("[UNSIZED-ADD")], off)
 
 
 # ------------------------------------------------------- WORKS checks ------
 # Each check raises AssertionError (or KeyError / AttributeError) on a module
 # that does not implement the gate; G1 runs them on the v1.20.0 base.
 def check_w1(mod):
-    d = _decision(mod, FIXTURES["w1_sized_plus_unsized"])
+    d, html, text = _surfaces(mod, FIXTURES["w1_sized_plus_unsized"])
     assert [(r["symbol"], r["sar"], r.get("shares")) for r in d["add"]] == [("1120.SR", 1250.0, 10)]
+    assert "No ADD can be placed today" not in html and "No ADD can be placed today" not in text
     assert d["add"][0]["note"] == sized(10, 1250) and d["folded"] == []
     held = {r["symbol"]: r for r in d["hold"]}
     assert held["2222.SR"]["unplaced_add"] == "unsized" and held["2222.SR"]["sar"] == 0.0
@@ -256,7 +306,8 @@ def check_w2(mod):
             % (DASH, DASH)) in html
     assert "ADD NOT PLACED TODAY %s SEE NOTES" % DASH in html
     assert "1 ADD not placed today (1 no deployable capital)" in html
-    assert "No ADD can be placed today" in html and "no buy clears it either" not in html
+    assert ">No ADD can be placed today</div>" in html and "no buy clears it either" not in html
+    assert "No portfolio action required today" not in html
     assert _line(text, "ADD NOT PLACED TODAY") == \
         "ADD NOT PLACED TODAY (still held): 5023.SR (unsized - no deployable capital)"
     assert "HOLD (data too weak" not in text and "HOLD: 1 - 5023.SR" in text
@@ -301,6 +352,7 @@ def check_w5(mod):
     assert _count(html) == 3 and "2 ADD not placed today (2 cash folded into another ADD ticket)" in html
     assert "ADD not placed: its cash joins the 1180.SR ticket" in html
     assert _line(text, "ADD:").startswith("ADD:   1180.SR (~2,104 SAR)")
+    assert "No ADD can be placed today" not in html and "No ADD can be placed today" not in text
 
 
 def check_w6(mod):
@@ -360,13 +412,56 @@ OBSERVE_LINES = {
         OBS + "2222.SR: ticket ~366 SAR / 4 sh would be ~300 SAR / 3 sh",
         OBS + "2222.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
               " - v1.20.0 drops it from the holdings"],
+    "n_mixed_holds": [
+        OBS + "1120.SR: ticket ~1,316 SAR / 11 sh would be ~1,250 SAR / 10 sh",
+        OBS + "2222.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 drops it from the holdings"],
+    "w13_exit_and_only_unplaced_adds": [
+        OBS + "5023.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 drops it from the holdings"],
 }
 
 
 def check_w7(mod, monkeypatch, capsys):
-    monkeypatch.setenv(GATE, "observe")
     for name, rows in FIXTURES.items():
-        assert _observe_lines(mod, rows, capsys) == OBSERVE_LINES[name], name
+        lines, rest, off = _observe_split(mod, rows, monkeypatch, capsys)
+        assert lines == OBSERVE_LINES[name], name
+        assert rest == off, name             # observe adds its own lines and nothing else
+
+
+WITHHELD = "its cash was to join the 1180.SR ticket, which is not placed today"
+OBSERVE_PUBLISHED = [
+    # (fixture, _Status rows, My_Portfolio rows, expected lines): the final-feed
+    # veto moves every ticket to BLOCK and the coherence guard demotes 1180.SR
+    # to VERIFY in BOTH versions, so only the held rows differ.
+    ("w5_sunday_fold", VETO, None, [
+        OBS + "3030.SR: would stay in the book (ADD not placed: %s) - v1.20.0 drops it from the holdings" % WITHHELD,
+        OBS + "4040.SR: would stay in the book (ADD not placed: %s) - v1.20.0 drops it from the holdings" % WITHHELD]),
+    ("w5_sunday_fold", None, DEMOTE_1180, [
+        OBS + "3030.SR: would stay in the book (ADD not placed: %s) - v1.20.0 drops it from the holdings" % WITHHELD,
+        OBS + "4040.SR: would stay in the book (ADD not placed: %s) - v1.20.0 drops it from the holdings" % WITHHELD]),
+    ("w1_sized_plus_unsized", VETO, None, [
+        OBS + "2222.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 drops it from the holdings"]),
+    ("w3_phantom_ticket", VETO, None, [
+        OBS + "9999.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 lists it under BLOCK (final feed withheld)"]),
+    ("w3c_ticket_moves_to_a_sized_row", VETO, None, [
+        OBS + "1111.SR: would be listed under BLOCK (final feed withheld) - v1.20.0 drops it from the holdings",
+        OBS + "2020.SR: would stay in the book (ADD not placed: its cash was to join the 1111.SR ticket,"
+              " which is not placed today) - v1.20.0 drops it from the holdings",
+        OBS + "9090.SR: would stay in the book (ADD not placed: unsized - no deployable capital)"
+              " - v1.20.0 lists it under BLOCK (final feed withheld)"]),
+    ("n_sized_only", VETO, None, []),
+]
+
+
+def check_w7b(mod, monkeypatch, capsys):
+    """Observe names what each version PUBLISHES after the veto and the coherence guard."""
+    for name, status, portfolio, want in OBSERVE_PUBLISHED:
+        lines, rest, off = _observe_split(mod, FIXTURES[name], monkeypatch, capsys, status, portfolio)
+        assert lines == want, (name, status is not None, portfolio is not None)
+        assert rest == off, name
 
 
 def check_w8(mod, monkeypatch):
@@ -381,6 +476,20 @@ def check_w8(mod, monkeypatch):
                and "joins the 1180.SR ticket (" not in r["note"] for r in d["hold"])
     assert "its cash was to join the 1180.SR ticket, which is not placed today" in text
     assert "cash joins" not in text and "cash joins" not in html
+    assert "2 ADD not placed today (2 cash was to join a ticket that is not placed today)" in html
+
+
+def check_w8b(mod):
+    """The fold target is demoted to VERIFY by the coherence guard."""
+    d, html, text = _surfaces(mod, FIXTURES["w5_sunday_fold"], portfolio=DEMOTE_1180)
+    assert d["add"] == [] and _syms(d["verify"]) == ["1180.SR"]
+    assert [(r["symbol"], r["unplaced_add"]) for r in d["hold"]] == [
+        ("3030.SR", "folded_withheld"), ("4040.SR", "folded_withheld")]
+    assert all("was to join the 1180.SR ticket, which is not placed today" in r["note"] for r in d["hold"])
+    assert "2 ADD not placed today (2 cash was to join a ticket that is not placed today)" in html
+    assert _line(text, "ADD NOT PLACED TODAY") == (
+        "ADD NOT PLACED TODAY (still held): 3030.SR (%s); 4040.SR (%s)" % (WITHHELD, WITHHELD))
+    assert "cash joins" not in text and "cash joins" not in html
 
 
 def check_w9(mod, monkeypatch):
@@ -392,13 +501,15 @@ def check_w9(mod, monkeypatch):
     assert ("2 positions are on hold for stated reasons %s 1 reliability-capped, 1 ADD not placed today"
             % DASH) in html
     assert _line(text, "HOLD (data too weak to act):") == "HOLD (data too weak to act): 4280.SR"
+    assert "MIXED REASONS %s SEE NOTES" % DASH in html and "ADD NOT PLACED TODAY %s SEE NOTES" % DASH not in html
 
 
 def check_w10(mod):
-    d = _decision(mod, FIXTURES["n_buy_and_blank"])
+    d, html, text = _surfaces(mod, FIXTURES["n_buy_and_blank"])
     assert d["add"] == [] and [(r["symbol"], r["unplaced_add"]) for r in d["hold"]] == [
         ("6001.SR", "unparsed"), ("6002.SR", "unparsed")]
     assert mod._unplaced_label(d["hold"][0]) == "no ticket size in its note"
+    assert "2 ADD not placed today (2 no ticket size in the note)" in html
 
 
 def check_w11(mod):
@@ -408,6 +519,8 @@ def check_w11(mod):
         "ADD NOT PLACED TODAY (still held): 2222.SR (unsized - no deployable capital)"
     assert [(r["symbol"], r["sar"]) for r in d["add"]] == [("1120.SR", 1250.0)]
     assert _count(html) == 6 and d["freed_cash"] == 3_900.0
+    assert "MIXED REASONS %s SEE NOTES" % DASH in html and "ADD NOT PLACED TODAY %s SEE NOTES" % DASH not in html
+    assert "No ADD can be placed today" not in html and "No ADD can be placed today" not in text
 
 
 def check_w12(mod):
@@ -415,6 +528,17 @@ def check_w12(mod):
     text = _pdf_text(mod, m)
     assert "5023.SR" in text and "unsized" in text and "HOLD" in text
     assert re.search(r"HOLDINGS\s*1\b", text) or re.search(r"\b1\s*HOLDINGS", text), text[:600]
+
+
+def check_w13(mod):
+    """Freed cash from an EXIT and only held ADDs: the freed-cash hero names them."""
+    d, html, text = _surfaces(mod, FIXTURES["w13_exit_and_only_unplaced_adds"])
+    assert d["add"] == [] and d["freed_cash"] == 3_100.0 and _syms(d["hold"]) == ["5023.SR"]
+    assert "no ADD can be placed today (1 not placed - see Hold)." in html            # preheader
+    assert "<strong>No ADD can be placed today</strong> (1 not placed - see Hold)" in html   # hero body
+    assert "no buy clears" not in html.lower()
+    assert "  No ADD can be placed today: 1 ADD signal(s) not placed" in text
+    assert _count(html) == 2
 
 
 def _enforce(monkeypatch):
@@ -455,9 +579,18 @@ def test_w7_observe_prints_one_line_per_affected_row(monkeypatch, capsys):
     check_w7(B, monkeypatch, capsys)
 
 
+def test_w7b_observe_compares_published_places_after_veto_and_coherence(monkeypatch, capsys):
+    check_w7b(B, monkeypatch, capsys)
+
+
 def test_w8_withheld_fold_target_is_named(monkeypatch):
     _enforce(monkeypatch)
     check_w8(B, monkeypatch)
+
+
+def test_w8b_demoted_fold_target_is_named(monkeypatch):
+    _enforce(monkeypatch)
+    check_w8b(B)
 
 
 def test_w9_narrative_kill_switch_keeps_the_true_copy(monkeypatch):
@@ -480,6 +613,11 @@ def test_w12_pdf_lists_the_held_add(monkeypatch):
     check_w12(B)
 
 
+def test_w13_freed_cash_hero_names_the_held_adds(monkeypatch):
+    _enforce(monkeypatch)
+    check_w13(B)
+
+
 # ------------------------------------------------------------- NEVER -------
 OFF_SPELLINGS = (None, "", "off", "OFF", " off ", "1", "on", "true", "yes", "enforced", "observe,enforce")
 # v1.20.0 (main 05b51ebe) per fixture, gate unset: sha256[:16] of the decision
@@ -497,6 +635,8 @@ OFF_GOLDEN = {
     "n_sized_only": "83383584a214cb10",
     "n_buy_and_blank": "95861ea3e1eec63c",
     "n_dup_symbol": "0fd08e9620d24ecd",
+    "n_mixed_holds": "0747cc34a2876f5d",
+    "w13_exit_and_only_unplaced_adds": "eac883867264f5cb",
 }
 
 
@@ -526,6 +666,26 @@ def test_n1c_off_pdf_text_equals_the_v1_20_0_base():
         mine = _pdf_text(B, _model(B, rows)).replace("v" + B.__version__, "v<version>")
         theirs = _pdf_text(b, _model(b, rows)).replace("v" + b.__version__, "v<version>")
         assert mine == theirs, name
+
+
+def test_n1d_off_stderr_equals_the_v1_20_0_base(capsys):
+    b = base()
+    for name, rows in FIXTURES.items():
+        for status, portfolio in ((None, None), (VETO, None), (None, DEMOTE_1180)):
+            assert _stderr(B, rows, capsys, status, portfolio) == \
+                _stderr(b, rows, capsys, status, portfolio), name
+
+
+def test_n1e_kill_switch_off_equals_the_base_and_observe_equals_off(monkeypatch, capsys):
+    b = base()
+    monkeypatch.setenv("TFB_BRIEF_HOLD_NARRATIVE_V2", "0")
+    for name, rows in FIXTURES.items():
+        monkeypatch.delenv(GATE, raising=False)
+        off = _digest(B, rows)
+        assert off == _digest(b, rows), name
+        monkeypatch.setenv(GATE, "observe")
+        assert _digest(B, rows) == off, name
+    capsys.readouterr()
 
 
 def test_n2_observe_outputs_equal_off(monkeypatch, capsys):
@@ -604,24 +764,28 @@ def test_n7_gate_words(monkeypatch, raw, want):
 # ---------------------------------------------------------------- GOLD -----
 def test_g1_golden_negative_base_fails_every_works_check(monkeypatch, capsys):
     b = base()
-    _enforce(monkeypatch)
     failed = []
-    checks = [(check_w1, ()), (check_w2, ()), (check_w3, ()), (check_w4, ()), (check_w5, ()),
-              (check_w6, ()), (check_w8, (monkeypatch,)), (check_w9, (monkeypatch,)), (check_w10, ()),
-              (check_w11, ())]
-    for check, extra in checks:
-        try:
-            check(b, *extra)
-        except (AssertionError, KeyError, AttributeError):
-            failed.append(check.__name__)
-    try:
-        check_w7(b, monkeypatch, capsys)
-    except (AssertionError, KeyError, AttributeError):
-        failed.append("check_w7")
-    assert sorted(failed) == sorted([c.__name__ for c, _e in checks] + ["check_w7"]), failed
-    monkeypatch.undo()
-    monkeypatch.setenv("TFB_BRIEF_NEWS_CONTEXT", "0")
-    monkeypatch.delenv(GATE, raising=False)
+    # each check runs in its own monkeypatch context (enforce set, env scrubbed),
+    # so a patch or env change of one check never leaks into the next
+    checks = [(check_w1, False), (check_w2, False), (check_w3, False), (check_w4, False),
+              (check_w5, False), (check_w6, False), (check_w8, True), (check_w8b, False),
+              (check_w9, True), (check_w10, False), (check_w11, False), (check_w13, False)]
+    for check, wants_mp in checks:
+        with monkeypatch.context() as mp:
+            _scrub_env(mp)
+            _enforce(mp)
+            try:
+                check(b, mp) if wants_mp else check(b)
+            except (AssertionError, KeyError, AttributeError):
+                failed.append(check.__name__)
+    for check in (check_w7, check_w7b):
+        with monkeypatch.context() as mp:
+            _scrub_env(mp)
+            try:
+                check(b, mp, capsys)
+            except (AssertionError, KeyError, AttributeError):
+                failed.append(check.__name__)
+    assert sorted(failed) == sorted([c.__name__ for c, _w in checks] + ["check_w7", "check_w7b"]), failed
     d = _decision(b, FIXTURES["w1_sized_plus_unsized"])
     assert [(r["symbol"], r["sar"], r.get("shares")) for r in d["add"]] == [("1120.SR", 1316.4, 11)]
     assert [(r["symbol"], r["sar"]) for r in _decision(b, FIXTURES["w3b_levels_sum_past_floor"])["add"]] == [
@@ -659,6 +823,8 @@ def test_v1b_against_the_base_ascii_and_functions():
     diff = list(difflib.unified_diff(old, new, lineterm="", n=0))
     added = [ln[1:] for ln in diff if ln.startswith("+") and not ln.startswith("+++")]
     assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()][:3]
+    removed = [ln[1:] for ln in diff if ln.startswith("-") and not ln.startswith("---")]
+    assert removed == REMOVED, removed     # prior WHY blocks and comments verbatim
 
     kinds = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
