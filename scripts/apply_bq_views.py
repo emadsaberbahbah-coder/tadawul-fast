@@ -2,8 +2,19 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.1.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.2.0 (program register C8, Phase 2)
 ================================================================================
+v1.2.0 (31 Oct 2026, Looker pages 3-6): the seven tabs archive_to_bigquery
+v1.1.0 adds (four market pages, three news gate tabs) are source tables, for
+v_universe / v_universe_latest / f_universe_return (World Top-25 ROI),
+v_news_items / v_econ_events / v_news_gate / v_calendar_events, the
+v_top10_insight and v_portfolio_insight evidence views and f_symbol_pick
+(the one-symbol page). Two helpers, f_col and f_at, read a wide tab by
+position after one header lookup per snapshot; header_names_used() reports
+the headers a view looks up either way (f_cell or f_col). WHY (owner request
+31 Oct 2026): "the top companies that have best ROI world wide ... the page
+of my portfolio and the page of top 10 ... insights ... that will make the
+decision more reliable ... deep analysis for one selected symbol".
 v1.1.0 (29 Oct 2026, global markets page): table functions (CREATE OR REPLACE
 TABLE FUNCTION - the Looker date range reaches them through a custom query)
 and market_series_daily (scripts/archive_market_series.py) as a source
@@ -56,7 +67,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -64,11 +75,14 @@ DEFAULT_DATASET = "tfb_archive"
 DEFAULT_LOCATION = "US"
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql" / "bigquery"
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
-# the tables scripts/archive_to_bigquery.py v1.0.0 creates (TABS -> table_name)
+# the tables scripts/archive_to_bigquery.py v1.1.0 creates (TABS -> table_name)
 ARCHIVE_TABLES = frozenset({
     "top_10_investments", "selection_log", "shadow_rank_log", "board_scorecard",
     "calendar_events", "signal_history", "performance_log", "my_portfolio",
     "portfolio_decision", "run_log",
+    # v1.2.0: the market pages and the news gate tabs (archive v1.1.0)
+    "market_leaders", "global_markets", "mutual_funds", "commodities_fx",
+    "news_items", "news_gate", "econ_events",
 })
 # the table scripts/archive_market_series.py v1.0.0 loads (global markets page)
 MARKET_TABLES = frozenset({"market_series_daily"})
@@ -197,8 +211,10 @@ def check_objects(objs: Sequence[SqlObject]) -> List[str]:
 
 
 def header_names_used(template: str) -> List[str]:
-    """Every header literal a view passes to f_cell (for the fixture test)."""
-    return re.findall(r"\.f_cell`\(h, (?:s\.cells|c), '([^']+)'\)", template)
+    """Every header literal a view looks up - with f_cell, or once per
+    snapshot with f_col (v1.2.0) - for the header tests."""
+    return (re.findall(r"\.f_cell`\(h, (?:s\.cells|c), '([^']+)'\)", template)
+            + re.findall(r"\.f_col`\(h, '([^']+)'\)", template))
 
 
 # --------------------------------------------------------------------- BigQuery

@@ -294,13 +294,13 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
-    ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    ("archive_to_bigquery", "1.1.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
     # scripts/apply_bq_views.py, the typed Looker views over the archive.
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.1.0", "bigquery looker views"),
+    ("apply_bq_views", "1.2.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).

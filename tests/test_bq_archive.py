@@ -1,4 +1,4 @@
-"""scripts/archive_to_bigquery.py v1.0.0 - the read-only daily BigQuery
+"""scripts/archive_to_bigquery.py v1.1.0 - the read-only daily BigQuery
 archive of the decision workbook (program register C8, Phase 1).
 
 REAL module; the only stub is the HTTP session (an AuthorizedSession-like
@@ -16,6 +16,9 @@ A4 failures: a tab the Sheets API rejects, a job errorResult, a missing
 A5 pure helpers: table names, cell text, header names, the row builder (empty
    rows skipped, record_json, caps), the tab selection, the date option
 A6 the workflow: schedule, arming, credentials, dry-run dispatch default
+A7 v1.1.0: the four market pages and the three news gate tabs are archived
+   with header row 1, every archive table is a source apply_bq_views knows,
+   and a 115-column market row keeps every cell and its record_json
 """
 from __future__ import annotations
 
@@ -210,7 +213,7 @@ def test_a3_date_option_and_default_tabs(env):
     s = FakeSession(sheets={t: [["h"], ["v"]] for t, _ in arc.TABS}, tables={arc.table_name(t) for t, _ in arc.TABS})
     assert arc.main(["--write", "--date", "2026-10-20"], session=s, now=NOW) == 0
     dests = sorted(j["config"]["configuration"]["load"]["destinationTable"]["tableId"] for j in s.jobs.values())
-    assert dests == sorted(arc.table_name(t) + "$20261020" for t, _ in arc.TABS) and len(dests) == 10
+    assert dests == sorted(arc.table_name(t) + "$20261020" for t, _ in arc.TABS) and len(dests) == 17
     assert arc.main(["--write", "--date", "27-10-2026"], session=FakeSession(), now=NOW) == 2
 
 
@@ -280,7 +283,7 @@ def test_a5_header_names_and_caps(monkeypatch):
 def test_a5_import_is_side_effect_free():
     src = (ROOT / "scripts" / "archive_to_bigquery.py").read_text(encoding="utf-8")
     assert "\nimport google" not in src and "\nfrom google" not in src and "\nimport requests" not in src
-    assert arc.__version__ == "1.0.0"
+    assert arc.__version__ == "1.1.0"
 
 
 # --------------------------------------------------------------------- A6
@@ -299,3 +302,23 @@ def test_a6_workflow():
     assert env["TFB_BQ_DATASET"] == "${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}"
     assert "secrets.GOOGLE_SHEETS_CREDENTIALS" in env["GOOGLE_SHEETS_CREDENTIALS"]
     assert 'MODE="--dry-run"' in step["run"] and "--write" in step["run"]
+
+
+# --------------------------------------------------------------------- A7
+def test_a7_market_and_news_tabs():
+    from scripts import apply_bq_views as bv
+    from core.sheets import schema_registry as reg
+    added = [("Market_Leaders", 1), ("Global_Markets", 1), ("Mutual_Funds", 1), ("Commodities_FX", 1),
+             ("_News_Items", 1), ("_News_Gate", 1), ("_Econ_Events", 1)]
+    assert list(arc.TABS[10:]) == added and len(arc.TABS) == 17
+    assert len({t for t, _ in arc.TABS}) == len({arc.table_name(t) for t, _ in arc.TABS}) == 17
+    assert {arc.table_name(t) for t, _ in arc.TABS} == bv.ARCHIVE_TABLES
+    head = reg.get_sheet_headers("Global_Markets")
+    row = ["AAPL.US", "Apple Inc."] + [""] * 6 + [271.4, 270.1] + [""] * 104 + ["warn"]
+    assert len(head) == len(row) == 115 <= arc.MAX_COLS
+    rows, n = arc.build_rows("Global_Markets", [head, row], 1, "2026-10-31", "x", "r")
+    assert n == {"rows": 2, "cells": 230, "truncated": 0} and rows[0]["record_json"] is None
+    assert rows[1]["cells"][8] == "271.4" and rows[1]["cells"][114] == "warn"
+    assert json.loads(rows[1]["record_json"]) == {"Symbol": "AAPL.US", "Name": "Apple Inc.",
+                                                  "Current Price": "271.4", "Previous Close": "270.1",
+                                                  "Warnings": "warn"}
