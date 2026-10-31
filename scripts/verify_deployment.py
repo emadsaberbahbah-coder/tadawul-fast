@@ -184,6 +184,11 @@ sys.path.insert(0, _ROOT)
 # 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
 # 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
 # requested; Commodities_FX name coverage). No verifier logic changed.
+# 2026-10-29 (same rule): run_dashboard_sync 6.70.2 -> 6.71.0 (FW2-STALE-PE,
+# TFB_SYNC_FW2_STALE_PE, default off: a row FW-2 would strip for a mildly
+# stale P/E keeps its fresh quote with P/E and EPS cleared once its last-good
+# row witnesses the instrument). Workflow-scoped like TFB_SYNC_COH_HK_*, so
+# FLAGS is unchanged. No verifier logic changed.
 # 2026-10-22 (F-7 v2 / v2b, Codex review on #818; SCRIPT_VERSION left unchanged
 # while #817 / #818 are open): data_engine_v2 pinned 5.158.0, and FLAGS declares
 # TFB_SCORING_SETTLE_PAGES as a Render-scoped value flag beside
@@ -274,7 +279,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
-    ("validate_dashboard", "1.3.3", "scoped literal contract and native cockpit validation"),
+    # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
+    # (the FEED banner detail keeps up to 1,000 characters).
+    ("validate_dashboard", "1.3.4", "scoped literal contract and native cockpit validation"),
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.4", "nightly offline workbook DQ audit"),
@@ -290,9 +297,15 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
-    ("release_decision_feed", "1.2.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
+    # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
+    ("release_decision_feed", "1.3.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
+    # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
+    # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
+    # (TFB_RELEASE_AFTER_SYNC, default off; workflow-scoped, never on Render).
+    ("await_cockpit_receipts", "1.0.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
@@ -302,18 +315,34 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.71.0", "dashboard sync"),
+    # 2026-10-31 (#778 merge of main #875; pin only): main pins 6.71.0 (FW2-STALE-PE);
+    # this bundle's FW-2 SCOPE (authored as 6.70.0, 6.71.0 since 2026-10-19) is 6.72.0.
+    ("run_dashboard_sync", "6.72.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
     # 2026-10-27 (A4 part 2; pin only, SCRIPT_VERSION unchanged): 1.18.1 -> 1.19.0
     # (a post-earnings-tagged seat is held back from the picks and named).
-    ("run_daily_brief", "1.19.0", "daily brief"),
+    # 2026-10-28 (audit; pin only): 1.19.0 -> 1.20.0 (send-time label and
+    # session hours from the IANA zones).
+    ("run_daily_brief", "1.20.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
     ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
+    # scripts/apply_bq_views.py, the typed Looker views over the archive.
+    # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
+    # the market_series_daily source for the global markets page), plus NEW
+    # scripts/archive_market_series.py, the daily bars of the reference markets.
+    ("apply_bq_views", "1.1.0", "bigquery looker views"),
+    # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
+    # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
+    # still shorter than MIN_BARS fails and keeps its rows).
+    # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
+    # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
+    ("archive_market_series", "1.1.1", "bigquery market series"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

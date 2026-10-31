@@ -22,6 +22,14 @@ sits at the stated P/E times the HKD-per-CNY rate BEFORE FW-2 SCOPE tiers it.
 The H-share perturbation (case 3) therefore passes with the default; t11
 pins that ordering and, with the band off, the 2026-10-14 drift behaviour.
 
+Merge note (2026-10-31): main's #875 shipped a different v6.71.0
+(FW2-STALE-PE, gate TFB_SYNC_FW2_STALE_PE), so FW-2 SCOPE is v6.72.0 and the
+base for the parity cases is main's v6.71.0 file (git show
+05b51ebe:scripts/run_dashboard_sync.py), whose _row_identity_firewall is
+v6.70.2's. t12 pins how the two gates compose: FW2-STALE-PE keeps a
+witnessed stale-P/E row with only P/E and EPS cleared (not BLOCKED), and
+FW-2 SCOPE fields the other drift rows.
+
 Run: pytest -q tests/test_sync_fw2_scope.py
   or python3 tests/test_sync_fw2_scope.py   (x3, digest)"""
 from __future__ import annotations
@@ -328,7 +336,7 @@ def test_t10_runlog_default_equals_base_and_census_suffix():
     assert " | fw2=" not in row[5] and "fw2" not in json.loads(row[9])
     if b() is not None:
         brow = _runlog(b())
-        norm = lambda r: [re.sub(r"6\.(69|70|71)\.[0-9]+", "X", str(c)) for c in r[1:]]
+        norm = lambda r: [re.sub(r"6\.(69|70|71|72)\.[0-9]+", "X", str(c)) for c in r[1:]]  # 6.72 since 2026-10-31
         assert norm(row) == norm(brow)
     census = {"mode": "enforce", "drift": 4, "gross": 1, "fielded": 4,
               "rows": [{"symbol": "JNJ", "tier": "drift", "action": "fielded"}]}
@@ -368,6 +376,82 @@ def test_t11_hk_fx_exemption_runs_before_the_tiers():
         b_mm, b_s, _bc = _run(b(), "off", h, rows, hk="0")
         f_mm, f_s, _fc = _run(mod, "off", h, rows, hk="0")
         assert (f_mm, f_s) == (b_mm, b_s) and hk <= set(b_s)
+
+
+def test_t12_composition_with_fw2_stale_pe():
+    """Merge 2026-10-31 (main #875 FW2-STALE-PE v6.71.0; FW-2 SCOPE v6.72.0).
+    Both enforce: the witnessed row in [0.80, 1.25] keeps its quote with only
+    P/E and EPS cleared and is NOT blocked (FW2-STALE-PE clears it before the
+    real FW-2, which then finds it untestable); the other drift rows are
+    fielded and BLOCKED; the gross row is stripped. Each gate alone is as
+    authored, and an observe side changes no row."""
+    mod = m()
+    if not hasattr(mod, "_fw2_stale_pe_firewall"):
+        pytest.skip("this module has no FW2-STALE-PE (main #875)")
+    h = ["Symbol", "Name", "Current Price", "Currency", "EPS (TTM)", "P/E (TTM)", "PEG",
+         "Investability Status", "Final Action", "Block Reason", "Data Provider", "Warnings"]
+    ix = {c: i for i, c in enumerate(h)}
+    acq = ("acquisition_status:success; acquisition_provider:eodhd; "
+           "acquisition_acquired_at:2026-10-28T11:59:00Z; "
+           "acquisition_quote_asof:2026-10-28T11:55:00Z")
+
+    def row(sym, name, px, eps, pe):
+        return [sym, name, px, "SAR", eps, pe, 1.5, "INVESTABLE", "BUY", "", "eodhd", acq]
+
+    fresh = [row("1120.SR", "Al Rajhi Bank", 107.0, 5.0, 19.5),   # 1.0974, witnessed
+             row("1010.SR", "Riyad Bank", 30.0, 2.0, 13.0),       # 1.1538, last-good Name differs
+             row("2222.SR", "Saudi Aramco", 32.0, 2.0, 10.0),     # 1.60, drift outside the band
+             row("7010.SR", "stc", 40.0, 2.0, 5.0),               # 4.00, gross
+             row("2010.SR", "SABIC", 70.0, 2.0, 35.0)]            # coherent
+    old = [list(h),
+           row("1120.SR", "AL RAJHI BANK", 100.0, 5.0, 20.0),
+           row("1010.SR", "Bank Albilad", 29.0, 2.0, 14.5),
+           row("2222.SR", "Saudi Aramco", 31.0, 2.0, 15.5),
+           row("7010.SR", "stc", 41.0, 2.0, 20.5),
+           row("2010.SR", "SABIC", 69.0, 2.0, 34.5)]
+
+    def blocked(r):
+        return r[ix["Investability Status"]] == "BLOCKED" and r[ix["Final Action"]] == "DO_NOT_INVEST"
+
+    def go(scope, spe):
+        with _Env(TFB_SYNC_FW2_SCOPE=scope):
+            out, stripped, rep = mod._fw2_stale_pe_firewall(
+                list(h), copy.deepcopy(fresh), spe, lambda: copy.deepcopy(old))
+            census = dict(getattr(mod, "_LAST_FW2_CENSUS", {}) or {}) if scope != "off" else {}
+        return out, stripped, rep, census
+
+    # both enforce
+    out, s, rep, c = go("enforce", "enforce")
+    by = {r[0]: r for r in out}
+    a = by["1120.SR"]
+    assert a[ix["P/E (TTM)"]] == "" and a[ix["EPS (TTM)"]] == "" and a[ix["PEG"]] == 1.5
+    assert not blocked(a) and a[ix["Name"]] == "Al Rajhi Bank" and a[ix["Current Price"]] == 107.0
+    assert mod._FW2_STALE_PE_TAG in a[ix["Warnings"]] and mod._FW2_FIELD_TAG not in a[ix["Warnings"]]
+    for sym in ("1010.SR", "2222.SR"):
+        r = by[sym]
+        assert blocked(r) and mod._FW2_FIELD_TAG in r[ix["Warnings"]]
+        assert r[ix["P/E (TTM)"]] == "" and r[ix["EPS (TTM)"]] == "" and r[ix["PEG"]] == ""
+        assert r[ix["Name"]] and r[ix["Current Price"]]
+    assert s == ["7010.SR"] and by["2010.SR"] == fresh[4]
+    assert [k[0] for k in rep["kept"]] == ["1120.SR"]
+    assert (c["drift"], c["gross"], c["fielded"]) == (2, 1, 2)
+    # FW-2 SCOPE enforce alone (the v6.70.2 call): the witnessed row is fielded too
+    with _Env(TFB_SYNC_FW2_SCOPE="enforce"):
+        alone, s_alone = mod._row_identity_firewall(list(h), copy.deepcopy(fresh))
+    assert blocked({r[0]: r for r in alone}["1120.SR"]) and s_alone == ["7010.SR"]
+    # FW-2 SCOPE enforce + FW2-STALE-PE observe: rows exactly as above, the report names 1120
+    out_o, s_o, rep_o, c_o = go("enforce", "observe")
+    assert out_o == alone and s_o == s_alone
+    assert [k[0] for k in rep_o["kept"]] == ["1120.SR"] and c_o["fielded"] == 3
+    # FW2-STALE-PE enforce alone (main #875's result): the other mismatches are stripped
+    out_n, s_n, rep_n, _c = go("off", "enforce")
+    a_n = {r[0]: r for r in out_n}["1120.SR"]
+    assert not blocked(a_n) and a_n[ix["P/E (TTM)"]] == "" and a_n[ix["PEG"]] == 1.5
+    assert sorted(s_n) == ["1010.SR", "2222.SR", "7010.SR"]
+    # FW-2 SCOPE observe + FW2-STALE-PE enforce: rows as STALE-PE alone; the census is the real pass
+    out_b, s_b, _rep_b, c_b = go("observe", "enforce")
+    assert out_b == out_n and s_b == s_n
+    assert (c_b["drift"], c_b["gross"], c_b["fielded"]) == (2, 1, 0)
 
 
 def _digest():
