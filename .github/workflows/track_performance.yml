@@ -1,5 +1,19 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.7 (2026-10-26) -- SAME-RUN MATURITIES COUNT (OWNER OPT-IN)
+# WHY (2026-10-26): an outcome matured by an audit pass kept the loader's
+# 'no valid stored outcome' flag, so the same run's summary and calibration
+# counted it invalid (run 40120329898: matured-fresh=87, then 'Invalid
+# matured excluded: 87'; those were legacy rows). A canonical v2 maturity
+# would also miss that run's S-1 row, and its MATURED receipt would lose
+# forecast_error_pp for good.
+# WHAT: the 'Run performance clock' step maps repository Variable
+# TRACK_MATURED_EVIDENCE_VALID (default 'off' = 1.0.5 behaviour) to
+# track_performance v6.51.0: 'enforce' marks a record this pass matures from a
+# finite witnessed ROI as a valid outcome. daily_sync's tracker step, which
+# audits on a manual dispatch with run_tracker=true, maps the same Variable
+# (ENV PARITY). Numbered 1.0.7 because open #841 claims 1.0.6.
+# Rollback: unset TRACK_MATURED_EVIDENCE_VALID (or set off).
 # VERSION 1.0.5 (2026-10-24) -- CANONICAL PROSPECTIVE TARGETS
 # New rows use forecast-price-derived percentage points and schema receipts.
 # Historical rows and promotion thresholds are unchanged; criterion4 now
@@ -314,6 +328,8 @@ jobs:
           TRACK_HIST_TARGET_CLOSE: ${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}
           TRACK_HIST_CLOSE_BUDGET: ${{ vars.TRACK_HIST_CLOSE_BUDGET || '60' }}
           TRACK_HIST_CLOSE_TIME_SEC: ${{ vars.TRACK_HIST_CLOSE_TIME_SEC || '240' }}
+          # (2026-10-26) 1.0.7: v6.51.0 same-run maturities count; 'off' = v6.49.0.
+          TRACK_MATURED_EVIDENCE_VALID: ${{ vars.TRACK_MATURED_EVIDENCE_VALID || 'off' }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's

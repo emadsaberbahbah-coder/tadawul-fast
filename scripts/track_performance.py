@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.49.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.51.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1758,7 +1758,65 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _board_symbols_enabled,
 #   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
 # ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
-SCRIPT_VERSION = "6.49.0"
+# -----------------------------------------------------------------------------
+# v6.51.0 (2026-10-26) [MATURED-EVIDENCE]: an outcome matured by THIS audit
+# pass counts as a valid outcome in the same run. ENV-gated, DEFAULT OFF
+# (TRACK_MATURED_EVIDENCE_VALID). Numbered 6.51.0 because open PR #841
+# claims 6.50.0 (whichever merges second renumbers).
+# EVIDENCE: PerformanceRecord.from_sheet_row sets realized_roi_source_valid
+#   = math.isfinite(_safe_float(Realized ROI %)), so every loaded ACTIVE row
+#   (blank cell) carries False. audit_active_records' single MATURED
+#   transition sets status, maturity_date and realized_roi from a finite,
+#   witnessed _roi_use but never revisits the flag, so every same-run
+#   consumer treats the outcome it just measured as a malformed stored
+#   outcome: _summary_outcome_cohort (summary panel, ReliabilityCalibrator,
+#   reports, --simulate) counts it 'invalid'; canonical_performance_report
+#   withholds target_achieved_at_horizon / forecast_error_pp, so the
+#   [OUTCOME-WITNESS v1] MATURED receipt written into Notes carries null for
+#   both (MATURED rows are never re-audited, so that is permanent) and
+#   _publish_s1_calibration's canonical checkpoint measure counts it
+#   'invalid_realized_evidence'. Live: Performance Clock run 40120329898
+#   (job 120950277470, 24 Oct 18:22Z, TRACK_SCHEDULED_AUDIT=1) logged
+#   'matured-fresh=87' and, in the same run, 'Matured: 11773 ... Invalid
+#   matured excluded: 87'; the next tracker run (daily_sync, record-only,
+#   job 121006724938) read the same rows as 11860 valid, 0 invalid. So each
+#   audit's own maturities miss that run's summary panel (rewritten by the
+#   next --analyze run, daily_sync's included) and its
+#   TFB_CALIBRATION_FACTORS and S-1 row (published only on audit runs), and
+#   reach those one audit run late. The 87 were legacy rows (no target
+#   schema): there the live effect was on the summary and the calibration
+#   inputs; legacy rows never reach the S-1 canonical measure and their
+#   receipts carry no target fields.
+#   From the first canonical v2 maturities (records made since #827,
+#   24 Oct) the S-1 measure would also drop them and the receipts would lose
+#   their target fields for good.
+# WHAT (audit_active_records only; one assignment, at the one place a record
+#   becomes MATURED, before the outcome receipt is built):
+#   off (DEFAULT; unset or any other word, '1' included): v6.49.0 exactly;
+#     no log line.
+#   enforce: a record that this pass matures from its finite _roi_use gets
+#     realized_roi_source_valid = True (non-finite ROIs stay PENDING above
+#     the transition), and one INFO line '[v6.51.0 MATURED-EVIDENCE]
+#     mode=enforce matured=N revalidated=K' follows the MATURE-FRESH line.
+#     The fresh close, CA-GUARD ok/adjust/ledger and HIST-CLOSE enforce
+#     paths all mature through that transition. A stored MATURED row with a
+#     malformed cell, a PENDING row and an EXPIRED (corp-action suspect or
+#     unpriced) row are never touched.
+# ENV LANE: both tracker steps map the Variable (ENV PARITY):
+#   .github/workflows/track_performance.yml 'Run performance clock' (every
+#   scheduled audit) and daily_sync.yml 'Track Performance (record + audit)',
+#   which passes --audit on a manual dispatch with run_tracker=true and so
+#   matures records too. Its scheduled runs never audit, so there the
+#   Variable is inert.
+# KNOWN LIMITS: maturities from before arming keep their null receipts (the
+#   summary and calibration already count them from the next run on). As on
+#   v6.49.0, run_once ignores save_records' result, so after a failed save
+#   the same run still publishes its own (unsaved) maturities in either
+#   mode.
+# ZERO functions removed. Additions: _matured_evidence_mode,
+#   _MATURED_EVIDENCE_TAG.
+# ROLLBACK: unset TRACK_MATURED_EVIDENCE_VALID (or set off).
+SCRIPT_VERSION = "6.51.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3827,6 +3885,18 @@ def _hist_target_close_mode() -> str:
     off, so an unset or mistyped Variable can never mature a record."""
     v = (os.getenv("TRACK_HIST_TARGET_CLOSE") or "off").strip().lower()
     return v if v in ("observe", "enforce") else "off"
+
+
+# --- v6.51.0 [MATURED-EVIDENCE]: same-run maturities are valid outcomes ------
+_MATURED_EVIDENCE_TAG = "[v6.51.0 MATURED-EVIDENCE]"
+
+
+def _matured_evidence_mode() -> str:
+    """v6.51.0: TRACK_MATURED_EVIDENCE_VALID off (DEFAULT) | enforce.
+    Exact word, case/space-insensitive; anything else (including '1') is
+    off, so an unset or mistyped Variable keeps the v6.49.0 behaviour."""
+    v = (os.getenv("TRACK_MATURED_EVIDENCE_VALID") or "off").strip().lower()
+    return "enforce" if v == "enforce" else "off"
 
 
 def _hist_close_budget() -> int:
@@ -10104,6 +10174,8 @@ class PerformanceTrackerApp:
         _hist_stats: Dict[str, Any] = {}
         _hist_used: List[Any] = []       # enforce: (record, live price, live ROI)
         _hist_observe: List[Any] = []    # observe: judged after the loop
+        _me_on = _matured_evidence_mode() == "enforce"   # v6.51.0; off -> inert
+        _me_revalidated = 0
         if _hist_mode != "off":
             _HIST_CLOSE_CACHE.clear()
             _HIST_CLOSE_BUDGET.clear()
@@ -10289,6 +10361,14 @@ class PerformanceTrackerApp:
                     r.status = PerformanceStatus.MATURED
                     r.maturity_date = now_r
                     r.realized_roi = float(_roi_use)
+                    if _me_on and not r.realized_roi_source_valid:
+                        # v6.51.0 [MATURED-EVIDENCE]: the loader flag described
+                        # the blank 'Realized ROI %' cell of an ACTIVE row; the
+                        # value is now this pass's witnessed, finite outcome
+                        # (non-finite _roi_use stayed PENDING above), so every
+                        # same-run consumer and the receipt below may use it.
+                        r.realized_roi_source_valid = True
+                        _me_revalidated += 1
                     if (r.realized_roi or 0.0) > 0:
                         r.outcome = "WIN"
                     elif (r.realized_roi or 0.0) < 0:
@@ -10316,6 +10396,10 @@ class PerformanceTrackerApp:
                 len(_expired_syms),
                 f" ({', '.join(_expired_syms[:8])}{'…' if len(_expired_syms) > 8 else ''})" if _expired_syms else "",
             )
+
+        if _me_on:
+            logger.info("%s mode=enforce matured=%d revalidated=%d",
+                        _MATURED_EVIDENCE_TAG, _n_matured, _me_revalidated)
 
         if _hist_mode != "off":
             # v6.47.0 [HIST-CLOSE]: observe judges its candidates only now;

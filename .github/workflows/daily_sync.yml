@@ -1400,6 +1400,12 @@ jobs:
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}
+          # (2026-10-26) track_performance v6.51.0 [MATURED-EVIDENCE]: a manual
+          # dispatch with run_tracker=true passes --audit below and matures
+          # records, so this lane maps the clock's Variable (ENV PARITY); the
+          # scheduled record-only runs never audit, so there it is inert.
+          # Default off = v6.49.0. Rollback: unset or off.
+          TRACK_MATURED_EVIDENCE_VALID: ${{ vars.TRACK_MATURED_EVIDENCE_VALID || 'off' }}
           # (2026-10-11) v6.45.0 prospective schema / publication identities.
           # Defaults off: arm one measured lane-consistent feature at a time.
           # Immutable snapshots retain first and subsequent daily publications;
