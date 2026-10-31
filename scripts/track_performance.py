@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.49.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.50.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1758,7 +1758,62 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _board_symbols_enabled,
 #   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
 # ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
-SCRIPT_VERSION = "6.49.0"
+# -----------------------------------------------------------------------------
+# v6.50.0 (2026-10-25) [LOG-READ]: Performance_Log numbers are read back at
+# full precision. ENV-gated, DEFAULT OFF (TRACK_LOG_UNFORMATTED_READ).
+# EVIDENCE: PerformanceStore.load_records read the log with ws.get(rng), so
+#   the Sheets API default valueRenderOption FORMATTED_VALUE applied and every
+#   number came back as its displayed text (about 10 significant digits under
+#   the Automatic format). The tracker writes the log RAW at full float
+#   precision, and canonical_performance_report proves a v2 target with
+#   math.isclose(stored, (target/entry - 1) * 100, rel_tol=1e-9,
+#   abs_tol=1e-8). A 1W/2W checkpoint target price is the interpolation
+#   entry*(1-frac) + forecast*frac (frac 7/30, 14/30) and carries about 16
+#   significant digits; rendered at about 10 it moves the price-implied ROI
+#   by up to about 5e-8 pp, past the 1e-8 absolute floor, whatever the ROI
+#   size, so a target that was exact when written failed as
+#   'schema_price_mismatch' once read back. 1M/3M target prices are the
+#   engine's 4 dp forecast prices and survive. The [CANONICAL-PERFORMANCE]
+#   lines show schema_price_mismatch 6 -> 6 -> 43 while percent_points went
+#   34 -> 222 -> 249 (jobs 120950277470, 121006724938, 121127954714; tracker
+#   steps at 24 Oct 18:21Z, 23:29Z and 25 Oct 10:08Z): the 188 rows recorded
+#   at 23:29Z (25 Oct Riyadh) were exact in memory on the run that wrote
+#   them, and 37 more targets failed on the next run, which read them back.
+#   An offline replay (400 sources x 4 horizons, '.10g' rendering) loses
+#   129/400 1W and 135/400 2W, 0 at 1M/3M, and 0 on a raw round-trip. An
+#   audit pass then makes the loss permanent:
+#   run_once -> audit -> _publish_s1_calibration -> save_records rewrote
+#   every row from the rounded floats. Consumers of the canonical target:
+#   S-1 criterion 4 (_S1_Calibration), the canonical unit counts and the
+#   outcome witness at maturity.
+# WHAT (load_records only; Signal_History and every other reader unchanged):
+#   off (DEFAULT; unset or any other word, '1' included): ws.get(rng) exactly
+#     as v6.49.0; no log line, no extra read.
+#   observe: the records are the off records. One extra read of the same
+#     range with valueRenderOption UNFORMATTED_VALUE (dateTimeRenderOption
+#     FORMATTED_STRING); both reads are parsed by from_sheet_row and compared
+#     field by field, and one WARNING line '[v6.50.0 LOG-READ] mode=observe
+#     ...' reports precision_only (numbers within 1e-6: absolute below 1,
+#     relative above), divergent {header: n} (numbers that differ beyond
+#     that, e.g. a percent number format), text_differs {header: n} (any
+#     other parsed difference, e.g. a typed boolean or a number in a text
+#     column), misaligned rows and the schema_price_mismatch count of both
+#     parses. A failed extra read logs one WARNING and changes nothing.
+#   enforce: the one read asks for UNFORMATTED_VALUE + FORMATTED_STRING and
+#     logs one INFO line '[v6.50.0 LOG-READ] mode=enforce rows=N'. Parsing is
+#     unchanged (from_sheet_row via _safe_float/_safe_str); the tracker's
+#     RAW-written strings and dates read back as the same strings.
+# ARMING (owner): repository Variable TRACK_LOG_UNFORMATTED_READ=observe for
+#   one Performance Clock run; require divergent={} and text_differs={} and an
+#   unformatted mismatch count below the formatted one; then set enforce. Both
+#   tracker lanes read the same Variable (ENV PARITY).
+# KNOWN LIMITS: rows already rewritten from a rounded read by an audit pass
+#   stay rounded (no repair here); a manually applied percent number format
+#   would change a cell's meaning under enforce, which observe reports.
+# ZERO functions removed. Additions: _log_read_mode, _log_read_observe,
+#   _LOG_READ_TAG, _LAST_LOG_READ.
+# ROLLBACK: unset TRACK_LOG_UNFORMATTED_READ (or set off).
+SCRIPT_VERSION = "6.50.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -6382,6 +6437,88 @@ def _evidence_append_failures() -> List[str]:
         return list(_EVIDENCE_APPEND_FAILURES)
 
 
+# --- v6.50.0 [LOG-READ]: Performance_Log numbers read at full precision ------
+_LOG_READ_TAG = "[v6.50.0 LOG-READ]"
+_LAST_LOG_READ: Dict[str, Any] = {}          # read-back of the last armed load
+
+
+def _log_read_mode() -> str:
+    """v6.50.0: TRACK_LOG_UNFORMATTED_READ off (DEFAULT) | observe | enforce.
+    Exact words, case/space-insensitive; anything else (including '1') is
+    off, so an unset or mistyped Variable keeps the v6.49.0 read."""
+    v = (os.getenv("TRACK_LOG_UNFORMATTED_READ") or "off").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _log_read_observe(store: Any, rng: str, rows_fmt: Any) -> Dict[str, Any]:
+    """v6.50.0 observe: ONE extra unformatted read of the same range; both
+    reads are parsed by from_sheet_row and compared field by field (what
+    enforce would change), and ONE WARNING line. Read-only and never raises:
+    the caller's records are the formatted (off) records."""
+    out: Dict[str, Any] = {"mode": "observe", "rows": 0, "unformatted_rows": 0,
+                           "precision_only": 0, "divergent": {}, "text_differs": {},
+                           "misaligned": 0, "canonical_mismatch_formatted": 0,
+                           "canonical_mismatch_unformatted": 0, "error": ""}
+    try:
+        rows_unf = store.backoff.execute_sync(
+            lambda: store.ws.get(rng, value_render_option="UNFORMATTED_VALUE",
+                                 date_time_render_option="FORMATTED_STRING"))
+        headers = list(store.HEADERS)
+        width = len(headers)
+
+        def _parse(rows: Any) -> List[Any]:
+            out_rows = []
+            for r in rows or []:
+                if r and _safe_str(r[0]):
+                    padded = list(r) + [""] * max(0, width - len(r))
+                    out_rows.append((padded, PerformanceRecord.from_sheet_row(padded, headers)))
+            return out_rows
+
+        fmt, unf = _parse(rows_fmt), _parse(rows_unf)
+        out["rows"], out["unformatted_rows"] = len(fmt), len(unf)
+        divergent: Dict[str, int] = defaultdict(int)
+        text_differs: Dict[str, int] = defaultdict(int)
+        for (pf, rf), (pu, ru) in zip(fmt, unf):
+            if _safe_str(pf[0]) != _safe_str(pu[0]):
+                out["misaligned"] += 1
+                continue
+            of, ou = store._record_to_row(rf), store._record_to_row(ru)
+            for i in range(width):
+                if _safe_str(pf[i]) == "" and _safe_str(pu[i]) == "":
+                    continue           # both blank: only parse fallbacks differ
+                a, b = of[i], ou[i]
+                if a == b:
+                    continue
+                if (isinstance(a, (int, float)) and not isinstance(a, bool)
+                        and isinstance(b, (int, float)) and not isinstance(b, bool)):
+                    fa, fb = float(a), float(b)
+                    if math.isfinite(fa) and math.isfinite(fb) and abs(fa - fb) <= 1e-6 * max(1.0, abs(fb)):
+                        out["precision_only"] += 1
+                    else:
+                        divergent[headers[i]] += 1
+                else:
+                    text_differs[headers[i]] += 1
+        out["divergent"] = dict(sorted(divergent.items()))
+        out["text_differs"] = dict(sorted(text_differs.items()))
+
+        def _mismatch(parsed: List[Any]) -> int:
+            return int(canonical_performance_report([rec for _r, rec in parsed])["unit_counts"]
+                       .get("schema_price_mismatch", 0))
+
+        out["canonical_mismatch_formatted"] = _mismatch(fmt)
+        out["canonical_mismatch_unformatted"] = _mismatch(unf)
+        logger.warning(
+            "%s mode=observe rows=%d unformatted_rows=%d precision_only=%d divergent=%s "
+            "text_differs=%s misaligned=%d canonical_mismatch formatted=%d unformatted=%d",
+            _LOG_READ_TAG, out["rows"], out["unformatted_rows"], out["precision_only"],
+            out["divergent"], out["text_differs"], out["misaligned"],
+            out["canonical_mismatch_formatted"], out["canonical_mismatch_unformatted"])
+    except Exception as e:
+        out["error"] = "%s: %s" % (type(e).__name__, str(e)[:200])
+        logger.warning("%s mode=observe comparison skipped: %s", _LOG_READ_TAG, out["error"])
+    return out
+
+
 class PerformanceStore:
     SHEET_DEFAULT = "Performance_Log"
     START_ROW = 5  # headers at row 5, data from row 6
@@ -6564,8 +6701,12 @@ class PerformanceStore:
             end_row = min(end_row, _rc)
         end_col = len(self.HEADERS)
         rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
+        _lr_mode = _log_read_mode()   # v6.50.0 [LOG-READ]: off -> the v6.49.0 read
 
         def _load() -> List[List[Any]]:
+            if _lr_mode == "enforce":
+                return self.ws.get(rng, value_render_option="UNFORMATTED_VALUE",  # type: ignore
+                                   date_time_render_option="FORMATTED_STRING")
             return self.ws.get(rng)  # type: ignore
 
         try:
@@ -6639,6 +6780,14 @@ class PerformanceStore:
                     _dm_mode, "would_expire" if _dm_mode == "observe" else "expired",
                     _dm["count"], _dm["wins"], _dm["losses"], _dm["breakeven"],
                     _dm["keys"][:6])
+            # v6.50.0 [LOG-READ]: armed modes only (off reads and logs nothing).
+            if _lr_mode == "enforce":
+                _LAST_LOG_READ.clear()
+                _LAST_LOG_READ.update({"mode": "enforce", "rows": len(rows or [])})
+                logger.info("%s mode=enforce rows=%d", _LOG_READ_TAG, len(rows or []))
+            elif _lr_mode == "observe":
+                _LAST_LOG_READ.clear()
+                _LAST_LOG_READ.update(_log_read_observe(self, rng, rows))
             return records
         except Exception as e:
             logger.error("Failed to load records: %s", e)
