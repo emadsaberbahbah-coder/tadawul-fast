@@ -23,7 +23,8 @@ quarantine needs; after the next sync the past date is gone. 2222.SR is a
 rated KSA name (views 1.4.0 sheet, v_symbol_rating) and Aramco reports Q3
 in the first week of November (4 Nov 2025, 5 Nov 2024). The live book of
 1 Nov (the 5023.SR sukuk, no earnings, and FRST.US, EODHD-covered) loses
-no guard input today; KSA board seats and ADD candidates do.
+no guard input today; KSA Top_10 seats do, and D1b (ADDs to a holding)
+would for any KSA holding with earnings.
 WHAT (only when TFB_CAL_LAST_REPORT_YAHOO is on/1/true/yes, any case;
 default off = the v1.3.2 requests, results and log lines byte for byte):
 after the EODHD batches, each KSA symbol is asked once through yfinance
@@ -46,7 +47,10 @@ later row with neither dated at most 21 days after it (a call or a meeting
 the page does not name: an unknown surprise would shorten the DT10 tag to
 5 sessions after a miss); a figureless row further on is a newer report not
 filled in yet and wins (TFB_CALENDAR_DAYS_BACK can reach 120); with no
-figured row, the latest row. eps_surprise_pct is
+figured row, the latest row. A frame with a NaT date is refused (counted
+in errors=N): yfinance 0.2.66 drops a dateless row and then re-assigns the
+parsed dates by position, so every later row carries the next row's date
+and the last row NaT - no date in that frame can be trusted. eps_surprise_pct is
 Surprise(%) when numeric, else (actual - estimate) / |estimate| x 100,
 rounded to 0.1 like v1.3.0; the row carries source 'yahoo_earnings_dates'
 and report_timing None. Fill-only: an EODHD row is never overwritten, and
@@ -1058,18 +1062,28 @@ def _yf_earnings_dates_past(ysym: str, start: _dt.date,
     stockholders' meeting (11) is not a report. Of the rows left, the LATEST
     with a numeric Reported EPS or Surprise(%) wins over a later row without
     figures at most 21 days on; otherwise the latest row.
-    Raises on rate-limit (and any fetch error) so the caller can classify;
-    returns None on genuinely absent data."""
+    Raises on rate-limit (and any fetch error) so the caller can classify,
+    and ValueError on a frame holding a NaT date (yfinance 0.2.66 shifted
+    its dates onto the wrong rows); returns None on genuinely absent data."""
     df = _yf.Ticker(ysym).get_earnings_dates(limit=12)  # type: ignore[union-attr]
     idx = getattr(df, "index", None)
     if idx is None:
         return None
+    entries = list(idx)
+    for x in entries:
+        try:
+            nat = x is not None and bool(x != x)    # NaT / NaN are the only values != themselves
+        except Exception:
+            nat = False
+        if nat:
+            raise ValueError("earnings dates frame holds a NaT date "
+                             "(yfinance re-assigned its dates by position)")
     rows = getattr(df, "iloc", None)
     best: Optional[_dt.date] = None
     best_row: Any = None
     best_eps: Optional[_dt.date] = None             # the latest row with EPS figures
     best_eps_row: Any = None
-    for pos, x in enumerate(list(idx)):
+    for pos, x in enumerate(entries):
         d = _yf_report_date(x)
         if d is None or d < start or d > end:
             continue

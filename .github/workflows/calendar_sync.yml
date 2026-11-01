@@ -34,7 +34,8 @@
 # 2026-11-01: maps calendar_provider v1.4.0 TFB_CAL_LAST_REPORT_YAHOO (DEFAULT
 #       OFF; NOT armed here) - the last-report lane skips every KSA symbol, so
 #       a Saudi name such as 2222.SR never gets a Last Earnings Date and the
-#       post-earnings quarantine cannot hold a KSA seat or ADD candidate.
+#       post-earnings quarantine cannot hold a KSA Top_10 seat or a KSA
+#       holding's ADD.
 #       Armed, Yahoo fills the KSA rows' last report (fill-only) and the run
 #       log shows 'last-report yahoo fill: n of m KSA (throttled=t,
 #       errors=e)'. Arm with the repo Variable TFB_CAL_LAST_REPORT_YAHOO=on
