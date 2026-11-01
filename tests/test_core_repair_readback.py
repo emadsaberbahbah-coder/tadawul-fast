@@ -445,10 +445,11 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
                     code = probe.main()
                 return code, json.loads(output.read_text()), transport, verify
 
+        # 2026-10-15: default armed in code (readback 1.2.2); no flag declares enforce.
         code, artifact, _transport, verify = invoke()
         self.assertEqual(code, 0)
-        self.assertEqual(verify.call_args.kwargs, {})
-        self.assertNotIn("expected_pf_research_view", artifact)
+        self.assertEqual(verify.call_args.kwargs, {"expected_pf_research_view": "enforce"})
+        self.assertEqual(artifact["expected_pf_research_view"], "enforce")
         code, artifact, _transport, verify = invoke("--expect-pf-research-view", "off")
         self.assertEqual(verify.call_args.kwargs, {})
         self.assertNotIn("expected_pf_research_view", artifact)
@@ -464,7 +465,8 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         transport.assert_not_called()
         verify.assert_not_called()
 
-    def test_workflow_passes_the_declared_mode_default_off(self):
+    # 2026-10-15: was test_..._default_off; the workflow fallback is now enforce.
+    def test_workflow_passes_the_declared_mode_default_enforce(self):
         import yaml
         from pathlib import Path
         root = Path(probe.__file__).resolve().parents[1]
@@ -472,7 +474,7 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         step = next(s for s in workflow["jobs"]["readback"]["steps"]
                     if "verify_core_repair_readback.py" in s.get("run", ""))
         self.assertEqual(step["env"]["TFB_PF_RESEARCH_VIEW_EXPECT"],
-                         "${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'off' }}")
+                         "${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'enforce' }}")
         self.assertIn('--expect-pf-research-view "$TFB_PF_RESEARCH_VIEW_EXPECT"', step["run"])
 
     def test_off_result_is_unchanged(self):
@@ -482,7 +484,7 @@ class PortfolioResearchViewLockstepTests(unittest.TestCase):
         legacy = self.run_probe()
         legacy.pop("checked_at_utc")
         self.assertEqual(result, legacy)
-        self.assertEqual(probe.SCRIPT_VERSION, "1.2.1")
+        self.assertEqual(probe.SCRIPT_VERSION, "1.2.2")  # 2026-10-15: default-enforce lockstep bump
 
 
 if __name__ == "__main__":
