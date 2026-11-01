@@ -232,10 +232,11 @@ console.log('M7 PASS embedded self-test lines');
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked on this change; pins moved. The delivered file
 // is v1.18.0; the added-lines lint and the census compare the v1.17.1 file rebuilt from it
 // (v1.18.0 edits reversed, SHA-256 pinned) with v1.17.0.
+// 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
 const s1171 = history.v1171Source(src);
-ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
+ok((src.match(/^var DT10_VERSION = '1\.19\.0';$/m) || []).length === 1 && /^ \* Version: 1\.19\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
    (s1171.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(s1171.split('\n')[3]),
-   'M8 version lockstep 1.18.0 (delivered) and 1.17.1 (rebuilt)');
+   'M8 version lockstep 1.19.0 (delivered) and 1.17.1 (rebuilt)');
 const why = src.slice(src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), src.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'));
 ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'M8 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'), base.indexOf(' * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE]'))) > 0,

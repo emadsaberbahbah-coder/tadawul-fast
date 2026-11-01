@@ -324,7 +324,8 @@ for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
     ok(n.note === b.note + ' | post-earn ' + WARN + '5/9', 'P2 status token ' + label + ': ' + n.note);
     ok(n.calReads.length === b.calReads.length + 1 && n.calReads[n.calReads.length - 1] === '1x1x' + (CAL_ROWS.length + 1) + 'x10',
        'P2 one extra Calendar_Events read (A1, all 10 columns) ' + label + ': ' + n.calReads.join(' '));
-    ok(n.ctx.__logs.some(l => l === '[DT10 v1.18.0] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),
+    // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked on this change; pin moved
+    ok(n.ctx.__logs.some(l => l === '[DT10 v1.19.0] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),
        'P2 Logger line ' + label);
   }
 }
@@ -526,14 +527,19 @@ for (const [props, mode] of [[{}, 'off'], [{ DT10_POST_EARN: 'observe' }, 'obser
 console.log('P6 PASS self-test');
 
 // ------------------------------------------------------------ P7 static
-ok((src.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]),
-   'P7 version lockstep 1.18.0');
+// 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked on this change; pins moved.
+// The delivered file is v1.19.0; the added-lines lint and the census compare the v1.18.0 file
+// rebuilt from it (v1.19.0 edits reversed, SHA-256 pinned) with v1.17.1.
+const s1180 = history.v1180Source(src);
+ok((src.match(/^var DT10_VERSION = '1\.19\.0';$/m) || []).length === 1 && /^ \* Version: 1\.19\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
+   (s1180.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(s1180.split('\n')[3]),
+   'P7 version lockstep 1.19.0 (delivered) and 1.18.0 (rebuilt)');
 const why = src.slice(src.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'));
 ok(why.length > 2000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'P7 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'))) > 0,
    'P7 the v1.17.1 WHY block verbatim');
 const baseLines = new Set(base.split('\n'));
-const added = src.split('\n').filter((l) => !baseLines.has(l));
+const added = s1180.split('\n').filter((l) => !baseLines.has(l));
 ok(added.length >= 140 && added.length <= 240, 'P7 added lines ' + added.length);
 for (const l of added) {
   if (/^ \* Version: 1\.18\.0 /.test(l)) continue;   // the version line keeps its pre-existing em dash
@@ -542,8 +548,8 @@ for (const l of added) {
   ok(!/\b(let|const|class)\s|=>|`|\.\.\./.test(code) || /^\s*(\*|\/\*)/.test(l), 'P7 ES5 added line: ' + l);
 }
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
-const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(src, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
-const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(src, /^var\s+([A-Za-z_$][\w$]*)/mg);
+const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(s1180, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(s1180, /^var\s+([A-Za-z_$][\w$]*)/mg);
 ok([...fb].every((f) => fn.has(f)) && [...vb].every((v) => vn.has(v)), 'P7 zero functions / vars removed');
 ok(deep([...fn].filter((f) => !fb.has(f)).sort(), ['dt10ApplyPostEarnTags_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_',
    'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10WeekdaysBetween_']) &&
