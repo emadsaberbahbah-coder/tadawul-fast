@@ -2,8 +2,28 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.4.1 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.5.0 (program register C8, Phase 2)
 ================================================================================
+v1.5.0 (2 Nov 2026, the learning loop from the archive). WHY (owner, 2 Nov
+2026: "learning is slow ... improve today, results tomorrow"; "layers for
+recommendations so the system still issues them when one is available"):
+the tracker closes a forecast only when an audit holds a live quote of
+exactly the target session, so 5,759 overdue records waited on 1 Nov while
+the bar archive already held those sessions' closes. New: v_outcome_engine
+(every Performance_Log record scored from the archived daily close of the
+first session on/after its target - engine_state, engine ROI and verdict,
+best / worst excursion, touched target, a 1W / 2W / 1M / 3M ladder, the
+first engine-scored record per key as the cohort, and the sheet's own
+outcome beside it with agree / disagree), v_outcome_calibration (engine win
+rate, realized ROI, ROI capture, excursions and the sheet's rate by
+confidence, reliability tier, data-quality tier, sector, market, horizon,
+origin, risk, recommendation and week, with a calibration flag) and
+v_board_archive (recommendation layer 2: the Top-10 panel's default gates
+re-run over the archived universe, research only, executable = FALSE).
+Changed: v_outcome_coverage adds the engine's scored / wins / rate and
+backlog states per horizon (file renumbered 69 -> 73, after the engine it
+reads). Research views: the live system never reads BigQuery; no decision,
+gate, count or broker action depends on them.
 v1.4.1 (1 Nov 2026, review follow-up on #886): v_outcome_coverage counts
 scored calls and wins over the sheet's outcome cohort only (in_outcome_cohort:
 the first valid matured record per stable key, as track_performance's
@@ -105,7 +125,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
