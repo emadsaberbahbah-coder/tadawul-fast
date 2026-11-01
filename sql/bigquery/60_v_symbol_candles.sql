@@ -15,7 +15,11 @@
 -- sma_20 / sma_50 / sma_200 average the close over that many candles (NULL
 -- until there are that many); change_pct is the move from the previous
 -- candle (percent points); volume_avg_20 averages the volume. symbol_label
--- keys the symbol picker.
+-- keys the symbol picker. last_close is the symbol's newest close and
+-- open/high/low/close_vs_last_pct place every candle against it (percent
+-- points; the newest close is 0): the Looker candlestick chart always draws
+-- its axis from zero, so candles in prices sit squeezed in a thin band at
+-- the top, while these straddle zero and fill the chart.
 CREATE OR REPLACE VIEW `{{DS}}.v_symbol_candles`
 OPTIONS (description = "TFB Looker v3: daily candles per symbol, one per trading session (two years of Yahoo bars for the deep set, nightly market-page snapshots for every other symbol) with moving averages")
 AS
@@ -147,7 +151,13 @@ SELECT
      ROUND(AVG(m.close) OVER (w ROWS BETWEEN 49 PRECEDING AND CURRENT ROW), 6), NULL) AS sma_50,
   IF(COUNT(m.close) OVER (w ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) = 200,
      ROUND(AVG(m.close) OVER (w ROWS BETWEEN 199 PRECEDING AND CURRENT ROW), 6), NULL) AS sma_200,
-  ROUND(AVG(m.volume) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) AS volume_avg_20
+  ROUND(AVG(m.volume) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) AS volume_avg_20,
+  LAST_VALUE(m.close IGNORE NULLS) OVER wall AS last_close,
+  ROUND((SAFE_DIVIDE(m.open, LAST_VALUE(m.close IGNORE NULLS) OVER wall) - 1) * 100, 4) AS open_vs_last_pct,
+  ROUND((SAFE_DIVIDE(m.high, LAST_VALUE(m.close IGNORE NULLS) OVER wall) - 1) * 100, 4) AS high_vs_last_pct,
+  ROUND((SAFE_DIVIDE(m.low, LAST_VALUE(m.close IGNORE NULLS) OVER wall) - 1) * 100, 4) AS low_vs_last_pct,
+  ROUND((SAFE_DIVIDE(m.close, LAST_VALUE(m.close IGNORE NULLS) OVER wall) - 1) * 100, 4) AS close_vs_last_pct
 FROM merged AS m
 LEFT JOIN lab AS l ON l.symbol = m.symbol
-WINDOW w AS (PARTITION BY m.symbol ORDER BY m.date);
+WINDOW w AS (PARTITION BY m.symbol ORDER BY m.date),
+  wall AS (PARTITION BY m.symbol ORDER BY m.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);

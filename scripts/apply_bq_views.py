@@ -2,8 +2,14 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.3.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.3.1 (program register C8, Phase 2)
 ================================================================================
+v1.3.1 (1 Nov 2026, the one-symbol page): v_symbol_candles also gives
+last_close (the symbol's newest close) and open / high / low /
+close_vs_last_pct, every candle in percent points against that close. The
+Looker candlestick chart always draws its axis from zero, so candles in
+prices sit squeezed in a thin band at the top; against the newest close
+they straddle zero and fill the chart. No other object changes.
 v1.3.0 (31 Oct 2026, owner request: candles, news and an IBKR-like rating
 in My Portfolio and on the one-symbol page): the three tables of
 scripts/archive_symbol_deep.py (symbol_bars_daily, symbol_analyst_daily,
@@ -76,7 +82,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
