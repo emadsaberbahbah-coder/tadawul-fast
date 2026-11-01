@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.2.0 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.3.1 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
-pages). Offline: the BigQuery session is a fake, no google library is
-imported.
+pages; 2d: candles, analysts, news and the TFB rating per symbol). Offline:
+the BigQuery session is a fake, no google library is imported.
 
   V1  the 36 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
@@ -15,10 +15,10 @@ imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the objects v1.3.0 adds or changes hash to their reviewed files
-      (pending pins, confirmed by bq_views --verify after the first --write;
-      v1.2.0's were read back on 31 Oct and are installed pins); a table
-      function keeps the query after its 'AS' line
+      the object v1.3.1 changes hashes to its reviewed file (a pending pin,
+      confirmed by bq_views --verify after the next --write; v1.2.0's were
+      read back on 31 Oct and v1.3.0's on 1 Nov, and are installed pins); a
+      table function keeps the query after its 'AS' line
   V5  the static checks refuse a data-changing statement, a hard-coded
       project, a forward reference, two statements, a function after a view,
       a misnamed file, a CREATE TABLE and an unknown source table; they accept
@@ -79,6 +79,13 @@ imported.
       one candle per session; the venue table covers every market_country
       v_universe can produce, with real time zones and the Sunday-Thursday
       markets (Codex P2 on #884 - fails on the first cut)
+  V20 v_symbol_candles places every candle against the symbol's newest close
+      (v1.3.1, for the Looker candlestick, whose axis always starts at 0):
+      the reference window is the symbol's whole history in date order, so
+      the newest close is 0 and each symbol keeps its own reference (simulated
+      from the parsed window - fails on the default frame, which ends at the
+      current row and flattens every close to 0, on a missing partition and
+      on a descending order); the four OHLC columns share that one reference
 """
 from __future__ import annotations
 
@@ -139,12 +146,9 @@ INSTALLED = {
     "v_news_gate": "ba73984a770ff9e343fbc477ecae62cd5317dbea9d24880559ca33c3ad7a6c6f",
     "v_calendar_events": "982b2d62ea7254759c320d3af87220543ec01405b72c2e2bf99938c639f4e6f0",
     "f_symbol_pick": "32777aa976c7220b789a103de61a027892173c98c731cfb3a7dedc467affb877",
-}
-# The objects apply_bq_views 1.3.0 adds or changes (31 Oct 2026), hashed from
-# the reviewed files: bq_views --verify after the first --write must find these
-# exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
-PENDING = {
-    "v_symbol_candles": "ed95728198f695a1829ccdf4f2f18d49f507f86743d934186241c1e9750d0cec",
+    # apply_bq_views 1.3.0, created by bq_views write run 41278750795 (1 Nov) and read back
+    # from INFORMATION_SCHEMA the same morning (all nine matched; v_symbol_candles changes
+    # again in 1.3.1, so it stays pending)
     "v_symbol_analyst": "32958e9e3e16cc6e52fafb4b784d12ab362f04bc4b8272739a04c1b06570a855",
     "v_symbol_news": "1e48d645856426b096cd9dc04ba594e0146f58b9a79de89bcb3b4e44a41c9bfd",
     "v_symbol_rating": "4b46dc88f64b9360e3abfb0898dc5680870fc5aa634c8b5b5bc86c492146ce04",
@@ -153,6 +157,13 @@ PENDING = {
     "v_dive_events": "bfcf61db2425619a8fe2f18778d573d0b506ba55a59f3f4850af067b5904f693",
     "v_top10_insight": "c197b1021774a7b23718019a13657d7395f5693cf2939c0f8cb696dd607cefd4",
     "v_portfolio_insight": "46505fd209702b7eb4291040fe07f20acac654325108f3e32993093ab0efb5c9",
+}
+# The object apply_bq_views 1.3.1 changes (1 Nov 2026), hashed from the reviewed
+# file: bq_views --verify after the next --write must find this exact body in
+# INFORMATION_SCHEMA (then it moves to INSTALLED). Installed 1.3.0 body:
+# ed95728198f695a1829ccdf4f2f18d49f507f86743d934186241c1e9750d0cec.
+PENDING = {
+    "v_symbol_candles": "c30bd475ffd4bb38bdf2e60676d34c3c4181925e4a44b6b4b54c68b28f4caf93",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -795,8 +806,53 @@ def case_v19():
     assert "FROM snap2 AS s" in candles and "WHERE prev_k IS NULL OR k != prev_k" in candles
 
 
+def _window_last(rows, win, ignore_nulls):
+    """LAST_VALUE(close) per row as BigQuery evaluates it under the window text `win`
+    (PARTITION BY / ORDER BY / an optional ROWS frame; no frame means the default,
+    which ends at the current row)."""
+    import re
+    part = re.search(r"PARTITION BY m\.([a-z_]+)", win)
+    order = re.search(r"ORDER BY m\.([a-z_]+)( DESC)?", win)
+    frame = re.search(r"ROWS BETWEEN UNBOUNDED PRECEDING AND (UNBOUNDED FOLLOWING|CURRENT ROW)", win)
+    assert order, win
+    assert not re.search(r"\bRANGE\b|\d+ (PRECEDING|FOLLOWING)", win), win   # outside this model
+    out = []
+    for r in rows:
+        group = sorted((x for x in rows if not part or x[part.group(1)] == r[part.group(1)]),
+                       key=lambda x: x[order.group(1)], reverse=bool(order.group(2)))
+        upto = group if frame and frame.group(1) == "UNBOUNDED FOLLOWING" else group[:group.index(r) + 1]
+        vals = [x["close"] for x in upto if x["close"] is not None or not ignore_nulls]
+        out.append(vals[-1] if vals else None)
+    return out
+
+
+def case_v20():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    candles = bv._code(objs["v_symbol_candles"].template)
+    win = re.findall(r"\bwall AS \(([^)]*)\)", candles)
+    assert len(win) == 1, win
+    last = re.findall(r"LAST_VALUE\(m\.close( IGNORE NULLS)?\) OVER wall", candles)
+    assert len(last) == 5 and len(set(last)) == 1, last           # last_close and the four columns
+    assert "LAST_VALUE(m.close IGNORE NULLS) OVER wall AS last_close" in candles
+    for col in ("open", "high", "low", "close"):
+        assert (f"ROUND((SAFE_DIVIDE(m.{col}, LAST_VALUE(m.close IGNORE NULLS) OVER wall) - 1) * 100, 4)"
+                f" AS {col}_vs_last_pct") in candles, col
+    # simulate the window on two symbols with interleaved dates (close is REQUIRED in the bars
+    # and > 0 in the snapshots; the NULL row only checks that the reference skips one)
+    rows = [{"symbol": "AAA", "date": 1, "close": 10.0}, {"symbol": "BBB", "date": 1, "close": 100.0},
+            {"symbol": "AAA", "date": 2, "close": 11.0}, {"symbol": "BBB", "date": 3, "close": 90.0},
+            {"symbol": "AAA", "date": 4, "close": 12.0}, {"symbol": "AAA", "date": 5, "close": None}]
+    ref = _window_last(rows, win[0], bool(last[0]))
+    assert ref == [12.0, 90.0, 12.0, 90.0, 12.0, 12.0], ref
+    pct = [round((r["close"] / x - 1) * 100, 4) if r["close"] is not None else None for r, x in zip(rows, ref)]
+    assert pct[4] == 0.0 and pct[3] == 0.0 and pct[0] == -16.6667 and pct[1] == 11.1111, pct
+    # golden: the default frame (to the current row) makes every close its own reference - a flat 0
+    assert _window_last(rows, "PARTITION BY m.symbol ORDER BY m.date", True)[0] == 10.0
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
-         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19]
+         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20]
 
 
 def test_v1(): case_v1()
@@ -818,6 +874,7 @@ def test_v16(): case_v16()
 def test_v17(): case_v17()
 def test_v18(): case_v18()
 def test_v19(): case_v19()
+def test_v20(): case_v20()
 
 
 if __name__ == "__main__":
