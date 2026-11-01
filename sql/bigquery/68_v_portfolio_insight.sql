@@ -13,8 +13,16 @@
 -- analyst consensus below Hold);
 -- caution_count counts them. Percent points. symbol_label keys the
 -- symbol picker shared with the candle, news and analyst views.
+-- 1.4.0: every holding carries its value, cost and P&L in riyals
+-- (value_sar, cost_sar, pnl_sar, pnl_sar_pct) and its share of the book
+-- (weight_sar_pct). The Portfolio_Decision figures are used when that night
+-- had a row for the name; otherwise the My_Portfolio figures, which are in
+-- the holding's own currency, are converted with v_fx_sar, and value_source
+-- says which. Before 1.4.0 the page totals left out any holding the
+-- decision page did not carry, and the sheet's position value mixed
+-- currencies in one column.
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_insight`
-OPTIONS (description = "TFB Looker v2: the latest holdings with the portfolio decision, market-page evidence, events, 7-day news and plain-word caution flags per holding")
+OPTIONS (description = "TFB Looker v4: the latest holdings with riyal values for every holding, the portfolio decision, market-page evidence, events, 7-day news, the TFB rating with its gate and plain-word caution flags")
 AS
 WITH hold AS (
   SELECT m.*
@@ -110,9 +118,23 @@ j AS (
     rt.tfb_rating_stars,
     rt.rating_confidence,
     rt.rating_parts,
+    rt.rating_gate,
+    rt.tfb_rating_display,
+    rt.analyst_source,
+    rt.news_source,
     rt.analyst_consensus_label,
     rt.analyst_consensus_score,
     rt.analysts,
+    fx.rate_to_sar AS fx_to_sar,
+    fx.fx_source,
+    COALESCE(d.market_value_sar, h.position_value * fx.rate_to_sar) AS value_sar,
+    COALESCE(d.cost_sar, h.position_cost * fx.rate_to_sar) AS cost_sar,
+    COALESCE(d.pnl_sar, (h.position_value - h.position_cost) * fx.rate_to_sar) AS pnl_sar,
+    CASE
+      WHEN d.market_value_sar IS NOT NULL THEN 'Portfolio_Decision'
+      WHEN fx.rate_to_sar IS NOT NULL THEN CONCAT('My_Portfolio x ', fx.fx_source)
+      ELSE 'no rate for the currency'
+    END AS value_source,
     ARRAY(
       SELECT f FROM UNNEST([
         IF(d.price_sar <= d.stop_sar, 'at or below the stop', NULL),
@@ -137,9 +159,12 @@ j AS (
   LEFT JOIN cal AS c ON c.symbol = h.symbol
   LEFT JOIN news AS n ON n.symbol = h.symbol
   LEFT JOIN `{{DS}}.v_symbol_rating` AS rt ON rt.symbol = h.symbol
+  LEFT JOIN `{{DS}}.v_fx_sar` AS fx ON fx.currency = h.currency
 )
 SELECT
   j.* EXCEPT (flags),
+  ROUND(SAFE_DIVIDE(j.pnl_sar, j.cost_sar) * 100, 2) AS pnl_sar_pct,
+  ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2) AS weight_sar_pct,
   ARRAY_TO_STRING(j.flags, ' · ') AS caution_flags,
   ARRAY_LENGTH(j.flags) AS caution_count
 FROM j;

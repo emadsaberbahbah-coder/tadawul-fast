@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.3.1 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.4.0 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
 pages; 2d: candles, analysts, news and the TFB rating per symbol). Offline:
 the BigQuery session is a fake, no google library is imported.
 
-  V1  the 36 objects load in apply order (6 functions, then the views and
+  V1  the 38 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
@@ -15,10 +15,11 @@ the BigQuery session is a fake, no google library is imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the object v1.3.1 changes hashes to its reviewed file (a pending pin,
-      confirmed by bq_views --verify after the next --write; v1.2.0's were
-      read back on 31 Oct and v1.3.0's on 1 Nov, and are installed pins); a
-      table function keeps the query after its 'AS' line
+      the objects v1.3.1 and v1.4.0 add or change hash to their reviewed
+      files (pending pins, confirmed by bq_views --verify after the next
+      --write; v1.2.0's were read back on 31 Oct and v1.3.0's on 1 Nov, and
+      are installed pins); a table function keeps the query after its 'AS'
+      line
   V5  the static checks refuse a data-changing statement, a hard-coded
       project, a forward reference, two statements, a function after a view,
       a misnamed file, a CREATE TABLE and an unknown source table; they accept
@@ -86,6 +87,25 @@ the BigQuery session is a fake, no google library is imported.
       from the parsed window - fails on the default frame, which ends at the
       current row and flattens every close to 0, on a missing partition and
       on a descending order); the four OHLC columns share that one reference
+  V21 v_fx_sar (v1.4.0): the riyal rate per currency reads only the FX rows
+      of the Commodities_FX page, USD from SAR=X and every other currency
+      through its dollar cross with the direct quote preferred, pence as a
+      hundredth of a pound; the rate table is simulated from the parsed
+      rules (fails on the inverse quote taken as direct, on pence as pounds)
+  V22 the rating gate (v1.4.0): v_symbol_rating names the engine verdict
+      beside every rating (blocked, do not invest, watch only, below the
+      floors, none) in rating_gate and tfb_rating_display, names the analyst
+      and news sources, and both insight views carry them; the portfolio
+      view gives riyal values for every holding (the decision page's figure
+      first, else the sheet's value times v_fx_sar) with its source, and the
+      Top-10 view says seat and allocation in plain words (a row without a
+      ticket is 'research board', never an order) - fails on the 1.3.1 files
+  V23 v_outcome_coverage (v1.4.0): per horizon and ALL, due / matured /
+      scored / wins with the win rate over scored calls only and the matured
+      share over due records; the overdue count is active records past
+      their target; simulated on a small log (fails when the win rate is
+      taken over matured instead of scored, when due ignores the target
+      date, and when ALL is missing)
 """
 from __future__ import annotations
 
@@ -151,19 +171,23 @@ INSTALLED = {
     # again in 1.3.1, so it stays pending)
     "v_symbol_analyst": "32958e9e3e16cc6e52fafb4b784d12ab362f04bc4b8272739a04c1b06570a855",
     "v_symbol_news": "1e48d645856426b096cd9dc04ba594e0146f58b9a79de89bcb3b4e44a41c9bfd",
-    "v_symbol_rating": "4b46dc88f64b9360e3abfb0898dc5680870fc5aa634c8b5b5bc86c492146ce04",
     "v_dive_signals": "70f12d9f52f86dda605931c4ddb5011382d51658cb725e51012302cba4836ed8",
     "v_dive_board": "3af206fc77283b1c9fbdff585d61d997f577c444ad5bc86088a0b33ac5ecdfaf",
     "v_dive_events": "bfcf61db2425619a8fe2f18778d573d0b506ba55a59f3f4850af067b5904f693",
-    "v_top10_insight": "c197b1021774a7b23718019a13657d7395f5693cf2939c0f8cb696dd607cefd4",
-    "v_portfolio_insight": "46505fd209702b7eb4291040fe07f20acac654325108f3e32993093ab0efb5c9",
 }
-# The object apply_bq_views 1.3.1 changes (1 Nov 2026), hashed from the reviewed
-# file: bq_views --verify after the next --write must find this exact body in
-# INFORMATION_SCHEMA (then it moves to INSTALLED). Installed 1.3.0 body:
-# ed95728198f695a1829ccdf4f2f18d49f507f86743d934186241c1e9750d0cec.
+# The objects apply_bq_views 1.3.1 and 1.4.0 add or change (1 Nov 2026), hashed
+# from the reviewed files: bq_views --verify after the next --write must find
+# these exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
+# Installed bodies they replace: v_symbol_candles ed95728198f6 (1.3.0),
+# v_symbol_rating 4b46dc88f64b, v_top10_insight c197b1021774,
+# v_portfolio_insight 46505fd20970 (all 1.3.0).
 PENDING = {
     "v_symbol_candles": "c30bd475ffd4bb38bdf2e60676d34c3c4181925e4a44b6b4b54c68b28f4caf93",
+    "v_fx_sar": "2c6262eb53692796710a71fa045c4ad0d56d883b66a597cc0d3ec011d00040ca",
+    "v_symbol_rating": "3a07d374b2b1c175e9dd040a0fbd87b6dda158b1d35edf00bf56d263a2b7d0d1",
+    "v_top10_insight": "66d2facf68aadfb9088e05eed29669daf063b04bb1b82a8ccf0928911438e9cf",
+    "v_portfolio_insight": "23425289b5eb4c185bed75e5acbed022cbd962a92ed47f7110c9fba23c84ccfb",
+    "v_outcome_coverage": "d84d077083b407775b678ba77f806f523ada3ddd1879821e0283bd8cc0195e33",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -172,13 +196,13 @@ EXPECTED_ORDER = [
     "v_run_log", "v_archive_health",
     "v_market_daily", "f_market_window", "f_market_summary",
     "v_universe", "v_universe_latest", "f_universe_return",
-    "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events", "f_symbol_pick",
+    "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events", "v_fx_sar", "f_symbol_pick",
     "v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
     "v_dive_signals", "v_dive_board", "v_dive_events",
-    "v_top10_insight", "v_portfolio_insight",
+    "v_top10_insight", "v_portfolio_insight", "v_outcome_coverage",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 4 + ["TABLE FUNCTION"] + ["VIEW"] * 9)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 10)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -749,7 +773,7 @@ def case_v18():
     assert abs(sum(present.values()) - 1.0) < 1e-9, present
     cuts = [float(x) for x in re.findall(r"WHEN r\.tfb_rating_score >= (\d+) THEN '", rating)]
     stars = [int(x) for x in re.findall(r"WHEN r\.tfb_rating_score >= \d+ THEN (\d)\n", rating)]
-    assert cuts == sorted(cuts, reverse=True) == [75, 60, 45, 30] and stars == [5, 4, 3, 2]
+    assert cuts == [75, 60, 45, 30] * 2 and stars == [5, 4, 3, 2]      # label and display agree
     assert "ELSE 'low'" in rating and "r.meets_floors THEN 'high'" in rating
     # the analyst consensus is recomputed from the counts, 5 = Strong Buy
     assert "SAFE_DIVIDE(5 * IFNULL(t.strong_buy, 0) + 4 * IFNULL(t.buy, 0)" in code["v_symbol_analyst"]
@@ -851,8 +875,161 @@ def case_v20():
     assert _window_last(rows, "PARTITION BY m.symbol ORDER BY m.date", True)[0] == 10.0
 
 
+def _fx_rules(code):
+    """The quote rules v_fx_sar applies, parsed from its SQL."""
+    import re
+    direct = re.search(r"REGEXP_EXTRACT\(symbol, r'\^\(\[A-Z\]\{3\}\)USD=X\$'\) AS ccy, price AS usd_per_unit, 'direct'", code)
+    inverse = re.search(r"REGEXP_EXTRACT\(symbol, r'\^\(\[A-Z\]\{3\}\)=X\$'\) AS ccy, 1 / price AS usd_per_unit, 'inverse'", code)
+    prefer = re.search(r"ORDER BY IF\(quote = 'direct', 0, 1\)\) = 1", code)
+    pence = re.search(r"r\.rate_to_sar / (\d+), CONCAT\('GBP/100 via ', r\.fx_source\)", code)
+    return direct, inverse, prefer, pence
+
+
+def _fx_table(quotes, prefer_direct=True, pence_div=100):
+    """What v_fx_sar makes of a Commodities_FX page: quotes is {symbol: price}."""
+    usd_sar = quotes.get("SAR=X")
+    to_usd = {}
+    for sym, px in quotes.items():
+        if sym.endswith("USD=X") and len(sym) == 8:
+            to_usd.setdefault(sym[:3], []).append(("direct", px))
+        elif sym.endswith("=X") and len(sym) == 5 and sym != "SAR=X":
+            to_usd.setdefault(sym[:3], []).append(("inverse", 1 / px))
+    rates = {"SAR": 1.0, "USD": usd_sar}
+    for ccy, cands in to_usd.items():
+        if ccy in ("SAR", "USD"):
+            continue
+        cands = sorted(cands, key=lambda c: 0 if (c[0] == "direct") == prefer_direct else 1)
+        rates[ccy] = cands[0][1] * usd_sar
+    if "GBP" in rates:
+        rates["GBX"] = rates["GBp"] = rates["GBP"] / pence_div
+    return rates
+
+
+def case_v21():
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_fx_sar"].template)
+    assert "source_page = 'Commodities_FX' AND asset_class = 'FX' AND current_price > 0" in code
+    assert set(bv._REF.findall(code)) - {"v_fx_sar"} == {"v_universe_latest"}, bv._REF.findall(code)
+    direct, inverse, prefer, pence = _fx_rules(code)
+    assert direct and inverse and prefer, "the dollar-cross rules"
+    assert pence and pence.group(1) == "100", "pence are a hundredth of a pound"
+    assert "WHERE symbol = 'SAR=X'" in code and "symbol != 'SAR=X'" in code
+    # the live page of 1 Nov 2026: a direct quote, an inverse quote, both, and pence
+    quotes = {"SAR=X": 3.7526, "GBPUSD=X": 1.3393, "HKDUSD=X": 0.12748, "HKD=X": 7.8442,
+              "EGP=X": 55.95, "AEDHKD=X": 2.13, "EURUSD=X": 1.11657}
+    t = _fx_table(quotes, prefer_direct=prefer is not None, pence_div=int(pence.group(1)))
+    assert t["USD"] == 3.7526 and t["SAR"] == 1.0
+    assert abs(t["GBP"] - 5.0259) < 1e-3 and abs(t["GBX"] - 0.050259) < 1e-5 and t["GBp"] == t["GBX"]
+    assert abs(t["HKD"] - 0.12748 * 3.7526) < 1e-6, "the direct quote wins over the inverse"
+    assert abs(t["EGP"] - 3.7526 / 55.95) < 1e-6, "an inverse-only quote"
+    assert "AED" not in t, "AEDHKD=X is not a dollar cross"
+    # golden: the inverse quote read as direct puts HKD at 29 riyals
+    wrong = _fx_table({k: v for k, v in quotes.items() if k != "HKDUSD=X"}, prefer_direct=True)
+    assert abs(wrong["HKD"] - 3.7526 / 7.8442) < 1e-6 and abs(t["HKD"] - wrong["HKD"]) < 1e-3
+
+
+def case_v22():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    code = {n: bv._code(objs[n].template) for n in objs}
+    rating = code["v_symbol_rating"]
+    # the gate names the engine verdict, in this order, and never reads the score
+    gate = re.search(r"CASE\n((?:(?!CASE\n).)*?)END AS rating_gate", rating, re.DOTALL).group(1)
+    arms = re.findall(r"WHEN (.*?) THEN '([^']+)'", gate)
+    assert [a[1] for a in arms] == ["blocked by the engine", "engine: do not invest", "engine: watch only",
+                                    "below the reliability / data-quality floors"], arms
+    assert "UPPER(r.investability_status) = 'BLOCKED'" in arms[0][0]
+    assert "UPPER(r.final_action) = 'DO_NOT_INVEST'" in arms[1][0]
+    assert "UPPER(r.final_action) = 'WATCH'" in arms[2][0]
+    assert "NOT IFNULL(r.meets_floors, FALSE)" in arms[3][0]
+    assert "ELSE 'none'" in gate and "tfb_rating_score" not in gate
+    # the display carries the label and the gate together
+    disp = re.search(r"CONCAT\(\n(.*?)\) AS tfb_rating_display", rating, re.DOTALL).group(1)
+    for part in ("' - blocked by the engine'", "' - engine: do not invest'", "' - engine: watch only'",
+                 "' - below the floors'", "ELSE 'No rating'"):
+        assert part in disp, part
+    # sources
+    assert "CONCAT('EODHD consensus, ', CAST(IFNULL(an.analysts, 0) AS STRING), ' analysts')" in rating
+    assert "THEN 'sheet analyst rating'" in rating and "ELSE 'no coverage'" in rating
+    assert "u.investability_status" in rating
+    # both insight views carry the gate, the display and the sources
+    for n in ("v_top10_insight", "v_portfolio_insight"):
+        for col in ("rt.rating_gate", "rt.tfb_rating_display", "rt.analyst_source", "rt.news_source"):
+            assert col in code[n], (n, col)
+    # the portfolio: riyal values for every holding, the decision page first, else the sheet x FX
+    pf = code["v_portfolio_insight"]
+    assert "LEFT JOIN `{{DS}}.v_fx_sar` AS fx ON fx.currency = h.currency" in pf
+    assert "COALESCE(d.market_value_sar, h.position_value * fx.rate_to_sar) AS value_sar" in pf
+    assert "COALESCE(d.cost_sar, h.position_cost * fx.rate_to_sar) AS cost_sar" in pf
+    assert "COALESCE(d.pnl_sar, (h.position_value - h.position_cost) * fx.rate_to_sar) AS pnl_sar" in pf
+    assert "ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2) AS weight_sar_pct" in pf
+    assert "ROUND(SAFE_DIVIDE(j.pnl_sar, j.cost_sar) * 100, 2) AS pnl_sar_pct" in pf
+    assert "WHEN d.market_value_sar IS NOT NULL THEN 'Portfolio_Decision'" in pf
+    assert "ELSE 'no rate for the currency'" in pf
+    # the Top-10: seat and allocation in plain words; a row without a ticket is research
+    t10 = code["v_top10_insight"]
+    assert "WHEN b.seat_rank IS NOT NULL THEN CONCAT('ranked seat ', CAST(b.seat_rank AS STRING))" in t10
+    assert "WHEN UPPER(b.stability_state) = 'GRACE' THEN 'grace, no seat'" in t10
+    assert "WHEN IFNULL(b.ticket_sar, 0) > 0 THEN CONCAT('ticket ', FORMAT('%.0f', b.ticket_sar), ' SAR')" in t10
+    assert "ELSE 'none - research board'" in t10
+    assert bv.check_objects(list(objs.values())) == []
+
+
+def _coverage(rows, now, win_over="scored", due_by="target", with_all=True):
+    """v_outcome_coverage on a small log: rows carry horizon, target (day), status,
+    call (WIN / LOSS / None). Returns {horizon: (due, matured, scored, wins, overdue, win_pct, share)}."""
+    out = {}
+    hs = sorted({r["horizon"] for r in rows})
+    groups = {h: [r for r in rows if r["horizon"] == h] for h in hs}
+    if with_all:
+        groups["ALL"] = rows
+    for h, rs in groups.items():
+        due = sum(1 for r in rs if (r["target"] <= now if due_by == "target" else True))
+        matured = sum(1 for r in rs if r["status"] == "matured")
+        scored = sum(1 for r in rs if r["status"] == "matured" and r["call"] in ("WIN", "LOSS"))
+        wins = sum(1 for r in rs if r["status"] == "matured" and r["call"] == "WIN")
+        overdue = sum(1 for r in rs if r["target"] <= now and r["status"] == "active")
+        denom = scored if win_over == "scored" else matured
+        out[h] = (due, matured, scored, wins, overdue,
+                  round(wins / denom * 100, 1) if denom else None,
+                  round(matured / due * 100, 1) if due else None)
+    return out
+
+
+def case_v23():
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_outcome_coverage"].template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_coverage"} == {"v_performance_log"}
+    assert "COUNTIF(target_at <= CURRENT_TIMESTAMP()) AS due" in code
+    assert "COUNTIF(is_matured) AS matured" in code and "COUNTIF(is_scored) AS scored" in code
+    assert "SUM(IFNULL(win_flag, 0)) AS wins" in code
+    assert "COUNTIF(target_at <= CURRENT_TIMESTAMP() AND status = 'active') AS overdue_open" in code
+    assert "ROUND(SAFE_DIVIDE(u.wins, u.scored) * 100, 1) AS win_pct" in code      # over decided calls
+    assert "ROUND(SAFE_DIVIDE(u.matured, u.due) * 100, 1) AS matured_share_pct" in code
+    assert "'ALL' AS horizon" in code and "MIN(oldest_overdue_target)" in code
+    assert "SELECT * FROM by_h\n  UNION ALL\n  SELECT * FROM all_h" in code       # the ALL row is published
+    assert "snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_performance_log`)" in code
+    rows = [{"horizon": "1W", "target": 1, "status": "matured", "call": "WIN"},
+            {"horizon": "1W", "target": 2, "status": "matured", "call": "LOSS"},
+            {"horizon": "1W", "target": 3, "status": "matured", "call": None},      # neutral tier
+            {"horizon": "1W", "target": 4, "status": "active", "call": None},       # overdue
+            {"horizon": "1W", "target": 9, "status": "active", "call": None},       # not due
+            {"horizon": "1M", "target": 2, "status": "active", "call": None},
+            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN"}]
+    c = _coverage(rows, now=5)
+    assert c["1W"] == (4, 3, 2, 1, 1, 50.0, 75.0), c["1W"]
+    assert c["1M"] == (2, 1, 1, 1, 1, 100.0, 50.0), c["1M"]
+    assert c["ALL"] == (6, 4, 3, 2, 2, 66.7, 66.7), c["ALL"]
+    # golden negatives: the rate over matured rows counts the neutral call as a loss; due
+    # without the target date is every record; no ALL row
+    assert _coverage(rows, now=5, win_over="matured")["1W"][5] == 33.3
+    assert _coverage(rows, now=5, due_by="all")["1W"][0] == 5
+    assert "ALL" not in _coverage(rows, now=5, with_all=False)
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
-         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20]
+         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
+         case_v22, case_v23]
 
 
 def test_v1(): case_v1()
@@ -875,6 +1052,9 @@ def test_v17(): case_v17()
 def test_v18(): case_v18()
 def test_v19(): case_v19()
 def test_v20(): case_v20()
+def test_v21(): case_v21()
+def test_v22(): case_v22()
+def test_v23(): case_v23()
 
 
 if __name__ == "__main__":
