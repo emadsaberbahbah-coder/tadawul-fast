@@ -2,8 +2,18 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.4.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.4.1 (program register C8, Phase 2)
 ================================================================================
+v1.4.1 (1 Nov 2026, review follow-up on #886): v_outcome_coverage counts
+scored calls and wins over the sheet's outcome cohort only (in_outcome_cohort:
+the first valid matured record per stable key, as track_performance's
+_summary_outcome_cohort counts them) and publishes matured_cohort and
+matured_excluded beside the raw matured count, so a key archived twice can
+never count twice in the win rate; v_portfolio_insight publishes
+weight_sar_pct only when every holding has a riyal value (NULL for all rows
+otherwise, with holdings_without_value saying how many), so a holding with no
+rate can no longer leave the others sharing 100 % of a partial book. No other
+object changes.
 v1.4.0 (1 Nov 2026, full review: data accuracy and honest presentation on the
 Looker pages). New: v_fx_sar (currency -> riyal from the Commodities_FX page)
 and v_outcome_coverage (how much of the Performance_Log has matured, per
@@ -95,7 +105,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

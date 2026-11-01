@@ -20,7 +20,8 @@
 -- the holding's own currency, are converted with v_fx_sar, and value_source
 -- says which. Before 1.4.0 the page totals left out any holding the
 -- decision page did not carry, and the sheet's position value mixed
--- currencies in one column.
+-- currencies in one column. 1.4.1: weight_sar_pct is NULL for every holding
+-- while any holding lacks a riyal value (holdings_without_value counts them).
 CREATE OR REPLACE VIEW `{{DS}}.v_portfolio_insight`
 OPTIONS (description = "TFB Looker v4: the latest holdings with riyal values for every holding, the portfolio decision, market-page evidence, events, 7-day news, the TFB rating with its gate and plain-word caution flags")
 AS
@@ -164,7 +165,13 @@ j AS (
 SELECT
   j.* EXCEPT (flags),
   ROUND(SAFE_DIVIDE(j.pnl_sar, j.cost_sar) * 100, 2) AS pnl_sar_pct,
-  ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2) AS weight_sar_pct,
+  -- 1.4.1: a weight is a share of the WHOLE book. When any holding has no riyal
+  -- value (no decision row and no rate for its currency) every weight is NULL,
+  -- and holdings_without_value says how many, instead of publishing shares of
+  -- the valued subset as if they were portfolio weights.
+  IF(COUNTIF(j.value_sar IS NULL) OVER () > 0, NULL,
+     ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2)) AS weight_sar_pct,
+  COUNTIF(j.value_sar IS NULL) OVER () AS holdings_without_value,
   ARRAY_TO_STRING(j.flags, ' · ') AS caution_flags,
   ARRAY_LENGTH(j.flags) AS caution_count
 FROM j;
