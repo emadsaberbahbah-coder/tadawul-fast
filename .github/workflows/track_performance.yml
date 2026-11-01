@@ -1,5 +1,40 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT
+# WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve today,
+# results tomorrow"): Performance_Log holds 13,856 active forecast records
+# (1,376 symbols), 5,759 of them overdue, and the learning loop matures only a
+# trickle. The outcome receipts of the 31 Oct 22:54 audit: about 3,250 records
+# 'quote_session_unknown;quote_rate_limit_breaker' (SR 1,490, US 1,003, HK
+# 445), about 1,450 'quote_outside_target_session' (US 1,039), about 250 with
+# no receipt, about 100 'outcome_calendar_unknown', 43
+# 'target_session_not_complete'. The audit prices EVERY active symbol, so the
+# Yahoo fallback's breaker trips before the due symbols are reached, and both
+# audit slots (11:47Z / 15:47Z, delivered 4-6 h late) land inside the US
+# session, so a US record can only mature through the v6.47.0 historical
+# target-session close path, whose yfinance pulls carry a 60-symbol budget.
+# WHAT: (1) a THIRD schedule slot '30 1 * * *' (04:30 Riyadh), after the US
+# close (21:00 UTC since US DST ended on 1 Nov 2026): a quote taken then
+# belongs to the target session, so 'quote_outside_target_session' stops for
+# US records whose target session was that day. Both earlier slots stay. The
+# scheduled-audit condition below (TRACK_SCHEDULED_AUDIT=1 together with
+# TRACK_DEDUP_MATURED observe | enforce) already applies to EVERY scheduled
+# run, the new slot included; a record-only schedule stays record-only.
+# (2) the 'Run performance clock' step maps track_performance v6.53.0's two
+# gates, both default off: TRACK_HIST_CLOSE_SOURCE (default 'yfinance' = the
+# v6.47.0 pull; 'bq_archive' reads the target-session close from BigQuery
+# tfb_archive.symbol_bars_daily in ONE query per audit pass;
+# 'bq_archive_then_yfinance' falls back per symbol) and TRACK_AUDIT_DUE_ONLY
+# (default '0'; '1' prices only the symbols with a due record, oldest target
+# first). The archive read needs TFB_BQ_PROJECT / TFB_BQ_DATASET /
+# TFB_BQ_LOCATION (the bq_*.yml pattern) and the existing
+# GOOGLE_SHEETS_CREDENTIALS. daily_sync's tracker step maps the same five
+# (ENV PARITY). The v6.47.0 gate itself stays mapped in this lane only.
+# ARMING (owner, one Variable per evidence run): TRACK_HIST_CLOSE_SOURCE=
+# bq_archive with TRACK_HIST_TARGET_CLOSE=observe for one audit, then
+# enforce; TRACK_AUDIT_DUE_ONLY=1 after one observed pass.
+# Rollback: unset TRACK_HIST_CLOSE_SOURCE and TRACK_AUDIT_DUE_ONLY (or set
+# yfinance / 0); the third cron line can be removed on its own.
 # VERSION 1.0.6 (2026-10-25) -- PERFORMANCE_LOG READ PRECISION (OWNER OPT-IN)
 # WHY (2026-10-25): track_performance read Performance_Log as formatted text
 # (about 10 significant digits), so canonical v2 1W/2W targets (an
@@ -127,6 +162,11 @@ on:
   schedule:
     - cron: "47 11 * * *"   # 14:47 Riyadh - after the Tadawul close
     - cron: "47 15 * * *"   # 18:47 Riyadh - backstop before Riyadh midnight
+    # (2026-11-02) 1.0.7: a slot AFTER the US close, so a US record's own
+    # target session can be audited with a quote from that session (see the
+    # header). Keyed to the next Riyadh day like any post-21:00Z run; the
+    # record leg is idempotent per Riyadh day, the audit leg is the point.
+    - cron: "30 1 * * *"   # 04:30 Riyadh - after the US close (21:00 UTC since US DST ended 1 Nov 2026)
 
   # Manual trigger — use this to START THE CLOCK immediately and to verify the
   # wiring without waiting for 14:00 UTC.
@@ -327,6 +367,23 @@ jobs:
           TRACK_HIST_TARGET_CLOSE: ${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}
           TRACK_HIST_CLOSE_BUDGET: ${{ vars.TRACK_HIST_CLOSE_BUDGET || '60' }}
           TRACK_HIST_CLOSE_TIME_SEC: ${{ vars.TRACK_HIST_CLOSE_TIME_SEC || '240' }}
+          # (2026-11-02) 1.0.7: track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY].
+          # TRACK_HIST_CLOSE_SOURCE: 'yfinance' (default) = the v6.47.0 pull;
+          # 'bq_archive' reads the target-session close from BigQuery
+          # tfb_archive.symbol_bars_daily in ONE query per audit pass (receipts
+          # carry provider 'bq_archive_bar'); 'bq_archive_then_yfinance' falls
+          # back per symbol. It only acts while the gate above is observe or
+          # enforce. TRACK_AUDIT_DUE_ONLY: '0' (default) prices every active
+          # symbol; '1' prices only the symbols with a due record, oldest target
+          # first (one '[v6.53.0 DUE-ONLY]' job-log line). The TFB_BQ_* trio is
+          # the bq_*.yml pattern; the archive's service account is the existing
+          # GOOGLE_SHEETS_CREDENTIALS below. Mirrored VERBATIM in daily_sync.yml's
+          # tracker step (ENV PARITY). ROLLBACK: unset (or yfinance / 0).
+          TRACK_HIST_CLOSE_SOURCE: ${{ vars.TRACK_HIST_CLOSE_SOURCE || 'yfinance' }}
+          TRACK_AUDIT_DUE_ONLY: ${{ vars.TRACK_AUDIT_DUE_ONLY || '0' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
