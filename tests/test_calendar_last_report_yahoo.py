@@ -3,39 +3,56 @@
 (TFB_CAL_LAST_REPORT_YAHOO, default off = v1.3.2 byte for byte).
 
 WHY (2026-11-01): fetch_last_earnings_map skips every KSA symbol (EODHD has
-no Saudi coverage) and no Yahoo path reads PAST reports, so a Saudi holding
-(2222.SR) never gets a Last Earnings Date on Calendar_Events and the
+no Saudi coverage) and no Yahoo path reads PAST reports, so a Saudi name
+such as 2222.SR never gets a Last Earnings Date on Calendar_Events and the
 post-earnings quarantine (16_Decision_Top10 v1.18.0 tag, 10_My_Portfolio
-PD_POST_EARN / D1b) cannot hold it. v1.4.0 fills the KSA rows' last report
-from yfinance get_earnings_dates when the gate is on.
+PD_POST_EARN / D1b) cannot hold a KSA seat or ADD candidate. v1.4.0 fills
+the KSA rows' last report from yfinance get_earnings_dates when the gate is
+on.
 
 REAL module; the only stubs are the EODHD HTTP seam (_get_json), the clock
-(_today), is_enabled, and yfinance (a duck-typed Ticker / frame; one case
-uses a real pandas frame when pandas is installed). No network.
+(_today), is_enabled, and yfinance (a duck-typed Ticker / frame; Y12 builds
+its frame with the REAL yfinance get_earnings_dates parser from a canned
+calendar page when yfinance is installed). No network.
 
 Y1   off (unset / off / 0 / blank / junk): results, EODHD requests, zero
      yfinance calls and log lines equal the untouched v1.3.2 (4c2bd640), on a
      mixed list and on a KSA-only list
 Y2   on, mixed list: 2222.SR gets the LATEST earnings row in the window
-     (future, older-than-window, today and meeting rows ignored); the US rows
-     and the EODHD requests equal the off run; 'source' only on KSA rows
+     (the future row, the meeting row and the older in-window row are not
+     taken; the window edges are Y13's); the US rows and the EODHD requests
+     equal the off run; 'source' only on KSA rows; the summary line
 Y3   on, KSA-only list (a bare 4-digit code too): filled with no EODHD
      request; the bare code is asked as '<code>.SR'
-Y4   dates: tz-aware timestamps are taken in Riyadh time; naive datetime,
-     date and text forms
+Y4   dates on the forward tier's basis: a tz-aware timestamp's own calendar
+     date (23:00 New York stays that New York day), naive, date, text, NaT
 Y5   surprise: Surprise(%) wins (rounded 0.1); else (actual - estimate) /
      |estimate|; estimate 0 or no actual -> None; NaN is not a number
 Y6   a rate-limit exception is counted (throttled=1) and drops only that
-     symbol; any other error drops only that symbol, uncounted; never raises
-Y7   yfinance not importable: one INFO line, the EODHD rows unchanged
+     symbol; any other error drops only that symbol (errors=1); never raises
+Y7   yfinance not importable: one line, the EODHD rows unchanged
 Y8   a per-symbol timeout drops only that symbol
 Y9   fill-only: a row already in the map is never overwritten
 Y10  Event Type: 'Earnings' / 'Call' and the raw codes 2 / 1 (also 2.0)
-     count; 'Meeting' / 11 never; absent or NaN counts
+     count; 'Meeting' / 11 never; absent or NaN counts. Event Name: a name
+     reading as a meeting (meeting, assembly, AGM, EGM) never counts
 Y11  end to end with the REAL run_calendar_sync merge_last_report and
-     last_report_cells: the 2222.SR row reads '2026-11-03 | 2 | -6.5'
-Y12  a real pandas frame shaped like yfinance 0.2.66 (tz-aware index, raw
-     integer event codes) - skipped without pandas
+     last_report_cells: the 2222.SR row reads '2026-11-02 | 3 | -6.5'
+Y12  the REAL yfinance get_earnings_dates parser (cache_get canned, no
+     network) on a calendar page with and without an Event Name column: on
+     0.2.66 no Event Type column and a New York index; a later meeting row
+     never replaces the report - skipped without yfinance
+Y13  window edges [today - 21, today - 1]: today out, yesterday in, the
+     start day in, the day before it out; only out-of-window rows -> None
+Y14  hand-off: over consecutive syncs the same New York evening row is in
+     Next Earnings Date (REAL _yf_earnings_dates_future) or in Last Earnings
+     Date on every day - no day in neither
+Y15  with no logging configured (run_calendar_sync), the summary and the
+     yfinance-missing lines reach stderr once; with an INFO handler they go
+     to the logger only
+Y16  a row with EPS figures beats a later call or unnamed no-figure row
+     (at most 21 days on); further on, or with no figured row, the latest
+     row wins (a newer report not filled in yet is not lost)
 G1   golden negative: Y2, Y3 and Y11 fail on the untouched v1.3.2 with the
      gate on (2222.SR stays absent)
 V1   version floor, verifier pin, calendar_sync step env maps the gate with
@@ -142,12 +159,12 @@ def er(when, est=None, rep=None, sur=None, kind="Earnings"):
 
 ARAMCO = Frame([
     er(dt.datetime(2027, 2, 10, 7, 0, tzinfo=RIYADH), est=0.5),                 # future
-    er(dt.datetime(2026, 11, 2, 23, 30, tzinfo=NY), est=0.46, rep=0.43),        # = 3 Nov Riyadh
+    er(dt.datetime(2026, 11, 2, 23, 30, tzinfo=NY), est=0.46, rep=0.43),        # 3 Nov Riyadh; NY date
     er(dt.datetime(2026, 10, 28, 10, 0, tzinfo=RIYADH), kind="Meeting"),        # not a report
     er(dt.datetime(2026, 10, 20, 7, 0, tzinfo=RIYADH), est=0.4, rep=0.44, sur=10.04),  # older, in window
     er(dt.datetime(2026, 8, 4, 7, 0, tzinfo=RIYADH), est=0.48, rep=0.5, sur=4.2),     # outside
 ])
-ARAMCO_ROW = {"last_earnings_date": "2026-11-03", "eps_surprise_pct": -6.5, "eps_actual": 0.43,
+ARAMCO_ROW = {"last_earnings_date": "2026-11-02", "eps_surprise_pct": -6.5, "eps_actual": 0.43,
               "eps_estimate": 0.46, "report_timing": None, "source": "yahoo_earnings_dates"}
 
 
@@ -248,7 +265,7 @@ def check_y2(mod, monkeypatch, caplog):
     assert all("source" not in v for k, v in out.items() if k != "2222.SR")
     assert calls == off_calls and ycalls == [("2222.SR", 12)]
     assert (logging.INFO, "[calendar_provider vV] last-report yahoo fill: 1 of 1 KSA "
-                          "(throttled=0): 2222.SR") in logs
+                          "(throttled=0, errors=0): 2222.SR") in logs
 
 
 def check_y3(mod, monkeypatch, caplog):
@@ -264,7 +281,7 @@ def check_y11(mod, monkeypatch, caplog):
     merged, n_fresh, n_carried = sync.merge_last_report(MIXED, out, {}, 21)
     assert n_fresh == 3 and n_carried == 0, (n_fresh, n_carried)
     cells = sync.last_report_cells("2222.SR", merged)
-    assert cells[0] == "2026-11-03" and cells[2] == -6.5, cells
+    assert cells[0] == "2026-11-02" and cells[1] == 3 and cells[2] == -6.5, cells
     assert sync.last_report_cells("FRST.US", merged)[2] == -22.2
 
 
@@ -277,17 +294,24 @@ def test_y3_on_ksa_only_list(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("when,want", [
-    (dt.datetime(2026, 11, 2, 23, 30, tzinfo=NY), dt.date(2026, 11, 3)),
-    (dt.datetime(2026, 11, 2, 20, 59, tzinfo=dt.timezone.utc), dt.date(2026, 11, 2)),
-    (dt.datetime(2026, 11, 2, 21, 0, tzinfo=dt.timezone.utc), dt.date(2026, 11, 3)),
+    (dt.datetime(2026, 11, 2, 23, 30, tzinfo=NY), dt.date(2026, 11, 2)),
+    (dt.datetime(2026, 11, 2, 21, 0, tzinfo=dt.timezone.utc), dt.date(2026, 11, 2)),
+    (dt.datetime(2026, 11, 3, 1, 0, tzinfo=RIYADH), dt.date(2026, 11, 3)),
     (dt.datetime(2026, 11, 2, 23, 30), dt.date(2026, 11, 2)),
     (dt.date(2026, 11, 2), dt.date(2026, 11, 2)),
     ("2026-11-02 07:00:00+03:00", dt.date(2026, 11, 2)),
     ("garbage", None),
     (None, None),
 ])
-def test_y4_dates_are_riyadh_dates(when, want):
+def test_y4_dates_on_the_forward_tier_basis(when, want):
     assert CP._yf_report_date(when) == want
+
+
+def test_y4b_nat_is_no_date():
+    pd = pytest.importorskip("pandas")
+    assert CP._yf_report_date(pd.NaT) is None
+    assert CP._yf_report_date(pd.Timestamp("2026-11-02 23:00", tz="America/New_York")) == \
+        dt.date(2026, 11, 2)
 
 
 @pytest.mark.parametrize("rep,est,sur,want", [
@@ -313,7 +337,7 @@ def test_y6_throttle_counted_other_errors_dropped(monkeypatch, caplog):
     out, _c, _y, logs = _run(CP, monkeypatch, caplog, ["2222.SR", "5110.SR", "4321.SR"], "on", yf)
     assert out == {"2222.SR": ARAMCO_ROW}
     assert (logging.INFO, "[calendar_provider vV] last-report yahoo fill: 1 of 3 KSA "
-                          "(throttled=1): 2222.SR") in logs
+                          "(throttled=1, errors=1): 2222.SR") in logs
 
 
 def test_y7_yfinance_missing(monkeypatch, caplog):
@@ -356,20 +380,158 @@ def test_y10_event_type(monkeypatch, kind, counts):
     assert row["last_earnings_date"] == ("2026-11-03" if counts else "2026-10-20"), (kind, row)
 
 
+@pytest.mark.parametrize("name,counts", [
+    ("Q3 2026 Earnings Release", True), ("Saudi Arabian Oil Co Earnings Call", True),
+    (NAN, True), (None, True),
+    ("Saudi Arabian Oil Co Annual General Meeting", False),
+    ("Extraordinary General Assembly", False), ("AGM", False), ("2026 EGM", False),
+    ("Shareholders' Meeting", False),
+])
+def test_y10b_event_name(monkeypatch, name, counts):
+    first = er(dt.datetime(2026, 11, 3, 7, 0, tzinfo=RIYADH), est=0.46, rep=0.43, kind=None)
+    if name is not None:
+        first[1]["Event Name"] = name
+    frame = Frame([first,
+                   er(dt.datetime(2026, 10, 20, 7, 0, tzinfo=RIYADH), est=0.4, rep=0.44, sur=10.04)])
+    monkeypatch.setattr(CP, "_yf", FakeYF({"2222.SR": frame}))
+    row = CP._yf_earnings_dates_past("2222.SR", dt.date(2026, 10, 15), dt.date(2026, 11, 4))
+    assert row["last_earnings_date"] == ("2026-11-03" if counts else "2026-10-20"), (name, row)
+
+
 def test_y11_end_to_end_sync_cells(monkeypatch, caplog):
     check_y11(CP, monkeypatch, caplog)
 
 
-def test_y12_real_pandas_frame(monkeypatch, caplog):
-    pd = pytest.importorskip("pandas")
-    idx = pd.DatetimeIndex([pd.Timestamp("2027-02-10 07:00", tz="Asia/Riyadh"),
-                            pd.Timestamp("2026-11-03 07:30", tz="Asia/Riyadh"),
-                            pd.Timestamp("2026-10-28 10:00", tz="Asia/Riyadh"),
-                            pd.Timestamp("2026-08-04 07:00", tz="Asia/Riyadh")], name="Earnings Date")
-    df = pd.DataFrame({"EPS Estimate": [0.5, 0.46, NAN, 0.48], "Reported EPS": [NAN, 0.43, NAN, 0.5],
-                       "Surprise(%)": [NAN, NAN, NAN, 4.2], "Event Type": [2, 2, 11, 2]}, index=idx)
+_PAGE_ROWS = [   # (Event Name, Earnings Date, EPS Estimate, Reported EPS, Surprise (%))
+    ("Q4 2026 Earnings Release", "February 9, 2027 at 11 PM EST", "0.5", "-", "-"),
+    ("Saudi Arabian Oil Co Extraordinary General Meeting", "November 4, 2026 at 3 AM EST",
+     "-", "-", "-"),
+    ("Q3 2026 Earnings Release", "November 2, 2026 at 11 PM EST", "0.46", "0.43", "-6.52"),
+    ("Q2 2026 Earnings Release", "August 3, 2026 at 11 PM EDT", "0.48", "0.5", "4.2"),
+]
+
+
+def _page(with_name):
+    head = ["Symbol", "Company"] + (["Event Name"] if with_name else []) + [
+        "Earnings Date", "EPS Estimate", "Reported EPS", "Surprise (%)"]
+    body = []
+    for name, when, est, rep_, sur in _PAGE_ROWS:
+        cells = ["2222.SR", "Saudi Arabian Oil Co"] + ([name] if with_name else []) + [
+            when, est, rep_, sur]
+        body.append("<tr>" + "".join("<td>%s</td>" % c for c in cells) + "</tr>")
+    return ("<html><body><table><thead><tr>" + "".join("<th>%s</th>" % h for h in head)
+            + "</tr></thead><tbody>" + "".join(body) + "</tbody></table></body></html>")
+
+
+def _real_parser_frame(with_name):
+    yf = pytest.importorskip("yfinance")
+    pytest.importorskip("pandas")
+
+    class _Resp:
+        text = _page(with_name)
+    t = yf.Ticker("2222.SR")
+    t._data.cache_get = lambda *_a, **_k: _Resp()      # the only seam: no network
+    return yf, t.get_earnings_dates(limit=12)
+
+
+@pytest.mark.parametrize("with_name", [True, False])
+def test_y12_real_yfinance_parser_frame(monkeypatch, caplog, with_name):
+    yf, df = _real_parser_frame(with_name)
+    if yf.__version__ == "0.2.66":                    # requirements.txt pin
+        assert "Event Type" not in df.columns and str(df.index.tz) == "America/New_York"
+        assert ("Event Name" in df.columns) is with_name
     out, _c, _y, _l = _run(CP, monkeypatch, caplog, KSA_ONLY, "on", FakeYF({"2222.SR": df}))
-    assert out == {"2222.SR": ARAMCO_ROW}, out
+    want = dict(ARAMCO_ROW, eps_actual=0.43, eps_estimate=0.46)
+    assert out == {"2222.SR": want}, out
+
+
+@pytest.mark.parametrize("offsets,want", [   # days from TODAY (2026-11-05)
+    ((0, -1, -16), "2026-11-04"),       # today out, yesterday in and latest
+    ((97, -93), None),                  # a future row and one long past only
+    ((-21,), "2026-10-15"),             # the start day is in
+    ((-22,), None),                     # the day before it is out
+    ((0,), None),                       # today only
+])
+def test_y13_window_edges(monkeypatch, caplog, offsets, want):
+    frame = Frame([er(dt.datetime.combine(TODAY + dt.timedelta(days=n), dt.time(7, 0), RIYADH),
+                      est=0.4, rep=0.44, sur=10.0) for n in offsets])
+    monkeypatch.setattr(CP, "_yf", FakeYF({"2222.SR": frame}))
+    row = CP._yf_earnings_dates_past("2222.SR", dt.date(2026, 10, 15), dt.date(2026, 11, 4))
+    assert (row or {}).get("last_earnings_date") == want, (offsets, row)
+    out, _c, _y, _l = _run(CP, monkeypatch, caplog, ["2222.SR"], "on", FakeYF({"2222.SR": frame}))
+    assert (out.get("2222.SR") or {}).get("last_earnings_date") == want, (offsets, out)
+
+
+def test_y14_next_to_last_hand_off_has_no_gap(monkeypatch, caplog):
+    frame = Frame([er(dt.datetime(2027, 2, 9, 23, 0, tzinfo=NY), est=0.5),
+                   er(dt.datetime(2026, 11, 2, 23, 0, tzinfo=NY), est=0.46, rep=0.43, kind=None)])
+    seen = []
+    for day in (1, 2, 3, 4):
+        today = dt.date(2026, 11, day)
+        yf = FakeYF({"2222.SR": frame})
+        _prep(CP, monkeypatch, yf, "on")
+        monkeypatch.setattr(CP, "_today", lambda today=today: today)
+        nxt = CP._yf_earnings_dates_future("2222.SR")
+        last = (CP.fetch_last_earnings_sync(["2222.SR"]).get("2222.SR") or {}).get(
+            "last_earnings_date")
+        in_next = nxt == dt.date(2026, 11, 2)
+        in_last = last == "2026-11-02"
+        seen.append((day, in_next, in_last))
+        assert in_next != in_last, seen
+    assert seen == [(1, True, False), (2, True, False), (3, False, True), (4, False, True)], seen
+
+
+def test_y15_summary_reaches_stderr_without_logging(monkeypatch, capsys, caplog):
+    real = CP.logger
+    bare = logging.getLogger("tfb.test.calendar_provider.bare")
+    bare.handlers, bare.propagate = [], False
+    bare.setLevel(logging.WARNING)
+    monkeypatch.setattr(CP, "logger", bare)
+    out, _c, _y, _l = _run(CP, monkeypatch, caplog, MIXED, "on")
+    err = capsys.readouterr().err.replace("v" + CP.__version__, "vV")
+    assert out["2222.SR"] == ARAMCO_ROW
+    assert err.splitlines().count("[calendar_provider vV] last-report yahoo fill: 1 of 1 KSA "
+                                  "(throttled=0, errors=0): 2222.SR") == 1, err
+    _prep(CP, monkeypatch, None, "on")
+    CP.fetch_last_earnings_sync(MIXED)
+    err = capsys.readouterr().err.replace("v" + CP.__version__, "vV")
+    assert err.splitlines() == ["[calendar_provider vV] last-report yahoo fill unavailable "
+                                "(yfinance not importable) - 1 KSA symbol(s) stay blank"], err
+    monkeypatch.setattr(CP, "logger", real)
+    _run(CP, monkeypatch, caplog, ["2222.SR"], "on")
+    assert "last-report yahoo fill" not in capsys.readouterr().err   # handler present: logger only
+
+
+@pytest.mark.parametrize("rows,want,sur", [
+    ([er(dt.datetime(2026, 11, 3, 7, 0, tzinfo=RIYADH), est=0.46, kind="Call"),
+      er(dt.datetime(2026, 11, 2, 7, 0, tzinfo=RIYADH), est=0.46, rep=0.43, kind="Earnings")],
+     "2026-11-02", -6.5),
+    ([er(dt.datetime(2026, 11, 4, 3, 0, tzinfo=NY), kind=None),
+      er(dt.datetime(2026, 11, 2, 23, 0, tzinfo=NY), est=0.46, rep=0.43, kind=None)],
+     "2026-11-02", -6.5),
+    ([er(dt.datetime(2026, 11, 3, 7, 0, tzinfo=RIYADH), est=0.46, sur=-6.52, kind=None),
+      er(dt.datetime(2026, 10, 20, 7, 0, tzinfo=RIYADH), est=0.4, rep=0.44, kind=None)],
+     "2026-11-03", -6.5),
+    ([er(dt.datetime(2026, 11, 3, 7, 0, tzinfo=RIYADH), est=0.46, kind=None),
+      er(dt.datetime(2026, 10, 1, 7, 0, tzinfo=RIYADH), est=0.4, rep=0.44, kind=None)],
+     "2026-11-03", None),
+])
+def test_y16_a_row_with_figures_beats_a_later_one_without(monkeypatch, rows, want, sur):
+    monkeypatch.setattr(CP, "_yf", FakeYF({"2222.SR": Frame(rows)}))
+    row = CP._yf_earnings_dates_past("2222.SR", dt.date(2026, 10, 15), dt.date(2026, 11, 4))
+    assert (row["last_earnings_date"], row["eps_surprise_pct"]) == (want, sur), row
+
+
+@pytest.mark.parametrize("gap,want", [(21, "2026-10-14"), (22, "2026-11-04"), (92, "2026-11-04")])
+def test_y16b_a_newer_report_without_figures_is_not_lost(monkeypatch, gap, want):
+    # TFB_CALENDAR_DAYS_BACK can reach 120: last quarter's figured row must not
+    # beat a report filed yesterday whose figures Yahoo has not filled in yet.
+    rows = [er(dt.datetime(2026, 11, 4, 7, 0, tzinfo=RIYADH), est=0.46, kind=None),
+            er(dt.datetime.combine(dt.date(2026, 11, 4) - dt.timedelta(days=gap), dt.time(7, 0),
+                                   RIYADH), est=0.4, rep=0.44, kind=None)]
+    monkeypatch.setattr(CP, "_yf", FakeYF({"2222.SR": Frame(rows)}))
+    row = CP._yf_earnings_dates_past("2222.SR", dt.date(2026, 7, 7), dt.date(2026, 11, 4))
+    assert row["last_earnings_date"] == want, (gap, row)
 
 
 # ------------------------------------------------------------- NEVER -------
