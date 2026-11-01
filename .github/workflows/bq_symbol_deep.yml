@@ -1,6 +1,27 @@
 # =============================================================================
 # 🔬 BigQuery Symbol Deep Data — candles, analyst consensus, per-symbol news
 # =============================================================================
+# VERSION 1.1.0 (2026-11-02) -- OUTCOME BARS (OWNER OPT-IN, default off)
+# WHY (owner, 2 Nov 00:13 Riyadh: "improve today, results tomorrow"): the
+#       BigQuery outcome engine (views 1.5.0) scores every overdue forecast
+#       record of v_performance_log from symbol_bars_daily, but only 164 of
+#       the 1,376 symbols with active records have bars (the deep set is the
+#       holdings, the board and the ROI leaders), so it can score about 30 %
+#       of the 5,759 overdue records.
+# WHAT: scripts/archive_symbol_deep.py v1.1.0 adds every symbol with an
+#       active Performance_Log record to the BARS load only (set_reason
+#       'outcome', at most 1,600, best effort: read after the deep set, never
+#       counted in the 80 % rule, never a reason to fail, one WRITE_TRUNCATE
+#       load of deep + outcome rows). They never enter the core set, so the
+#       EODHD loads and their budget guard are untouched.
+# GATE: the dispatch input outcome_bars (default false) arms it for one run;
+#       the repository Variable TFB_DEEP_OUTCOME_BARS=on arms the 00:20 UTC
+#       schedule (default off = 1.0.0 behaviour). Rollback: unset the
+#       Variable (or set it off); the next run replaces the table with the
+#       deep set alone.
+# PACE: about 1,500 symbols are 12-15 minutes on top of the deep set's 3;
+#       the script stops asking for the outcome set after 25 minutes, so the
+#       45-minute timeout below stays.
 # VERSION 1.0.0 (2026-10-31) -- program register C8, Phase 3 (the My
 #       Portfolio, Top-10 and symbol deep-dive pages of the Looker Studio
 #       report, owner request 31 Oct).
@@ -56,6 +77,11 @@ on:
           - bars
           - analyst
           - news
+      outcome_bars:
+        description: "Also load bars for every symbol with an active Performance_Log record (gate TFB_DEEP_OUTCOME_BARS)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -99,6 +125,9 @@ jobs:
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           TFB_BQ_DEEP: ${{ vars.TFB_BQ_DEEP || 'on' }}
           TFB_DEEP_EODHD: ${{ vars.TFB_DEEP_EODHD || 'on' }}
+          # 1.1.0: a dispatch with outcome_bars=true arms the outcome set for
+          # that run; the schedule follows the repository Variable (default off).
+          TFB_DEEP_OUTCOME_BARS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.outcome_bars == 'true' && 'on' || vars.TFB_DEEP_OUTCOME_BARS || 'off' }}
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: "US"
