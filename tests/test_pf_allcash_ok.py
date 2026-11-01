@@ -193,9 +193,10 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     text = GAS.read_text(encoding="utf-8")
     # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
     # 2026-10-28: v1.5.17 (post-earnings inputs) stacks on top; pin moved again
-    assert " * Version: 1.5.17\n" in text and "var PD_VERSION = '1.5.17';" in text
+    # 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on top; pin moved
+    assert " * Version: 1.5.18\n" in text and "var PD_VERSION = '1.5.18';" in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
-    assert "var PD_VERSION = '1.5.16';" not in text
+    assert "var PD_VERSION = '1.5.16';" not in text and "var PD_VERSION = '1.5.17';" not in text
     assert "\r" not in text
     now = set(_top_level_functions(text))
     base = set(golden["functions"])
@@ -203,14 +204,22 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     assert base <= now, sorted(base - now)
     # 2026-10-26: v1.5.16 (evidence publication) adds eight pdIbkr* functions on top of this change
     # 2026-10-28: v1.5.17 (post-earnings inputs) adds four pdPostEarn* functions
-    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdIbkrArmFollowUp_", "pdIbkrEvidenceFollowUp",
-                                  "pdIbkrFollowUpCore_", "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
-                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_", "pdPostEarnBody_", "pdPostEarnCore_",
-                                  "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]
+    # 2026-11-02: v1.5.18 adds thirteen pdCashSnap* and seven pdIbkrRetry* / retry follow-up functions
+    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
+                                  "pdCashSnapCoreOk_", "pdCashSnapHeaderMap_", "pdCashSnapLastKnownNote_",
+                                  "pdCashSnapMode_", "pdCashSnapRead_", "pdCashSnapRiyadh_", "pdCashSnapRow_",
+                                  "pdCashSnapSheetState_", "pdCashSnapStampMs_", "pdCashSnapTailScan_",
+                                  "pdCashSnapToken_", "pdIbkrArmFollowUp_", "pdIbkrArmRetry_",
+                                  "pdIbkrEvidenceFollowUp", "pdIbkrEvidenceFollowUpRetry", "pdIbkrFollowUpCore_",
+                                  "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
+                                  "pdIbkrRemoveFollowUp_", "pdIbkrRemoveRetry_", "pdIbkrRetryAfterSkip_",
+                                  "pdIbkrRetryCore_", "pdIbkrRetryMode_", "pdIbkrRetryState_", "pdIbkrRunLog_",
+                                  "pdPostEarnBody_", "pdPostEarnCore_", "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
     # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259
+    # 2026-11-02: + 708 lines for v1.5.18 (cash snapshot writer, last-known cash, follow-up retry)
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708
 
 
 def test_added_lines_are_es5_and_ascii(base_source):
