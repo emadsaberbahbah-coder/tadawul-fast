@@ -227,9 +227,9 @@ INSTALLED = {
 # bodies in INFORMATION_SCHEMA (then they move to INSTALLED). Installed body
 # v_outcome_coverage replaces: ab308c8c736d (1.4.1).
 PENDING = {
-    "v_outcome_engine": "88cc43d1b106f18d35bb3bf84c06709a9c05072732220f8edcdadf974dec41b6",
+    "v_outcome_engine": "a7f75e0528a36bed30147611165696df9f8074f4c2551d96dc0e83b9d8f71d62",
     "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
-    "v_board_archive": "ba1e819b16e03ea78ab761b7e58a79f9c5d772d93c1f582ea0b6a481f0b6a488",
+    "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
     "v_outcome_coverage": "341bd1f3a44d5d35e88c309a3f3a6ac6dd6e4678d640843c373fddad87447f31",
 }
 EXPECTED_ORDER = [
@@ -1117,12 +1117,13 @@ def _first_on_or_after(bars, day, within=None):
 
 
 def _engine(records, bars, today, window_days=7, later_session=False, bearish_inverted=True,
-            score_hold=False, dedupe=True):
+            score_hold=False, dedupe=True, entry_day_bar=False):
     """v_outcome_engine on a small log. records: id, key, symbol, stance, entry, target_price,
     recorded (day), target (session day), status, sheet_call; bars: symbol, date, high, low,
     close. Returns {id: row}. Golden switches: later_session accepts a bar past the window,
     bearish_inverted=False scores a bearish fall as a loss, score_hold scores HOLD, dedupe=False
-    counts every scored copy of a key in the cohort."""
+    counts every scored copy of a key in the cohort, entry_day_bar=True lets the recording
+    day's own bar into the excursions (Codex P2 on #891: a target touched by that morning's high)."""
     out = {}
     by_sym = {}
     for b in bars:
@@ -1157,7 +1158,8 @@ def _engine(records, bars, today, window_days=7, later_session=False, bearish_in
                 row["state"] = "no_bar_at_target"
         if sb and r["entry"]:
             tb = _first_on_or_after(sb, r["target"], window_days)
-            win = [b for b in sb if r["recorded"] <= b["date"] < r["target"]] + ([tb] if tb else [])
+            lo = r["recorded"] if entry_day_bar else r["recorded"] + 1
+            win = [b for b in sb if lo <= b["date"] < r["target"]] + ([tb] if tb and tb["date"] >= lo else [])
             if win:
                 row["mfe"] = round((max(b["high"] for b in win) / r["entry"] - 1) * 100, 4)
                 row["mae"] = round((min(b["low"] for b in win) / r["entry"] - 1) * 100, 4)
@@ -1221,6 +1223,9 @@ def case_v24():
     assert "ROW_NUMBER() OVER (PARTITION BY c.record_key, IFNULL(c.engine_call_outcome IN ('WIN', 'LOSS'), FALSE)" in code
     assert "ORDER BY c.recorded_at, c.sheet_row, c.record_id) = 1" in code
     assert "IF(c.call_outcome = c.engine_call_outcome, 'agree', 'disagree')" in code
+    assert "MAX(IF(b.date > r.recorded_day AND b.date < r.target_session_date, b.high, NULL)) AS pre_high" in code
+    assert "IF(r.entry_stance = 'bullish' AND a.tb.date > r.recorded_day AND a.tb.high >= r.target_price, a.tb.date, DATE '9999-12-31')" in code
+    assert "IF(a.tb.date > r.recorded_day, IFNULL(a.tb.high, 0), 0)" in code     # the target bar on the recording day is left out
     for col in ("mfe_pct", "mae_pct", "touched_target", "days_to_target_touch", "bars_observed", "last_close",
                 "bar_roi_pp", "roi_1w_pp", "roi_2w_pp", "roi_1m_pp", "roi_3m_pp", "sheet_vs_engine", "roi_gap_pp",
                 "in_engine_cohort", "engine_win_flag", "engine_scored", "target_bar_date", "target_close"):
@@ -1250,7 +1255,7 @@ def case_v24():
     e = _engine(recs, bars, today=15)
     assert e["r1"]["state"] == "scored_from_bar" and e["r1"]["roi"] == 70.0 and e["r1"]["call"] == "WIN"
     assert e["r1"]["vs"] == "agree" and e["r1"]["cohort"] is True
-    assert e["r1"]["mfe"] == 80.0 and e["r1"]["mae"] == -15.0 and e["r1"]["touched"] is True   # high 18 on day 8 >= 14
+    assert e["r1"]["mfe"] == 80.0 and e["r1"]["mae"] == -10.0 and e["r1"]["touched"] is True   # days 2-5 + day 8; day 1 left out
     assert e["r1"]["ladder"] == {"1w": 70.0, "2w": None, "1m": None, "3m": None}
     assert e["r2"]["state"] == "scored_from_bar" and e["r2"]["roi"] == -35.0 and e["r2"]["call"] == "WIN"
     assert e["r2"]["vs"] == "disagree" and e["r2"]["touched"] is False       # lows 9.0-10.0 (days 2-4) never reach 8.5
@@ -1269,6 +1274,14 @@ def case_v24():
     assert _engine(recs, bars, today=15, bearish_inverted=False)["r2"]["call"] == "LOSS"    # a bearish fall must win
     assert _engine(recs, bars, today=15, score_hold=True)["r3"]["scored"] is True           # HOLD must never score
     assert _engine(recs, bars, today=15, dedupe=False)["r7"]["cohort"] is True              # a copy must not count
+    # the recording day's bar never counts: a spike before the forecast existed is not a touch
+    spike = [{"symbol": "C", "date": 1, "high": 50, "low": 9, "close": 10}] + [
+        {"symbol": "C", "date": d, "high": 10.5, "low": 9.5, "close": 10} for d in (2, 3, 4, 5, 8)]
+    rc = [{"id": "r10", "key": "k10", "symbol": "C", "stance": "bullish", "entry": 10, "target_price": 20,
+           "recorded": 1, "target": 5, "status": "active", "sheet_call": None}]
+    assert _engine(rc, spike, today=15)["r10"]["touched"] is False and _engine(rc, spike, today=15)["r10"]["mfe"] == 5.0
+    assert _engine(rc, spike, today=15, entry_day_bar=True)["r10"]["touched"] is True        # golden: contaminated
+    assert _engine(recs, bars, today=15, entry_day_bar=True)["r1"]["mae"] == -15.0
 
 
 def _calibration(rows, min_sample=30, cohort_only=True, with_all=True, flag_small=True):
@@ -1339,7 +1352,8 @@ def case_v25():
     assert _calibration(small, flag_small=False)["HIGH"][4] == "High confidence under-delivers"
 
 
-def _board(rows, holdings=(), flagged=(), per_sector=3, per_market=10, seats=10, executable=False):
+def _board(rows, holdings=(), flagged=(), per_sector=3, per_market=10, seats=10, executable=False,
+           market_before_sector=False):
     """v_board_archive on universe rows: symbol, sector, market, final_action, inv, block,
     reco, rel, dq, risk, roi12, conflict, opp. Returns {symbol: (fails, seat)} and the constant."""
     out = {}
@@ -1377,8 +1391,13 @@ def _board(rows, holdings=(), flagged=(), per_sector=3, per_market=10, seats=10,
     sec, mkt, rank = {}, {}, 0
     for r in passers:
         sec[r["sector"]] = sec.get(r["sector"], 0) + 1
-        mkt[r["market"]] = mkt.get(r["market"], 0) + 1
-        if sec[r["sector"]] <= per_sector and mkt[r["market"]] <= per_market:
+        if market_before_sector:            # golden: the market cap counts sector-rejected names too
+            mkt[r["market"]] = mkt.get(r["market"], 0) + 1
+        if sec[r["sector"]] > per_sector:
+            continue
+        if not market_before_sector:
+            mkt[r["market"]] = mkt.get(r["market"], 0) + 1
+        if mkt[r["market"]] <= per_market:
             rank += 1
             if rank <= seats:
                 out[r["symbol"]][1] = rank
@@ -1398,7 +1417,9 @@ def case_v26():
     assert panel["T10: Required ROI %"] == "12" and panel["T10: Period (Months)"] == "12"
     assert "u.expected_roi_12m_pct >= 12" in code
     assert panel["T10: Required Annualized ROI %"] == "10" and "u.expected_roi_12m_pct >= 10" in code
-    assert panel["T10: Max Per Sector"] == "3" and "WHERE p.sector_rank <= 3 AND p.market_rank <= 10" in code
+    assert panel["T10: Max Per Sector"] == "3" and "WHERE p.sector_rank <= 3" in code
+    assert "WHERE s.market_rank <= 10" in code and code.index("WHERE p.sector_rank <= 3") < code.index("WHERE s.market_rank <= 10")
+    assert "FROM passers AS p\n  WHERE p.sector_rank <= 3" in code     # the market rank is taken over sector-admitted names only
     assert panel["T10: Max Per Market"] == "10" and panel["T10: Max Selected"] == "10"
     assert "IF(r.archive_rank <= 10, r.archive_rank, NULL) AS archive_seat" in code
     assert panel["T10: Allow Conflict"] == "'No'" and "provider/engine conflict (T10: Allow Conflict No)" in code
@@ -1444,6 +1465,11 @@ def case_v26():
     assert _board(rows, per_sector=4)[0]["D"][1] == 4
     assert _board([mk("G", risk="HIGH")])[0]["G"][1] is None
     assert _board(rows, executable=True)[1] is True and "TRUE AS executable" not in code
+    # ten names of one sector must not use up a market's ten places (Codex P2 on #891)
+    crowd = [mk(f"T{i}", opp=90 - i) for i in range(10)] + [mk(f"U{i}", sector=f"S{i}", opp=50 - i) for i in range(7)]
+    seated = [s for s, v in _board(crowd)[0].items() if v[1]]
+    assert len(seated) == 10 and seated[:3] == ["T0", "T1", "T2"] and all(f"U{i}" in seated for i in range(7))
+    assert len([s for s, v in _board(crowd, market_before_sector=True)[0].items() if v[1]]) == 3
 
 
 def _coverage_engine(rows, with_all=True, cohort=True):

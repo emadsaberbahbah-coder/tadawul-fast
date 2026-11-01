@@ -99,17 +99,25 @@ judged AS (
 passers AS (
   SELECT
     j.*,
-    ROW_NUMBER() OVER (PARTITION BY j.sector ORDER BY j.opportunity_score DESC, j.expected_roi_12m_pct DESC, j.reliability DESC, j.symbol) AS sector_rank,
-    ROW_NUMBER() OVER (PARTITION BY j.region ORDER BY j.opportunity_score DESC, j.expected_roi_12m_pct DESC, j.reliability DESC, j.symbol) AS market_rank
+    ROW_NUMBER() OVER (PARTITION BY j.sector ORDER BY j.opportunity_score DESC, j.expected_roi_12m_pct DESC, j.reliability DESC, j.symbol) AS sector_rank
   FROM judged AS j
   WHERE ARRAY_LENGTH(j.fails) = 0
 ),
-ranked AS (
+sector_capped AS (
+  -- the market cap counts only names the sector cap admitted (Codex P2 on
+  -- #891: ten names of one sector must not use up a market's ten places)
   SELECT
     p.*,
-    ROW_NUMBER() OVER (ORDER BY p.opportunity_score DESC, p.expected_roi_12m_pct DESC, p.reliability DESC, p.symbol) AS archive_rank
+    ROW_NUMBER() OVER (PARTITION BY p.region ORDER BY p.opportunity_score DESC, p.expected_roi_12m_pct DESC, p.reliability DESC, p.symbol) AS market_rank
   FROM passers AS p
-  WHERE p.sector_rank <= 3 AND p.market_rank <= 10
+  WHERE p.sector_rank <= 3
+),
+ranked AS (
+  SELECT
+    s.*,
+    ROW_NUMBER() OVER (ORDER BY s.opportunity_score DESC, s.expected_roi_12m_pct DESC, s.reliability DESC, s.symbol) AS archive_rank
+  FROM sector_capped AS s
+  WHERE s.market_rank <= 10
 )
 SELECT
   j.* EXCEPT (fails, cautions, is_holding),

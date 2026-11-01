@@ -27,8 +27,12 @@
 --   sheet_call_outcome / sheet_scored / sheet_win_flag and sheet_vs_engine:
 --                      agree | disagree | sheet_only | engine_only for matured
 --                      records; roi_gap_pp = engine - sheet realized ROI
---   mfe_pct / mae_pct  best and worst excursion of the high / low from entry
---                      up to the target bar (the newest bar while open)
+--   mfe_pct / mae_pct  best and worst excursion of the high / low AFTER the
+--                      recording day up to the target bar (the newest bar
+--                      while open): the recording day's own bar is left out,
+--                      because a daily bar cannot separate the moves before
+--                      the forecast existed from those after it (Codex P2
+--                      on #891 - a target 'touched' by that morning's high)
 --   touched_target, days_to_target_touch, bars_observed
 --   last_bar_date, last_close, bar_roi_pp (the engine's unrealized ROI)
 --   roi_1w_pp, roi_2w_pp, roi_1m_pp, roi_3m_pp: the close of the first bar
@@ -130,11 +134,13 @@ agg AS (
     ARRAY_AGG(IF(b.date >= r.target_session_date AND b.date <= DATE_ADD(r.target_session_date, INTERVAL 7 DAY),
                  STRUCT(b.date AS date, b.high AS high, b.low AS low, b.close AS close, b.source AS source), NULL)
               IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS tb,
-    MAX(IF(b.date < r.target_session_date, b.high, NULL)) AS pre_high,
-    MIN(IF(b.date < r.target_session_date, b.low, NULL)) AS pre_low,
-    COUNTIF(b.date < r.target_session_date) AS pre_bars,
-    MIN(IF(b.date < r.target_session_date AND r.entry_stance = 'bullish' AND b.high >= r.target_price, b.date, NULL)) AS pre_touch_up,
-    MIN(IF(b.date < r.target_session_date AND r.entry_stance = 'bearish' AND b.low <= r.target_price, b.date, NULL)) AS pre_touch_dn,
+    -- excursions start the day AFTER the recording (b.date > r.recorded_day): the
+    -- recording day's bar mixes pre-forecast and post-forecast moves
+    MAX(IF(b.date > r.recorded_day AND b.date < r.target_session_date, b.high, NULL)) AS pre_high,
+    MIN(IF(b.date > r.recorded_day AND b.date < r.target_session_date, b.low, NULL)) AS pre_low,
+    COUNTIF(b.date > r.recorded_day AND b.date < r.target_session_date) AS pre_bars,
+    MIN(IF(b.date > r.recorded_day AND b.date < r.target_session_date AND r.entry_stance = 'bullish' AND b.high >= r.target_price, b.date, NULL)) AS pre_touch_up,
+    MIN(IF(b.date > r.recorded_day AND b.date < r.target_session_date AND r.entry_stance = 'bearish' AND b.low <= r.target_price, b.date, NULL)) AS pre_touch_dn,
     ARRAY_AGG(IF(b.date >= DATE_ADD(r.recorded_day, INTERVAL 7 DAY), b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS close_1w,
     ARRAY_AGG(IF(b.date >= DATE_ADD(r.recorded_day, INTERVAL 14 DAY), b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS close_2w,
     ARRAY_AGG(IF(b.date >= DATE_ADD(r.recorded_day, INTERVAL 30 DAY), b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS close_1m,
@@ -155,13 +161,14 @@ j AS (
     a.tb.date AS target_bar_date,
     a.tb.close AS target_close,
     a.tb.source AS target_bar_source,
-    GREATEST(IFNULL(a.pre_high, 0), IFNULL(a.tb.high, 0)) AS win_high,
-    LEAST(IFNULL(a.pre_low, 1e18), IFNULL(a.tb.low, 1e18)) AS win_low,
-    IFNULL(a.pre_bars, 0) + IF(a.tb.date IS NULL, 0, 1) AS bars_observed,
+    GREATEST(IFNULL(a.pre_high, 0), IF(a.tb.date > r.recorded_day, IFNULL(a.tb.high, 0), 0)) AS win_high,
+    LEAST(IFNULL(a.pre_low, 1e18), IF(a.tb.date > r.recorded_day, IFNULL(a.tb.low, 1e18), 1e18)) AS win_low,
+    -- the target bar counts only when it is not the recording day's own bar
+    IFNULL(a.pre_bars, 0) + IF(a.tb.date IS NULL OR a.tb.date <= r.recorded_day, 0, 1) AS bars_observed,
     LEAST(IFNULL(a.pre_touch_up, DATE '9999-12-31'),
-          IF(r.entry_stance = 'bullish' AND a.tb.high >= r.target_price, a.tb.date, DATE '9999-12-31')) AS touch_up,
+          IF(r.entry_stance = 'bullish' AND a.tb.date > r.recorded_day AND a.tb.high >= r.target_price, a.tb.date, DATE '9999-12-31')) AS touch_up,
     LEAST(IFNULL(a.pre_touch_dn, DATE '9999-12-31'),
-          IF(r.entry_stance = 'bearish' AND a.tb.low <= r.target_price, a.tb.date, DATE '9999-12-31')) AS touch_dn,
+          IF(r.entry_stance = 'bearish' AND a.tb.date > r.recorded_day AND a.tb.low <= r.target_price, a.tb.date, DATE '9999-12-31')) AS touch_dn,
     a.close_1w, a.close_2w, a.close_1m, a.close_3m,
     CASE
       WHEN r.entry_price IS NULL OR r.entry_price <= 0 THEN 'no_entry_price'
