@@ -15,6 +15,13 @@
  * (2026-10-27, v1.17.1: version pins; census +1 function dt10PoolFieldsWithShadow_;
  *  +1 var DT10_SHADOW_POOL_FIELDS; the self-test must print 'shadow pool fields
  *  core: ok'. Behaviour is proved by tests/test_dt10_shadow_momentum.js.)
+ * (2026-11-01, v1.19.0: version pins; census +9 functions dt10StabQualifiedHoldSeat_,
+ *  dt10StabQualifiedHoldMode_, dt10SeatLiveFillOn_, dt10SeatLiveIndex_, dt10SeatLiveFillCore_,
+ *  dt10SeatLiveFill_, dt10OwnerRuleMarkOn_, dt10OwnerRuleCell_, dt10OwnerRuleNote_; +5 vars
+ *  DT10_QUALIFIED_HOLD_PROP, DT10_SEAT_LIVE_FILL_PROP, DT10_OWNER_RULE_PROP,
+ *  DT10_OWNER_RULE_ROI_MAX, DT10_OWNER_RULE_HEADERS; the self-test must print
+ *  'qualified hold core: ok', 'seat live fill core: ok' and 'owner rule core: ok'.
+ *  Behaviour is proved by tests/test_dt10_v1190_hold_live_rule.js.)
  * (2026-10-27, v1.18.0: version pins; census +6 functions dt10PostEarnMode_,
  *  dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_,
  *  dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_; +4 vars DT10_POST_EARN_PROP,
@@ -477,7 +484,7 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   const tabGrid = setValuesAt(C, '_T10_Candidates', 1, 1, 502, 25)[0];
   const stamp = tabGrid[0][0];
   assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v\d+\.\d+\.\d+$/);
-  assert(stamp.endsWith(' | DT10 v' + ctx.DT10_VERSION) && dt10AtLeast(ctx.DT10_VERSION, [1, 18, 0]), stamp);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+  assert(stamp.endsWith(' | DT10 v' + ctx.DT10_VERSION) && dt10AtLeast(ctx.DT10_VERSION, [1, 19, 0]), stamp);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
   deq(tabGrid[1], ctx.DT10_CAND_HEADERS);
   deq(tabGrid.slice(2), setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
   assert.equal(find(C, x => x[0] === 'hideSheet' && x[1] === '_T10_Candidates').length, 1);
@@ -571,7 +578,10 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
     'fx USX row: ABSENT', 'finding usx-subunit',
     'input truth (DT10_INPUT_TRUTH): off | cand tab (DT10_CAND_TAB): off | vintage cols (DT10_VINTAGE_COLS): off | policy ref: none',
     'evaluability core: ok', 'panel reference core: ok', 'label scan core: ok', 'vintage core: ok', 'cand pointer core: ok',
-    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v' + ctx.DT10_VERSION + '] self-test',   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v' + ctx.DT10_VERSION + '] self-test',   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
+    'qualified hold (DT10_QUALIFIED_HOLD): off', 'qualified hold core: ok',
+    'seat live fill (DT10_SEAT_LIVE_FILL): off', 'seat live fill core: ok',
+    'owner rule mark (DT10_OWNER_RULE_MARK): off', 'owner rule core: ok',
     'shadow rank log (DT10_SHADOW_RANK_LOG): off', 'shadow rank log core: ok',
     'shadow pool fields core: ok (Momentum Score sent only while the shadow log is armed) | sent now: no',
     'post-earnings core: ok (FRST 3/10; +EPS at 10 sessions untagged; blank EPS 5/5; past next date 1/5) | mode now: off',
@@ -598,16 +608,16 @@ const DESIGNED_FUNCTIONS = ['dt10AuditKeepOn_', 'dt10AuditKeepSymbols_', 'dt10Fe
 const DESIGNED_VARS = ['DT10_AUDIT_KEEP_PROP', 'DT10_AUDIT_KEEP_MAX', 'DT10_FEED_COHORT_BIND_PROP', 'DT10_SOURCE_APPROVED_SCOPE', 'DT10_CANDTAB_STAGE_SHEET', 'DT10_VINT_PUBLISHED_RE', 'DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
   'DT10_CANDTAB_SHEET', 'DT10_CANDTAB_COCKPIT_TARGET_ROWS', 'DT10_VINTAGE_PROP', 'DT10_VINTAGE_HEADERS', 'DT10_VINT_ASOF_RE', 'DT10_VINT_LKG_RE'].sort();
 function census(src, re) { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; }
-check('T9 static: DT10_VERSION >= 1.18.0 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
+check('T9 static: DT10_VERSION >= 1.19.0 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
   const { ctx } = loadTree(source);
-  assert(dt10AtLeast(ctx.DT10_VERSION, [1, 18, 0]), ctx.DT10_VERSION);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+  assert(dt10AtLeast(ctx.DT10_VERSION, [1, 19, 0]), ctx.DT10_VERSION);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
   assert(source.split('\n')[3].startsWith(' * Version: ' + ctx.DT10_VERSION + ' '));
   assert(source.includes("var DT10_VERSION = '" + ctx.DT10_VERSION + "';"));
   assert.doesNotThrow(() => new vm.Script(source, { filename: '16_Decision_Top10.gs' }), 'syntax (node --check equivalent)');
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
   const fns = census(source, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), vars = census(source, /^var\s+([A-Za-z_$][\w$]*)/mg);
-  assert.equal(fns.size,226,'full v1.18.1 function census (main v1.18.0 224 + dt10AuditKeepOn_, dt10AuditKeepSymbols_)'); assert.equal(vars.size,123,'full v1.18.1 variable census (main v1.18.0 121 + DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX)');   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+  assert.equal(fns.size,235,'full v1.19.1 function census (main v1.19.0 233 + dt10AuditKeepOn_, dt10AuditKeepSymbols_)'); assert.equal(vars.size,128,'full v1.19.1 variable census (main v1.19.0 126 + DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX)');   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
   for (const f of DESIGNED_FUNCTIONS) assert(fns.has(f), 'missing ' + f);
   for (const v of DESIGNED_VARS) assert(vars.has(v), 'missing ' + v);
   for (const f of DESIGNED_FUNCTIONS) assert.equal(typeof ctx[f], 'function', f);
@@ -647,7 +657,7 @@ check('T10 _Run_Log: off -> no row; observe/enforce -> exactly one INPUT-TRUTH r
   assert(row[5].startsWith('gates: news 0/500')); assert(row[5].length <= 400);
   const details = JSON.parse(row[9]);
   deq(Object.keys(details).sort(), ['alerts', 'cal', 'cand_rows', 'cand_tab', 'cand_tab_result', 'ev', 'input_truth', 'notes', 'ref', 'version', 'vintage_cols']);
-  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], [t.ctx.DT10_VERSION, 'observe', 'observe', 'observe', 500]);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], [t.ctx.DT10_VERSION, 'observe', 'observe', 'observe', 500]);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
   assert.equal(details.ev.news.unknown, 500); assert.equal(details.ref.drift_seed, 1); assert.equal(details.cal.sel_covered, 8);
   deq(details.alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 500], ['gate_not_evaluable', 500], ['panel_reference_drift', 1]]);
   assert(!/cash|nav|deployable/i.test(row[9]), 'details carry no portfolio words');

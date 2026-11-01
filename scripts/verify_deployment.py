@@ -311,7 +311,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
-    ("track_performance", "6.49.0", "track performance"),
+    # 2026-10-25: 6.50.0 [LOG-READ] Performance_Log read precision
+    # (TRACK_LOG_UNFORMATTED_READ, default off; pin only).
+    ("track_performance", "6.50.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
@@ -330,19 +332,23 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
     ("run_calendar_sync", "1.2.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
-    ("archive_to_bigquery", "1.0.0", "bigquery archive"),
+    ("archive_to_bigquery", "1.1.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
     # scripts/apply_bq_views.py, the typed Looker views over the archive.
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.1.0", "bigquery looker views"),
+    ("apply_bq_views", "1.4.1", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
     # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
     # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
     ("archive_market_series", "1.1.1", "bigquery market series"),
+    # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
+    # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
+    # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
+    ("archive_symbol_deep", "1.0.0", "bigquery symbol deep data"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

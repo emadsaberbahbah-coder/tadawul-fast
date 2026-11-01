@@ -62,6 +62,8 @@ var newSource = fs.readFileSync(NEW_PATH, 'utf8');
 // (stripDesigned throws on any other shape).
 // merge note 2026-10-28 (#778): the delivered file is now main's v1.18.0 plus the
 // v1.18.1 held-seat regions, so the layer is main's v1.18.0 byte for byte.
+// merge note 2026-11-01 (#778): the delivered file is now main's v1.19.0 plus the
+// v1.19.1 held-seat regions, so the layer is main's v1.19.0 byte for byte.
 var layerSource = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js')).stripDesigned(newSource);
 function dt10AtLeast(v, f) { var x = String(v).split('.').map(Number); for (var k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; }
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
@@ -231,13 +233,14 @@ function battery() {
     // 2026-10-26/27: the delivered file is v1.17.0 (funding evidence and the shadow rank log stacked on this change); pins moved
     // 2026-10-27: v1.17.1 (shadow momentum) stacked as well; pins moved
     // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
-    // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0: the delivered file sits above v1.18.0;
-    // the exact v1.18.0 pins hold on the layer (the delivered file with this bundle's regions stripped).
-    assert(dt10AtLeast(N.DT10_VERSION, [1, 18, 0]), 'delivered version ' + N.DT10_VERSION);
+    // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0: the delivered file sits above v1.19.0;
+    // the exact v1.19.0 pins hold on the layer (the delivered file with this bundle's regions stripped).
+    // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
+    assert(dt10AtLeast(N.DT10_VERSION, [1, 19, 0]), 'delivered version ' + N.DT10_VERSION);
     assert(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     assert(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    assert(/^ \* Version: 1\.18\.0 /.test(layerSource.split('\n')[3]), 'layer header line 4');
-    assert(layerSource.indexOf("var DT10_VERSION = '1.18.0';") > 0, 'layer DT10_VERSION literal');
+    assert(/^ \* Version: 1\.19\.0 /.test(layerSource.split('\n')[3]), 'layer header line 4');
+    assert(layerSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'layer DT10_VERSION literal');
     eq(N.DT10_T10_PENDING_GRACE_MAX, 5, 'clamp constant');
   });
 
@@ -372,7 +375,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('pending grace core: ok') > 0, 'battery line');
     assert(rep.indexOf('pending grace (TFB_T10_PENDING_GRACE_DAYS): 0 (') > 0, 'property line default');
-    assert(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+    assert(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
     // property memo, so the memo line reports one more key (keys=3); pin moved
@@ -398,7 +401,7 @@ function battery() {
       assert(!/\b(let|const|class)\s|=>|`/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l);
       if (!/^[\x09\x20-\x7e]*$/.test(l)) {
         // the only non-ASCII added line is the version header rewrite (pre-existing em dash)
-        assert(baseLines[l.replace('1.18.0', '1.14.0')] === true, 'non-ASCII added line: ' + l);
+        assert(baseLines[l.replace('1.19.0', '1.14.0')] === true, 'non-ASCII added line: ' + l);
       }
     });
     function nonAscii(s) { var m = {}; for (var j = 0; j < s.length; j++) { var c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
@@ -429,11 +432,11 @@ function battery() {
     // 2026-10-27: v1.17.1 (shadow momentum) adds dt10PoolFieldsWithShadow_ / DT10_SHADOW_POOL_FIELDS
     // 2026-10-27: v1.18.0 (post-earnings tag) adds the dt10PostEarn* family, dt10ApplyPostEarnTags_,
     //   dt10WeekdaysBetween_ and DT10_POST_EARN_PROP / _SESSIONS / _SESSIONS_NEG / _MAX_DAYS
-    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10AppendShadowRankLog_', 'dt10ApplyPostEarnTags_', 'dt10FundingAge_', 'dt10FundingApplyCore_', 'dt10FundingApply_', 'dt10FundingCashCents_', 'dt10FundingDecimal_', 'dt10FundingDiv_', 'dt10FundingExcludeList_', 'dt10FundingLinks_', 'dt10FundingMode_', 'dt10FundingNative_', 'dt10FundingNote_', 'dt10FundingRates_', 'dt10FundingSym_', 'dt10FundingUnits_', 'dt10FundingValueSar_', 'dt10PoolFieldsWithShadow_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_', 'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10StabPendingGrace_', 'dt10StabSoftMiss_', 'dt10WeekdaysBetween_'], 'top-level functions added');
-    eq(Object.keys(tb).length, 197, 'base top-level census'); eq(Object.keys(tn).length, 224, 'new top-level census');
+    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10AppendShadowRankLog_', 'dt10ApplyPostEarnTags_', 'dt10FundingAge_', 'dt10FundingApplyCore_', 'dt10FundingApply_', 'dt10FundingCashCents_', 'dt10FundingDecimal_', 'dt10FundingDiv_', 'dt10FundingExcludeList_', 'dt10FundingLinks_', 'dt10FundingMode_', 'dt10FundingNative_', 'dt10FundingNote_', 'dt10FundingRates_', 'dt10FundingSym_', 'dt10FundingUnits_', 'dt10FundingValueSar_', 'dt10OwnerRuleCell_', 'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleNote_', 'dt10PoolFieldsWithShadow_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_', 'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFillOn_', 'dt10SeatLiveFill_', 'dt10SeatLiveIndex_', 'dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10StabPendingGrace_', 'dt10StabQualifiedHoldMode_', 'dt10StabQualifiedHoldSeat_', 'dt10StabSoftMiss_', 'dt10WeekdaysBetween_'], 'top-level functions added');
+    eq(Object.keys(tb).length, 197, 'base top-level census'); eq(Object.keys(tn).length, 233, 'new top-level census');
     var vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(function (k) { return !vn[k]; }), [], 'vars removed');
-    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP'], 'vars added');
+    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_OWNER_RULE_HEADERS', 'DT10_OWNER_RULE_PROP', 'DT10_OWNER_RULE_ROI_MAX', 'DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_QUALIFIED_HOLD_PROP', 'DT10_SEAT_LIVE_FILL_PROP', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP'], 'vars added');
     var core = newSource.slice(newSource.indexOf('function dt10StabCore_('), newSource.indexOf('\n// ----', newSource.indexOf('function dt10StabCore_(')));
     ['outageOf', 'hardOut', 'scoreOf', 'smoothed', 'boardSort', 'inFinal', 'inList', 'qualifiedWithin', 'softMiss'].forEach(function (f) {
       assert(core.indexOf('function ' + f + '(') > 0, 'nested ' + f);

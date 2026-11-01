@@ -1,13 +1,13 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.18.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.19.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
  *
- * v1.18.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
+ * v1.19.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
  * (Built 2026-10-13 as an unreleased v1.13.9 draft in PR #770; renumbered
  * after #774 shipped v1.13.9, again on 2026-10-21 after #810 shipped a
  * different v1.13.10, on 2026-10-22 after #815 shipped a different
@@ -15,9 +15,11 @@
  * #838 shipped v1.14.0 (confirm basis) and v1.15.0 (pending grace), and
  * on 2026-10-27 after #844, #849 and #852 shipped v1.16.0 (funding
  * evidence), v1.17.0 (shadow rank log) and v1.17.1 (shadow momentum),
- * and on 2026-10-28 after #855 shipped v1.18.0 (post-earnings).
- * ALL v1.18.0 logic carried verbatim. No behaviour changed in the
- * renumbering; the base named below is now v1.18.0, the one it sits on.)
+ * on 2026-10-28 after #855 shipped v1.18.0 (post-earnings), and on
+ * 2026-11-01 after #887 shipped v1.19.0 (qualified hold, seat live fill,
+ * owner rule). ALL v1.19.0 logic carried verbatim. No behaviour changed
+ * in the renumbering; the base named below is now v1.19.0, the one it
+ * sits on.)
  * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held
  * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank
  * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit
@@ -26,7 +28,7 @@
  * backend never learns which incumbents this cockpit holds.
  * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)
  * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
- * v1.18.0 in every request and render (one memoized property read is
+ * v1.19.0 in every request and render (one memoized property read is
  * added). Armed, body.criteria gains audit_keep_symbols = the sorted
  * stability members (seated and grace-held, fast-track included; at most
  * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.
@@ -35,13 +37,108 @@
  * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and
  * either alone is inert. The list is display context, never a decision
  * input: it moves no gate, score, seat or ticket. A property or state read
- * failure sends nothing (the v1.18.0 body).
+ * failure sends nothing (the v1.19.0 body).
  * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;
  * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10
  * makes one guarded call before the POST. Harness:
  * tests/js/dt10_audit_keep.test.js.
- * Rollback: delete the property (the next run is v1.18.0 behaviour) or
- * re-paste v1.18.0.
+ * Rollback: delete the property (the next run is v1.19.0 behaviour) or
+ * re-paste v1.19.0.
+ *
+ * v1.19.0 (2026-11-01) [QUALIFIED-HOLD / SEAT-LIVE-FILL / OWNER-RULE] -- THREE GATES, DEFAULT OFF
+ * WHY (recommendation pages review, 31 Oct 2026, items R2.0 / R3.1 / R4.1):
+ * of the 258 board episodes since 1 Oct, 248 had exited, 225 of them within
+ * 3 days; 46 exits happened while the source row still read INVESTABLE /
+ * BUY with reliability >= 70 and DQ >= 80. Mechanism on this file: a seat
+ * is labelled GRACE whenever it is absent from the backend's sized
+ * `selected` list (`!rawSet[sym] || co > 0`), even when the audited grid
+ * still rates it INVEST inside the rank buffer -- the v1.14.0 qualified
+ * day that already keeps its miss clock at 0. GRACE suspends sizing and
+ * dt10BoardEligible_ excludes every GRACE seat, so a top-ranked qualified
+ * name (DDI.US, qualified #2, 'GRACE (0/3 missed)') was shown with no plan
+ * and never offered to the allocation replay. Grace seats absent from the
+ * audited grid rendered blank Rel / DQ / FX and a stale stash price (ZTO.US
+ * 19.88 while Global_Markets read 20.15, INVESTABLE / BUY, Rel 71.5, DQ
+ * 100). And the owner's interim buy rule (Confidence High AND Engine ROI
+ * 12M < 34 %) was visible nowhere on the board.
+ * WHAT -- three Script Properties, each DEFAULT OFF; absent, blank or any
+ * other word = the v1.18.0 run byte for byte (cells, status line, _Run_Log
+ * and Logger lines, _Selection_Log rows, state blob, knobs object):
+ * (1) DT10_QUALIFIED_HOLD = off | observe | enforce (R2.0). Read ONCE in
+ *   dt10ApplyStability_ (dt10StabQualifiedHoldMode_, the
+ *   dt10StabConfirmBasis_ pattern) into knobs.qualified_hold, set ONLY when
+ *   armed. In dt10StabCore_ a seat is HOLDABLE when it is a confirmed
+ *   member (ft !== true), absent from rawSet, co === 0, not outage-paused,
+ *   the basis is 'qualified' and dt10StabQualifiedWithin_ rates it INVEST
+ *   inside the rank buffer (the very test the counter pass applied).
+ *   observe: the stab note gains ', qhold: would hold N SYM ...' (up to 3
+ *   names, board order) and audit.qualified_held lists them; nothing else
+ *   moves. enforce: such a seat keeps 'ACTIVE (day n)' instead of 'GRACE
+ *   (0/n missed)', leaves the grace ledger ('N grace', held_by_grace), and
+ *   its ticket shell (dt10StabQualifiedHoldSeat_: the audited-row metrics
+ *   of the ghost, no _grace_hold, a countable _qhold marker, no plan) is
+ *   board-eligible, so dt10ReallocateBoard_ names it in
+ *   board_funding_symbols and the EXISTING replay decides; the note token
+ *   reads ', qhold: held N SYM ...'. Nothing here recomputes a gate, score
+ *   or verdict (section 8), lowers a threshold, adds a seat or sizes
+ *   anything: an unsized held seat finalizes as 'Research seat -- no
+ *   executable allocation today. ACTIVE (day n)' like any other unfunded
+ *   seat. Unconfirmed fast-track seats are never held (a fast-track seat
+ *   must not carry executable sizing under strict, v1.8.10). KNOWN LIMIT:
+ *   the backend's frozen snapshot carries only the research picks; a seat
+ *   the research pass deferred (sector / market cap, lot or floor, held
+ *   target, issuer dedup, price cross-check) is offered but cannot be sized
+ *   by the replay until the backend widens the snapshot.
+ * (2) DT10_SEAT_LIVE_FILL = off | on (R3.1). Read once in
+ *   dt10RefreshDecisionTop10Run_; when on, payload._dt10_live carries a
+ *   PURE index of the sheet pool rows the cockpit already collected
+ *   (dt10SeatLiveIndex_: Symbol -> Current Price, Forecast Reliability
+ *   Score, Data Quality Score, Currency, Investability Status) and the FX
+ *   map already read for the POST body; nothing new is fetched. After the
+ *   render's finalization dt10SeatLiveFillCore_ fills, on GRACE /
+ *   FAST-TRACK / held seats only, a blank Rel, DQ and FX (SAR = 1, else the
+ *   lookup rate through dt10HoldingFxRate_), replaces a ghost's stash price
+ *   with today's row price (audited grid row first, else the pool row) and
+ *   fills a blank or replaced Price SAR (grid price_sar, else price x FX at
+ *   2 dp); when the source row is investable (grid verdict INVEST, or
+ *   Investability Status INVESTABLE) the Advisor Note gains ' Source row
+ *   today: investable (...)'. Status, sizing, eligibility, clocks and the
+ *   state blob are untouched. Status token ' | live-fill k/n (m investable
+ *   at source)'. A NOT_ACTIONABLE feed still replaces the note cell with
+ *   the withhold text (v1.10.0); the numbers stay.
+ * (3) DT10_OWNER_RULE_MARK = off | on (R4.1). Read once in
+ *   dt10RefreshDecisionTop10Run_; when on, payload._dt10_rule is set and
+ *   the render appends ONE column after the seat block (after the v1.13.4
+ *   vintage columns when those are enforced; the same insertColumnsAfter
+ *   path), header 'Owner Rule', cell dt10OwnerRuleCell_(ticket): 'rule:
+ *   yes' when confidence_band is High (any case) AND engine_roi_pct <
+ *   DT10_OWNER_RULE_ROI_MAX (34), else 'rule: no (<band or conf unknown>;
+ *   ROI <x.x> or ROI unknown)' naming only the failing parts. Display only;
+ *   the withhold indices (<= 29), the LAYOUT_PRESERVE panel logic and every
+ *   existing column are untouched. Status token ' | owner-rule k/n yes'.
+ * Functions added (0 removed): dt10StabQualifiedHoldSeat_ (pure),
+ * dt10StabQualifiedHoldMode_, dt10SeatLiveFillOn_, dt10SeatLiveIndex_
+ * (pure), dt10SeatLiveFillCore_ (pure), dt10SeatLiveFill_,
+ * dt10OwnerRuleMarkOn_, dt10OwnerRuleCell_ (pure), dt10OwnerRuleNote_
+ * (pure). Changed: dt10StabCore_ (hold list, enforce branch, note token,
+ * audit key), dt10ApplyStability_ (one read), dt10RefreshDecisionTop10Run_
+ * (two reads, two status tokens), dt10RenderPayload_ (fill after
+ * finalization; the extra column), dt10SelfTest (three property lines,
+ * three 'core: ok' lines). Vars added: DT10_QUALIFIED_HOLD_PROP,
+ * DT10_SEAT_LIVE_FILL_PROP, DT10_OWNER_RULE_PROP, DT10_OWNER_RULE_ROI_MAX,
+ * DT10_OWNER_RULE_HEADERS.
+ * Harness: tests/test_dt10_v1190_hold_live_rule.js (REAL file; golden
+ * negative on the v1.18.0 base rebuilt by reversing these edits, SHA-256
+ * pinned, or a base file given as the second argument; kill identity with
+ * the three properties absent / off / junk / faulted through the pure
+ * core, dt10ApplyStability_, the REAL render and the REAL refresh;
+ * ES5/ASCII lint; inventory).
+ * Rollback: set the three properties off (or delete them) with no
+ * re-paste; or re-paste v1.18.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep. Operator order: observe the hold for several evidence runs
+ * and compare the 'would hold' names with the owner's judgement before
+ * enforce; one property per evidence run.
  *
  * v1.18.0 (2026-10-27) [POST-EARNINGS] -- THE BOARD SAYS WHEN A NAME HAS JUST REPORTED
  * WHY (program register A4 part 2; FRST post-mortem P1): the first funded
@@ -2155,7 +2252,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.18.1';
+var DT10_VERSION = '1.19.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3027,6 +3124,19 @@ var DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';
 // v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.
 var DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';
 var DT10_T10_PENDING_GRACE_MAX = 5;
+// v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
+// that the audited grid still rates INVEST inside the rank buffer -- see the
+// v1.19.0 header block. off (default) | observe | enforce.
+var DT10_QUALIFIED_HOLD_PROP = 'DT10_QUALIFIED_HOLD';
+// v1.19.0 [SEAT-LIVE-FILL]: live price / Rel / DQ / FX on grace, fast-track
+// and held seats from today's pool or grid row. off (default) | on.
+var DT10_SEAT_LIVE_FILL_PROP = 'DT10_SEAT_LIVE_FILL';
+// v1.19.0 [OWNER-RULE]: the owner's interim buy rule shown per seat
+// (Confidence High AND Engine ROI 12M < DT10_OWNER_RULE_ROI_MAX). Display
+// only; off (default) | on. The column rides after the seat block.
+var DT10_OWNER_RULE_PROP = 'DT10_OWNER_RULE_MARK';
+var DT10_OWNER_RULE_ROI_MAX = 34;
+var DT10_OWNER_RULE_HEADERS = ['Owner Rule'];
 // v1.11.10 [P-168]: outage pause -- see the v1.11.10 header block.
 var DT10_P168_MAX_PAUSE_DAYS = 5;         // consecutive paused day-advances
 var DT10_P168_OUTAGE_RE = /fetch_failed/i; // engine tag family on 'Warnings'
@@ -4273,6 +4383,24 @@ function dt10GraceSuspend_(tk, label) {
       'executable ticket).';
   return tk;
 }
+/** v1.19.0 [QUALIFIED-HOLD] PURE: the ticket shell of a seat HELD under
+ * DT10_QUALIFIED_HOLD = enforce. `tk` is the dt10StabGhost_ shell built
+ * from the seat's audited row (no raw ticket exists, so no plan exists):
+ * the grace marker goes (no _grace_hold, so dt10BoardEligible_ offers the
+ * seat to the allocation replay and the D-4 rank dash, the grace tint and
+ * the grace counts no longer apply), a countable _qhold marker rides for
+ * read-back and the note says what the hold is. Sizing keeps the dash
+ * vocabulary until the backend's replay funds it; nothing here sizes.
+ * Mutates and returns tk; never throws. */
+function dt10StabQualifiedHoldSeat_(tk) {
+  if (!tk || typeof tk !== 'object') return tk;
+  if (Object.prototype.hasOwnProperty.call(tk, '_grace_hold')) delete tk._grace_hold;
+  tk._qhold = true;
+  tk.advisor_note = 'Qualified hold: INVEST on the audited grid inside the ' +
+      'rank buffer, absent from the sized list today; offered to the ' +
+      'allocation replay (a plan appears only if the backend funds it).';
+  return tk;
+}
 /** v1.11.10 [P-168] PURE: outage map from the sheet pool rows the cockpit
  * POSTs (dt10CollectPoolRows_ output; keys are the source headers). A row
  * whose 'Warnings' cell carries the engine's own fetch_failed tag (the
@@ -4439,6 +4567,12 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   function softMiss(sym) {
     return dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut);
   }
+  // v1.19.0 [QUALIFIED-HOLD]: the hold mode rides as a plain knob (service
+  // read in dt10ApplyStability_); absent / anything else (older callers, the
+  // self-test replays, the property off) is the v1.18.0 board byte for byte.
+  var qhMode = (knobs.qualified_hold === 'observe' ||
+                knobs.qualified_hold === 'enforce') ? knobs.qualified_hold : 'off';
+  var qualifiedHeld = [];
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -4633,6 +4767,18 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     if (mst.ft === true && (mst.ci || 0) >= knobs.confirm_days) {
       mst.ft = false;                                    // v1.11.2 [P-61] graduated
     }
+    // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
+    // with a clean miss clock that the audited grid still rates INVEST inside
+    // the rank buffer (the v1.14.0 qualified day) is HOLDABLE. observe only
+    // lists it; enforce keeps it out of the grace ledger here and gives it
+    // the ACTIVE label in the output pass. Unconfirmed fast-track seats
+    // never qualify (v1.8.10: no executable sizing under strict).
+    if (qhMode !== 'off' && qualifiedBasis && !rawSet[msym] &&
+        (mst.co || 0) === 0 && mst.ft !== true &&
+        !dt10InList_(pausedSyms, msym) && qualifiedWithin(msym)) {
+      qualifiedHeld.push(msym);
+      if (qhMode === 'enforce') continue;
+    }
     if (!rawSet[msym] || (mst.co || 0) > 0) {
       heldByGrace.push({ symbol: msym, missed_days: mst.co || 0,
                          exit_days: knobs.exit_days,
@@ -4690,6 +4836,12 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     else if (inList(entered, osym)) {
       status = 'NEW (confirmed ' + knobs.confirm_days + '/' +
                knobs.confirm_days + ')';
+    } else if (qhMode === 'enforce' && inList(qualifiedHeld, osym)) {
+      // v1.19.0 [QUALIFIED-HOLD] enforce: the seat keeps the status the grid
+      // gives it. tk is the ghost shell (no raw ticket): strip its grace
+      // marker so the allocation replay is offered the seat; no sizing here.
+      status = 'ACTIVE (day ' + daysIn + ')';
+      dt10StabQualifiedHoldSeat_(tk);
     } else if (!rawSet[osym] || (ost.co || 0) > 0) {
       status = 'GRACE (' + (ost.co || 0) + '/' + knobs.exit_days + ' missed)';
       // v1.11.10 [P-168]: disclose the pause on the label (paint and the
@@ -4838,6 +4990,17 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       note += ', pheld ' + pendingHeld.length + ' ' + phParts.join(' ');
     }
   }
+  // v1.19.0 [QUALIFIED-HOLD]: read-back token only while armed (off leaves
+  // the note and the audit byte-identical to v1.18.0): the seats held, or
+  // that would be held, in board order, up to 3 names.
+  if (qhMode !== 'off') {
+    var qhParts = [];
+    for (var qhi = 0; qhi < qualifiedHeld.length && qhParts.length < 3; qhi++) {
+      qhParts.push(qualifiedHeld[qhi]);
+    }
+    note += ', qhold: ' + (qhMode === 'enforce' ? 'held ' : 'would hold ') +
+            qualifiedHeld.length + (qhParts.length ? ' ' + qhParts.join(' ') : '');
+  }
   var coreOut = {
     tickets: tickets,
     state: state,
@@ -4853,6 +5016,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     note: note
   };
   if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0
+  if (qhMode !== 'off') coreOut.audit.qualified_held = qualifiedHeld;   // v1.19.0
   return coreOut;
 }
 // ---------------------------------------------------------------------------
@@ -5024,6 +5188,23 @@ function dt10StabPendingGrace_() {
     return Math.min(DT10_T10_PENDING_GRACE_MAX, n);
   } catch (ePg) {}
   return 0;
+}
+
+/**
+ * v1.19.0 [QUALIFIED-HOLD]: hold mode -- Script Property DT10_QUALIFIED_HOLD
+ * (DT10_QUALIFIED_HOLD_PROP). Exactly 'observe' or 'enforce' (trimmed, any
+ * case) arms it; absent, blank, 'off', junk or a PropertiesService fault
+ * read as 'off' = the v1.18.0 board. Mirrors dt10StabPendingGrace_ (service
+ * read outside the pure core); never throws.
+ */
+function dt10StabQualifiedHoldMode_() {
+  try {
+    var v = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_QUALIFIED_HOLD_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (v === 'observe' || v === 'enforce') return v;
+  } catch (eQh) {}
+  return 'off';
 }
 
 /** v1.11.11 [P-144] PURE: UTC date key ('yyyy-MM-dd') of a feed-stamp
@@ -6005,6 +6186,192 @@ function dt10VintageNote_(selected, idx, mode) {
       '/' + sel.length + (idx ? '' : ' (no sheet pool)') +
       (mode === 'observe' ? ' [observe]' : '');
 }
+/** v1.19.0 [SEAT-LIVE-FILL]: Script Property DT10_SEAT_LIVE_FILL. Exactly
+ * 'on' (trimmed, any case) arms the fill; absent, blank, 'off', junk or a
+ * PropertiesService fault read as off (the v1.18.0 render). Never throws. */
+function dt10SeatLiveFillOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_SEAT_LIVE_FILL_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eLf) {}
+  return false;
+}
+/** v1.19.0 [SEAT-LIVE-FILL] PURE: {SYM: {price, rel, dq, ccy, status}} from
+ * the sheet pool rows the cockpit already POSTs (dt10CollectPoolRows_
+ * output; keys are the DT10_POOL_FIELDS sends). The first row per symbol
+ * wins (the collector already de-duplicates). Non-array or empty input
+ * => {}; never throws. */
+function dt10SeatLiveIndex_(rows) {
+  var idx = {};
+  if (!rows || !rows.length) return idx;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || typeof r !== 'object') continue;
+    var sym = dt10NormSym_(r['Symbol']);
+    if (!sym || Object.prototype.hasOwnProperty.call(idx, sym)) continue;
+    idx[sym] = { price: r['Current Price'],
+                 rel: r['Forecast Reliability Score'],
+                 dq: r['Data Quality Score'],
+                 ccy: r['Currency'],
+                 status: r['Investability Status'] };
+  }
+  return idx;
+}
+/** v1.19.0 [SEAT-LIVE-FILL] PURE: fills, on the GRACE / FAST-TRACK / held
+ * seats of `selected` only, the live numbers a seat without a raw ticket
+ * lacks. Source row: the audited grid row (cands, deduped by symbol, the
+ * highest opportunity_score wins -- the dt10StabCore_ rule) first, else
+ * the pool index row (dt10SeatLiveIndex_). Per seat: a blank reliability
+ * / dq is filled from the row; a blank fx_to_sar from `fx` (SAR = 1, else
+ * dt10HoldingFxRate_ on the seat's currency, else the row's); a ghost's
+ * price (no raw ticket: _grace_hold without _p145_suspended, or _qhold) is
+ * replaced by the row's positive price, and a blank or replaced Price SAR
+ * becomes the grid price_sar, else price x FX at 2 dp. When the row is
+ * investable (grid verdict INVEST, or Investability Status INVESTABLE) the
+ * note gains ' Source row today: investable (...)' once. Status, sizing,
+ * eligibility and every other field are untouched; a second pass changes
+ * nothing. Returns { seats, filled, investable }. */
+function dt10SeatLiveFillCore_(selected, cands, idx, fx) {
+  var out = { seats: 0, filled: 0, investable: 0 };
+  selected = selected || [];
+  cands = cands || [];
+  idx = idx || {};
+  fx = fx || {};
+  var grid = {};
+  for (var gi = 0; gi < cands.length; gi++) {
+    var gc = cands[gi];
+    if (!gc || typeof gc !== 'object') continue;
+    var gs = dt10NormSym_(gc.symbol);
+    if (!gs) continue;
+    var gsc = Number(gc.opportunity_score);
+    if (!grid[gs] ||
+        (isFinite(gsc) && gsc > (Number(grid[gs].opportunity_score) || -1e9))) {
+      grid[gs] = gc;
+    }
+  }
+  for (var i = 0; i < selected.length; i++) {
+    var t = selected[i];
+    if (!t || typeof t !== 'object') continue;
+    var seat = t._grace_hold === true || t._ft_suspended === true ||
+        t._qhold === true ||
+        /^(GRACE|FAST-TRACK)\b/.test(String(t._stab_status || ''));
+    if (!seat) continue;
+    out.seats++;
+    var sym = dt10NormSym_(t.symbol);
+    var g = sym && grid[sym] ? grid[sym] : null;
+    var p = sym && Object.prototype.hasOwnProperty.call(idx, sym) ? idx[sym] : null;
+    if (!g && !p) continue;
+    var ghost = (t._grace_hold === true && t._p145_suspended !== true) ||
+        t._qhold === true;
+    var touched = false, priceSet = false;
+    var rowPrice = Number(g ? g.price : p.price);
+    var rowRel = g ? g.reliability : p.rel;
+    var rowDq = g ? g.dq : p.dq;
+    var rowCcy = String((g ? g.currency : p.ccy) || '');
+    var investable = g ? String(g.verdict || '').toUpperCase() === 'INVEST' :
+        String(p.status || '').replace(/^\s+|\s+$/g, '').toUpperCase() === 'INVESTABLE';
+    if (ghost && isFinite(rowPrice) && rowPrice > 0 && t.price !== rowPrice) {
+      t.price = rowPrice;
+      priceSet = true;
+      touched = true;
+    }
+    if (!dt10HasValue_(t.reliability) && dt10HasValue_(rowRel) &&
+        isFinite(Number(rowRel))) {
+      t.reliability = Number(rowRel);
+      touched = true;
+    }
+    if (!dt10HasValue_(t.dq) && dt10HasValue_(rowDq) && isFinite(Number(rowDq))) {
+      t.dq = Number(rowDq);
+      touched = true;
+    }
+    var ccy = String(t.currency || rowCcy || '').replace(/^\s+|\s+$/g, '');
+    if (!dt10HasValue_(t.fx_to_sar) && ccy) {
+      var rate = ccy.toUpperCase() === 'SAR' ? 1 : dt10HoldingFxRate_(ccy, fx);
+      if (typeof rate === 'number' && isFinite(rate) && rate > 0) {
+        t.fx_to_sar = rate;
+        touched = true;
+      }
+    }
+    if (priceSet || !dt10HasValue_(t.price_sar)) {
+      var gps = g ? Number(g.price_sar) : NaN;
+      var fxv = Number(t.fx_to_sar), pxv = Number(t.price);
+      if (g && isFinite(gps) && gps > 0) {
+        t.price_sar = gps;
+        touched = true;
+      } else if (isFinite(fxv) && fxv > 0 && isFinite(pxv) && pxv > 0) {
+        t.price_sar = Math.round(pxv * fxv * 100) / 100;
+        touched = true;
+      }
+    }
+    if (investable) {
+      var note = String(t.advisor_note || '');
+      if (note.indexOf(' Source row today: investable') < 0) {
+        t.advisor_note = note + ' Source row today: investable (' +
+            (g ? 'INVEST on the audited grid' : 'Investability Status INVESTABLE') + ').';
+        out.investable++;
+      }
+    }
+    if (touched) out.filled++;
+  }
+  return out;
+}
+/** v1.19.0 [SEAT-LIVE-FILL]: render-side orchestrator. '' when the refresh
+ * attached no payload._dt10_live (gate off -> nothing touched); else fills
+ * the seats in place and returns the status token
+ * 'live-fill k/n (m investable at source)'. Guarded end to end. */
+function dt10SeatLiveFill_(payload) {
+  var lv = payload && payload._dt10_live;
+  if (!lv || typeof lv !== 'object') return '';
+  try {
+    var r = dt10SeatLiveFillCore_(payload.selected || [],
+        payload.candidates_rows || [], lv.idx || {}, lv.fx || {});
+    return 'live-fill ' + r.filled + '/' + r.seats +
+        (r.investable ? ' (' + r.investable + ' investable at source)' : '') +
+        (lv.idx ? '' : ' (no sheet pool)');
+  } catch (eLv) {
+    return 'live-fill n/a';
+  }
+}
+/** v1.19.0 [OWNER-RULE]: Script Property DT10_OWNER_RULE_MARK. Exactly 'on'
+ * (trimmed, any case) arms the per-seat marker; absent, blank, 'off', junk
+ * or a PropertiesService fault read as off (the v1.18.0 render). Never
+ * throws. */
+function dt10OwnerRuleMarkOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_OWNER_RULE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eOr) {}
+  return false;
+}
+/** v1.19.0 [OWNER-RULE] PURE: the 'Owner Rule' cell of one seat. The
+ * owner's interim buy rule (31 Oct 2026): Confidence band High AND Engine
+ * ROI 12M < DT10_OWNER_RULE_ROI_MAX. 'rule: yes' when both hold; else
+ * 'rule: no (<parts>)' naming only the failing parts: the band as printed
+ * ('Medium', 'Low'; 'conf unknown' when blank) and 'ROI <x.x>' ('ROI
+ * unknown' when not a number). Display only; never throws. */
+function dt10OwnerRuleCell_(t) {
+  t = t || {};
+  var band = String(t.confidence_band === null || t.confidence_band === undefined ?
+      '' : t.confidence_band).replace(/^\s+|\s+$/g, '');
+  var roi = Number(t.engine_roi_pct);
+  var roiKnown = dt10HasValue_(t.engine_roi_pct) && isFinite(roi);
+  var parts = [];
+  if (band.toUpperCase() !== 'HIGH') parts.push(band ? band : 'conf unknown');
+  if (!(roiKnown && roi < DT10_OWNER_RULE_ROI_MAX)) {
+    parts.push(roiKnown ? 'ROI ' + roi.toFixed(1) : 'ROI unknown');
+  }
+  return parts.length ? 'rule: no (' + parts.join('; ') + ')' : 'rule: yes';
+}
+/** v1.19.0 [OWNER-RULE] PURE: the status token 'owner-rule k/n yes'. */
+function dt10OwnerRuleNote_(selected) {
+  var sel = selected || [], yes = 0;
+  for (var i = 0; i < sel.length; i++) {
+    if (dt10OwnerRuleCell_(sel[i]) === 'rule: yes') yes++;
+  }
+  return 'owner-rule ' + yes + '/' + sel.length + ' yes';
+}
 var DT10_KPI_LABELS = ['Entered cash (SAR)', 'Exp. Gain 12M (SAR)', 'Selected',
   'Blended Reliability', 'Blended R/R (TP2)', 'Scanned', 'Passed',
   'Unallocated (SAR)',
@@ -6317,7 +6684,7 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
-/** v1.18.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
+/** v1.19.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
  * case) arms the held-seat hand-off; absent or any other word is off. A
  * property-service failure reads as OFF: the list is display context only,
  * so failing open keeps the unarmed request. Memoized (P-202). */
@@ -6332,7 +6699,7 @@ function dt10AuditKeepOn_() {
     } catch (eProp) { return false; }
   });
 }
-/** v1.18.1 PURE: the stability members (member === true: seated, grace-held
+/** v1.19.1 PURE: the stability members (member === true: seated, grace-held
  * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at
  * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */
 function dt10AuditKeepSymbols_(state) {
@@ -7288,6 +7655,11 @@ function dt10ApplyStability_(payload, panel, outage) {
   // knobs object byte for byte.
   var pgRead = dt10StabPendingGrace_();
   if (pgRead > 0) knobs.pending_grace = pgRead;
+  // v1.19.0 [QUALIFIED-HOLD]: same pattern -- one service read here; the knob
+  // is set ONLY when armed so an unarmed run publishes the v1.18.0 knobs
+  // object byte for byte.
+  var qhRead = dt10StabQualifiedHoldMode_();
+  if (qhRead !== 'off') knobs.qualified_hold = qhRead;
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -8411,6 +8783,10 @@ function dt10RefreshDecisionTop10Run_(run) {
   var itMode = dt10InputTruthMode_();
   var candMode = dt10CandTabMode_();
   var vintMode = dt10VintageColsMode_();
+  // v1.19.0 [SEAT-LIVE-FILL] / [OWNER-RULE]: one read each; off (default)
+  // => nothing is attached to the payload and the render is v1.18.0.
+  var liveOn = dt10SeatLiveFillOn_();
+  var ruleOn = dt10OwnerRuleMarkOn_();
   if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
@@ -8505,7 +8881,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
-  // v1.18.1: held seats kept in the backend's written audit (display only).
+  // v1.19.1: held seats kept in the backend's written audit (display only).
   if (dt10AuditKeepOn_()) {
     try {
       var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());
@@ -8567,6 +8943,15 @@ function dt10RefreshDecisionTop10Run_(run) {
     payload._dt10_vint = { mode: vintMode,
                            idx: pool ? dt10PoolVintageIndex_(pool.rows) : null };
   }
+  // v1.19.0 [SEAT-LIVE-FILL]: the live index of the sheet pool rows already
+  // collected and the FX map already read for the body; attached only when
+  // armed (off => the payload object is byte-identical).
+  if (liveOn) {
+    payload._dt10_live = { idx: pool ? dt10SeatLiveIndex_(pool.rows) : null,
+                           fx: body.fx_rates || {} };
+  }
+  // v1.19.0 [OWNER-RULE]: the marker column rides only when armed.
+  if (ruleOn) payload._dt10_rule = { mode: 'on' };
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   // Incomplete source evidence must not advance confirmation/miss memory.
   var stab = payload._dt10_uv.source_blocked === true ?
@@ -8589,6 +8974,9 @@ function dt10RefreshDecisionTop10Run_(run) {
   }
   var candNote = payload._dt10_cand_note || '';
   var vintNote = payload._dt10_vint_note || '';
+  // v1.19.0: status tokens the render stored ('' when a gate is off).
+  var liveNote = payload._dt10_live_note || '';
+  var ruleNote = payload._dt10_rule_note || '';
   var finalSource = payload._dt10_uv.source_readiness;
   if (pool) poolNote = dt10PoolNote_(pool, finalSource);
   else poolNote += ' | source readiness ' + (finalSource.ready ? 'VERIFIED (run ' + finalSource.cohort + ')' : 'WITHHELD: ' + finalSource.reason);
@@ -8606,6 +8994,8 @@ function dt10RefreshDecisionTop10Run_(run) {
       (itNote ? ' | ' + itNote : '') +               // v1.13.4 [WP-8]
       (candNote ? ' | ' + candNote : '') +
       (vintNote ? ' | ' + vintNote : '') +
+      (liveNote ? ' | ' + liveNote : '') +               // v1.19.0 [SEAT-LIVE-FILL]
+      (ruleNote ? ' | ' + ruleNote : '') +               // v1.19.0 [OWNER-RULE]
       dt10FunnelNote_(payload) + ' | ' + secs + 's',
       dt10OutputStatus_(payload));   // v1.11.0 (2)
   // v1.3.1: the cockpit OWNS the selection audit trail — log the board it
@@ -8841,6 +9231,11 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // painted. The pre-pool generation must still match the latest sources.
   payload._dt10_uv = dt10BoardVerdict_(sheet.getParent(), payload._dt10_source_context || {});
   dt10FinalizeBoard_(payload);
+  // v1.19.0 [SEAT-LIVE-FILL]: live numbers on grace / fast-track / held
+  // seats after the last note-replacing finalization ('' when the refresh
+  // attached no payload._dt10_live -> nothing touched, no key stored).
+  var liveFillNote = dt10SeatLiveFill_(payload);
+  if (liveFillNote) payload._dt10_live_note = liveFillNote;
   // v1.13.2: annotate after the last note-replacing finalization, before
   // painting the board. The refresh status and selection log use this result.
   var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
@@ -8923,6 +9318,18 @@ function dt10RenderPayload_(sheet, payload, tokens) {
                                selHeaders.length - sheet.getMaxColumns());
     }
   }
+  // v1.19.0 [OWNER-RULE]: one extra column after the seat block (after the
+  // vintage columns when those are enforced); off => the headers above and
+  // no key stored on the payload.
+  var _or = !!(payload._dt10_rule && payload._dt10_rule.mode === 'on');
+  if (_or) {
+    selHeaders = selHeaders.concat(DT10_OWNER_RULE_HEADERS);
+    if (sheet.getMaxColumns() < selHeaders.length) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(),
+                               selHeaders.length - sheet.getMaxColumns());
+    }
+    payload._dt10_rule_note = dt10OwnerRuleNote_(selected);
+  }
   var selRows = [];
   for (var s = 0; s < selected.length; s++) {
     selRows.push(dt10TicketToRow_(selected[s]));
@@ -8930,6 +9337,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       var _vc = dt10VintageCells_(selected[s], _vt.idx);
       selRows[selRows.length - 1].push(_vc[0], _vc[1]);
     }
+    if (_or) selRows[selRows.length - 1].push(dt10OwnerRuleCell_(selected[s]));   // v1.19.0
   }
   if (dt10Uv.state !== 'EXECUTABLE') {          /* v1.9.0 W1A-4a */
     for (var uvI = 0; uvI < selRows.length; uvI++) {
@@ -8955,6 +9363,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   if (_vt.mode === 'enforce' && selT.firstDataRow > 0) {   // v1.13.4 [WP-8]
     sheet.getRange(selT.firstDataRow, DT10_SELECTED_HEADERS.length + 1,
                    selT.count, DT10_VINTAGE_HEADERS.length).setNumberFormat('@');
+  }
+  if (_or && selT.firstDataRow > 0) {   // v1.19.0 [OWNER-RULE]: text cells
+    sheet.getRange(selT.firstDataRow, selHeaders.length, selT.count, 1)
+        .setNumberFormat('@');
   }
   if (_vt.mode !== 'off') {
     payload._dt10_vint_note = dt10VintageNote_(selected, _vt.idx, _vt.mode);
@@ -10166,6 +10578,158 @@ function dt10SelfTest() {
        ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +
          'two soft misses -> reset, structural block -> reset, member untouched)'
        : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));
+  /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
+     confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
+     the buffer boundary: off / junk = the v1.14.0 qualified replay byte for
+     byte; observe = the same board plus ', qhold: would hold 1 B.US' and
+     audit.qualified_held; enforce = B 'ACTIVE (day 7)' with no _grace_hold,
+     a _qhold marker, out of the grace ledger, board-eligible, still unsized,
+     state identical; B WATCH on the grid = 'GRACE (1/3 missed)' as before. */
+  report.push('qualified hold (DT10_QUALIFIED_HOLD): ' + dt10StabQualifiedHoldMode_() +
+              ' (off = v1.18.0 board; observe lists; enforce holds)');
+  function qhKnobs(mode) {
+    var k = cbKnobs('qualified');
+    if (mode !== undefined) k.qualified_hold = mode;
+    return k;
+  }
+  function qhRun(knobs, grid) {
+    return dt10StabCore_(cbRaw[0], grid, dt10StabParseState_(cbSeed), knobs, 2,
+                         cbDays[0]);
+  }
+  function qhSeat(o, sym) {
+    for (var qs = 0; qs < o.tickets.length; qs++) {
+      if (o.tickets[qs].symbol === sym) return o.tickets[qs];
+    }
+    return null;
+  }
+  function qhStrip(o) {   // everything but the armed token / audit key
+    var qa = {};
+    for (var qk in o.audit) {
+      if (o.audit.hasOwnProperty(qk) && qk !== 'qualified_held') qa[qk] = o.audit[qk];
+    }
+    return JSON.stringify({ t: o.tickets, s: o.state, a: qa,
+                            n: o.note.replace(/, qhold: [^,]*$/, '') });
+  }
+  var qhGridW = cbGrid(86);
+  qhGridW[14].verdict = 'WATCH';
+  var qhBase = cbQ[0];
+  var qhBaseStr = JSON.stringify({ t: qhBase.tickets, s: qhBase.state,
+                                   a: qhBase.audit, n: qhBase.note });
+  var qhOff = qhRun(qhKnobs(undefined), cbGrid(86));
+  var qhOffX = qhRun(qhKnobs('junk'), cbGrid(86));
+  var qhObs = qhRun(qhKnobs('observe'), cbGrid(86));
+  var qhEnf = qhRun(qhKnobs('enforce'), cbGrid(86));
+  var qhEnfW = qhRun(qhKnobs('enforce'), qhGridW);
+  var qhB = qhSeat(qhEnf, 'B.US'), qhBo = qhSeat(qhObs, 'B.US');
+  var qhBw = qhSeat(qhEnfW, 'B.US');
+  report.push('qualified hold core: ' +
+      ((JSON.stringify(qhOff) === JSON.stringify(qhBase) &&
+        JSON.stringify(qhOffX) === JSON.stringify(qhBase) &&
+        qhStrip(qhObs) === qhBaseStr &&
+        qhObs.note.indexOf(', qhold: would hold 1 B.US') > 0 &&
+        qhObs.audit.qualified_held.length === 1 &&
+        qhObs.audit.qualified_held[0] === 'B.US' &&
+        qhBo !== null && qhBo._stab_status === 'GRACE (0/3 missed)' &&
+        qhBo._grace_hold === true && !dt10BoardEligible_(qhBo) &&
+        qhB !== null && qhB._stab_status === 'ACTIVE (day 7)' &&
+        qhB._grace_hold !== true && qhB._qhold === true && qhB.rank === 2 &&
+        qhB.suggested_sar === '\u2014' && dt10BoardEligible_(qhB) &&
+        qhEnf.state.symbols['B.US'].co === 0 &&
+        qhEnf.state.symbols['B.US'].member === true &&
+        qhEnf.audit.held_by_grace.length === 0 &&
+        qhEnf.note.indexOf('grace') < 0 &&
+        qhEnf.note.indexOf(', qhold: held 1 B.US') > 0 &&
+        JSON.stringify(qhEnf.state) === JSON.stringify(qhBase.state) &&
+        JSON.stringify(qhSeat(qhEnf, 'A.US')) === JSON.stringify(qhSeat(qhBase, 'A.US')) &&
+        qhBw !== null && qhBw._stab_status === 'GRACE (1/3 missed)' &&
+        qhBw._grace_hold === true && qhEnfW.note.indexOf(', qhold: held 0') > 0)
+       ? 'ok (off/junk = v1.18.0 replay; observe adds the token only; enforce: B ACTIVE (day 7), ' +
+         'eligible, unsized, out of the grace ledger, state identical; B WATCH -> GRACE 1/3)'
+       : 'FAIL [' + qhObs.note + ' | ' + qhEnf.note + ' | ' + qhEnfW.note + ']'));
+  /* v1.19.0 [SEAT-LIVE-FILL]: property line (one read) + pure core. A stash
+     ghost (blank Rel / DQ / FX, stale price 19.88) with a pool row (20.15,
+     Rel 71.5, DQ 100, INVESTABLE) is filled and noted; a grid ghost takes
+     the grid price, Price SAR and FX and is noted (INVEST); a WATCHLIST pool
+     row fills but is not noted; a ghost without any row stays blank; an
+     ACTIVE seat and a fast-track seat with no row are untouched; a second
+     pass changes nothing; no _dt10_live gives ''. */
+  report.push('seat live fill (DT10_SEAT_LIVE_FILL): ' +
+              (dt10SeatLiveFillOn_() ? 'on' : 'off') + ' (off = v1.18.0 render)');
+  var lfIdx = dt10SeatLiveIndex_([
+      { 'Symbol': 'ZTO.US', 'Current Price': 20.15, 'Forecast Reliability Score': 71.5,
+        'Data Quality Score': 100, 'Currency': 'USD', 'Investability Status': 'INVESTABLE' },
+      { 'Symbol': 'ZTO.US', 'Current Price': 1 },
+      { 'Symbol': 'BHF.US', 'Current Price': 50.1, 'Forecast Reliability Score': 65,
+        'Data Quality Score': 90, 'Currency': 'USD', 'Investability Status': 'WATCHLIST' },
+      { 'Symbol': '' }, null]);
+  var lfSel = [
+      { symbol: 'ZTO.US', currency: 'USD', price: 19.88, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (2/3 missed)',
+        advisor_note: 'n1' },
+      { symbol: 'DDI.US', currency: 'USD', price: 13.2, price_sar: 49.5, fx_to_sar: '',
+        reliability: 71.5, dq: 100, _grace_hold: true, _stab_status: 'GRACE (0/3 missed)',
+        advisor_note: 'n2' },
+      { symbol: 'BHF.US', currency: 'USD', price: 49, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (2/3 missed)',
+        advisor_note: 'n3' },
+      { symbol: 'NONE.US', currency: 'USD', price: 5, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (1/3 missed)',
+        advisor_note: 'n4' },
+      { symbol: 'ACT.US', currency: 'USD', price: 7, price_sar: 26.25, fx_to_sar: 3.75,
+        reliability: 80, dq: 95, _stab_status: 'ACTIVE (day 3)', advisor_note: 'n5' },
+      { symbol: 'FT.US', currency: 'USD', price: 9, price_sar: 33.75, fx_to_sar: 3.75,
+        reliability: 77, dq: 90, _ft_suspended: true, _stab_status: 'FAST-TRACK (day 1)',
+        advisor_note: 'n6' }];
+  var lfCands = [{ symbol: 'DDI.US', verdict: 'INVEST', price: 13.4, price_sar: 50.25,
+                   reliability: 71.5, dq: 100, currency: 'USD', opportunity_score: 80 },
+                 { symbol: 'ACT.US', verdict: 'INVEST', price: 7.5, price_sar: 28.13,
+                   reliability: 80, dq: 95, currency: 'USD', opportunity_score: 70 }];
+  var lfBefore = JSON.stringify([lfSel[4], lfSel[5]]);
+  var lfRes = dt10SeatLiveFillCore_(lfSel, lfCands, lfIdx, { USD: 3.75 });
+  var lfOnce = JSON.stringify(lfSel);
+  var lfRes2 = dt10SeatLiveFillCore_(lfSel, lfCands, lfIdx, { USD: 3.75 });
+  report.push('seat live fill core: ' +
+      ((lfRes.seats === 5 && lfRes.filled === 3 && lfRes.investable === 2 &&
+        lfSel[0].price === 20.15 && lfSel[0].reliability === 71.5 && lfSel[0].dq === 100 &&
+        lfSel[0].fx_to_sar === 3.75 && lfSel[0].price_sar === 75.56 &&
+        lfSel[0].advisor_note ===
+            'n1 Source row today: investable (Investability Status INVESTABLE).' &&
+        lfSel[0]._stab_status === 'GRACE (2/3 missed)' && lfSel[0]._grace_hold === true &&
+        lfSel[1].price === 13.4 && lfSel[1].price_sar === 50.25 &&
+        lfSel[1].fx_to_sar === 3.75 &&
+        lfSel[1].advisor_note === 'n2 Source row today: investable (INVEST on the audited grid).' &&
+        lfSel[2].price === 50.1 && lfSel[2].reliability === 65 && lfSel[2].dq === 90 &&
+        lfSel[2].advisor_note === 'n3' &&
+        lfSel[3].price === 5 && lfSel[3].reliability === '' && lfSel[3].fx_to_sar === '' &&
+        JSON.stringify([lfSel[4], lfSel[5]]) === lfBefore &&
+        lfRes2.filled === 0 && lfRes2.investable === 0 && JSON.stringify(lfSel) === lfOnce &&
+        lfIdx['ZTO.US'].price === 20.15 && dt10SeatLiveIndex_(null)['X'] === undefined &&
+        dt10SeatLiveFill_({ selected: lfSel }) === '')
+       ? 'ok (stash ghost filled from the pool row and noted; grid ghost from the grid; ' +
+         'WATCHLIST row not noted; no row = blank; ACTIVE / fast-track untouched; idempotent)'
+       : 'FAIL [' + JSON.stringify(lfRes) + ' ' + JSON.stringify(lfSel[0]) + ']'));
+  /* v1.19.0 [OWNER-RULE]: property line (one read) + pure cell / note. */
+  report.push('owner rule mark (DT10_OWNER_RULE_MARK): ' +
+              (dt10OwnerRuleMarkOn_() ? 'on' : 'off') +
+              ' (High + Engine ROI 12M < ' + DT10_OWNER_RULE_ROI_MAX + '; display only)');
+  var orSel = [{ confidence_band: 'High', engine_roi_pct: 31.6 },
+               { confidence_band: 'Medium', engine_roi_pct: 34.8 },
+               { confidence_band: 'High', engine_roi_pct: 34 },
+               { confidence_band: 'Medium', engine_roi_pct: 20 },
+               { confidence_band: '', engine_roi_pct: '' },
+               { confidence_band: 'high', engine_roi_pct: '33.9' },
+               { confidence_band: 'Low' }];
+  var orCells = [];
+  for (var ori = 0; ori < orSel.length; ori++) orCells.push(dt10OwnerRuleCell_(orSel[ori]));
+  report.push('owner rule core: ' +
+      ((orCells.join('|') === 'rule: yes|rule: no (Medium; ROI 34.8)|rule: no (ROI 34.0)|' +
+            'rule: no (Medium)|rule: no (conf unknown; ROI unknown)|rule: yes|' +
+            'rule: no (Low; ROI unknown)' &&
+        dt10OwnerRuleNote_(orSel) === 'owner-rule 2/7 yes' &&
+        dt10OwnerRuleNote_([]) === 'owner-rule 0/0 yes' &&
+        dt10OwnerRuleCell_(null) === 'rule: no (conf unknown; ROI unknown)')
+       ? 'ok (High + ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' = yes; the failing part is named)'
+       : 'FAIL [' + orCells.join('|') + ']'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

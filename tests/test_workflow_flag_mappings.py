@@ -18,7 +18,8 @@ import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 TRACKER_DEFAULTS = {"TRACK_DEDUP_MATURED": "off", "TRACK_RISK_BLANK": "0",
-                    "TRACK_CANONICAL_TARGETS": "1", "TRACK_SIGNAL_PUBLICATION_MODE": "off"}
+                    "TRACK_CANONICAL_TARGETS": "1", "TRACK_SIGNAL_PUBLICATION_MODE": "off",
+                    "TRACK_LOG_UNFORMATTED_READ": "off"}   # 2026-10-25: v6.50.0 [LOG-READ]
 SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_TAB": "off",
     "TFB_SYNC_RETIRE_TAB_NAME": "_Retired_Symbols",

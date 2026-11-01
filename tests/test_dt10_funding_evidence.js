@@ -238,10 +238,11 @@ for (const f of FUNCS.slice(2)) ok(block.indexOf('function ' + f + '(') > 0, 'F1
 // 2026-10-27: v1.17.0 (shadow rank log) stacked on this change; pins moved
 // 2026-10-27: v1.17.1 (shadow momentum) stacked as well; pins moved
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
-ok((layerSrc.match(/var DT10_VERSION = '1\.18\.0';/) || []).length === 1 && /\* Version: 1\.18\.0 \(see DT10_VERSION;/.test(layerSrc), 'F10 version lockstep (layer)');
-ok(dt10Floor(deliveredVersion, [1, 18, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+// 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
+ok((layerSrc.match(/var DT10_VERSION = '1\.19\.0';/) || []).length === 1 && /\* Version: 1\.19\.0 \(see DT10_VERSION;/.test(layerSrc), 'F10 version lockstep (layer)');
+ok(dt10Floor(deliveredVersion, [1, 19, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
    src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
-   'F10 delivered version floor 1.18.0 in lockstep: ' + deliveredVersion);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+   'F10 delivered version floor 1.19.0 in lockstep: ' + deliveredVersion);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
 ok(src.indexOf("var fundingNote = dt10FundingApply_(body, Date.now());") > 0 && src.indexOf("cashNote + fundingNote + ' | '") > 0, 'F10 wired into the request + status line');
 console.log('F10 PASS lint + inventory');
 

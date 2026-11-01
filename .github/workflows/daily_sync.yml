@@ -1441,6 +1441,13 @@ jobs:
           TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
+          # (2026-10-25) track_performance v6.50.0 [LOG-READ]: Performance_Log
+          # numbers read at full precision (UNFORMATTED_VALUE) instead of their
+          # displayed text, so canonical v2 1W/2W targets survive the read-back.
+          # Default off = the v6.49.0 read. Arm: observe for one run, then
+          # enforce; both tracker lanes map the same Variable (ENV PARITY).
+          # Rollback: unset or off.
+          TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
