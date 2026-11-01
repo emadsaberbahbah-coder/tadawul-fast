@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.4.0 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.4.1 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
 pages; 2d: candles, analysts, news and the TFB rating per symbol). Offline:
@@ -15,7 +15,7 @@ the BigQuery session is a fake, no google library is imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the objects v1.3.1 and v1.4.0 add or change hash to their reviewed
+      the objects v1.3.1, v1.4.0 and v1.4.1 add or change hash to their reviewed
       files (pending pins, confirmed by bq_views --verify after the next
       --write; v1.2.0's were read back on 31 Oct and v1.3.0's on 1 Nov, and
       are installed pins); a table function keeps the query after its 'AS'
@@ -99,13 +99,17 @@ the BigQuery session is a fake, no google library is imported.
       view gives riyal values for every holding (the decision page's figure
       first, else the sheet's value times v_fx_sar) with its source, and the
       Top-10 view says seat and allocation in plain words (a row without a
-      ticket is 'research board', never an order) - fails on the 1.3.1 files
-  V23 v_outcome_coverage (v1.4.0): per horizon and ALL, due / matured /
-      scored / wins with the win rate over scored calls only and the matured
-      share over due records; the overdue count is active records past
-      their target; simulated on a small log (fails when the win rate is
-      taken over matured instead of scored, when due ignores the target
-      date, and when ALL is missing)
+      ticket is 'research board', never an order) - fails on the 1.3.1 files;
+      v1.4.1: the riyal weight is a share of the whole book, NULL for every
+      holding while any holding has no riyal value (fails on the 1.4.0 file)
+  V23 v_outcome_coverage (v1.4.0, cohort in v1.4.1): per horizon and ALL,
+      due / matured / scored / wins with the win rate over scored calls of
+      the sheet's outcome cohort only (first valid matured record per key)
+      and the matured share over due records; the overdue count is active
+      records past their target; simulated on a small log (fails when the
+      win rate is taken over matured instead of scored, when a key archived
+      twice counts twice, when due ignores the target date, and when ALL is
+      missing)
 """
 from __future__ import annotations
 
@@ -175,7 +179,7 @@ INSTALLED = {
     "v_dive_board": "3af206fc77283b1c9fbdff585d61d997f577c444ad5bc86088a0b33ac5ecdfaf",
     "v_dive_events": "bfcf61db2425619a8fe2f18778d573d0b506ba55a59f3f4850af067b5904f693",
 }
-# The objects apply_bq_views 1.3.1 and 1.4.0 add or change (1 Nov 2026), hashed
+# The objects apply_bq_views 1.3.1, 1.4.0 and 1.4.1 add or change (1 Nov 2026), hashed
 # from the reviewed files: bq_views --verify after the next --write must find
 # these exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
 # Installed bodies they replace: v_symbol_candles ed95728198f6 (1.3.0),
@@ -186,8 +190,8 @@ PENDING = {
     "v_fx_sar": "2c6262eb53692796710a71fa045c4ad0d56d883b66a597cc0d3ec011d00040ca",
     "v_symbol_rating": "3a07d374b2b1c175e9dd040a0fbd87b6dda158b1d35edf00bf56d263a2b7d0d1",
     "v_top10_insight": "66d2facf68aadfb9088e05eed29669daf063b04bb1b82a8ccf0928911438e9cf",
-    "v_portfolio_insight": "23425289b5eb4c185bed75e5acbed022cbd962a92ed47f7110c9fba23c84ccfb",
-    "v_outcome_coverage": "d84d077083b407775b678ba77f806f523ada3ddd1879821e0283bd8cc0195e33",
+    "v_portfolio_insight": "a905416997fa03335516b028edfa60a215d21d22ee6c75fdc54aba52eb64216b",
+    "v_outcome_coverage": "ab308c8c736da1bb8e9bfa052b5fccbe5151c15e483a6773e59ed98daf90fe7f",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -928,6 +932,16 @@ def case_v21():
     assert abs(wrong["HKD"] - 3.7526 / 7.8442) < 1e-6 and abs(t["HKD"] - wrong["HKD"]) < 1e-3
 
 
+def _weights(values, whole_book=True):
+    """weight_sar_pct over a book: with whole_book (1.4.1) every weight is None while any
+    value is None; without it (1.4.0) the valued subset is shared out as if it were the book."""
+    missing = sum(1 for v in values if v is None)
+    if whole_book and missing:
+        return [None] * len(values), missing
+    total = sum(v for v in values if v is not None)
+    return [round(v / total * 100, 2) if v is not None else None for v in values], missing
+
+
 def case_v22():
     import re
     objs = {o.name: o for o in bv.load_objects()}
@@ -962,7 +976,14 @@ def case_v22():
     assert "COALESCE(d.market_value_sar, h.position_value * fx.rate_to_sar) AS value_sar" in pf
     assert "COALESCE(d.cost_sar, h.position_cost * fx.rate_to_sar) AS cost_sar" in pf
     assert "COALESCE(d.pnl_sar, (h.position_value - h.position_cost) * fx.rate_to_sar) AS pnl_sar" in pf
-    assert "ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2) AS weight_sar_pct" in pf
+    # 1.4.1: a weight is a share of the whole book - NULL for every row while any holding
+    # has no riyal value, with holdings_without_value saying how many
+    assert ("IF(COUNTIF(j.value_sar IS NULL) OVER () > 0, NULL,\n"
+            "     ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2)) AS weight_sar_pct") in pf
+    assert "COUNTIF(j.value_sar IS NULL) OVER () AS holdings_without_value" in pf
+    assert _weights([100.0, 300.0]) == ([25.0, 75.0], 0)
+    assert _weights([100.0, 300.0, None]) == ([None, None, None], 1)       # partial book: no weights
+    assert _weights([100.0, 300.0, None], whole_book=False)[0] == [25.0, 75.0, None]   # the 1.4.0 defect
     assert "ROUND(SAFE_DIVIDE(j.pnl_sar, j.cost_sar) * 100, 2) AS pnl_sar_pct" in pf
     assert "WHEN d.market_value_sar IS NOT NULL THEN 'Portfolio_Decision'" in pf
     assert "ELSE 'no rate for the currency'" in pf
@@ -975,9 +996,12 @@ def case_v22():
     assert bv.check_objects(list(objs.values())) == []
 
 
-def _coverage(rows, now, win_over="scored", due_by="target", with_all=True):
+def _coverage(rows, now, win_over="scored", due_by="target", with_all=True, cohort=True):
     """v_outcome_coverage on a small log: rows carry horizon, target (day), status,
-    call (WIN / LOSS / None). Returns {horizon: (due, matured, scored, wins, overdue, win_pct, share)}."""
+    call (WIN / LOSS / None) and an optional cohort flag (False = a repeated key or an
+    invalid matured copy, outside the sheet's outcome cohort). Returns
+    {horizon: (due, matured, scored, wins, overdue, win_pct, share)}; with cohort (1.4.1)
+    scored and wins count cohort rows only, without it (1.4.0) every matured copy."""
     out = {}
     hs = sorted({r["horizon"] for r in rows})
     groups = {h: [r for r in rows if r["horizon"] == h] for h in hs}
@@ -986,8 +1010,9 @@ def _coverage(rows, now, win_over="scored", due_by="target", with_all=True):
     for h, rs in groups.items():
         due = sum(1 for r in rs if (r["target"] <= now if due_by == "target" else True))
         matured = sum(1 for r in rs if r["status"] == "matured")
-        scored = sum(1 for r in rs if r["status"] == "matured" and r["call"] in ("WIN", "LOSS"))
-        wins = sum(1 for r in rs if r["status"] == "matured" and r["call"] == "WIN")
+        inc = (lambda r: r.get("cohort", True)) if cohort else (lambda r: True)
+        scored = sum(1 for r in rs if r["status"] == "matured" and r["call"] in ("WIN", "LOSS") and inc(r))
+        wins = sum(1 for r in rs if r["status"] == "matured" and r["call"] == "WIN" and inc(r))
         overdue = sum(1 for r in rs if r["target"] <= now and r["status"] == "active")
         denom = scored if win_over == "scored" else matured
         out[h] = (due, matured, scored, wins, overdue,
@@ -1001,8 +1026,14 @@ def case_v23():
     code = bv._code(objs["v_outcome_coverage"].template)
     assert set(bv._REF.findall(code)) - {"v_outcome_coverage"} == {"v_performance_log"}
     assert "COUNTIF(target_at <= CURRENT_TIMESTAMP()) AS due" in code
-    assert "COUNTIF(is_matured) AS matured" in code and "COUNTIF(is_scored) AS scored" in code
-    assert "SUM(IFNULL(win_flag, 0)) AS wins" in code
+    assert "COUNTIF(is_matured) AS matured" in code
+    # 1.4.1: scored and wins over the sheet's outcome cohort (first valid matured record per
+    # key), so a key archived twice never counts twice; matured stays raw for coverage
+    assert "COUNTIF(in_outcome_cohort) AS matured_cohort" in code
+    assert "COUNTIF(is_matured AND NOT in_outcome_cohort) AS matured_excluded" in code
+    assert "COUNTIF(is_scored AND in_outcome_cohort) AS scored" in code
+    assert "SUM(IF(in_outcome_cohort, IFNULL(win_flag, 0), 0)) AS wins" in code
+    assert "SUM(matured_cohort) AS matured_cohort" in code and "SUM(matured_excluded) AS matured_excluded" in code
     assert "COUNTIF(target_at <= CURRENT_TIMESTAMP() AND status = 'active') AS overdue_open" in code
     assert "ROUND(SAFE_DIVIDE(u.wins, u.scored) * 100, 1) AS win_pct" in code      # over decided calls
     assert "ROUND(SAFE_DIVIDE(u.matured, u.due) * 100, 1) AS matured_share_pct" in code
@@ -1015,16 +1046,23 @@ def case_v23():
             {"horizon": "1W", "target": 4, "status": "active", "call": None},       # overdue
             {"horizon": "1W", "target": 9, "status": "active", "call": None},       # not due
             {"horizon": "1M", "target": 2, "status": "active", "call": None},
-            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN"}]
+            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN"},
+            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN", "cohort": False}]  # the same key, archived twice
     c = _coverage(rows, now=5)
     assert c["1W"] == (4, 3, 2, 1, 1, 50.0, 75.0), c["1W"]
-    assert c["1M"] == (2, 1, 1, 1, 1, 100.0, 50.0), c["1M"]
-    assert c["ALL"] == (6, 4, 3, 2, 2, 66.7, 66.7), c["ALL"]
+    assert c["1M"] == (3, 2, 1, 1, 1, 100.0, 66.7), c["1M"]      # the copy is matured, never scored
+    assert c["ALL"] == (7, 5, 3, 2, 2, 66.7, 71.4), c["ALL"]
     # golden negatives: the rate over matured rows counts the neutral call as a loss; due
-    # without the target date is every record; no ALL row
+    # without the target date is every record; no ALL row; every matured copy counted (1.4.0):
+    # two copies of one winning key beside one loss read 66.7 % where the sheet says 50 %
     assert _coverage(rows, now=5, win_over="matured")["1W"][5] == 33.3
     assert _coverage(rows, now=5, due_by="all")["1W"][0] == 5
     assert "ALL" not in _coverage(rows, now=5, with_all=False)
+    dup = [{"horizon": "2W", "target": 1, "status": "matured", "call": "WIN"},
+           {"horizon": "2W", "target": 1, "status": "matured", "call": "WIN", "cohort": False},
+           {"horizon": "2W", "target": 1, "status": "matured", "call": "LOSS"}]
+    assert _coverage(dup, now=5)["2W"][2:4] == (2, 1) and _coverage(dup, now=5)["2W"][5] == 50.0
+    assert _coverage(dup, now=5, cohort=False)["2W"][5] == 66.7
 
 
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
