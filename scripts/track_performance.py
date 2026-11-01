@@ -1878,19 +1878,24 @@ from urllib.error import HTTPError, URLError
 #     exception out of the pass); a symbol beyond the 2,000 cap ->
 #     'hist_close_archive_not_asked'; no archive bar dated the target session
 #     (symbol absent, or only other sessions present) ->
-#     'hist_close_archive_no_bar'; then the v6.47.0 judge's own refusals
-#     (conflict, invalid, scale mismatch, a confirmed ledger action after the
-#     target). The yfinance pull budget (TRACK_HIST_CLOSE_BUDGET), time
-#     budget and breaker apply to yfinance pulls only: under bq_archive no
-#     yfinance pull is made (pulls=0 on the HIST-CLOSE line).
+#     'hist_close_archive_no_bar'; a bar for that day whose source is not
+#     Yahoo's daily chart (yahoo_chart_v8_1h: a day the archive rebuilt from
+#     hourly prints, whose close is the last print, not the witnessed close;
+#     Codex P2 on #894) -> 'hist_close_archive_not_daily'; then the v6.47.0
+#     judge's own refusals (conflict, invalid, scale mismatch, a confirmed
+#     ledger action after the target). The yfinance pull budget
+#     (TRACK_HIST_CLOSE_BUDGET), time budget and breaker apply to yfinance
+#     pulls only: under bq_archive no yfinance pull is made (pulls=0 on the
+#     HIST-CLOSE line).
 #   bq_archive_then_yfinance -> the archive first; a symbol with no archive
 #     bar for its target session (and every symbol when the query failed)
 #     falls back to the v6.47.0 yfinance path under its existing budget,
 #     rotating window and breaker.
 #   One extra WARNING line per armed pass: '[ARCHIVE-BAR v6.53.0] source=<src>
-#     candidates=N symbols=S asked=A rows=R served=K no_bar=M not_asked=X
-#     fallback=F unavailable=0|1 [error=<class>] query_sec=T' (served, no_bar,
-#     not_asked and fallback count candidate RECORDS). The '[HIST-CLOSE
+#     candidates=N symbols=S asked=A rows=R served=K no_bar=M not_daily=H
+#     not_asked=X fallback=F unavailable=0|1 [error=<class>] query_sec=T'
+#     (served, no_bar, not_daily, not_asked and fallback count candidate
+#     RECORDS). The '[HIST-CLOSE
 #     v6.47.0]' line and _LAST_HIST_CLOSE keep their v6.47.0 shape under
 #     source=yfinance; the archive modes add 'source' and 'archive' keys.
 #   ENV: TFB_BQ_PROJECT (default project-2e3530e6-2311-4aa3-b36),
@@ -1949,8 +1954,8 @@ from urllib.error import HTTPError, URLError
 #   _hist_archive_prefetch, _hist_close_bars_for,
 #   _hist_close_candidate_session, _audit_due_only_enabled,
 #   _audit_due_symbols (+ _ARCHIVE_BAR_TAG, _ARCHIVE_BAR_PROVIDER,
-#   _ARCHIVE_BAR_TABLE, _ARCHIVE_BAR_MAX_SYMBOLS, _ARCHIVE_BAR_WALL_SEC,
-#   _ARCHIVE_BAR_QUERY_TIMEOUT_MS, _ARCHIVE_BAR_MAX_PAGES,
+#   _ARCHIVE_BAR_TABLE, _ARCHIVE_BAR_DAILY_SOURCES, _ARCHIVE_BAR_MAX_SYMBOLS,
+#   _ARCHIVE_BAR_WALL_SEC, _ARCHIVE_BAR_QUERY_TIMEOUT_MS, _ARCHIVE_BAR_MAX_PAGES,
 #   _HIST_ARCHIVE_CACHE, _HIST_ARCHIVE_STATE, _ARCHIVE_BAR_MODULE,
 #   _DUE_ONLY_TAG, _LAST_DUE_ONLY). _hist_close_evidence asks
 #   _hist_close_bars_for (yfinance -> the v6.47.0 _hist_close_bars call);
@@ -4297,6 +4302,11 @@ def _hist_close_judge(record: Any, context: Dict[str, Any], current: OutcomePric
 _ARCHIVE_BAR_TAG = "[ARCHIVE-BAR v6.53.0]"
 _ARCHIVE_BAR_PROVIDER = "bq_archive_bar"
 _ARCHIVE_BAR_TABLE = "symbol_bars_daily"
+# Only a bar from Yahoo's DAILY chart is a witnessed session close. The
+# archive also stores days rebuilt from hourly bars (source yahoo_chart_v8_1h:
+# archive_market_series.parse_hourly keeps the LAST hourly print of the day,
+# which need not be the close); those are refused, never a maturity.
+_ARCHIVE_BAR_DAILY_SOURCES = frozenset({"yahoo_chart_v8"})
 _ARCHIVE_BAR_MAX_SYMBOLS = 2000          # symbols asked per pass (sorted; the rest 'not_asked')
 _ARCHIVE_BAR_WALL_SEC = 150.0            # one query: post + polls + pages, then 'unavailable'
 _ARCHIVE_BAR_QUERY_TIMEOUT_MS = 60000    # jobs.query timeoutMs (the archive's own)
@@ -4509,7 +4519,7 @@ def _hist_archive_prefetch(pairs: List[Tuple[str, str]]) -> None:
     _HIST_ARCHIVE_STATE.update({"loaded": False, "unavailable": False, "error": "", "detail": "",
                                 "candidates": len(pairs), "symbols": 0, "asked": 0, "rows": 0,
                                 "since": "", "until": "", "query_sec": 0.0,
-                                "served": 0, "no_bar": 0, "not_asked": 0, "fallback": 0})
+                                "served": 0, "no_bar": 0, "not_daily": 0, "not_asked": 0, "fallback": 0})
     syms = sorted({_safe_str(s or "").upper() for s, _d in pairs if _safe_str(s or "")})
     dates = sorted({_safe_str(d or "")[:10] for _s, d in pairs if len(_safe_str(d or "")) >= 10})
     _HIST_ARCHIVE_STATE["symbols"] = len(syms)
@@ -4540,10 +4550,12 @@ def _hist_close_bars_for(symbol: str, session: str) -> Tuple[Optional[List[Dict[
     _hist_close_bars call, provider 'yfinance-history'. bq_archive -> the
     pass's archive read: 'hist_close_archive_unavailable' when it failed,
     'hist_close_archive_not_asked' beyond the cap, 'hist_close_archive_no_bar'
-    when no bar is dated the target session, else the bars with provider
-    'bq_archive_bar'. bq_archive_then_yfinance -> the same, but every refusal
-    above falls back to the v6.47.0 pull under its own budget and breaker.
-    Never raises."""
+    when no bar is dated the target session, 'hist_close_archive_not_daily'
+    when that day's bar was rebuilt from hourly prints (source other than
+    Yahoo's daily chart: its close is the last print of the day, not the
+    witnessed close), else the bars with provider 'bq_archive_bar'.
+    bq_archive_then_yfinance -> the same, but every refusal above falls back
+    to the v6.47.0 pull under its own budget and breaker. Never raises."""
     src = _hist_close_source()
     if src == "yfinance":
         bars, reason = _hist_close_bars(symbol)
@@ -4557,12 +4569,16 @@ def _hist_close_bars_for(symbol: str, session: str) -> Tuple[Optional[List[Dict[
         reason = "hist_close_archive_not_asked"
     else:
         bars = _HIST_ARCHIVE_CACHE[key]
-        if want and any(isinstance(b, dict) and _safe_str(b.get("date") or "")[:10] == want
-                        for b in bars or []):
-            st["served"] = int(st.get("served") or 0) + 1
-            return bars, "", _ARCHIVE_BAR_PROVIDER
-        reason = "hist_close_archive_no_bar"
-    tally = {"hist_close_archive_no_bar": "no_bar", "hist_close_archive_not_asked": "not_asked"}.get(reason)
+        hits = [b for b in bars or [] if isinstance(b, dict) and _safe_str(b.get("date") or "")[:10] == want]
+        if want and hits:
+            if all(_safe_str(b.get("source") or "") in _ARCHIVE_BAR_DAILY_SOURCES for b in hits):
+                st["served"] = int(st.get("served") or 0) + 1
+                return bars, "", _ARCHIVE_BAR_PROVIDER
+            reason = "hist_close_archive_not_daily"
+        else:
+            reason = "hist_close_archive_no_bar"
+    tally = {"hist_close_archive_no_bar": "no_bar", "hist_close_archive_not_asked": "not_asked",
+             "hist_close_archive_not_daily": "not_daily"}.get(reason)
     if tally:
         st[tally] = int(st.get(tally) or 0) + 1
     if src == "bq_archive":
@@ -10998,11 +11014,12 @@ class PerformanceTrackerApp:
                 _hist_stats.update(source=_hist_source, archive=_arch)
                 logger.warning(
                     "%s source=%s candidates=%d symbols=%d asked=%d rows=%d served=%d no_bar=%d "
-                    "not_asked=%d fallback=%d unavailable=%d%s query_sec=%.2f",
+                    "not_daily=%d not_asked=%d fallback=%d unavailable=%d%s query_sec=%.2f",
                     _ARCHIVE_BAR_TAG, _hist_source, int(_arch.get("candidates") or 0),
                     int(_arch.get("symbols") or 0), int(_arch.get("asked") or 0),
                     int(_arch.get("rows") or 0), int(_arch.get("served") or 0),
-                    int(_arch.get("no_bar") or 0), int(_arch.get("not_asked") or 0),
+                    int(_arch.get("no_bar") or 0), int(_arch.get("not_daily") or 0),
+                    int(_arch.get("not_asked") or 0),
                     int(_arch.get("fallback") or 0), 1 if _arch.get("unavailable") else 0,
                     (" error=" + _safe_str(_arch.get("error"))) if _arch.get("error") else "",
                     float(_arch.get("query_sec") or 0.0))

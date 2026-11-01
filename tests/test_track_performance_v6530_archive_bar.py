@@ -34,7 +34,10 @@ Cases
   S3  a symbol missing from the archive -> hist_close_archive_no_bar, ACTIVE
   S4  a later-session-only bar -> hist_close_archive_no_bar, ACTIVE
       (quote_outside_target_session semantics preserved); the judge's own
-      refusals still apply to archive bars
+      refusals still apply to archive bars; S4c a day rebuilt from hourly
+      prints (source yahoo_chart_v8_1h, Codex P2 on #894) ->
+      hist_close_archive_not_daily, never a maturity, yfinance decides in
+      the combined mode
   S5  a failed session / HTTP error / transport error / payload error /
       poll failure / over-paging -> every candidate
       hist_close_archive_unavailable, the pass continues, no exception, and
@@ -228,7 +231,7 @@ class FakeSession:
                     close = bar["close"]
                     rows.append({"f": [{"v": sym}, {"v": bar["date"]}, {"v": None}, {"v": None}, {"v": None},
                                        {"v": None if close is None else str(close)}, {"v": None},
-                                       {"v": "yahoo_chart_v8"}]})
+                                       {"v": bar.get("source", "yahoo_chart_v8")}]})
         return rows
 
     def _page(self, start):
@@ -461,7 +464,7 @@ def _s2_case(close, outcome):
             st["archive"]["rows"], st["archive"]["served"], st["archive"]["no_bar"]) == (1, 1, 1, 1, 1, 0)
     assert hist_lines(run) == [V647_LINE.replace("pulls=1 ok=1", "pulls=0 ok=0")]
     assert archive_lines(run) == ["[ARCHIVE-BAR v6.53.0] source=bq_archive candidates=1 symbols=1 asked=1 "
-                                  "rows=1 served=1 no_bar=0 not_asked=0 fallback=0 unavailable=0 "
+                                  "rows=1 served=1 no_bar=0 not_daily=0 not_asked=0 fallback=0 unavailable=0 "
                                   "query_sec=%.2f" % st["archive"]["query_sec"]]
 
 
@@ -562,6 +565,52 @@ def test_s4_later_session_only_bar_is_never_used():
         audit(tp, [rec], [row()], env=BQ, archive={"SYNTH.US": archive})
         assert rec.status == tp.PerformanceStatus.ACTIVE, label
         assert receipt(tp, rec)["hist_close_reason"] == reason, label
+
+
+HOURLY = {"date": SESSION, "close": 104.0, "split": 0.0, "source": "yahoo_chart_v8_1h"}
+
+
+def test_s4c_hourly_reconstruction_is_not_a_witnessed_close():
+    """Codex P2 on #894: a symbol_bars_daily row with source yahoo_chart_v8_1h
+    is a day rebuilt from hourly prints (archive_market_series.parse_hourly
+    keeps the LAST print, not the close), the path archive_symbol_deep takes
+    when Yahoo's daily history is short. It must never mature a record, with
+    or without the CA-GUARD; the combined mode asks yfinance instead."""
+    for label, synth_bars in (("hourly target bar", [b if b["date"] != SESSION else HOURLY for b in bars()]),
+                              ("hourly only", [HOURLY]),
+                              ("daily and hourly copies", bars(extra=[HOURLY])),
+                              ("unknown source", [dict(HOURLY, source="eodhd_eod")]),
+                              ("blank source", [dict(HOURLY, source="")])):
+        for ca_guard in (False, True):
+            rec = record(tp)
+            run = audit(tp, [rec], [row()], env=BQ, archive={"SYNTH.US": synth_bars}, ca_guard=ca_guard,
+                        patches={"_ca_ledger_factor": lambda *a, **k: None, "_mature_grace_days": lambda: 0})
+            assert rec.status == tp.PerformanceStatus.ACTIVE and rec.realized_roi is None, (label, ca_guard)
+            assert rec.outcome is None and rec.current_price == 110.0, (label, ca_guard)
+            proof = receipt(tp, rec)
+            assert proof["reason"] == "quote_outside_target_session", (label, ca_guard)
+            assert proof["hist_close_reason"] == "hist_close_archive_not_daily", (label, ca_guard)
+            assert run.pulls == [], (label, ca_guard)
+            assert tp._LAST_HIST_CLOSE["refused"] == {"hist_close_archive_not_daily": 1}, (label, ca_guard)
+            assert tp._LAST_HIST_CLOSE["archive"]["not_daily"] == 1, (label, ca_guard)
+            assert tp._LAST_HIST_CLOSE["archive"]["served"] == 0, (label, ca_guard)
+            assert "not_daily=1 not_asked=0" in archive_lines(run)[0], (label, ca_guard)
+    # a daily bar on another date beside the hourly target bar changes nothing
+    rec = record(tp)
+    audit(tp, [rec], [row()], env=BQ, archive={"SYNTH.US": [HOURLY, {"date": "2026-09-30", "close": 103.0,
+                                                                      "split": 0.0}]})
+    assert rec.status == tp.PerformanceStatus.ACTIVE
+    assert receipt(tp, rec)["hist_close_reason"] == "hist_close_archive_not_daily"
+    # the combined mode lets yfinance decide
+    rec = record(tp)
+    run = audit(tp, [rec], [row()], env=BQ_THEN, archive={"SYNTH.US": [HOURLY]}, bar_map={"SYNTH.US": bars(95.0)})
+    assert run.pulls == ["SYNTH.US"] and rec.status == tp.PerformanceStatus.MATURED
+    assert rec.realized_roi == pytest.approx(-5.0) and receipt(tp, rec)["provider"] == "yfinance-history"
+    assert tp._LAST_HIST_CLOSE["archive"]["not_daily"] == 1 and tp._LAST_HIST_CLOSE["archive"]["fallback"] == 1
+    # the daily source still serves, and the parser keeps every source label
+    shaped = tp._archive_bar_rows([{"symbol": "A.US", "date": SESSION, "close": "1", "source": "yahoo_chart_v8_1h"}])
+    assert shaped["A.US"][0]["source"] == "yahoo_chart_v8_1h"
+    assert tp._ARCHIVE_BAR_DAILY_SOURCES == frozenset({"yahoo_chart_v8"})
 
 
 def test_s4b_confirmed_ledger_action_after_target_refuses_before_the_archive():
@@ -691,7 +740,7 @@ def test_s8_archive_then_yfinance_falls_back_per_symbol():
     assert st["archive"]["served"] == 1 and st["archive"]["no_bar"] == 1 and st["archive"]["fallback"] == 1
     assert archive_lines(run)[0].startswith("[ARCHIVE-BAR v6.53.0] source=bq_archive_then_yfinance "
                                             "candidates=2 symbols=2 asked=2 rows=1 served=1 no_bar=1 "
-                                            "not_asked=0 fallback=1 unavailable=0")
+                                            "not_daily=0 not_asked=0 fallback=1 unavailable=0")
     # a later-session-only archive bar (inside a widened query) is no bar: yfinance decides
     x, y = record(tp, symbol="XXX.US"), record(tp, symbol="YYY.US", target=LATER_TARGET)
     run = audit(tp, [x, y], [row(symbol="XXX.US"), row(symbol="YYY.US")], env=BQ_THEN,
