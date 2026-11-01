@@ -1,7 +1,102 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.15
+ * Version: 1.5.17
+ *
+ * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS INPUTS: Calendar_Events REACHES
+ *                        THE PORTFOLIO_DECISION BACKEND GUARD; ALL v1.5.16
+ *                        logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (weekly review 28 Oct, defect D1): the page recommended 'ADD 48
+ * FRST.US (~2,671 SAR)' five sessions after a -22.2 % EPS miss (reported
+ * 22 Oct). The interim trading policy forbids adding inside 5 sessions of a
+ * report (10 after an EPS miss), and the Top-10 board already tags its seats
+ * from Calendar_Events (16_Decision_Top10 v1.18.0), but the backend that
+ * decides ADD never sees the calendar: the 122 My_Portfolio columns carry no
+ * report date. portfolio_actions 1.17.0 adds the guard (Render
+ * TFB_PF_ADD_POST_EARN = off | observe | enforce, default off) and needs the
+ * report dates in the request.
+ * WHAT: Script Property PD_POST_EARN = off (default: no Calendar_Events read,
+ * request and every line byte-identical to v1.5.16) | on. When on,
+ * refreshPortfolioDecision adds body.post_earnings = pdPostEarnBody_
+ * (schema tfb.pd-post-earnings/v1): status ok | unavailable | stale, asof
+ * (Riyadh date), updated (newest 'Updated At (Riyadh)' day), reports (recent
+ * reports in the calendar) and, for the held symbols only, {date, sessions,
+ * surprise} from the Top-10's own reader dt10PostEarnMapFromValues_ (same
+ * sessions, same 31-day window, Sun-Thu for KSA), plus a held name whose
+ * Last or Next Earnings Date is today at 0 sessions (review fix: that reader
+ * keeps strictly past reports only). A missing sheet, header or
+ * 16_Decision_Top10 parser, or any read error -> 'unavailable'; a newest
+ * update older than PD_POST_EARN_STALE_DAYS (7) -> 'stale'. The backend
+ * ignores the object unless the guard is armed, and pops it before meta, so
+ * with the guard off the page, the action log and every line are unchanged
+ * even when PD_POST_EARN is on; the field is never logged. Order: paste,
+ * set PD_POST_EARN=on, then arm the Render guard (an armed guard without
+ * inputs holds every ADD as 'earnings calendar absent'). pdMetaLine_ gains
+ * ' | post-earn <mode> (...)'
+ * and ' | tickets <open>/<cap> <mode> (...)' ONLY when the response carries
+ * meta.post_earn_guard / meta.ticket_cap (guards armed on Render).
+ * pdSelfTest reports the mode and the inputs a run would send now.
+ * ES5. Functions added: 4 (pdPostEarnMode_, pdPostEarnRiyadhDay_,
+ * pdPostEarnCore_, pdPostEarnBody_). Changed: refreshPortfolioDecision (one
+ * gated request field), pdMetaLine_ (two conditional tokens), pdSelfTest
+ * (one line). Vars added: 3 (PD_POST_EARN_PROP, PD_POST_EARN_SCHEMA,
+ * PD_POST_EARN_STALE_DAYS). Removed: 0.
+ * Harness: tests/test_pd_post_earn_inputs.js (REAL file; golden negative on
+ * the v1.5.16 base). Rollback: PD_POST_EARN=off (or delete it) with no
+ * re-paste, or re-paste v1.5.16; with either, an armed Render guard reads
+ * 'earnings calendar absent', so turn the guard off first.
+ *
+ * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION: THE SENT PACKET BECOMES THE
+ *                        TOP_10 COCKPIT'S FUNDING EVIDENCE -- PD_IBKR_EVIDENCE_PUBLISH,
+ *                        default off; ALL v1.5.15 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): Top_10_Investments
+ * confirmed FRST.US / ZTO.US / CRC.US ACTIVE (day 3) and rendered them
+ * UNSIZED (Ticket 0 SAR, Shares 0, 'Research seat -- no executable
+ * allocation today', EXECUTABLE 0 of 10; Portfolio_Decision v2 read 'IBKR
+ * evidence UNKNOWN'). The backend's allocate stage certifies executable
+ * funding only from a fresh (<= 900 s) broker packet in
+ * portfolio.reconciliation_evidence. This page has built exactly that
+ * packet from the read-only IBKR capture since v1.5.12 and sent it with its
+ * own request (status line 'ibkr evidence SENT (...)'), but the cockpit
+ * forwards the DOCUMENT PROPERTY TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1,
+ * which nothing wrote ('Nothing writes it today', v1.5.11). Two producers,
+ * one packet, no hand-over.
+ * WHAT: Script Property PD_IBKR_EVIDENCE_PUBLISH = off (default: every
+ * line, request and property byte-identical to v1.5.15) | on. Under
+ * PD_IBKR_EVIDENCE=enforce, when the plan is fresh and the packet is SENT,
+ * pdIbkrPublish_ writes that SAME packet (JSON, <= 9,000 chars, the limit
+ * both readers apply) to the document property and the status line gains
+ * ' | evidence published' (or ' | evidence NOT published: <reason>').
+ * Not fresh, observe, off or a failed publication -> nothing is written
+ * and the previous property is left for the backend's own freshness check
+ * to reject. ORDER: the backend accepts the packet for 900 s, so Top_10
+ * must render within ~14 min of the capture; pdIbkrCaptureWatch, after a
+ * refresh that published, arms ONE one-off trigger pdIbkrEvidenceFollowUp
+ * (+60 s) which clears itself, re-reads the packet age (<= 840 s), asks the
+ * Decision Chain's guards when 26_Decision_Chain is present
+ * (tfbDcReadInputs_: automation paused, sync in flight, cockpit running,
+ * quiet window) and then calls refreshDecisionTop10() -- the cockpit takes
+ * its own lock and its own gates; nothing here changes a verdict. One
+ * _Run_Log row (handler pdIbkrEvidenceFollowUp, page Top_10_Investments,
+ * OK/FAILED/SKIPPED) and one Logger line; never the packet. The cockpit
+ * side (16_Decision_Top10 v1.16.0, DT10_FUNDING_EVIDENCE=on) applies the
+ * property to its request: certified cash, links, peg FX, exclusions.
+ * pdSelfTest reports the publish mode, the follow-up trigger state and a
+ * pure 'follow-up core' check.
+ * ES5. Functions added: 8 (pdIbkrPublishMode_, pdIbkrPublish_,
+ * pdIbkrRemoveFollowUp_, pdIbkrArmFollowUp_, pdIbkrFollowUpCore_,
+ * pdIbkrRunLog_, pdIbkrEvidenceFollowUp, pdIbkrFollowUpState_). Changed:
+ * pdIbkrApply_ (publication + note suffix, enforce/fresh/on only),
+ * pdIbkrCaptureWatch (marker + follow-up arming), pdSelfTest. Vars added: 5
+ * (PD_IBKR_PUBLISH_PROP, PD_IBKR_FOLLOWUP_HANDLER, PD_IBKR_FOLLOWUP_DELAY_MS,
+ * PD_IBKR_FOLLOWUP_MAX_AGE_MS, PD_IBKR_PUBLISHED_RUN_). Removed: 0.
+ * Harness: tests/test_pd_evidence_publish.js (REAL file; golden negative on
+ * the v1.5.15 base). Rollback: PD_IBKR_EVIDENCE_PUBLISH=off (and delete the
+ * document property if a stale packet should not linger), or v1.5.15.
+ * Arming is an owner step AFTER the first funded ticket of 26 Oct 2026 is
+ * recorded.
  *
  * v1.5.15 (2026-10-24)  (PD-ALLCASH: A BROKER-PROVEN ALL-CASH BOOK IS A
  *                        DECIDED STATE -- PD_ALLCASH_OK, default enforce;
@@ -2603,7 +2698,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.15';
+var PD_VERSION = '1.5.17';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2790,6 +2885,22 @@ function pdMetaLine_(meta) {
     parts.push(Math.round(route.duration_ms) + 'ms');
   }
   if (route.request_id) parts.push('req ' + route.request_id);
+  /* v1.5.17 [D1b/D1c]: guard read-back, only when the backend reports the
+   * guard armed (absent blocks -> the v1.5.16 line). */
+  var pg = meta.post_earn_guard;
+  if (pg && typeof pg === 'object') {
+    parts.push('post-earn ' + pdCell_(pg.mode) + ' (' +
+               pdCell_(pg.input_status) + '; held ' + pdCell_(pg.held) +
+               (pg.mode === 'observe' ? '; would ' + pdCell_(pg.would_hold) : '') +
+               ')');
+  }
+  var tc = meta.ticket_cap;
+  if (tc && typeof tc === 'object') {
+    parts.push('tickets ' + pdCell_(tc.open_tickets) + '/' + pdCell_(tc.cap) +
+               ' ' + pdCell_(tc.mode) + ' (held ' + pdCell_(tc.held) +
+               (tc.mode === 'observe' ? '; would ' + pdCell_(tc.would_hold) : '') +
+               ')');
+  }
   return parts.join(' | ');
 }
 
@@ -3198,6 +3309,12 @@ var PD_IBKR_RATE_X100 = {USD: 375, SAR: 100};   /* exact SAR rate x 100 */
 var PD_IBKR_FX_SOURCE = 'policy://sama-usd-peg-3.75';
 var PD_IBKR_WATCH_HANDLER = 'pdIbkrCaptureWatch';
 var PD_IBKR_WATCH_EVERY_MIN = 5;
+/* v1.5.16: publish the SENT packet for 16_Decision_Top10 + one follow-up render */
+var PD_IBKR_PUBLISH_PROP = 'PD_IBKR_EVIDENCE_PUBLISH';   /* off (default) | on */
+var PD_IBKR_FOLLOWUP_HANDLER = 'pdIbkrEvidenceFollowUp';
+var PD_IBKR_FOLLOWUP_DELAY_MS = 60000;
+var PD_IBKR_FOLLOWUP_MAX_AGE_MS = 840000;   /* the packet's own acceptance window */
+var PD_IBKR_PUBLISHED_RUN_ = null;          /* set by pdIbkrPublish_ in this execution */
 var PD_IBKR_SAFE = 9007199254740991;
 var PD_IBKR_PROVENANCE_FIELDS = [
   { send: 'Data Provider', match: ['Data Provider'] },
@@ -3664,6 +3781,14 @@ function pdIbkrApply_(mode, body) {
       body.fx_rates = rates;
       delete body.reconciliation_evidence;     /* enforce: the capture only */
       if (fresh) body.reconciliation_evidence = plan.packet;
+      /* v1.5.16: the same packet becomes the Top_10 cockpit's funding
+       * evidence (document property); off -> nothing written. */
+      if (fresh && pdIbkrPublishMode_() === 'on') {
+        var pub = pdIbkrPublish_(plan.packet, nowMs);
+        res.published = pub.published;
+        res.publishNote = pub.published ? ' | evidence published'
+                                        : ' | evidence NOT published: ' + pub.reason;
+      }
       if (controls) {
         body.controls = controls;
         res.controls = controls;
@@ -3671,7 +3796,7 @@ function pdIbkrApply_(mode, body) {
       res.excluded = split.excluded;
       res.sent = fresh;
     }
-    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded);
+    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded) + (res.publishNote || '');
   } catch (e) {
     res.note = ' | ibkr evidence ERROR (' +
         String(e && e.message ? e.message : e).slice(0, 80) + ')';
@@ -3728,12 +3853,16 @@ function pdIbkrCaptureWatch() {
       props.setProperty(PD_IBKR_LAST_PROP, cap.id);
       return 'capture not usable for a decision';
     }
+    PD_IBKR_PUBLISHED_RUN_ = null;   /* v1.5.16 */
     var outcome = String(refreshPortfolioDecision() || '');
     if (/^(NETWORK ERROR|HTTP )/.test(outcome)) return 'refresh failed: ' + outcome;
     props.setProperty(PD_IBKR_LAST_PROP, cap.id);
+    /* v1.5.16: Top_10 must render inside the packet's window -> one-off trigger */
+    var armed = (PD_IBKR_PUBLISHED_RUN_ && pdIbkrPublishMode_() === 'on')
+        ? pdIbkrArmFollowUp_() : '';
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher refreshed (' +
-               mode + ', status ' + outcome + ')');
-    return 'refreshed';
+               mode + ', status ' + outcome + (armed ? ', ' + armed : '') + ')');
+    return 'refreshed' + (armed ? '; ' + armed : '');
   } catch (e) {
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher error: ' +
                String(e && e.message ? e.message : e).slice(0, 120));
@@ -3793,6 +3922,150 @@ function pdIbkrWatcherState_() {
              : 'not installed (run pdInstallCaptureWatcher)';
   } catch (e) {
     return 'unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/* ----- v1.5.16 evidence publication + follow-up render ------------------- */
+
+function pdIbkrPublishMode_() {
+  return pdIbkrProp_(PD_IBKR_PUBLISH_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** The SENT packet -> document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (the one 16_Decision_Top10 forwards; same 9,000-char limit). Records the
+ * publication for this execution only. Never logs the packet. */
+function pdIbkrPublish_(packet, nowMs) {
+  var out = {published: false, reason: ''};
+  try {
+    var text = JSON.stringify(packet);
+    if (!text || text.length > PD_EVIDENCE_MAX_CHARS) {
+      out.reason = 'packet oversized';
+      return out;
+    }
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) { out.reason = 'document properties unavailable'; return out; }
+    props.setProperty(PD_EVIDENCE_PROP, text);
+    PD_IBKR_PUBLISHED_RUN_ = {at_ms: nowMs,
+                              captured_at: String(packet && packet.captured_at || '')};
+    out.published = true;
+  } catch (e) {
+    out.reason = 'publish failed';
+  }
+  return out;
+}
+
+function pdIbkrRemoveFollowUp_() {
+  var n = 0;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) {
+        ScriptApp.deleteTrigger(all[i]);
+        n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+/** One-off trigger: Top_10 renders ~1 min after the publication, inside the
+ * packet's 14-minute acceptance window. Never throws. */
+function pdIbkrArmFollowUp_() {
+  try {
+    pdIbkrRemoveFollowUp_();
+    ScriptApp.newTrigger(PD_IBKR_FOLLOWUP_HANDLER).timeBased()
+        .after(PD_IBKR_FOLLOWUP_DELAY_MS).create();
+    return 'follow-up armed';
+  } catch (e) {
+    return 'follow-up not armed (' +
+        String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE: should the follow-up render Top_10 now? s = the Decision Chain's
+ * read inputs (26_Decision_Chain tfbDcReadInputs_) or null. */
+function pdIbkrFollowUpCore_(mode, packetAgeMs, hasTop10, s) {
+  if (mode !== 'on') return {go: false, reason: 'publish off'};
+  if (!hasTop10) return {go: false, reason: 'refreshDecisionTop10 unavailable'};
+  if (packetAgeMs === null || packetAgeMs === undefined) {
+    return {go: false, reason: 'no published packet'};
+  }
+  if (packetAgeMs < 0) return {go: false, reason: 'packet ahead of the clock'};
+  if (packetAgeMs > PD_IBKR_FOLLOWUP_MAX_AGE_MS) {
+    return {go: false, reason: 'packet too old (' + pdIbkrAge_(packetAgeMs) + ')'};
+  }
+  if (s) {
+    if (s.automationAllowed === false) return {go: false, reason: 'automation paused'};
+    if (s.inflight) return {go: false, reason: 'sync in flight'};
+    if (s.cockpitRunning) return {go: false, reason: 'cockpit refresh in progress'};
+    if (s.quiet) return {go: false, reason: 'quiet window'};
+  }
+  return {go: true, reason: 'packet age ' + pdIbkrAge_(packetAgeMs)};
+}
+
+/** One _Run_Log row (10-column house format). Never throws. */
+function pdIbkrRunLog_(level, status, message, ms, details) {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('_Run_Log');
+    if (!sh) return false;
+    var dj = '{}';
+    try { dj = JSON.stringify(details || {}); } catch (eJ) {}
+    sh.appendRow([new Date(), String(level || 'INFO'), PD_IBKR_FOLLOWUP_HANDLER,
+                  'Top_10_Investments', String(status || ''),
+                  String(message || '').slice(0, 400), '', '',
+                  ms === null || ms === undefined ? '' : String(ms), dj]);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** Time-driven once (pdIbkrArmFollowUp_): render Top_10 while the published
+ * packet is fresh, under the Decision Chain's guards when that file is
+ * present. Clears its own trigger first. Never throws. */
+function pdIbkrEvidenceFollowUp() {
+  var removed = pdIbkrRemoveFollowUp_();
+  var nowMs = Date.now();
+  var packet = pdEvidencePacket_();
+  var capMs = packet ? pdIbkrStampMs_(packet.captured_at) : null;
+  var age = capMs === null ? null : nowMs - capMs;
+  var s = null;
+  try {
+    if (typeof tfbDcReadInputs_ === 'function') {
+      s = tfbDcReadInputs_(SpreadsheetApp.getActiveSpreadsheet(), 'on',
+                           {pd: '', t10: '', claim: null, attempts: {}}, nowMs);
+    }
+  } catch (eS) { s = null; }
+  var d = pdIbkrFollowUpCore_(pdIbkrPublishMode_(), age,
+                              typeof refreshDecisionTop10 === 'function', s);
+  var t0 = Date.now(), outcome;
+  if (d.go) {
+    try {
+      refreshDecisionTop10();
+      outcome = 'rendered';
+    } catch (eR) {
+      outcome = 'error: ' + String(eR && eR.message ? eR.message : eR).slice(0, 120);
+    }
+  } else {
+    outcome = 'skipped: ' + d.reason;
+  }
+  var line = '[MP-DEC v' + PD_VERSION + '] evidence follow-up -> ' + outcome +
+      ' (' + d.reason + (removed ? '; trigger cleared' : '') + ')';
+  try { Logger.log(line); } catch (eL) {}
+  pdIbkrRunLog_(outcome === 'rendered' || !d.go ? 'INFO' : 'ERROR',
+                outcome === 'rendered' ? 'OK' : (d.go ? 'FAILED' : 'SKIPPED'),
+                line, Date.now() - t0, {version: PD_VERSION, go: d.go});
+  return outcome;
+}
+
+function pdIbkrFollowUpState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) n++;
+    }
+    return n ? n + ' armed' : 'none armed';
+  } catch (e) {
+    return 'unknown';
   }
 }
 
@@ -4139,6 +4412,186 @@ function pdApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 
 /* ----- main refresh --------------------------------------------------------------- */
 
+/* ----- v1.5.17 [D1b POST-EARN]: Calendar_Events inputs for the backend
+ * guard (portfolio_actions 1.17.0, Render TFB_PF_ADD_POST_EARN). ---------- */
+var PD_POST_EARN_PROP = 'PD_POST_EARN';
+var PD_POST_EARN_SCHEMA = 'tfb.pd-post-earnings/v1';
+var PD_POST_EARN_STALE_DAYS = 7;
+
+/** v1.5.17: 'on' when Script Property PD_POST_EARN is on (any case,
+ * surrounding blanks ignored); anything else, absent included, 'off'. */
+function pdPostEarnMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(PD_POST_EARN_PROP) || '');
+  } catch (ePm) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return raw === 'on' ? 'on' : 'off';
+}
+
+/** v1.5.17 PURE: integer day (UTC days since 1970) of a Riyadh calendar
+ * date: a Date is shifted +3 h; a string must start 'YYYY-MM-DD'. Else
+ * null. */
+function pdPostEarnRiyadhDay_(value) {
+  var text = '';
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (!isFinite(value.getTime())) return null;
+    text = new Date(value.getTime() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    text = value.replace(/^\s+/, '').slice(0, 10);
+  } else {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  var ms = Date.parse(text + 'T00:00:00.000Z');
+  if (!isFinite(ms) || new Date(ms).toISOString().slice(0, 10) !== text) return null;
+  return Math.round(ms / 86400000);
+}
+
+/** v1.5.17 PURE: the body.post_earnings object from a Calendar_Events grid
+ * (values; null when the sheet could not be read), the held symbols and the
+ * run time. Report dates, sessions and surprises come from the Top-10's
+ * reader dt10PostEarnMapFromValues_ (16_Decision_Top10 v1.18.0) so both
+ * pages count the same sessions; without it -> 'unavailable'. A held name
+ * whose Last or Next Earnings Date is today enters at 0 sessions (that
+ * reader keeps strictly past reports only). The newest
+ * 'Updated At (Riyadh)' day older than PD_POST_EARN_STALE_DAYS -> 'stale'.
+ * Never throws. */
+function pdPostEarnCore_(values, held, now) {
+  var nowDate = (now && Object.prototype.toString.call(now) === '[object Date]' &&
+                 isFinite(now.getTime())) ? now : new Date();
+  var today = pdPostEarnRiyadhDay_(nowDate);
+  var out = {schema: PD_POST_EARN_SCHEMA, status: 'unavailable',
+             asof: today === null ? '' : new Date(today * 86400000).toISOString().slice(0, 10),
+             updated: '', reports: 0, map: {}};
+  try {
+    if (typeof dt10PostEarnMapFromValues_ !== 'function') {
+      out.reason = 'post-earnings parser missing (16_Decision_Top10 v1.18.0)';
+      return out;
+    }
+    if (!values || !values.length) {
+      out.reason = 'Calendar_Events not readable';
+      return out;
+    }
+    var iSym = -1, iUpd = -1, iLast = -1, iNext = -1, iSur = -1, r, c, cells, tok;
+    for (r = 0; r < values.length && r < 10 && iSym < 0; r++) {
+      cells = values[r] || [];
+      var s = -1, u = -1, l = -1, x = -1, p = -1;
+      for (c = 0; c < cells.length; c++) {
+        tok = String(cells[c] === null || cells[c] === undefined ? '' : cells[c])
+            .toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (tok === 'symbol') s = c;
+        else if (tok === 'updatedatriyadh' || tok === 'updatedat') u = c;
+        else if (tok === 'lastearningsdate') l = c;
+        else if (tok === 'nextearningsdate' || tok === 'earningsdate') x = c;
+        else if (tok === 'epssurprise') p = c;
+      }
+      if (s >= 0 && (l >= 0 || x >= 0)) { iSym = s; iUpd = u; iLast = l; iNext = x; iSur = p; }
+    }
+    if (iSym < 0) {
+      out.reason = 'Calendar_Events header not found';
+      return out;
+    }
+    var firstBody = r;
+    var newest = null;
+    if (iUpd >= 0) {
+      for (; r < values.length; r++) {
+        var d = pdPostEarnRiyadhDay_((values[r] || [])[iUpd]);
+        if (d !== null && (newest === null || d > newest)) newest = d;
+      }
+    }
+    if (newest !== null) out.updated = new Date(newest * 86400000).toISOString().slice(0, 10);
+    var full = dt10PostEarnMapFromValues_(values, nowDate) || {};
+    var k, n = 0;
+    for (k in full) {
+      if (Object.prototype.hasOwnProperty.call(full, k)) n++;
+    }
+    out.reports = n;
+    var map = {}, heldSet = {};
+    for (var i = 0; i < (held || []).length; i++) {
+      var sym = String(held[i] === null || held[i] === undefined ? '' : held[i])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!sym) continue;
+      heldSet[sym] = true;
+      if (Object.prototype.hasOwnProperty.call(full, sym)) map[sym] = full[sym];
+    }
+    /* Review fix (Codex P1, PR #869): the Top-10 reader keeps strictly past
+     * reports, so a held name that reports, or reported, TODAY was missing
+     * and its ADD passed on the report day itself. Such a name enters at 0
+     * sessions (inside every window); the surprise is read only from a Last
+     * Earnings Date of today, as the Top-10 reader parses it. */
+    var dayOf = (typeof dt10CalendarDay_ === 'function') ? dt10CalendarDay_ : pdPostEarnRiyadhDay_;
+    for (var q = firstBody; today !== null && q < values.length; q++) {
+      cells = values[q] || [];
+      var hs = String(cells[iSym] === null || cells[iSym] === undefined ? '' : cells[iSym])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!hs || !heldSet[hs] || Object.prototype.hasOwnProperty.call(map, hs)) continue;
+      var lastDay = iLast >= 0 ? dayOf(cells[iLast]) : null;
+      var nextDay = iNext >= 0 ? dayOf(cells[iNext]) : null;
+      if (lastDay !== today && nextDay !== today) continue;
+      var sur = null;
+      if (lastDay === today && iSur >= 0) {
+        var raw = cells[iSur];
+        if (typeof raw === 'string') raw = raw.replace(/[,%\s]/g, '');
+        if (typeof raw === 'number' && isFinite(raw)) {
+          sur = raw;
+        } else if (typeof raw === 'string' && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+          sur = parseFloat(raw);
+        }
+        if (sur !== null && Math.abs(sur) > 999999) sur = sur > 0 ? 999999 : -999999;
+      }
+      map[hs] = {date: out.asof, sessions: 0, surprise: sur};
+    }
+    out.map = map;
+    if (iUpd >= 0 && (newest === null || today === null ||
+        today - newest > PD_POST_EARN_STALE_DAYS)) {
+      out.status = 'stale';
+      out.reason = newest === null ? 'no Updated At day' :
+          'newest calendar update ' + out.updated;
+      return out;
+    }
+    out.status = 'ok';
+    return out;
+  } catch (ePc) {
+    out.status = 'unavailable';
+    out.map = {};
+    out.reason = 'Calendar_Events parse failed';
+    return out;
+  }
+}
+
+/** v1.5.17: live Calendar_Events read for pdPostEarnCore_; the held symbols
+ * are the request rows' Symbol cells. Any failure -> 'unavailable'. Never
+ * throws; never logged. */
+function pdPostEarnBody_(ss, rows) {
+  var now = new Date();
+  var held = [];
+  try {
+    for (var i = 0; i < (rows || []).length; i++) {
+      if (rows[i] && rows[i]['Symbol'] !== undefined) held.push(rows[i]['Symbol']);
+    }
+  } catch (eHs) {
+    held = [];
+  }
+  var values = null;
+  try {
+    var sh = ss.getSheetByName('Calendar_Events');
+    var maxRows = (typeof DT10_CALENDAR_MAX_ROWS === 'number') ? DT10_CALENDAR_MAX_ROWS : 5000;
+    if (sh) {
+      var nr = sh.getLastRow(), nc = Math.min(sh.getLastColumn(), 16);
+      if (isFinite(nr) && isFinite(nc) && nr >= 2 && nc >= 2 && nr <= maxRows + 1) {
+        values = sh.getRange(1, 1, nr, nc).getValues();
+      }
+    }
+  } catch (eRd) {
+    values = null;
+  }
+  return pdPostEarnCore_(values, held, now);
+}
+
 function refreshPortfolioDecision() {
   var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -4176,6 +4629,11 @@ function refreshPortfolioDecision() {
    * (absent -> request unchanged). Never logged. */
   var evidence = pdEvidencePacket_();
   if (evidence) body.reconciliation_evidence = evidence;
+  /* v1.5.17 [D1b]: Calendar_Events post-earnings inputs for the backend
+   * guard (portfolio_actions 1.17.0); off -> no read and the request is
+   * unchanged. Never logged; the backend ignores it unless
+   * TFB_PF_ADD_POST_EARN is armed. */
+  if (pdPostEarnMode_() === 'on') body.post_earnings = pdPostEarnBody_(ss, pool.rows);
   /* v1.5.12: IBKR capture evidence + execution scope; off -> no Drive
    * read and the request is unchanged. Never logged. */
   var ibkr = ibkrMode === 'off' ? null : pdIbkrApply_(ibkrMode, body);
@@ -4628,6 +5086,31 @@ function pdSelfTest() {
         : 'rejected: ' + ibPlan.reason));
   }
   report.push('capture watcher: ' + pdIbkrWatcherState_());
+  /* v1.5.16: evidence publication (read-only; never the packet). */
+  report.push('evidence publish (PD_IBKR_EVIDENCE_PUBLISH): ' + pdIbkrPublishMode_() +
+      '; follow-up trigger: ' + pdIbkrFollowUpState_());
+  var fuOk = pdIbkrFollowUpCore_('on', 300000, true,
+      {automationAllowed: true, inflight: false, cockpitRunning: false, quiet: false}).go === true &&
+      pdIbkrFollowUpCore_('on', 841000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, true, {quiet: true}).go === false &&
+      pdIbkrFollowUpCore_('off', 1000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', null, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, false, null).go === false;
+  report.push('follow-up core: ' + (fuOk ? 'ok' : 'FAIL'));
+  /* v1.5.17 [D1b]: the post-earnings inputs the next run would send. */
+  var peNow = pdPostEarnBody_(ss, pool.rows);
+  var peList = [];
+  for (var pk in peNow.map) {
+    if (Object.prototype.hasOwnProperty.call(peNow.map, pk)) {
+      var pe = peNow.map[pk];
+      peList.push(pk + ' ' + pe.date + ' ' + pe.sessions + ' sess EPS ' +
+                  (pe.surprise === null ? 'n/a' : pe.surprise));
+    }
+  }
+  report.push('post-earnings inputs (PD_POST_EARN=' + pdPostEarnMode_() + '): ' + peNow.status +
+      (peNow.reason ? ' (' + peNow.reason + ')' : '') + '; calendar updated ' +
+      (peNow.updated || '-') + '; recent reports ' + peNow.reports +
+      '; held with a report: ' + (peList.length ? peList.join(', ') : 'none'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

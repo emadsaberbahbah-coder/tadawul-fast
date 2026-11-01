@@ -34,8 +34,9 @@ gives realized_roi_source_valid=False exactly as a production load does.
 
 The module under test is scripts/track_performance.py, or the file named by
 TFB_TRACK_UNDER_TEST (golden negative: point it at the untouched base copy,
-git show 08a15bc0:scripts/track_performance.py). The base for M4 / M7 is
-TFB_TRACK_BASE, else `git show 08a15bc0:scripts/track_performance.py`.
+git show bf1510ed:scripts/track_performance.py). The base for M4 / M7 is
+TFB_TRACK_BASE, else `git show bf1510ed:scripts/track_performance.py`
+(main after #841, v6.50.0; 08a15bc0 until the 2026-11-01 merge).
 
 Run: python tests/test_tracker_matured_evidence.py  (prints PASS k/k)
  or: python -m pytest -q tests/test_tracker_matured_evidence.py
@@ -64,7 +65,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 UNDER_TEST = Path(os.environ.get("TFB_TRACK_UNDER_TEST") or ROOT / "scripts" / "track_performance.py")
-BASE_SHA = "08a15bc0"
+BASE_SHA = "bf1510ed"   # main after #841 (v6.50.0); was 08a15bc0
 ENV = "TRACK_MATURED_EVIDENCE_VALID"
 PREFIXES = ("TRACK_", "TFB_TRACK_", "TFB_PERF_")
 UTC = timezone.utc

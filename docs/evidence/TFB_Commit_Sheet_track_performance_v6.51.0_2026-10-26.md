@@ -142,3 +142,8 @@ So every audit's own maturities:
 - No change to the malformed-stored-cell path.
 - No cron change, and no `ci.yml` change.
 - No change to `run_once`'s handling of a failed save (see S3).
+
+## Merge note (2026-11-01)
+
+#841 (track_performance v6.50.0 [LOG-READ]) merged first. This branch was merged onto main `bf1510ed` with a merge commit: the v6.51.0 WHY block sits above #841's v6.50.0 block (kept verbatim), `SCRIPT_VERSION = "6.51.0"`, the verifier pin is 6.51.0 with both dated comments, and the workflow headers read 1.0.7 above 1.0.6. Both Variables (`TRACK_MATURED_EVIDENCE_VALID`, `TRACK_LOG_UNFORMATTED_READ`) are mapped in both tracker steps. The harness base moved from `08a15bc0` to `bf1510ed`, so M7's exact additions set is again `_matured_evidence_mode` only. The golden-negative numbers above were measured against `08a15bc0` before the merge.
+
