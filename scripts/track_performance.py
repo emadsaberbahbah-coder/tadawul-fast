@@ -1764,7 +1764,7 @@ from urllib.error import HTTPError, URLError
 # merges later renumbers).
 # MERGE NOTE (2026-11-01): #841 merged first as v6.50.0 [LOG-READ]; this
 #   change was merged onto it and keeps 6.52.0 (open #845 still claims
-#   6.51.0). 'v6.49.0' below now reads 'v6.50.0' (which is v6.49.0
+#   6.51.0). Read 'v6.49.0' below as 'v6.50.0' (which is v6.49.0
 #   behaviour while TRACK_LOG_UNFORMATTED_READ is off). The v6.50.0 block
 #   follows verbatim.
 # EVIDENCE: audit_active_records counts every reason a due record stays
