@@ -413,21 +413,34 @@ def test_g1_golden_negative_base_leaves_the_saudi_row_blank(monkeypatch, caplog)
 
 
 # ------------------------------------------------------------------- V -----
+MAPPING = "${{ vars.TFB_CAL_LAST_REPORT_YAHOO || 'off' }}"
+
+
 def test_v1_version_pin_workflow_ci_why():
-    import yaml
     assert tuple(int(x) for x in CP.__version__.split(".")) >= (1, 4, 0)
     vd = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert re.search(r'\("core\.providers\.calendar_provider", "__version__", "%s",'
                      % re.escape(CP.__version__), vd)
-    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "calendar_sync.yml").read_text(encoding="utf-8"))
-    assert GATE not in (wf.get("env") or {})
-    hits = []
-    for job in wf["jobs"].values():
-        assert GATE not in (job.get("env") or {})
-        for step in job.get("steps") or []:
-            if GATE in (step.get("env") or {}):
-                hits.append(step["env"][GATE])
-    assert hits == ["${{ vars.TFB_CAL_LAST_REPORT_YAHOO || 'off' }}"], hits
+    wf_text = (ROOT / ".github" / "workflows" / "calendar_sync.yml").read_text(encoding="utf-8")
+    # The contract lane has no PyYAML: the text form is checked always (exactly one
+    # non-comment mapping line, at step-env depth), the parsed form when yaml exists.
+    lines = [ln for ln in wf_text.splitlines()
+             if GATE + ":" in ln and not ln.lstrip().startswith("#")]
+    assert lines == ["          %s: %s" % (GATE, MAPPING)], lines
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    if yaml is not None:
+        wf = yaml.safe_load(wf_text)
+        assert GATE not in (wf.get("env") or {})
+        hits = []
+        for job in wf["jobs"].values():
+            assert GATE not in (job.get("env") or {})
+            for step in job.get("steps") or []:
+                if GATE in (step.get("env") or {}):
+                    hits.append((step.get("name"), step["env"][GATE]))
+        assert hits == [("\U0001f4c5 Run calendar sync", MAPPING)], hits
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert re.search(r"tests/test_calendar_last_report_a4\.py \\\s*\n(\s*tests/\S+ \\\s*\n)*"
                      r"\s*tests/test_calendar_last_report_yahoo\.py", ci)
