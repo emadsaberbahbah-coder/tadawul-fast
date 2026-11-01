@@ -323,10 +323,11 @@ console.log('S7 PASS embedded self-test core');
 // ---------------------------------------------------------- S8 wiring + lint
 // 2026-10-27: v1.17.1 (shadow momentum) stacked on this change; pins moved (S9 checks the v1.17.0 file itself)
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
-ok((layerSrc.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]), 'S8 version lockstep 1.18.0 (layer)');
-ok(dt10Floor(deliveredVersion, [1, 18, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+// 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
+ok((layerSrc.match(/^var DT10_VERSION = '1\.19\.0';$/m) || []).length === 1 && /^ \* Version: 1\.19\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]), 'S8 version lockstep 1.19.0 (layer)');
+ok(dt10Floor(deliveredVersion, [1, 19, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
    src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
-   'S8 delivered version floor 1.18.0 in lockstep: ' + deliveredVersion);   // merge note 2026-10-28 (#778): held seats are v1.18.1 over #855's v1.18.0
+   'S8 delivered version floor 1.19.0 in lockstep: ' + deliveredVersion);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');
