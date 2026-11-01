@@ -2,8 +2,21 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.3.1 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.4.0 (program register C8, Phase 2)
 ================================================================================
+v1.4.0 (1 Nov 2026, full review: data accuracy and honest presentation on the
+Looker pages). New: v_fx_sar (currency -> riyal from the Commodities_FX page)
+and v_outcome_coverage (how much of the Performance_Log has matured, per
+horizon, so a win rate always sits next to its denominator). Changed:
+v_symbol_rating adds rating_gate / tfb_rating_display (the engine's verdict
+beside every rating: blocked, do not invest, watch only, below the floors,
+none - a Positive rating never overrides it) and the analyst / news sources;
+v_top10_insight adds seat_kind and allocation (a row without a ticket reads
+'none - research board', never an order); v_portfolio_insight gives riyal
+value, cost, P&L and weight for every holding (the decision page's figures
+first, else the sheet's values times v_fx_sar) with value_source. WHY (owner
+request 1 Nov 2026): "avoid any data presentation interpretation ...
+continuous presenting recommendation, avoid misleading".
 v1.3.1 (1 Nov 2026, the one-symbol page): v_symbol_candles also gives
 last_close (the symbol's newest close) and open / high / low /
 close_vs_last_pct, every candle in percent points against that close. The
@@ -82,7 +95,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

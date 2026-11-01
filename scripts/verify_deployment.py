@@ -302,7 +302,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.3.1", "bigquery looker views"),
+    ("apply_bq_views", "1.4.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).

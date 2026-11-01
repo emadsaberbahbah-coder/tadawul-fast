@@ -4,7 +4,10 @@
 -- the name (mkt_*: price, forecast, risk, signals, data age), its next
 -- earnings and ex-dividend dates, its news of the last 7 days and how its
 -- earlier board episodes ended, and the TFB rating with the analyst
--- consensus (v_symbol_rating, apply_bq_views 1.3.0). caution_flags lists, in plain words, what
+-- consensus (v_symbol_rating, apply_bq_views 1.3.0), its engine gate and
+-- the part sources (1.4.0). seat_kind and allocation (1.4.0) say in plain
+-- words whether a row holds a ranked seat or sits in grace, and whether any
+-- money is behind it. caution_flags lists, in plain words, what
 -- argues for a second look before acting (earnings or ex-dividend within 5
 -- days, market data older than 36 h when archived, a market copy more than
 -- a day old (a missed nightly archive), negative or high-severity news, below
@@ -113,9 +116,25 @@ j AS (
     rt.tfb_rating_stars,
     rt.rating_confidence,
     rt.rating_parts,
+    rt.rating_gate,
+    rt.tfb_rating_display,
+    rt.analyst_source,
+    rt.news_source,
     rt.analyst_consensus_label,
     rt.analyst_consensus_score,
     rt.analysts,
+    -- 1.4.0: the seat and the money in plain words. A board row with no
+    -- ticket is research, not an order - the page must never read as one.
+    CASE
+      WHEN b.seat_rank IS NOT NULL THEN CONCAT('ranked seat ', CAST(b.seat_rank AS STRING))
+      WHEN UPPER(b.stability_state) = 'GRACE' THEN 'grace, no seat'
+      WHEN UPPER(b.stability_state) = 'NEW' THEN 'new, no seat yet'
+      ELSE 'unranked'
+    END AS seat_kind,
+    CASE
+      WHEN IFNULL(b.ticket_sar, 0) > 0 THEN CONCAT('ticket ', FORMAT('%.0f', b.ticket_sar), ' SAR')
+      ELSE 'none - research board'
+    END AS allocation,
     ARRAY(
       SELECT f FROM UNNEST([
         IF(c.days_to_earnings_now BETWEEN 0 AND 5, 'earnings within 5 days', NULL),
