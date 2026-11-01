@@ -552,3 +552,53 @@ def test_real_offline_calendars_dst_holiday_early_close_and_saudi_weekend(monkey
     saturday = datetime(2026, 10, 10, 16, tzinfo=UTC)
     evidence, reason = tp._outcome_price_from_row(row(quote=friday, acquired=saturday), "SYNTH.US", saturday)
     assert evidence is not None and not reason
+
+
+# --- v6.51.0 [MATURED-EVIDENCE] guards (full harness:
+# tests/test_tracker_matured_evidence.py). A row loaded with a blank
+# 'Realized ROI %' cell matures in this audit pass; only enforce lets the
+# same run count it and write the receipt's target fields.
+def loaded_canonical_row(schema=True):
+    rec = record()
+    rec.notes = (tp._TARGET_SCHEMA_TAG + json.dumps({"version": 2, "horizon": "1W",
+                 "roi_unit": "percent_points", "basis": "forecast_price",
+                 "producer_version": "fixture"}) + "]") if schema else ""
+    store = object.__new__(tp.PerformanceStore)
+    cells = [str("" if v is None else v) for v in store._record_to_row(rec)]
+    cells[store.HEADERS.index("Realized ROI %")] = ""
+    return tp.PerformanceRecord.from_sheet_row(cells, store.HEADERS)
+
+
+@pytest.mark.parametrize("mode", [None, "off", "1"])
+def test_same_run_maturity_stays_invalid_until_matured_evidence_is_enforced(mode, monkeypatch):
+    if mode is None:
+        monkeypatch.delenv("TRACK_MATURED_EVIDENCE_VALID", raising=False)
+    else:
+        monkeypatch.setenv("TRACK_MATURED_EVIDENCE_VALID", mode)
+    rec = loaded_canonical_row()
+    run(app_with_response([row(price=104)]).audit_active_records([rec]))
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi_source_valid is False
+    summary = tp.PerformanceAnalyzer().analyze([rec])
+    assert (summary.matured_records, summary.invalid_matured_excluded) == (0, 1)   # the v6.49.0 lag, pinned
+    assert receipt(rec)["forecast_error_pp"] is None
+
+
+def test_matured_evidence_enforce_counts_the_same_run_outcome(monkeypatch):
+    monkeypatch.setenv("TRACK_MATURED_EVIDENCE_VALID", "enforce")
+    rec = loaded_canonical_row()
+    run(app_with_response([row(price=104)]).audit_active_records([rec]))
+    summary = tp.PerformanceAnalyzer().analyze([rec])
+    assert (summary.matured_records, summary.invalid_matured_excluded) == (1, 0)
+    assert rec.realized_roi_source_valid is True
+    proof = receipt(rec)
+    assert proof["forecast_error_pp"] == pytest.approx(-6.0) and proof["target_achieved_at_horizon"] is False
+
+
+def test_matured_evidence_enforce_counts_a_legacy_row_too(monkeypatch):
+    # the live 24 Oct population: rows with no target schema
+    monkeypatch.setenv("TRACK_MATURED_EVIDENCE_VALID", "enforce")
+    rec = loaded_canonical_row(schema=False)
+    run(app_with_response([row(price=104)]).audit_active_records([rec]))
+    summary = tp.PerformanceAnalyzer().analyze([rec])
+    assert (summary.matured_records, summary.invalid_matured_excluded) == (1, 0)
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi_source_valid is True
