@@ -216,7 +216,8 @@ def test_d7_leaked_cancellation_is_500_not_401(res):
 
 
 def test_d5b_version(res):
-    assert res["version"] == "8.14.7"
+    # 2026-10-28: 8.14.8 adds /health pf_gates keys only (D1b/D1c).
+    assert res["version"] == "8.14.8"
 
 
 def test_d6_golden_negative_on_base():

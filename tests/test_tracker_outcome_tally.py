@@ -49,8 +49,9 @@ Yahoo fallback off.
 
 The module under test is scripts/track_performance.py, or the file named by
 TFB_TRACK_UNDER_TEST (golden negative: point it at the untouched base copy,
-git show e8337a16:scripts/track_performance.py). The base for T3 / T7 is
-TFB_TRACK_BASE, else `git show e8337a16:scripts/track_performance.py`.
+git show bf1510ed:scripts/track_performance.py). The base for T3 / T7 is
+TFB_TRACK_BASE, else `git show bf1510ed:scripts/track_performance.py`
+(main after #841, v6.50.0; e8337a16 until the 2026-11-01 merge).
 
 Run: python tests/test_tracker_outcome_tally.py  (prints PASS k/k)
  or: python -m pytest -q tests/test_tracker_outcome_tally.py
@@ -80,7 +81,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 UNDER_TEST = Path(os.environ.get("TFB_TRACK_UNDER_TEST") or ROOT / "scripts" / "track_performance.py")
-BASE_SHA = "e8337a16"
+BASE_SHA = "bf1510ed"   # main after #841 (v6.50.0); was e8337a16
 ENV = "TRACK_OUTCOME_TALLY"
 PREFIXES = ("TRACK_", "TFB_TRACK_", "TFB_PERF_")
 UTC = timezone.utc

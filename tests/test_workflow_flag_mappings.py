@@ -18,13 +18,16 @@ import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 TRACKER_DEFAULTS = {"TRACK_DEDUP_MATURED": "off", "TRACK_RISK_BLANK": "0",
-                    "TRACK_CANONICAL_TARGETS": "1", "TRACK_SIGNAL_PUBLICATION_MODE": "off"}
+                    "TRACK_CANONICAL_TARGETS": "1", "TRACK_SIGNAL_PUBLICATION_MODE": "off",
+                    "TRACK_LOG_UNFORMATTED_READ": "off"}   # 2026-10-25: v6.50.0 [LOG-READ]
 SYNC_DEFAULTS = {
     "TFB_SYNC_RETIRE_TAB": "off",
     "TFB_SYNC_RETIRE_TAB_NAME": "_Retired_Symbols",
     "TFB_SYNC_RETIRE_MAX_PCT": "20",
     "TFB_SYNC_KLG_CRYPTO_NAME_GATE": "off",
     "TFB_OPP_FX_USX_SUBUNIT": "0",
+    # daily_sync.yml 1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE.
+    "TFB_SYNC_FW2_STALE_PE": "off",
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
 

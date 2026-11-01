@@ -201,3 +201,8 @@ A four-lens adversarial review ran (off identity, semantics on production-shaped
 - No change to the fallback's reason join. A joined reason also stops unpriced expiry; that is pre-existing and noted for the owner.
 - No cron change, and no `ci.yml` change.
 - No change to `_last_audit_stats`, `[PERF-VERDICT]` or `_Run_Log`.
+
+## Merge note (2026-11-01)
+
+#841 (track_performance v6.50.0 [LOG-READ]) merged first. This branch was merged onto main `bf1510ed` with a merge commit: the v6.52.0 WHY block sits above #841's v6.50.0 block (kept verbatim), `SCRIPT_VERSION = "6.52.0"` (open #845 still claims 6.51.0), the verifier pin is 6.52.0 with both dated comments, and the workflow headers read 1.0.8 above 1.0.6. Both Variables (`TRACK_OUTCOME_TALLY`, `TRACK_LOG_UNFORMATTED_READ`) are mapped in both tracker steps. The harness base moved from `e8337a16` to `bf1510ed`, so T7's exact additions set is again this release's. The golden-negative numbers above were measured against `e8337a16` before the merge.
+
