@@ -1764,8 +1764,8 @@ from urllib.error import HTTPError, URLError
 # (TRACK_MATURED_EVIDENCE_VALID). Numbered 6.51.0 because open PR #841
 # claims 6.50.0 (whichever merges second renumbers).
 # MERGE NOTE (2026-11-01): #841 merged first as v6.50.0 [LOG-READ]; this
-#   change was merged onto it and keeps 6.51.0. 'v6.49.0 exactly' below now
-#   reads 'v6.50.0 exactly' (which is v6.49.0 behaviour while
+#   change was merged onto it and keeps 6.51.0. Read 'v6.49.0 exactly'
+#   below as 'v6.50.0 exactly' (which is v6.49.0 behaviour while
 #   TRACK_LOG_UNFORMATTED_READ is off). The v6.50.0 block follows verbatim.
 # EVIDENCE: PerformanceRecord.from_sheet_row sets realized_roi_source_valid
 #   = math.isfinite(_safe_float(Realized ROI %)), so every loaded ACTIVE row
