@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.50.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1813,7 +1813,155 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _log_read_mode, _log_read_observe,
 #   _LOG_READ_TAG, _LAST_LOG_READ.
 # ROLLBACK: unset TRACK_LOG_UNFORMATTED_READ (or set off).
-SCRIPT_VERSION = "6.50.0"
+# -----------------------------------------------------------------------------
+# v6.53.0 (2026-11-02) [ARCHIVE-BAR + DUE-ONLY]: the historical target-session
+# close can come from the BigQuery bar archive, and an audit pass can price
+# only the symbols that are due. Two ENV gates, both DEFAULT OFF
+# (TRACK_HIST_CLOSE_SOURCE=yfinance, TRACK_AUDIT_DUE_ONLY=0) = v6.50.0
+# byte-identical apart from the version string. 6.51.0 and 6.52.0 are claimed
+# by the open PRs #845 and #857, so this build takes 6.53.0; whichever lands
+# later re-numbers.
+# EVIDENCE (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve
+#   today, results tomorrow"): Performance_Log holds 13,856 active forecast
+#   records over 1,376 symbols, 5,759 of them past their target, and the
+#   learning loop matures only a trickle. The outcome receipts of the 31 Oct
+#   22:54 audit say why: about 3,250 records carry
+#   'quote_session_unknown;quote_rate_limit_breaker' (SR 1,490, US 1,003, HK
+#   445), about 1,450 'quote_outside_target_session' (US 1,039), about 250 no
+#   receipt at all, about 100 'outcome_calendar_unknown' (MX and suffix-less
+#   names) and 43 'target_session_not_complete'. Three causes: (1)
+#   audit_active_records prices EVERY active symbol through the backend chain
+#   and then the Yahoo chart fallback, so the fallback's rate-limit breaker
+#   trips long before the due symbols are reached; (2) the two audit crons
+#   (11:47Z and 15:47Z, delivered 4-6 h late by GitHub) land inside the US
+#   session, so a US record can only mature through the v6.47.0 historical
+#   target-session close path (TRACK_HIST_TARGET_CLOSE, default off), whose
+#   yfinance pulls carry a 60-symbol budget and a breaker; (3) the maturation
+#   rule itself (_outcome_target_session: the first exchange-session close
+#   at/after the target, never a later session) is correct and is NOT
+#   changed here. BigQuery already holds daily OHLC bars for the symbols that
+#   matter (tfb_archive.symbol_bars_daily: symbol, yahoo_symbol, date, open,
+#   high, low, close, adj_close, volume, source, set_reason, captured_at,
+#   run_id; 315 symbols on 1 Nov, every symbol with an active record once
+#   #890 arms TFB_DEEP_OUTCOME_BARS; replaced nightly at 00:20 UTC from
+#   Yahoo's chart API, so 'close' is Yahoo's split-adjusted Close, the same
+#   series the yfinance path reads). The archive's service account
+#   (GOOGLE_SHEETS_CREDENTIALS) can query it.
+# WHAT (A) TRACK_HIST_CLOSE_SOURCE = yfinance (DEFAULT) | bq_archive |
+#   bq_archive_then_yfinance (exact words, case/space-insensitive; anything
+#   else -> yfinance). It only chooses WHERE _hist_close_evidence gets its
+#   bars; TRACK_HIST_TARGET_CLOSE (off | observe | enforce) keeps deciding
+#   whether the judge runs at all, so with that gate off nothing is read
+#   whatever the source says.
+#   bq_archive -> ONE parameterised BigQuery query per audit pass for every
+#     candidate symbol (SELECT symbol, date, open, high, low, close,
+#     adj_close, source FROM `<project>.<dataset>.symbol_bars_daily` WHERE
+#     symbol IN UNNEST(@symbols) AND date >= @since AND date <= @until; at
+#     most _ARCHIVE_BAR_MAX_SYMBOLS = 2000 symbols per pass, the dates
+#     bounded to the candidates' target sessions; jobs.query with the
+#     archive's 60 s timeoutMs, polled and paged under one
+#     _ARCHIVE_BAR_WALL_SEC wall clock) through the archive scripts' own REST
+#     pattern (scripts/archive_market_series.make_session -> google-auth
+#     AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS; no BigQuery client
+#     library). The rows become the SAME per-symbol bar structure
+#     _hist_close_bars returns ({"date", "close", "split": 0.0}), so
+#     _hist_close_evidence -> _hist_target_close -> _hist_close_judge -> the
+#     unchanged maturation path (CA-GUARD, WIN/LOSS, the [OUTCOME-WITNESS v1]
+#     receipt, dedup) are not touched. A matured receipt carries provider
+#     'bq_archive_bar' (hist_provider too), quote_kind
+#     'historical_daily_close', acquired_at = now and quote_asof = the target
+#     session's exchange close (the same context value the yfinance path
+#     uses). The archive symbol is the TFB symbol itself (2222.SR, AAPL.US).
+#     REFUSALS (the record stays ACTIVE, never EXPIRED): a failed, timed-out
+#     or over-paged query, or a session that cannot be built ->
+#     'hist_close_archive_unavailable' for every candidate (never an
+#     exception out of the pass); a symbol beyond the 2,000 cap ->
+#     'hist_close_archive_not_asked'; no archive bar dated the target session
+#     (symbol absent, or only other sessions present) ->
+#     'hist_close_archive_no_bar'; then the v6.47.0 judge's own refusals
+#     (conflict, invalid, scale mismatch, a confirmed ledger action after the
+#     target). The yfinance pull budget (TRACK_HIST_CLOSE_BUDGET), time
+#     budget and breaker apply to yfinance pulls only: under bq_archive no
+#     yfinance pull is made (pulls=0 on the HIST-CLOSE line).
+#   bq_archive_then_yfinance -> the archive first; a symbol with no archive
+#     bar for its target session (and every symbol when the query failed)
+#     falls back to the v6.47.0 yfinance path under its existing budget,
+#     rotating window and breaker.
+#   One extra WARNING line per armed pass: '[ARCHIVE-BAR v6.53.0] source=<src>
+#     candidates=N symbols=S asked=A rows=R served=K no_bar=M not_asked=X
+#     fallback=F unavailable=0|1 [error=<class>] query_sec=T' (served, no_bar,
+#     not_asked and fallback count candidate RECORDS). The '[HIST-CLOSE
+#     v6.47.0]' line and _LAST_HIST_CLOSE keep their v6.47.0 shape under
+#     source=yfinance; the archive modes add 'source' and 'archive' keys.
+#   ENV: TFB_BQ_PROJECT (default project-2e3530e6-2311-4aa3-b36),
+#     TFB_BQ_DATASET (default tfb_archive), TFB_BQ_LOCATION (default US) -
+#     the archive scripts' own names and defaults.
+# WHAT (B) TRACK_AUDIT_DUE_ONLY = 0 (DEFAULT) | 1. Today an audit pass prices
+#   every active symbol. For a record that is NOT yet due (now < target) the
+#   pass writes, when its symbol was priced: Current Price and Unrealized
+#   ROI from the fresh quote and Last Updated = now; when its symbol was NOT
+#   priced (breaker, budget, no witnessed quote): Last Updated = now only.
+#   Status, Realized ROI, Outcome and Notes (no receipt) are never written
+#   for a not-due record either way. With TRACK_AUDIT_DUE_ONLY=1 only the
+#   symbols with at least one active record whose parsed target time is at
+#   or before now are sent to the backend chain and the Yahoo fallback; the
+#   not-due symbols are simply not priced, so their records take the exact
+#   'not priced in this pass' path that already exists (Last Updated = now,
+#   every other cell untouched, no receipt). The due symbols are ordered
+#   oldest target first (the backend chunks keep that order; the Yahoo
+#   fallback keeps it too, because its rotating shuffle is bypassed under
+#   this gate - the due set rotates by itself as symbols mature), so a
+#   breaker that still trips hits the youngest backlog. One INFO line per
+#   pass: '[v6.53.0 DUE-ONLY] audit due-only: N due symbols priced, M not-due
+#   symbols skipped (due records=R, oldest target=YYYY-MM-DD, witnessed=K)'.
+#   _last_audit_stats['total'] (the PERF-VERDICT 'priced n/N') counts the
+#   symbols actually sent for pricing and 'due_only_skipped' carries M. A
+#   record whose target time cannot be parsed is not due (it cannot mature).
+# WHAT (C) .github/workflows/track_performance.yml 1.0.7: a third cron
+#   '30 1 * * *' (04:30 Riyadh), after the US close (21:00 UTC since US DST
+#   ended on 1 Nov 2026); a quote taken then belongs to the target session,
+#   so 'quote_outside_target_session' stops for US records whose target
+#   session was that day. The scheduled-audit condition
+#   (TRACK_SCHEDULED_AUDIT=1 with TRACK_DEDUP_MATURED observe | enforce)
+#   applies to every scheduled run, the new one included.
+# ENV LANE: track_performance.yml 'Run performance clock' maps
+#   TRACK_HIST_CLOSE_SOURCE (|| 'yfinance'), TRACK_AUDIT_DUE_ONLY (|| '0'),
+#   TFB_BQ_PROJECT, TFB_BQ_DATASET and TFB_BQ_LOCATION; daily_sync.yml's
+#   tracker step maps the same five (ENV PARITY). The v6.47.0 gate itself
+#   stays mapped in the clock lane only, so the archive read never runs in
+#   the sync lane; due-only applies to any audit pass in either lane.
+# ARMING (owner, one Variable per evidence run): TRACK_HIST_CLOSE_SOURCE=
+#   bq_archive with TRACK_HIST_TARGET_CLOSE=observe for one Performance Clock
+#   audit (read the ARCHIVE-BAR and HIST-CLOSE lines), then enforce;
+#   TRACK_AUDIT_DUE_ONLY=1 after one observed pass.
+# KNOWN LIMITS: the archive carries no split events, so the v6.47.0
+#   post-target split refusal cannot fire on archive bars; the CA-GUARD
+#   (ledger factor, 15 pp adjusted-series verification) and the 10x scale
+#   check stay the protection. A symbol the nightly archive did not capture
+#   (outside the deep and outcome sets, or a Yahoo miss) is 'no_bar' until
+#   it is. The read costs one BigQuery query per audit pass (a few MB
+#   scanned, a few seconds). A record whose symbol has no current witnessed
+#   quote is still not a candidate (v6.47.0); due-only makes that quote
+#   likelier for exactly the due symbols.
+# ZERO functions removed. Additions: _hist_close_source, _bq_project,
+#   _bq_dataset, _bq_location, _archive_bar_module, _archive_bar_session,
+#   _archive_bar_scrub, _archive_bar_query, _archive_bar_rows,
+#   _hist_archive_prefetch, _hist_close_bars_for,
+#   _hist_close_candidate_session, _audit_due_only_enabled,
+#   _audit_due_symbols (+ _ARCHIVE_BAR_TAG, _ARCHIVE_BAR_PROVIDER,
+#   _ARCHIVE_BAR_TABLE, _ARCHIVE_BAR_MAX_SYMBOLS, _ARCHIVE_BAR_WALL_SEC,
+#   _ARCHIVE_BAR_QUERY_TIMEOUT_MS, _ARCHIVE_BAR_MAX_PAGES,
+#   _HIST_ARCHIVE_CACHE, _HIST_ARCHIVE_STATE, _ARCHIVE_BAR_MODULE,
+#   _DUE_ONLY_TAG, _LAST_DUE_ONLY). _hist_close_evidence asks
+#   _hist_close_bars_for (yfinance -> the v6.47.0 _hist_close_bars call);
+#   _yahoo_chart_fallback_prices gains keep_order (default False =
+#   unchanged); audit_active_records prices _price_syms (= every active
+#   symbol unless due-only is on).
+# ROLLBACK: unset TRACK_HIST_CLOSE_SOURCE (or set yfinance) and unset
+#   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
+#   own. Records matured from archive bars keep their receipts
+#   (hist_provider 'bq_archive_bar' marks them).
+SCRIPT_VERSION = "6.53.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3577,11 +3725,13 @@ async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> floa
     return px
 
 
-async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
+async def _yahoo_chart_fallback_prices(symbols: List[str], keep_order: bool = False) -> Dict[str, float]:
     """v6.20.0 (PF-1): price the given symbols directly from Yahoo's v8
     chart API under a concurrency cap and wall-clock budget. Returns only
     witnessed positive prices, keyed by the ORIGINAL (TFB) symbol. Never raises.
     The numeric API is retained; OutcomePrices carries the required sidecar.
+    v6.53.0: keep_order=True (the due-only audit) keeps the caller's order
+    instead of the rotating shuffle; the default is unchanged.
     """
     syms = [
         _safe_str(x).strip().upper()
@@ -3593,7 +3743,8 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
         return {}
     # v6.28.0 FB-BRK: rotate the worklist so the same head symbols never
     # monopolise the budget leg after leg. Legacy flag keeps sheet order.
-    if _fallback_shuffle_enabled() and not _feed_legacy():
+    # v6.53.0 [DUE-ONLY]: an oldest-target-first worklist is kept as given.
+    if _fallback_shuffle_enabled() and not _feed_legacy() and not keep_order:
         random.shuffle(syms)
     t0 = time.time()
     budget = _fallback_budget_sec()
@@ -4061,13 +4212,15 @@ def _hist_close_evidence(record: Any, context: Dict[str, Any], current: OutcomeP
             return None, "hist_close_context_unknown"
         if _ca_ledger_factor(record.symbol, session) is not None:
             return None, "hist_close_post_target_action"
-        bars, reason = _hist_close_bars(record.symbol)
+        # v6.53.0 [ARCHIVE-BAR]: the source gate picks the bars; yfinance
+        # (DEFAULT) is the v6.47.0 _hist_close_bars call and provider.
+        bars, reason, provider = _hist_close_bars_for(record.symbol, session)
         if reason:
             return None, reason
         close, reason = _hist_target_close(bars, session, current.price)
         if reason:
             return None, reason
-        return OutcomePrice(record.symbol, float(close), _HIST_CLOSE_PROVIDER,
+        return OutcomePrice(record.symbol, float(close), provider,
                             _utc_now(), close_at, _HIST_CLOSE_KIND), ""
     except Exception:
         return None, "hist_close_unavailable"
@@ -4127,6 +4280,312 @@ def _hist_close_judge(record: Any, context: Dict[str, Any], current: OutcomePric
         horizon = _safe_str(getattr(record.horizon, "value", record.horizon))
         stats["by_horizon"][horizon] = stats["by_horizon"].get(horizon, 0) + 1
     return evidence, reason, roi
+
+
+# v6.53.0 - ARCHIVE BAR SOURCE (TRACK_HIST_CLOSE_SOURCE) + DUE-ONLY AUDIT
+# =============================================================================
+# The historical target-session close can be read from the BigQuery bar
+# archive (tfb_archive.symbol_bars_daily) instead of one yfinance pull per
+# symbol: ONE parameterised query per audit pass through the archive scripts'
+# own session (archive_market_series.make_session -> google-auth
+# AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS), no client library. The
+# rows take the bar shape _hist_close_bars returns, so everything after
+# _hist_close_evidence is the v6.47.0 path. The credential never reaches a
+# log line: a failure is reported by its class name and a scrubbed message.
+# The source gate never arms the judge - TRACK_HIST_TARGET_CLOSE does - so
+# with that gate off nothing here runs.
+_ARCHIVE_BAR_TAG = "[ARCHIVE-BAR v6.53.0]"
+_ARCHIVE_BAR_PROVIDER = "bq_archive_bar"
+_ARCHIVE_BAR_TABLE = "symbol_bars_daily"
+_ARCHIVE_BAR_MAX_SYMBOLS = 2000          # symbols asked per pass (sorted; the rest 'not_asked')
+_ARCHIVE_BAR_WALL_SEC = 150.0            # one query: post + polls + pages, then 'unavailable'
+_ARCHIVE_BAR_QUERY_TIMEOUT_MS = 60000    # jobs.query timeoutMs (the archive's own)
+_ARCHIVE_BAR_MAX_PAGES = 50
+_HIST_ARCHIVE_CACHE: Dict[str, Any] = {}   # per-pass TFB symbol -> bars ([] = asked, none)
+_HIST_ARCHIVE_STATE: Dict[str, Any] = {}   # per-pass read-back (loaded, unavailable, error, ...)
+_ARCHIVE_BAR_MODULE: Dict[str, Any] = {}   # lazily loaded archive_market_series
+_DUE_ONLY_TAG = "[v6.53.0 DUE-ONLY]"
+_LAST_DUE_ONLY: Dict[str, Any] = {}        # read-back of the last due-only audit pass
+
+
+def _hist_close_source() -> str:
+    """v6.53.0: TRACK_HIST_CLOSE_SOURCE yfinance (DEFAULT) | bq_archive |
+    bq_archive_then_yfinance. Exact words, case/space-insensitive; anything
+    else is yfinance, so an unset or mistyped Variable keeps the v6.47.0
+    pull. It never arms the judge: TRACK_HIST_TARGET_CLOSE does."""
+    v = (os.getenv("TRACK_HIST_CLOSE_SOURCE") or "yfinance").strip().lower()
+    return v if v in ("bq_archive", "bq_archive_then_yfinance") else "yfinance"
+
+
+def _bq_project() -> str:
+    """v6.53.0: the archive project (the archive scripts' own default)."""
+    return (os.getenv("TFB_BQ_PROJECT") or "project-2e3530e6-2311-4aa3-b36").strip()
+
+
+def _bq_dataset() -> str:
+    """v6.53.0: the archive dataset (default tfb_archive)."""
+    return (os.getenv("TFB_BQ_DATASET") or "tfb_archive").strip()
+
+
+def _bq_location() -> str:
+    """v6.53.0: the archive location (default US)."""
+    return (os.getenv("TFB_BQ_LOCATION") or "US").strip()
+
+
+def _audit_due_only_enabled() -> bool:
+    """v6.53.0: TRACK_AUDIT_DUE_ONLY=1/on/true/yes prices only the symbols
+    with a due active record. DEFAULT OFF (house convention)."""
+    return (os.getenv("TRACK_AUDIT_DUE_ONLY") or "0").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _audit_due_symbols(active: List[Any], now: datetime) -> Tuple[List[str], Dict[str, Any]]:
+    """v6.53.0 PURE: the symbols with at least one active record whose parsed
+    target time is at or before `now` (the loop's own test, now >= target),
+    oldest target first (ties: first seen), plus the read-back counts. A
+    record whose target cannot be parsed is not due: it cannot mature.
+    Never raises."""
+    oldest: Dict[str, datetime] = {}
+    first_seen: Dict[str, int] = {}
+    due_records = 0
+    all_syms = list(dict.fromkeys([r.symbol for r in active]))
+    for i, r in enumerate(active):
+        try:
+            target = _outcome_timestamp(getattr(r, "target_date", None))
+        except Exception:
+            target = None
+        if target is None or now < target:
+            continue
+        due_records += 1
+        if r.symbol not in oldest or target < oldest[r.symbol]:
+            oldest[r.symbol] = target
+        first_seen.setdefault(r.symbol, i)
+    due = sorted(oldest, key=lambda s: (oldest[s], first_seen[s]))
+    info = {"due_symbols": len(due), "skipped": len(all_syms) - len(due),
+            "due_records": due_records, "active_symbols": len(all_syms),
+            "oldest_target": (oldest[due[0]].astimezone(timezone.utc).strftime("%Y-%m-%d")
+                              if due else "")}
+    return due, info
+
+
+def _archive_bar_module() -> Any:
+    """v6.53.0: scripts/archive_market_series.py loaded from this file's own
+    folder (stdlib-only at import time; its make_session loads google-auth
+    lazily); cached. None when it cannot be loaded."""
+    if "mod" not in _ARCHIVE_BAR_MODULE:
+        try:
+            import importlib.util as _ilu
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive_market_series.py")
+            spec = _ilu.spec_from_file_location("_tfb_track_archive_market_series", path)
+            mod = _ilu.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)
+            _ARCHIVE_BAR_MODULE["mod"] = mod
+        except Exception:
+            _ARCHIVE_BAR_MODULE["mod"] = None
+    return _ARCHIVE_BAR_MODULE["mod"]
+
+
+def _archive_bar_session() -> Any:
+    """v6.53.0: the archive's own session builder (archive_market_series
+    .make_session -> archive_to_bigquery.make_session: a google-auth
+    AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS, BigQuery scope).
+    Raises when the module or the credential is unavailable; the message
+    never carries the credential."""
+    ams = _archive_bar_module()
+    if ams is None:
+        raise RuntimeError("archive_market_series unavailable")
+    return ams.make_session()
+
+
+def _archive_bar_scrub(text: Any) -> str:
+    """v6.53.0: a message safe for a log line - never a credential."""
+    t = _safe_str(text)
+    for marker in ("private_key", "PRIVATE KEY", "client_secret", "refresh_token",
+                   "Bearer ", "\"token\"", "access_token"):
+        if marker in t:
+            return "<redacted>"
+    return t[:160]
+
+
+def _archive_bar_query(session: Any, project: str, dataset: str, location: str,
+                       symbols: List[str], since: str, until: str) -> List[Dict[str, Any]]:
+    """v6.53.0: ONE BigQuery jobs.query for `symbols` (named ARRAY<STRING>
+    parameter) over the dates since..until (DATE parameters), polled through
+    jobs.getQueryResults while the job is not complete and paged by
+    pageToken, all under _ARCHIVE_BAR_WALL_SEC. Rows come back as dicts of
+    column name -> the REST value (strings). Raises on any failure; the
+    caller turns that into 'hist_close_archive_unavailable'."""
+    ams = _archive_bar_module()
+    api = getattr(ams, "BQ_API", None) or "https://bigquery.googleapis.com/bigquery/v2"
+    err = getattr(ams, "_err", None) or (lambda r: "HTTP %s" % getattr(r, "status_code", "?"))
+    sql = ("SELECT symbol, date, open, high, low, close, adj_close, source "
+           "FROM `%s.%s.%s` WHERE symbol IN UNNEST(@symbols) "
+           "AND date >= @since AND date <= @until ORDER BY symbol, date"
+           % (project, dataset, _ARCHIVE_BAR_TABLE))
+    body = {
+        "query": sql, "useLegacySql": False, "location": location,
+        "timeoutMs": _ARCHIVE_BAR_QUERY_TIMEOUT_MS, "parameterMode": "NAMED",
+        "queryParameters": [
+            {"name": "symbols", "parameterType": {"type": "ARRAY", "arrayType": {"type": "STRING"}},
+             "parameterValue": {"arrayValues": [{"value": s} for s in symbols]}},
+            {"name": "since", "parameterType": {"type": "DATE"}, "parameterValue": {"value": since}},
+            {"name": "until", "parameterType": {"type": "DATE"}, "parameterValue": {"value": until}},
+        ],
+        "labels": {"tfb": "track-archive-bar"},
+    }
+    t0 = time.time()
+    resp = session.post("%s/projects/%s/queries" % (api, project), json=body,
+                        timeout=_ARCHIVE_BAR_WALL_SEC)
+    if getattr(resp, "status_code", 0) != 200:
+        raise RuntimeError("query: %s" % err(resp))
+    payload = resp.json() or {}
+    if payload.get("errors"):
+        raise RuntimeError("query: " + _safe_str((payload["errors"][0] or {}).get("message") or "failed")[:300])
+    job_id = _safe_str((payload.get("jobReference") or {}).get("jobId") or "")
+    rows: List[Dict[str, Any]] = []
+    pages = 0
+    while True:
+        if payload.get("jobComplete", True):
+            names = [f.get("name") for f in ((payload.get("schema") or {}).get("fields") or [])]
+            for row in payload.get("rows") or []:
+                rows.append({n: (c or {}).get("v") for n, c in zip(names, row.get("f") or [])})
+            token = _safe_str(payload.get("pageToken") or "")
+            if not token:
+                return rows
+            pages += 1
+            if pages > _ARCHIVE_BAR_MAX_PAGES:
+                raise RuntimeError("query: more than %d pages" % _ARCHIVE_BAR_MAX_PAGES)
+            params: Dict[str, Any] = {"location": location, "pageToken": token}
+        else:
+            params = {"location": location, "timeoutMs": _ARCHIVE_BAR_QUERY_TIMEOUT_MS}
+        if (time.time() - t0) > _ARCHIVE_BAR_WALL_SEC:
+            raise RuntimeError("query: wall clock of %.0fs exceeded" % _ARCHIVE_BAR_WALL_SEC)
+        if not job_id:
+            raise RuntimeError("query: no job reference to poll")
+        resp = session.get("%s/projects/%s/queries/%s" % (api, project, job_id), params=params,
+                           timeout=_ARCHIVE_BAR_WALL_SEC)
+        if getattr(resp, "status_code", 0) != 200:
+            raise RuntimeError("query poll: %s" % err(resp))
+        payload = resp.json() or {}
+        if payload.get("errors"):
+            raise RuntimeError("query poll: " + _safe_str((payload["errors"][0] or {}).get("message") or "failed")[:300])
+
+
+def _archive_bar_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """v6.53.0 PURE: archive rows -> {TFB symbol: [bar, ...]} in the shape
+    _hist_close_bars returns ({"date": "YYYY-MM-DD", "close": float,
+    "split": 0.0}; the archive carries no split events). An unparsable
+    close stays None, so _hist_target_close refuses it as hist_close_invalid
+    rather than this parser dropping the date. Never raises."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        sym = _safe_str(r.get("symbol") or "").upper()
+        date = _safe_str(r.get("date") or "")[:10]
+        if not sym or not date:
+            continue
+        raw = r.get("close")
+        try:
+            close: Optional[float] = None if raw in (None, "") or isinstance(raw, bool) else float(raw)
+        except (TypeError, ValueError):
+            close = None
+        out.setdefault(sym, []).append({"date": date, "close": close, "split": 0.0,
+                                        "source": _safe_str(r.get("source") or "")})
+    return out
+
+
+def _hist_archive_prefetch(pairs: List[Tuple[str, str]]) -> None:
+    """v6.53.0: the ONE archive read of an audit pass. `pairs` are the
+    candidate (TFB symbol, target session) couples; the distinct symbols
+    (sorted, at most _ARCHIVE_BAR_MAX_SYMBOLS) are asked for the bars dated
+    between the earliest and the latest target session. Fills
+    _HIST_ARCHIVE_CACHE (symbol -> bars; [] when the archive has none) and
+    _HIST_ARCHIVE_STATE (loaded | unavailable + error class). Never raises:
+    a failed session or query leaves every candidate
+    'hist_close_archive_unavailable'."""
+    _HIST_ARCHIVE_CACHE.clear()
+    _HIST_ARCHIVE_STATE.clear()
+    _HIST_ARCHIVE_STATE.update({"loaded": False, "unavailable": False, "error": "", "detail": "",
+                                "candidates": len(pairs), "symbols": 0, "asked": 0, "rows": 0,
+                                "since": "", "until": "", "query_sec": 0.0,
+                                "served": 0, "no_bar": 0, "not_asked": 0, "fallback": 0})
+    syms = sorted({_safe_str(s or "").upper() for s, _d in pairs if _safe_str(s or "")})
+    dates = sorted({_safe_str(d or "")[:10] for _s, d in pairs if len(_safe_str(d or "")) >= 10})
+    _HIST_ARCHIVE_STATE["symbols"] = len(syms)
+    if not syms or not dates:
+        _HIST_ARCHIVE_STATE["loaded"] = True      # nothing to ask; lookups are 'not_asked'
+        return
+    asked = syms[:_ARCHIVE_BAR_MAX_SYMBOLS]
+    _HIST_ARCHIVE_STATE.update(asked=len(asked), since=dates[0], until=dates[-1])
+    t0 = time.time()
+    try:
+        session = _archive_bar_session()
+        rows = _archive_bar_query(session, _bq_project(), _bq_dataset(), _bq_location(),
+                                  asked, dates[0], dates[-1])
+        bars = _archive_bar_rows(rows)
+        for s in asked:
+            _HIST_ARCHIVE_CACHE[s] = bars.get(s, [])
+        _HIST_ARCHIVE_STATE.update(loaded=True, rows=len(rows or []))
+    except Exception as exc:
+        _HIST_ARCHIVE_STATE.update(unavailable=True, error=type(exc).__name__,
+                                   detail=_archive_bar_scrub(exc))
+    finally:
+        _HIST_ARCHIVE_STATE["query_sec"] = round(max(0.0, time.time() - t0), 2)
+
+
+def _hist_close_bars_for(symbol: str, session: str) -> Tuple[Optional[List[Dict[str, Any]]], str, str]:
+    """v6.53.0: (bars, reason, provider) for the target session `session`,
+    by TRACK_HIST_CLOSE_SOURCE. yfinance (DEFAULT) -> exactly the v6.47.0
+    _hist_close_bars call, provider 'yfinance-history'. bq_archive -> the
+    pass's archive read: 'hist_close_archive_unavailable' when it failed,
+    'hist_close_archive_not_asked' beyond the cap, 'hist_close_archive_no_bar'
+    when no bar is dated the target session, else the bars with provider
+    'bq_archive_bar'. bq_archive_then_yfinance -> the same, but every refusal
+    above falls back to the v6.47.0 pull under its own budget and breaker.
+    Never raises."""
+    src = _hist_close_source()
+    if src == "yfinance":
+        bars, reason = _hist_close_bars(symbol)
+        return bars, reason, _HIST_CLOSE_PROVIDER
+    st = _HIST_ARCHIVE_STATE
+    key = _safe_str(symbol or "").upper()
+    want = _safe_str(session or "")[:10]
+    if not st.get("loaded"):
+        reason = "hist_close_archive_unavailable"
+    elif key not in _HIST_ARCHIVE_CACHE:
+        reason = "hist_close_archive_not_asked"
+    else:
+        bars = _HIST_ARCHIVE_CACHE[key]
+        if want and any(isinstance(b, dict) and _safe_str(b.get("date") or "")[:10] == want
+                        for b in bars or []):
+            st["served"] = int(st.get("served") or 0) + 1
+            return bars, "", _ARCHIVE_BAR_PROVIDER
+        reason = "hist_close_archive_no_bar"
+    tally = {"hist_close_archive_no_bar": "no_bar", "hist_close_archive_not_asked": "not_asked"}.get(reason)
+    if tally:
+        st[tally] = int(st.get(tally) or 0) + 1
+    if src == "bq_archive":
+        return None, reason, _ARCHIVE_BAR_PROVIDER
+    st["fallback"] = int(st.get("fallback") or 0) + 1
+    bars, reason = _hist_close_bars(symbol)
+    return bars, reason, _HIST_CLOSE_PROVIDER
+
+
+def _hist_close_candidate_session(record: Any, prices: Any, now: datetime) -> Optional[str]:
+    """v6.53.0 PURE: the target session of an enforce candidate (the same
+    pre-pass as _hist_close_candidate), or None. Never raises."""
+    try:
+        if not _hist_close_candidate(record, prices, now):
+            return None
+        evidence, _reason = _outcome_map_evidence(prices, record.symbol, now)
+        if evidence is None:
+            return None
+        context, _reason = _outcome_target_session(record, evidence, now)
+        session = _safe_str(context.get("target_session") or "")[:10]
+        return session or None
+    except Exception:
+        return None
 
 
 # v6.22.0 — CA-GUARD ledger layer (confirmed `_Corporate_Actions` truth)
@@ -10192,26 +10651,37 @@ class PerformanceTrackerApp:
             return records
 
         syms = list(dict.fromkeys([r.symbol for r in active]))
+        # v6.53.0 [DUE-ONLY]: '0' (DEFAULT) prices every active symbol, as
+        # before (_price_syms is syms). '1' prices only the symbols with a
+        # due record, oldest target first; a not-due symbol is not priced in
+        # this pass, so its records take the existing 'no price' path (Last
+        # Updated only, no receipt) that a breaker-skipped symbol takes today.
+        _due_only = _audit_due_only_enabled()
+        _price_syms = syms
+        if _due_only:
+            _price_syms, _due_info = _audit_due_symbols(active, RiyadhTime.now())
+            _LAST_DUE_ONLY.clear()
+            _LAST_DUE_ONLY.update(_due_info)
         if not self.backend.base_url:
             # v6.18.0 (PRICE-FEED-LOUD): this exact silent {} froze all 2,264
             # records at entry price on 2026-07-12 — and would have expired the
             # whole first cohort UNPRICED. Never silent again.
             price_map = OutcomePrices()
-            price_map.reasons.update({s: "backend_unavailable" for s in syms})
+            price_map.reasons.update({s: "backend_unavailable" for s in _price_syms})
             global _LAST_FEED_DIAGNOSIS
             _LAST_FEED_DIAGNOSIS = "base_url_EMPTY"
             logger.error(
                 "%s backend base_url is EMPTY — %d active symbols cannot be "
                 "priced; fresh-only maturation will hold/expire the cohort. "
                 "Set the backend URL env for this job.",
-                _PRICE_FEED_TAG, len(syms),
+                _PRICE_FEED_TAG, len(_price_syms),
             )
         else:
-            fetched = await self.backend.fetch_prices(syms)
+            fetched = await self.backend.fetch_prices(_price_syms)
             price_map = fetched if isinstance(fetched, OutcomePrices) else OutcomePrices()
             if not isinstance(fetched, OutcomePrices):
-                price_map.reasons.update({s: "outcome_price_evidence_missing" for s in syms})
-            _dead = _price_feed_dead(syms, price_map)
+                price_map.reasons.update({s: "outcome_price_evidence_missing" for s in _price_syms})
+            _dead = _price_feed_dead(_price_syms, price_map)
             if _dead and not str(_LAST_FEED_DIAGNOSIS).startswith("backend_dead"):
                 _LAST_FEED_DIAGNOSIS = "backend_dead: " + str(_dead)[:160]
             if _dead:
@@ -10225,9 +10695,9 @@ class PerformanceTrackerApp:
         global _LAST_FALLBACK_FILLED
         _LAST_FALLBACK_FILLED = 0
         if _price_fallback_enabled():
-            _missing = [s for s in syms if _outcome_map_evidence(price_map, s, _utc_now())[0] is None]
+            _missing = [s for s in _price_syms if _outcome_map_evidence(price_map, s, _utc_now())[0] is None]
             if _missing:
-                _fb = await _yahoo_chart_fallback_prices(_missing)
+                _fb = await _yahoo_chart_fallback_prices(_missing, keep_order=_due_only)
                 for _k in _missing:
                     _evidence, _reason = _outcome_map_evidence(_fb, _k, _utc_now())
                     if _evidence is not None:
@@ -10236,6 +10706,16 @@ class PerformanceTrackerApp:
                     else:
                         _prior = price_map.reasons.get(_k, "")
                         price_map.reasons[_k] = ";".join(dict.fromkeys(x for x in (_prior, _reason) if x))
+
+        if _due_only:
+            # v6.53.0 [DUE-ONLY]: one read-back line per pass.
+            _LAST_DUE_ONLY["witnessed"] = sum(1 for s in _price_syms if s in price_map.evidence)
+            logger.info(
+                "%s audit due-only: %d due symbols priced, %d not-due symbols skipped "
+                "(due records=%d, oldest target=%s, witnessed=%d)",
+                _DUE_ONLY_TAG, len(_price_syms), int(_LAST_DUE_ONLY.get("skipped") or 0),
+                int(_LAST_DUE_ONLY.get("due_records") or 0),
+                _LAST_DUE_ONLY.get("oldest_target") or "-", int(_LAST_DUE_ONLY["witnessed"]))
 
         now_r = RiyadhTime.now()
 
@@ -10253,6 +10733,7 @@ class PerformanceTrackerApp:
         _hist_stats: Dict[str, Any] = {}
         _hist_used: List[Any] = []       # enforce: (record, live price, live ROI)
         _hist_observe: List[Any] = []    # observe: judged after the loop
+        _hist_source = "yfinance"        # v6.53.0: read only when the judge is armed
         if _hist_mode != "off":
             _HIST_CLOSE_CACHE.clear()
             _HIST_CLOSE_BUDGET.clear()
@@ -10267,6 +10748,18 @@ class PerformanceTrackerApp:
                 _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
                     [r.symbol for r in active if _hist_close_candidate(r, price_map, now_r)],
                     _hist_day, _hist_close_budget())
+            # v6.53.0 [ARCHIVE-BAR]: with an archive source the bars of EVERY
+            # candidate come from ONE BigQuery read per pass - before the loop
+            # under enforce (the same pre-pass), after it under observe (its
+            # own list). yfinance (DEFAULT) reads nothing here.
+            _hist_source = _hist_close_source()
+            if _hist_mode == "enforce" and _hist_source != "yfinance":
+                _hist_pairs: List[Tuple[str, str]] = []
+                for r in active:
+                    _hist_session = _hist_close_candidate_session(r, price_map, now_r)
+                    if _hist_session:
+                        _hist_pairs.append((r.symbol, _hist_session))
+                _hist_archive_prefetch(_hist_pairs)
 
         for r in active:
             _loop_i += 1
@@ -10473,6 +10966,10 @@ class PerformanceTrackerApp:
             if _hist_mode == "observe":
                 _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
                     [_r.symbol for _r, _ctx, _ev in _hist_observe], _hist_day, _hist_close_budget())
+                if _hist_source != "yfinance":
+                    # v6.53.0 [ARCHIVE-BAR]: observe's one archive read.
+                    _hist_archive_prefetch([(_r.symbol, _safe_str(_ctx.get("target_session") or "")[:10])
+                                            for _r, _ctx, _ev in _hist_observe])
             for _r, _ctx, _ev in _hist_observe:
                 _hist_close_judge(_r, _ctx, _ev, now_r, _hist_stats)
             for _r, _px0, _roi0 in _hist_used:
@@ -10494,13 +10991,30 @@ class PerformanceTrackerApp:
                 _hist_stats["pulls"], _hist_stats["ok"], _hist_stats["failed"],
                 (" first_error=" + _hist_stats["first_error"]) if _hist_stats["first_error"] else "",
                 "open" if _hist_stats["breaker"] else "closed", _hist_stats["deferred"])
+            if _hist_source != "yfinance":
+                # v6.53.0 [ARCHIVE-BAR]: one read-back line and two stats keys
+                # (yfinance keeps the v6.47.0 line and dict exactly).
+                _arch = dict(_HIST_ARCHIVE_STATE)
+                _hist_stats.update(source=_hist_source, archive=_arch)
+                logger.warning(
+                    "%s source=%s candidates=%d symbols=%d asked=%d rows=%d served=%d no_bar=%d "
+                    "not_asked=%d fallback=%d unavailable=%d%s query_sec=%.2f",
+                    _ARCHIVE_BAR_TAG, _hist_source, int(_arch.get("candidates") or 0),
+                    int(_arch.get("symbols") or 0), int(_arch.get("asked") or 0),
+                    int(_arch.get("rows") or 0), int(_arch.get("served") or 0),
+                    int(_arch.get("no_bar") or 0), int(_arch.get("not_asked") or 0),
+                    int(_arch.get("fallback") or 0), 1 if _arch.get("unavailable") else 0,
+                    (" error=" + _safe_str(_arch.get("error"))) if _arch.get("error") else "",
+                    float(_arch.get("query_sec") or 0.0))
             _LAST_HIST_CLOSE.clear()
             _LAST_HIST_CLOSE.update(_hist_stats)
 
         # v6.20.0 (VT-1): stash this pass's feed stats for the verdict line.
+        # v6.53.0 [DUE-ONLY]: priced / total count the symbols sent for
+        # pricing (_price_syms is syms unless due-only is on).
         try:
             _priced = sum(
-                1 for s in syms if float(price_map.get(s, 0.0) or 0.0) > 0.0
+                1 for s in _price_syms if float(price_map.get(s, 0.0) or 0.0) > 0.0
             )
             _roi_nz = sum(
                 1 for r in active
@@ -10510,7 +11024,7 @@ class PerformanceTrackerApp:
             )
             self._last_audit_stats = {
                 "priced": _priced,
-                "total": len(syms),
+                "total": len(_price_syms),
                 "roi_nonzero": _roi_nz,
                 "fallback_filled": int(_LAST_FALLBACK_FILLED),
                 "matured": int(_n_matured),
@@ -10521,6 +11035,8 @@ class PerformanceTrackerApp:
                 "outcome_evidence_version": "tfb.outcome-price.v1",
                 "outcome_skipped_reasons": dict(_skipped_outcome_reasons),
             }
+            if _due_only:   # v6.53.0 [DUE-ONLY]: the key exists only when armed
+                self._last_audit_stats["due_only_skipped"] = int(_LAST_DUE_ONLY.get("skipped") or 0)
         except Exception:
             self._last_audit_stats = {}
 

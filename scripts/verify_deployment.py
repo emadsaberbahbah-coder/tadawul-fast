@@ -279,7 +279,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
     # 2026-10-25: 6.50.0 [LOG-READ] Performance_Log read precision
     # (TRACK_LOG_UNFORMATTED_READ, default off; pin only).
-    ("track_performance", "6.50.0", "track performance"),
+    # 2026-11-02: 6.53.0 [ARCHIVE-BAR + DUE-ONLY] historical close from the
+    # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
+    # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
+    # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
+    ("track_performance", "6.53.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.

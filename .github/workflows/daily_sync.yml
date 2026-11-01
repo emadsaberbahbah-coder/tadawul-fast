@@ -1417,6 +1417,22 @@ jobs:
           # enforce; both tracker lanes map the same Variable (ENV PARITY).
           # Rollback: unset or off.
           TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
+          # (2026-11-02) track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY],
+          # mirrored VERBATIM from track_performance.yml 1.0.7 (ENV PARITY).
+          # TRACK_HIST_CLOSE_SOURCE: 'yfinance' (default) = the v6.47.0 pull;
+          # 'bq_archive' reads the target-session close from BigQuery
+          # tfb_archive.symbol_bars_daily in ONE query per audit pass. It only
+          # acts while the v6.47.0 historical-close gate is armed, and that gate
+          # is mapped in the Performance Clock lane only, so this lane never
+          # reads the archive. TRACK_AUDIT_DUE_ONLY: '0' (default) prices every
+          # active symbol; '1' prices only the symbols with a due record on a
+          # manual run_tracker=true audit. The TFB_BQ_* trio is the bq_*.yml
+          # pattern. ROLLBACK: unset (or yfinance / 0).
+          TRACK_HIST_CLOSE_SOURCE: ${{ vars.TRACK_HIST_CLOSE_SOURCE || 'yfinance' }}
+          TRACK_AUDIT_DUE_ONLY: ${{ vars.TRACK_AUDIT_DUE_ONLY || '0' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
