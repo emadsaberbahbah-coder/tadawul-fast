@@ -31,6 +31,12 @@
 #       on splitting mixed-venue batches and never asked for 42 codes (27 US
 #       names TAK..ZTO). Batches are now one venue each, US first, and the
 #       calendar is asked with EODHD's codes for '.L' / '.KL' / '.IS' / '.LS'.
+# 2026-11-01: maps calendar_provider v1.4.0 TFB_CAL_LAST_REPORT_YAHOO (DEFAULT
+#       OFF; NOT armed here) - the last-report lane skips every KSA symbol, so
+#       a Saudi holding (2222.SR) never gets a Last Earnings Date and the
+#       post-earnings quarantine cannot hold it. Armed, Yahoo fills the KSA
+#       rows' last report (fill-only). Arm with the repo Variable
+#       TFB_CAL_LAST_REPORT_YAHOO=on (needs TFB_CAL_LAST_REPORT=on too).
 # =============================================================================
 name: 📅 Calendar Sync
 
@@ -116,6 +122,10 @@ jobs:
           # the module; armed here). Kill: "off" (each independently).
           TFB_CALENDAR_VENUE_BATCHES: "on"
           TFB_CALENDAR_SUFFIX_MAP: "on"
+          # 2026-11-01: calendar_provider v1.4.0 - Saudi past reports from
+          # Yahoo (fill-only). Default off; arm with the repo Variable
+          # TFB_CAL_LAST_REPORT_YAHOO=on. Rollback: unset it.
+          TFB_CAL_LAST_REPORT_YAHOO: ${{ vars.TFB_CAL_LAST_REPORT_YAHOO || 'off' }}
         run: |
           if [[ -z "${EODHD_API_KEY:-}" ]]; then
             echo "::error::EODHD_API_KEY secret not set (add the rotated token in repo Settings → Secrets)."

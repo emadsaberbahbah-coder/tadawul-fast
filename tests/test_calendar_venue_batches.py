@@ -181,7 +181,9 @@ def _warnings(caplog, mod):
 @pytest.fixture
 def cp():
     import core.providers.calendar_provider as mod
-    assert mod.__version__ == "1.3.2"
+    # 2026-11-01: v1.4.0 (Saudi past reports from Yahoo, gated off by default)
+    # stacked on this change; the pin is a floor now
+    assert tuple(int(x) for x in mod.__version__.split(".")) >= (1, 3, 2), mod.__version__
     return mod
 
 

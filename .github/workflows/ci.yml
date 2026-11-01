@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.65 (2026-11-01) -- SAUDI PAST REPORTS (calendar_provider 1.4.0)
+#
+# v1.1.65 (1.1.62 / 1.1.63 are claimed by open #778, 1.1.64 by open #882):
+# run tests/test_calendar_last_report_yahoo.py (calendar_provider v1.4.0:
+# TFB_CAL_LAST_REPORT_YAHOO fills the last report of KSA symbols from Yahoo,
+# which EODHD does not cover) in the contract lane next to
+# tests/test_calendar_last_report_a4.py, and fetch the untouched v1.3.2
+# (4c2bd640) for its golden leg (a failed fetch only turns that leg into a
+# SKIP). Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
@@ -1261,6 +1271,10 @@ jobs:
           # the untouched calendar_provider v1.3.1 (e8337a16).
           git fetch --no-tags --depth=1 origin e8337a169669870a89ae1397f1847669220f1fc0 \
             || echo "::notice::calendar v1.3.1 base not fetched - test_calendar_venue_batches V1 will SKIP"
+          # v1.1.65: the golden leg of tests/test_calendar_last_report_yahoo.py
+          # reads the untouched calendar_provider v1.3.2 (4c2bd640).
+          git fetch --no-tags --depth=1 origin 4c2bd640730a4f0c5630d42ab1a8fa39c9ac438e \
+            || echo "::notice::calendar v1.3.2 base not fetched - test_calendar_last_report_yahoo base legs will SKIP"
           echo "::group::pytest (contract)"
           # PY-4 (2026-07-26): the exact current-schema contract is now an
           # UNCONDITIONAL gate — previously only the legacy alignment test
@@ -1280,6 +1294,7 @@ jobs:
             tests/test_calendar_last_report_a4.py \
             tests/test_calendar_split_404.py \
             tests/test_calendar_venue_batches.py \
+            tests/test_calendar_last_report_yahoo.py \
             tests/test_quote_epoch_producer.py \
             tests/test_redaction_boundaries.py \
             tests/test_route_error_redaction.py \

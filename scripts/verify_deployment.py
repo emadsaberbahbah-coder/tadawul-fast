@@ -231,7 +231,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-27 (same rule): 1.3.0 -> 1.3.1 (404 batch split, gated).
     # 2026-10-27 (same rule): 1.3.1 -> 1.3.2 (venue batches + EODHD exchange
     # codes for the calendar, both gated).
-    ("core.providers.calendar_provider", "__version__", "1.3.2",
+    # 2026-11-01 (same rule): 1.3.2 -> 1.4.0 (Saudi past reports from Yahoo,
+    # TFB_CAL_LAST_REPORT_YAHOO, default off).
+    ("core.providers.calendar_provider", "__version__", "1.4.0",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
