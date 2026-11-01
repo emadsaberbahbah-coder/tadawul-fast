@@ -30,6 +30,17 @@
 # GATE: vars.TFB_RELEASE_DEFER_DURING_SYNC (1/true/yes/on). Unset (default):
 # the step is skipped and the workflow behaves exactly as v1.2.0.
 # ROLLBACK: unset the variable, or revert the step and the release 'if'.
+# REVIEW FIX (2026-11-02, Codex P1 on PR #893, same unreleased 1.3.0): an
+# ARMED sticky kill (vars.TFB_DECISION_RELEASE_KILL, the job env maps it)
+# is never deferred. The script's kill branch (step 2) retracts an
+# EXECUTABLE feed BEFORE its in-flight probe, so a deferral that skipped
+# the script while a sync was queued or running would have left a live
+# release actionable. The defer step now tests the kill FIRST, with the
+# same armed-word parsing as release_killed() and the summary step, makes
+# no API call, records deferred=false / defer_reason=sticky_kill_armed and
+# the release step runs as today, so the kill lands at every slot. (A
+# scheduled sweep of an EXPIRED value can still wait for the next slot:
+# every consumer already reads an expired value as NOT_ACTIONABLE.)
 #
 # VERSION 1.2.0 (2026-10-29) -- RENDER SETTLE MAPPING (release_decision_feed 1.3.0)
 # (1.1.1 is claimed by open PR #831.)
@@ -286,6 +297,8 @@ jobs:
       # line, records deferred=true and the release step below is skipped,
       # so the slot ends GREEN-deferred; the next slot retries. A dispatched
       # release (operator or release_after_sync.yml) never takes this step.
+      # An ARMED sticky kill (TFB_DECISION_RELEASE_KILL) is never deferred:
+      # the script's kill branch must run at every slot (Codex P1, PR #893).
       # Unset variable: skipped, and the release step runs exactly as before.
       - name: Defer while a production sync is running
         id: defer
@@ -298,7 +311,17 @@ jobs:
           deferred=false
           reason=""
           busy="[]"
-          if [[ "$EVENT_NAME" == "schedule" ]]; then
+          # Review fix (Codex P1 on PR #893): an ARMED sticky kill is never
+          # deferred. The release script's kill branch (step 2) retracts an
+          # EXECUTABLE feed BEFORE its in-flight probe, so skipping the script
+          # while a sync is queued or running would leave a live release
+          # actionable. Same armed-word parsing as release_killed() and the
+          # summary step (strip, lower, 1/true/yes/on); the job env maps the
+          # Variable. Not deferred -> the release step runs as today and kills.
+          if python -c 'import os, sys; sys.exit(0 if (os.environ.get("TFB_DECISION_RELEASE_KILL") or "0").strip().lower() in {"1", "true", "yes", "on"} else 1)'; then
+            reason="sticky_kill_armed"
+            echo "Sticky kill armed: not deferring; the release step runs its kill branch."
+          elif [[ "$EVENT_NAME" == "schedule" ]]; then
             if listing="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?branch=main&per_page=50" \
                 --jq '[.workflow_runs[] | select((.event == "schedule" or .event == "workflow_dispatch") and .status != "completed") | {workflow: "daily_sync.yml", id: .id, event: .event, status: .status}]' 2>/dev/null)"; then
               busy="$listing"

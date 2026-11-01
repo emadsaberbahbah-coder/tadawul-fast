@@ -62,12 +62,16 @@ scheduled-slot deferral (vars.TFB_RELEASE_DEFER_DURING_SYNC, default off):
       no continue-on-error, cleanup last; the audit commands are unchanged
   W24 release_decision_feed.yml 'Defer while a production sync is running':
       gated AND schedule-only (matrix: never workflow_dispatch), one API
-      call, the release step skips on deferred=true, permissions unchanged
+      call, the release step skips on deferred=true, permissions unchanged;
+      an ARMED sticky kill is tested first with the script's own parsing
+      (Codex P1 on PR #893: the kill branch must run at every slot)
   W25 the three new shell blocks EXECUTED with stubs: the handshake step
       exits 0 whatever the script returns and writes its summary line; the
       defer step records deferred=true/false, writes the script's own exit-1
       evidence that the unchanged summary step renders, and prints the
-      release step's own scheduled-deferral warning
+      release step's own scheduled-deferral warning; with the sticky kill
+      armed (every armed word) a busy sync or a probe fault is NOT deferred
+      (no API call, no evidence) and the release step runs
 
 Runs standalone (python tests/test_await_cockpit_receipts.py -> PASS k/k)
 and under pytest. Offline: fakes only, no network, no credentials.
@@ -1329,7 +1333,18 @@ def case_w24_release_defer_step_contract(mp, tmp_path):
             got = evaluate_step_if(defer["if"], scope=_defer_scope(event_name=event, variable=word))
             assert got is want, (event, word)
     assert "github.event_name == 'schedule'" in defer["if"] and "vars.TFB_RELEASE_DEFER_DURING_SYNC" in defer["if"]
-    assert 'if [[ "$EVENT_NAME" == "schedule" ]]; then' in defer["run"]
+    assert 'elif [[ "$EVENT_NAME" == "schedule" ]]; then' in defer["run"]
+    # Codex P1 (PR #893): an ARMED sticky kill is tested FIRST, with the
+    # script's own armed-word parsing, before any API call; never deferred
+    kill_check = ('if python -c \'import os, sys; sys.exit(0 if (os.environ.get("TFB_DECISION_RELEASE_KILL") '
+                  'or "0").strip().lower() in {"1", "true", "yes", "on"} else 1)\'; then\n'
+                  '  reason="sticky_kill_armed"\n')
+    assert kill_check in defer["run"]
+    assert defer["run"].index(kill_check) < defer["run"].index("gh api ")
+    assert inspect.getsource(R.release_killed).count('(os.getenv(KILL_ENV) or "0").strip().lower() in _ARMED') == 1
+    assert R.KILL_ENV == "TFB_DECISION_RELEASE_KILL" and job["env"]["TFB_DECISION_RELEASE_KILL"] == \
+        "${{ vars.TFB_DECISION_RELEASE_KILL || '0' }}"
+    assert "TFB_DECISION_RELEASE_KILL" not in defer["env"]          # the job env maps it, as for the script
     # ONE read-only API call, the production workflow on main, both production events, not completed
     assert defer["run"].count("gh api ") == 1 and "curl" not in defer["run"]
     assert ("gh api \"repos/${GITHUB_REPOSITORY}/actions/workflows/daily_sync.yml/runs?branch=main&per_page=50\""
@@ -1433,22 +1448,42 @@ def case_w25_executed_shell_blocks(mp, tmp_path):
     release_steps = {step["name"]: step for step in _steps(RELEASE_YML, "release-decision-feed")}
     defer_run = release_steps[DEFER_STEP]["run"]
     summary_body = release_steps["Publish release summary"]["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    for mode, event, deferred, reason in (("busy", "schedule", "true", "production_run_in_flight"),
-                                          ("idle", "schedule", "false", ""),
-                                          ("fault", "schedule", "true", "probe_unavailable"),
-                                          ("busy", "workflow_dispatch", "false", "")):
-        work = tmp_path / ("defer-" + mode + event)
+    # (mode, event, kill word) -> (deferred, reason); the kill words are the
+    # script's release_killed() vocabulary (strip, lower), tested FIRST
+    matrix = [(("busy", "schedule", kill), ("false", "sticky_kill_armed"))
+              for kill in ("1", "true", "YES", " on ", "On")]
+    matrix += [(("fault", "schedule", "1"), ("false", "sticky_kill_armed")),
+               (("busy", "schedule", "0"), ("true", "production_run_in_flight")),
+               (("busy", "schedule", ""), ("true", "production_run_in_flight")),
+               (("busy", "schedule", "off"), ("true", "production_run_in_flight")),
+               (("busy", "schedule", "observe"), ("true", "production_run_in_flight")),
+               (("busy", "schedule", None), ("true", "production_run_in_flight")),
+               (("idle", "schedule", "0"), ("false", "")),
+               (("fault", "schedule", "0"), ("true", "probe_unavailable")),
+               (("busy", "workflow_dispatch", "0"), ("false", ""))]
+    for (mode, event, kill), (deferred, reason) in matrix:
+        tag = mode + event + (kill if kill is not None else "unset").strip()
+        work = tmp_path / ("defer-" + tag)
         work.mkdir()
-        calls = tmp_path / ("gh-calls-" + mode + event)
-        output = tmp_path / ("output-" + mode + event)
+        calls = tmp_path / ("gh-calls-" + tag)
+        output = tmp_path / ("output-" + tag)
         env = {"PATH": str(bin_dir) + os.pathsep + os.defpath, "GITHUB_REPOSITORY": "owner/repo",
                "GITHUB_RUN_ID": "777001", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_OUTPUT": str(output),
                "EVENT_NAME": event, "GH_TOKEN": "ghs_synthetic", "STUB_GH_MODE": mode,
                "STUB_GH_CALLS": str(calls)}
+        if kill is not None:
+            env["TFB_DECISION_RELEASE_KILL"] = kill
         result = _run_block(defer_run, work, env)
-        assert result.returncode == 0, (mode, event, result.stderr)
-        assert output.read_text() == "deferred=%s\ndefer_reason=%s\n" % (deferred, reason), (mode, event)
+        assert result.returncode == 0, (mode, event, kill, result.stderr)
+        assert output.read_text() == "deferred=%s\ndefer_reason=%s\n" % (deferred, reason), (mode, event, kill)
         evidence = work / "release_decision_feed.json"
+        if reason == "sticky_kill_armed":
+            # the kill is never deferred: no API call, no evidence, the release step runs and kills
+            assert not calls.exists() and not evidence.exists() and "::warning::" not in result.stdout
+            assert "Sticky kill armed: not deferring" in result.stdout
+            assert evaluate_step_if(release_steps[RELEASE_STEP]["if"],
+                                    scope=_defer_scope(event_name="schedule", variable="1", deferred=deferred))
+            continue
         if event != "schedule":
             assert not calls.exists() and not evidence.exists()          # defence in depth: no API call
             continue
