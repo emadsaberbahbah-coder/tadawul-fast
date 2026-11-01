@@ -2,9 +2,72 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.3.2 (VENUE BATCHES + EODHD EXCHANGE CODES)
+Calendar Provider -- v1.4.0 (SAUDI PAST REPORTS FROM YAHOO)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.4.0 (2026-11-01) -- the last-report lane can see Saudi reports. WHY:
+fetch_last_earnings_map (v1.3.0) skips every KSA symbol (EODHD has no Saudi
+coverage) and returns {} at once for a KSA-only list, and no Yahoo path
+reads PAST reports (the v1.2.0 tier keeps future dates only). So a .SR
+seat or ADD candidate never gets a Last Earnings Date on Calendar_Events,
+and the post-earnings quarantine that reads it (16_Decision_Top10 v1.18.0
+tag, 10_My_Portfolio PD_POST_EARN / D1b) cannot hold it. The commit sheets
+say so: calendar_last_report v1.2.0 line 28 ('EODHD only: no Saudi
+coverage for past reports'), pf_add_guards_d1 v1.17.0 line 40 ('a KSA
+holding passes (b)'), and the DT10 v1.18.0 WHY ('only a past Next Earnings
+Date can tag one'). An offline replay of the real sync and the real
+dt10PostEarnMapFromValues_ tags 2222.SR for ONE render (the morning after,
+through the past Next Earnings Date) instead of the 5 or 10 sessions the
+quarantine needs; after the next sync the past date is gone. 2222.SR is a
+rated KSA name (views 1.4.0 sheet, v_symbol_rating) and Aramco reports Q3
+in the first week of November (4 Nov 2025, 5 Nov 2024). The live book of
+1 Nov (the 5023.SR sukuk, no earnings, and FRST.US, EODHD-covered) loses
+no guard input today; KSA Top_10 seats do, and D1b (ADDs to a holding)
+would for any KSA holding with earnings.
+WHAT (only when TFB_CAL_LAST_REPORT_YAHOO is on/1/true/yes, any case;
+default off = the v1.3.2 requests, results and log lines byte for byte):
+after the EODHD batches, each KSA symbol is asked once through yfinance
+Ticker(...).get_earnings_dates(limit=12) (the endpoint the v1.2.0 tier
+already relies on; it lists past rows with Reported EPS and Surprise(%)),
+in a thread, bounded by TFB_CALENDAR_CONCURRENCY and
+TFB_CALENDAR_TIMEOUT_SEC like the forward tier. Per symbol one row inside
+[today - TFB_CALENDAR_DAYS_BACK, today - 1] lands, dated on the forward
+tier's basis (the index entry's own calendar date: New York on yfinance
+0.2.66), so one Yahoo row passes from Next Earnings Date (date >= today) to
+Last Earnings Date (date <= today - 1) with no day in neither; a Saudi
+report stamped the New York evening before counts that Riyadh morning's
+session as session 1. A row whose Event Type is present and is not
+'Earnings' or 'Call' (raw codes 2 / 1; a stockholders' meeting is 11), or
+whose Event Name reads as a meeting ('meeting', 'assembly', AGM, EGM), is
+never a report; yfinance 0.2.66 returns no Event Type (its scrape path
+keeps the page's own columns), so the name is what it carries. Of the rows
+left, the LATEST with a numeric Reported EPS or Surprise(%) wins over a
+later row with neither dated at most 21 days after it (a call or a meeting
+the page does not name: an unknown surprise would shorten the DT10 tag to
+5 sessions after a miss); a figureless row further on is a newer report not
+filled in yet and wins (TFB_CALENDAR_DAYS_BACK can reach 120); with no
+figured row, the latest row. A frame with a NaT date is refused (counted
+in errors=N): yfinance 0.2.66 drops a dateless row and then re-assigns the
+parsed dates by position, so every later row carries the next row's date
+and the last row NaT - no date in that frame can be trusted. eps_surprise_pct is
+Surprise(%) when numeric, else (actual - estimate) / |estimate| x 100,
+rounded to 0.1 like v1.3.0; the row carries source 'yahoo_earnings_dates'
+and report_timing None. Fill-only: an EODHD row is never overwritten, and
+non-KSA symbols are untouched. A rate-limited symbol is counted
+(throttled=N), any other per-symbol error or a timeout drops only that
+symbol (errors=N), and yfinance absent means one line and no fill. One
+summary line per call: 'last-report yahoo fill: n of m KSA (throttled=t,
+errors=e): ...', through the logger when a handler takes INFO, else
+written to stderr: run_calendar_sync configures no logging, so an INFO
+record alone would never reach the calendar_sync job log. A KSA-only list
+no longer returns {} at once when the gate is on. run_calendar_sync needs
+no change (merge_last_report reads last_earnings_date and
+eps_surprise_pct; it ignores the extra key). Codes EODHD rejects ('.T',
+'.SI', 'IG.MI') are not touched here.
+Additions (0 removed): _last_report_yahoo_enabled, _yf_report_date,
+_yf_row_value, _yf_earnings_dates_past, _yahoo_last_report_fill.
+Rollback: unset TFB_CAL_LAST_REPORT_YAHOO (or set off).
 
 v1.3.2 (2026-10-27) — US codes can no longer be starved by foreign codes
 EODHD rejects. WHY: the first run with the v1.3.1 split armed (calendar_sync
@@ -209,6 +272,8 @@ ENV
     TFB_CALENDAR_CONCURRENCY          parallel dividend calls   (default 4)
     TFB_CAL_YAHOO_FALLBACK            "0" disables the v1.1.0 Yahoo
                                       earnings/ex-div fallback (default ON)
+    TFB_CAL_LAST_REPORT_YAHOO         v1.4.0 "on" fills the last report of
+                                      KSA symbols from Yahoo (default off)
 
 VALIDATE FROM RENDER SHELL (after setting TFB_CALENDAR_ENABLED=1):
     python3 -m core.providers.calendar_provider AAPL MSFT.US 2222.SR
@@ -234,7 +299,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -625,12 +690,15 @@ async def fetch_last_earnings_map(symbols: List[str],
     "eps_estimate": float|None, "report_timing": str|None}} for the LATEST
     report in [today - days_back, today - 1]. Empty when disabled, on any
     error, or for symbols with no report in the window. KSA symbols skipped
-    (no EODHD coverage)."""
+    (no EODHD coverage).
+    v1.4.0: with TFB_CAL_LAST_REPORT_YAHOO on, KSA symbols are filled from
+    Yahoo after the EODHD batches (fill-only; rows carry a 'source' key)."""
     if not is_enabled():
         return {}
     try:
         code_map, _ksa = _split_symbols(symbols)
-        if not code_map:
+        _ksa_fill = bool(_ksa) and _last_report_yahoo_enabled()   # v1.4.0 (off: False)
+        if not code_map and not _ksa_fill:
             return {}
         today = _today()
         back = days_back or _env_int("TFB_CALENDAR_DAYS_BACK", 21, lo=1, hi=120)
@@ -687,6 +755,8 @@ async def fetch_last_earnings_map(symbols: List[str],
                     }
         if split_on:
             _log_split_state("last-earnings", state)
+        if _ksa_fill:                                    # v1.4.0: Saudi past reports
+            await _yahoo_last_report_fill(_ksa, start, end, out)
         return out
     except Exception as e:  # blanket: a calendar hiccup must never propagate
         logger.error("[calendar_provider v%s] fetch_last_earnings_map failed: %s",
@@ -948,6 +1018,177 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
         logger.error("[calendar_provider v%s] yahoo fallback pass failed: %s",
                      __version__, safe_error_text(e))
         return 0, 0
+
+
+# ----------------------------------------------------------------------------- #
+# v1.4.0 - the last report of KSA symbols from Yahoo (EODHD has no Saudi data)
+# ----------------------------------------------------------------------------- #
+def _last_report_yahoo_enabled() -> bool:
+    """v1.4.0: TFB_CAL_LAST_REPORT_YAHOO = on|1|true|yes (any case). Default off."""
+    return _env_str("TFB_CAL_LAST_REPORT_YAHOO").lower() in ("on", "1", "true", "yes")
+
+
+def _yf_report_date(x: Any) -> Optional[_dt.date]:
+    """v1.4.0 PURE: the calendar date of one get_earnings_dates index entry on
+    the basis the v1.2.0 forward tier (_yf_earnings_dates_future) dates the
+    Next Earnings Date: the entry's own .date() (a tz-aware timestamp in its
+    own zone - New York on yfinance 0.2.66), else the text's first 10
+    characters. NaT or anything unparsable -> None."""
+    try:
+        d = x.date() if hasattr(x, "date") else _parse_date(str(x)[:10])
+    except Exception:
+        d = _parse_date(str(x)[:10])
+    if not isinstance(d, _dt.date) or d != d:    # NaT is a date that != itself
+        return None
+    return d
+
+
+def _yf_row_value(row: Any, key: str) -> Any:
+    """v1.4.0 PURE: row[key] for a pandas Series or a dict-like; None when absent."""
+    try:
+        getter = getattr(row, "get", None)
+        return getter(key) if callable(getter) else None
+    except Exception:
+        return None
+
+
+def _yf_earnings_dates_past(ysym: str, start: _dt.date,
+                            end: _dt.date) -> Optional[Dict[str, Any]]:
+    """v1.4.0 SYNC worker (runs in a thread): the last report among the rows
+    of yfinance get_earnings_dates(limit=12) dated (_yf_report_date) in
+    [start, end], as a fetch_last_earnings_map row, or None. A row whose
+    Event Type is present and not 'Earnings' / 'Call' (or the raw codes
+    2 / 1), or whose Event Name reads as a meeting, is skipped: a
+    stockholders' meeting (11) is not a report. Of the rows left, the LATEST
+    with a numeric Reported EPS or Surprise(%) wins over a later row without
+    figures at most 21 days on; otherwise the latest row.
+    Raises on rate-limit (and any fetch error) so the caller can classify,
+    and ValueError on a frame holding a NaT date (yfinance 0.2.66 shifted
+    its dates onto the wrong rows); returns None on genuinely absent data."""
+    df = _yf.Ticker(ysym).get_earnings_dates(limit=12)  # type: ignore[union-attr]
+    idx = getattr(df, "index", None)
+    if idx is None:
+        return None
+    entries = list(idx)
+    for x in entries:
+        try:
+            nat = x is not None and bool(x != x)    # NaT / NaN are the only values != themselves
+        except Exception:
+            nat = False
+        if nat:
+            raise ValueError("earnings dates frame holds a NaT date "
+                             "(yfinance re-assigned its dates by position)")
+    rows = getattr(df, "iloc", None)
+    best: Optional[_dt.date] = None
+    best_row: Any = None
+    best_eps: Optional[_dt.date] = None             # the latest row with EPS figures
+    best_eps_row: Any = None
+    for pos, x in enumerate(entries):
+        d = _yf_report_date(x)
+        if d is None or d < start or d > end:
+            continue
+        try:
+            row = rows[pos] if rows is not None else None
+        except Exception:
+            row = None
+        kind = _yf_row_value(row, "Event Type")
+        if kind is not None and kind == kind:        # absent or NaN: unknown, kept
+            k = str(kind).strip()
+            k = k[:-2] if k.endswith(".0") else k
+            if k not in ("Earnings", "Call", "2", "1"):   # yfinance labels or raw codes
+                continue
+        name = _yf_row_value(row, "Event Name")     # yfinance 0.2.66: the page's column
+        if isinstance(name, str):
+            low = name.lower()
+            words = re.split(r"[^a-z]+", low)
+            if "meeting" in low or "assembly" in low or "agm" in words or "egm" in words:
+                continue
+        if best is None or d > best:
+            best, best_row = d, row
+        if (_num(_yf_row_value(row, "Reported EPS")) is not None
+                or _num(_yf_row_value(row, "Surprise(%)")) is not None):
+            if best_eps is None or d > best_eps:
+                best_eps, best_eps_row = d, row
+    if best_eps is not None and best is not None and \
+            (best - best_eps).days <= 21:            # a report with figures beats a later
+        best, best_row = best_eps, best_eps_row      # call or unnamed meeting row of its
+    # release (<= 21 days on); a figureless row further on is a newer report not filled in yet
+    if best is None:
+        return None
+    actual = _num(_yf_row_value(best_row, "Reported EPS"))
+    estimate = _num(_yf_row_value(best_row, "EPS Estimate"))
+    surprise = _num(_yf_row_value(best_row, "Surprise(%)"))
+    if surprise is None and actual is not None and estimate:
+        surprise = (actual - estimate) / abs(estimate) * 100.0
+    return {
+        "last_earnings_date": _iso(best),
+        "eps_surprise_pct": (round(surprise, 1) if surprise is not None else None),
+        "eps_actual": actual,
+        "eps_estimate": estimate,
+        "report_timing": None,
+        "source": "yahoo_earnings_dates",
+    }
+
+
+async def _yahoo_last_report_fill(ksa: List[str], start: _dt.date, end: _dt.date,
+                                  out: Dict[str, Dict[str, Any]]) -> int:
+    """v1.4.0: fill-only pass of the KSA symbols' last report into `out`
+    (an EODHD row is never overwritten). One summary line per call, through
+    the logger when a handler takes INFO, else to stderr (run_calendar_sync
+    configures no logging). Returns the number filled. Never raises."""
+    def _say(msg: str, *args: Any) -> None:
+        if logger.isEnabledFor(logging.INFO) and logger.hasHandlers():
+            logger.info(msg, *args)
+        else:
+            sys.stderr.write((msg % args) + "\n")
+
+    try:
+        syms = sorted(set(ksa))
+        if _yf is None:
+            _say("[calendar_provider v%s] last-report yahoo fill unavailable "
+                 "(yfinance not importable) - %d KSA symbol(s) stay blank",
+                 __version__, len(syms))
+            return 0
+        sem = asyncio.Semaphore(_env_int("TFB_CALENDAR_CONCURRENCY", 4, lo=1, hi=16))
+        tmo = float(_env_int("TFB_CALENDAR_TIMEOUT_SEC", 12, lo=2, hi=120))
+        found: Dict[str, Dict[str, Any]] = {}
+        throttled = [0]
+        errors = [0]
+
+        async def _one(sym: str) -> None:
+            async with sem:
+                ysym = _yahoo_symbol_for_cal(sym)
+                if "." not in ysym:              # a bare 4-digit Tadawul code
+                    ysym += ".SR"
+                try:
+                    row = await asyncio.wait_for(
+                        asyncio.to_thread(_yf_earnings_dates_past, ysym, start, end),
+                        timeout=tmo)
+                except Exception as e:
+                    if "ratelimit" in type(e).__name__.lower():
+                        throttled[0] += 1
+                    else:
+                        errors[0] += 1
+                    logger.debug("[calendar_provider] yahoo last report %s: %s",
+                                 sym, safe_error_text(e))
+                    return
+                if row:
+                    found[sym] = row
+
+        await asyncio.gather(*[_one(s) for s in syms])
+        filled: List[str] = []
+        for s in sorted(found):
+            if s not in out:
+                out[s] = found[s]
+                filled.append(s)
+        _say("[calendar_provider v%s] last-report yahoo fill: %d of %d KSA "
+             "(throttled=%d, errors=%d): %s", __version__, len(filled), len(syms),
+             throttled[0], errors[0], ",".join(filled[:20]) or "-")
+        return len(filled)
+    except Exception as e:
+        logger.error("[calendar_provider v%s] last-report yahoo fill failed: %s",
+                     __version__, safe_error_text(e))
+        return 0
 
 
 # ----------------------------------------------------------------------------- #

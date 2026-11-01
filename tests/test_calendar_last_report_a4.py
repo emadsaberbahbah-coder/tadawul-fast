@@ -142,7 +142,8 @@ def test_l1_provider_window_env_batches_and_failures(provider, monkeypatch):
     assert provider.fetch_last_earnings_sync(["AAA.US"]) == {}
     # 2026-10-27: v1.3.1 (404 batch split, gated) stacked on this change; pin moved
     # 2026-10-27: v1.3.2 (venue batches + EODHD exchange codes, gated); pin moved
-    assert provider.__version__ == "1.3.2"
+    # 2026-11-01: v1.4.0 (Saudi past reports from Yahoo, gated); the pin is a floor now
+    assert tuple(int(x) for x in provider.__version__.split(".")) >= (1, 3, 2), provider.__version__
 
 
 def test_l2_forward_context_untouched(provider, monkeypatch):
