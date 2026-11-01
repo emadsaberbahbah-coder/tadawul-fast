@@ -3,12 +3,15 @@
 -- last full one) with the evidence a decision needs beside each row: the engine's newest market-page view of
 -- the name (mkt_*: price, forecast, risk, signals, data age), its next
 -- earnings and ex-dividend dates, its news of the last 7 days and how its
--- earlier board episodes ended. caution_flags lists, in plain words, what
+-- earlier board episodes ended, and the TFB rating with the analyst
+-- consensus (v_symbol_rating, apply_bq_views 1.3.0). caution_flags lists, in plain words, what
 -- argues for a second look before acting (earnings or ex-dividend within 5
 -- days, market data older than 36 h when archived, a market copy more than
 -- a day old (a missed nightly archive), negative or high-severity news, below
 -- the reliability / data-quality floors, a block reason, a negative 12-month
--- forecast, no market-page row); caution_count counts them. Percent points.
+-- forecast, an analyst consensus below Hold, no market-page row);
+-- caution_count counts them. Percent points. symbol_label keys the
+-- symbol picker shared with the candle, news and analyst views.
 CREATE OR REPLACE VIEW `{{DS}}.v_top10_insight`
 OPTIONS (description = "TFB Looker v2: the latest Top-10 board with market-page evidence, events, 7-day news, past episodes and plain-word caution flags per row")
 AS
@@ -53,6 +56,7 @@ past AS (
 j AS (
   SELECT
     b.*,
+    COALESCE(u.symbol_label, b.symbol) AS symbol_label,
     u.symbol IS NOT NULL AS on_market_page,
     u.source_page AS mkt_page,
     u.region AS mkt_region,
@@ -104,6 +108,14 @@ j AS (
     p.past_win_plus5_pct,
     p.past_avg_ret_to_exit_pct,
     p.past_last_exit_date,
+    rt.tfb_rating_score,
+    rt.tfb_rating_label,
+    rt.tfb_rating_stars,
+    rt.rating_confidence,
+    rt.rating_parts,
+    rt.analyst_consensus_label,
+    rt.analyst_consensus_score,
+    rt.analysts,
     ARRAY(
       SELECT f FROM UNNEST([
         IF(c.days_to_earnings_now BETWEEN 0 AND 5, 'earnings within 5 days', NULL),
@@ -115,6 +127,7 @@ j AS (
         IF(u.symbol IS NOT NULL AND NOT u.meets_floors, 'below reliability / data-quality floors', NULL),
         IF(u.block_reason IS NOT NULL, CONCAT('blocked: ', u.block_reason), NULL),
         IF(u.expected_roi_12m_pct < 0, 'negative 12-month forecast', NULL),
+        IF(rt.analyst_consensus_score < 2.5, 'analyst consensus below Hold', NULL),
         IF(u.symbol IS NULL, 'no market-page row', NULL)
       ]) AS f
       WHERE f IS NOT NULL
@@ -124,6 +137,7 @@ j AS (
   LEFT JOIN cal AS c ON c.symbol = b.symbol
   LEFT JOIN news AS n ON n.symbol = b.symbol
   LEFT JOIN past AS p ON p.symbol = b.symbol
+  LEFT JOIN `{{DS}}.v_symbol_rating` AS rt ON rt.symbol = b.symbol
 )
 SELECT
   j.* EXCEPT (flags),

@@ -1,0 +1,130 @@
+# =============================================================================
+# 🔬 BigQuery Symbol Deep Data — candles, analyst consensus, per-symbol news
+# =============================================================================
+# VERSION 1.0.0 (2026-10-31) -- program register C8, Phase 3 (the My
+#       Portfolio, Top-10 and symbol deep-dive pages of the Looker Studio
+#       report, owner request 31 Oct).
+# scripts/archive_symbol_deep.py v1.0.0 loads into BigQuery (dataset
+#       tfb_archive, project-2e3530e6-2311-4aa3-b36, US):
+#       symbol_bars_daily    two years of daily OHLC from the Yahoo chart API
+#                            (no EODHD quota) for the deep set: holdings, Top-10
+#                            names of the last 30 days, the 50 best investable
+#                            expected-ROI names, Market_Leaders (cap 600);
+#                            replaced only when >= 80 % of the set answered.
+#       symbol_analyst_daily EODHD AnalystRatings (consensus, target, the five
+#                            analyst counts) for the core set (cap 120).
+#       symbol_news          EODHD headlines of the last 30 days with sentiment
+#                            for the core set.
+#       The EODHD loads read /api/user first and are SKIPPED when today's
+#       usage plus this run's cost (about 15 calls a symbol) would pass 60 % of
+#       the daily limit shared with the live sync, or when it cannot be read.
+#       NOTHING is written to the workbook; the live system never reads
+#       BigQuery; no decision, gate or count depends on these tables.
+# AUTH: the archive's service account (GOOGLE_SHEETS_CREDENTIALS, BigQuery
+#       Data Editor + Job User) and the existing EODHD_API_KEY secret.
+# GATE: armed here (TFB_BQ_DEEP defaults to on); kill with the repository
+#       Variable TFB_BQ_DEEP=off; TFB_DEEP_EODHD=off keeps the candles only.
+# SCHEDULE: 00:20 UTC daily (after the 23:05 UTC workbook archive that sets
+#       the symbol sets, and after EODHD's daily counter resets). A manual
+#       dispatch is a dry run unless write=true.
+# =============================================================================
+name: 🔬 BigQuery Symbol Deep Data
+
+on:
+  schedule:
+    # 00:20 UTC == 03:20 Asia/Riyadh, daily.
+    - cron: "20 0 * * *"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Load into BigQuery? (default: dry-run — reads the sources and prints what it would load)"
+        required: false
+        default: false
+        type: boolean
+      extra:
+        description: "Extra TFB symbols for the core set, comma-separated (e.g. 2222.SR,AAPL.US)"
+        required: false
+        default: ""
+        type: string
+      only:
+        description: "Which loads to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - bars
+          - analyst
+          - news
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  deep:
+    name: 🔬 Load the symbol deep data into BigQuery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 🔬 Run the loader
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          TFB_BQ_DEEP: ${{ vars.TFB_BQ_DEEP || 'on' }}
+          TFB_DEEP_EODHD: ${{ vars.TFB_DEEP_EODHD || 'on' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: "US"
+          INPUT_EXTRA: ${{ github.event.inputs.extra }}
+          INPUT_ONLY: ${{ github.event.inputs.only }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — reading the sources, loading nothing (tick write=true to load)."
+          fi
+          ONLY=()
+          case "${INPUT_ONLY:-all}" in
+            all) ;;
+            bars|analyst|news) ONLY=(--only "${INPUT_ONLY}") ;;
+            *) echo "::error::only must be all, bars, analyst or news"; exit 2 ;;
+          esac
+          python scripts/archive_symbol_deep.py $MODE --extra "${INPUT_EXTRA:-}" "${ONLY[@]}" 2>&1 | tee symbol_deep.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### 🔬 BigQuery Symbol Deep Data (${MODE#--})"
+            echo ""
+            echo '```'
+            tail -n 60 symbol_deep.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
