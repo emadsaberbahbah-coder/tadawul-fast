@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.50.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.52.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1759,6 +1759,64 @@ from urllib.error import HTTPError, URLError
 #   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
 # ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
 # -----------------------------------------------------------------------------
+# v6.52.0 (2026-10-27) [OUTCOME-TALLY]: say why due records did not mature.
+# Numbered 6.52.0 because open PRs #841 / #845 claim 6.50.0 / 6.51.0 (whichever
+# merges later renumbers).
+# MERGE NOTE (2026-11-01): #841 merged first as v6.50.0 [LOG-READ]; this
+#   change was merged onto it and keeps 6.52.0 (open #845 still claims
+#   6.51.0). Read 'v6.49.0' below as 'v6.50.0' (which is v6.49.0
+#   behaviour while TRACK_LOG_UNFORMATTED_READ is off). The v6.50.0 block
+#   follows verbatim.
+# EVIDENCE: audit_active_records counts every reason a due record stays
+#   unmatured (_skipped_outcome_reasons -> _last_audit_stats
+#   ['outcome_skipped_reasons']) but no surface ever prints it: the
+#   [PERF-VERDICT] line and the job log carry only 'matured N | pending M'.
+#   So the 26 Oct review could not tell WHY the two Sunday 25 Oct audits
+#   (jobs 121204298588 / 121254652958) matured 0 records although many .SR
+#   records targeted that session: an independent refuter rated the
+#   closing-auction hypothesis (backend .SR quote stamps 12:00-12:20Z, after
+#   XSAU's 12:00Z close, refused as quote_session_unknown because a
+#   source_quote gets zero close slack in _outcome_quote_session) PLAUSIBLE,
+#   not CONFIRMED, for want of exactly this tally. Pending was 4404 on the
+#   26 Oct 20:45Z audit (job 121837451879) with no reason breakdown.
+# WHAT (TRACK_OUTCOME_TALLY = off | observe; only the exact word 'observe',
+#   any case, arms it; anything else, '1' included, is off):
+#   off (DEFAULT): no collector exists (_OUTCOME_TALLY stays None), so every
+#     record, receipt, audit stat and log line is v6.49.0's apart from the
+#     SCRIPT_VERSION string itself (receipt tracker_version, version tags).
+#   observe: measures only. _outcome_tally_begin() arms two per-pass
+#     collectors at the top of audit_active_records; _outcome_receipt (the
+#     one place a due record's verdict is written) remembers each record's
+#     LAST (symbol, state, reason) before writing the unchanged receipt;
+#     _outcome_quote_session, when it refuses a source_quote/regular_market
+#     quote as quote_session_unknown, remembers the minutes between that
+#     quote and the last session close before it - the FIRST such quote per
+#     symbol, i.e. the backend's, which is absorbed before any Yahoo
+#     fallback. After the HIST-CLOSE block it logs INFO lines:
+#     '[v6.52.0 OUTCOME-TALLY] mode=observe evaluated=N matured=M expired=E
+#     pending=P calendars=K', then one '[v6.52.0 OUTCOME-TALLY] <CAL> n=
+#     matured= expired= pending= reasons=<reason:n,...>
+#     after_close_min=<0-15:a,15-20:b,20-60:c,60+:d>' line per exchange
+#     calendar (largest first, ties by name; reasons by count, then name),
+#     and disarms the collectors. Records, receipts, _last_audit_stats, saves
+#     and every other line are identical to off.
+# ENV LANE: both tracker steps map the Variable (ENV PARITY):
+#   track_performance.yml 'Run performance clock' (scheduled audits) and
+#   daily_sync.yml 'Track Performance (record + audit)' (audits on a manual
+#   dispatch with run_tracker=true; inert on record-only schedules, because
+#   a record-only run never calls audit_active_records).
+# KNOWN LIMITS: after_close_min counts distinct symbols, not records; the
+#   calendar is the symbol's exchange calendar by the same suffix rules as
+#   _outcome_sessions (UNKNOWN when the tracker has none); a quote refused
+#   for another reason carries no stamp. With the Yahoo fallback on (the
+#   production default) a backend refusal reads e.g.
+#   'quote_session_unknown;quote_http_429'. A pass that raises leaves the
+#   collectors armed but unread until the next audit call resets them.
+# ZERO functions removed. Additions: _outcome_tally_mode,
+#   _outcome_tally_begin, _outcome_tally_end, _outcome_tally_stamp,
+#   _outcome_tally_calendar, _outcome_tally_lines, _OUTCOME_TALLY_TAG,
+#   _OUTCOME_TALLY, _OUTCOME_TALLY_STAMPS.
+# ROLLBACK: unset TRACK_OUTCOME_TALLY (or set off).
 # v6.50.0 (2026-10-25) [LOG-READ]: Performance_Log numbers are read back at
 # full precision. ENV-gated, DEFAULT OFF (TRACK_LOG_UNFORMATTED_READ).
 # EVIDENCE: PerformanceStore.load_records read the log with ws.get(rng), so
@@ -1813,7 +1871,7 @@ from urllib.error import HTTPError, URLError
 # ZERO functions removed. Additions: _log_read_mode, _log_read_observe,
 #   _LOG_READ_TAG, _LAST_LOG_READ.
 # ROLLBACK: unset TRACK_LOG_UNFORMATTED_READ (or set off).
-SCRIPT_VERSION = "6.50.0"
+SCRIPT_VERSION = "6.52.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3324,6 +3382,8 @@ def _outcome_quote_session(evidence: OutcomePrice, now: datetime) -> Tuple[Optio
         close_slack = skew if evidence.quote_kind == "regular_market" else timedelta(0)
         matching = [s for s in sessions if s[1] <= evidence.quote_asof <= s[2] + close_slack]
         if len(matching) != 1:
+            if _OUTCOME_TALLY_STAMPS is not None and evidence.quote_asof >= sessions[0][1]:
+                _outcome_tally_stamp(evidence, sessions)   # v6.52.0 [OUTCOME-TALLY]
             return None, "quote_timestamp_stale" if evidence.quote_asof < sessions[0][1] else "quote_session_unknown"
         session = matching[0]
         if evidence.quote_asof > now + skew:
@@ -3457,6 +3517,8 @@ def _outcome_target_session(record: Any, evidence: OutcomePrice, now: datetime) 
 def _outcome_receipt(record: Any, now: datetime, state: str, reason: str,
                      evidence: Optional[OutcomePrice] = None, context: Optional[Dict[str, Any]] = None) -> None:
     """Replace only this version's last receipt in Notes; preserve other history."""
+    if _OUTCOME_TALLY is not None:   # v6.52.0 [OUTCOME-TALLY]; off -> None, inert
+        _OUTCOME_TALLY[id(record)] = (_safe_str(getattr(record, "symbol", "")).upper(), state, reason)
     receipt = {"schema": "tfb.outcome-price.v1", "tracker_version": SCRIPT_VERSION,
                "state": state, "reason": reason, "evaluated_at": now.isoformat(),
                "target_at": (_outcome_timestamp(record.target_date).isoformat()
@@ -3469,6 +3531,102 @@ def _outcome_receipt(record: Any, now: datetime, state: str, reason: str,
     parts = [p for p in str(record.notes or "").split(" | ") if not p.startswith(_OUTCOME_RECEIPT)]
     parts.append(_OUTCOME_RECEIPT + json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     record.notes = " | ".join(p for p in parts if p)
+
+
+# --- v6.52.0 [OUTCOME-TALLY]: why due records did or did not mature ---------
+_OUTCOME_TALLY_TAG = "[v6.52.0 OUTCOME-TALLY]"
+# Per-pass collectors; None (the default) means off and makes every hook inert.
+_OUTCOME_TALLY: Optional[Dict[int, Tuple[str, str, str]]] = None
+_OUTCOME_TALLY_STAMPS: Optional[Dict[str, float]] = None
+
+
+def _outcome_tally_mode() -> str:
+    v = (os.getenv("TRACK_OUTCOME_TALLY") or "off").strip().lower()
+    return "observe" if v == "observe" else "off"
+
+
+def _outcome_tally_begin() -> None:
+    """Arm fresh collectors for one audit pass (observe) or disarm them (off)."""
+    global _OUTCOME_TALLY, _OUTCOME_TALLY_STAMPS
+    if _outcome_tally_mode() == "observe":
+        _OUTCOME_TALLY, _OUTCOME_TALLY_STAMPS = {}, {}
+    else:
+        _OUTCOME_TALLY = _OUTCOME_TALLY_STAMPS = None
+
+
+def _outcome_tally_end() -> None:
+    """Disarm the collectors once the pass's line is out."""
+    global _OUTCOME_TALLY, _OUTCOME_TALLY_STAMPS
+    _OUTCOME_TALLY = _OUTCOME_TALLY_STAMPS = None
+
+
+def _outcome_tally_stamp(evidence: Any, sessions: Any) -> None:
+    """Minutes from the last session close before a refused quote to that quote.
+    The first refusal per symbol wins: the backend's, absorbed before any fallback."""
+    try:
+        if _OUTCOME_TALLY_STAMPS is None or evidence.quote_kind not in ("source_quote", "regular_market"):
+            return
+        closes = [s[2] for s in sessions if s[2] <= evidence.quote_asof]
+        if closes:
+            _OUTCOME_TALLY_STAMPS.setdefault(evidence.symbol,
+                                             (evidence.quote_asof - closes[-1]).total_seconds() / 60.0)
+    except Exception:
+        pass
+
+
+def _outcome_tally_calendar(symbol: str) -> str:
+    """The exchange calendar _outcome_sessions would use, without building it."""
+    try:
+        raw = _safe_str(symbol).upper()
+        if not raw or raw.startswith("^") or "=" in raw or raw.endswith("-USD"):
+            return "UNKNOWN"
+        from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+        suffix = raw.rsplit(".", 1)[1] if "." in raw else "US"
+        if "." in raw and US_SHARE_CLASS_DOT_RE.fullmatch(raw) and split_symbol_exchange(raw)[1] is None:
+            suffix = "US"
+        name = _OUTCOME_CALENDARS.get(suffix)
+        if name is None or ("." not in raw and not raw[0].isalpha()):
+            return "UNKNOWN"
+        return name
+    except Exception:
+        return "UNKNOWN"
+
+
+def _outcome_tally_lines(now: datetime) -> List[str]:
+    """Observe lines for one audit pass: a totals line, then one per calendar.
+    Empty when off or nothing was evaluated."""
+    if _OUTCOME_TALLY is None or not _OUTCOME_TALLY:
+        return []
+    stamps = _OUTCOME_TALLY_STAMPS or {}
+    cal_of: Dict[str, str] = {}
+    per: Dict[str, Dict[str, Any]] = {}
+    totals = {"MATURED": 0, "EXPIRED": 0, "PENDING": 0}
+    for sym, state, reason in _OUTCOME_TALLY.values():
+        if sym not in cal_of:
+            cal_of[sym] = _outcome_tally_calendar(sym)
+        state = state if state in totals else "PENDING"
+        c = per.setdefault(cal_of[sym], {"n": 0, "MATURED": 0, "EXPIRED": 0, "PENDING": 0,
+                                         "reasons": defaultdict(int), "late": set()})
+        c["n"] += 1
+        c[state] += 1
+        totals[state] += 1
+        if state != "MATURED":
+            c["reasons"][("expired:" if state == "EXPIRED" else "") + (reason or "-")] += 1
+        if "quote_session_unknown" in (reason or "").split(";") and sym in stamps:
+            c["late"].add(sym)
+    lines = ["%s mode=observe evaluated=%d matured=%d expired=%d pending=%d calendars=%d" % (
+        _OUTCOME_TALLY_TAG, len(_OUTCOME_TALLY), totals["MATURED"], totals["EXPIRED"],
+        totals["PENDING"], len(per))]
+    for name, c in sorted(per.items(), key=lambda kv: (-kv[1]["n"], kv[0])):
+        buckets = {"0-15": 0, "15-20": 0, "20-60": 0, "60+": 0}
+        for sym in c["late"]:
+            m = stamps[sym]
+            buckets["0-15" if m <= 15 else "15-20" if m <= 20 else "20-60" if m <= 60 else "60+"] += 1
+        lines.append("%s %s n=%d matured=%d expired=%d pending=%d reasons=%s after_close_min=%s" % (
+            _OUTCOME_TALLY_TAG, name, c["n"], c["MATURED"], c["EXPIRED"], c["PENDING"],
+            ",".join("%s:%d" % kv for kv in sorted(c["reasons"].items(), key=lambda kv: (-kv[1], kv[0]))) or "-",
+            ",".join("%s:%d" % kv for kv in buckets.items() if kv[1]) or "-"))
+    return lines
 
 
 def _yahoo_parse_chart_outcome(payload: Any, symbol: str, now: datetime) -> Tuple[Optional[OutcomePrice], str]:
@@ -10189,9 +10347,11 @@ class PerformanceTrackerApp:
             r for r in records if r.status == PerformanceStatus.ACTIVE and r.symbol
         ]
         if not active:
+            _outcome_tally_end()   # v6.52.0 [OUTCOME-TALLY]; collectors never left armed here
             return records
 
         syms = list(dict.fromkeys([r.symbol for r in active]))
+        _outcome_tally_begin()   # v6.52.0 [OUTCOME-TALLY]; off -> collectors stay None
         if not self.backend.base_url:
             # v6.18.0 (PRICE-FEED-LOUD): this exact silent {} froze all 2,264
             # records at entry price on 2026-07-12 — and would have expired the
@@ -10496,6 +10656,12 @@ class PerformanceTrackerApp:
                 "open" if _hist_stats["breaker"] else "closed", _hist_stats["deferred"])
             _LAST_HIST_CLOSE.clear()
             _LAST_HIST_CLOSE.update(_hist_stats)
+
+        if _OUTCOME_TALLY is not None:
+            # v6.52.0 [OUTCOME-TALLY]: observe only; nothing above reads it.
+            for _tally in _outcome_tally_lines(now_r):
+                logger.info("%s", _tally)
+            _outcome_tally_end()
 
         # v6.20.0 (VT-1): stash this pass's feed stats for the verdict line.
         try:

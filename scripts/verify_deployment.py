@@ -279,7 +279,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
     # 2026-10-25: 6.50.0 [LOG-READ] Performance_Log read precision
     # (TRACK_LOG_UNFORMATTED_READ, default off; pin only).
-    ("track_performance", "6.50.0", "track performance"),
+    # 2026-10-27: 6.52.0 [OUTCOME-TALLY] (TRACK_OUTCOME_TALLY, default off;
+    # pin only; merged onto #841's 6.50.0 on 2026-11-01; open #845 claims 6.51.0).
+    ("track_performance", "6.52.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.

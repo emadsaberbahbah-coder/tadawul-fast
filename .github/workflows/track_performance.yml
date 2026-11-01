@@ -1,5 +1,17 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.8 (2026-10-27) -- WHY DUE RECORDS DID NOT MATURE (OWNER OPT-IN)
+# WHY (2026-10-27): the audit counts every reason a due record stays
+# unmatured but never prints it, so the 25 Oct Sunday audits' 0 maturities
+# (many .SR records targeted that session) could not be explained.
+# WHAT: the 'Run performance clock' step maps repository Variable
+# TRACK_OUTCOME_TALLY (default 'off' = 1.0.5 behaviour) to track_performance
+# v6.52.0: 'observe' logs '[v6.52.0 OUTCOME-TALLY]' lines per audit (totals,
+# then one per exchange calendar) and changes nothing else. daily_sync's
+# tracker step maps the same Variable
+# (ENV PARITY). Numbered 1.0.8 because #841 / #845 claim 1.0.6 / 1.0.7
+# (#841 merged 2026-11-01; this PR was merged onto it the same day).
+# Rollback: unset TRACK_OUTCOME_TALLY (or set off).
 # VERSION 1.0.6 (2026-10-25) -- PERFORMANCE_LOG READ PRECISION (OWNER OPT-IN)
 # WHY (2026-10-25): track_performance read Performance_Log as formatted text
 # (about 10 significant digits), so canonical v2 1W/2W targets (an
@@ -425,6 +437,12 @@ jobs:
           # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
           # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
           TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
+          # (2026-10-27) 1.0.8: v6.52.0 [OUTCOME-TALLY] observe logs, per audit,
+          # why due records did not mature: a totals line, then one per exchange
+          # calendar (and, for quote_session_unknown, minutes after the close). Measures
+          # only. 'off' = v6.49.0. Mirrored in daily_sync.yml (ENV PARITY).
+          # ROLLBACK: unset or off.
+          TRACK_OUTCOME_TALLY: ${{ vars.TRACK_OUTCOME_TALLY || 'off' }}
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
           # plain secret, fall back to the _B64 variant if that is the one set.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
