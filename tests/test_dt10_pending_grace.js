@@ -54,12 +54,24 @@ var PROP = 'TFB_T10_PENDING_GRACE_DAYS';
 var DASH = '—';
 
 var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// merge note 2026-10-25 (#778), renewed 2026-10-27: the delivered file is
+// main's v1.17.1 plus #778's held-seat regions (v1.17.2;
+// tests/js/dt10_audit_keep_regions.js). Behaviour runs on the delivered file;
+// the base oracle, the diff lint (T5) and the inventory (T6) compare main's
+// v1.17.1 layer: the delivered file with exactly those regions removed
+// (stripDesigned throws on any other shape).
+// merge note 2026-10-28 (#778): the delivered file is now main's v1.18.0 plus the
+// v1.18.1 held-seat regions, so the layer is main's v1.18.0 byte for byte.
+// merge note 2026-11-01 (#778): the delivered file is now main's v1.19.0 plus the
+// v1.19.1 held-seat regions, so the layer is main's v1.19.0 byte for byte.
+var layerSource = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js')).stripDesigned(newSource);
+function dt10AtLeast(v, f) { var x = String(v).split('.').map(Number); for (var k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; }
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 /* The oracle: a supplied v1.14.0 file, else the delivered file with exactly the
  * enumerated v1.15.0 edits reversed (any unlisted change makes this throw). */
 var baseSource;
 try {
-  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1140Source(newSource);
+  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1140Source(layerSource);
 } catch (eBase) {
   console.log('FAIL T0 base oracle: ' + String(eBase && eBase.message || eBase).split('\n')[0]);
   console.log('FAIL 0/1');
@@ -221,10 +233,14 @@ function battery() {
     // 2026-10-26/27: the delivered file is v1.17.0 (funding evidence and the shadow rank log stacked on this change); pins moved
     // 2026-10-27: v1.17.1 (shadow momentum) stacked as well; pins moved
     // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
+    // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0: the delivered file sits above v1.19.0;
+    // the exact v1.19.0 pins hold on the layer (the delivered file with this bundle's regions stripped).
     // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
-    eq(N.DT10_VERSION, '1.19.0', 'delivered version');
-    assert(/^ \* Version: 1\.19\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    assert(newSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'DT10_VERSION literal');
+    assert(dt10AtLeast(N.DT10_VERSION, [1, 19, 0]), 'delivered version ' + N.DT10_VERSION);
+    assert(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
+    assert(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
+    assert(/^ \* Version: 1\.19\.0 /.test(layerSource.split('\n')[3]), 'layer header line 4');
+    assert(layerSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'layer DT10_VERSION literal');
     eq(N.DT10_T10_PENDING_GRACE_MAX, 5, 'clamp constant');
   });
 
@@ -359,7 +375,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('pending grace core: ok') > 0, 'battery line');
     assert(rep.indexOf('pending grace (TFB_T10_PENDING_GRACE_DAYS): 0 (') > 0, 'property line default');
-    assert(rep.indexOf('[DT10 v1.19.0] self-test') === 0, 'version line');
+    assert(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
     // property memo, so the memo line reports one more key (keys=3); pin moved
@@ -375,6 +391,7 @@ function battery() {
   });
 
   test('T5 ES5/ASCII lint of the diff: added lines ES5 and ASCII, no non-ASCII code point added or removed, file compiles', function () {
+    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer; main's v1.18.0 layer since 2026-10-28
     var baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
     for (var i = 0; i < bl.length; i++) baseLines[bl[i]] = true;
     var added = nl.filter(function (l) { return !baseLines[l]; });
@@ -405,6 +422,7 @@ function battery() {
   });
 
   test('T6 inventory: zero functions and zero vars removed vs the base; exactly the designed names added', function () {
+    var newSource = layerSource;   // merge note 2026-10-27 (#778): main's v1.17.1 layer; main's v1.18.0 layer since 2026-10-28
     function names(src, re) { var out = {}, m; while ((m = re.exec(src))) out[m[1]] = true; return out; }
     var fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(newSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
     deq(Object.keys(fb).filter(function (k) { return !fn[k]; }), [], 'functions removed');

@@ -1,11 +1,49 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.19.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.19.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.19.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
+ * (Built 2026-10-13 as an unreleased v1.13.9 draft in PR #770; renumbered
+ * after #774 shipped v1.13.9, again on 2026-10-21 after #810 shipped a
+ * different v1.13.10, on 2026-10-22 after #815 shipped a different
+ * v1.13.11 (bulk render formatting), on 2026-10-25 after #833 and
+ * #838 shipped v1.14.0 (confirm basis) and v1.15.0 (pending grace), and
+ * on 2026-10-27 after #844, #849 and #852 shipped v1.16.0 (funding
+ * evidence), v1.17.0 (shadow rank log) and v1.17.1 (shadow momentum),
+ * on 2026-10-28 after #855 shipped v1.18.0 (post-earnings), and on
+ * 2026-11-01 after #887 shipped v1.19.0 (qualified hold, seat live fill,
+ * owner rule). ALL v1.19.0 logic carried verbatim. No behaviour changed
+ * in the renumbering; the base named below is now v1.19.0, the one it
+ * sits on.)
+ * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held
+ * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank
+ * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit
+ * (TFB_OPP_AUDIT_ROWS_MAX keeps selected, unfunded, near-miss and INVEST
+ * rows only), so dt10StabIdFallback_ built an identity-only shell: the
+ * backend never learns which incumbents this cockpit holds.
+ * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)
+ * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
+ * v1.19.0 in every request and render (one memoized property read is
+ * added). Armed, body.criteria gains audit_keep_symbols = the sorted
+ * stability members (seated and grace-held, fast-track included; at most
+ * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.
+ * The allocation replay deep-copies body, so it carries the same list.
+ * opportunity_builder 1.27.0 writes those rows into the capped audit only
+ * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and
+ * either alone is inert. The list is display context, never a decision
+ * input: it moves no gate, score, seat or ticket. A property or state read
+ * failure sends nothing (the v1.19.0 body).
+ * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;
+ * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10
+ * makes one guarded call before the POST. Harness:
+ * tests/js/dt10_audit_keep.test.js.
+ * Rollback: delete the property (the next run is v1.19.0 behaviour) or
+ * re-paste v1.19.0.
  *
  * v1.19.0 (2026-11-01) [QUALIFIED-HOLD / SEAT-LIVE-FILL / OWNER-RULE] -- THREE GATES, DEFAULT OFF
  * WHY (recommendation pages review, 31 Oct 2026, items R2.0 / R3.1 / R4.1):
@@ -2214,7 +2252,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.19.0';
+var DT10_VERSION = '1.19.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -6646,6 +6684,36 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
+/** v1.19.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
+ * case) arms the held-seat hand-off; absent or any other word is off. A
+ * property-service failure reads as OFF: the list is display context only,
+ * so failing open keeps the unarmed request. Memoized (P-202). */
+var DT10_AUDIT_KEEP_PROP = 'DT10_AUDIT_KEEP';
+var DT10_AUDIT_KEEP_MAX = 60;   // mirrors opportunity_builder _AUDIT_KEEP_MAX
+function dt10AuditKeepOn_() {
+  return dt10PropMemoGet_('audit_keep', function () {
+    try {
+      return String(PropertiesService.getScriptProperties()
+          .getProperty(DT10_AUDIT_KEEP_PROP) || '')
+          .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+    } catch (eProp) { return false; }
+  });
+}
+/** v1.19.1 PURE: the stability members (member === true: seated, grace-held
+ * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at
+ * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */
+function dt10AuditKeepSymbols_(state) {
+  var out = [];
+  var syms = state && state.symbols;
+  if (!syms || typeof syms !== 'object') return out;
+  for (var k in syms) {
+    if (syms.hasOwnProperty(k) && k && syms[k] && syms[k].member === true) {
+      out.push(String(k));
+    }
+  }
+  out.sort();
+  return out.slice(0, DT10_AUDIT_KEEP_MAX);
+}
 
 /**
  * v1.11.7 [P-134]: cockpit cash source-of-truth mode.
@@ -8813,6 +8881,13 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
+  // v1.19.1: held seats kept in the backend's written audit (display only).
+  if (dt10AuditKeepOn_()) {
+    try {
+      var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());
+      if (akSyms.length) body.criteria.audit_keep_symbols = akSyms;
+    } catch (eAk) { /* send nothing: the unarmed body */ }
+  }
   var resp;
   try {
     resp = pool && !pool.rows.length ?

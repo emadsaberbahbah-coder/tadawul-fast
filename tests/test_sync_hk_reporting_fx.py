@@ -204,9 +204,12 @@ def test_h10_identity_selftest_still_passes():
 def test_h11_version_and_manifest_pin():
     # 6.70.2 (2026-10-21): STAMP-RETRY; the HK-FX contract itself is unchanged.
     # 6.71.0 (2026-10-29): FW2-STALE-PE (default off); HK-FX unchanged again.
-    assert sync.SCRIPT_VERSION == "6.71.0"
+    # merge note (2026-10-31, #778): FW-2 SCOPE is 6.72.0 over it; the floor is main's 6.71.0.
+    # merge note (2026-10-19, #778): FW-2 SCOPE moved the file to 6.71.0, so this
+    # is a version floor and the manifest pin is read from the source constant.
+    assert tuple(int(x) for x in sync.SCRIPT_VERSION.split(".")) >= (6, 71, 0)
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.71.0", "dashboard sync")' in src
+    assert f'("run_dashboard_sync", "{sync.SCRIPT_VERSION}", "dashboard sync")' in src
     ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "tests/test_sync_hk_reporting_fx.py" in ci
 

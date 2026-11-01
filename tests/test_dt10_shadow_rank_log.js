@@ -27,6 +27,16 @@ const history = require('./js/dt10_cash_utc_history');
 
 const SRC = process.argv[2] || path.join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs');
 const src = fs.readFileSync(SRC, 'utf8');
+// merge note 2026-10-27 (#778): the delivered file is main's v1.17.1 plus #778's
+// held-seat regions (v1.17.2; tests/js/dt10_audit_keep_regions.js). Behaviour
+// runs on the delivered file; the base oracle, the lint and the inventory
+// compare main's v1.17.1 layer: the delivered file with exactly those regions
+// removed (stripDesigned throws on any other shape).
+// merge note 2026-10-28 (#778): the delivered file is now main's v1.18.0 plus the
+// v1.18.1 held-seat regions, so the layer is main's v1.18.0 byte for byte.
+const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
+const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
+const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
 const FIX = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'rank_challenger_payload_v1280.json'), 'utf8'));
 
 function extract(source, name) {
@@ -314,7 +324,10 @@ console.log('S7 PASS embedded self-test core');
 // 2026-10-27: v1.17.1 (shadow momentum) stacked on this change; pins moved (S9 checks the v1.17.0 file itself)
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
-ok((src.match(/^var DT10_VERSION = '1\.19\.0';$/m) || []).length === 1 && /^ \* Version: 1\.19\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.19.0 (delivered)');
+ok((layerSrc.match(/^var DT10_VERSION = '1\.19\.0';$/m) || []).length === 1 && /^ \* Version: 1\.19\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]), 'S8 version lockstep 1.19.0 (layer)');
+ok(dt10Floor(deliveredVersion, [1, 19, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+   src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
+   'S8 delivered version floor 1.19.0 in lockstep: ' + deliveredVersion);   // merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');
@@ -338,14 +351,14 @@ new vm.Script(src, { filename: '16_Decision_Top10.gs' });
 console.log('S8 PASS wiring, lockstep, lint, inventory');
 
 // -------------------------------------------------------- S9 golden negative
-const base = history.v1160Source(src);
+const base = history.v1160Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1; v1.18.1 over #855's v1.18.0 since 2026-10-28
 const sha = crypto.createHash('sha256').update(base).digest('hex');
 ok(sha === history.V1160_SHA256, 'S9 base is the reviewed v1.16.0 file (SHA-256 pinned)');
 ok(/var DT10_VERSION = '1\.16\.0';/.test(base) && base.indexOf('ShadowLog') < 0 && base.indexOf('DT10_SHADOW') < 0 &&
    NEW_FUNCS.every((f) => base.indexOf('function ' + f + '(') < 0), 'S9 the base lacks every added name and the status token');
 function census(s, re) { const out = new Set(); let m; while ((m = re.exec(s))) out.add(m[1]); return out; }
 // 2026-10-27: the census compares v1.16.0 with the v1.17.0 file rebuilt from the delivered one (v1.17.1 edits reversed, SHA-256 pinned)
-const s1170 = history.v1170Source(src);
+const s1170 = history.v1170Source(layerSrc);   // merge note 2026-10-27 (#778): held seats are v1.17.2 over #852's v1.17.1; v1.18.1 over #855's v1.18.0 since 2026-10-28
 ok(crypto.createHash('sha256').update(s1170).digest('hex') === history.V1170_SHA256, 'S9 the v1.17.0 file is rebuilt exactly (SHA-256 pinned)');
 const fb = census(base, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = census(s1170, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
 const vb = census(base, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = census(s1170, /^var\s+([A-Za-z_$][\w$]*)/mg);

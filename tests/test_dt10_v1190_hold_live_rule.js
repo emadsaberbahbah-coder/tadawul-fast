@@ -61,10 +61,16 @@ const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
 const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+/* merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0. The structural checks
+ * (T0 pins, T7 diff inventory and reversal) read the layer: the delivered file with the bundle's
+ * designed regions stripped (tests/js/dt10_audit_keep_regions.js), which is main's v1.19.0 byte for
+ * byte; the behavioural checks run the delivered file. */
+const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
+const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 let baseSource;
 try {
-  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1180Source(newSource);
+  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1180Source(layerSource);
 } catch (eBase) {
   console.log('FAIL T0 base oracle: ' + String(eBase && eBase.message || eBase).split('\n')[0]);
   console.log('FAIL 0/1');
@@ -564,7 +570,7 @@ function seatRow(run, sym) { for (const r of run.seats) if (r[1] === sym) return
 const stripToken = s => String(s).replace(/, qhold: (?:would hold|held) \d+(?: [A-Z0-9.]+)*/, '');
 /* The version string reaches the meta footer, the B2 status line, the Logger lines and the
  * run-marker property; comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.19\.0/g, 'v1.18.0'));
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.19\.\d+/g, 'v1.18.0'));   // merge note 2026-11-01 (#778): v1.19.0 or the bundle's v1.19.1
 
 /* ============================================================ battery */
 function battery() {
@@ -576,9 +582,10 @@ function battery() {
   test('T0 base oracle is the reviewed v1.18.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1180_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.18.0', 'base version');
-    eq(N.DT10_VERSION, '1.19.0', 'delivered version');
-    ok(/^ \* Version: 1\.19\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    ok(newSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'DT10_VERSION literal');
+    ok(/^1\.(19|[2-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.19.0: ' + N.DT10_VERSION);   // merge note 2026-11-01 (#778)
+    ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
+    ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
+    ok(/^ \* Version: 1\.19\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'layer pins 1.19.0');
     eq(N.DT10_QUALIFIED_HOLD_PROP, HOLD); eq(N.DT10_SEAT_LIVE_FILL_PROP, LIVE); eq(N.DT10_OWNER_RULE_PROP, RULE);
     eq(N.DT10_OWNER_RULE_ROI_MAX, 34, 'the owner rule threshold is a display constant');
     deq(N.DT10_OWNER_RULE_HEADERS, ['Owner Rule']);
@@ -650,7 +657,9 @@ function battery() {
       deq(nv(n.logs), baseRefresh.logs, 'Logger lines ' + label);
       deq(n.posted, baseRefresh.posted, 'POST bodies (research + replay) ' + label);
       deq(n.saved, baseRefresh.saved, 'saved state blob ' + label);
-      eq(n.propReads.total, baseRefresh.propReads.total + 3, 'exactly three property reads added ' + label);
+      // merge note 2026-11-01 (#778): the bundle's v1.19.1 adds its own memoized DT10_AUDIT_KEEP read
+      eq(n.propReads.total - (n.propReads.byKey['DT10_AUDIT_KEEP'] || 0), baseRefresh.propReads.total + 3, 'exactly three property reads added ' + label);
+      ok((n.propReads.byKey['DT10_AUDIT_KEEP'] || 0) <= 1, 'the bundle reads DT10_AUDIT_KEEP at most once ' + label);
       deq([n.propReads.byKey[HOLD], n.propReads.byKey[LIVE], n.propReads.byKey[RULE]], [1, 1, 1], 'each read once ' + label);
     }
     ok(/\| output: EXECUTABLE \|/.test(baseRefresh.status) && /funding=final\/1exec/.test(baseRefresh.status), 'fixture: the base funds A only: ' + baseRefresh.status);
@@ -856,7 +865,7 @@ function battery() {
 
   test('T6 embedded dt10SelfTest: the three new core lines ok, property lines follow the properties, every base line kept, zero FAIL; the base lacks the lines', () => {
     const rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
-    ok(rep.indexOf('[DT10 v1.19.0] self-test') === 0, 'version line');
+    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-01 (#778)
     for (const l of ['qualified hold (DT10_QUALIFIED_HOLD): off (off = v1.18.0 board; observe lists; enforce holds)', 'qualified hold core: ok',
       'seat live fill (DT10_SEAT_LIVE_FILL): off (off = v1.18.0 render)', 'seat live fill core: ok',
       'owner rule mark (DT10_OWNER_RULE_MARK): off (High + Engine ROI 12M < 34; display only)', 'owner rule core: ok']) {
@@ -875,8 +884,9 @@ function battery() {
        faulted.indexOf('owner rule mark (DT10_OWNER_RULE_MARK): off') > 0, 'a property fault reads off');
   });
 
+  /* merge note 2026-11-01 (#778): T7 reads the layer (main's v1.19.0). */
   test('T7 ES5 / ASCII lint of the diff; inventory: 9 functions and 5 vars added, 0 removed; 22 hunks whose reversal is the reviewed v1.18.0 file', () => {
-    const baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
+    const baseLines = {}, bl = baseSource.split('\n'), nl = layerSource.split('\n');
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);
     ok(added.length >= 400 && added.length <= 600, 'added lines ' + added.length);
@@ -886,37 +896,37 @@ function battery() {
       if (!/^[\x09\x20-\x7e]*$/.test(l)) ok(baseLines[l.replace('1.19.0', '1.18.0')] === true, 'non-ASCII added line: ' + l);
     }
     function nonAscii(s) { const m = {}; for (let j = 0; j < s.length; j++) { const c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
-    deq(nonAscii(newSource), nonAscii(baseSource), 'non-ASCII code point multiset unchanged');
-    ok(newSource.indexOf('\r') < 0, 'LF only');
-    const why = newSource.slice(newSource.indexOf(' * v1.19.0 (2026-11-01)'), newSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'));
+    deq(nonAscii(layerSource), nonAscii(baseSource), 'non-ASCII code point multiset unchanged');
+    ok(layerSource.indexOf('\r') < 0, 'LF only');
+    const why = layerSource.slice(layerSource.indexOf(' * v1.19.0 (2026-11-01)'), layerSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'));
     ok(why.length > 3000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block present (newest first) and ASCII');
-    ok(newSource.indexOf(baseSource.slice(baseSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), baseSource.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'))) > 0, 'the v1.18.0 WHY block verbatim');
-    for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) ok(newSource.indexOf(l) > 0, 'WHY header lost: ' + l);
+    ok(layerSource.indexOf(baseSource.slice(baseSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), baseSource.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'))) > 0, 'the v1.18.0 WHY block verbatim');
+    for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) ok(layerSource.indexOf(l) > 0, 'WHY header lost: ' + l);
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
-    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(newSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
+    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(layerSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'functions removed (any level)');
-    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(newSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(layerSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     deq(Object.keys(tn).filter(k => !tb[k]).sort(), ['dt10OwnerRuleCell_', 'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleNote_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFillOn_',
       'dt10SeatLiveFill_', 'dt10SeatLiveIndex_', 'dt10StabQualifiedHoldMode_', 'dt10StabQualifiedHoldSeat_'], 'top-level functions added');
     eq(Object.keys(tb).length, 224, 'base census'); eq(Object.keys(tn).length, 233, 'new census');
-    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
+    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(layerSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DT10_OWNER_RULE_HEADERS', 'DT10_OWNER_RULE_PROP', 'DT10_OWNER_RULE_ROI_MAX', 'DT10_QUALIFIED_HOLD_PROP', 'DT10_SEAT_LIVE_FILL_PROP'], 'vars added');
     eq(Object.keys(vb).length, 121); eq(Object.keys(vn).length, 126);
     const newSet = {}; for (const l of nl) newSet[l] = true;
     deq(bl.filter(l => !newSet[l]).map(l => l.trim()), ["var DT10_VERSION = '1.18.0';", '* Version: 1.18.0 (see DT10_VERSION; header kept in lockstep — restored'].sort().reverse().sort(), 'only the two version lines left');
-    const core = newSource.slice(newSource.indexOf('function dt10StabCore_('), newSource.indexOf('\n// ----', newSource.indexOf('function dt10StabCore_(')));
+    const core = layerSource.slice(layerSource.indexOf('function dt10StabCore_('), layerSource.indexOf('\n// ----', layerSource.indexOf('function dt10StabCore_(')));
     for (const f of ['outageOf', 'hardOut', 'scoreOf', 'smoothed', 'boardSort', 'inFinal', 'inList', 'qualifiedWithin', 'softMiss']) ok(core.indexOf('function ' + f + '(') > 0, 'nested ' + f);
     for (const name of ['dt10StabQualifiedHoldSeat_', 'dt10StabQualifiedHoldMode_', 'dt10SeatLiveFillOn_', 'dt10SeatLiveIndex_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFill_',
       'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleCell_', 'dt10OwnerRuleNote_']) {
-      const start = newSource.indexOf('function ' + name + '(');
-      const body = newSource.slice(start, newSource.indexOf('\n}\n', start) + 3);
+      const start = layerSource.indexOf('function ' + name + '(');
+      const body = layerSource.slice(start, layerSource.indexOf('\n}\n', start) + 3);
       ok(start > 0 && /^[\x00-\x7f]*$/.test(body), 'ASCII ' + name);
       new vm.Script('(function(){' + body + '})');
     }
     const edits = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1190.json'));
     eq(edits.length, 22, 'twenty-two hunks');
-    eq(sha256(history.v1180Source(newSource)), history.V1180_SHA256, 'reversal = the reviewed v1.18.0 file');
+    eq(sha256(history.v1180Source(layerSource)), history.V1180_SHA256, 'reversal = the reviewed v1.18.0 file');
   });
 
   test('T8 service reads: observe / enforce spellings -> modes; on spellings -> on; blank, junk, absent, fault -> off', () => {

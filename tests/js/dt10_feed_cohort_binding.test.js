@@ -68,11 +68,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {feedHistorySource, HISTORY_SHA256} = require('./dt10_cash_utc_history');
+// v1.13.10 (held seats kept in the written audit) is stripped byte-exact
+// first, so the v1.13.9 history helper sees exactly the v1.13.9 text.
+const stripAuditKeep = require('./dt10_audit_keep_regions.js').stripDesigned;
 
 const ROOT = path.join(__dirname, '../..');
 const SOURCE_PATH = process.env.DT10_DELIVERED || path.join(ROOT, 'apps_script/16_Decision_Top10.gs');
 const source = fs.readFileSync(SOURCE_PATH, 'utf8');
-const historySource = feedHistorySource(source);
+const historySource = feedHistorySource(stripAuditKeep(source));
 const BASE_PATH = process.env.DT10_BASE || '';
 const baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : null;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
@@ -535,8 +538,9 @@ test('C11 pure helper edge cases', () => {
 });
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
-  assert.equal(ctx.DT10_VERSION, '1.19.0');   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.19\.0 /);   // 2026-10-27: v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved
+  const atLeast = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
+  assert(atLeast(ctx.DT10_VERSION, [1, 19, 0]), ctx.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; merge note 2026-11-01 (#778): held seats are v1.19.1 over #887's v1.19.0
+  assert(source.split('\n')[3].startsWith(' * Version: ' + ctx.DT10_VERSION + ' '));   // 2026-10-27: v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0, pin moved
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
   for (const name of ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt10BoardVerdict_']) {
@@ -672,10 +676,10 @@ test('H1 immutable v1.13.8 fixture digest and current edit mutation guard', () =
   assert.equal(count(source, 'function dt10SourceCount_(value) {\n'), 1);
   const unrelated = source.replace('function dt10SourceCount_(value) {\n',
     'function dt10SourceCount_(value) {\n  if (value === 424242) return 1;\n');
-  assert.throws(() => feedHistorySource(unrelated), assert.AssertionError);
+  assert.throws(() => feedHistorySource(stripAuditKeep(unrelated)), assert.AssertionError);
   const timestampMutation = source.replace("extra.updatedKey = t === 'lastupdatedutc' ? 'last_updated_utc' : 'last_updated';",
     "extra.updatedKey = 'last_updated';");
-  assert.throws(() => feedHistorySource(timestampMutation), assert.AssertionError);
+  assert.throws(() => feedHistorySource(stripAuditKeep(timestampMutation)), assert.AssertionError);
 });
 
 /* ============================================================ D1-D5, G1: immutable v1.13.8 */
