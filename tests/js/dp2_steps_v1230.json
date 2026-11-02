@@ -1,0 +1,46 @@
+[
+ [
+  "Version: 1.2.28 (2026-10-26)",
+  "Version: 1.2.30 (2026-10-28) - 1.2.30: certification expires with its evidence (IBKR capture + 14 min, measured when the page is built) and needs a live EXECUTABLE feed for the same run and a Portfolio_Decision status of ok; the header shows the page build time and the decision time separately. 1.2.29 (D4): an order the IBKR capture still lists as working with remaining shares counts as working even when IBKR labels it REPLACED (edited order). Rollback: Project History -> 1.2.28."
+ ],
+ [
+  "var DP2_VERSION = '1.2.28';",
+  "var DP2_VERSION = '1.2.30';"
+ ],
+ [
+  "placed: dp2Str_(o.order_time) });",
+  "placed: dp2Str_(o.order_time), remaining: dp2Num_(o.remaining_shares_qty), working: true });"
+ ],
+ [
+  "if (!dp2OrderActive_(o.status)) continue;",
+  "if (!dp2OrderActive_(o.status) && !(o.working === true && /REPLACED/.test(o.status) && typeof o.remaining === 'number' && o.remaining > 0)) continue;   // v1.2.29 (D4)"
+ ],
+ [
+  "var mlr = /Last run (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})/.exec(out.status); out.lastRun = mlr ? mlr[1] : '';",
+  "var mlr = /Last run (\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})/.exec(out.status); out.lastRun = mlr ? mlr[1] : ''; var mst = /\\|\\s*status:\\s*([A-Za-z_]+)/.exec(out.status); out.state = mst ? mst[1].toUpperCase() : '';   // v1.2.30"
+ ],
+ [
+  "function dp2Today_() { return Utilities.formatDate(new Date(), DP2.TZ, 'yyyy-MM-dd HH:mm'); }",
+  "function dp2Today_() { return Utilities.formatDate(new Date(), DP2.TZ, 'yyyy-MM-dd HH:mm'); } function dp2EvidenceExpiry_(pd, nowMs) { try { var ev = pd && pd.evidence; var cap = /^(\\d{1,2}):(\\d{2})$/.exec(String((ev && ev.capture) || '')); var lr = /^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2})/.exec(String((pd && pd.lastRun) || '')); if (!cap || !lr) return null; var limit = typeof ev.limit === 'number' && ev.limit > 0 ? ev.limit : DP2.EVIDENCE_LIMIT_MIN; var capMs = Date.UTC(+lr[1], +lr[2] - 1, +lr[3], +cap[1] - 3, +cap[2], 0); var runMs = Date.UTC(+lr[1], +lr[2] - 1, +lr[3], +lr[4] - 3, +lr[5], 0); if (capMs > runMs) capMs -= 86400000; var expMs = capMs + limit * 60000; var e = new Date(expMs + 10800000); var p2 = function (n) { return (n < 10 ? '0' : '') + n; }; return { live: typeof nowMs === 'number' && nowMs < expMs, expiresMs: expMs, hm: p2(e.getUTCHours()) + ':' + p2(e.getUTCMinutes()), capture: p2(+cap[1]) + ':' + cap[2], limit: limit }; } catch (x) { return null; } }   // v1.2.30: evidence expires at capture + limit, measured now"
+ ],
+ [
+  "var evFresh = /SENT|OK|FRESH/.test(evState) && !/NOT/.test(evState);",
+  "var evSent = /SENT|OK|FRESH/.test(evState) && !/NOT/.test(evState); var evExp = evSent ? dp2EvidenceExpiry_(pd, new Date().getTime()) : null; var evFresh = evSent && evExp !== null && evExp.live === true; if (evSent && !evFresh) evState = evExp === null ? 'SENT, capture time unknown' : 'EXPIRED at ' + evExp.hm + ' (capture ' + evExp.capture + ' + ' + evExp.limit + ' min)';   // v1.2.30"
+ ],
+ [
+  "var certified = evFresh && pd.readiness === 'VERIFIED' && feed.run && pd.receiptRun === feed.run;",
+  "var certified = evFresh && pd.readiness === 'VERIFIED' && pd.state === 'OK' && !!feed.run && pd.receiptRun === feed.run && dp2FeedView_(feed, new Date().getTime()).live === true;   // v1.2.30: a blocked, superseded or expired feed never certifies"
+ ],
+ [
+  "' \u00b7 IBKR evidence ' + evState + (pd.evidence && pd.evidence.age ? ' \u2014 capture ' + pd.evidence.capture + ' is ' + pd.evidence.age + ' old (limit ' + pd.evidence.limit + ' m)' : '') +",
+  "' \\u00b7 IBKR evidence ' + evState + (pd.evidence && pd.evidence.age ? ' \\u2014 capture ' + pd.evidence.capture + ', ' + pd.evidence.age + ' old when Portfolio_Decision ran (limit ' + pd.evidence.limit + ' m)' : '') +   // v1.2.30"
+ ],
+ [
+  "'built ' + dp2Today_() + ' \u00b7 PD run ' + (pd.lastRun || 'n/a') + ' \u00b7 FX ' + fx",
+  "'page built ' + dp2Today_() + ' \\u00b7 decision (Portfolio_Decision run) ' + (pd.lastRun || 'n/a') + (evExp ? ' \\u00b7 IBKR capture ' + evExp.capture + (evExp.live ? ' valid to ' : ' expired ') + evExp.hm : '') + ' \\u00b7 FX ' + fx"
+ ],
+ [
+  "['IBKR evidence freshness \u2264 ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' \u00b7 ' + pd.evidence.age : ''), evFresh ? DP2C.green : DP2C.red],",
+  "['IBKR evidence freshness \\u2264 ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' \\u00b7 ' + pd.evidence.age + ' old at the decision' : ''), evFresh ? DP2C.green : DP2C.red],   // v1.2.30"
+ ]
+]

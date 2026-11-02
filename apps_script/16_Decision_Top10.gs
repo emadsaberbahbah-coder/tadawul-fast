@@ -1,13 +1,13 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.19.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.20.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
  *
- * v1.19.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
+ * v1.20.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
  * (Built 2026-10-13 as an unreleased v1.13.9 draft in PR #770; renumbered
  * after #774 shipped v1.13.9, again on 2026-10-21 after #810 shipped a
  * different v1.13.10, on 2026-10-22 after #815 shipped a different
@@ -15,11 +15,12 @@
  * #838 shipped v1.14.0 (confirm basis) and v1.15.0 (pending grace), and
  * on 2026-10-27 after #844, #849 and #852 shipped v1.16.0 (funding
  * evidence), v1.17.0 (shadow rank log) and v1.17.1 (shadow momentum),
- * on 2026-10-28 after #855 shipped v1.18.0 (post-earnings), and on
+ * on 2026-10-28 after #855 shipped v1.18.0 (post-earnings), on
  * 2026-11-01 after #887 shipped v1.19.0 (qualified hold, seat live fill,
- * owner rule). ALL v1.19.0 logic carried verbatim. No behaviour changed
- * in the renumbering; the base named below is now v1.19.0, the one it
- * sits on.)
+ * owner rule), and on 2026-11-02 after #895 shipped v1.20.0 (ticket guard,
+ * plan-payoff KPI, venue line). ALL v1.20.0 logic carried verbatim. No
+ * behaviour changed in the renumbering; the base named below is now
+ * v1.20.0, the one it sits on.)
  * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held
  * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank
  * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit
@@ -28,7 +29,7 @@
  * backend never learns which incumbents this cockpit holds.
  * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)
  * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
- * v1.19.0 in every request and render (one memoized property read is
+ * v1.20.0 in every request and render (one memoized property read is
  * added). Armed, body.criteria gains audit_keep_symbols = the sorted
  * stability members (seated and grace-held, fast-track included; at most
  * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.
@@ -37,13 +38,131 @@
  * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and
  * either alone is inert. The list is display context, never a decision
  * input: it moves no gate, score, seat or ticket. A property or state read
- * failure sends nothing (the v1.19.0 body).
+ * failure sends nothing (the v1.20.0 body).
  * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;
  * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10
  * makes one guarded call before the POST. Harness:
  * tests/js/dt10_audit_keep.test.js.
- * Rollback: delete the property (the next run is v1.19.0 behaviour) or
- * re-paste v1.19.0.
+ * Rollback: delete the property (the next run is v1.20.0 behaviour) or
+ * re-paste v1.20.0.
+ *
+ * v1.20.0 (2026-11-02) [TICKET-GUARD / KPI-PLAN-GAIN / VENUE-LINE] -- THREE GATES, DEFAULT OFF
+ * WHY (live review, Mon 2 Nov 2026 09:50 Riyadh; the 08:49:43 render read
+ * 'FEED ACTIONABLE -- EXECUTABLE (verdict age 367m) -- SELECTED -- 6
+ * EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN
+ * TODAY)'): six tickets -- ITRN.US 12,199 SAR, DDI.US 12,334, CRC.US 8,527,
+ * GLPI.US 12,133, EFC.US 11,467, INDV.US 12,335 = 68,995 SAR, 75 % of NAV.
+ * (a) CRC.US reports TODAY (Calendar_Events 0 days to earnings) and EFC.US
+ *   in 2 days, both funded: the v1.6.0 earnings tag is annotation-only by
+ *   design and the backend rule that entries avoid the pre-earnings window
+ *   was never built.
+ * (b) The owner's own rules (24 Oct): the first live execution is limited
+ *   to 1-2 tickets while evidence accumulates, and the interim buy rule is
+ *   Confidence High AND Engine ROI 12M < 34 % (v1.19.0 only marks seats).
+ *   The board issued 6 tickets.
+ * (c) The KPI 'Exp. Gain 12M (SAR)' read 56,203 SAR on 68,997 SAR deployed:
+ *   the sum of ticket x the compounded-annualised TP1 ROI (P-141). Every
+ *   advisor note already says the truth in the backend's '[f1b-observe]
+ *   gain ann-basis X SAR vs plan payoff Y SAR' tag: the plan payoffs add up
+ *   to 11,078 SAR (ticket x (TP1 / price - 1)). A 5x inflated KPI on the
+ *   decision page (owner, 1 Nov: 'avoid misleading').
+ * (d) The feed verdict (stamp 02:42:14+03:00) is honoured for 480 minutes,
+ *   i.e. until 10:42 Riyadh, while all six tickets are US listings whose
+ *   session opens 17:30 Riyadh (winter time). Nothing on the board said so.
+ * WHAT -- three Script Properties, each DEFAULT OFF; absent, blank or any
+ * other word = the v1.19.0 run byte for byte (cells, banner, B2 status
+ * line, KPI strip, _Run_Log and Logger lines, _Selection_Log rows, state
+ * blob); the only difference is four property reads in the refresh:
+ * (1) DT10_TICKET_GUARD = off | observe | enforce. Read once in
+ *   dt10RefreshDecisionTop10Run_ (dt10TicketGuardConfig_); only when armed
+ *   are its knobs read and payload._dt10_tguard attached:
+ *   DT10_GUARD_EARN_DAYS (integer, default 3, clamped 0..30),
+ *   DT10_GUARD_OWNER_RULE (exactly 'on'; default off) and
+ *   DT10_GUARD_MAX_TICKETS (integer, default 0 = no cap, clamped 0..50).
+ *   In dt10RenderPayload_, after the finalization, the live fill and the
+ *   earnings / post-earnings annotations and before the KPI strip,
+ *   dt10TicketGuardCore_ (pure) walks the EXECUTABLE tickets (Ticket SAR > 0,
+ *   shares > 0, not grace, not fast-track) in board order on an EXECUTABLE
+ *   feed; the first failing filter holds a ticket: earnings (0 <= days to
+ *   earnings <= DT10_GUARD_EARN_DAYS, from the v1.6.0 tagger's own
+ *   Calendar_Events map of the same render -- one read per render), owner
+ *   rule (only when armed: dt10OwnerRuleCell_ is not 'rule: yes' -- the
+ *   very predicate of the v1.19.0 Owner Rule column), cap (a ticket past
+ *   the first N survivors). observe: nothing changes in any cell; B2 gains
+ *   'tguard: would hold CRC.US(earn 0d) EFC.US(earn 2d)' (or 'would hold
+ *   none') and one Logger line. enforce: dt10TicketGuardApply_ sends each
+ *   held ticket through the EXISTING research / no-allocation path -- it is
+ *   marked _board_unfunded (the replay's own marker for a seat it did not
+ *   fund) and dt10FinalizeBoard_ runs again: Ticket SAR 0, shares 0, gains
+ *   0, entry / stop / TPs dashed, the research note, and every KPI
+ *   recomputed over the remaining tickets (Exp. Gain, Unallocated gains the
+ *   held SAR, Fundable Now, Selected, Blended Reliability / R-R, the meta
+ *   footer 'funding=final/Nexec', the cash-floor observation, the
+ *   candidate flags). Funds From then reads 'Held -- earnings in 0d' /
+ *   'Held -- owner rule' / 'Held -- ticket cap 2' and the Advisor Note gains
+ *   '[held: <reason>] ' in front of the research-context tags the
+ *   annotations had put on the ticket; every other seat's note is restored
+ *   byte for byte. The banner reads 'N EXECUTABLE TICKETS + ... + K HELD BY
+ *   GUARD' (the Selected KPI keeps the v1.19.0 vocabulary -- a held ticket
+ *   counts as research there, the words tfb_workbook_dq_audit parses); B2
+ *   gains 'tguard: held K (CRC.US earn 0d, EFC.US earn 2d)'. No ticket is
+ *   resized, no freed cash is redistributed (it shows as Unallocated), no
+ *   executable count can rise, no gate, score or verdict is recomputed.
+ * (2) DT10_KPI_PLAN_GAIN = off | on. Read once in the refresh
+ *   (dt10KpiPlanGainMode_). on: the KPI label 'Exp. Gain 12M (SAR)' becomes
+ *   'Exp. Gain TP1 (SAR)' and its value the plan payoff of the executable
+ *   tickets after the guard, sum Ticket SAR x (TP1 SAR / Price SAR - 1)
+ *   rounded to SAR (dt10KpiPlanGain_, pure; an em dash with no ticket). The
+ *   per-row 'Gain 12M SAR' column and payload.kpis are unchanged. The
+ *   marker DT10_KPI_PLAN_LABEL_STATE ('tp1', set before an armed render)
+ *   lets the first render after a rollback write the v1.19.0 label back
+ *   (then it is deleted); while the KPI gate is off the refresh reads it.
+ * (3) DT10_VENUE_LINE = off | on. Read once in the refresh
+ *   (dt10VenueLineOn_). on: when the feed is EXECUTABLE the banner gains
+ *   ' -- <venue> opens HH:MM Riyadh (feed valid until HH:MM)' for each venue
+ *   of the executable tickets whose next regular session opens after the
+ *   feed expires (dt10VenueLine_, pure; the expiry is the cockpit's own
+ *   clock: 480 minutes after the verdict stamp). DT10_VENUES, by symbol
+ *   suffix, APPROXIMATE (no holidays, half days or lunch breaks): US (.US /
+ *   no suffix) 09:30-16:00 New York = 17:30-00:00 Riyadh in winter,
+ *   16:30-23:00 in US summer time; Tadawul (.SR / four digits) 10:00-15:00
+ *   Sun-Thu; London (.L) 11:00-19:30 winter; Euronext (.PA .AS .BR .LS) and
+ *   Xetra (.DE) 11:00-19:30 winter (10:00-18:30 in EU summer time); Hong
+ *   Kong (.HK) 04:30-11:00; Tokyo (.T) 03:00-09:30; Mon-Fri elsewhere.
+ *   Display only.
+ * GATES: DT10_TICKET_GUARD off | observe | enforce (+ DT10_GUARD_EARN_DAYS,
+ *   DT10_GUARD_OWNER_RULE, DT10_GUARD_MAX_TICKETS); DT10_KPI_PLAN_GAIN off
+ *   | on; DT10_VENUE_LINE off | on. One property per evidence run: the KPI
+ *   and the venue line first (display only), then the guard in observe for
+ *   one render, then enforce; the owner rule and the cap only when the
+ *   owner wants his 1-2 ticket rule enforced by the board.
+ * Functions added (0 removed): dt10TicketGuardMode_, dt10TicketGuardConfig_,
+ * dt10TicketGuardExec_ (pure), dt10TicketGuardCore_ (pure),
+ * dt10TicketGuardToken_ (pure), dt10TicketGuardHeldCount_ (pure),
+ * dt10TicketGuardApply_, dt10TicketGuard_, dt10KpiPlanGainMode_,
+ * dt10KpiPlanLabelMark_, dt10KpiPlanGain_ (pure), dt10VenueLineOn_,
+ * dt10VenueOf_ (pure), dt10VenueSummer_ (pure), dt10VenueSession_ (pure),
+ * dt10RiyadhClock_ (pure), dt10VenueLine_ (pure). Changed:
+ * dt10SelectedTitle_ (the held-by-guard segment), dt10RenderPayload_ (the
+ * guard, the KPI pair, the venue line), dt10RefreshDecisionTop10Run_ (three
+ * gate reads, the payload keys, the label marker, one status token),
+ * dt10SelfTest (one line per gate). Vars added: DT10_TICKET_GUARD_PROP,
+ * DT10_GUARD_EARN_DAYS_PROP, DT10_GUARD_EARN_DAYS_DEF,
+ * DT10_GUARD_EARN_DAYS_MAX, DT10_GUARD_OWNER_RULE_PROP,
+ * DT10_GUARD_MAX_TICKETS_PROP, DT10_GUARD_MAX_TICKETS_MAX,
+ * DT10_TGUARD_TAGS_RE, DT10_TGUARD_LIVE_RE, DT10_KPI_PLAN_GAIN_PROP,
+ * DT10_KPI_PLAN_GAIN_LABEL, DT10_KPI_PLAN_LABEL_PROP, DT10_VENUE_LINE_PROP,
+ * DT10_VENUES.
+ * Harness: tests/test_dt10_v1200_ticket_guard.js (REAL file; golden
+ * negative on the v1.19.0 base rebuilt by reversing these edits, SHA-256
+ * pinned, or a base file given as the second argument; kill identity with
+ * the three properties absent / off / junk / faulted through the REAL
+ * render and the REAL refresh; the live board of 2 Nov; ES5/ASCII lint;
+ * inventory).
+ * ROLLBACK: set the three properties off (or delete them) with no re-paste
+ * (the next render writes the v1.19.0 KPI label back); or re-paste v1.19.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.19.0 (2026-11-01) [QUALIFIED-HOLD / SEAT-LIVE-FILL / OWNER-RULE] -- THREE GATES, DEFAULT OFF
  * WHY (recommendation pages review, 31 Oct 2026, items R2.0 / R3.1 / R4.1):
@@ -2252,7 +2371,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.19.1';
+var DT10_VERSION = '1.20.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3137,6 +3256,44 @@ var DT10_SEAT_LIVE_FILL_PROP = 'DT10_SEAT_LIVE_FILL';
 var DT10_OWNER_RULE_PROP = 'DT10_OWNER_RULE_MARK';
 var DT10_OWNER_RULE_ROI_MAX = 34;
 var DT10_OWNER_RULE_HEADERS = ['Owner Rule'];
+// v1.20.0 [TICKET-GUARD]: executable tickets held back from today's plan
+// (earnings window, the owner's rule, a ticket cap) through the existing
+// research path -- see the v1.20.0 header block. off (default) | observe |
+// enforce; the three knobs are read only while the guard is armed.
+var DT10_TICKET_GUARD_PROP = 'DT10_TICKET_GUARD';
+var DT10_GUARD_EARN_DAYS_PROP = 'DT10_GUARD_EARN_DAYS';
+var DT10_GUARD_EARN_DAYS_DEF = 3;
+var DT10_GUARD_EARN_DAYS_MAX = 30;
+var DT10_GUARD_OWNER_RULE_PROP = 'DT10_GUARD_OWNER_RULE';
+var DT10_GUARD_MAX_TICKETS_PROP = 'DT10_GUARD_MAX_TICKETS';
+var DT10_GUARD_MAX_TICKETS_MAX = 50;
+// The research-context tags a held note keeps: the forward / post-earnings
+// prefix (the dt10UvWithholdRow_ pattern) and the v1.19.0 live-fill suffix.
+var DT10_TGUARD_TAGS_RE = /^((?:\u26a0 earnings \u2264\d+d \u00b7 )?(?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?)/;
+var DT10_TGUARD_LIVE_RE = / Source row today: investable \((?:INVEST on the audited grid|Investability Status INVESTABLE)\)\.$/;
+// v1.20.0 [KPI-PLAN-GAIN]: the KPI pair 'Exp. Gain TP1 (SAR)' = the plan
+// payoff of the executable tickets. off (default) | on. The marker records
+// an armed relabel so the render after a rollback writes the label back.
+var DT10_KPI_PLAN_GAIN_PROP = 'DT10_KPI_PLAN_GAIN';
+var DT10_KPI_PLAN_GAIN_LABEL = 'Exp. Gain TP1 (SAR)';
+var DT10_KPI_PLAN_LABEL_PROP = 'DT10_KPI_PLAN_LABEL_STATE';
+// v1.20.0 [VENUE-LINE]: the banner names a venue that opens after the feed
+// expires. off (default) | on. Regular sessions: venue-local minutes after
+// midnight, the standard UTC offset in minutes, the summer-time rule ('us':
+// second Sunday of March to the first Sunday of November; 'eu': last Sunday
+// of March to the last Sunday of October; +60 inside it) and the trading
+// week (Sun-Thu for Tadawul, else Mon-Fri). APPROXIMATE: no holidays, half
+// days, lunch breaks or auctions.
+var DT10_VENUE_LINE_PROP = 'DT10_VENUE_LINE';
+var DT10_VENUES = {
+  US: { name: 'US', open: 570, close: 960, utc: -300, dst: 'us', sunThu: false },
+  SR: { name: 'Tadawul', open: 600, close: 900, utc: 180, dst: '', sunThu: true },
+  L: { name: 'London', open: 480, close: 990, utc: 0, dst: 'eu', sunThu: false },
+  EU: { name: 'Euronext', open: 540, close: 1050, utc: 60, dst: 'eu', sunThu: false },
+  DE: { name: 'Xetra', open: 540, close: 1050, utc: 60, dst: 'eu', sunThu: false },
+  HK: { name: 'Hong Kong', open: 570, close: 960, utc: 480, dst: '', sunThu: false },
+  T: { name: 'Tokyo', open: 540, close: 930, utc: 540, dst: '', sunThu: false }
+};
 // v1.11.10 [P-168]: outage pause -- see the v1.11.10 header block.
 var DT10_P168_MAX_PAUSE_DAYS = 5;         // consecutive paused day-advances
 var DT10_P168_OUTAGE_RE = /fetch_failed/i; // engine tag family on 'Warnings'
@@ -6372,6 +6529,357 @@ function dt10OwnerRuleNote_(selected) {
   }
   return 'owner-rule ' + yes + '/' + sel.length + ' yes';
 }
+/** v1.20.0 [TICKET-GUARD]: Script Property DT10_TICKET_GUARD. Exactly
+ * 'observe' or 'enforce' (trimmed, any case) arm the guard; absent, blank,
+ * 'off', junk or a PropertiesService fault read as off (the v1.19.0 board).
+ * Never throws. */
+function dt10TicketGuardMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_TICKET_GUARD_PROP) || '');
+  } catch (eTg) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'observe' || raw === 'enforce') ? raw : 'off';
+}
+/** v1.20.0 [TICKET-GUARD]: null while the guard is off (one property read);
+ * else its knobs, read once each: {mode, earnDays (DT10_GUARD_EARN_DAYS,
+ * integer, default 3, clamped 0..30), ownerRule (DT10_GUARD_OWNER_RULE is
+ * exactly 'on'), maxTickets (DT10_GUARD_MAX_TICKETS, integer, default 0 =
+ * no cap, clamped 0..50)}. A read fault gives that knob's default. Never
+ * throws. */
+function dt10TicketGuardConfig_() {
+  var mode = dt10TicketGuardMode_();
+  if (mode === 'off') return null;
+  function read(key) {
+    try {
+      return String(PropertiesService.getScriptProperties().getProperty(key) || '')
+          .replace(/^\s+|\s+$/g, '');
+    } catch (eTk) {
+      return '';
+    }
+  }
+  return { mode: mode,
+           earnDays: dt10StabInt_(read(DT10_GUARD_EARN_DAYS_PROP),
+                                  DT10_GUARD_EARN_DAYS_DEF, 0, DT10_GUARD_EARN_DAYS_MAX),
+           ownerRule: read(DT10_GUARD_OWNER_RULE_PROP).toLowerCase() === 'on',
+           maxTickets: dt10StabInt_(read(DT10_GUARD_MAX_TICKETS_PROP), 0, 0,
+                                    DT10_GUARD_MAX_TICKETS_MAX) };
+}
+/** v1.20.0 [TICKET-GUARD] PURE: is `t` an EXECUTABLE ticket of the final
+ * board -- the dt10TicketClasses_ exec class (neither a grace ghost nor a
+ * fast-track suspension, shares > 0) with Ticket SAR > 0? dt10FinalizeBoard_
+ * zeroes every other seat. */
+function dt10TicketGuardExec_(t) {
+  return !!t && typeof t === 'object' && t._grace_hold !== true &&
+      t._ft_suspended !== true && Number(t.suggested_shares) > 0 &&
+      Number(t.suggested_sar) > 0;
+}
+/** v1.20.0 [TICKET-GUARD] PURE: which EXECUTABLE tickets the guard holds,
+ * in board order, on an EXECUTABLE feed only (feedOk). The first failing
+ * filter wins: (1) earnings -- 0 <= map[SYMBOL] <= cfg.earnDays, map being
+ * the v1.6.0 tagger's Calendar_Events {SYMBOL: days to earnings}; (2) owner
+ * rule -- only when cfg.ownerRule, a ticket for which dt10OwnerRuleCell_
+ * (the v1.19.0 Owner Rule predicate) is not 'rule: yes'; (3) cap -- when
+ * cfg.maxTickets > 0, a ticket after the first maxTickets survivors.
+ * Returns {checked, kept, held: [{index, symbol, kind, reason, tag}]}.
+ * Never mutates its input. */
+function dt10TicketGuardCore_(selected, feedOk, map, cfg) {
+  var out = { checked: 0, kept: 0, held: [] };
+  if (feedOk !== true) return out;
+  var sel = selected || [];
+  cfg = cfg || {};
+  map = map || {};
+  var earnDays = dt10StabInt_(cfg.earnDays, DT10_GUARD_EARN_DAYS_DEF, 0,
+                              DT10_GUARD_EARN_DAYS_MAX);
+  var cap = dt10StabInt_(cfg.maxTickets, 0, 0, DT10_GUARD_MAX_TICKETS_MAX);
+  for (var i = 0; i < sel.length; i++) {
+    var t = sel[i];
+    if (!dt10TicketGuardExec_(t)) continue;
+    out.checked++;
+    var sym = dt10NormSym_(t.symbol);
+    var d = Object.prototype.hasOwnProperty.call(map, sym) ? map[sym] : null;
+    var h = null;
+    if (typeof d === 'number' && isFinite(d) && d >= 0 && d <= earnDays) {
+      h = { kind: 'earn', reason: 'earnings in ' + d + 'd', tag: 'earn ' + d + 'd' };
+    } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t) !== 'rule: yes') {
+      h = { kind: 'rule', reason: 'owner rule', tag: 'owner rule' };
+    } else if (cap > 0 && out.kept >= cap) {
+      h = { kind: 'cap', reason: 'ticket cap ' + cap, tag: 'cap ' + cap };
+    }
+    if (h) {
+      h.index = i;
+      h.symbol = sym;
+      out.held.push(h);
+    } else {
+      out.kept++;
+    }
+  }
+  return out;
+}
+/** v1.20.0 [TICKET-GUARD] PURE: the status token (ASCII). observe: 'tguard:
+ * would hold SYM(tag) SYM(tag)' or 'tguard: would hold none'; enforce:
+ * 'tguard: held N (SYM tag, SYM tag)' or 'tguard: held 0'. */
+function dt10TicketGuardToken_(res, mode) {
+  var held = (res && res.held) || [];
+  var parts = [], i;
+  if (mode === 'enforce') {
+    for (i = 0; i < held.length; i++) parts.push(held[i].symbol + ' ' + held[i].tag);
+    return 'tguard: held ' + held.length +
+        (parts.length ? ' (' + parts.join(', ') + ')' : '');
+  }
+  for (i = 0; i < held.length; i++) parts.push(held[i].symbol + '(' + held[i].tag + ')');
+  return 'tguard: would hold ' + (parts.length ? parts.join(' ') : 'none');
+}
+/** v1.20.0 [TICKET-GUARD] PURE: seats the ENFORCED guard sent to the
+ * research path on this render (the _tguard_held marker); 0 while the
+ * guard is off or observing. */
+function dt10TicketGuardHeldCount_(selected) {
+  var n = 0, sel = selected || [];
+  for (var i = 0; i < sel.length; i++) {
+    if (sel[i] && typeof sel[i]._tguard_held === 'string') n++;
+  }
+  return n;
+}
+/** v1.20.0 [TICKET-GUARD]: enforce `res` (dt10TicketGuardCore_ on this
+ * board) through the EXISTING research / no-allocation path: each held
+ * ticket is marked _board_unfunded (the replay's own marker for a seat it
+ * did not fund) and dt10FinalizeBoard_ runs again -- Ticket SAR, shares and
+ * gains 0, entry / stop / TPs dashed, the research note, every KPI and the
+ * board_execution / cash-floor / candidate state recomputed over the
+ * remaining tickets. Funds From then reads 'Held -- <reason>' and the note
+ * '[held: <reason>] ' + the research-context tags the annotations had put
+ * on the ticket (DT10_TGUARD_TAGS_RE prefix, DT10_TGUARD_LIVE_RE suffix)
+ * around the research note. Every other seat's note is restored byte for
+ * byte (the re-finalization rewrites the notes of unfunded seats, which the
+ * annotations had already tagged). No ticket is resized and no freed cash
+ * is redistributed. Returns {before, after} executable counts; a rise
+ * throws. */
+function dt10TicketGuardApply_(payload, res) {
+  var sel = payload.selected || [];
+  var before = dt10TicketClasses_(sel).exec;
+  var heldAt = {}, keep = [], i, h, t, m;
+  for (i = 0; i < res.held.length; i++) heldAt[res.held[i].index] = true;
+  for (i = 0; i < sel.length; i++) {
+    t = sel[i];
+    if (!t || typeof t !== 'object' || heldAt[i] === true) continue;
+    keep.push({ t: t, has: Object.prototype.hasOwnProperty.call(t, 'advisor_note'),
+                note: t.advisor_note });
+  }
+  for (i = 0; i < res.held.length; i++) {
+    h = res.held[i];
+    t = sel[h.index];
+    var note = String(t.advisor_note === null || t.advisor_note === undefined ?
+        '' : t.advisor_note);
+    m = note.match(DT10_TGUARD_TAGS_RE);
+    h.pre = m ? m[1] : '';
+    m = note.match(DT10_TGUARD_LIVE_RE);
+    h.suf = m ? m[0] : '';
+    t._board_unfunded = true;
+    t._tguard_held = h.reason;
+  }
+  dt10FinalizeBoard_(payload);
+  for (i = 0; i < keep.length; i++) {
+    if (keep[i].has) keep[i].t.advisor_note = keep[i].note;
+    else delete keep[i].t.advisor_note;
+  }
+  for (i = 0; i < res.held.length; i++) {
+    h = res.held[i];
+    t = sel[h.index];
+    t.detail = t.detail || {};
+    t.detail.funds_from = 'Held \u2014 ' + h.reason;
+    t.advisor_note = '[held: ' + h.reason + '] ' + h.pre +
+        String(t.advisor_note === null || t.advisor_note === undefined ? '' : t.advisor_note) +
+        h.suf;
+  }
+  var after = dt10TicketClasses_(payload.selected || []).exec;
+  if (after > before) throw new Error('ticket guard raised the executable count');
+  return { before: before, after: after };
+}
+/** v1.20.0 [TICKET-GUARD]: render-side orchestrator, after the earnings
+ * annotations and before the KPI strip. '' when the refresh attached no
+ * payload._dt10_tguard (gate off -> nothing read, nothing touched, no key
+ * stored). Else decides on the earnings map of this render (the v1.6.0
+ * tagger's, so Calendar_Events is read once per render; read here only when
+ * the tagger did not run), applies under enforce, logs one Logger line and
+ * returns the status token; 'tguard: n/a' on a fault. */
+function dt10TicketGuard_(payload, map, ss) {
+  var tg = payload && payload._dt10_tguard;
+  if (!tg || typeof tg !== 'object' ||
+      (tg.mode !== 'observe' && tg.mode !== 'enforce')) return '';
+  try {
+    if (!map || typeof map !== 'object') map = dt10EarningsMap_(ss);
+    var feedOk = !!(payload._dt10_uv && payload._dt10_uv.state === 'EXECUTABLE');
+    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg);
+    var tail = '';
+    if (tg.mode === 'enforce' && res.held.length) {
+      var k = payload.kpis || {};
+      var unBefore = Number(k.capital_unallocated_sar) || 0;
+      var ap = dt10TicketGuardApply_(payload, res);
+      tail = ' | executable ' + ap.before + ' -> ' + ap.after + ', unallocated +' +
+          Math.round((Number((payload.kpis || {}).capital_unallocated_sar) || 0) - unBefore) +
+          ' SAR';
+    }
+    var parts = [];
+    for (var i = 0; i < res.held.length; i++) {
+      parts.push(res.held[i].symbol + '(' + res.held[i].tag + ')');
+    }
+    var cap = dt10StabInt_(tg.maxTickets, 0, 0, DT10_GUARD_MAX_TICKETS_MAX);
+    Logger.log('[DT10 v' + DT10_VERSION + '] ticket guard (' + tg.mode + '): ' +
+        (tg.mode === 'enforce' ? 'held ' : 'would hold ') + res.held.length + ' of ' +
+        res.checked + ' executable ticket(s)' + (parts.length ? ': ' + parts.join(' ') : '') +
+        ' | earnings <= ' + dt10StabInt_(tg.earnDays, DT10_GUARD_EARN_DAYS_DEF, 0,
+                                         DT10_GUARD_EARN_DAYS_MAX) + 'd, owner rule ' +
+        (tg.ownerRule === true ? 'on' : 'off') + ', cap ' + (cap > 0 ? cap : 'none') + tail);
+    return dt10TicketGuardToken_(res, tg.mode);
+  } catch (eTg) {
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] ticket guard FAILED: ' + eTg);
+    } catch (eLg) {}
+    return 'tguard: n/a';
+  }
+}
+/** v1.20.0 [KPI-PLAN-GAIN]: 'on' when DT10_KPI_PLAN_GAIN is exactly 'on'
+ * (trimmed, any case); else 'restore' when the marker
+ * DT10_KPI_PLAN_LABEL_STATE says an armed render relabelled the KPI (the
+ * next render writes the v1.19.0 label back), else 'off' (the v1.19.0 KPI
+ * strip). A fault reads off. Never throws. */
+function dt10KpiPlanGainMode_() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (String(props.getProperty(DT10_KPI_PLAN_GAIN_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on') return 'on';
+    return String(props.getProperty(DT10_KPI_PLAN_LABEL_PROP) || '') === 'tp1' ?
+        'restore' : 'off';
+  } catch (eKp) {}
+  return 'off';
+}
+/** v1.20.0 [KPI-PLAN-GAIN]: sets ('tp1') or deletes the label marker.
+ * Never throws. */
+function dt10KpiPlanLabelMark_(on) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (on) props.setProperty(DT10_KPI_PLAN_LABEL_PROP, 'tp1');
+    else props.deleteProperty(DT10_KPI_PLAN_LABEL_PROP);
+  } catch (eKm) {}
+}
+/** v1.20.0 [KPI-PLAN-GAIN] PURE: the plan payoff of the EXECUTABLE tickets
+ * (dt10TicketGuardExec_), sum Ticket SAR x (TP1 SAR / Price SAR - 1) rounded
+ * to SAR -- the figure each advisor note's '[f1b-observe] ... plan payoff'
+ * tag discloses -- or an em dash when no executable ticket carries a
+ * positive Price SAR and a positive TP1 SAR. */
+function dt10KpiPlanGain_(selected) {
+  var sel = selected || [], sum = 0, n = 0;
+  for (var i = 0; i < sel.length; i++) {
+    var t = sel[i];
+    if (!dt10TicketGuardExec_(t)) continue;
+    var px = Number(t.price_sar), tp1 = Number(t.tp1_sar);
+    if (!(isFinite(px) && px > 0 && isFinite(tp1) && tp1 > 0)) continue;
+    sum += Number(t.suggested_sar) * (tp1 / px - 1);
+    n++;
+  }
+  return n ? Math.round(sum) : '\u2014';
+}
+/** v1.20.0 [VENUE-LINE]: Script Property DT10_VENUE_LINE. Exactly 'on'
+ * (trimmed, any case) arms the banner line; anything else or a fault = off
+ * (the v1.19.0 banner). Never throws. */
+function dt10VenueLineOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_VENUE_LINE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eVl) {}
+  return false;
+}
+/** v1.20.0 [VENUE-LINE] PURE: the DT10_VENUES key of a symbol by suffix --
+ * .SR or four digits = SR, .US or no suffix = US, .L = L, .PA / .AS / .BR /
+ * .LS = EU, .DE = DE, .HK = HK, .T = T; '' for any other suffix (no line). */
+function dt10VenueOf_(symbol) {
+  var s = dt10NormSym_(symbol);
+  if (!s) return '';
+  if (/\.SR$/.test(s) || /^\d{4}$/.test(s)) return 'SR';
+  if (/\.US$/.test(s) || s.indexOf('.') < 0) return 'US';
+  if (/\.L$/.test(s)) return 'L';
+  if (/\.(PA|AS|BR|LS)$/.test(s)) return 'EU';
+  if (/\.DE$/.test(s)) return 'DE';
+  if (/\.HK$/.test(s)) return 'HK';
+  if (/\.T$/.test(s)) return 'T';
+  return '';
+}
+/** v1.20.0 [VENUE-LINE] PURE: is the venue-local calendar day `day`
+ * (integer UTC days since 1970-01-01) inside summer time under `rule` --
+ * 'us': from the second Sunday of March to the first Sunday of November;
+ * 'eu': from the last Sunday of March to the last Sunday of October;
+ * anything else: never. */
+function dt10VenueSummer_(rule, day) {
+  if (rule !== 'us' && rule !== 'eu') return false;
+  var y = new Date(day * 86400000).getUTCFullYear();
+  function sunday(month, nth) {   // nth >= 1: that Sunday; 0: the last one
+    var first = Math.floor(Date.UTC(y, month, 1) / 86400000);
+    if (nth > 0) return first + (7 - (((first % 7) + 11) % 7)) % 7 + (nth - 1) * 7;
+    var last = Math.floor(Date.UTC(y, month + 1, 0) / 86400000);
+    return last - (((last % 7) + 11) % 7);
+  }
+  if (rule === 'us') return day >= sunday(2, 2) && day < sunday(10, 1);
+  return day >= sunday(2, 0) && day < sunday(9, 0);
+}
+/** v1.20.0 [VENUE-LINE] PURE: the regular session of venue `v` (a
+ * DT10_VENUES entry) on its local calendar day `day` (integer UTC days) as
+ * {open, close} epoch ms, or null on a day it does not trade. */
+function dt10VenueSession_(v, day) {
+  var dow = ((day % 7) + 11) % 7;   // 0 = Sunday (dt10WeekdaysBetween_)
+  if (v.sunThu === true ? dow > 4 : (dow < 1 || dow > 5)) return null;
+  var off = v.utc + (dt10VenueSummer_(v.dst, day) ? 60 : 0);
+  return { open: day * 86400000 + (v.open - off) * 60000,
+           close: day * 86400000 + (v.close - off) * 60000 };
+}
+/** v1.20.0 [VENUE-LINE] PURE: 'HH:MM' in Riyadh (UTC+3, no summer time) of
+ * `ms`, with the weekday in front when it is not the Riyadh day of nowMs. */
+function dt10RiyadhClock_(ms, nowMs) {
+  var a = new Date(ms + 10800000), b = new Date(nowMs + 10800000);
+  var hm = a.toISOString().slice(11, 16);
+  if (a.toISOString().slice(0, 10) === b.toISOString().slice(0, 10)) return hm;
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][a.getUTCDay()] + ' ' + hm;
+}
+/** v1.20.0 [VENUE-LINE] PURE: ' \u2014 <venue> opens HH:MM Riyadh[, ...]
+ * (feed valid until HH:MM)' for the venues of the EXECUTABLE tickets
+ * (dt10TicketGuardExec_) whose next regular session opens after the feed
+ * expires, earliest first; '' when the verdict is not EXECUTABLE or its age
+ * is unknown, or when every such venue is open now or opens before the
+ * expiry. The expiry is the cockpit's own clock: DT10_UV_MAX_AGE_MIN after
+ * the verdict stamp = nowMs + (DT10_UV_MAX_AGE_MIN - ageMin) minutes.
+ * Display only. */
+function dt10VenueLine_(selected, uv, nowMs) {
+  if (!uv || uv.state !== 'EXECUTABLE' || typeof uv.ageMin !== 'number' ||
+      !isFinite(uv.ageMin) || typeof nowMs !== 'number' || !isFinite(nowMs)) return '';
+  var expiry = nowMs + (DT10_UV_MAX_AGE_MIN - uv.ageMin) * 60000;
+  var today = Math.floor(nowMs / 86400000);
+  var sel = selected || [], seen = {}, hits = [];
+  for (var i = 0; i < sel.length; i++) {
+    if (!dt10TicketGuardExec_(sel[i])) continue;
+    var key = dt10VenueOf_(sel[i].symbol);
+    if (!key || seen[key] === true) continue;
+    seen[key] = true;
+    var v = DT10_VENUES[key], next = null;
+    for (var d = today - 1; d <= today + 8 && next === null; d++) {
+      var s = dt10VenueSession_(v, d);
+      if (s && s.close > nowMs) next = s;
+    }
+    if (next && next.open > nowMs && next.open > expiry) {
+      hits.push({ at: next.open, name: v.name });
+    }
+  }
+  if (!hits.length) return '';
+  hits.sort(function (a, b) { return a.at - b.at; });
+  var parts = [];
+  for (var j = 0; j < hits.length; j++) {
+    parts.push(hits[j].name + ' opens ' + dt10RiyadhClock_(hits[j].at, nowMs) + ' Riyadh');
+  }
+  return ' \u2014 ' + parts.join(', ') + ' (feed valid until ' +
+      dt10RiyadhClock_(expiry, nowMs) + ')';
+}
 var DT10_KPI_LABELS = ['Entered cash (SAR)', 'Exp. Gain 12M (SAR)', 'Selected',
   'Blended Reliability', 'Blended R/R (TP2)', 'Scanned', 'Passed',
   'Unallocated (SAR)',
@@ -6616,10 +7124,15 @@ function dt10SelectedTitle_(payload, showFeed) {
     return t && t._ft_suspended === true && t._grace_hold !== true;
   }).length;
   var researchN = Math.max(0, cls.suspended - fastN);
+  // v1.20.0 [TICKET-GUARD]: tickets the enforced guard sent to the research
+  // path are counted apart (0 while the guard is off or observing).
+  var guardN = dt10TicketGuardHeldCount_(selected);
+  researchN = Math.max(0, researchN - guardN);
   var title = 'SELECTED — ' + execN + ' EXECUTABLE TICKET' + (execN === 1 ? '' : 'S') +
       (fastN > 0 ? ' + ' + fastN + ' FAST-TRACK (SIZING SUSPENDED)' : '') +
       (researchN > 0 ? ' + ' + researchN + ' RESEARCH (NO ALLOCATION)' : '') +
       (cls.grace > 0 ? ' + ' + cls.grace + ' GRACE-HELD (NO PLAN TODAY)' : '');
+  if (guardN > 0) title += ' + ' + guardN + ' HELD BY GUARD';   // v1.20.0
   var uv = p._dt10_uv || {};
   if (showFeed && uv.state !== 'EXECUTABLE') {
     var qualN = cls.exec + cls.suspended;
@@ -6684,7 +7197,7 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
-/** v1.19.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
+/** v1.20.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
  * case) arms the held-seat hand-off; absent or any other word is off. A
  * property-service failure reads as OFF: the list is display context only,
  * so failing open keeps the unarmed request. Memoized (P-202). */
@@ -6699,7 +7212,7 @@ function dt10AuditKeepOn_() {
     } catch (eProp) { return false; }
   });
 }
-/** v1.19.1 PURE: the stability members (member === true: seated, grace-held
+/** v1.20.1 PURE: the stability members (member === true: seated, grace-held
  * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at
  * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */
 function dt10AuditKeepSymbols_(state) {
@@ -8787,6 +9300,13 @@ function dt10RefreshDecisionTop10Run_(run) {
   // => nothing is attached to the payload and the render is v1.18.0.
   var liveOn = dt10SeatLiveFillOn_();
   var ruleOn = dt10OwnerRuleMarkOn_();
+  // v1.20.0 [TICKET-GUARD] / [KPI-PLAN-GAIN] / [VENUE-LINE]: one read per
+  // gate (the guard's knobs only while it is armed; the KPI label marker
+  // only while the KPI gate is not on); off (default) => nothing is
+  // attached to the payload and the render is v1.19.0.
+  var tguardCfg = dt10TicketGuardConfig_();
+  var kpiPlanMode = dt10KpiPlanGainMode_();
+  var venueOn = dt10VenueLineOn_();
   if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
@@ -8881,7 +9401,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
-  // v1.19.1: held seats kept in the backend's written audit (display only).
+  // v1.20.1: held seats kept in the backend's written audit (display only).
   if (dt10AuditKeepOn_()) {
     try {
       var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());
@@ -8952,6 +9472,12 @@ function dt10RefreshDecisionTop10Run_(run) {
   }
   // v1.19.0 [OWNER-RULE]: the marker column rides only when armed.
   if (ruleOn) payload._dt10_rule = { mode: 'on' };
+  // v1.20.0: the three gates ride only when armed (off => the payload object
+  // is byte-identical); the label marker is set before a relabelling render.
+  if (tguardCfg) payload._dt10_tguard = tguardCfg;
+  if (kpiPlanMode !== 'off') payload._dt10_kpi_plan = { mode: kpiPlanMode };
+  if (kpiPlanMode === 'on') dt10KpiPlanLabelMark_(true);
+  if (venueOn) payload._dt10_venue = { mode: 'on' };
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   // Incomplete source evidence must not advance confirmation/miss memory.
   var stab = payload._dt10_uv.source_blocked === true ?
@@ -8977,6 +9503,9 @@ function dt10RefreshDecisionTop10Run_(run) {
   // v1.19.0: status tokens the render stored ('' when a gate is off).
   var liveNote = payload._dt10_live_note || '';
   var ruleNote = payload._dt10_rule_note || '';
+  // v1.20.0: the guard's status token; a restored KPI label clears the marker.
+  var tguardNote = payload._dt10_tguard_note || '';
+  if (kpiPlanMode === 'restore') dt10KpiPlanLabelMark_(false);
   var finalSource = payload._dt10_uv.source_readiness;
   if (pool) poolNote = dt10PoolNote_(pool, finalSource);
   else poolNote += ' | source readiness ' + (finalSource.ready ? 'VERIFIED (run ' + finalSource.cohort + ')' : 'WITHHELD: ' + finalSource.reason);
@@ -8996,6 +9525,7 @@ function dt10RefreshDecisionTop10Run_(run) {
       (vintNote ? ' | ' + vintNote : '') +
       (liveNote ? ' | ' + liveNote : '') +               // v1.19.0 [SEAT-LIVE-FILL]
       (ruleNote ? ' | ' + ruleNote : '') +               // v1.19.0 [OWNER-RULE]
+      (tguardNote ? ' | ' + tguardNote : '') +           // v1.20.0 [TICKET-GUARD]
       dt10FunnelNote_(payload) + ' | ' + secs + 's',
       dt10OutputStatus_(payload));   // v1.11.0 (2)
   // v1.3.1: the cockpit OWNS the selection audit trail — log the board it
@@ -9243,6 +9773,11 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // DT10_POST_EARN is off -> no sheet read, earn and every note untouched).
   var postEarn = dt10PostEarnAnnotate_(payload, sheet.getParent());
   if (postEarn) earn.note = earn.note ? earn.note + ' | ' + postEarn : postEarn;
+  // v1.20.0 [TICKET-GUARD]: after the annotations and before the KPI strip
+  // ('' when the refresh attached no payload._dt10_tguard -> nothing read,
+  // nothing touched, no key stored).
+  var tguardNote = dt10TicketGuard_(payload, earn && earn.map, sheet.getParent());
+  if (tguardNote) payload._dt10_tguard_note = tguardNote;
   // KPI strip
   sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
@@ -9253,6 +9788,16 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   if (dt10SeatTruthOn_()) {   // v1.11.12 [P-149]
     var _stKpi = dt10SeatTruthKpi_(payload);
     if (_stKpi) sheet.getRange(DT10_ROW_KPI_VALUES, 3).setValue(_stKpi);
+  }
+  // v1.20.0 [KPI-PLAN-GAIN]: on -> the KPI pair 'Exp. Gain TP1 (SAR)' = the
+  // plan payoff of the executable tickets (after the guard); restore -> the
+  // v1.19.0 label written back once after a rollback; no key = v1.19.0.
+  var _kp = payload._dt10_kpi_plan;
+  if (_kp && _kp.mode === 'on') {
+    sheet.getRange(DT10_ROW_KPI_LABELS, 2).setValue(DT10_KPI_PLAN_GAIN_LABEL);
+    sheet.getRange(DT10_ROW_KPI_VALUES, 2).setValue(dt10KpiPlanGain_(payload.selected));
+  } else if (_kp && _kp.mode === 'restore') {
+    sheet.getRange(DT10_ROW_KPI_LABELS, 2).setValue(DT10_KPI_LABELS[1]);
   }
   var kpiFmts = [DT10_FMT_SAR, DT10_FMT_SAR, '@', '0.0', '0.00',
                  DT10_FMT_INT, DT10_FMT_INT, DT10_FMT_SAR];
@@ -9290,6 +9835,11 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // The upstream token may label input readiness but never invent a ticket.
   var dt10Uv = payload._dt10_uv;
   var dt10SelTitle = dt10SelectedTitle_(payload, dt10UvOn_() || dt10Uv.source_blocked === true);
+  // v1.20.0 [VENUE-LINE]: display only; '' unless a venue of an executable
+  // ticket opens after the feed expires (no payload key = v1.19.0 banner).
+  if (payload._dt10_venue && payload._dt10_venue.mode === 'on') {
+    dt10SelTitle += dt10VenueLine_(payload.selected || [], dt10Uv, new Date().getTime());
+  }
   if (dt10UvOn_()) {
     Logger.log('[DT10 v' + DT10_VERSION + '] upstream verdict: ' +
         (dt10Uv.state === 'EXECUTABLE' ? 'EXECUTABLE' : dt10Uv.reason) +
@@ -10730,6 +11280,145 @@ function dt10SelfTest() {
         dt10OwnerRuleCell_(null) === 'rule: no (conf unknown; ROI unknown)')
        ? 'ok (High + ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' = yes; the failing part is named)'
        : 'FAIL [' + orCells.join('|') + ']'));
+  /* v1.20.0 [TICKET-GUARD]: property line (one read; the knobs only while
+     armed) + pure battery on a five-seat board -- A High ROI 30 earnings in
+     0d, B Medium 20, C High 31 earnings in 5d, D High 25, E research (no
+     plan, earnings in 1d): earnings 3 holds A; 5 holds A and C; the owner
+     rule adds B; cap 1 keeps B only; a withheld feed holds nothing. When
+     allocation is enabled the enforce path runs through the REAL
+     dt10FinalizeBoard_: A Ticket 0 / 'Held -- earnings in 0d' / '[held:
+     earnings in 0d] ' + its earnings tag + the research note, unallocated
+     +1,000, three tickets left, B / C / D / E byte-identical. */
+  var tgCfgNow = dt10TicketGuardConfig_();
+  function tgBoard() {
+    function seat(sym, rank, sar, band, roi, tp1) {
+      return { symbol: sym, rank: rank, suggested_sar: sar, suggested_shares: sar / 100,
+               price_sar: 100, tp1_sar: tp1, stop_sar: 90, tp2_sar: tp1 + 10,
+               entry_zone: '99-101 SAR', exp_gain_12m_sar: sar / 2, confidence_band: band,
+               engine_roi_pct: roi, reliability: 80, _stab_status: 'ACTIVE (day 3)',
+               advisor_note: 'INVEST ' + sym, detail: { funds_from: 'Cash', rr_tp2: 2 } };
+    }
+    var tgRes = seat('E.US', 5, 0, 'High', 20, 110);
+    tgRes._board_unfunded = true;
+    return [seat('A.US', 1, 1000, 'High', 30, 120), seat('B.US', 2, 2000, 'Medium', 20, 110),
+            seat('C.US', 3, 3000, 'High', 31, 115), seat('D.US', 4, 4000, 'High', 25, 105),
+            tgRes];
+  }
+  var tgMap = { 'A.US': 0, 'C.US': 5, 'E.US': 1 };
+  function tgSyms(r) {
+    var tgOut = [];
+    for (var tgi = 0; tgi < r.held.length; tgi++) {
+      tgOut.push(r.held[tgi].symbol + ':' + r.held[tgi].kind);
+    }
+    return tgOut.join(',') + '/' + r.checked + '/' + r.kept;
+  }
+  var tgE = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3 });
+  var tgE5 = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 5 });
+  var tgR = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3, ownerRule: true });
+  var tgC = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3, maxTickets: 1 });
+  var tgW = dt10TicketGuardCore_(tgBoard(), false, tgMap, { earnDays: 30, maxTickets: 1 });
+  var tgApply = 'apply skipped (DT10_BOARD_FUNDING_MODE research)';
+  if (dt10BoardFundingMode_() === 'enabled') {
+    var tgPay = { version: 'st', selected: tgBoard(), kpis: { deployable_sar: 12000 },
+                  candidates_rows: [], alerts: [], near_miss: [],
+                  meta: { board_funding: { contract_version: 1, stage: 'allocate',
+                                           finalized: true, allocation_version: 'st',
+                                           eligible_symbols: ['A.US', 'B.US', 'C.US',
+                                                              'D.US', 'E.US'] } },
+                  _dt10_uv: { state: 'EXECUTABLE' } };
+    dt10FinalizeBoard_(tgPay);
+    tgPay.selected[0].advisor_note = '\u26a0 earnings \u22640d \u00b7 ' +
+        tgPay.selected[0].advisor_note;
+    tgPay.selected[4].advisor_note = '\u26a0 earnings \u22641d \u00b7 ' +
+        tgPay.selected[4].advisor_note;
+    var tgKeep = JSON.stringify(tgPay.selected.slice(1));
+    var tgUn0 = tgPay.kpis.capital_unallocated_sar;
+    var tgAp = dt10TicketGuardApply_(tgPay, dt10TicketGuardCore_(tgPay.selected, true, tgMap,
+                                                                 { earnDays: 3 }));
+    var tgA = tgPay.selected[0];
+    tgApply = (tgAp.before === 4 && tgAp.after === 3 && tgA.suggested_sar === 0 &&
+        tgA.suggested_shares === 0 && tgA.stop_sar === '\u2014' && tgA.tp1_sar === '\u2014' &&
+        tgA.detail.funds_from === 'Held \u2014 earnings in 0d' &&
+        tgA.advisor_note === '[held: earnings in 0d] \u26a0 earnings \u22640d \u00b7 ' +
+            'Research seat \u2014 no executable allocation today. ACTIVE (day 3)' &&
+        tgPay.kpis.capital_unallocated_sar === tgUn0 + 1000 &&
+        tgPay.kpis.fundable_now === 3 && tgPay.kpis.selected_count === 3 &&
+        JSON.stringify(tgPay.selected.slice(1)) === tgKeep &&
+        dt10TicketGuardHeldCount_(tgPay.selected) === 1 &&
+        dt10SelectedTitle_(tgPay, false).indexOf(
+            '3 EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 1 HELD BY GUARD') > 0) ?
+        'apply ok' : 'apply FAIL';
+  }
+  report.push('ticket guard (DT10_TICKET_GUARD): ' +
+      (tgCfgNow ? tgCfgNow.mode + ' [earnings <= ' + tgCfgNow.earnDays + 'd, owner rule ' +
+                  (tgCfgNow.ownerRule ? 'on' : 'off') + ', cap ' +
+                  (tgCfgNow.maxTickets > 0 ? tgCfgNow.maxTickets : 'none') + ']' : 'off') +
+      ' (off = v1.19.0 board; observe names; enforce holds) | core: ' +
+      ((tgSyms(tgE) === 'A.US:earn/4/3' && tgSyms(tgE5) === 'A.US:earn,C.US:earn/4/2' &&
+        tgSyms(tgR) === 'A.US:earn,B.US:rule/4/2' &&
+        tgSyms(tgC) === 'A.US:earn,C.US:cap,D.US:cap/4/1' && tgSyms(tgW) === '/0/0' &&
+        dt10TicketGuardToken_(tgR, 'enforce') ===
+            'tguard: held 2 (A.US earn 0d, B.US owner rule)' &&
+        dt10TicketGuardToken_(tgC, 'observe') ===
+            'tguard: would hold A.US(earn 0d) C.US(cap 1) D.US(cap 1)' &&
+        dt10TicketGuardToken_(tgW, 'observe') === 'tguard: would hold none' &&
+        dt10TicketGuardToken_(tgW, 'enforce') === 'tguard: held 0' &&
+        dt10TicketGuard_({ selected: tgBoard() }, tgMap, null) === '' &&
+        tgApply !== 'apply FAIL')
+       ? 'ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; ' + tgApply + ')'
+       : 'FAIL [' + tgSyms(tgE) + ' | ' + tgSyms(tgR) + ' | ' + tgSyms(tgC) + ' | ' +
+         tgApply + ']'));
+  /* v1.20.0 [KPI-PLAN-GAIN]: property line (the gate, and the label marker
+     while the gate is not on) + the pure sum on the same board: 1000 x 0.20
+     + 2000 x 0.10 + 3000 x 0.15 + 4000 x 0.05 = 1,050 SAR (E has no plan);
+     no executable ticket, or none with a usable TP1, = an em dash. */
+  var kpModeNow = dt10KpiPlanGainMode_();
+  var kpNoTp1 = tgBoard();
+  for (var kpi1 = 0; kpi1 < kpNoTp1.length; kpi1++) kpNoTp1[kpi1].tp1_sar = '\u2014';
+  report.push('kpi plan gain (DT10_KPI_PLAN_GAIN): ' +
+      (kpModeNow === 'restore' ? 'off (label restore pending)' : kpModeNow) +
+      ' (' + DT10_KPI_PLAN_GAIN_LABEL + ' = sum Ticket SAR x (TP1 SAR / Price SAR - 1); ' +
+      'off = v1.19.0 KPI) | core: ' +
+      ((dt10KpiPlanGain_(tgBoard()) === 1050 && dt10KpiPlanGain_([]) === '\u2014' &&
+        dt10KpiPlanGain_([tgBoard()[4]]) === '\u2014' && dt10KpiPlanGain_(kpNoTp1) === '\u2014' &&
+        dt10KpiPlanGain_(null) === '\u2014')
+       ? 'ok (four tickets 1050 SAR; no ticket = em dash)'
+       : 'FAIL [' + dt10KpiPlanGain_(tgBoard()) + ']'));
+  /* v1.20.0 [VENUE-LINE]: property line + the pure line at the 2 Nov 2026
+     08:49:43 render (verdict age 367.5m): US opens 17:30 Riyadh, the feed
+     is valid until 10:42; London 11:00 comes first; US summer time 16:30
+     (26 Oct); a Tadawul Sunday 10:00; a Friday-night board names Monday;
+     a venue open now, a withheld feed, an unknown age or an unsized ticket
+     give nothing. */
+  var vlNow = Date.UTC(2026, 10, 2, 5, 49, 43);
+  var vlUv = { state: 'EXECUTABLE', ageMin: 367.5 };
+  function vlT(sym, sar) {
+    return { symbol: sym, suggested_sar: sar === undefined ? 1000 : sar,
+             suggested_shares: sar === undefined ? 10 : sar };
+  }
+  var vl1 = dt10VenueLine_([vlT('CRC.US'), vlT('EFC.US')], vlUv, vlNow);
+  var vl2 = dt10VenueLine_([vlT('CRC.US'), vlT('BBOX.L')], vlUv, vlNow);
+  var vlSummer = dt10VenueLine_([vlT('CRC.US')], vlUv, Date.UTC(2026, 9, 26, 5, 49, 43));
+  var vlSr = dt10VenueLine_([vlT('2222.SR')], { state: 'EXECUTABLE', ageMin: 400 },
+                            Date.UTC(2026, 10, 1, 5, 0, 0));
+  var vlWk = dt10VenueLine_([vlT('CRC.US')], { state: 'EXECUTABLE', ageMin: 0 },
+                            Date.UTC(2026, 9, 30, 21, 30, 0));
+  report.push('venue line (DT10_VENUE_LINE): ' + (dt10VenueLineOn_() ? 'on' : 'off') +
+      ' (approximate regular sessions in Riyadh time, no holidays; display only) | core: ' +
+      ((vl1 === ' \u2014 US opens 17:30 Riyadh (feed valid until 10:42)' &&
+        vl2 === ' \u2014 London opens 11:00 Riyadh, US opens 17:30 Riyadh (feed valid until 10:42)' &&
+        vlSummer === ' \u2014 US opens 16:30 Riyadh (feed valid until 10:42)' &&
+        vlSr === ' \u2014 Tadawul opens 10:00 Riyadh (feed valid until 09:20)' &&
+        vlWk === ' \u2014 US opens Mon 17:30 Riyadh (feed valid until 08:30)' &&
+        dt10VenueLine_([vlT('CRC.US')], vlUv, Date.UTC(2026, 10, 2, 15, 0, 0)) === '' &&
+        dt10VenueLine_([vlT('CRC.US')], { state: 'NOT_ACTIONABLE', ageMin: 10 }, vlNow) === '' &&
+        dt10VenueLine_([vlT('CRC.US')], { state: 'EXECUTABLE', ageMin: null }, vlNow) === '' &&
+        dt10VenueLine_([vlT('CRC.US', 0)], vlUv, vlNow) === '' &&
+        dt10VenueOf_('1120') === 'SR' && dt10VenueOf_('BRK-B') === 'US' &&
+        dt10VenueOf_('MC.PA') === 'EU' && dt10VenueOf_('X.TO') === '')
+       ? 'ok (US 17:30 winter / 16:30 summer, London 11:00, Tadawul Sun 10:00, ' +
+         'Friday night -> Mon; open now / withheld / unsized = none)'
+       : 'FAIL [' + vl1 + ' | ' + vl2 + ' | ' + vlSummer + ' | ' + vlSr + ' | ' + vlWk + ']'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

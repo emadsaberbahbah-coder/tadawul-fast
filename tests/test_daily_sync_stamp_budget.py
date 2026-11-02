@@ -99,7 +99,11 @@ def test_b1_every_stamp_job_maps_the_budget():
 
 
 def test_b1_header_names_the_version():
-    head = WORKFLOW.read_text(encoding="utf-8").splitlines()[:6]
+    # The header block is every comment line before the first trigger key;
+    # daily_sync.yml 1.0.9 (2026-11-02, sync-render handshake) added a
+    # longer entry above 1.0.8, so the entry is no longer in the first 6 lines.
+    text = WORKFLOW.read_text(encoding="utf-8")
+    head = text.split("\non:\n", 1)[0].splitlines()
     assert any(l.startswith("# VERSION 1.0.7 (2026-10-28)") for l in head)
 
 

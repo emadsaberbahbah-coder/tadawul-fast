@@ -1,0 +1,1136 @@
+{
+ "about": "Live board of Mon 2 Nov 2026 (Top_10_Investments cockpit 08:49 Riyadh, v2 build 09:24) as read by the owner, for tests/test_dp2_v1231_engine_tickets.js. Ten seats: six ACTIVE engine tickets (Ticket SAR 12,199 / 12,334 / 8,527 / 12,133 / 11,467 / 12,335 = 68,995 SAR, Funds From Cash N SAR), OLP.US ACTIVE research (Ticket 0, Research - no allocation), BBOX.L / KB.US / 2020.HK GRACE. B2 carries stab[strict]. Seat header on row 19. The feed value follows the release_decision_feed.py grammar (run= / expires=). Cash 72,747 SAR; holdings 19,253 SAR (FRST.US 174 sh, 5023.SR sukuk) -> NAV 92,000, PF 10% floor 9,200, deployable 63,547.",
+ "frozen_now": "2026-11-02T06:24:00Z",
+ "run": "41363258387",
+ "top10": {
+  "title": "TOP 10 INVESTMENTS — Decision Cockpit",
+  "status": "Last run 2026-11-02 08:49:07 | status: ok | output: EXECUTABLE | route v3.31.0 | builder v1.27.5 | pool=sheets/4512 | funding=final/6exec | 61342ms | sheets pool 4512 rows [ML 247, GM 1803, CF 38, MF 2424] (12 duplicate symbols removed) | stab[strict]: 3 grace, confirm=qualified | epoch=2026-11-02/feed | earn ⚠1/10",
+  "panel": [
+   [
+    "T10: Max Selected",
+    10,
+    "T10: Max Per Sector",
+    2,
+    "T10: Max Per Market",
+    10
+   ],
+   [
+    "T10: Required ROI %",
+    12,
+    "T10: Max Weight %",
+    15,
+    "T10: Min Reliability",
+    70
+   ],
+   [
+    "Cash Available (SAR)",
+    72747,
+    "Pending Proceeds (SAR)",
+    0,
+    "T10: Stability Enabled",
+    "Yes"
+   ],
+   [
+    "T10: Stability Confirm Days",
+    3,
+    "T10: Stability Exit Days",
+    3,
+    "T10: Stability Rank Buffer",
+    15
+   ],
+   [
+    "Pool Source",
+    "sheets",
+    "T10: Stability Smooth Days",
+    5,
+    "T10: Min DQ",
+    80
+   ]
+  ],
+  "kpi_labels": [
+   "Entered cash (SAR)",
+   "Exp. Gain 12M (SAR)",
+   "Selected",
+   "Blended Reliability",
+   "Blended R/R (TP2)",
+   "Scanned",
+   "Passed",
+   "Unallocated (SAR)",
+   "Fundable Now",
+   "By Rotation",
+   "Capital Call (SAR)"
+  ],
+  "kpi_values": [
+   72747,
+   17591,
+   6,
+   73.8,
+   2.31,
+   4512,
+   14,
+   3752,
+   6,
+   0,
+   0
+  ],
+  "banner": "✅ FEED ACTIONABLE — EXECUTABLE (verdict age 247m) — SELECTED — 6 EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN TODAY)",
+  "seat_headers": [
+   "Rank",
+   "Symbol",
+   "Name",
+   "Market",
+   "Sector",
+   "Ccy",
+   "FX→SAR",
+   "Price",
+   "Price SAR",
+   "Entry Zone",
+   "Ticket SAR",
+   "Shares",
+   "Stop SAR",
+   "TP1 SAR",
+   "TP2 SAR",
+   "ROI % (TP1)",
+   "Engine ROI % (12M)",
+   "Ann ROI %",
+   "Gain 12M SAR",
+   "Rel",
+   "DQ",
+   "Conf",
+   "Funds From",
+   "Review By",
+   "Stability",
+   "Days",
+   "Since",
+   "Sm Score",
+   "Trend",
+   "Advisor Note"
+  ],
+  "seats": [
+   [
+    1,
+    "ITRN.US",
+    "Ituran Location and Control Ltd",
+    "NYSE/NASDAQ",
+    "Technology",
+    "USD",
+    3.75,
+    38.73,
+    145.24,
+    "141.6–148.9",
+    12199,
+    84,
+    133.62,
+    160.93,
+    176.61,
+    10.8,
+    24.1,
+    46.9,
+    2940,
+    76.5,
+    100,
+    "Medium",
+    "Cash 12,199 SAR",
+    "2026-12-02",
+    "ACTIVE (day 6)",
+    6,
+    "2026-10-28",
+    88.4,
+    "steady",
+    "INVEST — 12,199 SAR (84 sh) · earnings ≤ 9d"
+   ],
+   [
+    2,
+    "DDI.US",
+    "DoubleDown Interactive Co Ltd",
+    "NYSE/NASDAQ",
+    "Communication Services",
+    "USD",
+    3.75,
+    10.68,
+    40.05,
+    "39.0–41.1",
+    12334,
+    308,
+    36.85,
+    43.89,
+    47.74,
+    9.6,
+    30.7,
+    40.3,
+    3786,
+    71.5,
+    100,
+    "Medium",
+    "Cash 12,334 SAR",
+    "2026-12-02",
+    "ACTIVE (day 9)",
+    9,
+    "2026-10-25",
+    86.9,
+    "improving",
+    "INVEST — 12,334 SAR (308 sh)"
+   ],
+   [
+    3,
+    "CRC.US",
+    "California Resources Corp",
+    "NYSE/NASDAQ",
+    "Energy",
+    "USD",
+    3.75,
+    49.43,
+    185.36,
+    "180.7–190.0",
+    8527,
+    46,
+    170.53,
+    201.86,
+    218.35,
+    8.9,
+    22.4,
+    37.6,
+    1910,
+    74,
+    100,
+    "High",
+    "Cash 8,527 SAR",
+    "2026-12-02",
+    "ACTIVE (day 5)",
+    5,
+    "2026-10-29",
+    85.7,
+    "steady",
+    "INVEST — 8,527 SAR (46 sh)"
+   ],
+   [
+    4,
+    "GLPI.US",
+    "Gaming and Leisure Properties Inc",
+    "NYSE/NASDAQ",
+    "Real Estate",
+    "USD",
+    3.75,
+    46.22,
+    173.32,
+    "169.0–177.7",
+    12133,
+    70,
+    159.45,
+    187.01,
+    200.7,
+    7.9,
+    19.8,
+    33.4,
+    2402,
+    78,
+    100,
+    "High",
+    "Cash 12,133 SAR",
+    "2026-12-02",
+    "ACTIVE (day 7)",
+    7,
+    "2026-10-27",
+    85.1,
+    "steady",
+    "INVEST — 12,133 SAR (70 sh) · 52W near low"
+   ],
+   [
+    5,
+    "EFC.US",
+    "Ellington Financial Inc",
+    "NYSE/NASDAQ",
+    "Financial Services",
+    "USD",
+    3.75,
+    12.79,
+    47.96,
+    "46.8–49.2",
+    11467,
+    239,
+    44.12,
+    51.89,
+    55.83,
+    8.2,
+    21.0,
+    34.6,
+    2408,
+    72,
+    100,
+    "Medium",
+    "Cash 11,467 SAR",
+    "2026-12-02",
+    "ACTIVE (day 4)",
+    4,
+    "2026-10-30",
+    84.6,
+    "improving",
+    "INVEST — 11,467 SAR (239 sh)"
+   ],
+   [
+    6,
+    "INDV.US",
+    "Indivior PLC",
+    "NYSE/NASDAQ",
+    "Healthcare",
+    "USD",
+    3.75,
+    23.33,
+    87.49,
+    "85.3–89.7",
+    12335,
+    141,
+    80.49,
+    97.46,
+    107.44,
+    11.4,
+    33.6,
+    48.0,
+    4145,
+    70.5,
+    95,
+    "Medium",
+    "Cash 12,335 SAR",
+    "2026-12-02",
+    "ACTIVE (day 3)",
+    3,
+    "2026-10-31",
+    84.2,
+    "improving",
+    "INVEST — 12,335 SAR (141 sh)"
+   ],
+   [
+    7,
+    "OLP.US",
+    "One Liberty Properties Inc",
+    "NYSE/NASDAQ",
+    "Real Estate",
+    "USD",
+    3.75,
+    21.86,
+    81.98,
+    "—",
+    0,
+    0,
+    "—",
+    "—",
+    "—",
+    7.1,
+    17.2,
+    29.8,
+    0,
+    73,
+    100,
+    "Medium",
+    "Research — no allocation",
+    "2026-12-02",
+    "ACTIVE (day 2)",
+    2,
+    "2026-11-01",
+    83.9,
+    "steady",
+    "Research seat — no executable allocation today. ACTIVE (day 2)"
+   ],
+   [
+    "—",
+    "BBOX.L",
+    "Tritax Big Box REIT plc",
+    "LSE",
+    "Real Estate",
+    "GBp",
+    0.0505,
+    151.4,
+    7.65,
+    "—",
+    0,
+    0,
+    "—",
+    "—",
+    "—",
+    9.0,
+    18.5,
+    31.0,
+    0,
+    "",
+    "",
+    "",
+    "Research — no allocation",
+    "",
+    "GRACE (1/3 missed)",
+    10,
+    "2026-10-24",
+    84.2,
+    "declining",
+    "Stability grace hold (1/3 missed) — sizing suspended until it re-qualifies."
+   ],
+   [
+    "—",
+    "KB.US",
+    "KB Financial Group Inc",
+    "NYSE/NASDAQ",
+    "Financial Services",
+    "USD",
+    3.75,
+    71.2,
+    267.0,
+    "—",
+    0,
+    0,
+    "—",
+    "—",
+    "—",
+    8.4,
+    20.6,
+    33.9,
+    0,
+    72.5,
+    100,
+    "Medium",
+    "Research — no allocation",
+    "",
+    "GRACE (0/3 missed)",
+    12,
+    "2026-10-22",
+    83.1,
+    "steady",
+    "GRACE (0/3 missed) — re-qualifying seat; sizing suspended until the day-advance clock clears (a grace hold is not an executable ticket)."
+   ],
+   [
+    "—",
+    "2020.HK",
+    "ANTA Sports Products Ltd",
+    "HKEX",
+    "Consumer Cyclical",
+    "HKD",
+    0.482,
+    88.65,
+    42.73,
+    "—",
+    0,
+    0,
+    "—",
+    "—",
+    "—",
+    10.1,
+    26.4,
+    42.0,
+    0,
+    70,
+    95,
+    "Medium",
+    "Research — no allocation",
+    "",
+    "GRACE (2/3 missed)",
+    8,
+    "2026-10-26",
+    82.7,
+    "declining",
+    "Stability grace hold (2/3 missed) — sizing suspended until it re-qualifies."
+   ]
+  ],
+  "alerts": [
+   [
+    "earnings_window",
+    1,
+    "ITRN.US reports in 9 days — size accordingly"
+   ]
+  ],
+  "qualified_headers": [
+   "Rank",
+   "Symbol",
+   "Name",
+   "Sector",
+   "Score",
+   "ROI % (TP1)",
+   "Engine ROI % (12M)",
+   "Ann ROI %",
+   "R/R (TP2)",
+   "Rel",
+   "DQ",
+   "Risk",
+   "Why Not Selected"
+  ],
+  "qualified": [
+   [
+    1,
+    "ITRN.US",
+    "Ituran Location and Control Ltd",
+    "Technology",
+    88.4,
+    10.8,
+    24.1,
+    46.9,
+    2.35,
+    76.5,
+    100,
+    "Medium",
+    "selected"
+   ],
+   [
+    2,
+    "DDI.US",
+    "DoubleDown Interactive Co Ltd",
+    "Communication Services",
+    86.9,
+    9.6,
+    30.7,
+    40.3,
+    2.18,
+    71.5,
+    100,
+    "Medium",
+    "selected"
+   ],
+   [
+    3,
+    "CRC.US",
+    "California Resources Corp",
+    "Energy",
+    85.7,
+    8.9,
+    22.4,
+    37.6,
+    2.05,
+    74,
+    100,
+    "Low",
+    "selected"
+   ],
+   [
+    4,
+    "GLPI.US",
+    "Gaming and Leisure Properties Inc",
+    "Real Estate",
+    85.1,
+    7.9,
+    19.8,
+    33.4,
+    2.11,
+    78,
+    100,
+    "Low",
+    "selected"
+   ],
+   [
+    5,
+    "EFC.US",
+    "Ellington Financial Inc",
+    "Financial Services",
+    84.6,
+    8.2,
+    21.0,
+    34.6,
+    2.02,
+    72,
+    100,
+    "Medium",
+    "selected"
+   ],
+   [
+    6,
+    "INDV.US",
+    "Indivior PLC",
+    "Healthcare",
+    84.2,
+    11.4,
+    33.6,
+    48.0,
+    2.41,
+    70.5,
+    95,
+    "Medium",
+    "selected"
+   ],
+   [
+    7,
+    "OLP.US",
+    "One Liberty Properties Inc",
+    "Real Estate",
+    83.9,
+    7.1,
+    17.2,
+    29.8,
+    1.96,
+    73,
+    100,
+    "Medium",
+    "stability: held research seat"
+   ],
+   [
+    8,
+    "BBOX.L",
+    "Tritax Big Box REIT plc",
+    "Real Estate",
+    84.2,
+    9.0,
+    18.5,
+    31.0,
+    2.08,
+    71.5,
+    100,
+    "Medium",
+    "stability: GRACE (1/3 missed)"
+   ],
+   [
+    9,
+    "KB.US",
+    "KB Financial Group Inc",
+    "Financial Services",
+    83.1,
+    8.4,
+    20.6,
+    33.9,
+    2.12,
+    72.5,
+    100,
+    "Medium",
+    "stability: GRACE (0/3 missed)"
+   ],
+   [
+    10,
+    "2020.HK",
+    "ANTA Sports Products Ltd",
+    "Consumer Cyclical",
+    82.7,
+    10.1,
+    26.4,
+    42.0,
+    2.27,
+    70,
+    95,
+    "Medium",
+    "stability: GRACE (2/3 missed)"
+   ],
+   [
+    11,
+    "SHG.US",
+    "Shinhan Financial Group",
+    "Financial Services",
+    82.1,
+    8.0,
+    19.9,
+    32.5,
+    2.01,
+    74,
+    100,
+    "Medium",
+    "stability: awaiting confirmation (1/3 days)"
+   ],
+   [
+    12,
+    "PFLT.US",
+    "PennantPark Floating Rate",
+    "Financial Services",
+    81.6,
+    7.4,
+    16.1,
+    28.0,
+    1.92,
+    71,
+    100,
+    "Medium",
+    "sector cap"
+   ],
+   [
+    13,
+    "AER.US",
+    "AerCap Holdings",
+    "Industrials",
+    80.9,
+    7.8,
+    18.7,
+    30.9,
+    1.99,
+    75,
+    100,
+    "Low",
+    "stability: awaiting confirmation (2/3 days)"
+   ],
+   [
+    14,
+    "T82U.SI",
+    "Suntec REIT",
+    "Real Estate",
+    80.2,
+    7.2,
+    15.8,
+    27.4,
+    1.88,
+    70,
+    95,
+    "Medium",
+    "FLIP(strict)"
+   ]
+  ],
+  "gaps_title": "DATA GAPS — 14 of 61 passed (audited pool)",
+  "gaps_headers": [
+   "Gate",
+   "Candidates Failed",
+   "Share %",
+   "Examples"
+  ],
+  "gaps": [
+   [
+    "reliability",
+    21,
+    34.4,
+    "AAA.US, BBB.US"
+   ],
+   [
+    "roi_floor",
+    18,
+    29.5,
+    "CCC.US"
+   ],
+   [
+    "dq",
+    8,
+    13.1,
+    "DDD.L"
+   ]
+  ]
+ },
+ "status_kv": {
+  "TFB Decision Feed": "EXECUTABLE | run=41363258387 | 2026-11-02 02:42:14+03:00 | issued=2026-11-02T04:19:49+03:00 | expires=2026-11-02T10:42:14+03:00 | ttl_min=480 | release=19024886432 | attempt=1 | receipts=T10:41363258387,PF:41363258387 | t10_at=2026-11-02T04:12:31+03:00 | pf_at=2026-11-02T04:14:02+03:00 | mp_at=2026-11-02T04:10:55+03:00 | audits=0,0",
+  "TFB Calibration": "OK | as_of=2026-10-30 | n=412 | brier=0.231",
+  "TFB Feed Global_Markets": "OK | cov=99.2 | run=41363258387 | 2026-11-02 02:42:14+03:00",
+  "TFB Grid Capacity": "OK | 4512 of 5000 rows | 90.2%"
+ },
+ "feed_not_actionable": "NOT_ACTIONABLE(final_publication) | run=41363258387 | 2026-11-02 09:10:00+03:00 | coverage_failed",
+ "feed_superseded": "NOT_ACTIONABLE(final_publication) | run=41363258387 | 2026-11-02 09:12:00+03:00 | superseded_by_run=41380000001.1",
+ "pd": {
+  "status": "Last run 2026-11-02 08:46:00 | status: ok | holdings 2 rows from My_Portfolio (qty/cost from cost-basis: 2) | source readiness VERIFIED (run 41363258387) | ibkr evidence SENT (capture 08:41 age 5m; linked 1/1; cash 72747.00 SAR; USD 3.75; excluded 5023.SR)",
+  "panel": [
+   [
+    "PF: Max Position %",
+    15,
+    "PF: Max Sector %",
+    30,
+    "PF: Cash Floor %",
+    10
+   ]
+  ]
+ },
+ "s1": {
+  "title": [
+   "S-1 GATE",
+   "verdict: NOT_DECIDABLE (2 of 4 criteria pending)"
+  ],
+  "criteria": [
+   [
+    1,
+    "Matured INVESTABLE outcomes >= 60",
+    "PENDING",
+    "38 of 60 matured · next maturity 2026-11-09"
+   ],
+   [
+    2,
+    "Hit rate above the coin flip",
+    "PASS",
+    "57.9% · n 38"
+   ],
+   [
+    3,
+    "Calibration current",
+    "PASS",
+    "as_of 2026-10-30"
+   ],
+   [
+    4,
+    "Audited performance clock",
+    "PENDING",
+    "last audited run 2026-10-12 · scheduled runs are record-only"
+   ]
+  ]
+ },
+ "ledger": {
+  "status": "Last refresh 2026-11-02 08:30 | closed -1,812.40 · active 645.30 · lifetime -1,167.10 | 2 active · 27 closed",
+  "headers": [
+   "Symbol",
+   "Name",
+   "Ccy",
+   "Status",
+   "Buy Date",
+   "Buy Price",
+   "Shares",
+   "Cost Basis",
+   "Current Price",
+   "FX→SAR",
+   "Market Value SAR",
+   "Unrealized G/L SAR",
+   "Dividends Recv",
+   "Total Return SAR",
+   "Return %",
+   "Holding Days"
+  ],
+  "lots": [
+   [
+    "FRST.US",
+    "Primis Financial Corp",
+    "USD",
+    "Active",
+    "2026-10-26",
+    15.2,
+    174,
+    2644.8,
+    15.71,
+    3.75,
+    10253,
+    332.8,
+    0,
+    332.8,
+    0.0336,
+    7
+   ],
+   [
+    "5023.SR",
+    "Al Rajhi Sukuk 2028",
+    "SAR",
+    "Active",
+    "2025-09-29",
+    1000,
+    9,
+    9000,
+    1000,
+    1,
+    9000,
+    0,
+    312.5,
+    312.5,
+    0.0347,
+    399
+   ]
+  ]
+ },
+ "my_portfolio": {
+  "headers": [
+   "Symbol",
+   "Asset Class",
+   "Sector",
+   "Industry",
+   "Exchange",
+   "Current Price",
+   "52W High",
+   "52W Low",
+   "52W Position %",
+   "RSI (14)",
+   "Expected ROI 1M",
+   "Expected ROI 3M",
+   "Expected ROI 12M",
+   "Overall Score",
+   "Risk Bucket",
+   "Recommendation",
+   "Recommendation Detail",
+   "Position Qty",
+   "Avg Cost",
+   "Volatility 30D",
+   "Forecast Source",
+   "Warnings"
+  ],
+  "rows": [
+   [
+    "FRST.US",
+    "Equity",
+    "Financial Services",
+    "Banks - Regional",
+    "NASDAQ",
+    15.71,
+    18.2,
+    11.9,
+    60.5,
+    54,
+    1.2,
+    4.8,
+    16.4,
+    71,
+    "Medium",
+    "HOLD",
+    "hold under the bracket",
+    174,
+    15.2,
+    28.1,
+    "engine",
+    ""
+   ],
+   [
+    "5023.SR",
+    "Fixed Income",
+    "Financial Services",
+    "Sukuk",
+    "TADAWUL",
+    1000,
+    1002,
+    995,
+    70,
+    50,
+    0.4,
+    1.1,
+    4.9,
+    60,
+    "Low",
+    "HOLD",
+    "held for yield",
+    9,
+    1000,
+    1.1,
+    "static",
+    ""
+   ]
+  ]
+ },
+ "ibkr_capture": {
+  "ok": true,
+  "name": "TFB_IBKR_Capture_20261102-054100.json",
+  "reason": "",
+  "json": {
+   "schema": "tfb.ibkr-capture/v1",
+   "captured_at": "2026-11-02T05:41:00Z",
+   "balances": {
+    "balances": [
+     {
+      "currency": "USD",
+      "net_liquidation_value": 24533.33,
+      "stock_market_value": 2734.13,
+      "settled_cash": 19399.2,
+      "cash_balance": 19399.2,
+      "unrealized_pnl": 88.74
+     }
+    ]
+   },
+   "positions": {
+    "positions": [
+     {
+      "symbol": "FRST",
+      "position": 174
+     }
+    ]
+   },
+   "orders": {
+    "orders": [
+     {
+      "primary_description": "SELL 174 FRST LMT 17.90",
+      "secondary_description": "GTC",
+      "order_type": "LMT",
+      "side": "SELL",
+      "total_shares_qty": 174,
+      "remaining_shares_qty": 174,
+      "limit_price": 17.9,
+      "order_status": "REPLACED",
+      "order_time": "2026-10-26T06:23:34Z"
+     },
+     {
+      "primary_description": "SELL 174 FRST STP 14.56",
+      "secondary_description": "STP 14.56 GTC",
+      "order_type": "STP",
+      "side": "SELL",
+      "total_shares_qty": 174,
+      "remaining_shares_qty": 174,
+      "order_status": "REPLACED",
+      "order_time": "2026-10-26T06:23:34Z"
+     }
+    ]
+   }
+  }
+ },
+ "global_markets_status": {
+  "INVESTABLE": 6,
+  "WATCHLIST": 20,
+  "BLOCKED": 4
+ },
+ "performance_log": [
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "LOSS",
+   "INVESTABLE",
+   "BUY",
+   "3M"
+  ],
+  [
+   "WIN",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "WIN",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "WIN",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "WIN",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "WIN",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ],
+  [
+   "LOSS",
+   "WATCHLIST",
+   "ACCUMULATE",
+   "1M"
+  ]
+ ],
+ "bars": {
+  "ITRN.US": {
+   "base": 38.5,
+   "step": 0.21
+  },
+  "DDI.US": {
+   "base": 10.6,
+   "step": 0.07
+  },
+  "CRC.US": {
+   "base": 49.0,
+   "step": 0.33
+  }
+ }
+}
