@@ -312,7 +312,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
-    ("archive_symbol_deep", "1.0.0", "bigquery symbol deep data"),
+    # 2026-11-02 (same rule): 1.0.0 -> 1.1.0 (the symbols with an active
+    # Performance_Log record join the bars load for the BigQuery outcome
+    # engine; TFB_DEEP_OUTCOME_BARS, default off).
+    ("archive_symbol_deep", "1.1.0", "bigquery symbol deep data"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
