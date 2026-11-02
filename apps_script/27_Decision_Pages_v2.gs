@@ -27,9 +27,12 @@
  *           Portfolio_Decision_v2 action 3: on a live EXECUTABLE feed with engine tickets it states 'Board: N engine
  *           tickets (X SAR, feed valid until HH:MM). S-1 gate .. - the tickets are not S-1 authorised; size under your
  *           interim rule (1-2 tickets).' instead of 'No board-originated capital .. stays Tranche 0' (the two pages
- *           contradicted each other). Display / research only: nothing sizes a seat the engine did not fund, the
- *           Executable count is untouched, no gate, ticket, order or broker call. Kill switch: Script Property
- *           DP2_COHORT_LEGACY = 1 / on / true / yes restores the 1.2.30 cohort and wording of every line touched here.
+ *           contradicted each other). Review finding (Codex P1 on #896): the IBKR capture rows took an order's TOTAL
+ *           quantity as its coverage, so a partly filled stop overstated the protected shares and suppressed the
+ *           place-a-stop advice; coverage is now the remaining quantity (dp2CoverQty_, capped at the total). Display /
+ *           research only: nothing sizes a seat the engine did not fund, the Executable count is untouched, no gate,
+ *           ticket, order or broker call. Kill switch: Script Property DP2_COHORT_LEGACY = 1 / on / true / yes restores
+ *           the 1.2.30 behaviour of every line touched here (cohort, wording and the coverage quantity).
  *           Rollback: the property, or Project History -> 1.2.30 / 1.2.28.
  *   1.2.30 (prepared 28 Oct 2026, never installed - the live file was still 1.2.28 on 2 Nov; installed with 1.2.31 as the
  *           eleven steps of that day's sheet, unchanged): certification expires with its evidence (IBKR capture + 14 min,
@@ -293,8 +296,9 @@
  *   DP2_EXIT_ALERT_TO e-mail   (default: the script owner)
  *   DP2_HISTORY_URL   template with {symbol}, e.g. https://…/v1/history?symbol={symbol}&days=130
  *   DP2_HISTORY_KEY   value sent as X-API-Key with DP2_HISTORY_URL
- *   DP2_COHORT_LEGACY 1|on|true|yes (v1.2.31 kill switch: the 1.2.30 FAST-TRACK sizing cohort, seat labels and
- *                     Portfolio_Decision_v2 action wording; default absent = the engine-ticket mirror)
+ *   DP2_COHORT_LEGACY 1|on|true|yes (v1.2.31 kill switch: the 1.2.30 FAST-TRACK sizing cohort, seat labels,
+ *                     Portfolio_Decision_v2 action wording and IBKR coverage by the order total; default absent =
+ *                     the engine-ticket mirror and coverage by the remaining quantity)
  *
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
@@ -1312,6 +1316,7 @@ function dp2IbkrOverlayCapture_(out) {
   if (dp2Num_(b.unrealized_pnl) !== null) acct['unrealized_usd'] = dp2Num_(b.unrealized_pnl);
   if (nav && stk !== null) acct['leverage'] = Math.round(stk / nav * 100) / 100;
   var ords = (j.orders && j.orders.orders) || [], mapped = [];
+  var coverRem = !dp2CohortLegacy_();   // v1.2.31 (Codex P1 on #896): coverage = the shares an order can still sell (dp2CoverQty_)
   for (i = 0; i < ords.length; i++) {
     var o = ords[i] || {}, pdsc = dp2Str_(o.primary_description), sdsc = dp2Str_(o.secondary_description);
     var mo = /^(buy|sell)\s+[\d,\.]+\s+(\S+)/i.exec(pdsc);
@@ -1320,13 +1325,22 @@ function dp2IbkrOverlayCapture_(out) {
     var px = null;
     if (/STOP/.test(typ)) { var mstp = /STP\s+(?:LMT\s+)?([\d,]*\.?\d+)/i.exec(sdsc); px = mstp ? dp2Num_(mstp[1].replace(/,/g, '')) : null; }
     else px = dp2Num_(o.limit_price);
-    mapped.push({ symbol: mo ? mo[2].toUpperCase() : '', side: dp2Str_(o.side).toUpperCase() || (mo ? mo[1].toUpperCase() : ''), type: typ, qty: dp2Num_(o.total_shares_qty), price: px, status: dp2Str_(o.order_status).toUpperCase(), placed: dp2Str_(o.order_time), remaining: dp2Num_(o.remaining_shares_qty), working: true });
+    mapped.push({ symbol: mo ? mo[2].toUpperCase() : '', side: dp2Str_(o.side).toUpperCase() || (mo ? mo[1].toUpperCase() : ''), type: typ, qty: dp2CoverQty_(o, coverRem), total: dp2Num_(o.total_shares_qty), price: px, status: dp2Str_(o.order_status).toUpperCase(), placed: dp2Str_(o.order_time), remaining: dp2Num_(o.remaining_shares_qty), working: true });
   }
   out.account = acct; out.orders = mapped;
   out.tabs.account = true; out.tabs.orders = true;
   out.capture = { name: dp2Str_(cap.name), ms: capMs, positions: ((j.positions && j.positions.positions) || []).length, orders: mapped.length };
   out.captureNote = 'IBKR read-only capture ' + Utilities.formatDate(new Date(capMs), DP2.TZ, 'yyyy-MM-dd HH:mm') + ' Riyadh';
   return true;
+}
+/* v1.2.31 (Codex P1 on #896): an IBKR order protects only the shares it can still sell. A partly filled stop for 100
+ * shares with 20 remaining covers 20, not 100 - its total made a 50-share holding read fully covered and suppressed
+ * the place-a-stop advice for the 30 unprotected shares. Coverage = the remaining quantity (capped at the order
+ * total) when the capture carries it, the total otherwise; DP2_COHORT_LEGACY keeps the 1.2.30 total. Pure. */
+function dp2CoverQty_(o, useRemaining) {
+  var tot = dp2Num_(o && o.total_shares_qty), rem = dp2Num_(o && o.remaining_shares_qty);
+  if (useRemaining !== true || rem === null) return tot;
+  return Math.max(0, tot !== null ? Math.min(rem, tot) : rem);
 }
 /* v1.2.2 (Codex P1): broker TP / stop levels come ONLY from orders in an active status. Historical REPLACED,
    CANCELLED, FILLED or unknown-status rows never supply a level, so a replaced stop can no longer make an
@@ -2165,7 +2179,7 @@ function dp2SeatClass_(seat, strict, engineBoard) {
   if (/^Held\b/i.test(ff) || (engineBoard === true && /^Research\b/i.test(ff))) return 'research';
   return 'active';
 }
-var DP2_COHORT_LEGACY_PROP = 'DP2_COHORT_LEGACY';   // v1.2.31 kill switch: 1 / on / true / yes = the 1.2.30 cohort and wording
+var DP2_COHORT_LEGACY_PROP = 'DP2_COHORT_LEGACY';   // v1.2.31 kill switch: 1 / on / true / yes = the 1.2.30 cohort, wording and coverage
 function dp2CohortLegacy_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_COHORT_LEGACY_PROP)).trim()); }
 /* v1.2.31: the board's sizing cohort, worked out once per Top_10 read (kept on the reader object). basis:
  *   'engine'   the board carries at least one engine ticket - the cohort IS those tickets, mirrored as issued

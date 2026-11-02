@@ -36,7 +36,8 @@
  *       10:42). S-1 gate NOT_DECIDABLE (criteria 1 PENDING, 4 PENDING) - ..'; NOT_ACTIONABLE / SYNC RUNNING /
  *       EXPIRED / legacy / no engine ticket -> the v1.2.28 text; S-1 PASS -> neither
  *   T6  D4 (1.2.29): an IBKR order REPLACED with remaining 174 counts as working (no 'unprotected' action); a
- *       REPLACED order with nothing remaining still reads replaced
+ *       REPLACED order with nothing remaining still reads replaced; (Codex P1 on #896) a partly filled stop covers
+ *       only its remaining shares (dp2CoverQty_), behind the same kill switch
  *   T7  1.2.30: certification expires with the capture (08:50 CERTIFIED, 09:24 UNCERTIFIED 'EXPIRED at 08:55'),
  *       a NOT_ACTIONABLE feed for the same run never certifies
  *   T8  golden negatives: the T2-T6 checks fail on v1.2.28, the T2-T5 checks on v1.2.30, the T7 check on v1.2.28
@@ -586,6 +587,27 @@ function checkD4(src) {
   const g = pdView(build(src, 'pd', { board: BOARDS.today, capture: gone }));
   ok(g.actions.some(t => t.indexOf('FRST.US bracket: IBKR lists the 17.90 / 14.56 pair as REPLACED with no working successor') === 0), 'nothing remaining still reads replaced');
 }
+/* T6b (Codex P1 on #896): a partly filled stop protects only its remaining shares */
+function partialCapture() {
+  const c = clone(FIX.ibkr_capture);
+  c.json.orders.orders.forEach(o => { o.order_status = 'SUBMITTED'; });
+  c.json.orders.orders[1].remaining_shares_qty = 100;   // the 14.56 stop: 74 of 174 filled, 100 still working
+  return c;
+}
+function checkCoverage(src) {
+  const env = makeEnv(src, {});
+  ok(typeof env.ctx.dp2CoverQty_ === 'function', 'dp2CoverQty_ defined');
+  for (const [o, use, want] of [[{ total_shares_qty: 174, remaining_shares_qty: 100 }, true, 100], [{ total_shares_qty: 174, remaining_shares_qty: 100 }, false, 174],
+                                [{ total_shares_qty: 174 }, true, 174], [{ total_shares_qty: 100, remaining_shares_qty: 150 }, true, 100], [{ remaining_shares_qty: 50 }, true, 50],
+                                [{ total_shares_qty: 174, remaining_shares_qty: -5 }, true, 0], [{ total_shares_qty: '174', remaining_shares_qty: '20' }, true, 20], [{}, true, null], [null, true, null]]) {
+    eq(env.ctx.dp2CoverQty_(o, use), want, 'coverage of ' + JSON.stringify([o, use]));
+  }
+  const v = pdView(build(src, 'pd', { board: BOARDS.today, capture: partialCapture() }));
+  eq(v.frstStatus, 'working since 2026-10-26T06:23:34Z ' + DASH + " stop covers 100 of the position's 174 sh (partial)", 'partly filled stop: partial coverage');
+  eq(v.limit('Brackets working on every equity lot'), '0 of 1 ' + DOT + ' verify', 'brackets limit flags the gap');
+  const full = pdView(build(src, 'pd', { board: BOARDS.today }));
+  eq(full.frstStatus, 'working since 2026-10-26T06:23:34Z', 'remaining = total: full coverage as before');
+}
 /* T7: v1.2.30 certification expires with the capture */
 function checkCertification(src) {
   const early = build(src, 'pd', { board: BOARDS.today, now: Date.parse('2026-11-02T05:50:00Z') });
@@ -608,6 +630,9 @@ function checkLegacyIdentity(src, spellings) {
       deq(norm(n), norm(o), 'DP2_COHORT_LEGACY=1 = v1.2.30 (' + bd.name + ', ' + which + ')');
     }
   }
+  const pc = partialCapture();   // the Codex P1 coverage fix is behind the same switch
+  deq(norm(build(src, 'pd', { board: BOARDS.today, capture: pc, props: { [LEGACY]: '1' } })), norm(build(ORACLE, 'pd', { board: BOARDS.today, capture: pc, props: { [LEGACY]: '1' } })),
+      'DP2_COHORT_LEGACY=1 = v1.2.30 on a partly filled stop');
   const o = norm(build(ORACLE, 't10', { board: BOARDS.today }));
   for (const sp of spellings) deq(norm(build(src, 't10', { board: BOARDS.today, props: { [LEGACY]: sp } })), o, 'legacy spelling ' + JSON.stringify(sp));
 }
@@ -687,8 +712,9 @@ function battery() {
     ok(o.indexOf(ACTION3_OLD) >= 0, 'v1.2.30 contradicts the feed (the owner\'s read): ' + JSON.stringify(o));
   });
 
-  test('T6 D4 (1.2.29): FRST.US REPLACED with remaining 174 is working (no unprotected alarm); nothing remaining still reads replaced', () => {
+  test('T6 D4 (1.2.29): FRST.US REPLACED with remaining 174 is working (no unprotected alarm); nothing remaining still reads replaced; a partly filled stop covers only its remaining shares (Codex P1)', () => {
     checkD4(NEW);
+    checkCoverage(NEW);
   });
 
   test('T7 1.2.30 certification expires with the capture (08:50 CERTIFIED, 09:24 UNCERTIFIED EXPIRED at 08:55); NOT_ACTIONABLE never certifies', () => {
@@ -696,9 +722,11 @@ function battery() {
   });
 
   test('T8 golden negatives: the T2-T6 checks fail on the live v1.2.28, the T2-T5 checks on v1.2.30, the T7 check on v1.2.28', () => {
-    const checks = { T2: checkEngineBoard, T2b: checkEngineCaps, T2c: checkEngineEdges, T3: checkResearchBoard, T4: checkHeld, T5: checkAction3, T6: checkD4, T7: checkCertification };
-    for (const k of ['T2', 'T2b', 'T2c', 'T3', 'T4', 'T5', 'T6', 'T7']) fails(() => checks[k](BASE), k + ' on v1.2.28');
-    for (const k of ['T2', 'T2b', 'T2c', 'T3', 'T4', 'T5']) fails(() => checks[k](ORACLE), k + ' on v1.2.30');
+    const checks = { T2: checkEngineBoard, T2b: checkEngineCaps, T2c: checkEngineEdges, T3: checkResearchBoard, T4: checkHeld, T5: checkAction3, T6: checkD4, T6b: checkCoverage, T7: checkCertification };
+    for (const k of ['T2', 'T2b', 'T2c', 'T3', 'T4', 'T5', 'T6', 'T6b', 'T7']) fails(() => checks[k](BASE), k + ' on v1.2.28');
+    for (const k of ['T2', 'T2b', 'T2c', 'T3', 'T4', 'T5', 'T6b']) fails(() => checks[k](ORACLE), k + ' on v1.2.30');
+    const oc = pdView(build(ORACLE, 'pd', { board: BOARDS.today, capture: partialCapture() }));
+    eq(oc.frstStatus, 'working since 2026-10-26T06:23:34Z', 'v1.2.30 reads a partly filled stop (100 of 174 remaining) as full coverage');
     checkD4(ORACLE); checkCertification(ORACLE);   // 1.2.29 / 1.2.30 already hold on the oracle
     const bv = pdView(build(BASE, 'pd', { board: BOARDS.today }));
     ok(bv.actions.some(t => t.indexOf('FRST.US bracket: IBKR lists the 17.90 / 14.56 pair as REPLACED with no working successor. If nothing is working, 10,253 SAR is unprotected') === 0), 'v1.2.28 raises the FRST false alarm');
@@ -722,7 +750,9 @@ function battery() {
       ['certification without the live feed', " && dp2FeedView_(feed, new Date().getTime()).live === true;   // v1.2.30", ';   // v1.2.30', [checkCertification]],
       ['Held not read as research', "if (/^Held\\b/i.test(ff) || (engineBoard", 'if ((engineBoard', [checkHeld]],
       ['engine tile green on a dead feed', 'if (!fv.live) { tiles[tq].color = DP2C.grey;', 'if (false) { tiles[tq].color = DP2C.grey;', [checkEngineEdges]],
-      ['capped active seats unaccounted in the header', "if (co.basis !== 'engine' && co.n.active > nPlans)", 'if (false)', [checkResearchBoard]]
+      ['capped active seats unaccounted in the header', "if (co.basis !== 'engine' && co.n.active > nPlans)", 'if (false)', [checkResearchBoard]],
+      ['coverage from the order total (Codex P1 reverted)', 'qty: dp2CoverQty_(o, coverRem), total:', 'qty: dp2Num_(o.total_shares_qty), total:', [checkCoverage]],
+      ['coverage fix leaking past the kill switch', 'var coverRem = !dp2CohortLegacy_();', 'var coverRem = true;', [n => checkLegacyIdentity(n, [])]]
     ];
     let killed = 0;
     for (const [name, find, repl, checks] of M) {
@@ -738,7 +768,7 @@ function battery() {
     digest.push(String(killed));
   });
 
-  test('T10 ES5 / ASCII lint of the added lines; inventory (9 functions + 1 var added to v1.2.28, 0 removed); hunks whose reversal is the v1.2.30 oracle; LF only; WHY block', () => {
+  test('T10 ES5 / ASCII lint of the added lines; inventory (10 functions + 1 var added to v1.2.28, 0 removed); hunks whose reversal is the v1.2.30 oracle; LF only; WHY block', () => {
     const bl = BASE.split('\n'), nl = NEW.split('\n');
     const baseSet = new Set(bl), newSet = new Set(nl);
     const added = nl.filter(l => !baseSet.has(l));
@@ -753,7 +783,7 @@ function battery() {
       }
     }
     ok(NEW.indexOf('\r') < 0, 'LF only');
-    for (const name of ['dp2SeatClass_', 'dp2CohortLegacy_', 'dp2Cohort_', 'dp2SeatFlag_', 'dp2SeatsTitle_', 'dp2FeedTag_', 'dp2SeatsSub_', 'dp2BoardTicketsAction_']) {
+    for (const name of ['dp2SeatClass_', 'dp2CohortLegacy_', 'dp2Cohort_', 'dp2SeatFlag_', 'dp2SeatsTitle_', 'dp2FeedTag_', 'dp2SeatsSub_', 'dp2BoardTicketsAction_', 'dp2CoverQty_']) {
       const start = NEW.indexOf('function ' + name + '(');
       ok(start > 0, 'defined ' + name);
       const body = NEW.slice(start, NEW.indexOf('\n}\n', start) + 3);
@@ -763,7 +793,7 @@ function battery() {
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
     const fb = names(BASE, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(NEW, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'top-level functions removed');
-    deq(Object.keys(fn).filter(k => !fb[k]).sort(), ['dp2BoardTicketsAction_', 'dp2Cohort_', 'dp2CohortLegacy_', 'dp2FeedTag_', 'dp2SeatClass_', 'dp2SeatFlag_', 'dp2SeatsSub_', 'dp2SeatsTitle_'].sort(), 'top-level functions added at the start of a line');
+    deq(Object.keys(fn).filter(k => !fb[k]).sort(), ['dp2BoardTicketsAction_', 'dp2Cohort_', 'dp2CohortLegacy_', 'dp2CoverQty_', 'dp2FeedTag_', 'dp2SeatClass_', 'dp2SeatFlag_', 'dp2SeatsSub_', 'dp2SeatsTitle_'].sort(), 'top-level functions added at the start of a line');
     ok(NEW.indexOf('} function dp2EvidenceExpiry_(pd, nowMs) {') > 0, 'step 6 keeps dp2EvidenceExpiry_ on the dp2Today_ line (one-line step, as prepared)');
     const vb = names(BASE, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(NEW, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
