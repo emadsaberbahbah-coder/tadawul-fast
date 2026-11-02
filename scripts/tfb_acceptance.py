@@ -123,7 +123,17 @@ from typing import Any, Dict, List, Optional, Tuple
 # LiveSource.integrity_tab). Changed: 3 (_page_columns optional argument,
 # _top10_sections and check_decision_integrity A3 read integrity_tab).
 # Removed: 0.
-VERSION = "1.0.10"
+# v1.0.11 (2026-11-02) -- THE COCKPIT'S TP1 GAIN KPI IS READ, NAMED.
+# WHY: 16_Decision_Top10 v1.20.0 (Script Property DT10_KPI_PLAN_GAIN=on)
+# relabels the KPI 'Exp. Gain 12M (SAR)' as 'Exp. Gain TP1 (SAR)' (the plan
+# payoff, ticket x (TP1 / price - 1), instead of the annualised figure).
+# D10-1c read the gain only under the old label for its evidence text, so
+# with the gate on it would print 'gain_kpi=-'. CHANGE: when the 12M label
+# is absent or blank, the TP1 label is read and the evidence names its basis
+# ('gain_kpi=11,078 SAR (TP1 plan payoff)'). Evidence text only: no verdict,
+# measured value, threshold or read changes; with the cockpit gate off (the
+# default) every row is the v1.0.10 row. Functions added / removed: 0.
+VERSION = "1.0.11"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -634,6 +644,8 @@ def check_board(src: Source, board_min: int) -> List[Check]:
     else:
         gap = x["kpi_funded"] - x["exec"]
         gain = _s(k.get("Exp. Gain 12M (SAR)"))
+        if not gain and _s(k.get("Exp. Gain TP1 (SAR)")):   # v1.0.11: cockpit v1.20.0 KPI label
+            gain = _s(k.get("Exp. Gain TP1 (SAR)")) + " (TP1 plan payoff)"
         vc = "PASS" if gap == 0 else ("FAIL" if gap > 0 else "WARN")
         out.append(Check("D10-1c", "funded-KPI parity (Fundable Now == board exec)", vc, gap,
                          f"kpi_funded={x['kpi_funded']} exec={x['exec']} gain_kpi={gain or '-'}"

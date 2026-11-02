@@ -14,6 +14,8 @@ Renumbered again 2026-10-28 (merge of the bundle re-merged with main #870 and #8
 
 Merged 2026-10-31 (bundle re-merged with main #873-#881, `e0cbb684`): main's #875 shipped a different run_dashboard_sync v6.71.0 (FW2-STALE-PE, `TFB_SYNC_FW2_STALE_PE`, default off), so the bundle's FW-2 SCOPE is now **v6.72.0**; this PR's daily_sync.yml **1.0.6** default (`TFB_SYNC_FW2_SCOPE` fallback enforce) is unchanged, and its header notes the interaction: with FW2-STALE-PE off (as shipped), FW-2 SCOPE enforce fields every drift row BLOCKED; with it armed enforce, a drift row in [0.80, 1.25] whose last-good row witnesses the instrument is kept with only P/E and EPS cleared. portfolio_actions stays 1.17.2, engine 5.160.0, builder 1.28.2; G1's three pre-flip blobs are identical at `974bc418` and `e0cbb684` (PASS 11/11). #875's harness takes this PR's pre-merge head `4bc9e6a5` as its base here. No default changed.
 
+Merged 2026-11-02 (bundle re-merged with main #890-#896, `7a680475`): a clean automatic merge; this PR's delta is unchanged and no default moved. #895 shipped 16_Decision_Top10 v1.20.0, so the bundle's held seats are now v1.20.1 (this PR does not touch the cockpit). #893 took daily_sync.yml 1.0.9 (sync-render handshake, default off); this PR's 1.0.6 block (`TFB_SYNC_FW2_SCOPE` fallback enforce) is unchanged. The three G1 module blobs at `7a680475` equal `974bc418`'s; G1 PASS 11/11 with either.
+
 ## S0 - Decision and base
 | Item | Value |
 |---|---|
