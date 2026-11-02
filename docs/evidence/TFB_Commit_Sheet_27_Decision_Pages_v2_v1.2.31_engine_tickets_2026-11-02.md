@@ -1,0 +1,126 @@
+# Commit Sheet - `apps_script/27_Decision_Pages_v2.gs` v1.2.31 [ENGINE-TICKET MIRROR] (+ the prepared v1.2.29 D4 and v1.2.30 steps) - 2026-11-02
+
+**Scope:** live review of Mon 2 Nov 2026 (owner): *"Top_10_Investments_v2 … there is no allocation but the investment page top 10 show ✅ FEED ACTIONABLE — EXECUTABLE … 6 EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN TODAY)"*. Display / research only: the two v2 pages must describe the board the engine actually issued. No gate, ticket, order, broker call, coverage threshold or executable count is changed; the Executable tile still counts the cockpit's own `Ticket SAR > 0`. One kill switch (`DP2_COHORT_LEGACY`) restores the v1.2.30 behaviour of every line touched here byte for byte.
+**Files:** `apps_script/27_Decision_Pages_v2.gs` (live **1.2.28** -> **1.2.31**; 299,393 -> 319,972 bytes; 3,314 -> 3,480 newline-terminated lines, i.e. 3,315 -> 3,481 lines in the editor; the eleven prepared steps + 24 anchored hunks), `tests/test_dp2_v1231_engine_tickets.js` (new harness, 11 sections x2, `PASS 11/11`), `tests/test_dp2_v1231_engine_tickets.py` (new pytest wrapper, the `tests/test_dt10_v1190_hold_live_rule.py` pattern, skips without node), `tests/js/dp2_steps_v1230.json` (the eleven steps of 28 Oct, verbatim), `tests/js/dp2_edits_v1231.json` (the 24 hunks), `tests/fixtures/dp2_board_2026-11-02.json` (today's board), this sheet. **Not touched:** `.github/workflows/ci.yml` (the harness reaches the whole-suite job through its wrapper, as v1.19.0 of the cockpit did), the cockpit, the backend, the live Apps Script project, the workbook. The repo file is a mirror: nothing changes until the owner pastes it.
+
+## S0 - Evidence (live review, 2 Nov 2026, read-only)
+- **Base.** The live file is **v1.2.28** (3,315 lines, SHA-256 `a99af66a…`), mirrored byte for byte by `ae4a03f0` on `dp2-live-mirror-2026-11-02` (the first commit of this PR). **v1.2.29 (D4) and v1.2.30 were prepared on 28 Oct 2026 as eleven find/replace steps but never installed** - the live file is still 1.2.28.
+- **Top_10_Investments_v2** (built 09:24 Riyadh from the 08:49 cockpit): EXECUTABLE **6** (correct - `Ticket SAR > 0`) beside ALLOCATED (RESEARCH) **0 SAR** "0 of 0 plans funded"; header `SEATS — 10 · 0 plans · 3 grace-held`; every seat, the seven ACTIVE ones included, flagged `grace-held · not sized`; ALLOCATION "Plans in the sizing cohort: 0 - none (no fast-track seats)", "Allocated · cash after: 0 SAR · 72,747 SAR left".
+- **The board.** ITRN.US, DDI.US, CRC.US, GLPI.US, EFC.US, INDV.US ACTIVE with engine tickets (Ticket SAR 12,199 / 12,334 / 8,527 / 12,133 / 11,467 / 12,335 = **68,995 SAR**, Funds From `Cash N SAR`); OLP.US ACTIVE research (Ticket 0, `Research — no allocation`); BBOX.L, KB.US, 2020.HK GRACE. B2 carries `stab[strict]`.
+- **Root cause.** Since 1.2.0 the research mirror took its sizing cohort from `/FAST-TRACK/` (v1.2.28 lines 2106-2120 `dp2PlanSeats_`, 2608 `planSyms`, 2985 fast/grace split, 3094 `isPlan`, 3111 the flag, 3130 the colour, 3153 the cohort row). In the cockpit's strict stability mode (`16_Decision_Top10.gs` `dt10FastTrackSuspend_`, B2 `stab[strict]`) FAST-TRACK seats are the ones whose sizing is **suspended** and the engine funds the ACTIVE ones - the mirror sized exactly the seats the engine does not size and called the funded ones grace-held.
+- **Portfolio_Decision_v2 ACTIONS TODAY.** (2) "FRST.US bracket: IBKR lists the 17.90 / 14.56 pair as REPLACED with no working successor … unprotected" - a false alarm (IBKR's working list returns both FRST orders REPLACED with remaining 174: an edited, working order; the never-installed v1.2.29 D4 fixes it). (3) "No board-originated capital: S-1 gate NOT_DECIDABLE (1 PENDING, 4 PENDING) — deployable 63,547 SAR (after the 10% PF cash floor) stays Tranche 0" while the feed is EXECUTABLE with 6 engine tickets - the two pages contradicted each other.
+- The harness reproduces the owner's read on v1.2.30 (and v1.2.28) from today's board: `SEATS — 10 · 0 plans · 3 grace-held`, `ALLOCATED (RESEARCH) 0 SAR · 0 of 0 plans funded`, `0 - none (no fast-track seats)`, `0 SAR · 72,747 SAR left`, action 3 `No board-originated capital …`, and on v1.2.28 the FRST alarm `… 10,253 SAR is unprotected …`.
+
+## S1 - WHY
+A seat must read the way the engine treated it: funded seats as the engine's tickets, the seat the engine declined as research, grace and suspended seats as not sized. The research allocation exists to preview the engine's sizing; when the engine has issued tickets, the page mirrors them instead of inventing another cohort. Two decision pages must not contradict each other on the same feed.
+
+## S2 - WHAT
+### S2.1 The prepared v1.2.29 + v1.2.30 steps, applied first and unchanged
+The eleven single-line steps of `TFB_Commit_Sheet_27_Decision_Pages_v2_v1.2.30_2026-10-28.md` were parsed from that sheet and applied to the live v1.2.28 text in order; **every Find occurred exactly once in v1.2.28 and once in the running text; every Replace is ASCII**. Result: v1.2.30, SHA-256 `48480638…` (3,314 lines, unchanged count). They are stored verbatim in `tests/js/dp2_steps_v1230.json`, and the harness proves both directions (steps on v1.2.28 = v1.2.30; reversed = v1.2.28).
+
+| Step | What (28 Oct text) | Find in v1.2.28 |
+|---|---|---|
+| 1 | header `Version:` line (1.2.30 + 1.2.29 description) - re-worded by 1.2.31 into WHY entries, words kept | 1 |
+| 2 | `var DP2_VERSION` (then 1.2.31) | 1 |
+| 3 (D4) | capture rows keep `remaining` and `working: true` | 1 |
+| 4 (D4) | REPLACED with remaining > 0 counts as working | 1 |
+| 5 | parse the Portfolio_Decision status token | 1 |
+| 6 | `dp2EvidenceExpiry_` on the `dp2Today_` line | 1 |
+| 7 | evidence freshness measured at build time | 1 |
+| 8 | certification needs PD status ok and a live EXECUTABLE feed for the same run | 1 |
+| 9 | reason line: age when Portfolio_Decision ran | 1 |
+| 10 | header: page build time vs decision time + capture validity | 1 |
+| 11 | gate table row wording | 1 |
+
+Step 10's Find covers only the tail of its line, so that line keeps the pre-existing `—` of `'PORTFOLIO DECISION — v2'` (the one non-ASCII character on a changed line; every line 1.2.31 adds is ASCII, page characters spelled as JavaScript `\u` escapes).
+
+### S2.2 v1.2.31
+1. Header `Version: 1.2.31 (2026-11-02)` and `var DP2_VERSION = '1.2.31'` in lockstep; a dated WHY block for 1.2.31, then 1.2.30 and 1.2.29 (marked *prepared 28 Oct 2026, never installed*), all prior WHY entries verbatim; `DP2_COHORT_LEGACY` added to SCRIPT PROPERTIES.
+2. **`dp2SeatClass_(seat, strict, engineBoard)`** (pure), in the cockpit's own precedence (`dt10TicketClasses_` / `dt10HeldSeatReason_`):
+
+| Class | Rule (first match) |
+|---|---|
+| `engine` | `Ticket SAR > 0` |
+| `grace` | Stability starts with `GRACE` |
+| `suspended` | Stability says `sizing suspended`, or a FAST-TRACK seat while B2 carries `stab[strict]` (or whose Advisor Note says `sizing suspended`) |
+| `research` | Funds From starts with `Held` (16_Decision_Top10 v1.20.0: `Held — earnings in Nd` / `Held — owner rule` / `Held — ticket cap N`), or with `Research` **while the board carries an engine ticket** |
+| `active` | otherwise (ACTIVE / NEW; FAST-TRACK when not strict) |
+
+   Grace and suspended are read before Funds From because the cockpit's `dt10FinalizeBoard_` writes `Research — no allocation` on **every** unfunded seat (grace and suspended included) - and on a board with no engine ticket on every seat, so there the label says nothing about the seat.
+3. **`dp2Cohort_(t)`** (once per Top_10 read): basis `engine` when any seat carries an engine ticket - the cohort is those tickets, taken as issued (no cohort caps); `research` otherwise - the `active` seats, within the panel caps, sized by the unchanged conviction water-fill; `legacy` under the kill switch - `/FAST-TRACK/`.
+4. **`dp2Allocate_` mode `engine`**: each engine seat FUNDED at its own `Ticket SAR` / `Shares` (no water-fill, top-up, floor, sector test or funding need); totals, expected gain and risk rows describe the engine's tickets; the production `allocP` is the same object (no research needs, no rotation planned over the engine's tickets).
+5. **Top_10_Investments_v2**: SEATS header `SEATS — N · E engine tickets · …` (engine) / `· P plans ·` (research) with `research`, `fast-track suspended`, `not funded` / `outside the cohort caps` and `grace-held` counts; subtitle naming the basis and the feed; one class flag per seat (`engine ticket` / `research · not sized (<Funds From>)` / `grace-held · not sized` / `fast-track · sizing suspended (strict)` / `not funded by the engine`; `outside the sizing cohort (cohort caps)` on the research mirror); status colour navy for engine / active, amber otherwise; Held seats tile `A active · F fast-track · G grace-held`; Allocated tile `Allocated (engine)` on an engine board (grey, prefixed `feed <state> -`, once the release is no longer live); funnel `Seats → plans` / `Plans → executable` over the cohort; ALLOCATION title, cohort row `Plans in the sizing cohort (basis: engine tickets | research mirror)` - engine: `Engine tickets: N · X SAR (feed …) · SYM ticket, …`; the needs row and the funding block say the engine's tickets are not re-planned.
+6. **Portfolio_Decision_v2 action 3** (`dp2BoardTicketsAction_`): on a live EXECUTABLE feed (`dp2FeedView_`) with engine tickets: `Board: N engine tickets (X SAR, feed valid until HH:MM). S-1 gate <verdict> (criteria …) — the tickets are not S-1 authorised; size under your interim rule (1–2 tickets).` Otherwise, and under the kill switch, the v1.2.28 text unchanged (the original line is kept as the `else` branch).
+7. Functions added: `dp2SeatClass_`, `dp2CohortLegacy_`, `dp2Cohort_`, `dp2SeatFlag_`, `dp2SeatsTitle_`, `dp2FeedTag_`, `dp2SeatsSub_`, `dp2BoardTicketsAction_` (plus `dp2EvidenceExpiry_` from step 6); var added `DP2_COHORT_LEGACY_PROP`; nothing removed (top-level functions 146 -> 154 at a line start, 155 named; vars 32 -> 33). Changed: `dp2PlanSeats_`, `dp2Allocate_`, `dp2ResearchAllocation_`, `buildPortfolioDecisionV2`, `buildTop10V2`. Legacy lines that carry text are kept intact as `else` branches (header, flag, ALLOCATION title, funding line, action 3).
+
+## S3 - Gates / arming
+| Property (Script Property, new) | Default | Values | Effect |
+|---|---|---|---|
+| `DP2_COHORT_LEGACY` | absent = engine-ticket mirror | `1` / `on` / `true` / `yes` (any case, trimmed) | the v1.2.30 cohort (FAST-TRACK seats), seat labels, tiles, funnel, ALLOCATION block and PD action 3, byte for byte. Anything else, absent or a property fault = the mirror |
+
+## S4 - Expected on today's board (harness, frozen at 09:24 Riyadh, feed valid until 10:42)
+- Header: **`SEATS — 10 · 6 engine tickets · 1 research · 3 grace-held`**.
+- Seats (Alloc SAR / Buy qty / first flag): ITRN.US 12,199 / 84 `engine ticket`; DDI.US 12,334 / 308 `engine ticket`; CRC.US 8,527 / 46 `engine ticket`; GLPI.US 12,133 / 70 `engine ticket`; EFC.US 11,467 / 239 `engine ticket`; INDV.US 12,335 / 141 `engine ticket`; OLP.US blank `research · not sized (Research — no allocation)`; BBOX.L, KB.US, 2020.HK blank `grace-held · not sized`. Status navy for the six, amber for the other four.
+- Tiles: Held seats `10 · 7 active · 0 fast-track · 3 grace-held`; Executable `6` (unchanged); `ALLOCATED (ENGINE) 68,995 SAR · of deployable 72,747 - 6 of 6 plans funded`. Funnel `Seats → plans (6)` 60 %, `Plans → executable (6)` 100 %.
+- ALLOCATION: `ALLOCATION — the engine's tickets, mirrored`; `Plans in the sizing cohort (basis: engine tickets)` = `Engine tickets: 6 · 68,995 SAR (feed EXECUTABLE, valid until 10:42 Riyadh) · ITRN.US 12,199, DDI.US 12,334, CRC.US 8,527, GLPI.US 12,133, EFC.US 11,467, INDV.US 12,335 · mirrored from Top_10_Investments (Ticket SAR / Shares), not re-sized`; `Allocated · cash after` = `68,995 SAR · 3,752 SAR left`.
+- Portfolio_Decision_v2 action (formerly 3): **`Board: 6 engine tickets (68,995 SAR, feed valid until 10:42). S-1 gate NOT_DECIDABLE (criteria 1 PENDING, 4 PENDING) — the tickets are not S-1 authorised; size under your interim rule (1–2 tickets).`** The FRST.US order status reads `working since 2026-10-26T06:23:34Z`; the false alarm is gone (D4). At 09:24 the page is UNCERTIFIED: `IBKR evidence EXPIRED at 08:55 (capture 08:41 + 14 min)` (1.2.30).
+- After 10:42 (feed EXPIRED) or on a NOT_ACTIONABLE / superseded feed: action 3 returns to the v1.2.28 text and the engine tile turns grey `feed <state> - …`; with no engine ticket on the board the page sizes the active seats as a research preview (`Sizing preview only`).
+
+## S5 - Tests (all run 2026-11-02 against the delivered file, node v22.22.0)
+- `node tests/test_dp2_v1231_engine_tickets.js` -> `run 1: 11/11`, `run 2: 11/11`, `DP2 V1231 T0-T10 x2 identical digest c090fb6a4ae26cd9 | new SHA256 5e76df11… | v1.2.30 SHA256 48480638… | v1.2.28 SHA256 a99af66a…`, **`PASS 11/11`** (≈ 23 s). REAL file in three vm contexts (NEW, the v1.2.30 oracle, the live v1.2.28) on a recording spreadsheet model (cells, formats, merges, borders, row heights, charts, an ordered call log), frozen clock, failing UrlFetchApp (cached bars only), the 10_My_Portfolio capture reader; fixture `tests/fixtures/dp2_board_2026-11-02.json` (header row 19, the ten seats, B2 `stab[strict]`, KPI rows, the feed in the `release_decision_feed.py` grammar: `EXECUTABLE | run=41363258387 | 2026-11-02 02:42:14+03:00 | issued=2026-11-02T04:19:49+03:00 | expires=2026-11-02T10:42:14+03:00 | ttl_min=480 | …`).
+
+| Section | Case | Result |
+|---|---|---|
+| T0 | oracles SHA-256 pinned (v1.2.28 `a99af66a`, v1.2.30 `48480638`), steps both ways, version lockstep, three files compile | PASS |
+| T1 (1) | `DP2_COHORT_LEGACY` = `1` -> both pages, `Refresh both`, every cell / format / merge / chart / call / return value = the v1.2.30 build on the engine board, a strict research board and a not-strict research board (9 build pairs: Top-10 alone, Portfolio alone, Refresh both); `on`, `true`, `yes`, `TRUE`, ` On `, `Yes`, `1 ` likewise; `0`, `off`, `false`, blank, `no`, `legacy`, `onn`, `enable`, absent and a property fault = the new view | PASS |
+| T2 (2) | today: header, Alloc = Ticket SAR, Buy qty = Shares, flags per class, colours, tiles, funnel, `Engine tickets: 6 · 68,995 SAR`, needs / funding text; vs v1.2.30 only the tile rows, the seats block, the ALLOCATION block, the funnel chart and the footer version differ on Top_10_Investments_v2, only action 3 on Portfolio_Decision_v2; engine tickets beyond the sector cap all mirrored; grey engine tile on NOT_ACTIONABLE / EXPIRED; `not funded by the engine`; `Refresh both` = the page alone | PASS |
+| T3 (3) | no engine ticket + strict: the seven ACTIVE seats sized = the v1.2.30 water-fill of the same seats labelled FAST-TRACK (Alloc, qty, risk, gain, totals); 2020.HK FAST-TRACK `fast-track · sizing suspended (strict)`, not sized; not strict -> 8 plans; a `sizing suspended` note suspends; a third Real Estate seat `outside the cohort caps` | PASS |
+| T4 (4) | 18-row class table; `Held — earnings in 0d` reads research on the engine board and keeps the seat out of the research cohort | PASS |
+| T5 (5) | action 3: EXECUTABLE -> `Board: 6 engine tickets …`; NOT_ACTIONABLE, SYNC RUNNING, EXPIRED (11:00), legacy, no engine ticket -> the v1.2.28 text; S-1 PASS -> neither | PASS |
+| T6 (6) | D4: FRST REPLACED + remaining 174 -> `working since 2026-10-26T06:23:34Z`, `Brackets working … 1 of 1 · pass`, no alarm; remaining 0 -> still `REPLACED` | PASS |
+| T7 (7) | 1.2.30: 08:50 CERTIFIED; 09:24 UNCERTIFIED `IBKR evidence EXPIRED at 08:55 (capture 08:41 + 14 min)`, header `page built 2026-11-02 09:24 · decision (Portfolio_Decision run) 2026-11-02 08:46:00 · IBKR capture 08:41 expired 08:55`; NOT_ACTIONABLE same run never certifies | PASS |
+| T8 | golden negatives (below) | PASS |
+| T9 | 16 mutants killed (below) | PASS |
+| T10 | ES5 token lint + ASCII of every added line, inventory, exactly 22 v1.2.28 lines replaced (11 by the steps, 11 by 1.2.31) and every other base line kept in order, 24 hunks whose reversal is the v1.2.30 oracle, LF only, WHY block | PASS |
+
+- **Golden negatives, the base files run as the delivered file** (exit 1 both):
+  - v1.2.28 (`node tests/test_dp2_v1231_engine_tickets.js 27_v1.2.28.gs 27_v1.2.28.gs`, `FAIL 1/11`): `FAIL T2 … SEATS header: "SEATS — 10 · 0 plans · 3 grace-held"`; `FAIL T3 … research header: "SEATS — 10 · 1 plans · 2 grace-held"` (it sizes the one suspended FAST-TRACK seat); `FAIL T4 … dp2SeatClass_ defined`; `FAIL T5 … ["FRST.US bracket: IBKR lists the 17.90 / 14.56 pair as REPLACED with no working successor. If nothing is working, 10,253 SAR is unprotected — verify before the next US open.","No board-originated capital: S-1 gate NOT_D…`; `FAIL T6 … FRST order status: "REPLACED — no working successor listed → verify at the broker"`; `FAIL T7 … 09:24: UNCERTIFIED: true !== false`.
+  - v1.2.30 (oracle as the delivered file, `FAIL 3/11`): T2, T3, T4, T5 fail as above (`SEATS — 10 · 0 plans · 3 grace-held`, action 3 `No board-originated capital …`); T6 and T7 pass (1.2.29 / 1.2.30 hold there).
+  - Inside the passing run T8 asserts the same: T2, T2b, T2c, T3, T4, T5, T6, T7 checks fail on v1.2.28; T2-T5 on v1.2.30; the FRST alarm and the 09:24 certification on v1.2.28.
+- **Mutants** (each applied to the delivered text, anchor found exactly once, killed by the named check): cohort back to `/FAST-TRACK/` (T2, T3); engine allocation re-sized by the water-fill (T2); engine Shares ignored (T2); class flag skipped so ACTIVE seats read `grace-held` (T2); research read before grace - the spec's listing order - (T2, T4); `stab[strict]` not read (T3); legacy switch leaking (funnel post-pass unconditional, T1); legacy switch ignored (T1); action 3 ignoring the feed (T5); action 3 under the kill switch (T5); engine tickets capped by the cohort caps (T2b); D4 reverted (T6); certification without the live feed (T7); `Held` not read as research (T4); engine tile green on a dead feed (T2c); capped active seats unaccounted in the header (T3). **16/16 killed.**
+- **Pre-merge checks:** `node --check` on a `.js` copy - OK; `node tests/js/apps_script_syntax.test.js` - 6 sources compiled; an ES5 AST scan of the whole file (TypeScript parser, ES5 target: arrow / class / let / const / template / spread / destructuring / for-of / default params / shorthand / computed keys / generators / async) - 0 parse diagnostics, **0** ES2015+ constructs (v1.2.28: 0); every native harness of the CI lane on this tree, exit 0: `decision_board_funding` 64, `decision_source_readiness` 73, `apps_script_syntax` 6, `portfolio_reconciliation_inputs` 20, `test_dt10_calendar_completeness`, `test_dt10_confirm_basis` 8/8, `test_dt10_pending_grace` 8/8, `test_dt10_funding_evidence` 103, `test_dt10_shadow_rank_log` 86, `test_dt10_shadow_momentum` 365, `test_dt10_post_earnings` 686, `test_pd_evidence_publish` 59, `test_pd_post_earn_inputs` 62, `decision_input_truth`, `dt10_feed_cohort_binding` 21/21, `gas_ledger_fx_failed_state` 11/11, `dt10_bulk_format` 9/9, `decision_chain` 36/36, `test_dt10_v1190_hold_live_rule` 9/9, `test_dp2_v1231_engine_tickets` 11/11; `python -m pytest -q tests/test_dp2_v1231_engine_tickets.py tests/test_universe_maintenance.py` - **64 passed** (the latter pins `DP2_FLAG_RE_`, unchanged); `ruff check --select E9,F63,F7,F82` (CI rule set) on the tree - all checks passed; `python -m compileall -q tests` - exit 0; `python scripts/audit_repository_workflows.py` - errors 0, warnings 0.
+- **Delivered file:** SHA-256 `5e76df119d514713190ce4bba72b4e42e39d6e7505d5a7b61bc71e486f5c7bac` (prefix **`5e76df11`**), 319,972 bytes, UTF-16 length 318,720, **3,480** newline-terminated lines (**3,481** in the editor). v1.2.30 (the eleven steps alone): `48480638…`.
+
+## S6 - Item 4: every other place that assumed FAST-TRACK = sized
+| Place (v1.2.28 line) | Disposition |
+|---|---|
+| 2106-2120 `dp2PlanSeats_` cohort, 2608 PD `planSyms`, 2985 split, 3018 tile, 3035-3036 funnel, 3064 header, 3094 / 3111 / 3123-3124 seat rows, 3130 colour, 3153 / 3156 ALLOCATION rows | changed (S2.2), each under the kill switch |
+| `_DP2_Charts_T10` | the funnel block follows the cohort (T2 checks the data and the chart subtitle); the universe, gates, scatter, concentration (all held seats by sector) and hit-rate charts never read the cohort - unaffected |
+| exit / alert engine (`dp2ExitCompute_`, `dp2ExitSignal_`, `dp2ExitAlerts_`) | runs on ledger lots (held positions), never on seats - unaffected |
+| `dp2PlanText_` / `dp2FundingPlans_` / `dp2UnfundedAction_` / `dp2CapitalCall_` | format the needs of the sizing cohort; on an engine board there are none (nothing re-planned over the engine's tickets), on the research mirror they follow the active cohort - no FAST-TRACK test of their own |
+| ALL QUALIFIED table `stab` column (line 3248) | display of `Why Not Selected` text - not sizing; unaffected |
+| `dp2ReadTop10_` `stab[..]: N grace, M ft-carried` parse (line 967) | informational fields, not read by any sizing path; unaffected |
+| header history line 189 (1.2.0 "only FAST-TRACK plans are sized") | history, kept verbatim |
+
+## S7 - Known limits / deliberate cuts
+- **Strict mode is read from B2** (`stab[strict]`), with the FAST-TRACK seat's own `sizing suspended` note as a fallback. A cockpit caught mid-run (`status: running…`) carries neither; on a research board such a FAST-TRACK seat would then be sized as a preview (labelled `Sizing preview only`; never on an engine board, where only engine tickets are sized).
+- An engine board is mirrored as issued: no rotation, capital call or need is re-planned over the engine's tickets on this page (the cockpit's own ALERTS carry them).
+- Not changed (outside the asked surfaces): the Top-10 `ALERTS, GUARDS IN OBSERVE, NEXT STEP` text still opens with "Path to the first executable board …" on an executable board; the Portfolio_Decision_v2 Deployable tile still says `Tranche 0 (S-1 …)`; the Executable tile still counts `Ticket SAR > 0` regardless of the current feed state (all pre-existing; candidates for a follow-up).
+- `.github/workflows/ci.yml` is not edited; the pytest wrapper collects the harness in the whole-suite job. Adding `node tests/test_dp2_v1231_engine_tickets.js` to the native Apps Script step is a one-line follow-up.
+- The harness models the GAS services; the live workbook was not read or written by this change.
+
+## S8 - Operator steps (the repo file is a mirror; nothing changes until the paste)
+1. Merge the PR.
+2. Extensions ▸ Apps Script ▸ `27_Decision_Pages_v2.gs` ▸ select all ▸ paste the full file from `main` (SHA-256 `5e76df11…`, 3,481 lines in the editor) ▸ Save. (This also installs the prepared 1.2.29 / 1.2.30 steps - do **not** apply the 28 Oct find/replace sheet separately.)
+3. Menu **📊 Decision v2 ▸ 🔄 Refresh both v2 pages**.
+4. Check: Top_10_Investments_v2 header `SEATS — 10 · 6 engine tickets · 1 research · 3 grace-held` (on today's board), Alloc SAR = the cockpit's Ticket SAR, flags `engine ticket` / `research · not sized (…)` / `grace-held · not sized`; Portfolio_Decision_v2 ACTIONS TODAY reads `Board: 6 engine tickets (68,995 SAR, feed valid until 10:42). S-1 gate NOT_DECIDABLE (…) — …` while the release is live (the v1.2.28 text once it expires), and the FRST.US order status reads `working since …`.
+5. Rollback: Script Property `DP2_COHORT_LEGACY` = `1` (the 1.2.30 behaviour of every line touched here; no re-paste), or Apps Script ▸ Project History ▸ restore 1.2.28.
+
+## Correction record
+| Defect | Root cause | Change | Tests | Deployed/installed version | Effective mode | Live acceptance | Remaining dependency |
+|---|---|---|---|---|---|---|---|
+| Top_10_Investments_v2 sized 0 plans and flagged the six engine tickets grace-held while the board was EXECUTABLE 6 | research cohort = `/FAST-TRACK/` = the seats strict mode suspends | seat classes in the cockpit's precedence; engine board mirrored ticket for ticket; research cohort = active seats | T1-T4, T8, T9 | prepared in this PR; live is 1.2.28 | default on; `DP2_COHORT_LEGACY=1` restores 1.2.30 | pending paste: the SEATS header and flags above | owner pastes + Refresh both |
+| PD action 3 "No board-originated capital … stays Tranche 0" beside an EXECUTABLE feed with 6 tickets | action ignored the feed | factual board + S-1 line on a live EXECUTABLE feed | T5, T8 | as above | default on; kill switch restores | pending paste | as above |
+| FRST.US "REPLACED … unprotected" false alarm; certification on expired evidence | 1.2.29 / 1.2.30 prepared 28 Oct, never installed | the eleven steps, unchanged | T6, T7, T8 | as above | always on once pasted | pending paste | as above |
+
+Not a licensed financial adviser; the owner decides and executes every trade.

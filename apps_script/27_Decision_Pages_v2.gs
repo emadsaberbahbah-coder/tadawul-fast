@@ -1,7 +1,43 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.28 (2026-10-26)
+ * Version: 1.2.31 (2026-11-02)
+ *   1.2.31: THE MIRROR SIZES WHAT THE ENGINE SIZES (owner review, Mon 2 Nov 2026, the 09:24 build of the 08:49 cockpit:
+ *           'there is no allocation but the investment page top 10 show FEED ACTIONABLE - EXECUTABLE ... 6 EXECUTABLE
+ *           TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN TODAY)'). Top_10_Investments_v2 read EXECUTABLE 6
+ *           beside ALLOCATED (RESEARCH) 0 SAR '0 of 0 plans funded', the header 'SEATS - 10 . 0 plans . 3 grace-held',
+ *           'grace-held . not sized' on every seat (the six engine tickets included) and 'Plans in the sizing cohort: 0 -
+ *           none (no fast-track seats)'. Cause: since 1.2.0 the research mirror took its sizing cohort from /FAST-TRACK/,
+ *           but the cockpit's strict stability mode (16_Decision_Top10, B2 'stab[strict]') SUSPENDS sizing on FAST-TRACK
+ *           seats and the engine funds the ACTIVE ones - the mirror sized exactly the seats the engine does not size and
+ *           labelled the funded ones grace-held. Now one pure helper, dp2SeatClass_, reads each seat the way the cockpit
+ *           counts it (dt10TicketClasses_ / dt10HeldSeatReason_ precedence): engine (Ticket SAR > 0) > grace (Stability
+ *           GRACE..) > suspended (FAST-TRACK under stab[strict], or 'sizing suspended') > research (Funds From 'Held ..'
+ *           - 16_Decision_Top10 v1.20.0 earnings / owner rule / ticket cap - or 'Research ..' while the board carries an
+ *           engine ticket; the cockpit writes that label on EVERY unfunded seat, so on a board without one it says
+ *           nothing about the seat) > active. dp2Cohort_ picks the sizing cohort once per Top_10 read: a board with any
+ *           engine ticket is MIRRORED ticket for ticket (dp2Allocate_ mode 'engine': alloc = Ticket SAR, qty = Shares, no
+ *           re-sizing, no research needs or rotation over the engine's tickets); a board without one sizes the 'active'
+ *           seats (FAST-TRACK only when the cockpit is not strict) by the unchanged conviction water-fill. Surfaces: the
+ *           SEATS header ('SEATS - 10 . 6 engine tickets . 1 research . 3 grace-held', or '. N plans .' on the research
+ *           mirror), one class flag per seat ('engine ticket' / 'research . not sized (<Funds From>)' / 'grace-held . not
+ *           sized' / 'fast-track . sizing suspended (strict)' / 'not funded by the engine'), the status colour (navy =
+ *           engine / active), the Held seats tile ('A active . F fast-track . G grace-held'), the funnel stage 'Seats ->
+ *           plans', the ALLOCATION block ('Engine tickets: N . X SAR (feed ..)', the basis named on the cohort row), and
+ *           Portfolio_Decision_v2 action 3: on a live EXECUTABLE feed with engine tickets it states 'Board: N engine
+ *           tickets (X SAR, feed valid until HH:MM). S-1 gate .. - the tickets are not S-1 authorised; size under your
+ *           interim rule (1-2 tickets).' instead of 'No board-originated capital .. stays Tranche 0' (the two pages
+ *           contradicted each other). Display / research only: nothing sizes a seat the engine did not fund, the
+ *           Executable count is untouched, no gate, ticket, order or broker call. Kill switch: Script Property
+ *           DP2_COHORT_LEGACY = 1 / on / true / yes restores the 1.2.30 cohort and wording of every line touched here.
+ *           Rollback: the property, or Project History -> 1.2.30 / 1.2.28.
+ *   1.2.30 (prepared 28 Oct 2026, never installed - the live file was still 1.2.28 on 2 Nov; installed with 1.2.31 as the
+ *           eleven steps of that day's sheet, unchanged): certification expires with its evidence (IBKR capture + 14 min,
+ *           measured when the page is built) and needs a live EXECUTABLE feed for the same run and a Portfolio_Decision
+ *           status of ok; the header shows the page build time and the decision time separately.
+ *   1.2.29 (D4; prepared 28 Oct 2026 with 1.2.30, never installed): an order the IBKR capture still lists as working with
+ *           remaining shares counts as working even when IBKR labels it REPLACED (edited order). Rollback: Project History
+ *           -> 1.2.28.
  *   1.2.28: THE FEED CHIP SAYS WHY (owner question 26 Oct 13:27: 'NOT ACTIONABLE again?'). The pages read the release
  *           vocabulary of release_decision_feed.py as if it were the old ACTIONABLE one: a valid EXECUTABLE feed rendered
  *           amber on the T10 chip and red on the PD 'Feed / S-1' KPI and LIMITS row; an EXECUTABLE value past its
@@ -257,11 +293,13 @@
  *   DP2_EXIT_ALERT_TO e-mail   (default: the script owner)
  *   DP2_HISTORY_URL   template with {symbol}, e.g. https://…/v1/history?symbol={symbol}&days=130
  *   DP2_HISTORY_KEY   value sent as X-API-Key with DP2_HISTORY_URL
+ *   DP2_COHORT_LEGACY 1|on|true|yes (v1.2.31 kill switch: the 1.2.30 FAST-TRACK sizing cohort, seat labels and
+ *                     Portfolio_Decision_v2 action wording; default absent = the engine-ticket mirror)
  *
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.28';   // lockstep with the header
+var DP2_VERSION = '1.2.31';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -645,7 +683,7 @@ function dp2Fmt_(n, d) {
 function dp2Pct_(n, d) { return (n === null || n === undefined || isNaN(n)) ? '—' : ((n >= 0 ? '+' : '−') + Math.abs(n).toFixed(d === undefined ? 1 : d) + '%'); }
 function dp2Signed_(n, d) { if (n === null || n === undefined || isNaN(n)) return '—'; return (n >= 0 ? '+' : '−') + dp2Fmt_(Math.abs(n), d === undefined ? 0 : d); }
 function dp2PctPlain_(n, d) { return (n === null || n === undefined || isNaN(n)) ? '—' : (Number(n).toFixed(d === undefined ? 1 : d) + '%'); }
-function dp2Today_() { return Utilities.formatDate(new Date(), DP2.TZ, 'yyyy-MM-dd HH:mm'); }
+function dp2Today_() { return Utilities.formatDate(new Date(), DP2.TZ, 'yyyy-MM-dd HH:mm'); } function dp2EvidenceExpiry_(pd, nowMs) { try { var ev = pd && pd.evidence; var cap = /^(\d{1,2}):(\d{2})$/.exec(String((ev && ev.capture) || '')); var lr = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(String((pd && pd.lastRun) || '')); if (!cap || !lr) return null; var limit = typeof ev.limit === 'number' && ev.limit > 0 ? ev.limit : DP2.EVIDENCE_LIMIT_MIN; var capMs = Date.UTC(+lr[1], +lr[2] - 1, +lr[3], +cap[1] - 3, +cap[2], 0); var runMs = Date.UTC(+lr[1], +lr[2] - 1, +lr[3], +lr[4] - 3, +lr[5], 0); if (capMs > runMs) capMs -= 86400000; var expMs = capMs + limit * 60000; var e = new Date(expMs + 10800000); var p2 = function (n) { return (n < 10 ? '0' : '') + n; }; return { live: typeof nowMs === 'number' && nowMs < expMs, expiresMs: expMs, hm: p2(e.getUTCHours()) + ':' + p2(e.getUTCMinutes()), capture: p2(+cap[1]) + ':' + cap[2], limit: limit }; } catch (x) { return null; } }   // v1.2.30: evidence expires at capture + limit, measured now
 function dp2ColLetter_(c) { var s = ''; while (c > 0) { var m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); } return s; }
 function dp2HeaderMap_(row) {
   var map = {};
@@ -994,7 +1032,7 @@ function dp2ReadPortfolioDecision_() {
   var mev3 = /ibkr evidence SENT \(capture ([0-9:]+) age ([0-9hm ]+?)[;)]/.exec(out.status);
   if (!out.evidence && mev3) out.evidence = { state: 'SENT', capture: mev3[1], age: mev3[2].trim(), limit: DP2.EVIDENCE_LIMIT_MIN };
   var mfx = /USD ([0-9.]+)/.exec(out.status); out.fx = mfx ? parseFloat(mfx[1]) : null;
-  var mlr = /Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(out.status); out.lastRun = mlr ? mlr[1] : '';
+  var mlr = /Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(out.status); out.lastRun = mlr ? mlr[1] : ''; var mst = /\|\s*status:\s*([A-Za-z_]+)/.exec(out.status); out.state = mst ? mst[1].toUpperCase() : '';   // v1.2.30
   var mex = /excluded ([A-Z0-9., ]+?)(?: \||$)/.exec(out.status); out.excluded = mex ? mex[1].trim() : '';
   return out;
 }
@@ -1282,7 +1320,7 @@ function dp2IbkrOverlayCapture_(out) {
     var px = null;
     if (/STOP/.test(typ)) { var mstp = /STP\s+(?:LMT\s+)?([\d,]*\.?\d+)/i.exec(sdsc); px = mstp ? dp2Num_(mstp[1].replace(/,/g, '')) : null; }
     else px = dp2Num_(o.limit_price);
-    mapped.push({ symbol: mo ? mo[2].toUpperCase() : '', side: dp2Str_(o.side).toUpperCase() || (mo ? mo[1].toUpperCase() : ''), type: typ, qty: dp2Num_(o.total_shares_qty), price: px, status: dp2Str_(o.order_status).toUpperCase(), placed: dp2Str_(o.order_time) });
+    mapped.push({ symbol: mo ? mo[2].toUpperCase() : '', side: dp2Str_(o.side).toUpperCase() || (mo ? mo[1].toUpperCase() : ''), type: typ, qty: dp2Num_(o.total_shares_qty), price: px, status: dp2Str_(o.order_status).toUpperCase(), placed: dp2Str_(o.order_time), remaining: dp2Num_(o.remaining_shares_qty), working: true });
   }
   out.account = acct; out.orders = mapped;
   out.tabs.account = true; out.tabs.orders = true;
@@ -1309,7 +1347,7 @@ function dp2BracketFor_(orders, symbolKey) {
     if (isTp) lastTp = o.price;
     if (isStop) lastStop = o.price;
     if (/REPLACED/.test(dp2Str_(o.status).toUpperCase())) replaced++;
-    if (!dp2OrderActive_(o.status)) continue;
+    if (!dp2OrderActive_(o.status) && !(o.working === true && /REPLACED/.test(o.status) && typeof o.remaining === 'number' && o.remaining > 0)) continue;   // v1.2.29 (D4)
     active++;
     if (isTp) { tp = o.price; tpQty += (o.qty || 0); }
     if (isStop) { stopQty += (o.qty || 0); stops.push({ price: o.price, qty: o.qty || 0 }); if (stop === null || (o.price !== null && o.price < stop)) stop = o.price; }   // v1.2.11/13: quantities per level; `stop` = the LOWEST active level (weakest protection)
@@ -2103,7 +2141,98 @@ function dp2FxToSar_(ccy, fx) {
   if (DP2A_FX_APPROX_.hasOwnProperty(base)) return { rate: c === 'GBX' ? DP2A_FX_APPROX_[base] / 100 : DP2A_FX_APPROX_[base], source: 'approx' };
   return { rate: null, source: 'none' };
 }
-/* Plan seats = FAST-TRACK seats in rank order within the sector / market caps (the engine's sizing cohort). */
+/* ========================================================= v1.2.31: seat classes and the sizing cohort */
+/* v1.2.31: THE SEAT CLASSES THE COCKPIT'S OWN BOARD IMPLIES. 16_Decision_Top10 (dt10FinalizeBoard_) keeps Ticket SAR > 0
+ * only on a seat the engine funded; every other seat - grace, suspended fast-track or research - is written with Ticket 0
+ * and Funds From 'Research - no allocation'. So the Stability text is read before Funds From, in the cockpit's own
+ * precedence (dt10TicketClasses_ / dt10HeldSeatReason_):
+ *   engine    Ticket SAR > 0 - the engine's ticket
+ *   grace     Stability starts with GRACE - held, not sized
+ *   suspended FAST-TRACK while B2 carries 'stab[strict]', or 'sizing suspended' in the Stability text (or, on a
+ *             FAST-TRACK seat, in its Advisor Note) - sizing suspended by the cockpit
+ *   research  Funds From 'Held ..' (16_Decision_Top10 v1.20.0: 'Held - earnings in Nd' / 'Held - owner rule' /
+ *             'Held - ticket cap N'), or 'Research ..' while the board carries an engine ticket (the engine funded
+ *             other seats and not this one; on a board without any engine ticket that label is on every seat)
+ *   active    otherwise - ACTIVE / NEW, and FAST-TRACK when the cockpit is not strict
+ * Pure (no service call); never throws. */
+function dp2SeatClass_(seat, strict, engineBoard) {
+  var s = seat || {};
+  var tk = dp2Num_(s['Ticket SAR']);
+  if (tk !== null && tk > 0) return 'engine';
+  var stab = dp2Str_(s['Stability']).trim(), ff = dp2Str_(s['Funds From']).trim();
+  if (/^GRACE/i.test(stab)) return 'grace';
+  if (/sizing suspended/i.test(stab) || (/FAST-TRACK/i.test(stab) && (strict === true || /sizing suspended/i.test(dp2Str_(s['Advisor Note']))))) return 'suspended';
+  if (/^Held\b/i.test(ff) || (engineBoard === true && /^Research\b/i.test(ff))) return 'research';
+  return 'active';
+}
+var DP2_COHORT_LEGACY_PROP = 'DP2_COHORT_LEGACY';   // v1.2.31 kill switch: 1 / on / true / yes = the 1.2.30 cohort and wording
+function dp2CohortLegacy_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_COHORT_LEGACY_PROP)).trim()); }
+/* v1.2.31: the board's sizing cohort, worked out once per Top_10 read (kept on the reader object). basis:
+ *   'engine'   the board carries at least one engine ticket - the cohort IS those tickets, mirrored as issued
+ *   'research' no engine ticket - the 'active' seats, sized by the conviction water-fill (dp2Allocate_)
+ *   'legacy'   DP2_COHORT_LEGACY - the FAST-TRACK seats (1.2.0 - 1.2.30) */
+function dp2Cohort_(t) {
+  if (t && t.cohort_) return t.cohort_;
+  var seats = (t && t.seats) || [], i;
+  var co = { legacy: dp2CohortLegacy_(), strict: /stab\[strict\]/.test(dp2Str_(t && t.status)), engineBoard: false, basis: '',
+             n: { engine: 0, research: 0, grace: 0, suspended: 0, active: 0 }, engineSar: 0, engineSyms: [] };
+  for (i = 0; i < seats.length; i++) { var tk0 = dp2Num_(seats[i]['Ticket SAR']); if (tk0 !== null && tk0 > 0) co.engineBoard = true; }
+  for (i = 0; i < seats.length; i++) {
+    var c = dp2SeatClass_(seats[i], co.strict, co.engineBoard);
+    co.n[c]++;
+    if (c === 'engine') { co.engineSar += dp2Num_(seats[i]['Ticket SAR']); co.engineSyms.push(dp2Str_(seats[i]['Symbol']).trim()); }
+  }
+  co.basis = co.legacy ? 'legacy' : (co.engineBoard ? 'engine' : 'research');
+  co.cls = function (seat) { return dp2SeatClass_(seat, co.strict, co.engineBoard); };
+  co.member = function (seat) {
+    if (co.basis === 'legacy') return /FAST-TRACK/.test(dp2Str_(seat && seat['Stability']));
+    return co.cls(seat) === (co.basis === 'engine' ? 'engine' : 'active');
+  };
+  if (t) t.cohort_ = co;
+  return co;
+}
+/* v1.2.31: the one class flag a seat carries on the SEATS table ('' = none: an active seat the research mirror sizes). */
+function dp2SeatFlag_(cls, seat, co, inPlans) {
+  if (cls === 'engine') return 'engine ticket';
+  if (cls === 'research') return 'research \u00b7 not sized (' + (dp2Str_(seat && seat['Funds From']).trim() || 'no allocation') + ')';
+  if (cls === 'grace') return 'grace-held \u00b7 not sized';
+  if (cls === 'suspended') return 'fast-track \u00b7 sizing suspended' + (co.strict ? ' (strict)' : '');
+  if (co.basis === 'engine') return 'not funded by the engine';
+  return inPlans ? '' : 'outside the sizing cohort (cohort caps)';
+}
+/* v1.2.31: the SEATS section title and subtitle (DP2_COHORT_LEGACY keeps the 1.2.30 text at the call site). */
+function dp2SeatsTitle_(nSeats, co, nPlans) {
+  var parts = ['SEATS \u2014 ' + nSeats];
+  parts.push(co.basis === 'engine' ? co.n.engine + ' engine ticket' + (co.n.engine === 1 ? '' : 's') : nPlans + ' plan' + (nPlans === 1 ? '' : 's'));
+  if (co.basis === 'engine' && co.n.active) parts.push(co.n.active + ' not funded');
+  if (co.basis !== 'engine' && co.n.active > nPlans) parts.push((co.n.active - nPlans) + ' outside the cohort caps');
+  if (co.n.research) parts.push(co.n.research + ' research');
+  if (co.n.suspended) parts.push(co.n.suspended + ' fast-track suspended');
+  parts.push(co.n.grace + ' grace-held');
+  return parts.join(' \u00b7 ');
+}
+function dp2FeedTag_(feed, fv) {   // 'EXECUTABLE, valid until 10:42 Riyadh' / 'EXPIRED, expiry 10:42 Riyadh' / 'NOT ACTIONABLE'
+  return fv.label + (feed && feed.expiresHm ? (fv.live ? ', valid until ' : ', expiry ') + feed.expiresHm + ' Riyadh' : '');
+}
+function dp2SeatsSub_(co, alloc, feed, fv) {
+  if (co.basis === 'engine') return 'Alloc / Buy qty = the engine\'s own tickets as Top_10_Investments issued them (Ticket SAR / Shares; feed ' + dp2FeedTag_(feed, fv) + ') \u2014 mirrored, never re-sized. Research, grace-held and suspended fast-track seats carry no allocation (the flag names the class). Dyn. stop = entry \u2212 2 \u00d7 ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = ticket \u00d7 plan ROI.';
+  var cfg = alloc && alloc.cfg;
+  return 'Alloc / Buy qty = research allocation of the deployable cash across the active seats (FAST-TRACK only when the cockpit is not strict), mirroring the engine\'s conviction sizing (weight = plan ROI \u00d7 risk \u00d7 reliability, per-seat cap ' + (cfg ? cfg.maxWeightPct : DP2A.MAX_WEIGHT_PCT) + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + (cfg && cfg.envPresent ? dp2Fmt_(cfg.opFloor) + ' SAR' + (cfg.venueOn ? ' raised to the venue floor' : '') : dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR research floor (DP2_ENGINE_ENV unset)') + ', the engine\'s own cash reserve). Grace-held, suspended fast-track and research (held) seats are not sized. Dyn. stop = entry \u2212 2 \u00d7 ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation \u00d7 plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.';
+}
+/* v1.2.31: Portfolio_Decision_v2 action 3 follows the feed. On a live EXECUTABLE release with engine tickets on the board,
+ * 'No board-originated capital .. stays Tranche 0' contradicted Top_10_Investments_v2 (EXECUTABLE, N tickets); the action
+ * states the board and the S-1 gate side by side. null = keep the 1.2.28 wording (DP2_COHORT_LEGACY, a feed that is not
+ * a live EXECUTABLE release, or no engine ticket on the board). */
+function dp2BoardTicketsAction_(t10, feed, s1) {
+  var co = dp2Cohort_(t10);
+  if (co.legacy || co.n.engine < 1) return null;
+  var fv = dp2FeedView_(feed, new Date().getTime());
+  if (fv.label !== 'EXECUTABLE') return null;
+  var pend = ((s1 && s1.criteria) || []).filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' ' + c.status; }).join(', ');
+  return { p: 4, t: 'Board: ' + co.n.engine + ' engine ticket' + (co.n.engine === 1 ? '' : 's') + ' (' + dp2Fmt_(co.engineSar) + ' SAR, ' + (feed.expiresHm ? 'feed valid until ' + feed.expiresHm : 'feed EXECUTABLE') + '). S-1 gate ' + ((s1 && s1.verdict) || 'n/a') + (pend ? ' (criteria ' + pend + ')' : '') + ' \u2014 the tickets are not S-1 authorised; size under your interim rule (1\u20132 tickets).' };
+}
+/* Plan seats = the sizing cohort (v1.2.31 dp2Cohort_: the engine's tickets, else the active seats; FAST-TRACK seats under
+ * DP2_COHORT_LEGACY, as 1.2.0 - 1.2.30) in rank order within the sector / market caps (an engine ticket is taken as issued). */
 /* v1.2.4: the cohort caps come from the Top_10 panel (T10: Max Selected / Max Per Sector / Max Per Market), DP2A only as fallback. */
 function dp2CohortCaps_(t) {
   var pnl = (t && t.panel) || {};
@@ -2114,13 +2243,14 @@ function dp2PlanSeats_(t, fx, xbars, qmap, cfg) {
   var out = [], sectors = {}, markets = {};
   var caps = dp2CohortCaps_(t);
   cfg = cfg || dp2ProdConfig_(t);   // v1.2.20: _sizing_cohort — normalized sectors (the Unknown bucket exempt from the count cap) and canonical market keys
+  var co = dp2Cohort_(t);   // v1.2.31: the sizing cohort (engine tickets / active seats; DP2_COHORT_LEGACY = the FAST-TRACK seats)
   for (var i = 0; i < t.seats.length; i++) {
     var s = t.seats[i];
     var stability = dp2Str_(s['Stability']);
-    if (!/FAST-TRACK/.test(stability)) continue;
-    if (out.length >= caps.maxSelected) break;
+    if (!co.member(s)) continue;   // v1.2.31 (was /FAST-TRACK/: the seats strict mode does NOT size)
+    if (co.basis !== 'engine' && out.length >= caps.maxSelected) break;   // v1.2.31: an engine ticket is mirrored as issued (the engine applied the caps)
     var sym = dp2Str_(s['Symbol']).trim(), sec = cfg.sector(s['Sector']), mkt = dp2Str_(s['Market']).trim() || 'Unknown', mkey = cfg.marketKey(mkt);
-    if (((sectors[sec] || 0) >= caps.maxPerSector && !(cfg.sectorNormalize && sec === 'Unknown')) || (markets[mkey] || 0) >= caps.maxPerMarket) continue;
+    if (co.basis !== 'engine' && (((sectors[sec] || 0) >= caps.maxPerSector && !(cfg.sectorNormalize && sec === 'Unknown')) || (markets[mkey] || 0) >= caps.maxPerMarket)) continue;
     var q = (qmap && qmap[sym]) || {};
     var ccy = dp2Str_(s['Ccy']);
     var fxRow = dp2Num_(s['FX→SAR']);
@@ -2142,11 +2272,14 @@ function dp2PlanSeats_(t, fx, xbars, qmap, cfg) {
     sectors[sec] = (sectors[sec] || 0) + 1; markets[mkey] = (markets[mkey] || 0) + 1;
     out.push({ sym: sym, name: dp2Str_(s['Name']), sector: sec, market: mkt, ccy: ccy, fxUse: fxUse, fxSource: fxSource, price: price, priceSar: (price !== null && fxUse !== null) ? price * fxUse : null,
                roi3: roi3, roi12: roi12, roiVal: roiVal, roiValSource: roiValSource, rel: rel, dq: dp2Num_(s['DQ']), risk: risk, rank: dp2Num_(s['Rank']), stability: stability, atr: atr,
-               stop0: (price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null, ticketEngine: dp2Num_(s['Ticket SAR']) });
+               stop0: (price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null, ticketEngine: dp2Num_(s['Ticket SAR']),
+               sharesEngine: dp2Num_(s['Shares']) });   // v1.2.31: the engine's Shares (mirrored with Ticket SAR on an engine board)
   }
   return out;
 }
 /* Allocation of the deployable cash across the plan seats (research). pvSar = holdings value; cashSar = cash; navSar = pv + cash. */
+/* v1.2.31: mode 'engine' = an engine board mirrored: each plan is FUNDED at its Ticket SAR / Shares (no water-fill, no
+ * top-up, no floor or sector test, no funding need) - the totals, gain and risk rows then describe the engine's tickets. */
 function dp2Allocate_(plans, cashSar, pvSar, secCtx, reserveSar, cfg, mode) {
   var cash = Math.max(0, cashSar || 0), pv = Math.max(0, pvSar || 0), nav = cash + pv;
   cfg = cfg || dp2ProdConfig_(null);   // v1.2.20: the production configuration (DP2_ENGINE_ENV), engine defaults + a research floor when unset
@@ -2186,6 +2319,7 @@ function dp2Allocate_(plans, cashSar, pvSar, secCtx, reserveSar, cfg, mode) {
     var sec = cfg.sector(p.sector);
     var target = targets.hasOwnProperty(p.sym) ? targets[p.sym] : 0;
     var r = { sym: p.sym, weight: weights[p.sym] || 0, target: target, qty: 0, alloc: 0, gain3: null, riskSar: null, state: '', note: '', sector: sec };
+    if (mode === 'engine') { r.weight = 0; r.qty = (p.sharesEngine !== null && p.sharesEngine > 0) ? p.sharesEngine : 0; r.alloc = p.ticketEngine; r.state = 'FUNDED'; r.plan = p; r.engine = true; if (secSar) secSar[sec] = (secSar[sec] || 0) + r.alloc; remaining -= r.alloc; rows.push(r); continue; }   // v1.2.31: the engine's own ticket (Ticket SAR / Shares), never re-sized
     if (!p.priceSar) { r.state = 'NO_FX'; r.note = 'no FX→SAR for ' + p.ccy; rows.push(r); continue; }
     var sized;
     if (mode === 'conviction') {
@@ -2538,9 +2672,10 @@ function dp2ResearchAllocation_(t, led, mp, ib, cashSar, fx, xbars) {
   var secCtx = mkSec();
   var reserve = dp2CashReserve_(t, cashSar, (cashSar || 0) + pv, cfg);   // v1.2.15: the engine's reserve, not a hard-coded 10 %
   // the research view is the conviction rule (the owner's target); the funding plans follow production's mode
-  var alloc = dp2Allocate_(plans, cashSar, pv, secCtx, reserve.sar, cfg, 'conviction');
-  alloc.secCtx = secCtx; alloc.reserve = reserve; alloc.cfg = cfg;
-  var allocP = cfg.sizingMode === 'conviction' ? alloc : dp2Allocate_(plans, cashSar, pv, mkSec(), reserve.sar, cfg, 'cap');
+  var cohortA = dp2Cohort_(t);   // v1.2.31: an engine board is mirrored ticket for ticket (mode 'engine': no re-sizing, no research needs)
+  var alloc = dp2Allocate_(plans, cashSar, pv, secCtx, reserve.sar, cfg, cohortA.basis === 'engine' ? 'engine' : 'conviction');
+  alloc.secCtx = secCtx; alloc.reserve = reserve; alloc.cfg = cfg; alloc.cohort = cohortA;
+  var allocP = (cfg.sizingMode === 'conviction' || cohortA.basis === 'engine') ? alloc : dp2Allocate_(plans, cashSar, pv, mkSec(), reserve.sar, cfg, 'cap');
   alloc.prod = allocP; alloc.needsProd = allocP.needs;
   var holdings = dp2RotationHoldings_(eq, fi, ib, qmap, seatMap, cfg);
   alloc.holdings = holdings;
@@ -2605,7 +2740,7 @@ function buildPortfolioDecisionV2() {
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
   var alloc = null;
   try {
-    var planSyms = []; for (var pi = 0; pi < t10.seats.length; pi++) { if (/FAST-TRACK/.test(dp2Str_(t10.seats[pi]['Stability']))) planSyms.push(dp2Str_(t10.seats[pi]['Symbol']).trim()); }
+    var planSyms = [], coPd = dp2Cohort_(t10); for (var pi = 0; pi < t10.seats.length; pi++) { if (coPd.member(t10.seats[pi])) planSyms.push(dp2Str_(t10.seats[pi]['Symbol']).trim()); }   // v1.2.31: the sizing cohort's bars (legacy: the FAST-TRACK seats)
     var seatBars = {}; try { seatBars = dp2LoadBars_(planSyms); } catch (eS) { seatBars = {}; }
     alloc = dp2ResearchAllocation_(t10, led, mp, ib, cashSar || 0, fx, seatBars);
   } catch (eA) { alloc = null; }
@@ -2636,8 +2771,8 @@ function buildPortfolioDecisionV2() {
 
   // evidence
   var evState = pd.evidence ? pd.evidence.state : 'UNKNOWN';
-  var evFresh = /SENT|OK|FRESH/.test(evState) && !/NOT/.test(evState);
-  var certified = evFresh && pd.readiness === 'VERIFIED' && feed.run && pd.receiptRun === feed.run;
+  var evSent = /SENT|OK|FRESH/.test(evState) && !/NOT/.test(evState); var evExp = evSent ? dp2EvidenceExpiry_(pd, new Date().getTime()) : null; var evFresh = evSent && evExp !== null && evExp.live === true; if (evSent && !evFresh) evState = evExp === null ? 'SENT, capture time unknown' : 'EXPIRED at ' + evExp.hm + ' (capture ' + evExp.capture + ' + ' + evExp.limit + ' min)';   // v1.2.30
+  var certified = evFresh && pd.readiness === 'VERIFIED' && pd.state === 'OK' && !!feed.run && pd.receiptRun === feed.run && dp2FeedView_(feed, new Date().getTime()).live === true;   // v1.2.30: a blocked, superseded or expired feed never certifies
   var stateChip = certified ? ['CERTIFIED', 'green'] : ['UNCERTIFIED', 'amber'];
 
   // trades
@@ -2655,9 +2790,9 @@ function buildPortfolioDecisionV2() {
   dp2ChartsBegin_(DP2.SHEET_CHARTS_PD);
   var row = 1;
   var reason = 'source readiness ' + (pd.readiness || 'n/a') + (pd.receiptRun ? ' (run ' + pd.receiptRun + ')' : '') +
-    ' · IBKR evidence ' + evState + (pd.evidence && pd.evidence.age ? ' — capture ' + pd.evidence.capture + ' is ' + pd.evidence.age + ' old (limit ' + pd.evidence.limit + ' m)' : '') +
+    ' \u00b7 IBKR evidence ' + evState + (pd.evidence && pd.evidence.age ? ' \u2014 capture ' + pd.evidence.capture + ', ' + pd.evidence.age + ' old when Portfolio_Decision ran (limit ' + pd.evidence.limit + ' m)' : '') +   // v1.2.30
     ' · feed ' + (feed.state ? dp2FeedView_(feed, new Date().getTime()).label : 'n/a') + (feed.blocker && !feed.supersededBy ? ' (' + feed.blocker + ')' : '') + (feed.reasons ? ' → ' + feed.reasons : '');
-  dp2Header_(sh, row, 'PORTFOLIO DECISION — v2', stateChip[0], stateChip[1], 'built ' + dp2Today_() + ' · PD run ' + (pd.lastRun || 'n/a') + ' · FX ' + fx);
+  dp2Header_(sh, row, 'PORTFOLIO DECISION — v2', stateChip[0], stateChip[1], 'page built ' + dp2Today_() + ' \u00b7 decision (Portfolio_Decision run) ' + (pd.lastRun || 'n/a') + (evExp ? ' \u00b7 IBKR capture ' + evExp.capture + (evExp.live ? ' valid to ' : ' expired ') + evExp.hm : '') + ' \u00b7 FX ' + fx);
   row++;
   dp2Line_(sh, row, reason, { color: DP2C.ink, size: 9.5, bg: DP2C.surface, height: 30 }); row++;
   dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + (ib.capture ? ' · IBKR cash and working orders from the read-only capture ' + dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ' (' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ', STALE' : '') + ')' : '') + '; trades and TWR from the _IBKR_* tabs' : ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + (ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ', ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' — STALE manual snapshot' : '') : 'MISSING — no broker snapshot; cash from ' + cashSource) + ')' + (ib.captureNote ? ' — capture: ' + ib.captureNote : '')) + ' · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
@@ -2898,6 +3033,9 @@ function buildPortfolioDecisionV2() {
 
   // actions + limits
   if (!evFresh) actions.push({ p: 0, t: 'Portfolio_Decision carries no fresh IBKR evidence (' + evState + (pd.evidence && pd.evidence.age ? ', ' + pd.evidence.age : '') + '): it certifies only when it runs within 14 min of the morning capture — install the capture watcher once (Apps Script editor: run pdInstallCaptureWatcher; Script Property PD_IBKR_EVIDENCE = observe or enforce), or refresh Portfolio_Decision right after the 08:40 capture. The figures above come from the ledger and ' + (ib.capture ? 'the IBKR capture ' : 'the _IBKR_* tabs ') + '(' + dp2Str_(ib.account['as_of'] || 'n/a') + ').' });   // v1.2.22
+  var boardAct = dp2BoardTicketsAction_(t10, feed, s1);   // v1.2.31: action 3 follows the feed (null = the 1.2.28 wording below)
+  if (s1.verdict !== 'PASS' && boardAct) actions.push(boardAct);
+  else   // the 1.2.28 wording: DP2_COHORT_LEGACY, a feed that is not a live EXECUTABLE release, or no engine ticket on the board
   if (s1.verdict !== 'PASS') actions.push({ p: 4, t: 'No board-originated capital: S-1 gate ' + (s1.verdict || 'n/a') + (s1.criteria.length ? ' (' + s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' ' + c.status; }).join(', ') + ')' : '') + '; deployable ' + dp2Fmt_(deploySar) + ' SAR (after the 10% PF cash floor) stays Tranche 0.' });
   for (i = 0; i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory (Shadow_Board, research only): sell ' + switches[i].sell + ' → buy ' + switches[i].buy + ' Δ ' + dp2Pct_(switches[i].delta, 1) + ' vs hurdle ' + dp2PctPlain_(switches[i].hurdle, 1) + '; not executable while the feed is ' + (feed.state || 'n/a') + '.' });
   // v1.2.12: two lots of one symbol can raise the identical position-level action — show it once
@@ -2920,7 +3058,7 @@ function buildPortfolioDecisionV2() {
     ['Broker stop ≥ dynamic stop on every lot, full quantity', (function () { var n = 0; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') n++; return n ? n + ' lot(s) to raise / place / complete' : 'pass'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.code === 'RAISE_STOP' || exitItems[k].sig.code === 'NO_BROKER_STOP' || exitItems[k].sig.code === 'STOP_PARTIAL') return DP2C.amber; return DP2C.green; })()],
     ['SELL NOW signals open', (function () { var n = []; for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) n.push(exitItems[k].symbol); return n.length ? n.join(', ') : 'none'; })(), (function () { for (var k = 0; k < exitItems.length; k++) if (exitItems[k].sig.alert) return DP2C.red; return DP2C.green; })()],
     ['Rotation candidate (research, ' + (alloc ? dp2RotationBasisLabel_(alloc.basis) : 'engine 12M') + ' = production basis)', alloc && alloc.fundingWithheld ? 'withheld — ' + (alloc.cfg && alloc.cfg.issues.length ? alloc.cfg.issues[0] : 'production configuration not mirrored') : alloc && alloc.rotationProd ? alloc.rotationProd.rotation.action + ' ' + alloc.rotationProd.rotation.symbol + ' → ' + alloc.rotationProd.sym + ' (+' + dp2Fmt_(alloc.rotationProd.rotation.edge, 1) + ' pp)' + (alloc.rotationOther ? '' : ' · other basis: none') : (alloc && alloc.rotationOther ? 'none on the production basis · ' + (alloc.basis === 'plan3m' ? 'engine 12M' : 'plan 3M') + ' would rotate ' + alloc.rotationOther.rotation.symbol + ' → ' + alloc.rotationOther.sym + ' (research only)' : (alloc && (alloc.needsProd || alloc.needs).length ? 'none — capital call' : 'none needed')), alloc && alloc.rotationProd ? DP2C.amber : DP2C.ink],
-    ['IBKR evidence freshness ≤ ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' · ' + pd.evidence.age : ''), evFresh ? DP2C.green : DP2C.red],
+    ['IBKR evidence freshness \u2264 ' + DP2.EVIDENCE_LIMIT_MIN + ' min', evState + (pd.evidence && pd.evidence.age ? ' \u00b7 ' + pd.evidence.age + ' old at the decision' : ''), evFresh ? DP2C.green : DP2C.red],   // v1.2.30
     ['Source receipt = sync run', (pd.receiptRun || 'n/a') + (feed.run ? ' vs ' + feed.run : '') + ' · ' + (feed.run && pd.receiptRun === feed.run ? 'pass' : 'fail'), feed.run && pd.receiptRun === feed.run ? DP2C.green : DP2C.red],
     ['Decision feed', feed.state ? (function (v) { return v.label + (v.note ? ' - ' + v.note : ''); })(dp2FeedView_(feed, new Date().getTime())) : 'n/a', feed.state ? dp2FeedView_(feed, new Date().getTime()).color : DP2C.red],
     ['S-1 gate', (s1.verdict || 'n/a') + (s1.criteria.length ? ' · pending: ' + s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n; }).join(', ') : ''), s1.verdict === 'PASS' ? DP2C.green : DP2C.amber],
@@ -2992,6 +3130,7 @@ function buildTop10V2() {
   var mp = dp2ReadMyPortfolio_();
   var alloc = null;
   try { alloc = dp2ResearchAllocation_(t, led, mp, ib, cashSar || 0, fx, xbars); } catch (eA) { alloc = null; }
+  var cohort = dp2Cohort_(t), coN = cohort.legacy ? fast.length : (alloc ? alloc.plans.length : (cohort.basis === 'engine' ? cohort.n.engine : cohort.n.active));   // v1.2.31: the sizing cohort and its size (legacy: the FAST-TRACK seats)
   var qualified = t.qualified;
   var qCount = t.qualifiedCount || qualified.length;
   var inv = gm.counts['INVESTABLE'] || null;
@@ -3021,6 +3160,9 @@ function buildTop10V2() {
     { label: executable > 0 ? 'Allocated (research)' : 'Sizing preview only', value: alloc ? dp2Fmt_(alloc.allocated) + ' SAR' : 'n/a', sub: alloc ? ((executable > 0 ? '' : 'preview only - nothing executable today - ') + 'of deployable ' + dp2Fmt_(alloc.deployable) + ' - ' + alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length + ' of ' + alloc.plans.length + ' plans ' + (executable > 0 ? 'funded' : 'sized') + ' - cap ' + dp2Fmt_(alloc.cap) + '/seat') : 'allocation unavailable', color: alloc && alloc.allocated > 0 && executable > 0 ? DP2C.green : DP2C.grey },
     { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records', color: DP2C.amber }
   ];
+  // v1.2.31: the Held seats tile splits the seats by their Stability (active / fast-track / grace-held); an engine board's allocation tile is the
+  // engine's, grey and prefixed with the feed state once the release is no longer live (expired, superseded or withdrawn)
+  if (!cohort.legacy) { for (var tq = 0; tq < tiles.length; tq++) { if (tiles[tq].label === 'Held seats') tiles[tq].sub = (seats.length - fast.length - grace.length) + ' active \u00b7 ' + fast.length + ' fast-track \u00b7 ' + grace.length + ' grace-held'; else if (tiles[tq].label === 'Allocated (research)' && alloc && alloc.mode === 'engine') { tiles[tq].label = 'Allocated (engine)'; if (!fv.live) { tiles[tq].color = DP2C.grey; tiles[tq].sub = 'feed ' + fv.label + ' - ' + tiles[tq].sub; } } } }
   row = dp2Tiles_(sh, row, tiles); row++;
 
   // charts: funnel + universe/gates
@@ -3034,6 +3176,7 @@ function buildTop10V2() {
                 ['Qualified → held seats', (qCount && seats.length) ? seats.length / qCount : null, seats.length],
                 ['Seats → fast-track plans', seats.length ? fast.length / seats.length : null, fast.length],
                 ['Plans → executable', fast.length ? executable / fast.length : 0, executable]];
+  if (!cohort.legacy) { stages[3] = ['Seats \u2192 plans', seats.length ? coN / seats.length : null, coN]; stages[4] = ['Plans \u2192 executable', coN ? executable / coN : 0, executable]; }   // v1.2.31: the funnel counts the sizing cohort (engine tickets / active seats), not the FAST-TRACK seats
   var fRows = stages.filter(function (s) { return s[1] !== null; }).map(function (s) { return [s[0] + ' (' + dp2Fmt_(s[2]) + ')', s[1]]; });
   var fSub = stages.map(function (s) { var p = s[0].split('\u2192'); return (p[1] || p[0]).replace(/^\s+|\s+$/g, '') + ' ' + dp2Fmt_(s[2]); }).join('  >  ');   // 1.2.27
   var rngF = dp2ChartData_('Funnel', ['Stage', 'Conversion'], fRows, '0%');
@@ -3061,10 +3204,13 @@ function buildTop10V2() {
   row++;
 
   // seats table — 3-month close, research allocation (conviction mirror), initial dynamic stop
+  if (!cohort.legacy) row = dp2Section_(sh, row, 1, 16, dp2SeatsTitle_(seats.length, cohort, coN), dp2SeatsSub_(cohort, alloc, feed, fv));   // v1.2.31: engine tickets / research mirror, every class counted
+  else   // the 1.2.30 wording (DP2_COHORT_LEGACY)
   row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + (alloc && alloc.cfg ? alloc.cfg.maxWeightPct : DP2A.MAX_WEIGHT_PCT) + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + (alloc && alloc.cfg && alloc.cfg.envPresent ? dp2Fmt_(alloc.cfg.opFloor) + ' SAR' + (alloc.cfg.venueOn ? ' raised to the venue floor' : '') : dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR research floor (DP2_ENGINE_ENV unset)') + ', the engine\'s own cash reserve). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
   var sHdr = ['#', 'Symbol · name', '3-month close', 'Seat status', 'Price', 'Alloc SAR', 'Buy qty', 'Dyn. stop (2×ATR)', 'Risk SAR', 'Exp. gain 3M', 'ROI 3M plan', 'ROI 12M eng.', 'Rel · DQ · score', 'Flags'];
   var sSp = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2];
   var sRows = [], sRisk = [], sState = [];
+  var sCl = [];   // v1.2.31: each seat's class (dp2SeatClass_)
   var secSeats = {};
   var qmap = {};
   var seatFresh = 0, seatSources = {};
@@ -3091,7 +3237,7 @@ function buildTop10V2() {
     var fxRow = dp2Num_(s['FX→SAR']);
     var fxUse = fxRow !== null ? fxRow : (ccy === 'USD' ? fx : (ccy === 'SAR' ? 1 : null));
     var stability = dp2Str_(s['Stability']);
-    var isPlan = /FAST-TRACK/.test(stability);
+    var isPlan = cohort.member(s), sCls = cohort.cls(s); sCl.push(sCls);   // v1.2.31: in the sizing cohort (legacy: /FAST-TRACK/) and the seat's class
     var ar = (alloc && alloc.byRow[sym]) || null;
     var planObj = null; if (alloc) { for (var pj = 0; pj < alloc.plans.length; pj++) if (alloc.plans[pj].sym === sym) planObj = alloc.plans[pj]; }
     if (fxUse === null && planObj && planObj.fxUse !== null) fxUse = planObj.fxUse;
@@ -3108,6 +3254,8 @@ function buildTop10V2() {
     if (ar && ar.state === 'SECTOR_CAP') flags.push('sector cap: ' + ar.note);
     if (ar && ar.state === 'UNFUNDED') flags.push('unfunded: ' + ar.note);
     if (ar && ar.state === 'NO_FX') flags.push(ar.note);
+    if (!cohort.legacy) { var cflag = dp2SeatFlag_(sCls, s, cohort, !!planObj); if (cflag) flags.push(cflag); }   // v1.2.31: the seat's class (engine / research / grace / suspended / not funded)
+    else   // the 1.2.30 flag (DP2_COHORT_LEGACY)
     if (!isPlan) flags.push('grace-held · not sized');
     var mearn = /earnings ≤\s?(\d+)d/.exec(note); if (mearn) flags.push('earnings ≤ ' + mearn[1] + ' d');
     if (/52W/.test(note)) flags.push(/low/.test(note) ? '52W near low' : '52W flag');
@@ -3127,7 +3275,7 @@ function buildTop10V2() {
   row = dp2Table_(sh, row, sHdr, sRows, { spans: sSp, align: ['r', 'l', 'c', 'l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l'], fmt: ['0', '', '', '', '', '#,##0', '#,##0', '', '#,##0', '#,##0', '0.0%', '0.0%', '', ''], wrap: [false, true, false, true, false, false, false, true, false, false, false, false, false, true], rowHeight: 36 });
   for (i = 0; i < sRows.length; i++) {
     var srr = seatTop + 1 + i;
-    var sc = sh.getRange(srr, 5); var stxt = dp2Str_(sRows[i][3]); sc.setFontColor(/FAST-TRACK/.test(stxt) ? DP2C.navyText : DP2C.amber).setFontWeight('bold').setFontSize(8.5);
+    var sc = sh.getRange(srr, 5); var stxt = dp2Str_(sRows[i][3]); sc.setFontColor((cohort.legacy ? /FAST-TRACK/.test(stxt) : (sCl[i] === 'engine' || sCl[i] === 'active')) ? DP2C.navyText : DP2C.amber).setFontWeight('bold').setFontSize(8.5);   // v1.2.31: navy = engine / active seats (legacy: FAST-TRACK)
     sh.getRange(srr, 2, 1, 2).setFontSize(8.5);
     sh.getRange(srr, 9).setFontSize(8.5).setFontColor(DP2C.ink2);
     var rk = sRisk[i]; if (rk !== null && navSar && rk / navSar * 100 > DP2X.RISK_WARN_PCT_NAV) sh.getRange(srr, 10).setFontColor(DP2C.red).setFontWeight('bold');
@@ -3138,6 +3286,8 @@ function buildTop10V2() {
   row += 2;
 
   // allocation + funding plans / rotation
+  if (cohort.basis === 'engine') row = dp2Section_(sh, row, 1, 8, 'ALLOCATION \u2014 the engine\'s tickets, mirrored', 'Ticket SAR / Shares exactly as Top_10_Investments issued them (feed ' + dp2FeedTag_(feed, fv) + '): nothing is re-sized while the board carries engine tickets; the conviction water-fill applies only to a board without them.');   // v1.2.31
+  else   // the research mirror (no engine ticket on the board) and DP2_COHORT_LEGACY
   row = dp2Section_(sh, row, 1, 8, 'ALLOCATION — research mirror of the engine\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');
   var rpH = (alloc && alloc.rotParams) || dp2RotParams_();   // v1.2.17: the production parameters in use
   dp2Section_(sh, row - 2, 9, 16, 'FUNDING PLANS & ROTATION — when cash does not cover the plans', 'One rotation per run: the held equity with the lowest forward ROI that trails the opportunity by ≥ ' + rpH.edge12 + ' pp (engine 12M) or ≥ ' + rpH.edge3 + ' pp (plan 3M) after ' + rpH.cost + '% cost, on the production basis (TFB_OPP_ROTATION_BASIS).');
@@ -3158,6 +3308,20 @@ function buildTop10V2() {
       ['Production configuration (DP2_ENGINE_ENV)', alloc.cfg ? alloc.cfg.summary : 'n/a', alloc.cfg && alloc.cfg.planReady ? DP2C.ink : DP2C.amber],
       ['Unfunded plans — production rule' + (alloc.cfg && alloc.cfg.envPresent ? ' (' + alloc.cfg.sizingMode + ' mode)' : '') + ' — need = the seat\'s effective minimum ticket', (alloc.needsProd || alloc.needs).length ? (alloc.needsProd || alloc.needs).map(function (n) { return n.sym + ' ' + dp2Fmt_(n.need); }).join(' · ') + (alloc.fundingWithheld ? ' · research floor — ' + alloc.fundingWithheld : ' · a rotation funds that minimum ticket (raise TFB_OPP_MIN_TICKET_SAR for a larger switch)') : (alloc.rows.some(function (r) { return r.state === 'RELEASED'; }) ? 'none — ' + alloc.rows.filter(function (r) { return r.state === 'RELEASED'; }).map(function (r) { return r.sym; }).join(', ') + ' released by the floor rule (deferred, no need)' : 'none')]
     ];
+    // v1.2.31: the cohort row names its basis (engine tickets / research mirror); the n/a and needs rows follow the cohort
+    if (!cohort.legacy) {
+      for (var ak = 0; ak < aRows.length; ak++) {
+        if (aRows[ak][0] === 'Plans in the sizing cohort') {
+          aRows[ak] = cohort.basis === 'engine'
+            ? ['Plans in the sizing cohort (basis: engine tickets)', 'Engine tickets: ' + alloc.plans.length + ' \u00b7 ' + dp2Fmt_(alloc.allocated) + ' SAR (feed ' + dp2FeedTag_(feed, fv) + ') \u00b7 ' + alloc.rows.map(function (r) { return r.sym + ' ' + dp2Fmt_(r.alloc); }).join(', ') + ' \u00b7 mirrored from Top_10_Investments (Ticket SAR / Shares), not re-sized']
+            : ['Plans in the sizing cohort (basis: research mirror)', String(aRows[ak][1]).replace(' - none (no fast-track seats)', ' - none (no active seats)') + ' \u00b7 active seats' + (cohort.strict ? ', fast-track sizing suspended (strict)' : ', fast-track included (not strict)')];
+        } else if (aRows[ak][0] === 'Risk if every initial stop is hit' && alloc.riskSar === null && !alloc.plans.length) {
+          aRows[ak][1] = 'n/a - no plans in the sizing cohort (' + (cohort.basis === 'engine' ? '0 engine tickets' : '0 active seats') + ')';
+        } else if (/^Unfunded plans/.test(aRows[ak][0]) && alloc.mode === 'engine') {
+          aRows[ak][1] = 'not re-planned \u2014 the engine\'s tickets are mirrored; its own funding plans and capital call are in the Top_10_Investments ALERTS';
+        }
+      }
+    }
     var a1 = dp2KV_(sh, aTop, 1, 8, aRows);
     var pLines = [];
     pLines.push('Production basis: ' + dp2RotationBasisLabel_(alloc.basis) + ' (' + dp2RotationBasisSrcTxt_(alloc.basisInfo) + ') — only its plans drive SWITCH actions; the other basis is research.' + (alloc.rotParams ? ' Rotation rule: hurdle ' + alloc.rotParams.edge12 + ' pp (12M) / ' + alloc.rotParams.edge3 + ' pp (3M) after ' + alloc.rotParams.cost + '% cost, held ≥ ' + alloc.rotParams.minHeld + ' d, not within ' + alloc.rotParams.tp1Prox + '% of TP1, excluded ' + (alloc.rotParams.exclude.join(', ') || 'none') + ' (' + alloc.rotParams.source + ').' : '') + (alloc.prod && alloc.prod !== alloc ? ' Needs come from production\'s ' + alloc.prod.mode + '-mode sizing; the ALLOCATION block shows the conviction rule.' : ''));
@@ -3165,6 +3329,8 @@ function buildTop10V2() {
     for (i = 0; i < alloc.plans12.length; i++) pLines.push('• 12M basis' + (alloc.basis === '12m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans12[i]));
     for (i = 0; i < alloc.plans3.length; i++) pLines.push('• 3M basis' + (alloc.basis === 'plan3m' ? ' (production)' : ' (research)') + ': ' + dp2PlanText_(alloc.plans3[i]));
     if (!alloc.fundingWithheld) { var ccP = dp2CapitalCall_(alloc.plansProd, alloc.cfg ? alloc.cfg.capitalCallTopN : 3); if (ccP.sum > 0) pLines.push('Capital call on the production basis (top-' + ccP.topN + ' plans, TFB_OPP_CAPITAL_CALL_TOPN — as the engine\'s KPI and alert): deposit ≥ ' + dp2Fmt_(ccP.sum) + ' SAR to take ' + ccP.syms.join(', ') + '.'); }
+    if (alloc.mode === 'engine') pLines.push('Engine tickets mirrored (' + alloc.plans.length + ', ' + dp2Fmt_(alloc.allocated) + ' SAR): no rotation, funding plan or capital call is re-planned over them here \u2014 the engine\'s own are in the Top_10_Investments ALERTS.');   // v1.2.31
+    else   // the research mirror and DP2_COHORT_LEGACY
     if (!(alloc.needsProd || alloc.needs).length && !alloc.fundingWithheld) pLines.push('No funding need on the production rule — no rotation today' + (alloc.rows.some(function (r) { return r.state === 'RELEASED' || r.state === 'UNFUNDED'; }) ? ' (released / unfunded seats are deferrals, not needs — as the engine).' : '.'));
     var holdTxt = alloc.holdings.filter(function (h) { return !h.isFI; }).map(function (h) { return h.symbol + ' fwd 12M ' + dp2PctPlain_(h.roi12, 1) + ' · 3M plan ' + (h.roi3 !== null ? dp2PctPlain_(h.roi3, 1) + ' (' + h.roi3Src + ')' : 'n/a — no TP1 ladder, never rotates on 3M') + (h.roi3Model !== null ? ' · model 3M ' + dp2PctPlain_(h.roi3Model, 1) : '') + ' · ' + dp2Fmt_(h.valueSar) + ' SAR · ' + (h.holdingDays !== null ? h.holdingDays + ' d' : '—'); }).join('\n');
     pLines.push('Holdings (12M = My_Portfolio engine forecast · 3M = plan-TP1 ROI, as the engine; the model 3M is shown, not used):\n' + (holdTxt || 'none'));
