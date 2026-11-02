@@ -116,6 +116,10 @@ jobs:
           TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
           TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
           TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
+          # 2026-11-02 run_daily_brief v1.22.0 [STATUS-READ-VETO]: on | off (default).
+          # Off = v1.20.0; on = a failed _Status read withholds every ticket and
+          # Top-10 pick (the brief still sends). Rollback: unset the Variable.
+          TFB_BRIEF_STATUS_READ_VETO: ${{ vars.TFB_BRIEF_STATUS_READ_VETO || 'off' }}
         run: |
           if [[ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]]; then
             echo "::error::No Google credentials. Set secret GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_B64."
