@@ -1,5 +1,27 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.9 (2026-11-02) -- SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0)
+# WHY (runs of 1-2 Nov 2026; owner, 2 Nov: "the system costs a lot ...
+# improve today, results tomorrow"): the final job 'Audit final coverage and
+# decision clocks' judges the native cockpit BEFORE the asynchronous Apps
+# Script render of Top_10_Investments / Portfolio_Decision has consumed this
+# run, so a healthy scheduled sync ends red on timing alone and both cockpits
+# read 'source readiness VERIFIED (run <id>)' seven to eight minutes later
+# (release_after_sync went green at 12:33Z and 19:13Z on 1 Nov). The red runs
+# hide real failures and burn runner minutes.
+# WHAT: ONE gated step, 'Await the native cockpit render (handshake)',
+# immediately BEFORE the final audit: scripts/await_cockpit_receipts.py
+# --wait-only, the same read-only poll release_after_sync.yml uses, until
+# both cockpits carry the receipt for THIS run or the bound ends
+# (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It only
+# DELAYS the audit: '|| true', never fails the job, never writes, never
+# dispatches; its JSON joins the final publication artifact and one line
+# goes to the step summary. The audit, every veto and --publish-blockers are
+# byte-identical. The job timeout rises 30 -> 55 minutes (the 20-minute cap
+# plus the step's own 25-minute backstop); nothing else in the job changes.
+# GATE: vars.TFB_SYNC_AWAIT_RENDER (1/true/yes/on). Unset (default): the
+# step is skipped and the workflow behaves exactly as v1.0.8.
+# ROLLBACK: unset the variable, or revert this step and the timeout.
 # VERSION 1.0.8 (2026-10-29) -- FW2-STALE-PE ENV MAPPING (run_dashboard_sync 6.71.0)
 # Both page-writing jobs map TFB_SYNC_FW2_STALE_PE, default 'off' (the 6.70.2
 # FW-2 call, byte-identical). WHY: the v6.71.0 block in run_dashboard_sync.py.
@@ -2110,7 +2132,9 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     environment: production
-    timeout-minutes: 30
+    # v1.0.9: 30 -> 55, room for the gated handshake wait (cap 20 min) and
+    # its 25-minute step backstop before the unchanged final audit.
+    timeout-minutes: 55
     env:
       PYTHONPATH: ${{ github.workspace }}
       TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
@@ -2185,6 +2209,57 @@ jobs:
               handle.write('GOOGLE_APPLICATION_CREDENTIALS=' + str(path) + '\n')
           PY
 
+      # (2026-11-02) v1.0.9 SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0
+      # --wait-only). WHY: the audit below judges the native cockpit BEFORE the
+      # asynchronous Apps Script render of Top_10_Investments /
+      # Portfolio_Decision has consumed this run, so a healthy scheduled sync
+      # ends red on timing alone and reads VERIFIED seven to eight minutes
+      # later (1 Nov: 12:33Z, 19:13Z). WHAT: this step only DELAYS the
+      # unchanged audit: the same read-only poll as release_after_sync.yml
+      # (one batchGet of _Status L1:M60 and the two cockpit B2 cells per poll,
+      # the strict audit's own receipt parser), until both cockpits carry
+      # 'source readiness VERIFIED (run <this run>)' or the bound ends
+      # (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It
+      # never fails this job ('|| true'; the script exits 2 only on a
+      # configuration error and never raises), never writes the workbook,
+      # never dispatches anything, and uses the credentials configured above.
+      # Its report joins the final publication artifact; one line goes to the
+      # step summary. GATE: vars.TFB_SYNC_AWAIT_RENDER (1/true/yes/on, as the
+      # release script reads armed words); unset or any other value skips the
+      # step and the job runs exactly as v1.0.8. The audit below keeps every
+      # veto, threshold and --publish-blockers exactly as before.
+      - name: Await the native cockpit render (handshake)
+        if: ${{ contains(fromJSON('["1","true","yes","on"]'), vars.TFB_SYNC_AWAIT_RENDER) }}
+        timeout-minutes: 25
+        env:
+          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}
+        run: |
+          set -euo pipefail
+          rm -f await_render.json
+          python scripts/await_cockpit_receipts.py --wait-only \
+            --run-id "$GITHUB_RUN_ID" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --max-minutes "$TFB_SYNC_AWAIT_RENDER_MIN" \
+            --json-out await_render.json || true
+          python - <<'PY' || true
+          import json, os
+          from pathlib import Path
+          path = Path('await_render.json')
+          line = 'Await render (handshake): no report was written; the audit ran without a wait.'
+          if path.exists():
+              result = json.loads(path.read_text())
+              seen = result.get('consumed_at_s') or {}
+              def at(name):
+                  return 'none' if seen.get(name) is None else 'at %s s' % seen[name]
+              line = ('Await render (handshake): %s after %s s, %s polls; receipts for run %s: '
+                      'Portfolio_Decision %s, Top_10_Investments %s.' % (
+                          result.get('outcome'), result.get('waited_s'), result.get('polls'),
+                          result.get('run_id'), at('pf'), at('t10')))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(line + '\n\n')
+          print(line)
+          PY
+
       - name: Audit final coverage and decision clocks
         id: final_audit
         run: |
@@ -2247,6 +2322,7 @@ jobs:
           path: |
             final_decision_publication.json
             final_dashboard_validation.json
+            await_render.json
           retention-days: 30
           if-no-files-found: warn
 
