@@ -25,7 +25,7 @@ Offline replay with the real module and a stubbed `read_range`, feed `NOT_ACTION
 | _Status read | execution_veto | SELL / TRIM / ADD | Top-10 picks | subject |
 | --- | --- | --- | --- | --- |
 | ok | set | all withheld | withheld | no ticket |
-| raises (HTTP 503) | none | EXIT.US / TRIM.US / ADD.US with shares, stops, targets | SELECTED.US | `... add ADD.US` |
+| raises (HTTP 503) | none | EXIT.US / TRIM.US / ADD.US as executable tickets (ADD 10 sh ~700 SAR) | SELECTED.US | `... add ADD.US` |
 
 `send_digest` is fail-closed on the same read: `_read_status_rows` / `_manifest_gate` report `_Status read failed`, and the digest withholds and still sends a research-only copy.
 
@@ -66,7 +66,7 @@ Zero functions removed.
 
 ## S3 - Tests
 
-`tests/test_daily_brief_status_read_veto.py`: **PASS 35/35** as a script, 35 passed under pytest. The brief suites together (blocked inputs, post-earnings tag, send window, this file): 99 passed.
+`tests/test_daily_brief_status_read_veto.py`: **PASS 42/42** as a script, 42 passed under pytest. The brief suites together (blocked inputs, post-earnings tag, send window, this file): 106 passed.
 
 | Case | Checks |
 | --- | --- |
@@ -74,23 +74,25 @@ Zero functions removed.
 | S1b / S1c | the six on-spellings; junk stays off. |
 | S2 | on, `_Status` raises: the one receipt row; every SELL / TRIM / ADD withheld (0 SAR, no shares / stop / targets, 0 freed cash); the picks withheld; text, HTML and PDF carry the banner and `status_unreadable`, never `HTTP 503` or SELECTED.US; the subject offers nothing; exactly two stderr lines. |
 | S3 | on, `_Status` readable (EXECUTABLE, NOT_ACTIONABLE, no key, empty): identical to off. |
-| S4 | on, Top_10, Portfolio_Decision or Calendar_Events fails: identical to off. |
-| S5 | on, `HttpError` (with a key-like string), `TimeoutError`, `ValueError`: the receipt names the class only; the text never reaches any surface. |
+| S4 | on, any other page fails (each of the nine alone, and all nine at once): identical to off; the list is checked against `ALL_PAGES`. |
+| S5 | on, `HttpError` (with a key-like string), `TimeoutError`, `ValueError`: the receipt names the class only; the text never reaches the receipt, the text or the HTML. The v1.20.0 WARN log line keeps it, unchanged. |
 | G1 | on the untouched v1.20.0 the same failed read gives no veto, EXIT / TRIM / ADD tickets, the SELECTED.US pick, `ADD.US` in the subject and BEST NEW BUYS in the text; S2's checks fail there. |
 | V1 / V1b | version floor, verifier pin, the step-env mapping (one line, step env only), the ci.yml step, WHY order, ASCII file; against the base: ASCII added lines, the only removed line is the old `__version__`, exactly one function added, none removed. |
 
-Golden negative of the whole file (`TFB_TEST_BRIEF_DELIVERED=<v1.20.0 copy>`): **26 failed, 8 passed, 1 skipped**. The 8 passes are by construction: S3 (4) and S4 (3) compare on with off, which are equal where the gate does not exist, and G1 targets the base. V1b applies to 1.22.0 only.
+Golden negative of the whole file (`TFB_TEST_BRIEF_DELIVERED=<v1.20.0 copy>`): **26 failed, 15 passed, 1 skipped**. The 15 passes are by construction: S3 (4) and S4 (10) compare on with off, which are equal where the gate does not exist, and G1 targets the base. V1b applies to 1.22.0 only.
 
 Mutants, each killed:
 
 - the gate check removed: 8 failed;
-- every failed page treated as `_Status`: 3;
+- every failed page treated as `_Status`: 10;
+- the condition widened to `_Status` plus Shadow_Board, My_Portfolio or the first market page: 2 each;
+- every page but Portfolio_Decision, Top_10 and Calendar_Events treated as `_Status`: 7;
 - the exception text in the receipt: 4;
 - the extra stderr line dropped: 1;
 - a receipt word the veto does not know: 4;
 - `yes` dropped from the gate words: 1.
 
-On a shallow checkout without the base: 25 passed, 10 skipped visibly (S1 x8, G1, V1b).
+On a shallow checkout without the base: 32 passed, 10 skipped visibly (S1 x8, G1, V1b).
 
 Other checks:
 
@@ -127,3 +129,25 @@ Rollback: unset the Variable (or set it off).
 - **v_outcome_engine (views 1.5.0):** touched_target ignores the call's direction, and hourly target closes are scored as session closes.
 - **Daily brief, failed Calendar_Events read:** it drops the earnings-proximity warning and the Calendar_Events fallback of the Best-new-buys earnings guard.
 - **Outcome tracker:** no exchange calendar for .MX and other Yahoo suffixes, so those forecasts never mature.
+
+## S7 - Independent review (before merge)
+
+Codex: no findings. An independent three-lens review of `220700dc` (correctness and off identity, decision semantics and parity, tests and claims) put each finding to an adversarial verifier: 1 confirmed, 4 rejected, 1 not verified.
+
+The code was found clean:
+- 4,244 runs of `main(--out, --send)` side by side with v1.20.0 (clock fixed, SMTP faked) were identical with the gate off;
+- 1,190 runs with the gate on and `_Status` raising gave the same email and files as v1.20.0 reading a readable WITHHELD feed;
+- `_Status` has exactly one consumer;
+- BaseException subclasses propagate as before;
+- odd exception class names are escaped in the HTML.
+
+| Finding | Fix |
+| --- | --- |
+| Confirmed (minor): S4 covered 3 of the 9 other pages, so page-condition mutants that also caught Shadow_Board, My_Portfolio or a market page survived | S4 now runs each of the nine alone and all nine together, checked against `ALL_PAGES`; those mutants fail (2 / 2 / 2 / 7) |
+| Not verified, but correct: "the text never reaches any surface" ignored the WARN log line | S5 wording now names the receipt, the text and the HTML, and says the v1.20.0 WARN line keeps the text |
+| Rejected, but the wording was loose: the S1 replay row said "shares, stops, targets", while the fixture has no stop or target columns | S1 row reworded |
+
+The other rejections:
+- a total outage names the withheld feed as the cause: documented, and no ticket differs;
+- `send_digest`'s L1:M60 globals read fails open: pre-existing, and the stand-in is never written to the sheet;
+- V1's ci.yml check is a substring match: the step's placement in the blocking job is verified directly.

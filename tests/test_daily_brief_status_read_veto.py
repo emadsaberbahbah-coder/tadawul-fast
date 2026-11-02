@@ -27,9 +27,11 @@ S2  on, _Status read raises: one receipt row WITHHELD(status_unreadable)
     the subject offers nothing; two stderr lines
 S3  on, _Status readable (EXECUTABLE / NOT_ACTIONABLE / no key / empty):
     identical to off - the gate acts only on a failed read
-S4  on, another page fails (Top_10, Portfolio_Decision, Calendar_Events):
-    identical to off
-S5  on, any exception class: the receipt names the class only
+S4  on, any other page fails (each of the nine alone, and all nine at
+    once): identical to off
+S5  on, any exception class: the receipt names the class only; the text
+    never reaches the receipt, text or HTML (the v1.20.0 WARN log line keeps
+    it, unchanged)
 G1  golden negative: on the untouched v1.20.0 the same failed read emails
     'add ADD.US', TRIM and EXIT tickets and the SELECTED.US buy (S2 fails)
 V1  version floor, verify_deployment pin, daily_brief.yml step env maps
@@ -252,13 +254,18 @@ def test_s3_on_readable_status_is_unchanged(monkeypatch, capsys, feed):
     assert on == off, feed
 
 
-@pytest.mark.parametrize("page", ["Top_10_Investments", "Portfolio_Decision", "Calendar_Events"])
-def test_s4_on_other_failed_pages_are_unchanged(monkeypatch, capsys, page):
+OTHER_PAGES = ["Portfolio_Decision", "Top_10_Investments", "My_Portfolio", "Market_Leaders",
+               "Global_Markets", "Commodities_FX", "Mutual_Funds", "Calendar_Events", "Shadow_Board"]
+
+
+@pytest.mark.parametrize("pages", [[p] for p in OTHER_PAGES] + [OTHER_PAGES])
+def test_s4_on_other_failed_pages_are_unchanged(monkeypatch, capsys, pages):
     mod = delivered()
-    errs = {page: RuntimeError("HTTP 500 synthetic")}
+    assert sorted(OTHER_PAGES + ["_Status"]) == sorted(mod.ALL_PAGES)   # every other page
+    errs = {page: RuntimeError("HTTP 500 synthetic") for page in pages}
     off, _m = run(mod, monkeypatch, capsys, None, Sheets(errors=errs))
     on, _m = run(mod, monkeypatch, capsys, "on", Sheets(errors=errs))
-    assert on == off, page
+    assert on == off, pages
 
 
 @pytest.mark.parametrize("exc,name", [
