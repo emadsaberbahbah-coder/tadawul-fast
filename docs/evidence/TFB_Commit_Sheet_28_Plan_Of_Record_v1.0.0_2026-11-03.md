@@ -21,26 +21,41 @@ All read-only: `_Selection_Log`, `_Status`, `My_Portfolio`, `Portfolio_Decision`
 | 23:31 | Scheduled release re-verifies, decision audit exit 2 (`decision_findings_present`), withdraws: `NOT_ACTIONABLE(final_publication) … decision_failed` | release summary |
 | 00:55 | Release refused: `release_window_consumed` | release summary |
 | 01:21 | Portfolio_Decision: the four new holdings read **BLOCK** "RECONCILIATION_REQUIRED: missing_evidence" | sheet |
+| 01:45 (3 Nov) | IBKR lists the INDV position as **SUPN** (contract 849142054, 95 sh @ 35.45) after the Supernus merger; still no stop | IBKR positions / orders |
 
-**Why the pool fell from 26 to 2 in eight minutes:** the W-2 quote-freshness gate (`core/analysis/opportunity_builder.py` v1.4.0+, `TFB_TICKET_FRESHNESS_GATE`, default on) fails every quote older than 15 minutes while its venue trades ("STALE_PRICE intraday"). The workbook's US prices came from the 15:35 sync, before the 17:30 open. After the open every US name was deferred and only the two Hong Kong names, whose market was closed, still qualified. The gate is correct protection against sizing a ticket from an old price intraday. The defect is that a plan built correctly on the last close disappears from every page the moment its market opens.
+**Why the pool fell from 26 to 2 in eight minutes:** the W-2 quote-freshness gate (`core/analysis/opportunity_builder.py` v1.4.0+, `TFB_TICKET_FRESHNESS_GATE`, default on) fails every quote older than 15 minutes while its venue trades ("STALE_PRICE intraday"). The workbook's US prices came from the 15:35 sync, before the 17:30 open. After the open every US name was deferred, and only the two Hong Kong names, whose market was closed, still qualified. The gate is correct protection against sizing a ticket from an old price intraday. The defect is that a plan built correctly on the last close disappears from every page the moment its market opens.
 
-**The structural result:** no window existed on 2 Nov in which US tickets were both released and tradable. The morning release expired before the open; the afternoon release was emptied by the freshness gate at the open. Tadawul has the same pattern at 10:00.
+**The structural result:** no window existed on 2 Nov in which US tickets were both released and tradable. The morning release expired before the open, and the freshness gate emptied the afternoon release at the open. Tadawul has the same pattern at 10:00.
 
 ## 2. What this build does
 A new file. No other file changes. It writes nothing that any audit, release check or receipt reads.
 
-- **Reads:** `_Selection_Log`, `My_Portfolio` (Position Qty, Avg Cost, Buy Date), `_Status` L:M `TFB Decision Feed`, and the latest read-only IBKR capture through `10_My_Portfolio` `pdIbkrLatestCapture_`.
-- **Writes:** only `_Plan_Of_Record` (hidden ledger, rebuilt each refresh from the last 4 days of renders) and `Plan_Of_Record` (the page).
+- **Reads:**
+  - `_Selection_Log`;
+  - `Top_10_Investments`: status line B2 and the ticket table, i.e. the board as rendered;
+  - `My_Portfolio`: Position Qty, Avg Cost, Buy Date;
+  - `_Status` L:M `TFB Decision Feed`;
+  - the latest read-only IBKR capture, through `10_My_Portfolio` `pdIbkrLatestCapture_`.
+- **Writes:**
+  - `_Plan_Of_Record`: the hidden ledger, which is the plan of record itself, carried forward on every refresh;
+  - `Plan_Of_Record`: the page;
+  - one Script Property, `POR_HOLDINGS_SNAPSHOT`: the holdings this refresh saw, used as the baseline of the next lock.
+- **Renders:** each refresh reads the cockpit log and the board.
+  - The cockpit logs a render only when its seat signature changes (`dt10AppendSelectionLog_` with `DT10_SELECTION_LOG` unset). The signature leaves out shares, levels and the run.
+  - So when the board's status line does not say `SelLog: +N`, the board counts as one more render, at its `Last run` time.
 - **Lock rule, per venue session:**
   - A plan is the tickets of an EXECUTABLE render.
   - Its session is the first regular session of the ticket's venue whose close is after the render.
   - A newer EXECUTABLE render before that open replaces the plan (pre-open re-lock).
-  - Once the market is open the plan is frozen until the close.
+  - Renders issued while the market is open never change the plan.
+  - Plans are carried in the ledger. They stay on record when their render leaves the log tail or the board, until 4 days after the close.
 - **Status per ticket:**
-  - EXECUTED: the holding grew by at least 90 % of the plan's shares since the lock, or, with the lock-time quantity unknown, a holding bought on or after the lock date.
+  - EXECUTED: the holding grew by at least 90 % of the plan's shares since the lock. The baseline is the holdings snapshot of a refresh taken at or before the lock, at most 60 minutes earlier; with no such snapshot, the rule is a holding bought on or after the lock date.
   - PARTIAL, INVALIDATED (release kill switch), EXPIRED, NOT EXECUTABLE (feed validity), WAITING, OPEN.
-- **IBKR protection:** the working SELL stop covering the executed shares against the plan stop, or `NO STOP AT IBKR`.
-- **Live board:** each ticket's latest cockpit state shown beside the plan, so a re-ranking never reads as a change of plan.
+- **IBKR protection:**
+  - shows the working SELL stop covering the executed shares, against the plan stop, or `NO STOP AT IBKR`;
+  - `POR_IBKR_ALIASES` maps a ticket whose ticker changed (for example `INDV.US=SUPN`).
+- **Live board:** each ticket's latest cockpit state is shown beside the plan, so a re-ranking never reads as a change of plan.
 
 What the page would have shown at 01:40 on 3 Nov (harness T3, the real board):
 
@@ -53,44 +68,82 @@ What the page would have shown at 01:40 on 3 Nov (harness T3, the real board):
 | EFC.US 268 | EXPIRED | — | not on the board |
 | INDV.US 93 | EXECUTED (95 sh @ 35.45) | **NO STOP AT IBKR** | GRACE (23:42) |
 
-## 3. Gates (Script Properties; no re-paste to change)
-- `POR_MODE` = `off` (default) | `observe` | `on`. Any other value is off.
-  - off: nothing read or written.
-  - observe: ledger only.
-  - on: ledger and page.
-- `POR_VALIDITY` = `feed` (default) | `session`.
-  - feed: an unexecuted ticket is OPEN only while the decision feed releases the plan's own run. The release TTL keeps its meaning.
-  - session: the plan stays OPEN through its market session. It is built on the last close, which the freshness gate itself certifies while the market is closed. Entry stays bounded by the entry zone (limit orders), and the release kill switch still invalidates it.
-  - **Arming `session` is an owner decision**: it lets a pre-open plan outlive the 8-hour feed TTL until its market closes.
+## 3. Review fixes (Codex on #898, before the first paste)
+| Finding | Fix | Proof |
+|---|---|---|
+| P1: with `POR_VALIDITY=feed`, an expired EXECUTABLE cell still read OPEN. The cell is not rewritten when the release expires | `porFeedOf_` applies the cockpit's own clock: `dt10UvParse_`, 480 min from the first stamp, 15 min skew, naive stamps read the same way. It also applies the release's `expires=` token. Whichever ends first decides. The reason reads "the release of this plan (run N) expired …" | T12: the morning release at 17:45 reads NOT EXECUTABLE ("expired 2026-11-02 12:19"). On 13 values, POR's live/age equals `dt10UvParse_` run from `16_Decision_Top10.gs` itself. Mutants: expiry ignored, token case ignored |
+| P1: the lock-time quantity came from the first refresh after the lock, so a fill in between became the baseline (OPEN, and no missing-stop warning) | The baseline now comes only from `POR_HOLDINGS_SNAPSHOT` taken at or before the lock, at most 60 min earlier. It is carried per session and symbol. Otherwise the buy-date rule applies | T7: lock at 18:00 with 100 sh bought before the 18:10 refresh → EXECUTED, `NO STOP AT IBKR`. A snapshot taken after the lock, or 90 min before it, is never the baseline. Mutants: post-lock snapshot, unbounded gap |
+| P2: `_Selection_Log` skips renders with an unchanged seat signature, so a later pre-open render with new shares or a new run never reached the lock rule | Board capture (above), plus the ledger carried as the record. A logged board is read only from the log. Forcing `DT10_SELECTION_LOG=always` was rejected: the scorecard, DQ-65, `v_selection_log` and the archive read every logged row | T10: an unlogged 16:50 render (run 41445971593, ITRN 70) re-locks the plan, and at 18:10 it is OPEN under the release of its own run. Without the record it reads NOT EXECUTABLE. T11 and T15 test the carry. Mutants: capture ignored, logged board read twice, ledger ignored, lock-order changes |
 
-## 4. Operator steps
+## 4. Gates (Script Properties; no re-paste to change)
+- `POR_MODE` = `off` (default) | `observe` | `on`. Any other value is off.
+  - off: nothing is read or written.
+  - observe: the ledger and the snapshot are written.
+  - on: the ledger, the snapshot and the page are written.
+- `POR_VALIDITY` = `feed` (default) | `session`.
+  - feed: an unexecuted ticket is OPEN only while the decision feed releases the plan's own run and that release has not expired.
+  - session: the plan stays OPEN through its market session. It is built on the last close, which the freshness gate itself certifies while the market is closed. Entry stays bounded by the entry zone (limit orders), and the release kill switch still invalidates it.
+  - **Arming `session` is an owner decision.** It lets a pre-open plan outlive the 8-hour feed TTL until its market closes.
+- `POR_IBKR_ALIASES` = empty (default) | `INDV.US=SUPN, …`: the IBKR ticker of a renamed holding, used for the stop and limit match only.
+
+## 5. Operator steps
 1. Merge this PR.
 2. Apps Script → **+** → Script → name `28_Plan_Of_Record` → paste the file from `main` (SHA-256 below) → Save.
 3. Run `porSelfTest` once. It authorizes Drive for the capture reader; read the log lines.
-4. Project Settings → Script Properties: `POR_MODE` = `observe`.
+4. Project Settings → Script Properties:
+   - `POR_MODE` = `observe`;
+   - optionally `POR_IBKR_ALIASES` = `INDV.US=SUPN`.
 5. Run `porInstallTrigger` (every 15 minutes).
 6. After one session, read `_Plan_Of_Record`; then set `POR_MODE` = `on`.
-7. Decide `POR_VALIDITY` (`feed` keeps today's semantics; `session` keeps a pre-open plan executable through its market session).
+7. Decide `POR_VALIDITY`:
+   - `feed` keeps today's semantics;
+   - `session` keeps a pre-open plan executable through its market session.
 
-**Rollback:** `POR_MODE=off` (or `porRemoveTrigger`), or delete the file; the two sheets can then be deleted by hand.
+**Rollback:** `POR_MODE=off` (or `porRemoveTrigger`), or delete the file. The two sheets and `POR_HOLDINGS_SNAPSHOT` can then be deleted by hand.
 
-## 5. Verification
-- `node tests/test_por_v100.js` → **PASS 29/29**: compile, ES5 / ASCII, gates, sessions (US DST and standard time, Tadawul Sun–Thu, LSE BST/GMT, HKEX), the real 2 Nov board at 01:40 / 18:10 / 16:00 / 09:00 / 11:30 / 17:45, pre-open re-lock and in-session freeze, kill switch, lock-time quantity, Date cells, header drift (fail closed, no write), missing inputs, determinism, write isolation, triggers, eight mutants killed, two runs with matching digests.
+## 6. Verification
+- `node tests/test_por_v100.js` → **PASS 50/50**. The harness runs the real file in a vm with a recording GAS shim. It covers:
+  - T0–T6:
+    - compile, ES5 / ASCII and the function inventory;
+    - gates;
+    - sessions: US DST and standard time, Tadawul Sun–Thu, LSE BST/GMT, HKEX;
+    - the real 2 Nov board at 01:40 / 18:10 / 16:00 / 09:00 / 11:30 / 17:45;
+    - pre-open re-lock and in-session freeze;
+    - kill switch.
+  - T7: the snapshot baseline.
+  - T8: robustness — Date cells, header drift fails closed, a board read fault, determinism.
+  - T9: write isolation, including Script Properties; `porSelfTest` writes nothing.
+  - T10–T15:
+    - board capture;
+    - the ledger as record;
+    - feed expiry checked against the cockpit's reader;
+    - aliases;
+    - the contract with `16_Decision_Top10.gs`: `DT10_SELECTED_HEADERS`, B2, `Last run`, `output:`, `SelLog: +N`, `VERIFIED (run N)`, log headers and clock constants, all read from that file;
+    - merge order.
+  - 17 mutants killed.
+  - Two runs with matching digests.
+- The same harness fails on the reviewed commit `f3a0c4b7`, for the reviewed reasons (T12 "an EXECUTABLE cell past its clock: OPEN").
 - `pytest tests/test_por_v100.py` → 2 passed. `node tests/js/apps_script_syntax.test.js` → 7 sources compiled.
-- File: `apps_script/28_Plan_Of_Record.gs`, 877 lines, SHA-256 `27f2aa0c296853656d9debd6529c7a11b4ffa2841af2f894ec788eb61f6f78aa`, 45 functions (prefix `por`), removed 0.
+- File: `apps_script/28_Plan_Of_Record.gs`, 1,184 lines, SHA-256 `795bde8f19f9b5aa05feea1d550d3efaee373f141e1a0d8d47d6920f64dc3197`, 61 functions (prefix `por`), removed 0.
 
-## 6. Known limits
+## 7. Known limits
 - Exchange holidays and half days are not modelled: a ticket on a holiday expires at that day's close without a fill.
 - Venues outside US, Tadawul, HKEX, LSE, TSE and the main EU markets follow the feed only.
-- Fills appear after the next IBKR capture reaches My_Portfolio (hourly in the US session).
-- IBKR matching is by base symbol (ITRN.US ↔ ITRN).
+- Fills appear after they reach My_Portfolio, which is fed from `_Portfolio_CostBasis`.
+- IBKR matching is by base symbol (ITRN.US ↔ ITRN) or `POR_IBKR_ALIASES`.
+- The board is read every 15 minutes. If the cockpit replaces an unlogged render within that window, POR never sees it: the plan stays on its previous lock, and feed validity shows NOT EXECUTABLE when the release has moved to a newer run.
+- A pre-open render first seen after the open still takes the plan's place, because it was the plan at the open. `Replaced Lock` shows it.
 - Each run takes a few seconds; 96 runs a day use roughly 5–8 minutes of the Apps Script daily trigger budget.
 
-## 7. Not in this build (next, each its own gated change)
+## 8. Not in this build (next, each its own gated change)
 1. Top_10_Investments_v2 and Portfolio_Decision read `_Plan_Of_Record`. That gives one decision header on every page, so an executed ticket reads "executed — manage on Portfolio_Decision", not grace or BLOCK.
 2. One stop rule across pages (owner decision): the engine plan stop (ITRN 48.27) or the v2 2×ATR stop (49.94). Today the owner's IBKR stops follow v2.
-3. Forecast stability: 483–751 symbols a day moved their 3-month expected ROI by ≥ 2 points at an unchanged price, 187–326 flipped to or from the derived 10.5 % value, and 25–39 changed investability with no price change (BigQuery `v_universe`, 31 Oct → 2 Nov). Hysteresis or carry-forward belongs in the backend.
+3. Forecast stability, in the backend (hysteresis or carry-forward). BigQuery `v_universe`, 31 Oct → 2 Nov, at an unchanged price:
+   - 483–751 symbols a day moved their 3-month expected ROI by ≥ 2 points;
+   - 187–326 flipped to or from the derived 10.5 % value;
+   - 25–39 changed investability.
 4. Venue-aware release: a pre-open release slot per market, so a plan locks on the last close before each open.
-5. The reconciliation evidence supplier (D4) so Portfolio_Decision stops showing BLOCK on every new holding.
+5. The reconciliation evidence supplier (D4), so Portfolio_Decision stops showing BLOCK on every new holding.
+6. Identity after a ticker change: INDV.US is now SUPN at IBKR, while the universe still carries the old Supernus Pharmaceuticals SUPN.US row. The mapping should follow the IBKR contract id, not the ticker text.
 
 Not a licensed financial adviser; the owner decides and executes every trade. No broker order was created, modified or cancelled.
