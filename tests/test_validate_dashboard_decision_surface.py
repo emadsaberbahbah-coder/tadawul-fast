@@ -19,7 +19,8 @@ Cases (read_range is a scripted fake; asyncio.sleep is patched to no-op):
      re-read, detail quotes the status line
   V4 VALIDATE_T10_INPROGRESS_READS=0 -> one read only (v1.3.0)
   V5 a normal published board -> one read; banner/sizing checks unchanged
-  V6 version 1.3.1
+  V6 version 1.3.4
+  V8 (v1.3.4) a long FEED banner reaches the evidence whole (was cut at 120)
   V7 stamp age arithmetic (Riyadh wall clock, UTC+3; override honoured)
 
 Run:  python -m pytest -q tests/test_validate_dashboard_decision_surface.py
@@ -135,7 +136,7 @@ def test_v5_published_board_single_read(monkeypatch):
 
 
 def test_v6_version():
-    assert vd.SCRIPT_VERSION == "1.3.3"
+    assert vd.SCRIPT_VERSION == "1.3.4"
 
 
 def test_v7_stamp_age(monkeypatch):
@@ -146,3 +147,17 @@ def test_v7_stamp_age(monkeypatch):
     assert round(vd._cockpit_status_age_min(line, now)) == 297
     assert vd._cockpit_status_age_min("Last run soon | status: running", now) is None
     assert vd._cockpit_status_age_min("", now) is None
+
+
+def test_v8_long_feed_banner_kept_whole():
+    reason = ("FEED NOT ACTIONABLE \u2014 source readiness: collected pool reconciliation "
+              "unverified: pool receipt cohort unverified; Global_Markets source run "
+              "40484148059 differs from cohort 40556442682 | run=40556442682")
+    grid = [BOARD[0], BOARD[1], [reason]] + BOARD[3:]
+    res = {r.name: r for r in vd.check_top10_surface(PAGE, grid)}
+    banner = res["decision.feed_banner_present"]
+    assert banner.status == "PASS" and len(reason) > 120
+    assert banner.detail == reason
+    huge = [BOARD[0], BOARD[1], ["FEED: NOT ACTIONABLE " + "x" * 5000]] + BOARD[3:]
+    res = {r.name: r for r in vd.check_top10_surface(PAGE, huge)}
+    assert len(res["decision.feed_banner_present"].detail) == vd.FEED_BANNER_DETAIL_MAX

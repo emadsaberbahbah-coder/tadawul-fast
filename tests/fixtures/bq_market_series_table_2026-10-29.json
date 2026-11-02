@@ -1,0 +1,115 @@
+{
+ "_note": "tables.get of project-2e3530e6-2311-4aa3-b36.tfb_archive.market_series_daily on 2026-10-29 right after its creation (schema and rangePartitioning only; NULLABLE fields come back without a mode)",
+ "rangePartitioning": {
+  "field": "series_id",
+  "range": {
+   "end": "1001",
+   "interval": "1",
+   "start": "1"
+  }
+ },
+ "schema": {
+  "fields": [
+   {
+    "description": "permanent id (one partition per series)",
+    "mode": "REQUIRED",
+    "name": "series_id",
+    "type": "INTEGER"
+   },
+   {
+    "description": "Yahoo symbol",
+    "mode": "REQUIRED",
+    "name": "symbol",
+    "type": "STRING"
+   },
+   {
+    "description": "display name",
+    "mode": "REQUIRED",
+    "name": "name",
+    "type": "STRING"
+   },
+   {
+    "description": "US | Europe | China | Japan | Gulf | World | Commodities",
+    "mode": "REQUIRED",
+    "name": "region",
+    "type": "STRING"
+   },
+   {
+    "description": "country or area",
+    "name": "country",
+    "type": "STRING"
+   },
+   {
+    "description": "Index | Market ETF (USD) | US sector ETF (USD) | World sector ETF (USD) | Commodity (USD)",
+    "mode": "REQUIRED",
+    "name": "kind",
+    "type": "STRING"
+   },
+   {
+    "description": "currency of the prices",
+    "mode": "REQUIRED",
+    "name": "currency",
+    "type": "STRING"
+   },
+   {
+    "description": "sector of a sector ETF or commodity",
+    "name": "sector",
+    "type": "STRING"
+   },
+   {
+    "description": "trading date on the venue's own calendar",
+    "mode": "REQUIRED",
+    "name": "date",
+    "type": "DATE"
+   },
+   {
+    "description": "open",
+    "name": "open",
+    "type": "FLOAT"
+   },
+   {
+    "description": "high",
+    "name": "high",
+    "type": "FLOAT"
+   },
+   {
+    "description": "low",
+    "name": "low",
+    "type": "FLOAT"
+   },
+   {
+    "description": "close (price, not dividend-adjusted)",
+    "mode": "REQUIRED",
+    "name": "close",
+    "type": "FLOAT"
+   },
+   {
+    "description": "close adjusted for dividends and splits",
+    "name": "adj_close",
+    "type": "FLOAT"
+   },
+   {
+    "description": "volume (0 or null for most indices)",
+    "name": "volume",
+    "type": "INTEGER"
+   },
+   {
+    "description": "yahoo_chart_v8",
+    "mode": "REQUIRED",
+    "name": "source",
+    "type": "STRING"
+   },
+   {
+    "description": "when this job read the bars",
+    "mode": "REQUIRED",
+    "name": "captured_at",
+    "type": "TIMESTAMP"
+   },
+   {
+    "description": "GitHub Actions run id",
+    "name": "run_id",
+    "type": "STRING"
+   }
+  ]
+ }
+}

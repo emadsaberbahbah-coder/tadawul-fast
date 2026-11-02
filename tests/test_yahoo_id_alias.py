@@ -26,6 +26,17 @@ full dependency set, like tests/test_crypto_provider_identity.py):
   A8 the map equals the ids the probe spec carries for those rows
   A9 version, manifest pin and flag registration
 
+v5.7.1 / engine v5.159.2 (2026-10-28, final audit of run 40673830237:
+Commodities_FX name coverage 98.45 % < 99 % - the seven aliased coins were
+priced but their chart-meta name was refused as identity_echo_refused):
+  A10 yahoo_id_alias: the verified id for the nine only while the flag is
+      on; '' for controls, for the targets themselves and for junk input
+  A11 BB-1 echo gate: the echoed alias matches its page symbol only while
+      the flag is on; a crossed coin and every control pair are unchanged
+  A12 the real _apply_identity_rescue with a chart meta echoing the alias:
+      off -> blank name + identity_echo_refused (the live defect); on ->
+      the verified name; a crossed coin stays refused
+
 Run: python tests/test_yahoo_id_alias.py   or   pytest -q <this file>
 """
 from __future__ import annotations
@@ -135,6 +146,93 @@ def test_a7_adapter_mapping_follows_the_flag(monkeypatch):
     assert yc._yc_yahoo_symbol("DX=F") == "DX-Y.NYB"
 
 
+# ----------------------------------------------------------------------------- A10-A12 (v5.7.1 / v5.159.2)
+NAMES = {
+    "SUI-USD": "Sui USD", "GRT-USD": "The Graph USD", "APT-USD": "Aptos USD",
+    "UNI-USD": "Uniswap USD", "COMP-USD": "Compound USD", "IMX-USD": "Immutable USD",
+    "STX-USD": "Stacks USD",
+}
+
+
+def test_a10_yahoo_id_alias_follows_the_flag(monkeypatch):
+    for sym in list(ALIAS) + CONTROLS:
+        assert normalize.yahoo_id_alias(sym) == ""          # off: nothing
+    _arm(monkeypatch, "0")
+    assert normalize.yahoo_id_alias("SUI-USD") == ""
+    _arm(monkeypatch)
+    for sym, target in ALIAS.items():
+        assert normalize.yahoo_id_alias(sym) == target
+        assert normalize.yahoo_id_alias(sym.lower()) == target
+        assert normalize.yahoo_id_alias(target) == ""        # a target is not a page symbol
+    for sym in CONTROLS:
+        assert normalize.yahoo_id_alias(sym) == ""
+    for junk in (None, "", "   ", 42, object()):
+        assert normalize.yahoo_id_alias(junk) == ""
+
+
+def test_a11_echo_gate_accepts_only_the_verified_alias(monkeypatch):
+    engine = pytest.importorskip("core.data_engine_v2")
+    controls = [("SUI-USD", "SUI-USD", True), ("AAPL.US", "AAPL", True), ("AAPL", "MSFT", False),
+                ("7205.T", "ACU.US", False), ("SUI-USD", "", True), ("SUI-USD", "GRT6719-USD", False),
+                ("BTC-USD", "SUI20947-USD", False), ("LBS=F", "DX-Y.NYB", False)]
+    for sym, target in ALIAS.items():
+        assert engine._bb1_echo_matches(sym, target) is False   # the live refusal
+    before = [engine._bb1_echo_matches(a, b) for a, b, _ in controls]
+    assert before == [want for _, _, want in controls]
+    _arm(monkeypatch)
+    for sym, target in ALIAS.items():
+        assert engine._bb1_echo_matches(sym, target) is True
+        assert engine._bb1_echo_matches(sym.lower(), target.lower()) is True
+    assert [engine._bb1_echo_matches(a, b) for a, b, _ in controls] == before
+    for sym, target in ALIAS.items():                        # crossed aliases stay refused
+        for other, other_target in ALIAS.items():
+            if other != sym and other_target != target:
+                assert engine._bb1_echo_matches(sym, other_target) is False
+
+
+def _rescue(engine, monkeypatch, page_symbol, meta):
+    import asyncio
+    from types import SimpleNamespace
+
+    async def fetch_chart_meta(_sym):
+        return dict(meta)
+
+    monkeypatch.setattr(engine, "_import_yahoo_provider_module",
+                        lambda _name: SimpleNamespace(fetch_chart_meta=fetch_chart_meta))
+    monkeypatch.delenv("TFB_ENGINE_IDENTITY_RESCUE", raising=False)
+    real = object.__new__(engine.DataEngineV5)
+    row = {"symbol": page_symbol, "name": "", "asset_class": "Crypto", "current_price": 1.0}
+    return asyncio.run(real._apply_identity_rescue(row, page_symbol))
+
+
+@pytest.mark.parametrize("page_symbol", sorted(NAMES))
+def test_a12_real_rescue_names_the_aliased_coins(monkeypatch, page_symbol):
+    engine = pytest.importorskip("core.data_engine_v2")
+    target = ALIAS[page_symbol]
+    meta = {"symbol": target, "longName": NAMES[page_symbol], "shortName": NAMES[page_symbol],
+            "instrumentType": "CRYPTOCURRENCY", "currency": "USD", "exchangeName": "CCC"}
+    off = _rescue(engine, monkeypatch, page_symbol, meta)
+    assert off["name"] == ""
+    assert "identity_echo_refused" in str(off.get("warnings"))
+    _arm(monkeypatch)
+    on = _rescue(engine, monkeypatch, page_symbol, meta)
+    assert on["name"] == NAMES[page_symbol]
+    assert "name_from_chart_meta" in str(on.get("warnings"))
+    assert "identity_echo_refused" not in str(on.get("warnings"))
+    assert on["current_price"] == 1.0                        # the rescue never touches price
+
+
+def test_a12_real_rescue_still_refuses_a_crossed_coin(monkeypatch):
+    engine = pytest.importorskip("core.data_engine_v2")
+    _arm(monkeypatch)
+    crossed = {"symbol": "GRT6719-USD", "longName": "The Graph USD", "instrumentType": "CRYPTOCURRENCY"}
+    row = _rescue(engine, monkeypatch, "SUI-USD", crossed)
+    assert row["name"] == ""
+    assert "identity_echo_refused" in str(row.get("warnings"))
+    plain = {"symbol": "SUI-USD", "longName": "Sui USD"}         # an echo of the page symbol: unchanged
+    assert _rescue(engine, monkeypatch, "SUI-USD", plain)["name"] == "Sui USD"
+
+
 # ----------------------------------------------------------------------------- A8-A9
 def test_a8_map_matches_the_probe_spec():
     assert normalize._YAHOO_ID_ALIAS == ALIAS
@@ -145,9 +243,10 @@ def test_a8_map_matches_the_probe_spec():
 
 
 def test_a9_version_pin_and_flag_registration():
-    assert normalize.__version__ == "5.7.0"
+    # 2026-10-28 (stacked): 5.7.1 adds yahoo_id_alias (A10-A12).
+    assert normalize.__version__ == "5.7.1"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert "('core.symbols.normalize', '__version__', '5.7.0', 'symbol normalization')" in vd
+    assert "('core.symbols.normalize', '__version__', '5.7.1', 'symbol normalization')" in vd
     assert "('TFB_YAHOO_ID_ALIAS', '0'," in vd
     contract = (_REPO / "docs" / "render_env_contract.md").read_text(encoding="utf-8")
     assert "TFB_YAHOO_ID_ALIAS" in contract

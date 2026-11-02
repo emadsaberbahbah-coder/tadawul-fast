@@ -573,7 +573,22 @@ from __future__ import annotations
 #   on the sheet -> no key and no line: the v1.18.1 output byte for byte.
 # ZERO functions removed. Added: _POST_EARN_NOTE_RE, _post_earnings_note,
 #   _post_earnings_held_line.
-__version__ = "1.19.0"
+# ---------------------------------------------------------------------------
+# v1.20.0 (2026-10-28) -- [SEND-WINDOW] truthful send-time and session hours
+# WHY (audit 2026-10-28, brief run 40573531442): every brief said "before
+#   market open" and "Sent before market open" although the four sends
+#   (10:30 / 13:30 / 18:00 / 22:00 Riyadh, daily_brief.yml) all fall after
+#   the Tadawul open, and the 22:56 copy of 27 Oct went out with the US
+#   session nearly over. "WHEN YOU CAN ACT" printed US 16:30-23:00 and
+#   Europe ~10:00-19:30 as constants; US hours move to 17:30-00:00 Riyadh
+#   when US daylight time ends (1 Nov 2026) and Europe's to ~11:00-19:30.
+# CHANGE: _send_window(when) derives the label (before Tadawul open / during
+#   Tadawul hours / before US open / during US hours / after US close /
+#   weekend) and the US and Europe hours from the IANA zones for the send
+#   date. Regular sessions only: exchange holidays are not checked, and the
+#   footer says so. Recommendations, numbers and layout are unchanged.
+# ZERO functions removed. Added: _send_window.
+__version__ = "1.20.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -2372,11 +2387,52 @@ def _glance_block(d: Dict[str, Any]) -> str:
   </td></tr>"""
 
 
+def _send_window(when: _dt.datetime) -> Dict[str, str]:
+    """v1.20.0: the send moment against regular session hours, in Riyadh time.
+
+    A naive ``when`` is Riyadh wall-clock time (daily_brief.yml sets
+    TZ=Asia/Riyadh). Returns ``label`` plus ``us`` and ``europe`` hours for
+    the send date, converted from America/New_York (09:30-16:00) and
+    Europe/London (08:00-16:30) so daylight-time changes are followed.
+    Regular sessions only; exchange holidays are not checked."""
+    from zoneinfo import ZoneInfo
+    riyadh, ny, london = (ZoneInfo("Asia/Riyadh"), ZoneInfo("America/New_York"),
+                          ZoneInfo("Europe/London"))
+    t = when.replace(tzinfo=riyadh) if when.tzinfo is None else when.astimezone(riyadh)
+
+    def span(zone, start, end) -> str:
+        day = t.date()
+        a = _dt.datetime.combine(day, start, zone).astimezone(riyadh)
+        b = _dt.datetime.combine(day, end, zone).astimezone(riyadh)
+        return f"{a:%H:%M}\u2013{b:%H:%M}"
+
+    us_open, us_close = _dt.time(9, 30), _dt.time(16, 0)
+    n = t.astimezone(ny)
+    tadawul_day = t.weekday() in (6, 0, 1, 2, 3)   # Sunday-Thursday
+    us_day = n.weekday() < 5
+    clock = t.time()
+    if tadawul_day and clock < _dt.time(10, 0):
+        label = "before Tadawul open"
+    elif tadawul_day and clock < _dt.time(15, 0):
+        label = "during Tadawul hours"
+    elif us_day and us_open <= n.time() < us_close:
+        label = "during US hours"
+    elif us_day and n.time() < us_open:
+        label = "after Tadawul close \u00b7 before US open" if tadawul_day else "before US open"
+    elif us_day:
+        label = "after US close"
+    else:
+        label = "weekend \u2014 Tadawul and US closed"
+    return {"label": label, "us": span(ny, us_open, us_close),
+            "europe": "~" + span(london, _dt.time(8, 0), _dt.time(16, 30))}
+
+
 def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     d = model["decision"]; t = model["top10"]; mk = model["market"]
     metrics = model.get("metrics", {}) or {}  # v1.3.0
     date_long = when.strftime("%A").rstrip()
     date_short = when.strftime("%d %B %Y")
+    window = _send_window(when)
 
     # v1.7.0 (A): DATA VINTAGE NOTICE — amber banner when the NEWEST market-
     # page update is older than TFB_BRIEF_STALE_HOURS at send time. Naive
@@ -2645,7 +2701,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     <div style="height:1px; background:{BRASS}; margin:16px 0 14px 0; line-height:1px; font-size:0;">&nbsp;</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
       <td style="font-family:{SERIF}; color:#FFFFFF; font-size:25px;">Daily Investment Brief<div style="font-family:{SANS}; font-size:10px; color:#9CA8BA; letter-spacing:2px; margin-top:4px;">LOCAL&nbsp;&amp;&nbsp;GLOBAL&nbsp;MARKETS</div></td>
-      <td align="right" style="font-family:{SANS}; color:#A9B4C4; font-size:12px;">{date_long}<br>{date_short}<br><span style="color:#7E8AA0;">before market open</span></td>
+      <td align="right" style="font-family:{SANS}; color:#A9B4C4; font-size:12px;">{date_long}<br>{date_short}<br><span style="color:#7E8AA0;">{_esc(window['label'])}</span></td>
     </tr></table>
   </td></tr>
 
@@ -2697,7 +2753,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   <tr><td style="padding:18px 32px 0 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{INK};"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:11px; color:#C7D0DC; line-height:1.8;">
       <span style="color:{BRASS}; font-family:{SERIF}; font-size:12px; letter-spacing:1px;">WHEN YOU CAN ACT</span> &nbsp;(Riyadh time)<br>
-      <strong style="color:#fff;">Tadawul</strong> 10:00–15:00, Sun–Thu &nbsp;·&nbsp; <strong style="color:#fff;">US</strong> 16:30–23:00 &nbsp;·&nbsp; <strong style="color:#fff;">Europe</strong> ~10:00–19:30 &nbsp;·&nbsp; <strong style="color:#fff;">Tokyo/HK</strong> early morning
+      <strong style="color:#fff;">Tadawul</strong> 10:00–15:00, Sun–Thu &nbsp;·&nbsp; <strong style="color:#fff;">US</strong> {window['us']} &nbsp;·&nbsp; <strong style="color:#fff;">Europe</strong> {window['europe']} &nbsp;·&nbsp; <strong style="color:#fff;">Tokyo/HK</strong> early morning<br>
+      <span style="color:#8D98A8;">Regular sessions on the send date; exchange holidays are not checked.</span>
     </td></tr></table>
   </td></tr>
 
@@ -2708,7 +2765,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   </td></tr>
 
 </table>
-<div style="font-family:{SANS}; font-size:10px; color:#A8A398; margin-top:14px;">Sent before market open · {date_short}, {when.strftime('%H:%M')} Riyadh</div>
+<div style="font-family:{SANS}; font-size:10px; color:#A8A398; margin-top:14px;">Sent {_esc(window['label'])} · {date_short}, {when.strftime('%H:%M')} Riyadh</div>
 </td></tr></table></body></html>"""
 
 
@@ -3459,8 +3516,12 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         lines.append(f"  NEW BUYS: {len(t['top'])} - " + ", ".join(p["symbol"] for p in t["top"]))
     _pl = f"{d['pl_pct']:+.1f}%" if d.get("pl_pct") is not None else "-"
     lines.append(f"  BOOK: {_book_money(d.get('mv'))} SAR | P&L {_pl} | freed cash ~{d['freed_cash']:,.0f} SAR")
-    lines += ["", "When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US 16:30-23:00 - "
-              "Europe ~10:00-19:30 - Tokyo/HK early morning.", ""]
+    window = {k: v.replace("\u2013", "-").replace("\u2014", "-").replace("\u00b7", "-")
+              for k, v in _send_window(when).items()}   # the text part stays ASCII
+    lines += ["", f"Sent {window['label']} ({when:%H:%M} Riyadh).",
+              f"When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US {window['us']} - "
+              f"Europe {window['europe']} - Tokyo/HK early morning. "
+              "Regular sessions; exchange holidays are not checked.", ""]
     return "\n".join(lines)
 
 

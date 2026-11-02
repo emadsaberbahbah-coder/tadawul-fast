@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.17.0  (header synced to runtime; history below)
+Version: 1.17.1  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -884,7 +884,47 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   calls, four alerts, two meta blocks). Removed: 0.
 #   Tests: tests/test_pf_add_guards_d1.py. Rollback: both envs unset
 #   (= v1.16.1 output, byte for byte) or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.17.0"
+# ---------------------------------------------------------------------------
+# v1.17.1 (2026-10-28) [D1b INVALID EVIDENCE] A MALFORMED POST-EARNINGS ENTRY
+#   IS UNKNOWN, NEVER DROPPED
+# WHY: owner readiness review, 28 Oct 14:47 Riyadh (priority 3), reproduced
+#   on v1.17.0: {"FRST.US": {"date": "2026-10-22", "sessions": 4, ...}}
+#   holds the ADD under TFB_PF_ADD_POST_EARN=enforce, but the same entry with
+#   "sessions": "4" was dropped by _post_earn_inputs, so FRST.US looked
+#   report-free and its ADD passed. Dropping evidence that is present but
+#   malformed turns "cannot verify" into "verified clean".
+# WHAT (only while the guard is observe/enforce; off is untouched):
+#   - an entry with a bad structure, date or sessions goes to pe["unknown"]
+#     with the rejected field; nothing is coerced ("4" is not 4; bool, float,
+#     None, NaN, negative, missing all fail). A date must be YYYY-MM-DD and
+#     not after asof; sessions an int >= 0 and not above the calendar days
+#     since that date. A duplicate symbol, or one also listed as uncovered,
+#     is unknown too; an entry that names no symbol makes the input invalid.
+#     enforce -> "ADD held [POST-EARN]: earnings entry for SYM invalid
+#     (sessions '4') - the post-earnings window cannot be verified (was ADD:
+#     ...)"; observe -> the observe tag only.
+#   - an unknown EPS surprise (blank, missing or malformed) cannot rule out a
+#     miss: the longer of the two windows applies (5/10 -> 10), and the
+#     trigger says "EPS unknown" / "EPS invalid (...)". A known surprise keeps
+#     the v1.17.0 windows. Report day (0 sessions) still holds.
+#   - optional body field "uncovered": held symbols with no Calendar_Events
+#     row (sent by a later 10_My_Portfolio; 1.5.17 does not send it). Absent
+#     -> v1.17.0 behaviour; a valid list (<= 200 symbols) -> a listed ADD is
+#     unknown ("no earnings calendar row for SYM"); malformed -> input
+#     invalid. The EODHD calendar does not cover KSA names, so once the
+#     field is sent a KSA ADD holds under enforce (limit, by design).
+#   - meta.post_earn_guard gains invalid_entries and uncovered (null when
+#     the field is absent). Alerts reuse add_post_earn_hold / _observe.
+#   Preserved: a held symbol absent from the map passes; statuses absent,
+#   unavailable, stale and invalid hold under enforce; sukuk exempt; a
+#   post-earnings hold still frees its ticket-cap slot; the ticket cap does
+#   not count working orders that have not filled (limit, unchanged).
+# Functions added: 3 (_post_earn_day, _post_earn_show, _post_earn_entry_fault).
+#   Changed: _post_earn_inputs, _post_earn_eval, _apply_add_post_earn, the
+#   post_earn_guard meta block. Removed: 0. Tests:
+#   tests/test_pf_add_guards_d1.py, tests/test_pf_add_guards_d1_route.py.
+#   Rollback: TFB_PF_ADD_POST_EARN unset (off is the v1.17.0 output) or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.17.1"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -3566,15 +3606,73 @@ def _env_post_earn_sessions_neg():
     return n if 0 <= n <= _POST_EARN_MAX_SESSIONS else 10
 
 
+def _post_earn_day(value):
+    """v1.17.1 [D1b]: a YYYY-MM-DD string (surrounding blanks allowed) ->
+    date, anything else -> None. Never raises."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (len(text) != 10 or not text.isascii() or text[4] != "-" or text[7] != "-"
+            or not (text[:4] + text[5:7] + text[8:]).isdigit()):
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _post_earn_show(value):
+    """v1.17.1 [D1b]: a short ASCII rendering of a rejected field value."""
+    try:
+        text = ascii(value)
+    except Exception:  # noqa: BLE001 - display only
+        text = "?"
+    return text if len(text) <= 24 else text[:21] + "..."
+
+
+def _post_earn_entry_fault(entry, asof_day):
+    """v1.17.1 [D1b] PURE: '' for a well-formed map entry, else the rejected
+    field ("sessions '4'", "date missing", ...). Nothing is coerced: sessions
+    must be an int (not bool) >= 0 and not above the calendar days between
+    the report date and asof; the date must be YYYY-MM-DD and not after
+    asof. Never raises."""
+    try:
+        if not isinstance(entry, dict):
+            return "entry %s" % _post_earn_show(entry)
+        if "date" not in entry:
+            return "date missing"
+        day = _post_earn_day(entry.get("date"))
+        if day is None:
+            return "date %s" % _post_earn_show(entry.get("date"))
+        if day > asof_day:
+            return "date %s after asof %s" % (day.isoformat(), asof_day.isoformat())
+        if "sessions" not in entry:
+            return "sessions missing"
+        sessions = entry.get("sessions")
+        if type(sessions) is not int or sessions < 0:
+            return "sessions %s" % _post_earn_show(sessions)
+        days = (asof_day - day).days
+        if sessions > days:
+            return ("sessions %d above the %d calendar day%s since %s"
+                    % (sessions, days, "" if days == 1 else "s", day.isoformat()))
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        return "entry unreadable"
+    return ""
+
+
 def _post_earn_inputs(raw, today=None):
     """v1.17.0 [D1b] PURE: validated body.post_earnings ->
     {"status", "asof", "updated", "reports", "map": {SYMBOL: {"date",
-    "sessions", "surprise"}}}. status: absent (not supplied) | unavailable |
-    stale (from the producer) | invalid (wrong schema, malformed map, asof
-    not within one day of `today`, a Riyadh date) | ok. Malformed entries
-    are dropped. Never raises."""
+    "sessions", "surprise"}}, "unknown": {SYMBOL: trigger}, "uncovered":
+    set or None}. status: absent (not supplied) | unavailable | stale (from
+    the producer) | invalid (wrong schema, malformed map or uncovered list,
+    an entry that names no symbol, asof not within one day of `today`, a
+    Riyadh date) | ok. v1.17.1: a present but malformed entry is never
+    dropped - its symbol goes to "unknown" with the rejected field; a
+    malformed surprise keeps the entry with surprise None and a
+    "surprise_bad" note. Never raises."""
     out = {"status": "absent", "asof": None, "updated": None, "reports": None,
-           "map": {}}
+           "map": {}, "unknown": {}, "uncovered": None}
     if raw is None:
         return out
     try:
@@ -3606,50 +3704,80 @@ def _post_earn_inputs(raw, today=None):
         if not isinstance(entries, dict) or len(entries) > _POST_EARN_MAX_SYMBOLS:
             out["status"] = "invalid"
             return out
-        clean = {}
+        clean, unknown, seen = {}, {}, set()
         for sym, e in entries.items():
-            key = str(sym or "").strip().upper()
-            if not key or not isinstance(e, dict):
+            key = sym.strip().upper() if isinstance(sym, str) else ""
+            if not key:
+                # v1.17.1: evidence that names no symbol cannot clear any ADD.
+                out["status"] = "invalid"
+                return out
+            if key in seen:
+                clean.pop(key, None)
+                unknown[key] = "earnings entry for %s invalid (duplicate symbol)" % key
                 continue
-            day = str(e.get("date") or "").strip()
-            try:
-                datetime.strptime(day, "%Y-%m-%d")
-            except (TypeError, ValueError):
-                continue
-            sessions = e.get("sessions")
-            if (isinstance(sessions, bool) or not isinstance(sessions, (int, float))
-                    or not math.isfinite(sessions) or sessions < 0
-                    or int(sessions) != sessions):
+            seen.add(key)
+            fault = _post_earn_entry_fault(e, asof_day)
+            if fault:
+                unknown[key] = "earnings entry for %s invalid (%s)" % (key, fault)
                 continue
             sur = e.get("surprise")
-            if (isinstance(sur, bool) or not isinstance(sur, (int, float))
-                    or not math.isfinite(sur)):
+            bad_sur = None
+            if sur is not None and not (type(sur) in (int, float) and math.isfinite(sur)):
+                bad_sur = "surprise %s" % _post_earn_show(sur)
                 sur = None
-            clean[key] = {"date": day, "sessions": int(sessions),
+            clean[key] = {"date": e["date"].strip(), "sessions": e["sessions"],
                           "surprise": float(sur) if sur is not None else None}
+            if bad_sur:
+                clean[key]["surprise_bad"] = bad_sur
+        uncovered = None
+        if "uncovered" in raw:
+            listed = raw.get("uncovered")
+            if not isinstance(listed, list) or len(listed) > _POST_EARN_MAX_SYMBOLS:
+                out["status"] = "invalid"
+                return out
+            uncovered = set()
+            for item in listed:
+                key = item.strip().upper() if isinstance(item, str) else ""
+                if not key:
+                    out["status"] = "invalid"
+                    return out
+                uncovered.add(key)
+            for key in sorted(uncovered & (set(clean) | set(unknown))):
+                clean.pop(key, None)
+                unknown[key] = ("earnings entry for %s invalid (also listed as "
+                                "uncovered)" % key)
         out["map"] = clean
+        out["unknown"] = unknown
+        out["uncovered"] = uncovered
         out["status"] = "ok"
     except Exception:  # noqa: BLE001 - pure helper, never fatal
         out = {"status": "invalid", "asof": None, "updated": None,
-               "reports": None, "map": {}}
+               "reports": None, "map": {}, "unknown": {}, "uncovered": None}
     return out
 
 
 def _post_earn_eval(cand, pe, sessions_pos, sessions_neg):
     """v1.17.0 [D1b] PURE: {"in_window", "limit", "trig"} for one holding.
     The limit is sessions_neg after a negative EPS surprise, else
-    sessions_pos; a holding absent from the map is outside every window."""
+    sessions_pos; a holding absent from the map is outside every window.
+    v1.17.1: an unknown or invalid surprise cannot rule out a miss, so the
+    longer of the two windows applies."""
     out = {"in_window": False, "limit": None, "trig": ""}
     try:
         sym = str((cand or {}).get("symbol") or "").strip().upper()
         e = ((pe or {}).get("map") or {}).get(sym)
         if not e:
             return out
-        neg = e["surprise"] is not None and e["surprise"] < 0
-        lim = int(sessions_neg if neg else sessions_pos)
+        if e["surprise"] is None:
+            lim = int(max(sessions_pos, sessions_neg))
+            eps = ("invalid (%s), the longer window applies" % e["surprise_bad"]
+                   if e.get("surprise_bad") else "unknown, the longer window applies")
+        else:
+            neg = e["surprise"] < 0
+            lim = int(sessions_neg if neg else sessions_pos)
+            eps = "%+.1f%%" % e["surprise"]
         out["limit"] = lim
         out["in_window"] = 0 <= e["sessions"] <= lim
-        eps = "n/a" if e["surprise"] is None else "%+.1f%%" % e["surprise"]
         if e["sessions"] == 0:
             # Review fix (PR #869): a report dated today (before or after
             # the release) is the report day itself.
@@ -3668,8 +3796,9 @@ def _apply_add_post_earn(cand, action, reason, proceeds, capped_from, pe):
     byte-identical). off -> pass-through; only an ADD is examined; a sukuk
     is exempt (D-9). observe -> tag only; enforce -> ADD narrows to HOLD with
     capped_from=ADD and zero proceeds when the holding is inside its window
-    or the inputs cannot verify it. Returns (action, reason, proceeds,
-    capped_from)."""
+    or the inputs cannot verify it (v1.17.1: also when its own entry is
+    malformed or it is listed as uncovered). Returns (action, reason,
+    proceeds, capped_from)."""
     mode = _env_add_post_earn_mode()
     if mode == "off" or action != ACTION_ADD:
         return action, reason, proceeds, capped_from
@@ -3677,8 +3806,16 @@ def _apply_add_post_earn(cand, action, reason, proceeds, capped_from, pe):
         return action, reason, proceeds, capped_from
     pe = pe or {}
     status = pe.get("status") if pe.get("status") in _POST_EARN_STATUSES else "invalid"
+    trig = None
     if status != "ok":
         trig = "earnings calendar %s" % status
+    else:
+        # v1.17.1: this holding's own evidence is malformed or missing.
+        sym = str((cand or {}).get("symbol") or "").strip().upper()
+        trig = (pe.get("unknown") or {}).get(sym)
+        if not trig and sym and sym in (pe.get("uncovered") or ()):
+            trig = "no earnings calendar row for %s" % sym
+    if trig:
         if mode == "observe":
             tag = " | [postearn-observe] %s - would HOLD under enforce" % trig
             return action, (reason or "") + tag, proceeds, capped_from
@@ -4654,6 +4791,13 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta, post_earnings=None):
                 "calendar_updated": _pe["updated"],
                 "calendar_reports": _pe["reports"],
                 "holdings_with_report": len(_pe["map"]),
+                # v1.17.1: entries with a rejected field (incl. a surprise)
+                # and the uncovered count (null = field not sent).
+                "invalid_entries": len(_pe.get("unknown") or {}) + sum(
+                    1 for _v in (_pe.get("map") or {}).values()
+                    if _v.get("surprise_bad")),
+                "uncovered": (len(_pe["uncovered"])
+                              if _pe.get("uncovered") is not None else None),
                 "held": sum(1 for e in entries if e.get("capped_from")
                             and "add held [post-earn]" in
                             str(e.get("action_reason") or "").lower()),

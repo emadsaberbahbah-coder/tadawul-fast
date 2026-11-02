@@ -2,8 +2,19 @@
 # scripts/archive_to_bigquery.py
 """
 ================================================================================
-TFB BigQuery Archive - v1.0.0 (program register C8, Phase 1)
+TFB BigQuery Archive - v1.1.0 (program register C8, Phase 1)
 ================================================================================
+v1.1.0 (31 Oct 2026, Looker pages 3-6): seven more tabs, all with header
+row 1 - the four market pages (Market_Leaders, Global_Markets, Mutual_Funds,
+Commodities_FX: one 115-column layout, core/sheets/schema_registry.py) and
+the news gate's _News_Items, _News_Gate and _Econ_Events
+(scripts/news_macro_gate.py). WHY (owner request 31 Oct 2026): the World
+Top-25 ROI table, the My Portfolio / Top-10 evidence pages and the one-symbol
+deep-dive need every instrument's price, forecast, scores and decision, and
+the news and economic calendar, kept day by day - the pages themselves are
+overwritten by each sync and the news tabs roll over. Same read-only
+contract: one values.get per tab, nothing written to the workbook, one
+partition per day (about 10,000 market rows a night).
 WHY (owner decision 27 Oct 2026): the decision workbook overwrites most of
 its learning surfaces every day - the Top-10 board, Calendar_Events, the
 nightly _Board_Scorecard, My_Portfolio, Portfolio_Decision - and the logs
@@ -60,7 +71,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # (tab, header_row): header_row is the 1-based row holding column names, 0 when
 # the tab is a multi-zone layout (title rows, several tables) - cells only.
@@ -75,6 +86,14 @@ TABS: Tuple[Tuple[str, int], ...] = (
     ("My_Portfolio", 1),
     ("Portfolio_Decision", 0),
     ("_Run_Log", 1),
+    # v1.1.0: the market pages (one 115-column header) and the news gate tabs
+    ("Market_Leaders", 1),
+    ("Global_Markets", 1),
+    ("Mutual_Funds", 1),
+    ("Commodities_FX", 1),
+    ("_News_Items", 1),
+    ("_News_Gate", 1),
+    ("_Econ_Events", 1),
 )
 MAX_ROWS_PER_TAB = 250_000
 MAX_COLS = 400
@@ -230,7 +249,7 @@ def read_tab(session: Any, sid: str, tab: str) -> List[List[Any]]:
     rng = quote("'" + tab.replace("'", "''") + "'", safe="")
     url = (f"{SHEETS_API}/{sid}/values/{rng}?majorDimension=ROWS"
            "&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING")
-    resp = session.get(url, timeout=120)
+    resp = session.get(url, timeout=300)   # v1.1.0: 120 -> 300 s (Global_Markets ~800k cells)
     if resp.status_code != 200:
         raise RuntimeError(f"read {tab}: {_err(resp)}")
     return list((resp.json() or {}).get("values") or [])

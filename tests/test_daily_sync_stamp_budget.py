@@ -52,6 +52,10 @@ WORKFLOW = _REPO / ".github" / "workflows" / "daily_sync.yml"
 BASE_SHA = "21dc13e9"  # main before v1.0.7 (daily_sync.yml v1.0.4)
 KEY = "TFB_SYNC_STATUS_STAMP_DEADLINE_S"
 EXPR = "${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}"
+# daily_sync.yml 1.0.8 (2026-10-29) maps one more key in the same two jobs
+# (run_dashboard_sync 6.71.0 FW2-STALE-PE; pinned in tests/test_fw2_stale_pe.py).
+# B4 strips it too, so it still proves "env mapping only" back to v1.0.4.
+LATER_KEYS = ("TFB_SYNC_FW2_STALE_PE",)
 
 
 def _jobs(doc):
@@ -95,7 +99,11 @@ def test_b1_every_stamp_job_maps_the_budget():
 
 
 def test_b1_header_names_the_version():
-    head = WORKFLOW.read_text(encoding="utf-8").splitlines()[:6]
+    # The header block is every comment line before the first trigger key;
+    # daily_sync.yml 1.0.9 (2026-11-02, sync-render handshake) added a
+    # longer entry above 1.0.8, so the entry is no longer in the first 6 lines.
+    text = WORKFLOW.read_text(encoding="utf-8")
+    head = text.split("\non:\n", 1)[0].splitlines()
     assert any(l.startswith("# VERSION 1.0.7 (2026-10-28)") for l in head)
 
 
@@ -219,6 +227,8 @@ def _strip_added(doc):
             env = holder.get("env")
             if isinstance(env, dict):
                 env.pop(KEY, None)
+                for later in LATER_KEYS:
+                    env.pop(later, None)
     return out
 
 

@@ -214,9 +214,11 @@ def test_a6_cli_accepts_auto_and_refuses_a_missing_source(monkeypatch, tmp_path)
 
 
 def test_a7_pin_and_workflow_invariants():
-    assert R.SCRIPT_VERSION == "1.2.0"
+    # 2026-10-29 (1.3.0): a version floor and k==k pin instead of an exact
+    # string, so the next release bump does not stale this auto-source case.
+    assert tuple(int(part) for part in R.SCRIPT_VERSION.split(".")) >= (1, 2, 0)
     verifier = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("release_decision_feed", "1.2.0"' in verifier
+    assert '("release_decision_feed", "' + R.SCRIPT_VERSION + '"' in verifier
     text = (_REPO / ".github" / "workflows" / "release_decision_feed.yml").read_text(encoding="utf-8")
     assert "schedule:" in text and "source_run_id || 'auto'" in text
     # the schedule never kills or sweeps by itself; the sticky variable does

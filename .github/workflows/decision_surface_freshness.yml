@@ -1,5 +1,30 @@
 name: 🛡️ Decision Surface Freshness
 
+# =============================================================================
+# VERSION 1.1.0 (2026-11-02) -- SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0)
+# (first dated entry; the earlier file carried no version header)
+# WHY (runs of 1-2 Nov 2026): on workflow_run of the Advanced Sync this
+# workflow audits the cockpits at the same moment the sync's final job does,
+# BEFORE the asynchronous Apps Script render of Top_10_Investments /
+# Portfolio_Decision has consumed that run, and flags T10_OLDER_THAN_SOURCE /
+# T10_POOL_RECONCILIATION_UNPROVEN on timing alone; seven to eight minutes
+# later both cockpits read 'source readiness VERIFIED (run <id>)'.
+# WHAT: ONE gated step, 'Await the native cockpit render (handshake)',
+# immediately BEFORE 'Audit decision surfaces', for workflow_run events only:
+# scripts/await_cockpit_receipts.py --wait-only --run-id <the triggering
+# sync, github.event.workflow_run.id>, the same read-only poll
+# release_after_sync.yml uses, until both cockpits carry that receipt or the
+# bound ends (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20
+# minutes). It only DELAYS the audit: '|| true', never fails the job, never
+# writes, never dispatches; its JSON joins the evidence artifact and one line
+# goes to the step summary. The audit and its findings are byte-identical.
+# The job timeout rises 20 -> 45 minutes (the 20-minute cap plus the step's
+# own 25-minute backstop); nothing else changes.
+# GATE: vars.TFB_SYNC_AWAIT_RENDER (1/true/yes/on), the same Variable as the
+# sync's final job. Unset (default): the step is skipped, nothing moves.
+# ROLLBACK: unset the variable, or revert this step and the timeout.
+# =============================================================================
+
 on:
   pull_request:
     paths:
@@ -88,7 +113,9 @@ jobs:
         )
       }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # v1.1.0: 20 -> 45, room for the gated handshake wait (cap 20 min) and
+    # its 25-minute step backstop before the unchanged audit.
+    timeout-minutes: 45
     environment: production
     env:
       PYTHONUNBUFFERED: '1'
@@ -162,6 +189,54 @@ jobs:
           [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
+      # (2026-11-02) v1.1.0 SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0
+      # --wait-only). WHY: on workflow_run this job audits the cockpits BEFORE
+      # the asynchronous Apps Script render has consumed the triggering sync
+      # and flags T10_OLDER_THAN_SOURCE / T10_POOL_RECONCILIATION_UNPROVEN on
+      # timing alone. WHAT: this step only DELAYS the unchanged audit below:
+      # the same read-only poll as release_after_sync.yml, until both
+      # cockpits carry 'source readiness VERIFIED (run <triggering sync>)' or
+      # the bound ends (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap
+      # 20 minutes). It never fails this job ('|| true'; the script exits 2
+      # only on a configuration error and never raises), never writes the
+      # workbook, never dispatches, and uses the read-only credentials
+      # configured above. workflow_run events only: a manual dispatch has no
+      # triggering sync to wait for. GATE: vars.TFB_SYNC_AWAIT_RENDER
+      # (1/true/yes/on); unset or any other value skips the step and the job
+      # runs exactly as before. The audit below keeps every finding as is.
+      - name: Await the native cockpit render (handshake)
+        if: ${{ github.event_name == 'workflow_run' && contains(fromJSON('["1","true","yes","on"]'), vars.TFB_SYNC_AWAIT_RENDER) }}
+        timeout-minutes: 25
+        env:
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}
+        run: |
+          set -euo pipefail
+          rm -f await_render.json
+          python scripts/await_cockpit_receipts.py --wait-only \
+            --run-id "$SOURCE_RUN_ID" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --max-minutes "$TFB_SYNC_AWAIT_RENDER_MIN" \
+            --json-out await_render.json || true
+          python - <<'PY' || true
+          import json, os
+          from pathlib import Path
+          path = Path('await_render.json')
+          line = 'Await render (handshake): no report was written; the audit ran without a wait.'
+          if path.exists():
+              result = json.loads(path.read_text())
+              seen = result.get('consumed_at_s') or {}
+              def at(name):
+                  return 'none' if seen.get(name) is None else 'at %s s' % seen[name]
+              line = ('Await render (handshake): %s after %s s, %s polls; receipts for run %s: '
+                      'Portfolio_Decision %s, Top_10_Investments %s.' % (
+                          result.get('outcome'), result.get('waited_s'), result.get('polls'),
+                          result.get('run_id'), at('pf'), at('t10')))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(line + '\n\n')
+          print(line)
+          PY
+
       - name: Audit decision surfaces
         id: audit
         run: |
@@ -205,7 +280,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: decision-surface-freshness-${{ github.event.workflow_run.id || github.run_id }}
-          path: decision_surface_freshness.json
+          path: |
+            decision_surface_freshness.json
+            await_render.json
           retention-days: 30
           if-no-files-found: warn
 

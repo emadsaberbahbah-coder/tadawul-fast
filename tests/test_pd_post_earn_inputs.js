@@ -245,8 +245,11 @@ for (const f of FUNCS) ok(block.indexOf('function ' + f + '(') >= 0, 'E9 invento
 const h0 = src.indexOf(' * v1.5.17 (2026-10-28)');
 const h1 = src.indexOf(' * v1.5.16 (2026-10-26)');
 ok(h0 > 0 && h1 > h0 && ![...src.slice(h0, h1)].some((ch) => ch.charCodeAt(0) > 126), 'E9 WHY block ASCII, above v1.5.16');
+// 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on this change; the
+// lockstep holds at the delivered file's own version, which must be 1.5.17 or later.
 // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over this v1.5.17; the delivered file may sit above
 // v1.5.17, so the floor is v1.5.17 and the header line stays in lockstep with PD_VERSION.
+// merge note 2026-11-02 (#780): panel preserve is now v1.5.19 over #892's v1.5.18; the same floor covers it.
 const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m) || [];
 ok(pdv.length === 4 && (src.match(/var PD_VERSION = '/g) || []).length === 1 &&
    new RegExp('^ \\* Version: ' + pdv[1] + '\\.' + pdv[2] + '\\.' + pdv[3] + '$', 'm').test(src) &&
@@ -270,8 +273,16 @@ if (process.env.PD_BASE) {
   // merge note 2026-10-28 (#780): the delivered file also carries #780's three panel-preserve functions
   // (tests/js/pf_panel_preserve.test.js), which the v1.5.16 base lacks.
   const PD780 = ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'];
-  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + FUNCS.length + PD780.length,
-     'E10 zero functions removed; exactly ' + FUNCS.length + ' added + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
+  // merge note 2026-11-02 (#780): panel preserve is v1.5.19 over #892's v1.5.18, which adds twenty pdCashSnap* /
+  // pdIbkrRetry* functions (tests/test_my_portfolio_v1518_cash_snapshot.js); they count too.
+  const PD892 = ['pdCashSnapMode_', 'pdCashSnapRiyadh_', 'pdCashSnapHeaderMap_', 'pdCashSnapCents_',
+    'pdCashSnapStampMs_', 'pdCashSnapRead_', 'pdCashSnapTailScan_', 'pdCashSnapRow_', 'pdCashSnapToken_',
+    'pdCashSnapLastKnownNote_', 'pdCashSnapApply_', 'pdCashSnapSheetState_', 'pdCashSnapCoreOk_', 'pdIbkrRetryMode_',
+    'pdIbkrRetryCore_', 'pdIbkrRemoveRetry_', 'pdIbkrArmRetry_', 'pdIbkrRetryAfterSkip_', 'pdIbkrEvidenceFollowUpRetry',
+    'pdIbkrRetryState_'];
+  ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
+     PD892.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + FUNCS.length + PD892.length + PD780.length,
+     'E10 zero functions removed; exactly ' + FUNCS.length + ' added + #892\'s 20 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('E10 PASS golden negative on the v1.5.16 base ' + sha.slice(0, 12));
 } else {
   console.log('E10 SKIP (set PD_BASE=<v1.5.16 file> to run the golden negative)');

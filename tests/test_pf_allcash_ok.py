@@ -193,14 +193,17 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     text = GAS.read_text(encoding="utf-8")
     # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
     # 2026-10-28: v1.5.17 (post-earnings inputs) stacks on top; pin moved again
+    # 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on top; pin moved
     # merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17;
     # it adds pdPanelPreserveMode_ / pdPanelPreserve_ / pdPanelSeedValue_ and 144
     # lines, all ASCII (tests/js/pf_panel_preserve.test.js).
+    # merge note 2026-11-02 (#780): panel preserve is now v1.5.19 over #892's v1.5.18;
+    # the floor moves to 1.5.18 and the header line stays in lockstep with PD_VERSION.
     m = re.search(r"var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';", text)
-    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 17), m
+    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 18), m
     assert " * Version: %s.%s.%s\n" % m.groups() in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
-    assert "var PD_VERSION = '1.5.16';" not in text
+    assert "var PD_VERSION = '1.5.16';" not in text and "var PD_VERSION = '1.5.17';" not in text
     assert "\r" not in text
     now = set(_top_level_functions(text))
     base = set(golden["functions"])
@@ -208,15 +211,25 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     assert base <= now, sorted(base - now)
     # 2026-10-26: v1.5.16 (evidence publication) adds eight pdIbkr* functions on top of this change
     # 2026-10-28: v1.5.17 (post-earnings inputs) adds four pdPostEarn* functions
-    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdIbkrArmFollowUp_", "pdIbkrEvidenceFollowUp",
-                                  "pdIbkrFollowUpCore_", "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
-                                  "pdIbkrRemoveFollowUp_", "pdIbkrRunLog_", "pdPanelPreserveMode_",
-                                  "pdPanelPreserve_", "pdPanelSeedValue_", "pdPostEarnBody_", "pdPostEarnCore_",
-                                  "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]   # + #780
+    # 2026-11-02: v1.5.18 adds thirteen pdCashSnap* and seven pdIbkrRetry* / retry follow-up functions
+    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
+                                  "pdCashSnapCoreOk_", "pdCashSnapHeaderMap_", "pdCashSnapLastKnownNote_",
+                                  "pdCashSnapMode_", "pdCashSnapRead_", "pdCashSnapRiyadh_", "pdCashSnapRow_",
+                                  "pdCashSnapSheetState_", "pdCashSnapStampMs_", "pdCashSnapTailScan_",
+                                  "pdCashSnapToken_", "pdIbkrArmFollowUp_", "pdIbkrArmRetry_",
+                                  "pdIbkrEvidenceFollowUp", "pdIbkrEvidenceFollowUpRetry", "pdIbkrFollowUpCore_",
+                                  "pdIbkrFollowUpState_", "pdIbkrPublishMode_", "pdIbkrPublish_",
+                                  "pdIbkrRemoveFollowUp_", "pdIbkrRemoveRetry_", "pdIbkrRetryAfterSkip_",
+                                  "pdIbkrRetryCore_", "pdIbkrRetryMode_", "pdIbkrRetryState_", "pdIbkrRunLog_",
+                                  "pdPanelPreserveMode_", "pdPanelPreserve_", "pdPanelSeedValue_",
+                                  "pdPostEarnBody_", "pdPostEarnCore_", "pdPostEarnMode_", "pdPostEarnRiyadhDay_"]   # + #780
     non_ascii = sum(1 for line in text.split("\n") if re.search(r"[^\x00-\x7f]", line))
     assert non_ascii == golden["non_ascii_lines"] == 97
     # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 144   # + #780
+    # 2026-11-02: + 708 lines for v1.5.18 (cash snapshot writer, last-known cash, follow-up retry)
+    # merge note 2026-11-02 (#780): + 148 lines for panel preserve v1.5.19 over #892's v1.5.18 (144 as of
+    # 2026-10-28, plus the extended renumber note and a two-line MERGE NOTE in its WHY block).
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 148   # + #780
 
 
 # merge note 2026-10-25 (#780): the three seed lines buildPortfolioDecisionLayout
@@ -241,7 +254,9 @@ def test_added_lines_are_es5_and_ascii(base_source):
     # this v1.5.14 base the delivered file also carries #780's 145 added / 3 removed
     # panel-preserve lines (the version swaps are already in main's counts); the three
     # removed seed lines are matched exactly below.
-    assert 95 + 145 <= len(added) <= 110 + 145 and len(removed) <= 10 + 3, (len(added), len(removed))
+    # merge note 2026-11-02 (#780): panel preserve is v1.5.19 over #892's v1.5.18; its share against this
+    # base is now 151 added / 3 removed (the extended renumber note and the MERGE NOTE in its WHY block).
+    assert 95 + 151 <= len(added) <= 110 + 151 and len(removed) <= 10 + 3, (len(added), len(removed))
     code = [line for line in added if not re.match(r"\s*(\*|/\*|//)", line)]
     assert len(code) >= 40, len(code)
     for line in added:

@@ -61,9 +61,18 @@ const VARS = ['PD_VERSION', 'PD_EVIDENCE_PROP', 'PD_EVIDENCE_MAX_CHARS', 'PD_IBK
 const FUNCS = ['pdSrcStampMs_', 'pdIbkrStampMs_', 'pdIbkrAge_', 'pdIbkrProp_', 'pdEvidencePacket_', 'pdIbkrPublishMode_',
   'pdIbkrPublish_', 'pdIbkrRemoveFollowUp_', 'pdIbkrArmFollowUp_', 'pdIbkrFollowUpCore_', 'pdIbkrRunLog_',
   'pdIbkrEvidenceFollowUp', 'pdIbkrFollowUpState_'];
+// 2026-11-02: v1.5.18 (follow-up retry, PD_IBKR_FOLLOWUP_RETRY default off) stacks on this change; the
+// follow-up now consults the retry gate after a skip, so its vars and helpers are extracted too. The
+// property stays absent here, so every P5 line, row and detail below is the v1.5.16 output.
+const VARS_V1518 = ['PD_IBKR_RETRY_PROP', 'PD_IBKR_RETRY_HANDLER', 'PD_IBKR_RETRY_DELAY_MS', 'PD_IBKR_RETRY_REASON',
+  'PD_IBKR_RETRY_RUN_'];
+const FUNCS_V1518 = ['pdIbkrRetryMode_', 'pdIbkrRetryCore_', 'pdIbkrRemoveRetry_', 'pdIbkrArmRetry_',
+  'pdIbkrRetryAfterSkip_'];
 const geval = eval;
 for (const v of VARS) geval(extractVar(src, v));
 for (const f of FUNCS) geval(extract(src, f));
+for (const v of VARS_V1518) { try { geval(extractVar(src, v)); } catch (e) { /* a pre-1.5.18 file */ } }
+for (const f of FUNCS_V1518) { try { geval(extract(src, f)); } catch (e) { /* a pre-1.5.18 file */ } }
 
 let pass = 0;
 function ok(cond, label) { if (!cond) { console.error('FAIL ' + label); process.exit(1); } pass++; }
@@ -215,9 +224,17 @@ if (process.env.PD_BASE) {
   // merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17, which adds four pdPostEarn*
   // functions (tests/test_pd_post_earn_inputs.js); they count too.
   const PD869 = ['pdPostEarnMode_', 'pdPostEarnRiyadhDay_', 'pdPostEarnCore_', 'pdPostEarnBody_'];
+  // merge note 2026-11-02 (#780): panel preserve is v1.5.19 over #892's v1.5.18, which adds twenty pdCashSnap* /
+  // pdIbkrRetry* functions (tests/test_my_portfolio_v1518_cash_snapshot.js); they count too.
+  const PD892 = ['pdCashSnapMode_', 'pdCashSnapRiyadh_', 'pdCashSnapHeaderMap_', 'pdCashSnapCents_',
+    'pdCashSnapStampMs_', 'pdCashSnapRead_', 'pdCashSnapTailScan_', 'pdCashSnapRow_', 'pdCashSnapToken_',
+    'pdCashSnapLastKnownNote_', 'pdCashSnapApply_', 'pdCashSnapSheetState_', 'pdCashSnapCoreOk_', 'pdIbkrRetryMode_',
+    'pdIbkrRetryCore_', 'pdIbkrRemoveRetry_', 'pdIbkrArmRetry_', 'pdIbkrRetryAfterSkip_', 'pdIbkrEvidenceFollowUpRetry',
+    'pdIbkrRetryState_'];
   ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
-     PD869.every((n) => nn.has(n) && nb.indexOf(n) < 0) && nn.size === nb.length + 8 + PD869.length + PD780.length,
-     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
+     PD869.every((n) => nn.has(n) && nb.indexOf(n) < 0) && PD892.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
+     nn.size === nb.length + 8 + PD869.length + PD892.length + PD780.length,
+     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #892\'s 20 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('P9 PASS golden negative on the v1.5.15 base ' + sha.slice(0, 12));
 } else {
   console.log('P9 SKIP (set PD_BASE=<v1.5.15 file> to run the golden negative)');
