@@ -245,7 +245,12 @@ for (const f of FUNCS) ok(block.indexOf('function ' + f + '(') >= 0, 'E9 invento
 const h0 = src.indexOf(' * v1.5.17 (2026-10-28)');
 const h1 = src.indexOf(' * v1.5.16 (2026-10-26)');
 ok(h0 > 0 && h1 > h0 && ![...src.slice(h0, h1)].some((ch) => ch.charCodeAt(0) > 126), 'E9 WHY block ASCII, above v1.5.16');
-ok((src.match(/var PD_VERSION = '1\.5\.17';/g) || []).length === 1 && /^ \* Version: 1\.5\.17$/m.test(src), 'E9 version lockstep');
+// 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on this change; the
+// lockstep holds at the delivered file's own version, which must be 1.5.17 or later.
+const pdv = src.match(/^var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';$/m) || [];
+ok(pdv.length === 4 && (src.match(/var PD_VERSION = '/g) || []).length === 1 &&
+   new RegExp('^ \\* Version: ' + pdv[1] + '\\.' + pdv[2] + '\\.' + pdv[3] + '$', 'm').test(src) &&
+   (+pdv[1]) * 1e6 + (+pdv[2]) * 1e3 + (+pdv[3]) >= 1005017, 'E9 version lockstep');
 ok(src.indexOf(" * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION") > 0 && src.indexOf(" * v1.5.15 (2026-10-24)  (PD-ALLCASH") > 0, 'E9 prior WHY blocks kept');
 const metaFn = extract(src, 'pdMetaLine_');
 ok(!/\b(let|const)\s|=>|`/.test(metaFn) && ![...metaFn].some((ch) => ch.charCodeAt(0) > 126), 'E9 pdMetaLine_ ES5/ASCII');

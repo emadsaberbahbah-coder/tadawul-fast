@@ -1,4 +1,4 @@
-"""track_performance v6.51.0 [MATURED-EVIDENCE] -- an outcome matured by THIS
+"""track_performance v6.54.0 [MATURED-EVIDENCE] -- an outcome matured by THIS
 audit pass counts as a valid outcome in the same run
 (TRACK_MATURED_EVIDENCE_VALID = off (default) | enforce).
 
@@ -12,7 +12,7 @@ gives realized_roi_source_valid=False exactly as a production load does.
   M0  the mode parser takes the exact word 'enforce' only
   M1  enforce: a fresh witnessed close matures the row and the SAME run's
       summary, calibrator, canonical report, S-1 measure and MATURED receipt
-      all use it; one INFO '[v6.51.0 MATURED-EVIDENCE]' line, after the
+      all use it; one INFO '[v6.54.0 MATURED-EVIDENCE]' line, after the
       MATURE-FRESH line
   M2  enforce: the HIST-CLOSE enforce path reaches the same assignment
   M3  enforce: same-run consumers equal the next run's reload
@@ -23,7 +23,7 @@ gives realized_roi_source_valid=False exactly as a production load does.
       a row left PENDING or a corp-action-suspect row that goes EXPIRED
   M6  workflow and pins: both tracker steps (the clock, and daily_sync's,
       which audits on a manual dispatch) map the Variable once (default
-      'off'), header 1.0.7, SCRIPT_VERSION >= 6.51.0 in lockstep with
+      'off'), header 1.0.8, SCRIPT_VERSION >= 6.54.0 in lockstep with
       docstring line 5 and the verify_deployment pin
   M7  ASCII added lines, zero removals, exactly this release's additions
       (needs the base copy)
@@ -34,9 +34,10 @@ gives realized_roi_source_valid=False exactly as a production load does.
 
 The module under test is scripts/track_performance.py, or the file named by
 TFB_TRACK_UNDER_TEST (golden negative: point it at the untouched base copy,
-git show bf1510ed:scripts/track_performance.py). The base for M4 / M7 is
-TFB_TRACK_BASE, else `git show bf1510ed:scripts/track_performance.py`
-(main after #841, v6.50.0; 08a15bc0 until the 2026-11-01 merge).
+git show 3bbf3c80:scripts/track_performance.py). The base for M4 / M7 is
+TFB_TRACK_BASE, else `git show 3bbf3c80:scripts/track_performance.py`
+(main after #894, v6.53.0; bf1510ed until the 2026-11-02 merge, 08a15bc0
+until the 2026-11-01 merge).
 
 Run: python tests/test_tracker_matured_evidence.py  (prints PASS k/k)
  or: python -m pytest -q tests/test_tracker_matured_evidence.py
@@ -65,7 +66,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 UNDER_TEST = Path(os.environ.get("TFB_TRACK_UNDER_TEST") or ROOT / "scripts" / "track_performance.py")
-BASE_SHA = "bf1510ed"   # main after #841 (v6.50.0); was 08a15bc0
+BASE_SHA = "3bbf3c80"   # main after #894 (v6.53.0); was bf1510ed, before that 08a15bc0
 ENV = "TRACK_MATURED_EVIDENCE_VALID"
 PREFIXES = ("TRACK_", "TFB_TRACK_", "TFB_PERF_")
 UTC = timezone.utc
@@ -306,7 +307,7 @@ def test_m1_enforce_same_run_consumers_and_receipt_use_the_new_outcome():
     assert proof["target_achieved_at_horizon"] is False
     assert got["canonical"] == {"1W": (2, pytest.approx(-6.0))} and got["s1_n"] == 2
     assert rec.realized_roi_source_valid is True
-    line = "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=1"
+    line = "[v6.54.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=1"
     assert logs.count(line) == 1
     order = [m for _, m in logs.records]
     fresh_at = [i for i, m in enumerate(order) if "MATURE-FRESH-ONLY" in m]
@@ -365,18 +366,18 @@ def test_m5_stored_malformed_pending_and_expired_stay_invalid():
     assert stored.status == TP.PerformanceStatus.MATURED and got["summary"][:2] == (0, 1)
     assert pending.status == TP.PerformanceStatus.ACTIVE and pending.realized_roi is None
     assert suspect.status == TP.PerformanceStatus.EXPIRED and suspect.outcome == "CORP_ACTION_SUSPECT"
-    assert "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=0 revalidated=0" in logs
+    assert "[v6.54.0 MATURED-EVIDENCE] mode=enforce matured=0 revalidated=0" in logs
 
 
 def test_m6_workflow_mapping_and_version_pins():
     import yaml
-    assert _version(TP.SCRIPT_VERSION) >= (6, 51, 0), TP.SCRIPT_VERSION
+    assert _version(TP.SCRIPT_VERSION) >= (6, 54, 0), TP.SCRIPT_VERSION
     src = UNDER_TEST.read_text(encoding="utf-8")
     assert src.split("\n")[4].endswith("(v%s)" % TP.SCRIPT_VERSION), src.split("\n")[4]
     verify = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("track_performance", "%s", "track performance")' % TP.SCRIPT_VERSION in verify
     wf_text = (ROOT / ".github" / "workflows" / "track_performance.yml").read_text(encoding="utf-8")
-    assert "# VERSION 1.0.7 (2026-10-26) -- SAME-RUN MATURITIES COUNT (OWNER OPT-IN)" in wf_text
+    assert "# VERSION 1.0.8 (2026-10-26) -- SAME-RUN MATURITIES COUNT (OWNER OPT-IN)" in wf_text
     want = "${{ vars.TRACK_MATURED_EVIDENCE_VALID || 'off' }}"
     for name, step_suffix in (("track_performance.yml", "Run performance clock"),
                               ("daily_sync.yml", "Track Performance (record + audit)")):
@@ -409,7 +410,7 @@ def test_m7_ascii_added_lines_and_zero_removals():
 
     assert names(src) - names(new) == set(), sorted(names(src) - names(new))
     added_names = names(new) - names(src)
-    if TP.SCRIPT_VERSION == "6.51.0":        # exactly this release's additions
+    if TP.SCRIPT_VERSION == "6.54.0":        # exactly this release's additions
         assert added_names == ADDED, sorted(added_names)
     else:                                    # a later release may add more
         assert ADDED <= added_names, sorted(added_names)
@@ -427,7 +428,7 @@ def test_m8_legacy_row_without_target_schema_counts_in_the_same_run():
     assert rec.realized_roi_source_valid is True
     assert got["canonical"] == {} and got["s1_n"] == 0          # legacy rows never reach S-1
     assert "forecast_error_pp" not in receipt(TP, rec)          # no target schema, no target fields
-    assert "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=1 revalidated=1" in logs
+    assert "[v6.54.0 MATURED-EVIDENCE] mode=enforce matured=1 revalidated=1" in logs
     rec, logs, got = run({})
     assert got["summary"][:2] == (0, 1) and rec.realized_roi_source_valid is False, got
 
@@ -448,7 +449,7 @@ def test_m9_ca_guard_adjust_and_ledger_maturities_count_in_the_same_run():
     assert [adj.realized_roi_source_valid, led.realized_roi_source_valid] == [True, True]
     assert pa["forecast_error_pp"] == pytest.approx(-5.0) and pl["forecast_error_pp"] == pytest.approx(-10.0)
     assert got["s1_n"] == 2
-    assert "[v6.51.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=2" in logs
+    assert "[v6.54.0 MATURED-EVIDENCE] mode=enforce matured=2 revalidated=2" in logs
 
 
 CASES = [test_m0_mode_parser_exact_word,

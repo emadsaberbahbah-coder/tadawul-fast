@@ -146,3 +146,13 @@ So every audit's own maturities:
 ## Merge note (2026-11-01)
 
 #841 (track_performance v6.50.0 [LOG-READ]) merged first. This branch was merged onto main `bf1510ed` with a merge commit: the v6.51.0 WHY block sits above #841's v6.50.0 block (kept verbatim), `SCRIPT_VERSION = "6.51.0"`, the verifier pin is 6.51.0 with both dated comments, and the workflow headers read 1.0.7 above 1.0.6. Both Variables (`TRACK_MATURED_EVIDENCE_VALID`, `TRACK_LOG_UNFORMATTED_READ`) are mapped in both tracker steps. The harness base moved from `08a15bc0` to `bf1510ed`, so M7's exact additions set is again `_matured_evidence_mode` only. The golden-negative numbers above were measured against `08a15bc0` before the merge.
+
+## Merge note (2026-11-02)
+
+#894 (track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY], workflow 1.0.7) merged first. This branch was merged onto main `3bbf3c80` with a merge commit and renumbered:
+- `SCRIPT_VERSION` 6.51.0 -> 6.54.0, docstring line 5 and the verifier pin 6.54.0 (6.53.0's dated pin comment kept above this one's).
+- The WHY block sits directly above #894's v6.53.0 block (verbatim), with a MERGE NOTE: read 'v6.51.0' in the log tag as 'v6.54.0' and 'v6.49.0 exactly' as 'v6.53.0 exactly'. The log tag is now `[v6.54.0 MATURED-EVIDENCE]`; read the tag in S2 and S5 above that way.
+- `.github/workflows/track_performance.yml` header 1.0.7 -> 1.0.8 above #894's 1.0.7 (verbatim). The env line follows #894's five mapped lines in the clock step.
+- The harness base moved from `bf1510ed` to `3bbf3c80`, so M4 compares with main's v6.53.0 and M7's exact additions set is again `_matured_evidence_mode` only. `OFF_GOLDEN` is unchanged (99b4de1ea3b1bfb2): the off output of 6.54.0 equals 3bbf3c80's.
+- `tests/test_track_performance_v6530_archive_bar.py` (#894): its exact 6.53.0 pins became floors (W1), and N2's exact additions set applies on 6.53.0 only, as M7 here does.
+- The golden negative against `3bbf3c80` gives the same counts as S4: 9 failed, 1 passed as a script; 9 failed, 9 passed under pytest.

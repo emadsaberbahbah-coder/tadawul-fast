@@ -16,8 +16,16 @@
 -- (stars 5..1); rating_confidence: high when coverage >= 80 % and the row
 -- passes the reliability / data-quality floors, medium at >= 60 %, else
 -- low. A summary of evidence, not advice.
+-- rating_gate (1.4.0) says whether the engine lets the name be acted on at
+-- all: 'blocked by the engine', 'engine: do not invest', 'engine: watch
+-- only', 'below the reliability / data-quality floors', else 'none'. A
+-- rating is a weighing of evidence; the gate is the decision layer's
+-- verdict, and a Positive rating never overrides it, so tfb_rating_display
+-- carries both ('Positive - engine: watch only'). analyst_source and
+-- news_source name where the analyst and news parts came from, so an
+-- uncovered listing reads 'no coverage' instead of looking neutral.
 CREATE OR REPLACE VIEW `{{DS}}.v_symbol_rating`
-OPTIONS (description = "TFB Looker v3: the TFB rating per symbol - six weighted parts (engine, analysts, target, momentum, news, risk), label, stars, confidence")
+OPTIONS (description = "TFB Looker v4: the TFB rating per symbol - six weighted parts (engine, analysts, target, momentum, news, risk), label, stars, confidence, the engine gate and the part sources")
 AS
 WITH nw AS (
   SELECT
@@ -32,8 +40,17 @@ WITH nw AS (
 c AS (
   SELECT
     u.symbol, u.symbol_label, u.name, u.region, u.market_country, u.sector, u.asset_class,
-    u.current_price, u.currency, u.recommendation, u.final_action, u.meets_floors,
+    u.current_price, u.currency, u.recommendation, u.final_action, u.investability_status, u.meets_floors,
     u.reliability, u.data_quality,
+    CASE
+      WHEN an.consensus_score IS NOT NULL THEN CONCAT('EODHD consensus, ', CAST(IFNULL(an.analysts, 0) AS STRING), ' analysts')
+      WHEN u.analyst_rating IS NOT NULL AND u.analyst_rating != '' THEN 'sheet analyst rating'
+      ELSE 'no coverage'
+    END AS analyst_source,
+    CASE
+      WHEN nw.news_30d > 0 THEN CONCAT('EODHD and the news gate, ', CAST(nw.news_30d AS STRING), ' items in 30 days')
+      ELSE 'no coverage'
+    END AS news_source,
     an.consensus_score AS analyst_consensus_score,
     an.consensus_label AS analyst_consensus_label,
     an.analysts,
@@ -93,6 +110,29 @@ SELECT
     WHEN r.coverage_pct >= 60 THEN 'medium'
     ELSE 'low'
   END AS rating_confidence,
+  CASE
+    WHEN UPPER(r.investability_status) = 'BLOCKED' THEN 'blocked by the engine'
+    WHEN UPPER(r.final_action) = 'DO_NOT_INVEST' THEN 'engine: do not invest'
+    WHEN UPPER(r.final_action) = 'WATCH' THEN 'engine: watch only'
+    WHEN NOT IFNULL(r.meets_floors, FALSE) THEN 'below the reliability / data-quality floors'
+    ELSE 'none'
+  END AS rating_gate,
+  CONCAT(
+    CASE
+      WHEN r.tfb_rating_score >= 75 THEN 'Very positive'
+      WHEN r.tfb_rating_score >= 60 THEN 'Positive'
+      WHEN r.tfb_rating_score >= 45 THEN 'Neutral'
+      WHEN r.tfb_rating_score >= 30 THEN 'Negative'
+      WHEN r.tfb_rating_score IS NOT NULL THEN 'Very negative'
+      ELSE 'No rating'
+    END,
+    CASE
+      WHEN UPPER(r.investability_status) = 'BLOCKED' THEN ' - blocked by the engine'
+      WHEN UPPER(r.final_action) = 'DO_NOT_INVEST' THEN ' - engine: do not invest'
+      WHEN UPPER(r.final_action) = 'WATCH' THEN ' - engine: watch only'
+      WHEN NOT IFNULL(r.meets_floors, FALSE) THEN ' - below the floors'
+      ELSE ''
+    END) AS tfb_rating_display,
   ARRAY_TO_STRING(ARRAY(
     SELECT p FROM UNNEST([
       IF(r.part_engine IS NULL, NULL, FORMAT('engine %.0f', r.part_engine)),

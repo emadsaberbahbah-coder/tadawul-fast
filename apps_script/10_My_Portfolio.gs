@@ -1,7 +1,125 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.17
+ * Version: 1.5.18
+ *
+ * v1.5.18 (2026-11-02)  (CASH EVIDENCE ROW + LAST-KNOWN CASH + FOLLOW-UP
+ *                        RETRY: _Cash_Snapshot GETS ONE CERTIFIABLE IBKR
+ *                        ROW PER RIYADH DAY, A STALE RENDER NAMES THE LAST
+ *                        KNOWN CASH, ONE RETRY AFTER A COCKPIT COLLISION --
+ *                        PD_CASH_SNAPSHOT_WRITE and PD_IBKR_FOLLOWUP_RETRY,
+ *                        both default off; ALL v1.5.17 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (workbook review 2 Nov 2026; owner: 'cash can be added automatically
+ * -- you have IBKR access, add it yourself'): three cash numbers disagree.
+ * Top_10's panel 'Cash Available (SAR)' reads 72,747 SAR from _Cash_Snapshot,
+ * whose last row is 27 Oct, typed by the operator (its note still reads
+ * 'Derayah ... Al Rajhi sukuk only'); Portfolio_Decision_v2 reads that
+ * panel; THIS page shows 'PF: Cash Available 0 SAR', KPI Cash 0, Cash % 0
+ * and Deployable 0 whenever the capture is older than 14 minutes at render
+ * time (the 1 Nov archive: 'BLOCKED; RECONCILIATION_REQUIRED:
+ * missing_evidence | [custody-unverified]'); IBKR itself holds 19,399.20 USD
+ * settled (~72,797 SAR). The read-only captures (TFB_IBKR_Capture_*.json:
+ * hourly 10:05-14:05 Sun-Thu, from 2 Nov also 17:35-23:35 Mon-Fri, plus
+ * 08:40 daily) already give this page a certifiable settled-cash figure
+ * several times a day (v1.5.12 pdIbkrPlan_: settled less working-BUY
+ * reservations at the declared 3.75 peg), and nothing writes it down.
+ * _Run_Log of 1 Nov also shows the evidence follow-up rendering five times
+ * (packet age 5-6 min) and skipped once with 'cockpit refresh in progress':
+ * the 11:10 scheduled cockpit refresh collided with the 11:06 capture.
+ * WHAT (two Script Properties; absent = off = every line, request, cell,
+ * row, trigger and property byte-identical to v1.5.17; the writer never
+ * touches _Cash_Snapshot when off):
+ *  (1) PD_CASH_SNAPSHOT_WRITE = off (default) | observe | on. Inside
+ *      pdIbkrApply_ -- the one place a capture becomes a plan, so the
+ *      watcher, the scheduled refresh and a manual refresh all pass here --
+ *      when the plan is valid, fresh under the existing 14-minute rule and
+ *      plan.cashCents is not null, pdCashSnapApply_ appends ONE
+ *      _Cash_Snapshot row per Riyadh day: the first certifiable capture of
+ *      the day; never a second row for the same Riyadh date (Script
+ *      Property PD_CASH_SNAPSHOT_LAST, then a scan of the tail rows' Date,
+ *      any writer); never an overwrite or a delete; append-only below the
+ *      last used row (appendRow). The cells land BY HEADER NAME, the names
+ *      and aliases the export audit certifies (scripts/tfb_export_audit.py,
+ *      cash certification contract v1.1.1; tests/test_cash_snapshot_
+ *      certification.py 'live v1.0.1 header with appended columns'):
+ *      Date (the capture's Riyadh day, a date cell), Time ('HH:mm:ss'
+ *      Riyadh), Balance SAR (= plan.cashCents / 100, the certified cash the
+ *      request carries), Account ('IBKR (<account_alias>)'), Currency,
+ *      Balance Type 'settled_cash', Balance (native settled cash less
+ *      working-BUY reservations -- the figure the SAR cents derive from, so
+ *      Balance SAR = Balance x FX within the audit's one halala), FX to SAR
+ *      (the declared peg, 3.75 for USD), FX As Of (the capture instant,
+ *      '+03:00'); when the header also carries them: As Of / Timestamp, Type
+ *      'SNAPSHOT (IBKR capture)', Amount SAR 0, Delta vs Prev (vs the newest
+ *      numeric Balance SAR), Note ('ibkr-capture:<file>; captured_at <iso>;
+ *      written <date HH:MM> Riyadh, age <Nm>; settled/reserved; FX
+ *      policy://sama-usd-peg-3.75 @ 3.75; writer 10_My_Portfolio v1.5.18'),
+ *      Source Ref / Source / Evidence Ref, FX Source, Writer. A missing tab,
+ *      an empty header, a header without Date / Time / Balance SAR / Account
+ *      / Currency / Balance Type (or without Balance / FX to SAR / FX As Of
+ *      for a non-SAR balance), several cash currencies in one capture, or a
+ *      withheld cash figure -> nothing is written and the reason is in the
+ *      status line (on: also one _Run_Log row, handler pdCashSnapApply_,
+ *      page _Cash_Snapshot, status SKIPPED). observe -> nothing is written;
+ *      the status line carries ' | [cash-snapshot-observe] would append
+ *      (<the cells>)' or ' | [cash-snapshot-observe] would not append:
+ *      <why>' and Logger one line (never amounts). on -> ' | cash snapshot
+ *      appended (...)' with one _Run_Log OK row, ' | cash snapshot NOT
+ *      appended: <why>' or ' | cash snapshot kept: row for <date> exists'.
+ *      The whole writer runs inside its own try/catch: a Sheets failure
+ *      becomes ' | cash snapshot ERROR (...)' (+ one FAILED row) and the
+ *      evidence send, the controls and the packet are untouched.
+ *  (2) Last-known cash, presentation only (same property, observe or on):
+ *      when the capture is NOT fresh at render time, or there is none, the
+ *      status line gains ' | last known cash <N> SAR (as of <date HH:MM>
+ *      Riyadh, <age> old; not applied to funding)' from the newest
+ *      _Cash_Snapshot row with a numeric Balance SAR (any writer; a row
+ *      without a time reads '(no time), at least <age> old'). The controls
+ *      sent to the backend, the funding rule, the 14-minute rule, the
+ *      packet, the all-cash gate and the KPI cells are unchanged: cash that
+ *      is not proven fresh is never sent as fundable.
+ *  (3) PD_IBKR_FOLLOWUP_RETRY = off (default) | on. When
+ *      pdIbkrEvidenceFollowUp skips with 'cockpit refresh in progress',
+ *      pdIbkrRetryAfterSkip_ arms ONE one-off trigger
+ *      pdIbkrEvidenceFollowUpRetry (+3 min; the follow-up's own mechanism)
+ *      only if the packet will still be inside PD_IBKR_FOLLOWUP_MAX_AGE_MS
+ *      when it fires; the retry run clears its trigger, runs the same
+ *      guards and render, logs ' (retry)' in its line and its _Run_Log row
+ *      (handler pdIbkrEvidenceFollowUpRetry) and never re-arms. The skip
+ *      line gains '; retry armed (+3m) (packet Nm old at the retry)' or
+ *      '; retry not armed: <why>'; the _Run_Log details gain 'retry'.
+ *  pdSelfTest reports the writer mode, the last date written here, the
+ *  tab's header verdict, row count and newest row day (never amounts, the
+ *  alias or the file name), a pure 'cash snapshot core' check, the retry
+ *  mode, the retry trigger state and a pure 'retry core' check.
+ * ES5. Functions added: 20 (pdCashSnapMode_, pdCashSnapRiyadh_,
+ * pdCashSnapHeaderMap_, pdCashSnapCents_, pdCashSnapStampMs_, pdCashSnapRead_,
+ * pdCashSnapTailScan_, pdCashSnapRow_, pdCashSnapToken_,
+ * pdCashSnapLastKnownNote_, pdCashSnapApply_, pdCashSnapSheetState_,
+ * pdCashSnapCoreOk_, pdIbkrRetryMode_, pdIbkrRetryCore_, pdIbkrRemoveRetry_,
+ * pdIbkrArmRetry_, pdIbkrRetryAfterSkip_, pdIbkrEvidenceFollowUpRetry,
+ * pdIbkrRetryState_). Changed: pdIbkrApply_ (gated hook + note suffix),
+ * pdIbkrRunLog_ (optional handler / page; defaults unchanged),
+ * pdIbkrEvidenceFollowUp (retry marker, line token, details), pdSelfTest
+ * (three lines). Vars added: 17 (PD_CASH_SNAP_PROP, PD_CASH_SNAP_LAST_PROP,
+ * PD_CASH_SNAP_SHEET, PD_CASH_SNAP_TYPE, PD_CASH_SNAP_BALANCE_TYPE,
+ * PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SCAN_ROWS, PD_CASH_SNAP_MAX_COLS,
+ * PD_CASH_SNAP_RIYADH_MS, PD_CASH_SNAP_DAY_MS, PD_CASH_SNAP_FIELDS,
+ * PD_CASH_SNAP_FOREIGN_KEYS, PD_IBKR_RETRY_PROP, PD_IBKR_RETRY_HANDLER,
+ * PD_IBKR_RETRY_DELAY_MS, PD_IBKR_RETRY_REASON, PD_IBKR_RETRY_RUN_).
+ * Removed: 0.
+ * Harness: tests/test_my_portfolio_v1518_cash_snapshot.js (REAL file in a
+ * vm with service stubs; off compared live with the v1.5.17 base; golden
+ * negative; mutants). Rollback: PD_CASH_SNAPSHOT_WRITE=off and
+ * PD_IBKR_FOLLOWUP_RETRY=off (or delete them) with no re-paste, or re-paste
+ * v1.5.17; rows already appended stay (they are evidence).
+ * LIMIT: no lock is taken around the same-day check (the watcher already
+ * holds the script lock while it renders), so two renders inside the same
+ * second could both append; the audits report a duplicate date as WARN.
+ * The Top_10 panel cell is not written here. ORDER: paste, run pdSelfTest
+ * once, PD_CASH_SNAPSHOT_WRITE=observe for one capture cycle (read the
+ * would-append line), then on; PD_IBKR_FOLLOWUP_RETRY=on.
  *
  * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS INPUTS: Calendar_Events REACHES
  *                        THE PORTFOLIO_DECISION BACKEND GUARD; ALL v1.5.16
@@ -2698,7 +2816,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.17';
+var PD_VERSION = '1.5.18';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3796,7 +3914,16 @@ function pdIbkrApply_(mode, body) {
       res.excluded = split.excluded;
       res.sent = fresh;
     }
+    /* v1.5.18: one certifiable settled-cash row per Riyadh day in
+     * _Cash_Snapshot, or the last-known token on a stale render
+     * (PD_CASH_SNAPSHOT_WRITE); off -> no sheet access and no token. The
+     * controls, the packet and res.sent above are already final. */
+    var snapMode = pdCashSnapMode_();
+    if (snapMode !== 'off') {
+      res.cashSnapNote = pdCashSnapApply_(snapMode, plan, fresh, cap.name, nowMs).note;
+    }
     res.note = pdIbkrNote_(mode, plan, fresh, split.excluded) + (res.publishNote || '');
+    res.note += res.cashSnapNote || '';   /* v1.5.18 */
   } catch (e) {
     res.note = ' | ibkr evidence ERROR (' +
         String(e && e.message ? e.message : e).slice(0, 80) + ')';
@@ -4003,15 +4130,17 @@ function pdIbkrFollowUpCore_(mode, packetAgeMs, hasTop10, s) {
   return {go: true, reason: 'packet age ' + pdIbkrAge_(packetAgeMs)};
 }
 
-/** One _Run_Log row (10-column house format). Never throws. */
-function pdIbkrRunLog_(level, status, message, ms, details) {
+/** One _Run_Log row (10-column house format). Never throws. v1.5.18: the
+ * optional handler / page default to the follow-up's own, so every earlier
+ * caller writes the same row. */
+function pdIbkrRunLog_(level, status, message, ms, details, handler, page) {
   try {
     var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('_Run_Log');
     if (!sh) return false;
     var dj = '{}';
     try { dj = JSON.stringify(details || {}); } catch (eJ) {}
-    sh.appendRow([new Date(), String(level || 'INFO'), PD_IBKR_FOLLOWUP_HANDLER,
-                  'Top_10_Investments', String(status || ''),
+    sh.appendRow([new Date(), String(level || 'INFO'), String(handler || PD_IBKR_FOLLOWUP_HANDLER),
+                  String(page || 'Top_10_Investments'), String(status || ''),
                   String(message || '').slice(0, 400), '', '',
                   ms === null || ms === undefined ? '' : String(ms), dj]);
     return true;
@@ -4047,12 +4176,21 @@ function pdIbkrEvidenceFollowUp() {
   } else {
     outcome = 'skipped: ' + d.reason;
   }
-  var line = '[MP-DEC v' + PD_VERSION + '] evidence follow-up -> ' + outcome +
-      ' (' + d.reason + (removed ? '; trigger cleared' : '') + ')';
+  /* v1.5.18: a retry run is marked; a cockpit collision on a first run may
+   * arm ONE retry (PD_IBKR_FOLLOWUP_RETRY=on). Off, or any other skip, adds
+   * nothing to the line, the row or the details. */
+  var isRetry = PD_IBKR_RETRY_RUN_ !== null;
+  if (isRetry && PD_IBKR_RETRY_RUN_.removed) removed = PD_IBKR_RETRY_RUN_.removed;
+  var retry = d.go ? '' : pdIbkrRetryAfterSkip_(d.reason, age, isRetry);
+  var line = '[MP-DEC v' + PD_VERSION + '] evidence follow-up' + (isRetry ? ' (retry)' : '') +
+      ' -> ' + outcome +
+      ' (' + d.reason + (removed ? '; trigger cleared' : '') + (retry ? '; ' + retry : '') + ')';
   try { Logger.log(line); } catch (eL) {}
+  var details = {version: PD_VERSION, go: d.go};
+  if (retry) details.retry = retry;
   pdIbkrRunLog_(outcome === 'rendered' || !d.go ? 'INFO' : 'ERROR',
                 outcome === 'rendered' ? 'OK' : (d.go ? 'FAILED' : 'SKIPPED'),
-                line, Date.now() - t0, {version: PD_VERSION, go: d.go});
+                line, Date.now() - t0, details, isRetry ? PD_IBKR_RETRY_HANDLER : null);
   return outcome;
 }
 
@@ -4062,6 +4200,561 @@ function pdIbkrFollowUpState_() {
     var all = ScriptApp.getProjectTriggers();
     for (var i = 0; i < all.length; i++) {
       if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) n++;
+    }
+    return n ? n + ' armed' : 'none armed';
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+/* ----- v1.5.18 cash snapshot writer + last-known cash + follow-up retry -- */
+
+var PD_CASH_SNAP_PROP = 'PD_CASH_SNAPSHOT_WRITE';    /* off (default) | observe | on */
+var PD_CASH_SNAP_LAST_PROP = 'PD_CASH_SNAPSHOT_LAST'; /* Riyadh date of the last row written here */
+var PD_CASH_SNAP_SHEET = '_Cash_Snapshot';
+var PD_CASH_SNAP_TYPE = 'SNAPSHOT (IBKR capture)';
+var PD_CASH_SNAP_BALANCE_TYPE = 'settled_cash';
+var PD_CASH_SNAP_HANDLER = 'pdCashSnapApply_';
+var PD_CASH_SNAP_SCAN_ROWS = 400;        /* tail rows read for the same-day check */
+var PD_CASH_SNAP_MAX_COLS = 60;
+var PD_CASH_SNAP_RIYADH_MS = 3 * 3600000;
+var PD_CASH_SNAP_DAY_MS = 86400000;
+/* The header names the export audit certifies (scripts/tfb_export_audit.py,
+ * cash certification contract v1.1.1); the first alias found wins. */
+var PD_CASH_SNAP_FIELDS = [
+  {key: 'date', names: ['Date'], required: true},
+  {key: 'time', names: ['Time'], required: true},
+  {key: 'balance_sar', names: ['Balance SAR'], required: true},
+  {key: 'account', names: ['Account', 'Account ID'], required: true},
+  {key: 'currency', names: ['Currency', 'Ccy'], required: true},
+  {key: 'balance_type', names: ['Balance Type'], required: true},
+  {key: 'balance', names: ['Balance', 'Native Balance'], required: false},
+  {key: 'fx', names: ['FX to SAR'], required: false},
+  {key: 'fx_asof', names: ['FX As Of'], required: false},
+  {key: 'asof', names: ['As Of', 'Timestamp'], required: false},
+  {key: 'type', names: ['Type'], required: false},
+  {key: 'amount_sar', names: ['Amount SAR'], required: false},
+  {key: 'delta', names: ['Delta vs Prev'], required: false},
+  {key: 'note', names: ['Note'], required: false},
+  {key: 'source', names: ['Source Ref', 'Source', 'Evidence Ref'], required: false},
+  {key: 'fx_source', names: ['FX Source'], required: false},
+  {key: 'writer', names: ['Writer'], required: false}
+];
+var PD_CASH_SNAP_FOREIGN_KEYS = ['balance', 'fx', 'fx_asof'];   /* required for a non-SAR balance */
+var PD_IBKR_RETRY_PROP = 'PD_IBKR_FOLLOWUP_RETRY';   /* off (default) | on */
+var PD_IBKR_RETRY_HANDLER = 'pdIbkrEvidenceFollowUpRetry';
+var PD_IBKR_RETRY_DELAY_MS = 180000;
+var PD_IBKR_RETRY_REASON = 'cockpit refresh in progress';
+var PD_IBKR_RETRY_RUN_ = null;   /* set by pdIbkrEvidenceFollowUpRetry for its own execution */
+
+/** v1.5.18: observe | on when the property says so (trimmed, any case);
+ * anything else, absent included, 'off'. Never throws. */
+function pdCashSnapMode_() {
+  var v = pdIbkrProp_(PD_CASH_SNAP_PROP).toLowerCase();
+  return (v === 'observe' || v === 'on') ? v : 'off';
+}
+
+/** PURE: an instant -> its Riyadh calendar parts (UTC+3, no DST). */
+function pdCashSnapRiyadh_(ms) {
+  var iso = new Date(ms + PD_CASH_SNAP_RIYADH_MS).toISOString();
+  var y = +iso.slice(0, 4), mo = +iso.slice(5, 7), d = +iso.slice(8, 10);
+  return {date: iso.slice(0, 10), time: iso.slice(11, 19), hhmm: iso.slice(11, 16),
+          iso: iso.slice(0, 19) + '+03:00',
+          midnightMs: Date.UTC(y, mo - 1, d) - PD_CASH_SNAP_RIYADH_MS};
+}
+
+/** PURE: the header row -> {ok, reason, idx: {key: 0-based column}, width}.
+ * idx is filled for every name found even when a required one is missing,
+ * so a legacy header can still serve the last-known note. */
+function pdCashSnapHeaderMap_(header) {
+  var out = {ok: false, reason: '', idx: {}, width: 0};
+  var names = [];
+  for (var i = 0; i < (header || []).length; i++) {
+    names.push(String(header[i] === null || header[i] === undefined ? '' : header[i])
+        .replace(/^\s+|\s+$/g, ''));
+  }
+  out.width = names.length;
+  if (!names.length || !names.join('')) {
+    out.reason = 'header empty';
+    return out;
+  }
+  var missing = [];
+  for (var f = 0; f < PD_CASH_SNAP_FIELDS.length; f++) {
+    var field = PD_CASH_SNAP_FIELDS[f], at = -1;
+    for (var a = 0; a < field.names.length && at < 0; a++) {
+      for (var c = 0; c < names.length; c++) {
+        if (names[c] === field.names[a]) { at = c; break; }
+      }
+    }
+    if (at >= 0) out.idx[field.key] = at;
+    else if (field.required) missing.push(field.names[0]);
+  }
+  if (missing.length) {
+    out.reason = 'header lacks ' + missing.join(', ');
+    return out;
+  }
+  out.ok = true;
+  return out;
+}
+
+/** PURE: a Balance SAR cell -> integer cents, or null (text with thousands
+ * separators is accepted; anything that is not a plain amount is not). */
+function pdCashSnapCents_(value) {
+  if (typeof value === 'number') return pdIbkrUnits_(value, 2);
+  if (typeof value === 'string') return pdIbkrUnits_(value.replace(/,/g, ''), 2);
+  return null;
+}
+
+/** PURE: a row's Date / Time / As Of cells -> {ms, hasTime}. An As Of value
+ * wins when it parses (a Date keeps its instant; a naive string is Riyadh);
+ * else the Riyadh day of Date plus a Time cell (a Date's wall clock, a day
+ * fraction, or 'HH:mm[:ss]'); a day without a time is its Riyadh midnight
+ * with hasTime false; no day -> ms null. */
+function pdCashSnapStampMs_(dateCell, timeCell, asofCell) {
+  var out = {ms: null, hasTime: false};
+  if (asofCell !== null && asofCell !== undefined && asofCell !== '') {
+    var asMs = pdSrcStampMs_(asofCell);
+    if (asMs !== null) { out.ms = asMs; out.hasTime = true; return out; }
+  }
+  var day = pdPostEarnRiyadhDay_(dateCell);
+  if (day === null) return out;
+  out.ms = day * PD_CASH_SNAP_DAY_MS - PD_CASH_SNAP_RIYADH_MS;
+  var dayMs = null;
+  if (Object.prototype.toString.call(timeCell) === '[object Date]') {
+    if (isFinite(timeCell.getTime())) {
+      dayMs = (timeCell.getTime() + PD_CASH_SNAP_RIYADH_MS) % PD_CASH_SNAP_DAY_MS;
+      if (dayMs < 0) dayMs += PD_CASH_SNAP_DAY_MS;
+    }
+  } else if (typeof timeCell === 'number') {
+    if (isFinite(timeCell) && timeCell >= 0 && timeCell < 1) {
+      dayMs = Math.round(timeCell * PD_CASH_SNAP_DAY_MS);
+    }
+  } else if (typeof timeCell === 'string') {
+    var m = timeCell.replace(/^\s+|\s+$/g, '').match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (m && +m[1] <= 23 && +m[2] <= 59 && (!m[3] || +m[3] <= 59)) {
+      dayMs = ((+m[1]) * 3600 + (+m[2]) * 60 + (m[3] ? +m[3] : 0)) * 1000;
+    }
+  }
+  if (dayMs !== null) { out.ms += dayMs; out.hasTime = true; }
+  return out;
+}
+
+/** Bounded read of the tab: the header row (<= 60 columns) and the last
+ * <= 400 data rows. {header, map, rows, lastRow, firstRow}. */
+function pdCashSnapRead_(sh) {
+  var out = {header: [], map: null, rows: [], lastRow: 0, firstRow: 0};
+  var lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (!(lastRow >= 1 && lastCol >= 1)) {
+    out.map = pdCashSnapHeaderMap_([]);
+    return out;
+  }
+  var width = Math.min(lastCol, PD_CASH_SNAP_MAX_COLS);
+  out.header = sh.getRange(1, 1, 1, width).getValues()[0];
+  out.map = pdCashSnapHeaderMap_(out.header);
+  out.lastRow = lastRow;
+  if (lastRow >= 2) {
+    var from = Math.max(2, lastRow - PD_CASH_SNAP_SCAN_ROWS + 1);
+    out.firstRow = from;
+    out.rows = sh.getRange(from, 1, lastRow - from + 1, width).getValues();
+  }
+  return out;
+}
+
+/** PURE: the tail rows -> {exists: a row carries the Riyadh day dayInt (any
+ * writer), prev: the newest numeric Balance SAR, newest: {balanceCents,
+ * stampMs, hasTime}} -- the newest row is the last one with a numeric
+ * Balance SAR, the row the export audit certifies. */
+function pdCashSnapTailScan_(read, dayInt) {
+  var out = {exists: false, prev: null, newest: null};
+  var idx = read && read.map ? read.map.idx : {};
+  var rows = read && read.rows ? read.rows : [];
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var row = rows[r] || [];
+    var dcell = idx.hasOwnProperty('date') ? row[idx.date] : null;
+    if (dayInt !== null && !out.exists && pdPostEarnRiyadhDay_(dcell) === dayInt) {
+      out.exists = true;
+    }
+    if (!out.newest && idx.hasOwnProperty('balance_sar')) {
+      var cents = pdCashSnapCents_(row[idx.balance_sar]);
+      if (cents !== null) {
+        var st = pdCashSnapStampMs_(dcell,
+            idx.hasOwnProperty('time') ? row[idx.time] : null,
+            idx.hasOwnProperty('asof') ? row[idx.asof] : null);
+        out.newest = {balanceCents: cents, stampMs: st.ms, hasTime: st.hasTime};
+        out.prev = cents / 100;
+      }
+    }
+    if (out.newest && (dayInt === null || out.exists)) break;
+  }
+  return out;
+}
+
+/** PURE: the _Cash_Snapshot row for a certifiable plan -> {ok, reason, row,
+ * date, cells}. One cash currency only. Balance SAR is the plan's certified
+ * cents (the figure the request carries); Balance is the native settled
+ * cash less working-BUY reservations, the figure those cents are derived
+ * from, so Balance SAR = Balance x FX within the audit's one halala. */
+function pdCashSnapRow_(map, plan, capName, nowMs, prevBalance) {
+  var out = {ok: false, reason: '', row: null, date: '', cells: null};
+  if (!(map && map.ok)) { out.reason = map ? map.reason : 'header unknown'; return out; }
+  if (!(plan && plan.ok === true && plan.packet)) { out.reason = 'no valid plan'; return out; }
+  if (plan.cashCents === null || plan.cashCents === undefined) {
+    out.reason = 'cash withheld (' + (plan.cashNote || 'not certifiable') + ')';
+    return out;
+  }
+  var acct = plan.packet.accounts && plan.packet.accounts[0];
+  var cashRows = (acct && acct.cash) ? acct.cash : [];
+  if (cashRows.length !== 1) {
+    var ccys = [];
+    for (var i = 0; i < cashRows.length; i++) ccys.push(cashRows[i].currency);
+    out.reason = 'several cash currencies (' + ccys.join(',') + '); one-currency rows only';
+    return out;
+  }
+  var ccy = pdIbkrSym_(cashRows[0].currency);
+  var settled = pdIbkrUnits_(cashRows[0].settled_cash, 6);
+  var reserved = pdIbkrUnits_(cashRows[0].reserved_cash, 6);
+  if (settled === null || reserved === null || !PD_IBKR_RATE_X100.hasOwnProperty(ccy)) {
+    out.reason = 'native cash unreadable';
+    return out;
+  }
+  if (ccy !== 'SAR') {
+    var lacks = [];
+    for (var k = 0; k < PD_CASH_SNAP_FOREIGN_KEYS.length; k++) {
+      var key = PD_CASH_SNAP_FOREIGN_KEYS[k];
+      if (!map.idx.hasOwnProperty(key)) {
+        for (var f = 0; f < PD_CASH_SNAP_FIELDS.length; f++) {
+          if (PD_CASH_SNAP_FIELDS[f].key === key) lacks.push(PD_CASH_SNAP_FIELDS[f].names[0]);
+        }
+      }
+    }
+    if (lacks.length) { out.reason = 'header lacks ' + lacks.join(', '); return out; }
+  }
+  var native = Number(pdIbkrUnitsText_(settled - reserved, 6));
+  var rate = PD_IBKR_RATE_X100[ccy] / 100;
+  var cap = pdCashSnapRiyadh_(plan.capturedMs);
+  var now = pdCashSnapRiyadh_(nowMs);
+  var balance = plan.cashCents / 100;
+  var ref = 'ibkr-capture:' + String(capName || '');
+  var writer = '10_My_Portfolio v' + PD_VERSION;
+  var cells = {
+    date: new Date(cap.midnightMs),
+    time: cap.time,
+    asof: cap.iso,
+    type: PD_CASH_SNAP_TYPE,
+    amount_sar: 0,
+    balance_sar: balance,
+    delta: (typeof prevBalance === 'number' && isFinite(prevBalance))
+        ? Math.round((balance - prevBalance) * 100) / 100 : '',
+    note: ref + '; captured_at ' + String(plan.packet.captured_at || '') +
+        '; written ' + now.date + ' ' + now.hhmm + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) +
+        '; settled ' + pdIbkrUnitsText_(settled, 6) + ' ' + ccy +
+        ', reserved ' + pdIbkrUnitsText_(reserved, 6) + ' ' + ccy +
+        '; FX ' + PD_IBKR_FX_SOURCE + ' @ ' + rate + '; writer ' + writer,
+    account: 'IBKR (' + String(acct.account_id || '') + ')',
+    currency: ccy,
+    balance_type: PD_CASH_SNAP_BALANCE_TYPE,
+    balance: native,
+    fx: rate,
+    fx_asof: cap.iso,
+    source: ref,
+    fx_source: PD_IBKR_FX_SOURCE,
+    writer: writer
+  };
+  var row = [];
+  for (var c = 0; c < map.width; c++) row.push('');
+  for (var name in cells) {
+    if (cells.hasOwnProperty(name) && map.idx.hasOwnProperty(name)) row[map.idx[name]] = cells[name];
+  }
+  out.ok = true;
+  out.row = row;
+  out.date = cap.date;
+  out.cells = cells;
+  return out;
+}
+
+/** PURE: the status-line token (never the receipt phrase; bounded). */
+function pdCashSnapToken_(mode, ok, text) {
+  var token;
+  if (mode === 'observe') {
+    token = ok ? ' | [cash-snapshot-observe] would append (' + text + ')'
+               : ' | [cash-snapshot-observe] would not append: ' + text;
+  } else {
+    token = ok ? ' | cash snapshot appended (' + text + ')' : ' | cash snapshot ' + text;
+  }
+  return token.replace(/source\s+readiness/gi, 'source check').slice(0, 400);
+}
+
+/** The newest _Cash_Snapshot row (any writer) as a presentation-only token
+ * for a render whose capture is not fresh. Never throws. */
+function pdCashSnapLastKnownNote_(nowMs) {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    if (!sh) return ' | last known cash unavailable (' + PD_CASH_SNAP_SHEET + ' missing)';
+    var scan = pdCashSnapTailScan_(pdCashSnapRead_(sh), null);
+    if (!scan.newest) return ' | last known cash unavailable (no Balance SAR row)';
+    var n = scan.newest, when;
+    if (n.stampMs === null) {
+      when = 'date unknown';
+    } else {
+      var rp = pdCashSnapRiyadh_(n.stampMs);
+      if (n.hasTime) {
+        when = 'as of ' + rp.date + ' ' + rp.hhmm + ' Riyadh, ' + pdIbkrAge_(nowMs - n.stampMs) + ' old';
+      } else {
+        var endMs = n.stampMs + PD_CASH_SNAP_DAY_MS;
+        when = 'as of ' + rp.date + ' (no time), ' +
+            (nowMs >= endMs ? 'at least ' + pdIbkrAge_(nowMs - endMs) + ' old' : 'today');
+      }
+    }
+    return (' | last known cash ' + pdIbkrCentsText_(n.balanceCents) + ' SAR (' + when +
+            '; not applied to funding)').replace(/source\s+readiness/gi, 'source check');
+  } catch (e) {
+    return ' | last known cash unavailable (' +
+        String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** v1.5.18: the gated writer. mode is observe | on; plan / fresh / capName
+ * come from pdIbkrApply_. Not fresh -> the last-known token only. Fresh and
+ * certifiable -> one row per Riyadh day, append-only, by header name;
+ * observe -> the would-append line instead. Never throws; the funding path
+ * never sees this result. Returns {note, written, reason, date}. */
+function pdCashSnapApply_(mode, plan, fresh, capName, nowMs) {
+  var out = {note: '', written: false, reason: '', date: ''};
+  try {
+    if (!fresh) {
+      out.note = pdCashSnapLastKnownNote_(nowMs);
+      return out;
+    }
+    if (!(plan && plan.ok === true)) { out.reason = 'no valid plan'; }
+    else if (plan.cashCents === null || plan.cashCents === undefined) {
+      out.reason = 'cash withheld (' + (plan.cashNote || 'not certifiable') + ')';
+    }
+    if (out.reason) {
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'NOT appended: ' + out.reason : out.reason);
+      if (mode === 'on') {
+        pdIbkrRunLog_('INFO', 'SKIPPED', '[MP-DEC v' + PD_VERSION + '] cash snapshot not appended: ' +
+            out.reason, null, {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+      }
+      return out;
+    }
+    var day = pdCashSnapRiyadh_(plan.capturedMs).date;
+    out.date = day;
+    if (pdIbkrProp_(PD_CASH_SNAP_LAST_PROP) === day) {
+      out.reason = 'row for ' + day + ' exists';
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'kept: ' + out.reason : out.reason);
+      return out;
+    }
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    var built = null;
+    if (!sh) {
+      out.reason = PD_CASH_SNAP_SHEET + ' missing';
+    } else {
+      var read = pdCashSnapRead_(sh);
+      if (!read.map.ok) {
+        out.reason = read.map.reason;
+      } else {
+        var scan = pdCashSnapTailScan_(read, pdPostEarnRiyadhDay_(day));
+        if (scan.exists) {
+          out.reason = 'row for ' + day + ' exists';
+          out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'kept: ' + out.reason : out.reason);
+          return out;
+        }
+        built = pdCashSnapRow_(read.map, plan, capName, nowMs, scan.prev);
+        if (!built.ok) out.reason = built.reason;
+      }
+    }
+    if (out.reason) {
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'NOT appended: ' + out.reason : out.reason);
+      try {
+        Logger.log('[MP-DEC v' + PD_VERSION + '] cash snapshot (' + mode + ') not written: ' + out.reason);
+      } catch (eL1) {}
+      if (mode === 'on') {
+        pdIbkrRunLog_('INFO', 'SKIPPED', '[MP-DEC v' + PD_VERSION + '] cash snapshot not appended: ' +
+            out.reason, null, {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+      }
+      return out;
+    }
+    var cells = built.cells;
+    var sar = pdIbkrCentsText_(plan.cashCents);
+    if (mode === 'observe') {
+      out.note = pdCashSnapToken_(mode, true, day + ' ' + cells.time + ' Riyadh; ' + cells.account +
+          '; ' + cells.currency + ' ' + cells.balance + ' ' + cells.balance_type + '; ' + sar +
+          ' SAR; FX ' + cells.fx + ' ' + cells.fx_source + '; delta ' +
+          (cells.delta === '' ? 'n/a' : cells.delta) + '; ' + cells.source);
+      try {
+        Logger.log('[MP-DEC v' + PD_VERSION + '] cash snapshot (observe) would append a row for ' +
+                   day + ' (capture ' + cells.time + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) + ')');
+      } catch (eL2) {}
+      return out;
+    }
+    var props = PropertiesService.getScriptProperties();
+    props.setProperty(PD_CASH_SNAP_LAST_PROP, day);
+    try {
+      sh.appendRow(built.row);
+    } catch (eW) {
+      try { props.deleteProperty(PD_CASH_SNAP_LAST_PROP); } catch (eD) {}
+      throw eW;
+    }
+    out.written = true;
+    out.note = pdCashSnapToken_(mode, true, day + ' ' + cells.time.slice(0, 5) + ' Riyadh; ' + sar +
+        ' SAR; ' + cells.currency + ' ' + cells.balance + ' ' + cells.balance_type +
+        '; FX ' + cells.fx);
+    var line = '[MP-DEC v' + PD_VERSION + '] cash snapshot appended for ' + day + ' (capture ' +
+        cells.time.slice(0, 5) + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) + ')';
+    try { Logger.log(line); } catch (eL3) {}
+    pdIbkrRunLog_('INFO', 'OK', line, null, {version: PD_VERSION, mode: mode, date: day,
+                  age_ms: plan.ageMs}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+  } catch (e) {
+    out.note = ' | cash snapshot ERROR (' +
+        String(e && e.message ? e.message : e).slice(0, 80) + ')';
+    try {
+      pdIbkrRunLog_('ERROR', 'FAILED', '[MP-DEC v' + PD_VERSION + '] cash snapshot write failed: ' +
+          String(e && e.message ? e.message : e).slice(0, 120), null,
+          {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+    } catch (eR) {}
+  }
+  return out;
+}
+
+/** Self-test: the tab's header verdict and newest row day (never amounts). */
+function pdCashSnapSheetState_() {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    if (!sh) return PD_CASH_SNAP_SHEET + ': missing';
+    var read = pdCashSnapRead_(sh);
+    var scan = pdCashSnapTailScan_(read, null);
+    var newest = 'none';
+    if (scan.newest) {
+      newest = scan.newest.stampMs === null ? 'date unknown'
+          : pdCashSnapRiyadh_(scan.newest.stampMs).date + (scan.newest.hasTime ? '' : ' (no time)');
+    }
+    return PD_CASH_SNAP_SHEET + ': ' + (read.map.ok ? 'header ok (' + read.map.width + ' columns)'
+                                                    : read.map.reason) +
+        '; rows ' + Math.max(0, read.lastRow - 1) + '; newest row ' + newest;
+  } catch (e) {
+    return PD_CASH_SNAP_SHEET + ': unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE self-check of the writer's core on synthetic values. */
+function pdCashSnapCoreOk_() {
+  try {
+    var full = pdCashSnapHeaderMap_(['Date', 'Time', 'Type', 'Amount SAR', 'Balance SAR',
+        'Delta vs Prev', 'Note', 'Account', 'Currency', 'Balance Type', 'Balance', 'FX to SAR',
+        'FX As Of']);
+    var legacy = pdCashSnapHeaderMap_(['Date', 'Time', 'Type', 'Amount SAR', 'Balance SAR',
+        'Delta vs Prev', 'Note']);
+    if (!full.ok || full.width !== 13 || legacy.ok ||
+        legacy.reason !== 'header lacks Account, Currency, Balance Type') return false;
+    if (pdCashSnapHeaderMap_([]).reason !== 'header empty') return false;
+    var capMs = Date.UTC(2026, 10, 2, 7, 6, 12);
+    var plan = {ok: true, cashCents: 7274700, cashNote: '', capturedMs: capMs, ageMs: 300000,
+                packet: {captured_at: '2026-11-02T07:06:12.000Z', accounts: [{account_id: 'alias',
+                         cash: [{currency: 'USD', settled_cash: '19399.2', reserved_cash: '0'}]}]}};
+    var r = pdCashSnapRow_(full, plan, 'TFB_IBKR_Capture_selftest.json', capMs + 300000, 72000);
+    if (!r.ok || r.date !== '2026-11-02' || r.row.length !== 13) return false;
+    var c = r.cells;
+    if (c.time !== '10:06:12' || c.asof !== '2026-11-02T10:06:12+03:00' ||
+        c.balance_sar !== 72747 || c.balance !== 19399.2 || c.fx !== 3.75 ||
+        c.currency !== 'USD' || c.balance_type !== 'settled_cash' || c.type !== PD_CASH_SNAP_TYPE ||
+        c.account !== 'IBKR (alias)' || c.delta !== 747 || c.fx_asof !== c.asof ||
+        Math.abs(c.balance * c.fx - c.balance_sar) > 0.01 ||
+        r.row[4] !== 72747 || r.row[7] !== 'IBKR (alias)' || r.row[9] !== 'settled_cash') return false;
+    if (pdCashSnapRow_(full, {ok: true, cashCents: null, cashNote: 'x', packet: {}}, 'f', 0, null)
+        .reason !== 'cash withheld (x)') return false;
+    if (pdCashSnapRow_(legacy, plan, 'f', 0, null).ok) return false;
+    var tail = {map: full, rows: [
+      [new Date(capMs - 2 * PD_CASH_SNAP_DAY_MS), '', 'SNAPSHOT', '', 72000, '', 'n'],
+      [new Date(capMs), '10:06:12', 'SNAPSHOT', '', 72747, '', 'n']]};
+    var scan = pdCashSnapTailScan_(tail, pdPostEarnRiyadhDay_('2026-11-02'));
+    if (!scan.exists || scan.prev !== 72747 || !scan.newest.hasTime) return false;
+    var other = pdCashSnapTailScan_(tail, pdPostEarnRiyadhDay_('2026-11-03'));
+    if (other.exists) return false;
+    var st = pdCashSnapStampMs_(new Date(capMs), null, null);
+    if (st.hasTime || st.ms !== Date.UTC(2026, 10, 1, 21, 0, 0)) return false;
+    return pdCashSnapMode_() === 'off' || pdCashSnapMode_() === 'observe' || pdCashSnapMode_() === 'on';
+  } catch (e) {
+    return false;
+  }
+}
+
+/** v1.5.18: 'on' only when PD_IBKR_FOLLOWUP_RETRY says so. */
+function pdIbkrRetryMode_() {
+  return pdIbkrProp_(PD_IBKR_RETRY_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** PURE: arm ONE retry? Only on the first run, only after a cockpit
+ * collision, only when the packet is still inside its window when the
+ * retry fires. The retry run never re-arms. */
+function pdIbkrRetryCore_(mode, reason, packetAgeMs, isRetry) {
+  if (mode !== 'on') return {arm: false, reason: 'retry off'};
+  if (isRetry) return {arm: false, reason: 'a retry never re-arms'};
+  if (reason !== PD_IBKR_RETRY_REASON) return {arm: false, reason: 'not a cockpit collision'};
+  if (typeof packetAgeMs !== 'number' || !isFinite(packetAgeMs) || packetAgeMs < 0) {
+    return {arm: false, reason: 'packet age unknown'};
+  }
+  var then = packetAgeMs + PD_IBKR_RETRY_DELAY_MS;
+  if (then > PD_IBKR_FOLLOWUP_MAX_AGE_MS) {
+    return {arm: false, reason: 'packet would be ' + pdIbkrAge_(then) + ' old at the retry (limit 14m)'};
+  }
+  return {arm: true, reason: 'packet ' + pdIbkrAge_(then) + ' old at the retry'};
+}
+
+function pdIbkrRemoveRetry_() {
+  var n = 0;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_RETRY_HANDLER) {
+        ScriptApp.deleteTrigger(all[i]);
+        n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+/** One-off trigger: the retry fires 3 minutes later. Never throws. */
+function pdIbkrArmRetry_() {
+  try {
+    pdIbkrRemoveRetry_();
+    ScriptApp.newTrigger(PD_IBKR_RETRY_HANDLER).timeBased()
+        .after(PD_IBKR_RETRY_DELAY_MS).create();
+    return 'retry armed (+3m)';
+  } catch (e) {
+    return 'retry not armed (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** After a skipped follow-up: the line token ('' when the gate is off or
+ * the skip is not a cockpit collision on a first run). */
+function pdIbkrRetryAfterSkip_(reason, packetAgeMs, isRetry) {
+  if (!isRetry && reason !== PD_IBKR_RETRY_REASON) return '';
+  var mode = pdIbkrRetryMode_();
+  if (mode !== 'on') return '';
+  var rc = pdIbkrRetryCore_(mode, reason, packetAgeMs, isRetry);
+  return rc.arm ? pdIbkrArmRetry_() + ' (' + rc.reason + ')' : 'retry not armed: ' + rc.reason;
+}
+
+/** Time-driven once (pdIbkrArmRetry_): the one retry of the follow-up.
+ * Clears its own trigger, marks the execution, runs the same guards and
+ * render as pdIbkrEvidenceFollowUp, never re-arms. */
+function pdIbkrEvidenceFollowUpRetry() {
+  var removed = pdIbkrRemoveRetry_();
+  PD_IBKR_RETRY_RUN_ = {removed: removed};
+  try {
+    return pdIbkrEvidenceFollowUp();
+  } finally {
+    PD_IBKR_RETRY_RUN_ = null;
+  }
+}
+
+function pdIbkrRetryState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_RETRY_HANDLER) n++;
     }
     return n ? n + ' armed' : 'none armed';
   } catch (e) {
@@ -5097,6 +5790,21 @@ function pdSelfTest() {
       pdIbkrFollowUpCore_('on', null, true, null).go === false &&
       pdIbkrFollowUpCore_('on', 1000, false, null).go === false;
   report.push('follow-up core: ' + (fuOk ? 'ok' : 'FAIL'));
+  /* v1.5.18: cash snapshot writer, last-known cash and the follow-up retry
+   * (read-only; never amounts, the alias or the capture file name). */
+  report.push('cash snapshot writer (PD_CASH_SNAPSHOT_WRITE): ' + pdCashSnapMode_() +
+      '; last written here: ' + (pdIbkrProp_(PD_CASH_SNAP_LAST_PROP) || 'none') +
+      '; ' + pdCashSnapSheetState_());
+  report.push('cash snapshot core: ' + (pdCashSnapCoreOk_() ? 'ok' : 'FAIL'));
+  var rtOk = pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, false).arm === true &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660000, false).arm === true &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660001, false).arm === false &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, true).arm === false &&
+      pdIbkrRetryCore_('on', 'quiet window', 300000, false).arm === false &&
+      pdIbkrRetryCore_('off', PD_IBKR_RETRY_REASON, 300000, false).arm === false &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, null, false).arm === false;
+  report.push('follow-up retry (PD_IBKR_FOLLOWUP_RETRY): ' + pdIbkrRetryMode_() +
+      '; retry trigger: ' + pdIbkrRetryState_() + '; retry core: ' + (rtOk ? 'ok' : 'FAIL'));
   /* v1.5.17 [D1b]: the post-earnings inputs the next run would send. */
   var peNow = pdPostEarnBody_(ss, pool.rows);
   var peList = [];

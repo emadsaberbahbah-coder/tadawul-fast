@@ -554,7 +554,7 @@ def test_real_offline_calendars_dst_holiday_early_close_and_saudi_weekend(monkey
     assert evidence is not None and not reason
 
 
-# --- v6.51.0 [MATURED-EVIDENCE] guards (full harness:
+# --- v6.54.0 [MATURED-EVIDENCE] guards (full harness:
 # tests/test_tracker_matured_evidence.py). A row loaded with a blank
 # 'Realized ROI %' cell matures in this audit pass; only enforce lets the
 # same run count it and write the receipt's target fields.
