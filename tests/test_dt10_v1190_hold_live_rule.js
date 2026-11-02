@@ -70,6 +70,10 @@ try {
   console.log('FAIL 0/1');
   process.exit(1);
 }
+// 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked on this change; pins
+// moved. Behaviour runs on the delivered file; the v1.19.0 lint / inventory (T7) compares the
+// v1.19.0 file rebuilt from it (v1.20.0 edits reversed, SHA-256 pinned) with the base.
+const s1190 = /^var DT10_VERSION = '1\.19\.0';$/m.test(newSource) ? newSource : history.v1190Source(newSource);
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const NOW = Date.parse(FIX.frozen_now);            // 2026-10-10T19:28:22Z
@@ -564,7 +568,7 @@ function seatRow(run, sym) { for (const r of run.seats) if (r[1] === sym) return
 const stripToken = s => String(s).replace(/, qhold: (?:would hold|held) \d+(?: [A-Z0-9.]+)*/, '');
 /* The version string reaches the meta footer, the B2 status line, the Logger lines and the
  * run-marker property; comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.19\.0/g, 'v1.18.0'));
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19|20)\.0/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too
 
 /* ============================================================ battery */
 function battery() {
@@ -576,9 +580,10 @@ function battery() {
   test('T0 base oracle is the reviewed v1.18.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1180_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.18.0', 'base version');
-    eq(N.DT10_VERSION, '1.19.0', 'delivered version');
-    ok(/^ \* Version: 1\.19\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    ok(newSource.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.20.0', 'delivered version');   // 2026-11-02: v1.20.0 pins moved
+    ok(/^ \* Version: 1\.20\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
+    ok(newSource.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'DT10_VERSION literal');
+    ok(/^ \* Version: 1\.19\.0 /.test(s1190.split('\n')[3]) && s1190.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'rebuilt v1.19.0 lockstep');
     eq(N.DT10_QUALIFIED_HOLD_PROP, HOLD); eq(N.DT10_SEAT_LIVE_FILL_PROP, LIVE); eq(N.DT10_OWNER_RULE_PROP, RULE);
     eq(N.DT10_OWNER_RULE_ROI_MAX, 34, 'the owner rule threshold is a display constant');
     deq(N.DT10_OWNER_RULE_HEADERS, ['Owner Rule']);
@@ -650,7 +655,8 @@ function battery() {
       deq(nv(n.logs), baseRefresh.logs, 'Logger lines ' + label);
       deq(n.posted, baseRefresh.posted, 'POST bodies (research + replay) ' + label);
       deq(n.saved, baseRefresh.saved, 'saved state blob ' + label);
-      eq(n.propReads.total, baseRefresh.propReads.total + 3, 'exactly three property reads added ' + label);
+      // 2026-11-02: v1.20.0 adds four more reads (its three gates and the KPI label marker), each once
+      eq(n.propReads.total, baseRefresh.propReads.total + 3 + 4, 'exactly three (+ four v1.20.0) property reads added ' + label);
       deq([n.propReads.byKey[HOLD], n.propReads.byKey[LIVE], n.propReads.byKey[RULE]], [1, 1, 1], 'each read once ' + label);
     }
     ok(/\| output: EXECUTABLE \|/.test(baseRefresh.status) && /funding=final\/1exec/.test(baseRefresh.status), 'fixture: the base funds A only: ' + baseRefresh.status);
@@ -856,7 +862,7 @@ function battery() {
 
   test('T6 embedded dt10SelfTest: the three new core lines ok, property lines follow the properties, every base line kept, zero FAIL; the base lacks the lines', () => {
     const rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
-    ok(rep.indexOf('[DT10 v1.19.0] self-test') === 0, 'version line');
+    ok(rep.indexOf('[DT10 v1.20.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
     for (const l of ['qualified hold (DT10_QUALIFIED_HOLD): off (off = v1.18.0 board; observe lists; enforce holds)', 'qualified hold core: ok',
       'seat live fill (DT10_SEAT_LIVE_FILL): off (off = v1.18.0 render)', 'seat live fill core: ok',
       'owner rule mark (DT10_OWNER_RULE_MARK): off (High + Engine ROI 12M < 34; display only)', 'owner rule core: ok']) {
@@ -866,7 +872,7 @@ function battery() {
     const baseLines = repB.split('\n'), newLines = rep.split('\n');
     const missing = baseLines.filter(l => l.indexOf('[DT10 v1.18.0]') !== 0 && newLines.indexOf(l) < 0);
     deq(missing, [], 'every base self-test line present');
-    eq(newLines.length, baseLines.length + 6, 'exactly six lines added');
+    eq(newLines.length, baseLines.length + 6 + 3, 'exactly six lines added (+ the three v1.20.0 gate lines)');
     const armed = String(loadMini(newSource, { [HOLD]: ' Enforce ', [LIVE]: 'ON', [RULE]: 'on' }).dt10SelfTest());
     ok(armed.indexOf('qualified hold (DT10_QUALIFIED_HOLD): enforce') > 0 && armed.indexOf('seat live fill (DT10_SEAT_LIVE_FILL): on') > 0 &&
        armed.indexOf('owner rule mark (DT10_OWNER_RULE_MARK): on') > 0 && armed.indexOf('FAIL') < 0, 'armed property lines');
@@ -876,7 +882,7 @@ function battery() {
   });
 
   test('T7 ES5 / ASCII lint of the diff; inventory: 9 functions and 5 vars added, 0 removed; 22 hunks whose reversal is the reviewed v1.18.0 file', () => {
-    const baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
+    const baseLines = {}, bl = baseSource.split('\n'), nl = s1190.split('\n');   // 2026-11-02: the rebuilt v1.19.0
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);
     ok(added.length >= 400 && added.length <= 600, 'added lines ' + added.length);
@@ -886,20 +892,20 @@ function battery() {
       if (!/^[\x09\x20-\x7e]*$/.test(l)) ok(baseLines[l.replace('1.19.0', '1.18.0')] === true, 'non-ASCII added line: ' + l);
     }
     function nonAscii(s) { const m = {}; for (let j = 0; j < s.length; j++) { const c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
-    deq(nonAscii(newSource), nonAscii(baseSource), 'non-ASCII code point multiset unchanged');
+    deq(nonAscii(s1190), nonAscii(baseSource), 'non-ASCII code point multiset unchanged'); deq(nonAscii(newSource), nonAscii(baseSource), 'delivered too');
     ok(newSource.indexOf('\r') < 0, 'LF only');
     const why = newSource.slice(newSource.indexOf(' * v1.19.0 (2026-11-01)'), newSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'));
     ok(why.length > 3000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block present (newest first) and ASCII');
     ok(newSource.indexOf(baseSource.slice(baseSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), baseSource.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'))) > 0, 'the v1.18.0 WHY block verbatim');
     for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) ok(newSource.indexOf(l) > 0, 'WHY header lost: ' + l);
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
-    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(newSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
+    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(s1190, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'functions removed (any level)');
-    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(newSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(s1190, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     deq(Object.keys(tn).filter(k => !tb[k]).sort(), ['dt10OwnerRuleCell_', 'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleNote_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFillOn_',
       'dt10SeatLiveFill_', 'dt10SeatLiveIndex_', 'dt10StabQualifiedHoldMode_', 'dt10StabQualifiedHoldSeat_'], 'top-level functions added');
     eq(Object.keys(tb).length, 224, 'base census'); eq(Object.keys(tn).length, 233, 'new census');
-    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
+    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(s1190, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DT10_OWNER_RULE_HEADERS', 'DT10_OWNER_RULE_PROP', 'DT10_OWNER_RULE_ROI_MAX', 'DT10_QUALIFIED_HOLD_PROP', 'DT10_SEAT_LIVE_FILL_PROP'], 'vars added');
     eq(Object.keys(vb).length, 121); eq(Object.keys(vn).length, 126);
