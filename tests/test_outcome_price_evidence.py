@@ -321,7 +321,7 @@ def test_actual_backend_failed_http_remains_pending_after_grace():
     assert receipt(rec)["reason"] == "quote_transport_failed"
 
 
-# --- v6.52.0 [OUTCOME-TALLY] guards (full harness:
+# --- v6.55.0 [OUTCOME-TALLY] guards (full harness:
 # tests/test_tracker_outcome_tally.py). observe logs one line per audit with
 # why due records did not mature, per calendar; off logs nothing new.
 def _tally_audit(mode, monkeypatch):
@@ -359,10 +359,10 @@ def test_outcome_tally_observe_names_the_saudi_refusal(monkeypatch):
     recs, lines = _tally_audit("observe", monkeypatch)
     assert recs[1].status == tp.PerformanceStatus.MATURED and recs[0].status == tp.PerformanceStatus.ACTIVE
     # two 2286.SR records, one symbol: n counts records, after_close_min symbols
-    assert lines == ["[v6.52.0 OUTCOME-TALLY] mode=observe evaluated=3 matured=1 expired=0 pending=2 calendars=2",
-                     "[v6.52.0 OUTCOME-TALLY] XSAU n=2 matured=0 expired=0 pending=2 "
+    assert lines == ["[v6.55.0 OUTCOME-TALLY] mode=observe evaluated=3 matured=1 expired=0 pending=2 calendars=2",
+                     "[v6.55.0 OUTCOME-TALLY] XSAU n=2 matured=0 expired=0 pending=2 "
                      "reasons=quote_session_unknown:2 after_close_min=0-15:1",
-                     "[v6.52.0 OUTCOME-TALLY] XNYS n=1 matured=1 expired=0 pending=0 reasons=- after_close_min=-"], lines
+                     "[v6.55.0 OUTCOME-TALLY] XNYS n=1 matured=1 expired=0 pending=0 reasons=- after_close_min=-"], lines
     assert tp._OUTCOME_TALLY is None
 
 

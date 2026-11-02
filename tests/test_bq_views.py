@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.3.1 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.5.0 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
-pages; 2d: candles, analysts, news and the TFB rating per symbol). Offline:
-the BigQuery session is a fake, no google library is imported.
+pages; 2d: candles, analysts, news and the TFB rating per symbol; 2e: the
+learning loop from the archive). Offline: the BigQuery session is a fake, no
+google library is imported.
 
-  V1  the 36 objects load in apply order (6 functions, then the views and
+  V1  the 41 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
@@ -15,10 +16,11 @@ the BigQuery session is a fake, no google library is imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the object v1.3.1 changes hashes to its reviewed file (a pending pin,
-      confirmed by bq_views --verify after the next --write; v1.2.0's were
-      read back on 31 Oct and v1.3.0's on 1 Nov, and are installed pins); a
-      table function keeps the query after its 'AS' line
+      the objects v1.5.0 adds or changes hash to their reviewed files (pending
+      pins, confirmed by bq_views --verify after the next --write; v1.2.0's
+      were read back on 31 Oct, v1.3.0's on 1 Nov and v1.3.1 / 1.4.0 / 1.4.1's
+      on 1 Nov 15:27 Riyadh, and are installed pins); a table function keeps
+      the query after its 'AS' line
   V5  the static checks refuse a data-changing statement, a hard-coded
       project, a forward reference, two statements, a function after a view,
       a misnamed file, a CREATE TABLE and an unknown source table; they accept
@@ -86,6 +88,64 @@ the BigQuery session is a fake, no google library is imported.
       from the parsed window - fails on the default frame, which ends at the
       current row and flattens every close to 0, on a missing partition and
       on a descending order); the four OHLC columns share that one reference
+  V21 v_fx_sar (v1.4.0): the riyal rate per currency reads only the FX rows
+      of the Commodities_FX page, USD from SAR=X and every other currency
+      through its dollar cross with the direct quote preferred, pence as a
+      hundredth of a pound; the rate table is simulated from the parsed
+      rules (fails on the inverse quote taken as direct, on pence as pounds)
+  V22 the rating gate (v1.4.0): v_symbol_rating names the engine verdict
+      beside every rating (blocked, do not invest, watch only, below the
+      floors, none) in rating_gate and tfb_rating_display, names the analyst
+      and news sources, and both insight views carry them; the portfolio
+      view gives riyal values for every holding (the decision page's figure
+      first, else the sheet's value times v_fx_sar) with its source, and the
+      Top-10 view says seat and allocation in plain words (a row without a
+      ticket is 'research board', never an order) - fails on the 1.3.1 files;
+      v1.4.1: the riyal weight is a share of the whole book, NULL for every
+      holding while any holding has no riyal value (fails on the 1.4.0 file)
+  V23 v_outcome_coverage (v1.4.0, cohort in v1.4.1): per horizon and ALL,
+      due / matured / scored / wins with the win rate over scored calls of
+      the sheet's outcome cohort only (first valid matured record per key)
+      and the matured share over due records; the overdue count is active
+      records past their target; simulated on a small log (fails when the
+      win rate is taken over matured instead of scored, when a key archived
+      twice counts twice, when due ignores the target date, and when ALL is
+      missing)
+  V24 v_outcome_engine (v1.5.0): every record scored from the archived daily
+      close of the FIRST bar on/after the target session, never a later one
+      (a bar past the 7-day window is no_bar_at_target; the archive not yet
+      there is awaiting_bar); the target session is the venue-local day,
+      stepped to the next day after the venue's close; the call is scored by
+      entry stance exactly as the sheet scores realized ROI (a bearish fall
+      wins); HOLD is never scored; excursions, touched target and the
+      1W / 2W / 1M / 3M ladder come from the same bars; the engine cohort is
+      the first engine-scored record per key; the sheet's call sits beside
+      the engine's as agree / disagree / sheet_only / engine_only; the view
+      reads only v_performance_log and symbol_bars_daily (simulated on a
+      small log - fails when a later session is accepted, when a bearish
+      WIN reads LOSS, when a second copy of a key counts, when HOLD scores)
+  V25 v_outcome_calibration (v1.5.0): every rate over the engine cohort
+      only (records and due over the slice), one row per dimension x value
+      plus ALL, the sheet's cohort rate beside the engine's, 'High confidence
+      under-delivers' when the HIGH band's win rate sits below MEDIUM or LOW,
+      'small sample' under 30 scored calls, roi_capture NULL when the average
+      target is under 1 point (simulated - fails on rates over every record,
+      on a missing ALL row, on the flag against a small sample)
+  V26 v_board_archive (v1.5.0): each Top-10 panel default (DT10_PANEL in
+      16_Decision_Top10.gs, read from its source) is a named gate - INVEST,
+      INVESTABLE, no block, no sell-class tier, reliability 70, data quality
+      80, risk Medium, 12-month ROI 12 (annualized 10), no conflict, not a
+      holding, not named by the news gate - the seat order and the 3-per-
+      sector / 10-per-market / 10-seat caps are simulated, executable is the
+      constant FALSE and the board_kind says research only (each floor is a
+      golden negative; fails when a holding or a HIGH-risk name takes a seat,
+      when a fourth name of one sector seats, when executable is not FALSE)
+  V27 v_outcome_coverage (v1.5.0 extension): the engine's scored / wins /
+      rate and the backlog states (scorable now, awaiting bar, no bar, no bar
+      at target) per horizon and summed in ALL, beside the tracker's columns
+      unchanged; the file now applies after v_outcome_engine (fails when the
+      ALL row drops an engine column, when the engine rate is taken over
+      every scored row instead of the cohort)
 """
 from __future__ import annotations
 
@@ -151,19 +211,26 @@ INSTALLED = {
     # again in 1.3.1, so it stays pending)
     "v_symbol_analyst": "32958e9e3e16cc6e52fafb4b784d12ab362f04bc4b8272739a04c1b06570a855",
     "v_symbol_news": "1e48d645856426b096cd9dc04ba594e0146f58b9a79de89bcb3b4e44a41c9bfd",
-    "v_symbol_rating": "4b46dc88f64b9360e3abfb0898dc5680870fc5aa634c8b5b5bc86c492146ce04",
     "v_dive_signals": "70f12d9f52f86dda605931c4ddb5011382d51658cb725e51012302cba4836ed8",
     "v_dive_board": "3af206fc77283b1c9fbdff585d61d997f577c444ad5bc86088a0b33ac5ecdfaf",
     "v_dive_events": "bfcf61db2425619a8fe2f18778d573d0b506ba55a59f3f4850af067b5904f693",
-    "v_top10_insight": "c197b1021774a7b23718019a13657d7395f5693cf2939c0f8cb696dd607cefd4",
-    "v_portfolio_insight": "46505fd209702b7eb4291040fe07f20acac654325108f3e32993093ab0efb5c9",
-}
-# The object apply_bq_views 1.3.1 changes (1 Nov 2026), hashed from the reviewed
-# file: bq_views --verify after the next --write must find this exact body in
-# INFORMATION_SCHEMA (then it moves to INSTALLED). Installed 1.3.0 body:
-# ed95728198f695a1829ccdf4f2f18d49f507f86743d934186241c1e9750d0cec.
-PENDING = {
+    # apply_bq_views 1.3.1, 1.4.0 and 1.4.1, installed by bq_views write run 41306557892
+    # (1 Nov, 15:27 Riyadh) and read back from INFORMATION_SCHEMA the same afternoon (38/38)
     "v_symbol_candles": "c30bd475ffd4bb38bdf2e60676d34c3c4181925e4a44b6b4b54c68b28f4caf93",
+    "v_fx_sar": "2c6262eb53692796710a71fa045c4ad0d56d883b66a597cc0d3ec011d00040ca",
+    "v_symbol_rating": "3a07d374b2b1c175e9dd040a0fbd87b6dda158b1d35edf00bf56d263a2b7d0d1",
+    "v_top10_insight": "66d2facf68aadfb9088e05eed29669daf063b04bb1b82a8ccf0928911438e9cf",
+    "v_portfolio_insight": "a905416997fa03335516b028edfa60a215d21d22ee6c75fdc54aba52eb64216b",
+}
+# The objects apply_bq_views 1.5.0 adds or changes (2 Nov 2026), hashed from the
+# reviewed files: bq_views --verify after the next --write must find these exact
+# bodies in INFORMATION_SCHEMA (then they move to INSTALLED). Installed body
+# v_outcome_coverage replaces: ab308c8c736d (1.4.1).
+PENDING = {
+    "v_outcome_engine": "a7f75e0528a36bed30147611165696df9f8074f4c2551d96dc0e83b9d8f71d62",
+    "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
+    "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
+    "v_outcome_coverage": "341bd1f3a44d5d35e88c309a3f3a6ac6dd6e4678d640843c373fddad87447f31",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -172,13 +239,14 @@ EXPECTED_ORDER = [
     "v_run_log", "v_archive_health",
     "v_market_daily", "f_market_window", "f_market_summary",
     "v_universe", "v_universe_latest", "f_universe_return",
-    "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events", "f_symbol_pick",
+    "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events", "v_fx_sar", "f_symbol_pick",
     "v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
     "v_dive_signals", "v_dive_board", "v_dive_events",
     "v_top10_insight", "v_portfolio_insight",
+    "v_outcome_engine", "v_outcome_calibration", "v_board_archive", "v_outcome_coverage",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 4 + ["TABLE FUNCTION"] + ["VIEW"] * 9)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 13)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -736,7 +804,9 @@ def case_v18():
     used = {n: set(bv._REF.findall(c)) & bv.DEEP_TABLES for n, c in code.items()}
     assert {n: t for n, t in used.items() if t} == {
         "v_symbol_candles": {"symbol_bars_daily"}, "v_symbol_analyst": {"symbol_analyst_daily"},
-        "v_symbol_news": {"symbol_news"}}, used
+        "v_symbol_news": {"symbol_news"},
+        "v_outcome_engine": {"symbol_bars_daily"}}, used          # v1.5.0: the engine reads the bars too
+    assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
               "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):
@@ -749,7 +819,7 @@ def case_v18():
     assert abs(sum(present.values()) - 1.0) < 1e-9, present
     cuts = [float(x) for x in re.findall(r"WHEN r\.tfb_rating_score >= (\d+) THEN '", rating)]
     stars = [int(x) for x in re.findall(r"WHEN r\.tfb_rating_score >= \d+ THEN (\d)\n", rating)]
-    assert cuts == sorted(cuts, reverse=True) == [75, 60, 45, 30] and stars == [5, 4, 3, 2]
+    assert cuts == [75, 60, 45, 30] * 2 and stars == [5, 4, 3, 2]      # label and display agree
     assert "ELSE 'low'" in rating and "r.meets_floors THEN 'high'" in rating
     # the analyst consensus is recomputed from the counts, 5 = Strong Buy
     assert "SAFE_DIVIDE(5 * IFNULL(t.strong_buy, 0) + 4 * IFNULL(t.buy, 0)" in code["v_symbol_analyst"]
@@ -851,8 +921,612 @@ def case_v20():
     assert _window_last(rows, "PARTITION BY m.symbol ORDER BY m.date", True)[0] == 10.0
 
 
+def _fx_rules(code):
+    """The quote rules v_fx_sar applies, parsed from its SQL."""
+    import re
+    direct = re.search(r"REGEXP_EXTRACT\(symbol, r'\^\(\[A-Z\]\{3\}\)USD=X\$'\) AS ccy, price AS usd_per_unit, 'direct'", code)
+    inverse = re.search(r"REGEXP_EXTRACT\(symbol, r'\^\(\[A-Z\]\{3\}\)=X\$'\) AS ccy, 1 / price AS usd_per_unit, 'inverse'", code)
+    prefer = re.search(r"ORDER BY IF\(quote = 'direct', 0, 1\)\) = 1", code)
+    pence = re.search(r"r\.rate_to_sar / (\d+), CONCAT\('GBP/100 via ', r\.fx_source\)", code)
+    return direct, inverse, prefer, pence
+
+
+def _fx_table(quotes, prefer_direct=True, pence_div=100):
+    """What v_fx_sar makes of a Commodities_FX page: quotes is {symbol: price}."""
+    usd_sar = quotes.get("SAR=X")
+    to_usd = {}
+    for sym, px in quotes.items():
+        if sym.endswith("USD=X") and len(sym) == 8:
+            to_usd.setdefault(sym[:3], []).append(("direct", px))
+        elif sym.endswith("=X") and len(sym) == 5 and sym != "SAR=X":
+            to_usd.setdefault(sym[:3], []).append(("inverse", 1 / px))
+    rates = {"SAR": 1.0, "USD": usd_sar}
+    for ccy, cands in to_usd.items():
+        if ccy in ("SAR", "USD"):
+            continue
+        cands = sorted(cands, key=lambda c: 0 if (c[0] == "direct") == prefer_direct else 1)
+        rates[ccy] = cands[0][1] * usd_sar
+    if "GBP" in rates:
+        rates["GBX"] = rates["GBp"] = rates["GBP"] / pence_div
+    return rates
+
+
+def case_v21():
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_fx_sar"].template)
+    assert "source_page = 'Commodities_FX' AND asset_class = 'FX' AND current_price > 0" in code
+    assert set(bv._REF.findall(code)) - {"v_fx_sar"} == {"v_universe_latest"}, bv._REF.findall(code)
+    direct, inverse, prefer, pence = _fx_rules(code)
+    assert direct and inverse and prefer, "the dollar-cross rules"
+    assert pence and pence.group(1) == "100", "pence are a hundredth of a pound"
+    assert "WHERE symbol = 'SAR=X'" in code and "symbol != 'SAR=X'" in code
+    # the live page of 1 Nov 2026: a direct quote, an inverse quote, both, and pence
+    quotes = {"SAR=X": 3.7526, "GBPUSD=X": 1.3393, "HKDUSD=X": 0.12748, "HKD=X": 7.8442,
+              "EGP=X": 55.95, "AEDHKD=X": 2.13, "EURUSD=X": 1.11657}
+    t = _fx_table(quotes, prefer_direct=prefer is not None, pence_div=int(pence.group(1)))
+    assert t["USD"] == 3.7526 and t["SAR"] == 1.0
+    assert abs(t["GBP"] - 5.0259) < 1e-3 and abs(t["GBX"] - 0.050259) < 1e-5 and t["GBp"] == t["GBX"]
+    assert abs(t["HKD"] - 0.12748 * 3.7526) < 1e-6, "the direct quote wins over the inverse"
+    assert abs(t["EGP"] - 3.7526 / 55.95) < 1e-6, "an inverse-only quote"
+    assert "AED" not in t, "AEDHKD=X is not a dollar cross"
+    # golden: the inverse quote read as direct puts HKD at 29 riyals
+    wrong = _fx_table({k: v for k, v in quotes.items() if k != "HKDUSD=X"}, prefer_direct=True)
+    assert abs(wrong["HKD"] - 3.7526 / 7.8442) < 1e-6 and abs(t["HKD"] - wrong["HKD"]) < 1e-3
+
+
+def _weights(values, whole_book=True):
+    """weight_sar_pct over a book: with whole_book (1.4.1) every weight is None while any
+    value is None; without it (1.4.0) the valued subset is shared out as if it were the book."""
+    missing = sum(1 for v in values if v is None)
+    if whole_book and missing:
+        return [None] * len(values), missing
+    total = sum(v for v in values if v is not None)
+    return [round(v / total * 100, 2) if v is not None else None for v in values], missing
+
+
+def case_v22():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    code = {n: bv._code(objs[n].template) for n in objs}
+    rating = code["v_symbol_rating"]
+    # the gate names the engine verdict, in this order, and never reads the score
+    gate = re.search(r"CASE\n((?:(?!CASE\n).)*?)END AS rating_gate", rating, re.DOTALL).group(1)
+    arms = re.findall(r"WHEN (.*?) THEN '([^']+)'", gate)
+    assert [a[1] for a in arms] == ["blocked by the engine", "engine: do not invest", "engine: watch only",
+                                    "below the reliability / data-quality floors"], arms
+    assert "UPPER(r.investability_status) = 'BLOCKED'" in arms[0][0]
+    assert "UPPER(r.final_action) = 'DO_NOT_INVEST'" in arms[1][0]
+    assert "UPPER(r.final_action) = 'WATCH'" in arms[2][0]
+    assert "NOT IFNULL(r.meets_floors, FALSE)" in arms[3][0]
+    assert "ELSE 'none'" in gate and "tfb_rating_score" not in gate
+    # the display carries the label and the gate together
+    disp = re.search(r"CONCAT\(\n(.*?)\) AS tfb_rating_display", rating, re.DOTALL).group(1)
+    for part in ("' - blocked by the engine'", "' - engine: do not invest'", "' - engine: watch only'",
+                 "' - below the floors'", "ELSE 'No rating'"):
+        assert part in disp, part
+    # sources
+    assert "CONCAT('EODHD consensus, ', CAST(IFNULL(an.analysts, 0) AS STRING), ' analysts')" in rating
+    assert "THEN 'sheet analyst rating'" in rating and "ELSE 'no coverage'" in rating
+    assert "u.investability_status" in rating
+    # both insight views carry the gate, the display and the sources
+    for n in ("v_top10_insight", "v_portfolio_insight"):
+        for col in ("rt.rating_gate", "rt.tfb_rating_display", "rt.analyst_source", "rt.news_source"):
+            assert col in code[n], (n, col)
+    # the portfolio: riyal values for every holding, the decision page first, else the sheet x FX
+    pf = code["v_portfolio_insight"]
+    assert "LEFT JOIN `{{DS}}.v_fx_sar` AS fx ON fx.currency = h.currency" in pf
+    assert "COALESCE(d.market_value_sar, h.position_value * fx.rate_to_sar) AS value_sar" in pf
+    assert "COALESCE(d.cost_sar, h.position_cost * fx.rate_to_sar) AS cost_sar" in pf
+    assert "COALESCE(d.pnl_sar, (h.position_value - h.position_cost) * fx.rate_to_sar) AS pnl_sar" in pf
+    # 1.4.1: a weight is a share of the whole book - NULL for every row while any holding
+    # has no riyal value, with holdings_without_value saying how many
+    assert ("IF(COUNTIF(j.value_sar IS NULL) OVER () > 0, NULL,\n"
+            "     ROUND(SAFE_DIVIDE(j.value_sar, SUM(j.value_sar) OVER ()) * 100, 2)) AS weight_sar_pct") in pf
+    assert "COUNTIF(j.value_sar IS NULL) OVER () AS holdings_without_value" in pf
+    assert _weights([100.0, 300.0]) == ([25.0, 75.0], 0)
+    assert _weights([100.0, 300.0, None]) == ([None, None, None], 1)       # partial book: no weights
+    assert _weights([100.0, 300.0, None], whole_book=False)[0] == [25.0, 75.0, None]   # the 1.4.0 defect
+    assert "ROUND(SAFE_DIVIDE(j.pnl_sar, j.cost_sar) * 100, 2) AS pnl_sar_pct" in pf
+    assert "WHEN d.market_value_sar IS NOT NULL THEN 'Portfolio_Decision'" in pf
+    assert "ELSE 'no rate for the currency'" in pf
+    # the Top-10: seat and allocation in plain words; a row without a ticket is research
+    t10 = code["v_top10_insight"]
+    assert "WHEN b.seat_rank IS NOT NULL THEN CONCAT('ranked seat ', CAST(b.seat_rank AS STRING))" in t10
+    assert "WHEN UPPER(b.stability_state) = 'GRACE' THEN 'grace, no seat'" in t10
+    assert "WHEN IFNULL(b.ticket_sar, 0) > 0 THEN CONCAT('ticket ', FORMAT('%.0f', b.ticket_sar), ' SAR')" in t10
+    assert "ELSE 'none - research board'" in t10
+    assert bv.check_objects(list(objs.values())) == []
+
+
+def _coverage(rows, now, win_over="scored", due_by="target", with_all=True, cohort=True):
+    """v_outcome_coverage on a small log: rows carry horizon, target (day), status,
+    call (WIN / LOSS / None) and an optional cohort flag (False = a repeated key or an
+    invalid matured copy, outside the sheet's outcome cohort). Returns
+    {horizon: (due, matured, scored, wins, overdue, win_pct, share)}; with cohort (1.4.1)
+    scored and wins count cohort rows only, without it (1.4.0) every matured copy."""
+    out = {}
+    hs = sorted({r["horizon"] for r in rows})
+    groups = {h: [r for r in rows if r["horizon"] == h] for h in hs}
+    if with_all:
+        groups["ALL"] = rows
+    for h, rs in groups.items():
+        due = sum(1 for r in rs if (r["target"] <= now if due_by == "target" else True))
+        matured = sum(1 for r in rs if r["status"] == "matured")
+        inc = (lambda r: r.get("cohort", True)) if cohort else (lambda r: True)
+        scored = sum(1 for r in rs if r["status"] == "matured" and r["call"] in ("WIN", "LOSS") and inc(r))
+        wins = sum(1 for r in rs if r["status"] == "matured" and r["call"] == "WIN" and inc(r))
+        overdue = sum(1 for r in rs if r["target"] <= now and r["status"] == "active")
+        denom = scored if win_over == "scored" else matured
+        out[h] = (due, matured, scored, wins, overdue,
+                  round(wins / denom * 100, 1) if denom else None,
+                  round(matured / due * 100, 1) if due else None)
+    return out
+
+
+def case_v23():
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_outcome_coverage"].template)
+    # v1.5.0: the engine's columns join the log by record_id; the tracker's columns are unchanged
+    assert set(bv._REF.findall(code)) - {"v_outcome_coverage"} == {"v_performance_log", "v_outcome_engine"}
+    assert "LEFT JOIN `{{DS}}.v_outcome_engine` AS e ON e.record_id = l.record_id" in code
+    assert "COUNTIF(target_at <= CURRENT_TIMESTAMP()) AS due" in code
+    assert "COUNTIF(is_matured) AS matured" in code
+    # 1.4.1: scored and wins over the sheet's outcome cohort (first valid matured record per
+    # key), so a key archived twice never counts twice; matured stays raw for coverage
+    assert "COUNTIF(in_outcome_cohort) AS matured_cohort" in code
+    assert "COUNTIF(is_matured AND NOT in_outcome_cohort) AS matured_excluded" in code
+    assert "COUNTIF(is_scored AND in_outcome_cohort) AS scored" in code
+    assert "SUM(IF(in_outcome_cohort, IFNULL(win_flag, 0), 0)) AS wins" in code
+    assert "SUM(matured_cohort) AS matured_cohort" in code and "SUM(matured_excluded) AS matured_excluded" in code
+    assert "COUNTIF(target_at <= CURRENT_TIMESTAMP() AND status = 'active') AS overdue_open" in code
+    assert "ROUND(SAFE_DIVIDE(u.wins, u.scored) * 100, 1) AS win_pct" in code      # over decided calls
+    assert "ROUND(SAFE_DIVIDE(u.matured, u.due) * 100, 1) AS matured_share_pct" in code
+    assert "'ALL' AS horizon" in code and "MIN(oldest_overdue_target)" in code
+    assert "SELECT * FROM by_h\n  UNION ALL\n  SELECT * FROM all_h" in code       # the ALL row is published
+    assert "snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_performance_log`)" in code
+    rows = [{"horizon": "1W", "target": 1, "status": "matured", "call": "WIN"},
+            {"horizon": "1W", "target": 2, "status": "matured", "call": "LOSS"},
+            {"horizon": "1W", "target": 3, "status": "matured", "call": None},      # neutral tier
+            {"horizon": "1W", "target": 4, "status": "active", "call": None},       # overdue
+            {"horizon": "1W", "target": 9, "status": "active", "call": None},       # not due
+            {"horizon": "1M", "target": 2, "status": "active", "call": None},
+            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN"},
+            {"horizon": "1M", "target": 5, "status": "matured", "call": "WIN", "cohort": False}]  # the same key, archived twice
+    c = _coverage(rows, now=5)
+    assert c["1W"] == (4, 3, 2, 1, 1, 50.0, 75.0), c["1W"]
+    assert c["1M"] == (3, 2, 1, 1, 1, 100.0, 66.7), c["1M"]      # the copy is matured, never scored
+    assert c["ALL"] == (7, 5, 3, 2, 2, 66.7, 71.4), c["ALL"]
+    # golden negatives: the rate over matured rows counts the neutral call as a loss; due
+    # without the target date is every record; no ALL row; every matured copy counted (1.4.0):
+    # two copies of one winning key beside one loss read 66.7 % where the sheet says 50 %
+    assert _coverage(rows, now=5, win_over="matured")["1W"][5] == 33.3
+    assert _coverage(rows, now=5, due_by="all")["1W"][0] == 5
+    assert "ALL" not in _coverage(rows, now=5, with_all=False)
+    dup = [{"horizon": "2W", "target": 1, "status": "matured", "call": "WIN"},
+           {"horizon": "2W", "target": 1, "status": "matured", "call": "WIN", "cohort": False},
+           {"horizon": "2W", "target": 1, "status": "matured", "call": "LOSS"}]
+    assert _coverage(dup, now=5)["2W"][2:4] == (2, 1) and _coverage(dup, now=5)["2W"][5] == 50.0
+    assert _coverage(dup, now=5, cohort=False)["2W"][5] == 66.7
+
+
+# --------------------------------------------------------------------- v1.5.0
+def _first_on_or_after(bars, day, within=None):
+    """The first bar on/after `day` (days are ints); None beyond `within` days."""
+    cands = [b for b in bars if b["date"] >= day and (within is None or b["date"] <= day + within)]
+    return min(cands, key=lambda b: b["date"]) if cands else None
+
+
+def _engine(records, bars, today, window_days=7, later_session=False, bearish_inverted=True,
+            score_hold=False, dedupe=True, entry_day_bar=False):
+    """v_outcome_engine on a small log. records: id, key, symbol, stance, entry, target_price,
+    recorded (day), target (session day), status, sheet_call; bars: symbol, date, high, low,
+    close. Returns {id: row}. Golden switches: later_session accepts a bar past the window,
+    bearish_inverted=False scores a bearish fall as a loss, score_hold scores HOLD, dedupe=False
+    counts every scored copy of a key in the cohort, entry_day_bar=True lets the recording
+    day's own bar into the excursions (Codex P2 on #891: a target touched by that morning's high)."""
+    out = {}
+    by_sym = {}
+    for b in bars:
+        by_sym.setdefault(b["symbol"], []).append(b)
+    for r in records:
+        sb = by_sym.get(r["symbol"], [])
+        row = {"state": None, "roi": None, "call": None, "scored": False, "win": None,
+               "mfe": None, "mae": None, "touched": None, "ladder": {}}
+        scorable = r["stance"] in ("bullish", "bearish") or (score_hold and r["stance"] == "neutral")
+        if r["entry"] is None or r["entry"] <= 0:
+            row["state"] = "no_entry_price"
+        elif not scorable:
+            row["state"] = "unscorable_stance"
+        elif r["target"] > today:
+            row["state"] = "target_not_due"
+        elif not sb:
+            row["state"] = "no_bar_for_symbol"
+        else:
+            tb = _first_on_or_after(sb, r["target"], None if later_session else window_days)
+            last = max(b["date"] for b in sb)
+            if tb is not None:
+                row["state"] = "scored_from_bar"
+                row["roi"] = round((tb["close"] / r["entry"] - 1) * 100, 4)
+                sign = 1 if r["stance"] in ("bullish", "neutral") else (-1 if bearish_inverted else 1)
+                v = row["roi"] * sign
+                row["call"] = "WIN" if v > 0 else ("LOSS" if v < 0 else "BREAKEVEN")
+                row["scored"] = row["call"] in ("WIN", "LOSS")
+                row["win"] = 1 if row["call"] == "WIN" else (0 if row["call"] == "LOSS" else None)
+            elif r["target"] + window_days > last:
+                row["state"] = "awaiting_bar"
+            else:
+                row["state"] = "no_bar_at_target"
+        if sb and r["entry"]:
+            tb = _first_on_or_after(sb, r["target"], window_days)
+            lo = r["recorded"] if entry_day_bar else r["recorded"] + 1
+            win = [b for b in sb if lo <= b["date"] < r["target"]] + ([tb] if tb and tb["date"] >= lo else [])
+            if win:
+                row["mfe"] = round((max(b["high"] for b in win) / r["entry"] - 1) * 100, 4)
+                row["mae"] = round((min(b["low"] for b in win) / r["entry"] - 1) * 100, 4)
+                if r["stance"] == "bullish":
+                    row["touched"] = any(b["high"] >= r["target_price"] for b in win)
+                elif r["stance"] == "bearish":
+                    row["touched"] = any(b["low"] <= r["target_price"] for b in win)
+            for label, days in (("1w", 7), ("2w", 14), ("1m", 30), ("3m", 91)):
+                b = _first_on_or_after(sb, r["recorded"] + days)
+                row["ladder"][label] = round((b["close"] / r["entry"] - 1) * 100, 4) if b else None
+        sc = r.get("sheet_call")
+        if r["status"] != "matured":
+            row["vs"] = None
+        elif sc and row["call"]:
+            row["vs"] = "agree" if sc == row["call"] else "disagree"
+        elif sc:
+            row["vs"] = "sheet_only"
+        elif row["call"]:
+            row["vs"] = "engine_only"
+        else:
+            row["vs"] = None
+        out[r["id"]] = row
+    seen = set()
+    for r in sorted(records, key=lambda r: (r["recorded"], r["id"])):
+        row = out[r["id"]]
+        if not row["scored"]:
+            row["cohort"] = False
+        elif dedupe and r["key"] in seen:
+            row["cohort"] = False
+        else:
+            row["cohort"] = True
+            seen.add(r["key"])
+    return out
+
+
+def case_v24():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_outcome_engine"].template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_engine"} == {"v_performance_log", "symbol_bars_daily"}
+    # the first bar on/after the target session, within 7 days, never a later session
+    assert "IF(b.date >= r.target_session_date AND b.date <= DATE_ADD(r.target_session_date, INTERVAL 7 DAY)," in code
+    assert "IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS tb" in code
+    # the target session: the venue-local day, the next day after the venue's close
+    assert "DATE_ADD(DATE(rec.target_at, COALESCE(v.tz, 'America/New_York')), INTERVAL 1 DAY)" in code
+    assert "> COALESCE(v.close_min, 960)" in code
+    venues = re.findall(r"\('([A-Z]+)', '([^']+)', '([^']+)', (\d+)\)", code)
+    assert {v[0] for v in venues} >= {"SR", "US", "HK", "L", "T", "DE", "PA", "MI", "MC", "AS", "BR", "SW", "LS",
+                                      "VI", "WA", "AX", "TO", "NS", "KS", "TW", "SS", "SZ", "SI", "KL", "JK",
+                                      "JO", "MX", "SA", "IS", "OL"}
+    tz = {v[0]: v[2] for v in venues}
+    close = {v[0]: int(v[3]) for v in venues}
+    assert tz["SR"] == "Asia/Riyadh" and close["SR"] == 900 and tz["US"] == "America/New_York" and close["US"] == 960
+    # the call is scored by stance exactly as the sheet scores realized ROI
+    assert ("WHEN s.entry_stance = 'bearish'\n        THEN CASE WHEN s.engine_roi_pp < 0 THEN 'WIN' "
+            "WHEN s.engine_roi_pp > 0 THEN 'LOSS' ELSE 'BREAKEVEN' END") in code
+    assert "WHEN r.entry_stance NOT IN ('bullish', 'bearish') OR r.entry_stance IS NULL THEN 'unscorable_stance'" in code
+    for state in ("no_entry_price", "unscorable_stance", "target_not_due", "no_bar_for_symbol", "scored_from_bar",
+                  "awaiting_bar", "no_bar_at_target"):
+        assert f"'{state}'" in code, state
+    assert "ROW_NUMBER() OVER (PARTITION BY c.record_key, IFNULL(c.engine_call_outcome IN ('WIN', 'LOSS'), FALSE)" in code
+    assert "ORDER BY c.recorded_at, c.sheet_row, c.record_id) = 1" in code
+    assert "IF(c.call_outcome = c.engine_call_outcome, 'agree', 'disagree')" in code
+    assert "MAX(IF(b.date > r.recorded_day AND b.date < r.target_session_date, b.high, NULL)) AS pre_high" in code
+    assert "IF(r.entry_stance = 'bullish' AND a.tb.date > r.recorded_day AND a.tb.high >= r.target_price, a.tb.date, DATE '9999-12-31')" in code
+    assert "IF(a.tb.date > r.recorded_day, IFNULL(a.tb.high, 0), 0)" in code     # the target bar on the recording day is left out
+    for col in ("mfe_pct", "mae_pct", "touched_target", "days_to_target_touch", "bars_observed", "last_close",
+                "bar_roi_pp", "roi_1w_pp", "roi_2w_pp", "roi_1m_pp", "roi_3m_pp", "sheet_vs_engine", "roi_gap_pp",
+                "in_engine_cohort", "engine_win_flag", "engine_scored", "target_bar_date", "target_close"):
+        assert f" AS {col}" in code, col
+    assert "research view" in code and "Directional Win Rate" in code
+    # the simulator: a small log on one symbol with bars on days 1-5, 8-12 (no weekend bars)
+    bars = [{"symbol": "A", "date": d, "high": 10 + d, "low": 8 + d * 0.5, "close": 9 + d}
+            for d in (1, 2, 3, 4, 5, 8, 9, 10, 11, 12)]
+    recs = [
+        {"id": "r1", "key": "k1", "symbol": "A", "stance": "bullish", "entry": 10, "target_price": 14,
+         "recorded": 1, "target": 6, "status": "matured", "sheet_call": "WIN"},        # target on a weekend: day 8 bar
+        {"id": "r2", "key": "k2", "symbol": "A", "stance": "bearish", "entry": 20, "target_price": 8.5,
+         "recorded": 2, "target": 4, "status": "matured", "sheet_call": "LOSS"},       # price fell: bearish WIN, sheet disagrees
+        {"id": "r3", "key": "k3", "symbol": "A", "stance": "neutral", "entry": 10, "target_price": 11,
+         "recorded": 1, "target": 3, "status": "matured", "sheet_call": None},         # HOLD never scores
+        {"id": "r4", "key": "k4", "symbol": "A", "stance": "bullish", "entry": 10, "target_price": 30,
+         "recorded": 1, "target": 20, "status": "active", "sheet_call": None},         # not due (today 15)
+        {"id": "r5", "key": "k5", "symbol": "B", "stance": "bullish", "entry": 10, "target_price": 12,
+         "recorded": 1, "target": 3, "status": "active", "sheet_call": None},          # no bars for B
+        {"id": "r6", "key": "k6", "symbol": "A", "stance": "bullish", "entry": 10, "target_price": 12,
+         "recorded": 1, "target": 13, "status": "active", "sheet_call": None},         # archive ends day 12: awaiting
+        {"id": "r7", "key": "k1", "symbol": "A", "stance": "bullish", "entry": 10, "target_price": 14,
+         "recorded": 3, "target": 5, "status": "matured", "sheet_call": "WIN"},        # second copy of k1
+        {"id": "r8", "key": "k8", "symbol": "A", "stance": "bullish", "entry": None, "target_price": 14,
+         "recorded": 1, "target": 5, "status": "active", "sheet_call": None},          # no entry price
+    ]
+    e = _engine(recs, bars, today=15)
+    assert e["r1"]["state"] == "scored_from_bar" and e["r1"]["roi"] == 70.0 and e["r1"]["call"] == "WIN"
+    assert e["r1"]["vs"] == "agree" and e["r1"]["cohort"] is True
+    assert e["r1"]["mfe"] == 80.0 and e["r1"]["mae"] == -10.0 and e["r1"]["touched"] is True   # days 2-5 + day 8; day 1 left out
+    assert e["r1"]["ladder"] == {"1w": 70.0, "2w": None, "1m": None, "3m": None}
+    assert e["r2"]["state"] == "scored_from_bar" and e["r2"]["roi"] == -35.0 and e["r2"]["call"] == "WIN"
+    assert e["r2"]["vs"] == "disagree" and e["r2"]["touched"] is False       # lows 9.0-10.0 (days 2-4) never reach 8.5
+    assert e["r3"]["state"] == "unscorable_stance" and e["r3"]["call"] is None and e["r3"]["vs"] is None
+    assert e["r4"]["state"] == "target_not_due" and e["r4"]["ladder"]["1w"] == 70.0   # day 8 close 17
+    assert e["r5"]["state"] == "no_bar_for_symbol"
+    assert e["r6"]["state"] == "awaiting_bar"
+    assert e["r7"]["scored"] is True and e["r7"]["cohort"] is False           # the repeated key counts once
+    assert e["r8"]["state"] == "no_entry_price"
+    # golden negatives
+    far = [{"id": "r9", "key": "k9", "symbol": "A", "stance": "bullish", "entry": 10, "target_price": 14,
+            "recorded": 1, "target": 6, "status": "active", "sheet_call": None}]
+    gap_bars = [b for b in bars if b["date"] <= 5] + [{"symbol": "A", "date": 30, "high": 40, "low": 30, "close": 35}]
+    assert _engine(far, gap_bars, today=40)["r9"]["state"] == "no_bar_at_target"            # 24 days later: never used
+    assert _engine(far, gap_bars, today=40, later_session=True)["r9"]["state"] == "scored_from_bar"
+    assert _engine(recs, bars, today=15, bearish_inverted=False)["r2"]["call"] == "LOSS"    # a bearish fall must win
+    assert _engine(recs, bars, today=15, score_hold=True)["r3"]["scored"] is True           # HOLD must never score
+    assert _engine(recs, bars, today=15, dedupe=False)["r7"]["cohort"] is True              # a copy must not count
+    # the recording day's bar never counts: a spike before the forecast existed is not a touch
+    spike = [{"symbol": "C", "date": 1, "high": 50, "low": 9, "close": 10}] + [
+        {"symbol": "C", "date": d, "high": 10.5, "low": 9.5, "close": 10} for d in (2, 3, 4, 5, 8)]
+    rc = [{"id": "r10", "key": "k10", "symbol": "C", "stance": "bullish", "entry": 10, "target_price": 20,
+           "recorded": 1, "target": 5, "status": "active", "sheet_call": None}]
+    assert _engine(rc, spike, today=15)["r10"]["touched"] is False and _engine(rc, spike, today=15)["r10"]["mfe"] == 5.0
+    assert _engine(rc, spike, today=15, entry_day_bar=True)["r10"]["touched"] is True        # golden: contaminated
+    assert _engine(recs, bars, today=15, entry_day_bar=True)["r1"]["mae"] == -15.0
+
+
+def _calibration(rows, min_sample=30, cohort_only=True, with_all=True, flag_small=True):
+    """v_outcome_calibration on engine rows: conf, scored (bool), cohort (bool), win (1/0/None),
+    roi, target_roi; returns {value: (scored, wins, rate, capture, flag)} for the confidence
+    dimension plus ALL."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["conf"], []).append(r)
+    if with_all:
+        groups["ALL"] = rows
+    out = {}
+    for v, rs in groups.items():
+        inc = (lambda r: r["cohort"]) if cohort_only else (lambda r: r["scored"])
+        sc = [r for r in rs if inc(r)]
+        wins = sum(1 for r in sc if r["win"] == 1)
+        rate = round(wins / len(sc) * 100, 1) if sc else None
+        avg_roi = sum(r["roi"] for r in sc) / len(sc) if sc else None
+        avg_t = sum(r["target_roi"] for r in sc) / len(sc) if sc else None
+        capture = round(avg_roi / avg_t * 100, 1) if sc and abs(avg_t) >= 1 else None
+        out[v] = [len(sc), wins, rate, capture, None]
+    for v, row in out.items():
+        if flag_small and row[0] < min_sample:
+            row[4] = "small sample"
+    h = out.get("HIGH", [0, 0, None])[2]
+    m = out.get("MEDIUM", [0, 0, None])[2]
+    lo = out.get("LOW", [0, 0, None])[2]
+    if "HIGH" in out and out["HIGH"][4] is None and h is not None and \
+            ((m is not None and h < m) or (lo is not None and h < lo)):
+        out["HIGH"][4] = "High confidence under-delivers"
+    return {v: tuple(r) for v, r in out.items()}
+
+
+def case_v25():
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_outcome_calibration"].template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_calibration"} == {"v_outcome_engine"}
+    assert "STRUCT('ALL' AS dimension, 'ALL' AS value)" in code
+    for dim in ("confidence", "reliability_tier", "data_quality_tier", "sector", "market", "horizon", "origin_tab",
+                "risk_bucket", "entry_recommendation", "recorded_week"):
+        assert f"STRUCT('{dim}'" in code, dim
+    assert "COUNTIF(in_engine_cohort) AS engine_scored" in code
+    assert "SUM(IF(in_engine_cohort, IFNULL(engine_win_flag, 0), 0)) AS engine_wins" in code
+    assert "ROUND(AVG(IF(in_engine_cohort, engine_roi_pp, NULL)), 4) AS avg_engine_roi_pp" in code
+    assert "COUNTIF(in_outcome_cohort AND sheet_scored) AS sheet_scored" in code
+    assert "ROUND(SAFE_DIVIDE(g.engine_wins, g.engine_scored) * 100, 1) AS engine_win_rate_pct" in code
+    assert ("IF(ABS(g.avg_target_roi_pp) >= 1, ROUND(SAFE_DIVIDE(g.avg_engine_roi_pp, g.avg_target_roi_pp) * 100, 1), NULL) "
+            "AS roi_capture_pct") in code
+    assert "WHEN f.engine_scored < 30 THEN 'small sample'" in code
+    assert "AND (f.high_rate < f.medium_rate OR f.high_rate < f.low_rate) THEN 'High confidence under-delivers'" in code
+    assert "WHEN e.entry_forecast_reliability < 70 THEN '< 70'" in code and "ELSE '90+'" in code
+    rows = ([{"conf": "HIGH", "scored": True, "cohort": True, "win": 1, "roi": 2.0, "target_roi": 4.0}] * 10
+            + [{"conf": "HIGH", "scored": True, "cohort": True, "win": 0, "roi": -3.0, "target_roi": 4.0}] * 20
+            + [{"conf": "HIGH", "scored": True, "cohort": False, "win": 1, "roi": 9.0, "target_roi": 4.0}] * 5   # copies
+            + [{"conf": "MEDIUM", "scored": True, "cohort": True, "win": 1, "roi": 1.0, "target_roi": 0.2}] * 25
+            + [{"conf": "MEDIUM", "scored": True, "cohort": True, "win": 0, "roi": -1.0, "target_roi": 0.2}] * 10
+            + [{"conf": "LOW", "scored": True, "cohort": True, "win": 1, "roi": 1.0, "target_roi": 2.0}] * 3)
+    c = _calibration(rows)
+    assert c["HIGH"] == (30, 10, 33.3, round(((10 * 2 - 20 * 3) / 30) / 4.0 * 100, 1), "High confidence under-delivers"), c["HIGH"]
+    assert c["MEDIUM"][:3] == (35, 25, 71.4) and c["MEDIUM"][3] is None        # average target 0.2: no capture
+    assert c["LOW"] == (3, 3, 100.0, 50.0, "small sample")
+    assert c["ALL"][:3] == (68, 38, 55.9)
+    # golden negatives: every scored copy counted; no ALL row; the flag against a small sample
+    assert _calibration(rows, cohort_only=False)["HIGH"][:2] == (35, 15)
+    assert "ALL" not in _calibration(rows, with_all=False)
+    small = [{"conf": "HIGH", "scored": True, "cohort": True, "win": 0, "roi": -1.0, "target_roi": 2.0}] * 5 + rows[35:]
+    assert _calibration(small)["HIGH"][4] == "small sample"
+    assert _calibration(small, flag_small=False)["HIGH"][4] == "High confidence under-delivers"
+
+
+def _board(rows, holdings=(), flagged=(), per_sector=3, per_market=10, seats=10, executable=False,
+           market_before_sector=False):
+    """v_board_archive on universe rows: symbol, sector, market, final_action, inv, block,
+    reco, rel, dq, risk, roi12, conflict, opp. Returns {symbol: (fails, seat)} and the constant."""
+    out = {}
+    passers = []
+    for r in rows:
+        fails = []
+        if r["final_action"] != "INVEST":
+            fails.append("engine: final action not INVEST")
+        if r["inv"] != "INVESTABLE":
+            fails.append("engine: not INVESTABLE")
+        if r.get("block"):
+            fails.append("engine: block reason")
+        if (r.get("reco") or "").upper().replace("_", " ") in ("SELL", "STRONG SELL", "REDUCE", "AVOID", "EXIT", "TRIM"):
+            fails.append("sell-class recommendation")
+        if not (r["rel"] is not None and r["rel"] >= 70):
+            fails.append("reliability below 70 (T10: Min Reliability)")
+        if not (r["dq"] is not None and r["dq"] >= 80):
+            fails.append("data quality below 80 (T10: Min Data Quality)")
+        if (r.get("risk") or "") not in ("LOW", "MODERATE"):
+            fails.append("risk above Medium (T10: Max Risk Level)")
+        if not (r["roi12"] is not None and r["roi12"] >= 12):
+            fails.append("12-month ROI below 12 % (T10: Required ROI %)")
+        if not (r["roi12"] is not None and r["roi12"] >= 10):
+            fails.append("annualized ROI below 10 % (T10: Required Annualized ROI %)")
+        if str(r.get("conflict", "")).upper() == "TRUE":
+            fails.append("provider/engine conflict (T10: Allow Conflict No)")
+        if r["symbol"] in holdings:
+            fails.append("portfolio holding (T10: Include Portfolio Holdings No)")
+        if r["symbol"] in flagged:
+            fails.append("named by the news gate (T10: Allow Negative News No)")
+        out[r["symbol"]] = [fails, None]
+        if not fails:
+            passers.append(r)
+    passers.sort(key=lambda r: (-r["opp"], -r["roi12"], -r["rel"], r["symbol"]))
+    sec, mkt, rank = {}, {}, 0
+    for r in passers:
+        sec[r["sector"]] = sec.get(r["sector"], 0) + 1
+        if market_before_sector:            # golden: the market cap counts sector-rejected names too
+            mkt[r["market"]] = mkt.get(r["market"], 0) + 1
+        if sec[r["sector"]] > per_sector:
+            continue
+        if not market_before_sector:
+            mkt[r["market"]] = mkt.get(r["market"], 0) + 1
+        if mkt[r["market"]] <= per_market:
+            rank += 1
+            if rank <= seats:
+                out[r["symbol"]][1] = rank
+    return {k: tuple(v) for k, v in out.items()}, executable
+
+
+def case_v26():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    code = bv._code(objs["v_board_archive"].template)
+    assert set(bv._REF.findall(code)) - {"v_board_archive"} == {"v_universe_latest", "v_my_portfolio", "v_news_gate"}
+    gas = (ROOT / "apps_script" / "16_Decision_Top10.gs").read_text(encoding="utf-8")
+    panel = dict(re.findall(r"\{ label: '(T10: [^']+)', def: ([^,]+), kind", gas))
+    assert panel["T10: Min Reliability"] == "70" and "u.reliability >= 70" in code
+    assert panel["T10: Min Data Quality"] == "80" and "u.data_quality >= 80" in code
+    assert panel["T10: Max Risk Level"] == "'Medium'" and "NOT IN ('LOW', 'MODERATE')" in code
+    assert panel["T10: Required ROI %"] == "12" and panel["T10: Period (Months)"] == "12"
+    assert "u.expected_roi_12m_pct >= 12" in code
+    assert panel["T10: Required Annualized ROI %"] == "10" and "u.expected_roi_12m_pct >= 10" in code
+    assert panel["T10: Max Per Sector"] == "3" and "WHERE p.sector_rank <= 3" in code
+    assert "WHERE s.market_rank <= 10" in code and code.index("WHERE p.sector_rank <= 3") < code.index("WHERE s.market_rank <= 10")
+    assert "FROM passers AS p\n  WHERE p.sector_rank <= 3" in code     # the market rank is taken over sector-admitted names only
+    assert panel["T10: Max Per Market"] == "10" and panel["T10: Max Selected"] == "10"
+    assert "IF(r.archive_rank <= 10, r.archive_rank, NULL) AS archive_seat" in code
+    assert panel["T10: Allow Conflict"] == "'No'" and "provider/engine conflict (T10: Allow Conflict No)" in code
+    assert panel["T10: Include Portfolio Holdings"] == "'No'"
+    assert "portfolio holding (T10: Include Portfolio Holdings No)" in code
+    assert panel["T10: Allow Negative News"] == "'No'" and "named by the news gate (T10: Allow Negative News No)" in code
+    assert "IF(IFNULL(u.final_action, '') != 'INVEST', 'engine: final action not INVEST', NULL)" in code
+    assert "IF(IFNULL(u.investability_status, '') != 'INVESTABLE', 'engine: not INVESTABLE', NULL)" in code
+    assert "'sell-class recommendation'" in code and "'STRONG SELL', 'REDUCE', 'AVOID', 'EXIT', 'TRIM'" in code
+    assert "FALSE AS executable" in code and "'archive board - research only, not the cockpit' AS board_kind" in code
+    assert "T10: Min Risk/Reward" in code and "gates_not_applied" in code     # named, not silently applied
+    assert ("PARTITION BY j.sector ORDER BY j.opportunity_score DESC, j.expected_roi_12m_pct DESC, "
+            "j.reliability DESC, j.symbol") in code
+    assert "WHERE j.final_action = 'INVEST' OR j.investability_status = 'INVESTABLE'" in code
+    base = {"final_action": "INVEST", "inv": "INVESTABLE", "block": None, "reco": "BUY", "rel": 75, "dq": 90,
+            "risk": "LOW", "roi12": 20, "conflict": "FALSE", "opp": 60, "market": "US", "sector": "Tech"}
+
+    def mk(sym, **kw):
+        r = dict(base, symbol=sym)
+        r.update(kw)
+        return r
+    rows = [mk("A", opp=70), mk("B", opp=69), mk("C", opp=68), mk("D", opp=67),            # four Tech names
+            mk("E", sector="Energy", opp=66), mk("F", sector="Energy", opp=50, rel=60),    # F: reliability
+            mk("G", sector="Banks", opp=65, risk="HIGH"), mk("H", sector="Banks", opp=64, roi12=11),
+            mk("I", sector="Banks", opp=63, conflict="TRUE"), mk("J", sector="Banks", opp=62, reco="SELL"),
+            mk("K", sector="Banks", opp=61, final_action="WATCH", inv="WATCHLIST"),
+            mk("L", sector="Banks", opp=60, block="sell class"), mk("M", sector="Banks", opp=59, dq=70),
+            mk("N", sector="Retail", opp=58), mk("O", sector="Retail", opp=57)]
+    b, ex = _board(rows, holdings={"O"}, flagged={"N"})
+    assert ex is False
+    assert [b[s][1] for s in "ABCD"] == [1, 2, 3, None]                 # the fourth Tech name never seats
+    assert b["E"][1] == 4 and b["F"] == (["reliability below 70 (T10: Min Reliability)"], None)
+    assert b["G"][0] == ["risk above Medium (T10: Max Risk Level)"]
+    assert b["H"][0] == ["12-month ROI below 12 % (T10: Required ROI %)"]
+    assert b["I"][0] == ["provider/engine conflict (T10: Allow Conflict No)"]
+    assert b["J"][0] == ["sell-class recommendation"]
+    assert b["K"][0] == ["engine: final action not INVEST", "engine: not INVESTABLE"]
+    assert b["L"][0] == ["engine: block reason"] and b["M"][0] == ["data quality below 80 (T10: Min Data Quality)"]
+    assert b["N"][0] == ["named by the news gate (T10: Allow Negative News No)"]
+    assert b["O"][0] == ["portfolio holding (T10: Include Portfolio Holdings No)"]
+    # golden negatives: a holding seated; a fourth name of one sector; a HIGH-risk name; executable TRUE
+    assert _board(rows, holdings=set(), flagged={"N"})[0]["O"][1] == 5
+    assert _board(rows, per_sector=4)[0]["D"][1] == 4
+    assert _board([mk("G", risk="HIGH")])[0]["G"][1] is None
+    assert _board(rows, executable=True)[1] is True and "TRUE AS executable" not in code
+    # ten names of one sector must not use up a market's ten places (Codex P2 on #891)
+    crowd = [mk(f"T{i}", opp=90 - i) for i in range(10)] + [mk(f"U{i}", sector=f"S{i}", opp=50 - i) for i in range(7)]
+    seated = [s for s, v in _board(crowd)[0].items() if v[1]]
+    assert len(seated) == 10 and seated[:3] == ["T0", "T1", "T2"] and all(f"U{i}" in seated for i in range(7))
+    assert len([s for s, v in _board(crowd, market_before_sector=True)[0].items() if v[1]]) == 3
+
+
+def _coverage_engine(rows, with_all=True, cohort=True):
+    """the v1.5.0 engine columns of v_outcome_coverage: rows carry horizon, state, cohort, win."""
+    hs = sorted({r["horizon"] for r in rows})
+    groups = {h: [r for r in rows if r["horizon"] == h] for h in hs}
+    if with_all:
+        groups["ALL"] = rows
+    out = {}
+    for h, rs in groups.items():
+        inc = (lambda r: r["cohort"]) if cohort else (lambda r: r["state"] == "scored_from_bar")
+        scored = sum(1 for r in rs if inc(r))
+        wins = sum(1 for r in rs if inc(r) and r["win"] == 1)
+        out[h] = (scored, wins, round(wins / scored * 100, 1) if scored else None,
+                  sum(1 for r in rs if r["state"] == "scored_from_bar"),
+                  sum(1 for r in rs if r["state"] == "awaiting_bar"),
+                  sum(1 for r in rs if r["state"] == "no_bar_for_symbol"),
+                  sum(1 for r in rs if r["state"] == "no_bar_at_target"))
+    return out
+
+
+def case_v27():
+    objs = bv.load_objects()
+    names = [o.name for o in objs]
+    assert names.index("v_outcome_coverage") > names.index("v_outcome_engine")      # applies after the engine
+    assert [o.path.name for o in objs if o.name == "v_outcome_coverage"] == ["73_v_outcome_coverage.sql"]
+    code = bv._code({o.name: o for o in objs}["v_outcome_coverage"].template)
+    for col in ("COUNTIF(in_engine_cohort) AS engine_scored",
+                "SUM(IF(in_engine_cohort, IFNULL(engine_win_flag, 0), 0)) AS engine_wins",
+                "COUNTIF(engine_state = 'scored_from_bar') AS engine_scorable_now",
+                "COUNTIF(engine_state = 'awaiting_bar') AS engine_awaiting_bar",
+                "COUNTIF(engine_state = 'no_bar_for_symbol') AS engine_no_bar",
+                "COUNTIF(engine_state = 'no_bar_at_target') AS engine_no_bar_at_target",
+                "SUM(engine_scored) AS engine_scored", "SUM(engine_wins) AS engine_wins",
+                "SUM(engine_scorable_now) AS engine_scorable_now", "SUM(engine_awaiting_bar) AS engine_awaiting_bar",
+                "SUM(engine_no_bar) AS engine_no_bar", "SUM(engine_no_bar_at_target) AS engine_no_bar_at_target",
+                "ROUND(SAFE_DIVIDE(u.engine_wins, u.engine_scored) * 100, 1) AS engine_win_rate_pct"):
+        assert col in code, col
+    # the tracker's columns are unchanged (V23 reads them too)
+    assert "COUNTIF(is_scored AND in_outcome_cohort) AS scored" in code
+    rows = [{"horizon": "1W", "state": "scored_from_bar", "cohort": True, "win": 1},
+            {"horizon": "1W", "state": "scored_from_bar", "cohort": True, "win": 0},
+            {"horizon": "1W", "state": "scored_from_bar", "cohort": False, "win": 1},    # a copy of a key
+            {"horizon": "1W", "state": "awaiting_bar", "cohort": False, "win": None},
+            {"horizon": "1M", "state": "no_bar_for_symbol", "cohort": False, "win": None},
+            {"horizon": "1M", "state": "scored_from_bar", "cohort": True, "win": 1},
+            {"horizon": "1M", "state": "no_bar_at_target", "cohort": False, "win": None}]
+    c = _coverage_engine(rows)
+    assert c["1W"] == (2, 1, 50.0, 3, 1, 0, 0) and c["1M"] == (1, 1, 100.0, 1, 0, 1, 1)
+    assert c["ALL"] == (3, 2, 66.7, 4, 1, 1, 1)
+    assert "ALL" not in _coverage_engine(rows, with_all=False)
+    assert _coverage_engine(rows, cohort=False)["1W"][:3] == (3, 2, 66.7)     # every copy counted: wrong
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
-         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20]
+         case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
+         case_v22, case_v23, case_v24, case_v25, case_v26, case_v27]
 
 
 def test_v1(): case_v1()
@@ -875,6 +1549,13 @@ def test_v17(): case_v17()
 def test_v18(): case_v18()
 def test_v19(): case_v19()
 def test_v20(): case_v20()
+def test_v21(): case_v21()
+def test_v22(): case_v22()
+def test_v23(): case_v23()
+def test_v24(): case_v24()
+def test_v25(): case_v25()
+def test_v26(): case_v26()
+def test_v27(): case_v27()
 
 
 if __name__ == "__main__":

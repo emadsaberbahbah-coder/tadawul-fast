@@ -31,7 +31,7 @@ SYNC_DEFAULTS = {
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
 
-# 2026-10-27: v6.52.0 [OUTCOME-TALLY] maps in both tracker lanes.
+# 2026-10-27: v6.55.0 (authored as v6.52.0) [OUTCOME-TALLY] maps in both tracker lanes.
 TRACKER_DEFAULTS["TRACK_OUTCOME_TALLY"] = "off"
 
 

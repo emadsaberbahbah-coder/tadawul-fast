@@ -205,3 +205,14 @@ A four-lens adversarial review ran (off identity, semantics on production-shaped
 ## Merge note (2026-11-01)
 
 #841 (track_performance v6.50.0 [LOG-READ]) merged first. This branch was merged onto main `bf1510ed` with a merge commit: the v6.52.0 WHY block sits above #841's v6.50.0 block (kept verbatim), `SCRIPT_VERSION = "6.52.0"` (open #845 still claims 6.51.0), the verifier pin is 6.52.0 with both dated comments, and the workflow headers read 1.0.8 above 1.0.6. Both Variables (`TRACK_OUTCOME_TALLY`, `TRACK_LOG_UNFORMATTED_READ`) are mapped in both tracker steps. The harness base moved from `e8337a16` to `bf1510ed`, so T7's exact additions set is again this release's. The golden-negative numbers above were measured against `e8337a16` before the merge.
+
+## Merge note (2026-11-02)
+
+#894 (track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY], clock workflow 1.0.7) merged first. This branch was merged onto main `3bbf3c80` with a merge commit and renumbered:
+- `SCRIPT_VERSION` 6.52.0 -> 6.55.0 (open #845 claims 6.54.0); the log tag is now `[v6.55.0 OUTCOME-TALLY]`. Read 6.52.0 / `[v6.52.0 OUTCOME-TALLY]` / header 1.0.8 above as 6.55.0 / `[v6.55.0 OUTCOME-TALLY]` / 1.0.9.
+- The WHY block sits directly above #894's v6.53.0 block (verbatim), with a renumber line and a MERGE NOTE; #841's v6.50.0 block is now above it. Off is v6.53.0 behaviour (v6.50.0 while `TRACK_HIST_CLOSE_SOURCE=yfinance` and `TRACK_AUDIT_DUE_ONLY=0`).
+- `audit_active_records`: `_outcome_tally_begin()` runs right before #894's due-only selection; the tally lines still follow the HIST-CLOSE (and ARCHIVE-BAR) lines.
+- Clock workflow header 1.0.9 above main's 1.0.7 (open #845 claims 1.0.8); verifier pin 6.55.0 with every dated comment kept.
+- Harness base `bf1510ed` -> `3bbf3c80`, so T3 proves off against main's v6.53.0 and T7's exact additions set is again this release's (now keyed on 6.55.0). `OFF_GOLDEN` is unchanged (`30ffbf022760aef3`): the v6.53.0 base gives the same T3 output. `ci.yml` is still not touched (no fetch line: the harness runs only in the advisory whole-suite job, where T3 checks the digest and T7 skips).
+- #894's `tests/test_track_performance_v6530_archive_bar.py`: its exact 6.53.0 pins became floors; its exact added-functions set applies on 6.53.0 only.
+- Golden negative against `3bbf3c80`: 9 failed, 1 passed (T3).

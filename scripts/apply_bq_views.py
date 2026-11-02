@@ -2,8 +2,51 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.3.1 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.5.0 (program register C8, Phase 2)
 ================================================================================
+v1.5.0 (2 Nov 2026, the learning loop from the archive). WHY (owner, 2 Nov
+2026: "learning is slow ... improve today, results tomorrow"; "layers for
+recommendations so the system still issues them when one is available"):
+the tracker closes a forecast only when an audit holds a live quote of
+exactly the target session, so 5,759 overdue records waited on 1 Nov while
+the bar archive already held those sessions' closes. New: v_outcome_engine
+(every Performance_Log record scored from the archived daily close of the
+first session on/after its target - engine_state, engine ROI and verdict,
+best / worst excursion, touched target, a 1W / 2W / 1M / 3M ladder, the
+first engine-scored record per key as the cohort, and the sheet's own
+outcome beside it with agree / disagree), v_outcome_calibration (engine win
+rate, realized ROI, ROI capture, excursions and the sheet's rate by
+confidence, reliability tier, data-quality tier, sector, market, horizon,
+origin, risk, recommendation and week, with a calibration flag) and
+v_board_archive (recommendation layer 2: the Top-10 panel's default gates
+re-run over the archived universe, research only, executable = FALSE).
+Changed: v_outcome_coverage adds the engine's scored / wins / rate and
+backlog states per horizon (file renumbered 69 -> 73, after the engine it
+reads). Research views: the live system never reads BigQuery; no decision,
+gate, count or broker action depends on them.
+v1.4.1 (1 Nov 2026, review follow-up on #886): v_outcome_coverage counts
+scored calls and wins over the sheet's outcome cohort only (in_outcome_cohort:
+the first valid matured record per stable key, as track_performance's
+_summary_outcome_cohort counts them) and publishes matured_cohort and
+matured_excluded beside the raw matured count, so a key archived twice can
+never count twice in the win rate; v_portfolio_insight publishes
+weight_sar_pct only when every holding has a riyal value (NULL for all rows
+otherwise, with holdings_without_value saying how many), so a holding with no
+rate can no longer leave the others sharing 100 % of a partial book. No other
+object changes.
+v1.4.0 (1 Nov 2026, full review: data accuracy and honest presentation on the
+Looker pages). New: v_fx_sar (currency -> riyal from the Commodities_FX page)
+and v_outcome_coverage (how much of the Performance_Log has matured, per
+horizon, so a win rate always sits next to its denominator). Changed:
+v_symbol_rating adds rating_gate / tfb_rating_display (the engine's verdict
+beside every rating: blocked, do not invest, watch only, below the floors,
+none - a Positive rating never overrides it) and the analyst / news sources;
+v_top10_insight adds seat_kind and allocation (a row without a ticket reads
+'none - research board', never an order); v_portfolio_insight gives riyal
+value, cost, P&L and weight for every holding (the decision page's figures
+first, else the sheet's values times v_fx_sar) with value_source. WHY (owner
+request 1 Nov 2026): "avoid any data presentation interpretation ...
+continuous presenting recommendation, avoid misleading".
 v1.3.1 (1 Nov 2026, the one-symbol page): v_symbol_candles also gives
 last_close (the symbol's newest close) and open / high / low /
 close_vs_last_pct, every candle in percent points against that close. The
@@ -82,7 +125,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.1"
+__version__ = "1.5.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

@@ -1,4 +1,4 @@
-"""track_performance v6.52.0 [OUTCOME-TALLY] -- one observe line per audit
+"""track_performance v6.55.0 [OUTCOME-TALLY] -- one observe line per audit
 saying why due records did or did not mature, per exchange calendar
 (TRACK_OUTCOME_TALLY = off (default) | observe).
 
@@ -39,7 +39,7 @@ Yahoo fallback off.
       -> no line; only live quote kinds are stamped; the first stamp wins;
       helpers never raise
   T6  workflow and pins: both tracker steps map the Variable once (default
-      'off'), header 1.0.8, SCRIPT_VERSION >= 6.52.0 in lockstep with
+      'off'), header 1.0.9, SCRIPT_VERSION >= 6.55.0 in lockstep with
       docstring line 5 and the verify_deployment pin
   T7  ASCII added lines (the inherited U+2013 on docstring line 5 excepted),
       zero removals at any depth (Class.method included), exactly this
@@ -49,9 +49,10 @@ Yahoo fallback off.
 
 The module under test is scripts/track_performance.py, or the file named by
 TFB_TRACK_UNDER_TEST (golden negative: point it at the untouched base copy,
-git show bf1510ed:scripts/track_performance.py). The base for T3 / T7 is
-TFB_TRACK_BASE, else `git show bf1510ed:scripts/track_performance.py`
-(main after #841, v6.50.0; e8337a16 until the 2026-11-01 merge).
+git show 3bbf3c80:scripts/track_performance.py). The base for T3 / T7 is
+TFB_TRACK_BASE, else `git show 3bbf3c80:scripts/track_performance.py`
+(main after #894, v6.53.0; bf1510ed from the 2026-11-01 merge, e8337a16
+before it). Authored as v6.52.0 / header 1.0.8; renumbered 2026-11-02.
 
 Run: python tests/test_tracker_outcome_tally.py  (prints PASS k/k)
  or: python -m pytest -q tests/test_tracker_outcome_tally.py
@@ -81,7 +82,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 UNDER_TEST = Path(os.environ.get("TFB_TRACK_UNDER_TEST") or ROOT / "scripts" / "track_performance.py")
-BASE_SHA = "bf1510ed"   # main after #841 (v6.50.0); was e8337a16
+BASE_SHA = "3bbf3c80"   # main after #894 (v6.53.0); was bf1510ed, then e8337a16
 ENV = "TRACK_OUTCOME_TALLY"
 PREFIXES = ("TRACK_", "TFB_TRACK_", "TFB_PERF_")
 UTC = timezone.utc
@@ -90,12 +91,13 @@ US_CLOSE = datetime(2026, 10, 8, 20, tzinfo=UTC)
 SR_CLOSE = datetime(2026, 10, 8, 12, tzinfo=UTC)
 OBSERVE = {ENV: "observe"}
 OFF_SPELLINGS = (None, "", "off", "0", "1", "true", "on", "enforce", "observed")
-# sha256[:16] of the base (v6.49.0) T3 output; proven against the base in T3
-# when the base is available, checked alone on a shallow CI checkout.
+# sha256[:16] of the base (v6.49.0; v6.53.0 since the 2026-11-02 merge) T3
+# output; proven against the base in T3 when the base is available, checked
+# alone on a shallow CI checkout.
 OFF_GOLDEN = "30ffbf022760aef3"
 ADDED = {"_outcome_tally_mode", "_outcome_tally_begin", "_outcome_tally_end",
          "_outcome_tally_stamp", "_outcome_tally_calendar", "_outcome_tally_lines"}
-TAG = "[v6.52.0 OUTCOME-TALLY]"
+TAG = "[v6.55.0 OUTCOME-TALLY]"
 
 
 def _load(path: Path, name: str):
@@ -568,13 +570,13 @@ def test_t8_calendar_name_matches_outcome_sessions_without_building_calendars():
 
 def test_t6_workflow_mapping_and_version_pins():
     import yaml
-    assert _version(TP.SCRIPT_VERSION) >= (6, 52, 0), TP.SCRIPT_VERSION
+    assert _version(TP.SCRIPT_VERSION) >= (6, 55, 0), TP.SCRIPT_VERSION
     src = UNDER_TEST.read_text(encoding="utf-8")
     assert src.split("\n")[4].endswith("(v%s)" % TP.SCRIPT_VERSION), src.split("\n")[4]
     verify = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("track_performance", "%s", "track performance")' % TP.SCRIPT_VERSION in verify
     clock = (ROOT / ".github" / "workflows" / "track_performance.yml").read_text(encoding="utf-8")
-    assert "# VERSION 1.0.8 (2026-10-27) -- WHY DUE RECORDS DID NOT MATURE (OWNER OPT-IN)" in clock
+    assert "# VERSION 1.0.9 (2026-10-27) -- WHY DUE RECORDS DID NOT MATURE (OWNER OPT-IN)" in clock
     want = "${{ vars.TRACK_OUTCOME_TALLY || 'off' }}"
     for name, step_suffix in (("track_performance.yml", "Run performance clock"),
                               ("daily_sync.yml", "Track Performance (record + audit)")):
@@ -615,7 +617,7 @@ def test_t7_ascii_added_lines_and_zero_removals():
 
     assert names(src) - names(new) == set(), sorted(names(src) - names(new))
     added_names = names(new) - names(src)
-    if TP.SCRIPT_VERSION == "6.52.0":        # exactly this release's additions
+    if TP.SCRIPT_VERSION == "6.55.0":        # exactly this release's additions
         assert added_names == ADDED, sorted(added_names)
     else:                                    # a later release may add more
         assert ADDED <= added_names, sorted(added_names)
