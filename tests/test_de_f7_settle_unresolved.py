@@ -125,13 +125,18 @@ def _without_unres(row):
 
 def _holdback_reference(scorer, max_passes):
     """Today's (v5.152.0) non-stable branch, computed directly: the result plus
-    _f7_settle_holdback on the same row."""
+    _f7_settle_holdback on the same row. v5.158.0 (F-7 v2b): under observe the
+    v2 shadow's tag follows the holdback - the failure row carries no
+    confidence marker, so its shadow is the result itself: stx:p<n> plus the
+    pass-1 -> pass-2 diff, composed by _f7_settle_tag."""
     row = f7._failure_row()
     os.environ[MAX_ENV] = str(max_passes)
     with patch.object(de, "_compute_scores_canonical_first", scorer), \
             patch.object(de, "_apply_phase_dd_enhancements", lambda r: r):
         result = de._f7_settle_result(row)
     de._f7_settle_holdback(row, result)
+    if de._f7_settle_mode() == "observe":
+        de._v573_append_warning(row, de._f7_settle_tag("observe", None, result.passes_run, list(result.first_diff)))
     return row
 
 
@@ -335,7 +340,8 @@ def test_u8_wiring_and_version():
     assert src.count("if _f7_settle_unresolved(row):  # v5.153.0 (WP-2b): an unresolved score never seats a board row") == 1
     # prior contracts intact
     assert src.count("scoring_settle=%s") == 1 and src.count("tuple_noise=%s") == 1
-    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx)") == 1
+    # v5.157.0 (F-7 v2): the call site passes the inferred market scope page
+    assert src.count("merged = _f7_settle_pass(merged, sym, page_ctx, scope_page=self._f7_scope_page(sym))") == 1
     assert de._F7_UNRESOLVED_RANK_TAG == "rank_skipped_settle_unresolved"
     assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 153, 0)
     assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v" + de.__version__ in src

@@ -1062,8 +1062,10 @@ def test_v633_far_future_reject_is_logged_not_clamped():
 def test_v416_runtime_version_matches_file():
     """Telemetry must match the current file header as the route advances."""
     header = ast.get_docstring(ast.parse(_AA_SRC))
+    # 2026-10-28: the header dash may be an em dash or the ASCII "--" (the
+    # v4.19.0 header follows the ASCII-only rule for added lines).
     advertised = _g5_re.search(
-        r"^Advanced Analysis Root Owner\s*—\s*v(\d+\.\d+\.\d+)",
+        r"^Advanced Analysis Root Owner\s*(?:\u2014|--)\s*v(\d+\.\d+\.\d+)",
         header, _g5_re.MULTILINE)
     assert advertised is not None, "route header must advertise its current version"
     runtime = _AA.ADVANCED_ANALYSIS_VERSION

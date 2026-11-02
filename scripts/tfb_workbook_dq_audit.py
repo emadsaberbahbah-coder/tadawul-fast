@@ -3,6 +3,11 @@
 tfb_workbook_dq_audit.py - offline DQ-01..DQ-75 measurement harness over a TFB
 workbook export (WP-0 of the 2026-10-11 audit framework).
 
+v1.0.4 (2026-10-24) - verify validator scope against the actual page census.
+DQ-72 accepts a complete 1,500-row page and detects any partial, missing,
+duplicate or failed coverage receipt. The old Count == 1500 heuristic both
+rejected exact-size pages and missed caps at other sizes.
+
 v1.0.3 (2026-10-14) - preserve unknown Top-10 KPI observations.
 Both Entered cash (SAR) and legacy Deployable (SAR) strips are recognized by
 unique Selected/Passed headers. Missing, ambiguous or malformed Selected
@@ -143,7 +148,7 @@ import sys
 import tempfile
 import time
 
-SCRIPT_VERSION = "1.0.3"   # DQ-45 recognizes both KPI titles and preserves unknown.
+SCRIPT_VERSION = "1.0.4"   # DQ-72 reconciles actual page scope and audit receipts.
 
 # --------------------------------------------------------------------------- #
 # CONFIG - every threshold, vocabulary and policy constant lives here
@@ -2748,22 +2753,34 @@ def dq_72_validator_scope(ctx):
         return not_checked("DQ-72", "validator_scope", "I", "ops", "Dashboard_Audit header 'Page|Check' not found", "", "WP-10")
     ix = _header_index(rows, hi)
     body = rows[hi + 1:]
-    vals, ex, capped = {}, [], 0
+    vals, ex, coverage = {}, [], {}
     for r in body:
         page, chk = _s(r[ix["Page"]]), _s(r[ix["Check"]])
         n = _num(r[ix["Count"]]) if "Count" in ix else None
-        if chk == "scope.coverage" and n is not None:
+        if chk == "scope.coverage":
             vals[f"{page}:coverage"] = n
-            if n == 1500:
-                capped += 1
-                ex.append(f"{page} capped at 1500")
+            state = _s(r[ix["Status"]]).upper() if "Status" in ix else ""
+            detail = _s(r[ix["Detail"]]) if "Detail" in ix else ""
+            coverage.setdefault(page, []).append((n, state, detail))
         if chk == "sanity.roi12_within_softcap" and n is not None:
             vals[f"{page}:roi12_audit"] = n
+    for page, source in ctx["pages"].items():
+        if page not in set(MARKET_PAGES) | {PORTFOLIO_PAGE}:
+            continue
+        expected = source.n
+        vals[f"{page}:source_rows"] = expected
+        receipts = coverage.get(page, [])
+        if len(receipts) != 1:
+            ex.append(f"{page} has {len(receipts)} scope receipts; expected one for {expected} rows")
+            continue
+        n, state, detail = receipts[0]
+        if n != expected or state != "PASS" or "SAMPLE_ONLY" in detail.upper():
+            ex.append(f"{page} scope {n}/{expected}, status={state or 'UNKNOWN'}")
     gm = ctx["pages"].get("Global_Markets")
     if gm:
         vals["Global_Markets:roi12_dq33"] = sum(1 for r in gm.body if (gm.num(r, "Expected ROI 12M") or 0) > THRESHOLDS["roi12_soft_cap"])
-    return check("DQ-72", "validator_scope", "I", "ops", "FAIL" if capped else "PASS", capped, vals, ex,
-                 "pages whose Dashboard_Audit scope.coverage Count == 1500 (sampled); its roi12_within_softcap count vs the full-page DQ-33 count",
+    return check("DQ-72", "validator_scope", "I", "ops", "FAIL" if ex else "PASS", len(ex), vals, ex,
+                 "pages missing one passing scope receipt whose row count matches the full source page; its roi12_within_softcap count vs the full-page DQ-33 count",
                  "validator reads full pages", "WP-10")
 
 
@@ -3777,6 +3794,10 @@ def build_synthetic(dirpath, clean=True):
         runlog_levels = ["INFO", "WARN", "WARNING"]                            # DQ-70 WARN/WARNING
         status_vocab = ["SUCCESS", "success", "OK", "SUCCESS"]                 # DQ-71
         dash_cov["Global_Markets"] = 1500.0                                    # DQ-72
+        # Other synthetic defects add physical source rows; keep their audit
+        # scope receipts current so DQ-72 isolates the one intentional mismatch.
+        dash_cov["Commodities_FX"] = 6.0
+        dash_cov["Mutual_Funds"] = 4.0
         s1_detail = "2/10 scored days · 8 excluded-infra"                 # DQ-73
         quota_line = quota_line.replace("rows402 new=0", "rows402 new=3")      # DQ-74 402 events
         http_rows = [("502", "/v1/advanced/sheet-rows")] * 11                  # DQ-74 502 x11

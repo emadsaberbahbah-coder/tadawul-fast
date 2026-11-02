@@ -1,5 +1,53 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.9 (2026-11-02) -- SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0)
+# WHY (runs of 1-2 Nov 2026; owner, 2 Nov: "the system costs a lot ...
+# improve today, results tomorrow"): the final job 'Audit final coverage and
+# decision clocks' judges the native cockpit BEFORE the asynchronous Apps
+# Script render of Top_10_Investments / Portfolio_Decision has consumed this
+# run, so a healthy scheduled sync ends red on timing alone and both cockpits
+# read 'source readiness VERIFIED (run <id>)' seven to eight minutes later
+# (release_after_sync went green at 12:33Z and 19:13Z on 1 Nov). The red runs
+# hide real failures and burn runner minutes.
+# WHAT: ONE gated step, 'Await the native cockpit render (handshake)',
+# immediately BEFORE the final audit: scripts/await_cockpit_receipts.py
+# --wait-only, the same read-only poll release_after_sync.yml uses, until
+# both cockpits carry the receipt for THIS run or the bound ends
+# (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It only
+# DELAYS the audit: '|| true', never fails the job, never writes, never
+# dispatches; its JSON joins the final publication artifact and one line
+# goes to the step summary. The audit, every veto and --publish-blockers are
+# byte-identical. The job timeout rises 30 -> 55 minutes (the 20-minute cap
+# plus the step's own 25-minute backstop); nothing else in the job changes.
+# GATE: vars.TFB_SYNC_AWAIT_RENDER (1/true/yes/on). Unset (default): the
+# step is skipped and the workflow behaves exactly as v1.0.8.
+# ROLLBACK: unset the variable, or revert this step and the timeout.
+# VERSION 1.0.8 (2026-10-29) -- FW2-STALE-PE ENV MAPPING (run_dashboard_sync 6.71.0)
+# Both page-writing jobs map TFB_SYNC_FW2_STALE_PE, default 'off' (the 6.70.2
+# FW-2 call, byte-identical). WHY: the v6.71.0 block in run_dashboard_sync.py.
+# VERSION 1.0.7 (2026-10-28) -- _Status STAMP RETRY BUDGET 300 S
+# (1.0.5 and 1.0.6 are claimed by open PRs #778 and #779.)
+# WHY (run 40556442682, 27 Oct 2026 18:03Z): the Global_Markets leg wrote
+# 6,611 rows, then its _Status stamp FAILED - two reads of _Status!A:A each
+# hit the 60 s socket timeout and the 90 s retry budget (run_dashboard_sync
+# v6.70.2 default) allowed no third attempt. Global_Markets kept run
+# 40484148059 while every other page carried 40556442682, so the Top-10
+# cockpit read 'source readiness WITHHELD: Global_Markets source run ...
+# differs from cohort ...' until a later sync - the 21 Oct E1 class again.
+# Both page-writing jobs (sync-dashboard, recover-missing-market-pages) now
+# map TFB_SYNC_STATUS_STAMP_DEADLINE_S with a default of 300: the default 4
+# attempts (backoff 3 / 8 / 15 s) fit even when every read waits its full
+# 60 s (worst case about 266 s, paid only by a stamp that keeps failing).
+# The repository Variable of the same name overrides it (the script clamps
+# 10..600); setting it to 90 restores v1.0.4. Env mapping only: no step,
+# gate, threshold or other job changes.
+# VERSION 1.0.4 (2026-10-21) -- TRUTHFUL BACKEND 401/403 SUMMARY
+# WHY (run 39513589733, #4998): the leg warned "batches recovered, SYNC DONE
+# failed=0" because ONE of its two SYNC DONE lines said failed=0 while the
+# other said failed=2. Recovery is now claimed only when every SYNC DONE line
+# reports failed=0, the real failed= counts are printed in both messages, and
+# a higher exit code is never lowered to 1. Messages name main.py 8.14.6 (the
+# auth wall no longer answers 401 for downstream errors). Text-only otherwise.
 # VERSION 1.0.3 (2026-10-13) -- SUPERSEDE A RELEASED DECISION FEED AT WRITER START (P0-1)
 # WHY (2026-10-13, Codex P1 on PR #763): with TFB_DECISION_RELEASE armed, a
 # release of run N stayed EXECUTABLE while this workflow re-stamped every page
@@ -446,6 +494,14 @@ jobs:
       TFB_SYNC_OHLC_READBACK: ${{ vars.TFB_SYNC_OHLC_READBACK || '0' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # v1.0.7 (2026-10-28): retry budget for one _Status stamp. 300 s lets
+      # the default 4 attempts run even when each read takes its full 60 s
+      # (run 40556442682 lost the Global_Markets stamp after 2 attempts at 90).
+      TFB_SYNC_STATUS_STAMP_DEADLINE_S: ${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}
+      # v1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE. off keeps
+      # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
+      # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
+      TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
@@ -1222,11 +1278,21 @@ jobs:
           fi
           BK401=$(grep -ciE "httpx.*(401 Unauthorized|403 Forbidden)" "$LOG_FILE" || true)
           if [ "${BK401:-0}" -gt 0 ]; then
-            if grep -qE "SYNC DONE \| .*failed=0" "$LOG_FILE"; then
-              echo "::warning::Backend returned ${BK401} 401/403 response(s) during this leg (transient; batches recovered, SYNC DONE failed=0). If this repeats outside a Render deploy, check TFB_TOKEN on both sides."
+            # 1.0.4 (2026-10-21): recovery is claimed only when EVERY
+            # "SYNC DONE |" summary of this leg reports failed=0 (the portfolio
+            # group and the default group each print one). The 1.0.3 test
+            # matched ANY line, so run 39513589733 printed "failed=0" while the
+            # other summary said failed=2. The real counts are printed, and an
+            # exit code already above 1 is never lowered.
+            DONE_LINES=$(grep -E "SYNC DONE \|" "$LOG_FILE" || true)
+            DONE_N=$(printf '%s\n' "$DONE_LINES" | grep -c "SYNC DONE" || true)
+            DONE_BAD=$(printf '%s\n' "$DONE_LINES" | grep -cE "failed=[1-9][0-9]*" || true)
+            DONE_FAILED=$(printf '%s\n' "$DONE_LINES" | grep -oE "failed=[0-9]+" | tr '\n' ' ' | sed 's/ *$//' || true)
+            if [ "${DONE_N:-0}" -gt 0 ] && [ "${DONE_BAD:-0}" -eq 0 ]; then
+              echo "::warning::Backend returned ${BK401} 401/403 response(s) during this leg; batches recovered (all ${DONE_N} SYNC DONE summaries: ${DONE_FAILED}). Before main.py 8.14.6 the auth wall also answered 401 when a request failed downstream (timeout, dropped response); if this repeats on 8.14.6+, check TFB_TOKEN on both sides."
             else
-              echo "::error::Backend auth failure: ${BK401} 401/403 response(s) and the sync did not complete cleanly. Check TFB_TOKEN (GitHub secret vs Render env)."
-              EXIT_CODE=1
+              echo "::error::Backend returned ${BK401} 401/403 response(s) and the sync did not complete cleanly (SYNC DONE summaries: ${DONE_FAILED:-none}). On main.py 8.14.6+ a 401 is a real auth refusal: check TFB_TOKEN (GitHub secret vs Render env)."
+              if [ "$EXIT_CODE" -lt 1 ]; then EXIT_CODE=1; fi
             fi
           fi
 
@@ -1267,11 +1333,18 @@ jobs:
             export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
           fi
           # Capture exit without tripping the default `-e` shell.
+          # Each leg owns only its scoped acquisition pages. Validating other
+          # writers or the asynchronous native cockpit here raced their writes
+          # and also suppressed the success()-guarded tracker. The final job
+          # retains one full contract + native check under the same write lease.
+          VALIDATE_PAGES="$(python scripts/workflow_validation_scope.py pages)"
+          read -r -a PAGE_ARGS <<< "$VALIDATE_PAGES"
           code=0
           python scripts/validate_dashboard.py \
             --sheet-id "$TARGET_SHEET_ID" \
+            --pages "${PAGE_ARGS[@]}" \
             --json-out validate_dashboard.json \
-            --write-sheet 1 || code=$?
+            --write-sheet 0 || code=$?
           echo "validate_exit=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" -ge 2 ]; then
             echo "::error::Dashboard validation failed (exit $code) — see report above / Dashboard_Audit tab."
@@ -1318,18 +1391,20 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
-          # (2026-09-22) P-158 TARGET-UNIT SENTRY — scripts/track_performance.py
-          # v6.39.0 (deployed 2026-09-21: [PERF-VERDICT v6.39.0] selftest=PASS 14/14).
-          # observe: criterion-4 row untouched, stored rows never rewritten; adds
-          # the legacy-vs-unit-corrected MAE block at _S1_Calibration!A4:D9 and
-          # ONE [PERF-UNIT v6.39.0] _Run_Log line per run (fraction/percent/
-          # unresolved counts). Explicit words only: off|observe|enforce.
-          # KILL-SWITCH: delete this line -> off (v6.39.0 default = legacy).
-          # Hardcoded here, not a repo Variable (S-1 lesson 2026-09-10: a Variable
-          # can be silently unset). This step runs in GitHub Actions, so a Render
-          # env var would never be seen. Enforce = separate sitting with the S-1
-          # criterion-4 boundary note.
-          TFB_PERF_TARGET_UNIT_SENTRY: "observe"
+          # v6.48.0: criterion4 uses canonical forecast provenance and pp.
+          # Unproven, ambiguous or duplicate targets cannot supply a sample.
+          # Historical target cells and S1 thresholds remain unchanged.
+          # Rollback: set both workflow lines to observe; legacy stays diagnostic.
+          TFB_PERF_TARGET_UNIT_SENTRY: "enforce"
+          # (2026-10-25) v6.49.0 [BOARD-COVERAGE]: the live Top_10_Investments
+          # board's seated symbols (incl. GRACE ghosts) join the forced-coverage
+          # set, so Signal_History / Performance_Log record the recommendations
+          # the Apps Script board actually publishes (24 Oct: none of the 10
+          # seated names had a snapshot). Default off = v6.48.0 byte-identical.
+          # Mirrored VERBATIM from track_performance.yml (ENV PARITY). Read-back:
+          # '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' job-log line and
+          # Origin Tab 'Decision_Board' in Signal_History. ROLLBACK: unset / 0.
+          TFB_TRACK_BOARD_SYMBOLS: ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}
           # (2026-10-11) P-189b / P-188 / P-191 flag mapping - mirrored VERBATIM from
           # .github/workflows/track_performance.yml's run step (ENV PARITY: the two
           # blocks MUST stay identical; tests/test_track_flags_mapped.py pins it).
@@ -1353,9 +1428,33 @@ jobs:
           # reruns use the same run ID. Canonical targets require price evidence.
           # Read-back: SIGNAL-PUBLICATION logs and canonical_performance export.
           # Rollback: off/0; historical target values and publications stay.
-          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '0' }}
+          # Prospective price-derived percentage points; explicit '0' rolls back.
+          TRACK_CANONICAL_TARGETS: ${{ vars.TRACK_CANONICAL_TARGETS || '1' }}
           TRACK_SIGNAL_PUBLICATION_MODE: ${{ vars.TRACK_SIGNAL_PUBLICATION_MODE || 'off' }}
           TRACK_PUBLICATION_ID: ${{ github.run_id }}
+          # (2026-10-25) track_performance v6.50.0 [LOG-READ]: Performance_Log
+          # numbers read at full precision (UNFORMATTED_VALUE) instead of their
+          # displayed text, so canonical v2 1W/2W targets survive the read-back.
+          # Default off = the v6.49.0 read. Arm: observe for one run, then
+          # enforce; both tracker lanes map the same Variable (ENV PARITY).
+          # Rollback: unset or off.
+          TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
+          # (2026-11-02) track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY],
+          # mirrored VERBATIM from track_performance.yml 1.0.7 (ENV PARITY).
+          # TRACK_HIST_CLOSE_SOURCE: 'yfinance' (default) = the v6.47.0 pull;
+          # 'bq_archive' reads the target-session close from BigQuery
+          # tfb_archive.symbol_bars_daily in ONE query per audit pass. It only
+          # acts while the v6.47.0 historical-close gate is armed, and that gate
+          # is mapped in the Performance Clock lane only, so this lane never
+          # reads the archive. TRACK_AUDIT_DUE_ONLY: '0' (default) prices every
+          # active symbol; '1' prices only the symbols with a due record on a
+          # manual run_tracker=true audit. The TFB_BQ_* trio is the bq_*.yml
+          # pattern. ROLLBACK: unset (or yfinance / 0).
+          TRACK_HIST_CLOSE_SOURCE: ${{ vars.TRACK_HIST_CLOSE_SOURCE || 'yfinance' }}
+          TRACK_AUDIT_DUE_ONLY: ${{ vars.TRACK_AUDIT_DUE_ONLY || '0' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
@@ -1718,6 +1817,14 @@ jobs:
       TFB_SYNC_OHLC_READBACK: ${{ vars.TFB_SYNC_OHLC_READBACK || '0' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # v1.0.7 (2026-10-28): retry budget for one _Status stamp. 300 s lets
+      # the default 4 attempts run even when each read takes its full 60 s
+      # (run 40556442682 lost the Global_Markets stamp after 2 attempts at 90).
+      TFB_SYNC_STATUS_STAMP_DEADLINE_S: ${{ vars.TFB_SYNC_STATUS_STAMP_DEADLINE_S || '300' }}
+      # v1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE. off keeps
+      # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
+      # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
+      TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
@@ -2041,7 +2148,9 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     environment: production
-    timeout-minutes: 30
+    # v1.0.9: 30 -> 55, room for the gated handshake wait (cap 20 min) and
+    # its 25-minute step backstop before the unchanged final audit.
+    timeout-minutes: 55
     env:
       PYTHONPATH: ${{ github.workspace }}
       TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
@@ -2116,15 +2225,83 @@ jobs:
               handle.write('GOOGLE_APPLICATION_CREDENTIALS=' + str(path) + '\n')
           PY
 
+      # (2026-11-02) v1.0.9 SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0
+      # --wait-only). WHY: the audit below judges the native cockpit BEFORE the
+      # asynchronous Apps Script render of Top_10_Investments /
+      # Portfolio_Decision has consumed this run, so a healthy scheduled sync
+      # ends red on timing alone and reads VERIFIED seven to eight minutes
+      # later (1 Nov: 12:33Z, 19:13Z). WHAT: this step only DELAYS the
+      # unchanged audit: the same read-only poll as release_after_sync.yml
+      # (one batchGet of _Status L1:M60 and the two cockpit B2 cells per poll,
+      # the strict audit's own receipt parser), until both cockpits carry
+      # 'source readiness VERIFIED (run <this run>)' or the bound ends
+      # (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It
+      # never fails this job ('|| true'; the script exits 2 only on a
+      # configuration error and never raises), never writes the workbook,
+      # never dispatches anything, and uses the credentials configured above.
+      # Its report joins the final publication artifact; one line goes to the
+      # step summary. GATE: vars.TFB_SYNC_AWAIT_RENDER (1/true/yes/on, as the
+      # release script reads armed words); unset or any other value skips the
+      # step and the job runs exactly as v1.0.8. The audit below keeps every
+      # veto, threshold and --publish-blockers exactly as before.
+      - name: Await the native cockpit render (handshake)
+        if: ${{ contains(fromJSON('["1","true","yes","on"]'), vars.TFB_SYNC_AWAIT_RENDER) }}
+        timeout-minutes: 25
+        env:
+          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}
+        run: |
+          set -euo pipefail
+          rm -f await_render.json
+          python scripts/await_cockpit_receipts.py --wait-only \
+            --run-id "$GITHUB_RUN_ID" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --max-minutes "$TFB_SYNC_AWAIT_RENDER_MIN" \
+            --json-out await_render.json || true
+          python - <<'PY' || true
+          import json, os
+          from pathlib import Path
+          path = Path('await_render.json')
+          line = 'Await render (handshake): no report was written; the audit ran without a wait.'
+          if path.exists():
+              result = json.loads(path.read_text())
+              seen = result.get('consumed_at_s') or {}
+              def at(name):
+                  return 'none' if seen.get(name) is None else 'at %s s' % seen[name]
+              line = ('Await render (handshake): %s after %s s, %s polls; receipts for run %s: '
+                      'Portfolio_Decision %s, Top_10_Investments %s.' % (
+                          result.get('outcome'), result.get('waited_s'), result.get('polls'),
+                          result.get('run_id'), at('pf'), at('t10')))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as handle:
+              handle.write(line + '\n\n')
+          print(line)
+          PY
+
       - name: Audit final coverage and decision clocks
         id: final_audit
         run: |
           set -euo pipefail
+          # The native cockpit is asynchronous and is not a matrix-leg output.
+          # Inspect its real grid only after all source writers/recovery finish.
+          # A failed or missing structural witness still reaches the finalizer's
+          # one downgrade writer; it must never leave an old executable feed.
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
+          fi
+          rm -f final_dashboard_validation.json
+          structure_code=0
+          python scripts/validate_dashboard.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --pages Market_Leaders Global_Markets Commodities_FX Mutual_Funds My_Portfolio Top_10_Investments \
+            --json-out final_dashboard_validation.json \
+            --write-sheet 1 || structure_code=$?
+          python scripts/workflow_validation_scope.py attest \
+            --report final_dashboard_validation.json --process-exit "$structure_code" || true
           code=0
           python scripts/finalize_decision_publication.py \
             --sheet-id "$TARGET_SHEET_ID" \
             --max-rows 20000 \
             --publish-blockers \
+            --decision-structure-report final_dashboard_validation.json \
             --json-out final_decision_publication.json || code=$?
           echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
           if [[ "$code" -ne 0 ]]; then
@@ -2150,13 +2327,18 @@ jobs:
                       handle.write('| ' + key + ' | ' + json.dumps(result.get(key)) + ' |\n')
                   handle.write('\nNative installation and refresh are required before executable decisions.\n')
           PY
+          python scripts/render_audit_summary.py \
+            --final-report final_decision_publication.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload final publication evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: final-decision-publication-${{ github.run_id }}
-          path: final_decision_publication.json
+          path: |
+            final_decision_publication.json
+            final_dashboard_validation.json
+            await_render.json
           retention-days: 30
           if-no-files-found: warn
 

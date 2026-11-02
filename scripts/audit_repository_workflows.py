@@ -41,6 +41,29 @@ def _line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
+def _force_refetch_evidence(value: str) -> str:
+    """Classify source evidence only; a repository expression is not runtime state."""
+    value = value.strip()
+    if re.fullmatch(r"(?:''|\"\"|'\s*'|\"\s*\"|null|~)?\s*(?:#.*)?", value, re.I):
+        return "empty"
+    expression = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}\s*(?:#.*)?", value)
+    if expression:
+        inner = expression.group(1)
+        literal = re.fullmatch(r"(['\"])(.*?)\1", inner)
+        if literal:
+            return "literal" if literal.group(2).strip() else "empty"
+        fallback = re.fullmatch(
+            r"(?:vars|inputs)\.[A-Za-z_][A-Za-z0-9_]*\s*\|\|\s*(['\"])(.*?)\1",
+            inner,
+        )
+        if fallback and fallback.group(2).strip():
+            return "nonempty_default"
+        return "runtime_unknown"
+    if value in {"|", ">", "|-", ">-", "|+", ">+"}:
+        return "runtime_unknown"
+    return "literal"
+
+
 def audit_workflow_text(path: str, text: str) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -101,14 +124,28 @@ def audit_workflow_text(path: str, text: str) -> list[Finding]:
         ))
 
     for match in re.finditer(
-        r"(?m)^\s*TFB_SYNC_FORCE_REFETCH_SYMBOLS\s*:\s*.+$", text
+        r"(?m)^[ \t]*TFB_SYNC_FORCE_REFETCH_SYMBOLS[ \t]*:[ \t]*(?P<value>[^\r\n]*)$", text
     ):
+        evidence = _force_refetch_evidence(match.group("value"))
+        if evidence == "empty":
+            continue
+        if evidence == "runtime_unknown":
+            findings.append(Finding(
+                "NOTICE",
+                "RUNTIME_OVERRIDE_UNVERIFIED",
+                path,
+                _line_number(text, match.start()),
+                "force-refetch is configurable; source text cannot establish its effective runtime value",
+            ))
+            continue
         findings.append(Finding(
             "WARN",
             "TEMPORARY_OVERRIDE_ACTIVE",
             path,
             _line_number(text, match.start()),
-            "one-run force-refetch override remains active; verify and remove after the repair run",
+            ("one-run force-refetch has a nonempty source default; effective runtime value is unverified"
+             if evidence == "nonempty_default" else
+             "one-run force-refetch has a nonempty literal; verify and remove after the repair run"),
         ))
 
     id_token = re.search(r"(?m)^\s*id-token\s*:\s*write\s*$", text)
@@ -156,8 +193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(args.root).resolve()
     findings = audit_paths(_default_paths(root))
     for finding in findings:
+        annotation = {"WARN": "warning", "NOTICE": "notice", "ERROR": "error"}[finding.severity]
         print(
-            f"::{finding.severity.lower()} file={finding.path},line={finding.line}::"
+            f"::{annotation} file={finding.path},line={finding.line}::"
             f"{finding.code}: {finding.detail}"
         )
 

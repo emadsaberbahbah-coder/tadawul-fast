@@ -110,12 +110,47 @@ from zoneinfo import ZoneInfo
 # v1.1.4: replace the complete header/body/tail in one atomic values request.
 # A transport failure before commit no longer leaves known events erased;
 # lost acknowledgement after commit leaves the complete new table, not a mix.
-__version__ = "1.1.4"
+# v1.2.0 (2026-10-27): LAST REPORT DATE (program register A4, the
+# post-earnings quarantine data lane). WHY: FRST.US was bought on 26 Oct two
+# sessions after a 22% EPS miss (Q3 reported 22 Oct after the close; -4.1%
+# and -3.7% on heavy volume the next sessions). This tab only knew its NEXT
+# report (2027-01-28), so neither the cockpit's earnings tag nor the owner's
+# manual earnings rule - both forward-only - could see that the name had just
+# reported and missed. WHAT: TFB_CAL_LAST_REPORT = off (DEFAULT: the
+# 7-column table, the A1:G read and write and every log line are v1.1.4 byte
+# for byte) | on. When on, core.providers.calendar_provider v1.3.0
+# fetch_last_earnings_sync() adds, per symbol, the LATEST report date in the
+# last TFB_CALENDAR_DAYS_BACK days (default 21, 1..120) and its EPS surprise
+# %, and three columns are appended AFTER Source: Last Earnings Date | Days
+# Since Earnings | EPS Surprise %. Every existing reader is unaffected (the
+# GAS cockpit reads A:G; the tracker and the brief read by header name).
+# FILL-ONLY CARRY: a harvested symbol whose fresh fetch has no report keeps a
+# prior row's last report while it is still inside the window (a provider 429
+# must not erase a quarantine); a carried report never resurrects a symbol
+# and expires with the window. The prior read widens to A1:J only when the
+# tab already has 10 columns; the tab grows to 10 columns before the write.
+# One summary line: last_report: with=n fresh=f carried=c window=Nd.
+# Rollback: unset TFB_CAL_LAST_REPORT; the next run writes A1:G again and
+# blanks H:J in the same atomic update (review fix below).
+# Review fix (Codex P2 on PR #850): with the lane off the publication is
+# A:G only, so rows could move under H:J values an earlier ON run left
+# behind, and a re-arm inside the window would carry another row's report
+# (FRST's -22.2% landing on ZTO). When the lane is off and the tab still
+# holds the last-report block (>= 10 columns AND H1:J1 equal to the three
+# last-report headers), the off run now writes A1:J with H:J blank, header
+# included; a 7-column tab (never armed) stays v1.1.4 byte for byte.
+# Functions added: _last_report_enabled, _last_report_window, _to_num,
+# _days_since, _past_report, parse_prior_last, merge_last_report,
+# last_report_cells, _stale_last_report_cols. Removed: 0.
+__version__ = "1.2.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
 
 HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
            "Next Ex-Div Date", "Days To ExDiv", "Updated At (Riyadh)", "Source"]
+# v1.2.0: appended after Source only when TFB_CAL_LAST_REPORT is on.
+LAST_REPORT_HEADERS = ["Last Earnings Date", "Days Since Earnings",
+                       "EPS Surprise %"]
 
 
 def _out(msg: str) -> None:
@@ -145,6 +180,36 @@ def _is_ticker_shaped(sym: str) -> bool:
     return bool(_TICKER_RE.match((sym or "").strip().upper()))
 
 
+def _last_report_enabled() -> bool:
+    """v1.2.0 gate - DEFAULT OFF. TFB_CAL_LAST_REPORT=on (or 1/true/yes)
+    adds the three last-report columns; anything else is v1.1.4."""
+    return _env("TFB_CAL_LAST_REPORT", "off").lower() in ("on", "1", "true", "yes")
+
+
+def _last_report_window() -> int:
+    """v1.2.0: look-back days for the last report (TFB_CALENDAR_DAYS_BACK,
+    default 21, clamped 1..120 - the provider's own bounds)."""
+    try:
+        v = int(float(_env("TFB_CALENDAR_DAYS_BACK", "21") or "21"))
+    except ValueError:
+        v = 21
+    return max(1, min(120, v))
+
+
+def _to_num(value: Any) -> Optional[float]:
+    """v1.2.0: finite float from a cell or payload value, else None."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace("%", "").replace(",", "")
+    if not text:
+        return None
+    try:
+        v = float(text)
+    except ValueError:
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
 def _today_riyadh() -> _dt.date:
     return _dt.datetime.now(_RIYADH).date()
 
@@ -157,6 +222,25 @@ def _days_until(iso: Optional[str]) -> Any:
         return (d - _today_riyadh()).days
     except Exception:
         return ""
+
+
+def _days_since(iso: Any) -> Any:
+    """v1.2.0: whole days from a YYYY-MM-DD report to today (Riyadh); ''."""
+    text = str(iso or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return ""
+    try:
+        return (_today_riyadh() - _dt.date.fromisoformat(text)).days
+    except ValueError:
+        return ""
+
+
+def _past_report(value: Any, window: int) -> Optional[str]:
+    """v1.2.0: the canonical report day when it lies 1..window days ago."""
+    d = _days_since(value)
+    if d == "" or not (1 <= d <= window):
+        return None
+    return str(value).strip()
 
 
 def _future_date(value: Any) -> Optional[str]:
@@ -346,6 +430,93 @@ def apply_sticky(symbols: List[str],
     return symbols_out, ctx_out, carried, n_fill, n_res
 
 
+def parse_prior_last(values: List[List[Any]], window: int) -> Dict[str, Dict[str, Any]]:
+    """v1.2.0: {SYM: {"date": iso, "surprise": float|None}} from the prior
+    tab's Last Earnings Date / EPS Surprise % columns - reports still inside
+    the window only (the past expires); ticker-shape guarded like
+    parse_prior. A tab without the column yields {}."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not values:
+        return out
+    hdr_i, cs, cd, cp = -1, -1, -1, -1
+    for i, row in enumerate(values[:5]):
+        low = [str(c or "").strip().lower() for c in row]
+        if "symbol" in low:
+            hdr_i, cs = i, low.index("symbol")
+            for j, h in enumerate(low):
+                if h == "last earnings date":
+                    cd = j
+                elif h == "eps surprise %":
+                    cp = j
+            break
+    if hdr_i < 0 or cs < 0 or cd < 0:
+        return out
+    for row in values[hdr_i + 1:]:
+        sym = str(row[cs] if cs < len(row) else "").strip().upper()
+        if not sym or sym == "SYMBOL" or sym in out:
+            continue
+        if _ticker_guard_enabled() and not _is_ticker_shaped(sym):
+            continue
+        d = _past_report(row[cd] if cd < len(row) else "", window)
+        if d is None:
+            continue
+        out[sym] = {"date": d,
+                    "surprise": _to_num(row[cp] if 0 <= cp < len(row) else None)}
+    return out
+
+
+def merge_last_report(symbols: List[str],
+                      fresh: Dict[str, Dict[str, Any]],
+                      prior_last: Dict[str, Dict[str, Any]],
+                      window: int) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    """v1.2.0: (merged, n_fresh, n_carried). Fresh provider data wins; a
+    prior report fills a symbol the fresh fetch left empty while it is still
+    inside the window; a symbol outside `symbols` is never added."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    n_fresh = n_carried = 0
+    for s in symbols:
+        f = (fresh or {}).get(s) or {}
+        d = _past_report(f.get("last_earnings_date"), window)
+        if d:
+            merged[s] = {"date": d, "surprise": _to_num(f.get("eps_surprise_pct")),
+                         "carried": False}
+            n_fresh += 1
+            continue
+        p = (prior_last or {}).get(s) or {}
+        d = _past_report(p.get("date"), window)
+        if d:
+            merged[s] = {"date": d, "surprise": _to_num(p.get("surprise")),
+                         "carried": True}
+            n_carried += 1
+    return merged, n_fresh, n_carried
+
+
+def _stale_last_report_cols(ws: Any) -> bool:
+    """v1.2.0 review fix: True when the tab still carries the last-report
+    block of an earlier ON run - at least 10 columns AND H1:J1 equal to
+    LAST_REPORT_HEADERS. A narrower tab -> False without any read; a failed
+    header read -> WARN and False (H:J left as is)."""
+    cols = getattr(ws, "col_count", None)
+    if not isinstance(cols, int) or cols < len(HEADERS) + len(LAST_REPORT_HEADERS):
+        return False
+    try:
+        got = ws.get("A1:J1")
+    except Exception as e:
+        _out(f"WARN: last-report header read failed ({e}) - H:J left as is")
+        return False
+    head = [str(c or "").strip() for c in (got[0] if got else [])][7:10]
+    return head == LAST_REPORT_HEADERS
+
+
+def last_report_cells(symbol: str, merged: Dict[str, Dict[str, Any]]) -> List[Any]:
+    """v1.2.0: [Last Earnings Date, Days Since Earnings, EPS Surprise %]."""
+    m = (merged or {}).get(symbol)
+    if not m:
+        return ["", "", ""]
+    sp = m.get("surprise")
+    return [m["date"], _days_since(m["date"]), "" if sp is None else round(float(sp), 1)]
+
+
 def build_rows(symbols: List[str],
                ctx: Dict[str, Dict[str, Optional[str]]],
                source: str,
@@ -442,6 +613,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"WARN: provider failed ({e}) — writing blank dates")
         ctx, source = {}, f"provider error — blank dates"
 
+    # v1.2.0: the last-report lane (DEFAULT OFF = v1.1.4 byte for byte).
+    lr_on = _last_report_enabled()
+    lr_window = _last_report_window()
+    prior_last: Dict[str, Dict[str, Any]] = {}
+
     # Read one sentinel row beyond the supported full table. Never replace a
     # truncated prior table: that would erase unseen future sticky events.
     prior: Dict[str, Dict[str, str]] = {}
@@ -455,12 +631,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         read_rows = allocated_rows if isinstance(allocated_rows, int) and allocated_rows > 0 \
             else _MAX_CALENDAR_BODY_ROWS + 2
-        prior_values = prior_sheet.get(f"A1:G{read_rows}")
+        # v1.2.0: widen the read only when the tab already holds the
+        # last-report columns (a read beyond the grid would fail).
+        prior_cols = getattr(prior_sheet, "col_count", None)
+        read_last = "J" if (lr_on and isinstance(prior_cols, int)
+                            and prior_cols >= len(HEADERS) + len(LAST_REPORT_HEADERS)) else "G"
+        prior_values = prior_sheet.get(f"A1:{read_last}{read_rows}")
         if len(prior_values) > _MAX_CALENDAR_BODY_ROWS + 1:
             _out("ERROR: prior calendar exceeds bounded full-table capacity — preserving tab")
             return 2
         prior_extent = max(min(read_rows, _MAX_CALENDAR_BODY_ROWS + 1), len(prior_values))
         prior = parse_prior(prior_values)
+        if lr_on:
+            prior_last = parse_prior_last(prior_values, lr_window)
     except Exception as e:
         _out(f"WARN: prior-tab read failed ({e}) — no carry this run")
         if write and type(e).__name__ != "WorksheetNotFound":
@@ -475,6 +658,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     _out(f"rows: {len(rows)} | with at least one date: {filled} | "
          f"carried={n_fill} resurrected={n_res} | "
          f"prior_junk_purged={getattr(parse_prior, 'junk_purged', 0)}")
+    headers = list(HEADERS)
+    if lr_on:
+        fresh_last: Dict[str, Dict[str, Any]] = {}
+        try:
+            from core.providers.calendar_provider import (  # noqa: PLC0415
+                fetch_last_earnings_sync, is_enabled as _lr_enabled)
+            if _lr_enabled():
+                fresh_last = fetch_last_earnings_sync(symbols, lr_window) or {}
+        except Exception as e:
+            _out(f"WARN: last-report fetch failed ({e}) - prior reports only")
+        merged_last, n_lf, n_lc = merge_last_report(symbols, fresh_last, prior_last, lr_window)
+        rows = [r + last_report_cells(r[0], merged_last) for r in rows]
+        headers += LAST_REPORT_HEADERS
+        _out(f"last_report: with={len(merged_last)} fresh={n_lf} carried={n_lc} "
+             f"window={lr_window}d")
+    last_col = "J" if lr_on else "G"
 
     if not write:
         for r in rows[:15]:
@@ -482,24 +681,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out("dry-run — nothing written (pass --write to publish)")
         return 0
 
+    # v1.2.0 review fix: lane off on a tab an earlier ON run widened -> blank
+    # H:J (header included) in the same atomic update, so the old reports can
+    # never be carried onto rows that moved under them.
+    if not lr_on and prior_sheet is not None and _stale_last_report_cols(prior_sheet):
+        headers += [""] * len(LAST_REPORT_HEADERS)
+        rows = [r + [""] * len(LAST_REPORT_HEADERS) for r in rows]
+        last_col = "J"
+        _out("last_report: off - clearing H:J left by an earlier ON run")
+
     try:
         extent = max(1000, len(rows) + 1, prior_extent)
         ws = prior_sheet
         if ws is None:
-            ws = book.add_worksheet(title=tab, rows=extent, cols=len(HEADERS))
+            ws = book.add_worksheet(title=tab, rows=extent, cols=len(headers))
         else:
             allocated_rows = getattr(ws, "row_count", None)
             if isinstance(allocated_rows, int) and allocated_rows < extent:
                 # Growing the grid preserves all existing cells. A cancelled
                 # or rejected publication after resize still has its old facts.
                 ws.resize(rows=extent)
-        values = [list(HEADERS)] + rows + [
-            [""] * len(HEADERS) for _ in range(extent - len(rows) - 1)]
+            # v1.2.0: the last-report columns need a 10-column grid.
+            allocated_cols = getattr(ws, "col_count", None)
+            if lr_on and isinstance(allocated_cols, int) and allocated_cols < len(headers):
+                ws.resize(cols=len(headers))
+        values = [list(headers)] + rows + [
+            [""] * len(headers) for _ in range(extent - len(rows) - 1)]
         # Sheets applies one Values.update atomically. Include explicit blanks
         # through the entire old extent: null/omitted cells would retain stale
         # values. Do not clear separately or retry after an ambiguous response;
         # acknowledgement loss may mean the complete replacement already won.
-        ws.update(values=values, range_name=f"A1:G{extent}",
+        ws.update(values=values, range_name=f"A1:{last_col}{extent}",
                   value_input_option="RAW")
         try:
             ws.freeze(rows=1)
@@ -596,6 +808,43 @@ def _selftest() -> int:
                    and not _is_ticker_shaped("GC=F")
                    and not _is_ticker_shaped("BRK-B")
                    and not _is_ticker_shaped("TOOLONGNAME.US")))
+    # --- v1.2.0: last-report lane (pure helpers; gate parsing) ---
+    d3 = (today - _dt.timedelta(days=3)).isoformat()
+    d30 = (today - _dt.timedelta(days=30)).isoformat()
+    lr_tab = [HEADERS + LAST_REPORT_HEADERS,
+              ["FRST.US", "", "", "", "", "x", "eodhd", d3, 3, -22.2],
+              ["OLD.US", "", "", "", "", "x", "eodhd", d30, 30, 5.0],
+              ["FORECAST", "", "", "", "", "x", "eodhd", d3, 3, 1.0]]
+    pl = parse_prior_last(lr_tab, 21)
+    checks.append(("last report: prior inside the window kept, expired/junk dropped",
+                   list(pl) == ["FRST.US"] and pl["FRST.US"] == {"date": d3, "surprise": -22.2}
+                   and parse_prior_last(tab, 21) == {}))
+    merged, nf2, nc2 = merge_last_report(
+        ["FRST.US", "NEW.US", "GONE.US"],
+        {"NEW.US": {"last_earnings_date": d3, "eps_surprise_pct": 4.04},
+         "GONE.US": {"last_earnings_date": d30, "eps_surprise_pct": 1.0}},
+        {"FRST.US": pl["FRST.US"], "LOST.US": {"date": d3, "surprise": 1.0}}, 21)
+    checks.append(("last report: fresh wins, prior fills, out-of-window and unharvested ignored",
+                   sorted(merged) == ["FRST.US", "NEW.US"] and nf2 == 1 and nc2 == 1
+                   and merged["FRST.US"]["carried"] is True
+                   and merged["NEW.US"]["carried"] is False))
+    checks.append(("last report: cells (date, days since, surprise rounded 0.1; blanks)",
+                   last_report_cells("NEW.US", merged) == [d3, 3, 4.0]
+                   and last_report_cells("ABSENT.US", merged) == ["", "", ""]))
+    saved_lr = os.environ.get("TFB_CAL_LAST_REPORT")
+    states = []
+    for v in (None, "", "off", "observe", "on", "1", "TRUE"):
+        if v is None:
+            os.environ.pop("TFB_CAL_LAST_REPORT", None)
+        else:
+            os.environ["TFB_CAL_LAST_REPORT"] = v
+        states.append(_last_report_enabled())
+    if saved_lr is None:
+        os.environ.pop("TFB_CAL_LAST_REPORT", None)
+    else:
+        os.environ["TFB_CAL_LAST_REPORT"] = saved_lr
+    checks.append(("last report: gate default off; on/1/true arm it",
+                   states == [False, False, False, False, True, True, True]))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)

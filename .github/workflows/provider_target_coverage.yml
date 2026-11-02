@@ -1,5 +1,8 @@
 name: Provider Target Coverage Alert
 
+# v1.1.2 (2026-10-24): retain the red audit and expose the recovery prerequisite
+# in the job summary. Empty/missing references still require explicit reviewed
+# bootstrap; this workflow never initializes one merely to clear a failure.
 # W1B-1 v1.1 — read-only forecast-provenance coverage audit.
 # External audit 2026-08-17 (4 P0 accepted): the cached file is now the
 # LAST-GOOD reference, mutated by the Python only on eligible healthy runs
@@ -97,6 +100,7 @@ jobs:
         env:
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_PTC_DROP_PCT: ${{ github.event.inputs.drop_pct || vars.TFB_PTC_DROP_PCT || '20' }}
           TFB_PTC_ROW_DROP_PCT: ${{ vars.TFB_PTC_ROW_DROP_PCT || '30' }}
           TFB_PTC_MIN_ROWS: ${{ vars.TFB_PTC_MIN_ROWS || '50' }}
@@ -112,6 +116,22 @@ jobs:
             --state provider_target_last_good.json \
             --observation-out provider_target_observation.json \
             --json-out provider_target_coverage.json
+
+      - name: Explain audit recovery without accepting a baseline
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from scripts.audit_provider_target_coverage import render_step_summary
+          report = Path('provider_target_coverage.json')
+          if report.is_file():
+              text = render_step_summary(json.loads(report.read_text()))
+          else:
+              text = '# Provider-target coverage\n\nUNKNOWN: no report was produced. Inspect the failed step; do not bootstrap without verified source evidence.\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write(text)
+          PY
 
       - name: Validate baseline before caching
         id: baseline

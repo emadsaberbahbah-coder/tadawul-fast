@@ -526,7 +526,9 @@ app = FastAPI()
 snapshot = main._mount_routes_controlled(app)
 assert ("platform_source", "routes.platform_source") in main._CONTROLLED_ROUTE_PLAN
 assert "routes.platform_source" in snapshot["mounted"]
-mounted = [(r.path, r.methods, r.endpoint.__module__) for r in app.routes
+# Included routers may be lazy; retain the exact route/owner check through
+# the same effective-route view used by the application's diagnostics.
+mounted = [(r.path, r.methods, r.endpoint.__module__) for r in main._iter_effective_routes(app.routes)
            if getattr(r, "path", "").startswith("/v1/platform")]
 assert mounted == [(auth.SOURCE_READ_PATH, {"POST"}, "routes.platform_source")]
 app.add_middleware(main.GlobalAuthEnforcementMiddleware)

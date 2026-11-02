@@ -354,21 +354,31 @@ def test_main_actual_public_error_handler_keeps_status_request_id_and_success(
     assert success.status_code == 200 and success.json() == expected
 
 
-def _calendar(credentials, captured, respond):
+def _calendar(credentials, captured, respond, split="", venue="", suffix="", code_map=None):
     logger = logging.getLogger("calendar.boundary.offline")
     logger.handlers = [logging.StreamHandler(captured)]
     logger.propagate = False
     logger.setLevel(logging.DEBUG)
+    # 2026-10-27: calendar_provider v1.3.1 reads TFB_CALENDAR_SPLIT_404 through
+    # _env_str; `split` is its value here ('' = off, the v1.3.0 path).
     namespace = {"httpx": httpx, "_dt": dt, "asyncio": asyncio,
         "__version__": "synthetic-offline", "logger": logger,
         "is_enabled": lambda: True, "_api_key": lambda: credentials[0],
         "_base_url": lambda: "https://calendar.invalid/api",
-        "_split_symbols": lambda symbols: ({"SYNTHETIC.US": "SYNTHETIC"}, []),
+        "_split_symbols": lambda symbols: (dict(code_map or {"SYNTHETIC.US": "SYNTHETIC"}), []),
         "_today": lambda: dt.date(2026, 10, 8),
         "_env_int": lambda name, default, **kwargs: default,
+        "_env_str": lambda name, default="": {"TFB_CALENDAR_SPLIT_404": split,
+            "TFB_CALENDAR_VENUE_BATCHES": venue, "TFB_CALENDAR_SUFFIX_MAP": suffix}.get(name, default),
         "_client": lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond))}
+    # 2026-10-27: v1.3.2 adds the venue-batch / exchange-code helpers (both
+    # gates read '' here = off, the v1.3.1 path).
     return _definitions("core/providers/calendar_provider.py",
-        {"_get_json", "fetch_earnings_map", "_iso", "_parse_date"}, namespace)
+        {"_get_json", "fetch_earnings_map", "_iso", "_parse_date",
+         "_split_404_enabled", "_is_http_404", "_split_state", "_earnings_items_split",
+         "_earnings_split_payload", "_log_split_state",
+         "_venue_batches_enabled", "_suffix_map_enabled", "_calendar_code",
+         "_earnings_codes", "_venue_of", "_earnings_batches"}, namespace)
 
 
 @pytest.mark.parametrize("status", [401, 503])
@@ -389,6 +399,50 @@ def test_calendar_actual_httpx_status_error_cannot_log_query_key(
     assert "earnings batch failed" in captured.getvalue()
     assert str(status) in captured.getvalue()
     _assert_no_credentials(captured.getvalue(), credentials)
+
+
+def test_calendar_split_404_never_logs_query_key(credentials, logging_state):
+    """2026-10-27 (calendar_provider v1.3.1): with the split armed, a 404 batch
+    is retried and the rejected code is named in one WARNING line - the line
+    carries codes and counts only, never the request URL or the key."""
+    captured = io.StringIO()
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(404, text="synthetic not found", request=request)
+
+    source = _calendar(credentials, captured, respond, split="on")
+    result = asyncio.run(source.fetch_earnings_map(["SYNTHETIC"]))
+    assert result == {} and len(requests) == 1
+    assert requests[0].url.params.get("api_token") == credentials[0]
+    text = captured.getvalue()
+    assert "EODHD rejected 1 code(s): SYNTHETIC.US" in text
+    assert "calendar.invalid" not in text and "api_token" not in text
+    _assert_no_credentials(text, credentials)
+
+
+def test_calendar_exchange_codes_never_log_query_key(credentials, logging_state):
+    """2026-10-27 (calendar_provider v1.3.2): with venue batches and the
+    exchange-code map armed, the request carries EODHD's code and the WARNING
+    line names it with the translation counts - never the URL or the key."""
+    captured = io.StringIO()
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(404, text="synthetic not found", request=request)
+
+    source = _calendar(credentials, captured, respond, split="on", venue="on", suffix="on",
+                       code_map={"SYNTHETIC.L": "SYNTHETIC.L"})
+    result = asyncio.run(source.fetch_earnings_map(["SYNTHETIC.L"]))
+    assert result == {} and len(requests) == 1
+    assert requests[0].url.params.get("symbols") == "SYNTHETIC.LSE"
+    assert requests[0].url.params.get("api_token") == credentials[0]
+    text = captured.getvalue()
+    assert "EODHD rejected 1 code(s): SYNTHETIC.LSE" in text and "L->LSE x1" in text
+    assert "calendar.invalid" not in text and "api_token" not in text
+    _assert_no_credentials(text, credentials)
 
 
 def test_calendar_success_keeps_earliest_future_mapping_and_one_request(credentials, logging_state):

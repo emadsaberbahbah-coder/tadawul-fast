@@ -123,7 +123,20 @@ from typing import Any, Dict, List, Optional, Tuple
 # LiveSource.integrity_tab). Changed: 3 (_page_columns optional argument,
 # _top10_sections and check_decision_integrity A3 read integrity_tab).
 # Removed: 0.
-# v1.0.11 (2026-10-20, Codex P2 on PR #808) -- RELOCATED AUDIT GRID.
+# v1.0.11 (2026-11-02) -- THE COCKPIT'S TP1 GAIN KPI IS READ, NAMED.
+# WHY: 16_Decision_Top10 v1.20.0 (Script Property DT10_KPI_PLAN_GAIN=on)
+# relabels the KPI 'Exp. Gain 12M (SAR)' as 'Exp. Gain TP1 (SAR)' (the plan
+# payoff, ticket x (TP1 / price - 1), instead of the annualised figure).
+# D10-1c read the gain only under the old label for its evidence text, so
+# with the gate on it would print 'gain_kpi=-'. CHANGE: when the 12M label
+# is absent or blank, the TP1 label is read and the evidence names its basis
+# ('gain_kpi=11,078 SAR (TP1 plan payoff)'). Evidence text only: no verdict,
+# measured value, threshold or read changes; with the cockpit gate off (the
+# default) every row is the v1.0.10 row. Functions added / removed: 0.
+# v1.0.12 (2026-10-20, Codex P2 on PR #808) -- RELOCATED AUDIT GRID.
+# Renumbered from v1.0.11 on 2026-11-02 after #895 shipped v1.0.11 (above).
+# MERGE NOTE: read 're-deploy v1.0.10' below as 're-deploy v1.0.11'; with
+# the gate off this file runs exactly as v1.0.11.
 # WHY: 16_Decision_Top10 DT10_CAND_TAB=enforce moves the audit grid to the
 # hidden tab _T10_Candidates (row 1 run stamp + receipt JSON in column 2,
 # row 2 headers, rows 3.. data; dt10CandTabWrite_) and leaves the section
@@ -140,7 +153,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # missing tab is recorded in .errors (fail-closed). ROLLBACK: unset the
 # Variable, or re-deploy v1.0.10. Functions added: 2 (_cand_tab_pointer,
 # _cand_tab_audit). Changed: 1 (_top10_sections). Removed: 0.
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^&/]{0,23}$")
 _NUM_RE = re.compile(r"^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?$")
@@ -651,6 +664,8 @@ def check_board(src: Source, board_min: int) -> List[Check]:
     else:
         gap = x["kpi_funded"] - x["exec"]
         gain = _s(k.get("Exp. Gain 12M (SAR)"))
+        if not gain and _s(k.get("Exp. Gain TP1 (SAR)")):   # v1.0.11: cockpit v1.20.0 KPI label
+            gain = _s(k.get("Exp. Gain TP1 (SAR)")) + " (TP1 plan payoff)"
         vc = "PASS" if gap == 0 else ("FAIL" if gap > 0 else "WARN")
         out.append(Check("D10-1c", "funded-KPI parity (Fundable Now == board exec)", vc, gap,
                          f"kpi_funded={x['kpi_funded']} exec={x['exec']} gain_kpi={gain or '-'}"
@@ -944,7 +959,7 @@ def _top10_sections(src: Source) -> Dict[str, Tuple[List[str], List[List[str]]]]
         elif prev.startswith("CANDIDATES") and "audit" not in out:
             out["audit"] = (r, body(i))
     if _live_window_enabled() and "audit" in out and _cand_tab_pointer(out["audit"][1]):
-        moved = _cand_tab_audit(src)   # v1.0.11: DT10_CAND_TAB=enforce layout
+        moved = _cand_tab_audit(src)   # v1.0.12: DT10_CAND_TAB=enforce layout
         if moved is not None:
             out["audit"] = moved
     return out
@@ -954,13 +969,13 @@ _CAND_TAB = "_T10_Candidates"
 
 
 def _cand_tab_pointer(body: List[List[str]]) -> bool:
-    """v1.0.11: True when the cockpit audit body is the one pointer line that
+    """v1.0.12: True when the cockpit audit body is the one pointer line that
     16_Decision_Top10 (DT10_CAND_TAB=enforce) writes instead of the grid."""
     return bool(body) and any(f"written to hidden tab {_CAND_TAB}" in _s(c) for c in body[0])
 
 
 def _cand_tab_audit(src: Source) -> Optional[Tuple[List[str], List[List[str]]]]:
-    """v1.0.11: (header, body) of _T10_Candidates when its receipt (row 1,
+    """v1.0.12: (header, body) of _T10_Candidates when its receipt (row 1,
     column 2) is COMMITTED and its row count matches the data rows; else None."""
     rows = [[_s(c) for c in r] for r in src.integrity_tab(_CAND_TAB)]
     if len(rows) < 2 or len(rows[0]) < 2:

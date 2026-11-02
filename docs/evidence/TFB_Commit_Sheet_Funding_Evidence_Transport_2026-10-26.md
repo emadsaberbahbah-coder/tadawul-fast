@@ -1,0 +1,48 @@
+# TFB Commit Sheet — Funding evidence transport (16_Decision_Top10 v1.16.0 + 10_My_Portfolio v1.5.16)
+
+Date: 2026-10-26 (Monday, first-ticket day). Branch `fix/funding-evidence-transport-20261026`.
+Status: **built and tested in the repo; NOT pasted into the live Apps Script project.** Paste only after today's FRST fill is recorded (owner step, evening of 26 Oct or Tuesday 27 Oct morning before 08:30).
+
+## 1. WHY (verified on the live workbook, 26 Oct 08:09–09:12 Riyadh)
+- The first 3/3 board (FRST.US, ZTO.US, CRC.US ACTIVE day 3) rendered **unsized**: Ticket 0 SAR, Shares 0, Entry/Stop/TP "—", advisor note *Research seat — no executable allocation today*, EXECUTABLE 0 of 10, SIZING PREVIEW ONLY 0 SAR. Portfolio_Decision v2 read **"IBKR evidence UNKNOWN"**.
+- Trace: the cockpit's allocate replay POSTs the same body as its first request. The backend's allocate stage (`core/analysis/opportunity_builder._portfolio_input_assessment` → `core/portfolio_reconciliation.certify_portfolio_inputs`) withholds executable funding unless **all** of: a fresh (≤ 900 s) packet in `portfolio.reconciliation_evidence`; `cash_available_sar` equal to the packet's certified cash (settled − reserved × proven rate) to the cent; `fx_rates` equal to the packet's FX proofs; every holding row linked to a packet position and every positive position represented; `holdings_input_incomplete === false`; `pending_proceeds_sar == 0`; holding `value_sar == price × fx × quantity` (±0.01).
+- The cockpit forwarded the document property `TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1` since v1.11.x, but **nothing wrote it** ("Nothing writes it today", 10_My_Portfolio v1.5.11). 10_My_Portfolio v1.5.12+ already builds exactly that packet from the read-only IBKR capture and sends it with *its own* request (status line `ibkr evidence SENT (…)`), i.e. two producers, one packet, no hand-over. Three more mismatches would have withheld funding even with the packet present: cash from the Top_10 panel (82,819.20, before the day's BUY reservation 174 × 15.20), `fx_rates.USD` from `TFB_FX_LOOKUP` (3.7448 vs the 3.75 peg in the proof), and the Sukuk row 5023.SR (Tadawul custody) that can never link to an IBKR position.
+- Consequence: the executable funding path had never been exercisable in production. Not a stability-layer, feed or release defect — those passed.
+
+## 2. WHAT
+
+### 16_Decision_Top10.gs v1.16.0 [FUNDING-EVIDENCE]
+- Script Property **`DT10_FUNDING_EVIDENCE`** = off (DEFAULT: request body, status line and every render byte-identical to v1.15.0) | on.
+- `dt10FundingApply_(body, nowMs)` runs once after the holdings and cash-source blocks; the PURE `dt10FundingApplyCore_` applies the packet IN PLACE only when every check holds: schema 1; `captured_at` with explicit offset; age 0..840 s; holdings sent (`DT10_SEND_HOLDINGS`) and read complete; FX proofs readable at 2 decimals. Then: rows in `PD_EXECUTION_EXCLUDE` leave the funding cohort; `holding_links` rebuilt for THIS request's rows (native symbol + currency; unrepresented positives disclosed); `cash_available_sar` = certified cash in integer cents (round half-even, as the backend); `pending_proceeds_sar = 0`; `fx_rates` gains the proven rates (USD 3.75); kept rows with a proven currency, quantity and price get `value_sar` recomputed at that rate. The allocate replay deep-copies the applied body.
+- Status line: ` | funding evidence APPLIED (capture age Nm; cash X SAR; linked a/b; excluded …; USD 3.75)` or ` | funding evidence NOT APPLIED (<reason>)`. Never the packet.
+- Functions added 15 (`dt10FundingMode_`, `dt10FundingExcludeList_`, `dt10FundingSym_`, `dt10FundingUnits_`, `dt10FundingDiv_`, `dt10FundingAge_`, `dt10FundingNative_`, `dt10FundingRates_`, `dt10FundingCashCents_`, `dt10FundingLinks_`, `dt10FundingDecimal_`, `dt10FundingValueSar_`, `dt10FundingApplyCore_`, `dt10FundingNote_`, `dt10FundingApply_`), vars 5, removed 0; `dt10SelfTest` gains `funding evidence core`. Census 199 → 214 functions, 107 → 112 vars.
+
+### 10_My_Portfolio.gs v1.5.16 [EVIDENCE PUBLICATION]
+- Script Property **`PD_IBKR_EVIDENCE_PUBLISH`** = off (DEFAULT: byte-identical to v1.5.15) | on.
+- Under `PD_IBKR_EVIDENCE=enforce`, when the plan is fresh and the packet is SENT, `pdIbkrPublish_` writes the SAME packet (≤ 9,000 chars) to the document property; status line gains ` | evidence published` (or ` | evidence NOT published: <reason>`).
+- Timing: `pdIbkrCaptureWatch`, after a refresh that published, arms ONE one-off trigger `pdIbkrEvidenceFollowUp` (+60 s) which clears itself, re-checks the packet age (≤ 840 s), consults the Decision Chain's guards when 26_ is present (automation paused / sync in flight / cockpit running / quiet window) and calls `refreshDecisionTop10()`. One `_Run_Log` row (handler `pdIbkrEvidenceFollowUp`, page Top_10_Investments, OK/FAILED/SKIPPED) + one Logger line; never the packet.
+- Functions added 8, vars 5, removed 0; `pdSelfTest` reports the publish mode, follow-up trigger state and `follow-up core: ok`.
+
+### Expected first run (Tuesday morning, both properties on)
+capture 08:40 → watcher ≤ 08:45 → PD refresh (`ibkr evidence SENT … | evidence published`) → follow-up 08:46–08:47 → Top_10 status line `… | funding evidence APPLIED (capture age ~6m; cash 72901.20 SAR; linked 1/1 [FRST.US]; excluded 5023.SR; USD 3.75) | …` → allocate replay certifies → confirmed seats sized (Ticket/Shares/Entry/Stop/TP filled). If the morning 08:07 render precedes the capture, it stays unsized and the follow-up render is the sized one.
+
+## 3. Tests (all local, node 22 + venv311)
+- `tests/test_dt10_funding_evidence.js` — 103 checks: mode reader, integer ports (units, half-even division), FX proofs, certified cash (72,901.20 from 22,085.12 − 2,644.80 × 3.75; over-reserved / incomplete / no proof fail), links (FRST↔FRST.US, 'BRK B'→BRK-B.US, ambiguous→unlinked, unrepresented), value_sar at the peg (15.20 × 174 × 3.75 = 9,918.00), core apply with untouched-body invariants (stale 841 s, future, naive stamp, schema, holdings absent/incomplete, bad proof, over-reserved), note format, kill identity through the orchestrator, ES5/ASCII lint + inventory, **golden negative on the v1.15.0 base (sha256 e099e187…)**.
+- `tests/test_pd_evidence_publish.js` — 61 checks: publish mode, property written verbatim/oversized/unavailable/throws, follow-up core (12 cases), arm/remove (never stacks), follow-up end to end (renders + clears trigger + run-log OK; stale → SKIPPED; chain guard; broken chain read does not block; render error → FAILED; no cockpit; no packet; off; no _Run_Log sheet), wiring (publication inside the enforce branch; watcher marker + arming), kill identity, lint + inventory, **golden negative on the v1.5.15 base (sha256 343ade4d…)**: zero functions removed, exactly 8 added.
+- Version-chain oracle extended: `tests/js/dt10_cash_utc_history.js` gains `v1150Source` (reverses the 7 v1.16.0 hunks in `tests/js/dt10_edits_v1160.json`, hash-pinned to the v1.15.0 file); pending-grace and confirm-basis oracles chain through it. Pins moved in 8 sibling harnesses (dt10 pending grace, confirm basis, input truth, source readiness, feed cohort binding, bulk format, ledger fx state, pf all-cash + its python lockstep test).
+- Green: all 7 dt10 node harnesses, both new harnesses, the 9 CI native Apps Script harnesses, and the python suites that read the two files (`test_pf_allcash_ok`, `test_gas_ledger_fx_failed_state`, `test_pf_ibkr_evidence`, `test_pf_source_receipt`, `test_top10_kpi_label_compat`, `test_approved_scope_native_binding`, `test_daily_brief_blocked_inputs`, `test_executable_quote_conflicts`, `test_release_decision_feed`: 228 passed, 12 skipped).
+- CI v1.1.38 runs both harnesses in the native Apps Script step.
+
+## 4. Owner paste order (after the FRST fill is recorded)
+1. Paste `16_Decision_Top10.gs` v1.16.0 (includes v1.15.0) → run `dt10SelfTest` → expect `funding evidence core: ok (mode off, packet absent)` and `pending grace core: ok`.
+2. Paste `10_My_Portfolio.gs` v1.5.16 → run `pdSelfTest` → expect `evidence publish (PD_IBKR_EVIDENCE_PUBLISH): off; follow-up trigger: none armed` and `follow-up core: ok`.
+3. Script Properties (bound project): `PD_IBKR_EVIDENCE_PUBLISH=on`, `DT10_FUNDING_EVIDENCE=on` (plus the already planned `TFB_T10_PENDING_GRACE_DAYS=1`). Prerequisites already live: `PD_IBKR_EVIDENCE=enforce`, `PD_EXECUTION_EXCLUDE=5023.SR`, `DT10_SEND_HOLDINGS` on (default), capture watcher installed, `TFB_DECISION_CHAIN=on`.
+4. Verify Tuesday 08:47: Portfolio_Decision B2 carries `evidence published`; `_Run_Log` has one `pdIbkrEvidenceFollowUp` OK row; Top_10 B2 carries `funding evidence APPLIED (…)`; the confirmed seats show Ticket/Shares/Entry/Stop/TP.
+
+## 5. Rollback
+- `DT10_FUNDING_EVIDENCE=off` and/or `PD_IBKR_EVIDENCE_PUBLISH=off` (no re-paste; byte-identical behaviour). To drop a lingering packet: delete document property `TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1` (the backend's own freshness check already rejects a stale one). Re-paste v1.15.0 / v1.5.15 from Apps Script project history if needed.
+
+## 6. Known limits / follow-ups
+- Tomorrow's FRST holding row needs My_Portfolio's provider / last-updated columns for the backend's quote-freshness check (existing path, v1.13.x proof fields); if the row's quote is stale at 08:47 the backend withholds with `holding_quote_unverified` — disclosed in the backend reason, not a GAS defect.
+- `value_sar` is recomputed only for kept rows with a proven currency, a quantity and a price; otherwise the backend's `holding_value_unverified` applies.
+- The engine's Upside/Downside % unit issue and PR #835 (engine 5.159.0) remain separate items.

@@ -172,7 +172,33 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 #   byte-untouched; prior excluded days stand; the counter continues.
 # Rollback: env off (or git revert). Functions added: 5. Removed: 0.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.5.0"
+# ---------------------------------------------------------------------------
+# VERSION 1.6.0 (2026-10-28) - READ A SETTLED TOP-10 (weekly review D7)
+# EVIDENCE (shadow_board.yml logs, [SHADOW-BOARD] cands=): morning runs read
+#   6-25 candidates every day; evening runs read 0 on 20, 21, 23 and 27 Oct
+#   (5, 10, 10, 10 on the other evenings). 27 Oct: this job started 19:24:47Z
+#   (22:24:47 Riyadh, board stamp "as of 2026-10-27 22:25") while
+#   26_Decision_Chain was re-rendering Top_10_Investments every ~5 min (its
+#   _Run_Log rows at 22:14:35, 22:19:58 and 22:27:32 Riyadh close renders of
+#   about 2 min each). A render writes "status: running..." into B2, then
+#   clears every zone from row 18 down (dt10RenderPayload_) before repainting,
+#   so a read inside that window finds no "Symbol" header and rows_to_records
+#   returns []: cands=0, Shadow_Board rows 0, and the S-1 scorer reads
+#   board_rows=0 for that day.
+# FIX: TFB_SHADOW_T10_READ_RETRIES = 0 (default, one read: byte-identical to
+#   v1.5.0) .. 20. When > 0 and the first read is empty (no candidate rows)
+#   or B2 says the cockpit is rendering ("status: running"), the tab is read
+#   again after TFB_SHADOW_T10_READ_WAIT_S seconds (default 30, 5..120), up to
+#   that many times, and the first settled read (rows present, not rendering)
+#   is used. A read that never settles keeps v1.5.0's result (whatever the
+#   last read parsed). One log line when armed:
+#   "[SHADOW-BOARD-READ v1.6.0] retries=<n> first=<empty|rendering|ok>
+#   final=<ok|empty|rendering> cands=<k>". No gate, verdict, ranking, sizing,
+#   freeze, regime or ROI path changes.
+# Functions added: 4 (_t10_read_retries, _t10_read_wait_s, top10_rendering,
+#   read_top10_settled). Removed: 0. Rollback: env 0 (or git revert).
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "1.6.0"
 # -----------------------------------------------------------------------------
 # v1.3.0 (2026-08-30) - BLOCKED NAMES GET NO COST MODEL (source-level D-1 fix)
 # -----------------------------------------------------------------------------
@@ -365,6 +391,76 @@ def _symbol_shaped(s: str) -> bool:
         _SYM_SHAPE = (re.compile(r"[A-Z0-9\-\^]{1,10}\.[A-Z]{1,3}"),
                       re.compile(r"[A-Z\-\^]{1,6}"))
     return bool(_SYM_SHAPE[0].fullmatch(s) or _SYM_SHAPE[1].fullmatch(s))
+
+
+ENV_T10_READ_RETRIES = "TFB_SHADOW_T10_READ_RETRIES"    # v1.6.0 0..20, default 0
+ENV_T10_READ_WAIT_S = "TFB_SHADOW_T10_READ_WAIT_S"      # v1.6.0 5..120, default 30
+
+
+def _t10_read_retries() -> int:
+    """v1.6.0: re-reads of an unsettled Top_10 read; 0 (default/junk) = off."""
+    try:
+        v = int(str(os.getenv(ENV_T10_READ_RETRIES) or "0").strip())
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(20, v))
+
+
+def _t10_read_wait_s() -> float:
+    """v1.6.0: seconds between re-reads (default 30, clamped 5..120)."""
+    try:
+        v = float(str(os.getenv(ENV_T10_READ_WAIT_S) or "30").strip())
+    except (TypeError, ValueError):
+        return 30.0
+    return max(5.0, min(120.0, v))
+
+
+def top10_rendering(values: Sequence[Sequence[Any]]) -> bool:
+    """v1.6.0 PURE: True when the cockpit status row (row 2) says a render is
+    in progress ("Last run <stamp> | status: running..."). 16_Decision_Top10
+    writes that line before it clears and repaints the zones."""
+    import re
+    rows = values or []
+    if len(rows) < 2:
+        return False
+    for cell in rows[1] or []:
+        if re.search(r"status:\s*running", str(cell or ""), re.IGNORECASE):
+            return True
+    return False
+
+
+def read_top10_settled(read_fn, retries: int, wait_s: float, sleep_fn=None
+                       ) -> Tuple[List[Sequence[Any]], List[Dict[str, Any]],
+                                  Dict[str, Any]]:
+    """v1.6.0: read Top_10 until it is settled (candidate rows present and the
+    cockpit not rendering), at most `retries` re-reads `wait_s` apart.
+    -> (values, cands, info{retries, first, final}). A failed re-read keeps
+    the last good values; the result of the last read is used when the tab
+    never settles (v1.5.0 behaviour). Injectable read/sleep for tests."""
+    if sleep_fn is None:
+        import time
+        sleep_fn = time.sleep
+
+    def state(vals, recs):
+        if top10_rendering(vals):
+            return "rendering"
+        return "ok" if recs else "empty"
+
+    values = read_fn()
+    cands = rows_to_records(values)
+    first = state(values, cands)
+    st = first
+    n = 0
+    while st != "ok" and n < max(0, int(retries)):
+        sleep_fn(wait_s)
+        n += 1
+        try:
+            values = read_fn()
+        except Exception:  # noqa: BLE001
+            continue
+        cands = rows_to_records(values)
+        st = state(values, cands)
+    return values, cands, {"retries": n, "first": first, "final": st}
 
 
 def rows_to_records(values: Sequence[Sequence[Any]],
@@ -778,7 +874,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     equity = float(os.getenv("TFB_SHADOW_EQUITY_SAR") or "130000")
 
     sh = _open_sheet(args.sheet_id)
-    cands = rows_to_records(sh.worksheet(TAB_TOP10).get_all_values())
+    _t10_tries = _t10_read_retries()                    # v1.6.0 (D7)
+    if _t10_tries > 0:
+        _t10_vals, cands, _t10_info = read_top10_settled(
+            lambda: sh.worksheet(TAB_TOP10).get_all_values(),
+            _t10_tries, _t10_read_wait_s())
+        print(f"[SHADOW-BOARD-READ v{SCRIPT_VERSION}] "
+              f"retries={_t10_info['retries']} first={_t10_info['first']} "
+              f"final={_t10_info['final']} cands={len(cands)}")
+    else:
+        cands = rows_to_records(sh.worksheet(TAB_TOP10).get_all_values())
     try:
         holds = rows_to_records(sh.worksheet(TAB_HOLDINGS).get_all_values())
     except Exception:  # noqa: BLE001

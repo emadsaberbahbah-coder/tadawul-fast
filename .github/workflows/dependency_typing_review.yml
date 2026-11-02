@@ -30,9 +30,49 @@ jobs:
         with:
           python-version: '3.11'
       - name: Audit exact dependency pins
+        id: audit
         run: |
           python -m pip install 'pip-audit==2.9.0'
-          pip-audit --requirement requirements.txt --no-deps --disable-pip
+          code=0
+          pip-audit --requirement requirements.txt --no-deps --disable-pip \
+            --format json --output dependency-audit.json || code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Summarize the retained direct-pin audit
+        if: always()
+        env:
+          AUDIT_EXIT: ${{ steps.audit.outputs.exit_code }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          try:
+              report = json.loads(Path('dependency-audit.json').read_text())
+              rows = report['dependencies']
+              if not isinstance(rows, list) or not rows:
+                  raise ValueError('dependency list unavailable')
+              findings = sum(len(row.get('vulns', [])) for row in rows)
+              skipped = [row['name'] for row in rows if row.get('skip_reason')]
+              code = os.environ.get('AUDIT_EXIT', '')
+              if code != ('1' if findings else '0'):
+                  raise ValueError('process/report outcome differs or is unavailable')
+              text = f'Direct pins: {findings} known advisories; {len(skipped)} skipped entries; audit exit {code}.\n'
+              if skipped:
+                  text += 'Skipped entries: ' + ', '.join(skipped) + '.\n'
+          except Exception as exc:
+              text = 'UNKNOWN: dependency audit evidence unavailable (' + type(exc).__name__ + ').\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as handle:
+              handle.write('### Dependency review (advisory)\n\n' + text)
+              handle.write('\nThis audit covers direct pins; it does not certify resolved transitive dependencies.\n')
+          PY
+      - name: Retain dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-audit-${{ github.run_id }}
+          path: dependency-audit.json
+          if-no-files-found: warn
+          retention-days: 30
   typed-baseline:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

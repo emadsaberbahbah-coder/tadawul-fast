@@ -2,9 +2,10 @@
 """tests/test_acceptance_live_window.py
 scripts/tfb_acceptance.py v1.0.10: TFB_ACCEPTANCE_LIVE_WINDOW lets the LIVE
 reader give the decision-integrity checks A1, A2a and A3 the rows and columns
-they parse (default off = the v1.0.9 reads). v1.0.11 (Codex P2 on #808): with
+they parse (default off = the v1.0.9 reads). v1.0.12 (Codex P2 on #808): with
 the gate on, A2a also reads the committed hidden _T10_Candidates grid when
-DT10_CAND_TAB=enforce has moved the audit there (W7).
+DT10_CAND_TAB=enforce has moved the audit there (W7). Renumbered from v1.0.11
+on 2026-11-02 after #895 shipped a different v1.0.11 (TP1 gain KPI label).
 
 The defect (run 39420446126, 2026-10-20 12:12Z): A1 'Top_10 board section not
 found', A2a 'Top_10 audit section not found', A3-<page> 'Symbol/Name columns
@@ -25,7 +26,7 @@ trailing empty cells and rows. Fixtures are synthetic.
   W5 on: a failed window read is recorded in .errors (fail-closed)
   W6 the export / in-memory sources ignore the gate, and the live window
      measures exactly what the export path measures on the same grid
-  W7 v1.0.11, on, DT10_CAND_TAB=enforce layout (Codex P2 on #808): the cockpit audit is
+  W7 v1.0.12, on, DT10_CAND_TAB=enforce layout (Codex P2 on #808): the cockpit audit is
      one pointer line and the grid sits in the hidden _T10_Candidates (row 1
      stamp + receipt, row 2 headers, rows 3..). A COMMITTED receipt with the
      same row count is read; PENDING, a row-count mismatch or a missing tab
@@ -45,7 +46,8 @@ Offline: no network, no credentials, no live Sheet.
 Run: pytest -q tests/test_acceptance_live_window.py
   or python3 tests/test_acceptance_live_window.py   (PASS k/k + digest)
   TFB_TEST_ACC_BASE=<git show aa1f440c:scripts/tfb_acceptance.py> (v1.0.9) for N1/N2;
-  TFB_TEST_ACC_DELIVERED=<git show 97fa9915:...> (v1.0.10) fails W7 only."""
+  TFB_TEST_ACC_DELIVERED=<git show 97fa9915:...> (v1.0.10) fails W7 only;
+  so does <git show 3bbf3c80:...> (main's v1.0.11, merge note 2026-11-02)."""
 from __future__ import annotations
 
 import contextlib

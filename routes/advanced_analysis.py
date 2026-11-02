@@ -2,6 +2,18 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner -- v4.19.0
+POST-EARNINGS GUARD INPUTS ON THE PORTFOLIO ROUTE (2026-10-28, D1b)
+================================================================================
+portfolio_actions 1.17.0 holds an ADD inside the post-earnings window
+(TFB_PF_ADD_POST_EARN, default off). Its inputs come from Portfolio_Decision
+(10_My_Portfolio v1.5.17 reads Calendar_Events) as body.post_earnings. This
+route forwards that object, when it is a mapping, as
+upstream_meta["post_earnings"] to the builder, which pops it like the
+evidence packet (meta.upstream never echoes it). Absent or not a mapping ->
+upstream_meta is unchanged. No other route, gate or response field changes.
+Zero functions removed or added. Rollback: git revert.
+================================================================================
 Advanced Analysis Root Owner — v4.18.2
 ROUTE AUTH ON THE ROUTED PATH (2026-10-13, SECURITY)
 ================================================================================
@@ -558,7 +570,9 @@ logger.addHandler(logging.NullHandler())
 # v4.18.2 (2026-10-13, SECURITY): _auth_passed reads the ASGI scope path,
 # not the Host-derived request.url.path (see the module docstring). The
 # trailing note on the next line is the v4.18.1 entry, kept as it was.
-ADVANCED_ANALYSIS_VERSION = "4.18.2"  # bind Insights request criteria and budget
+# v4.19.0 (2026-10-28, D1b): portfolio_actions_post forwards
+# body.post_earnings (a mapping) as upstream_meta["post_earnings"].
+ADVANCED_ANALYSIS_VERSION = "4.19.0"  # bind Insights request criteria and budget
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -4568,6 +4582,12 @@ async def portfolio_actions_post(
         "reconciliation_evidence": merged_body.get("reconciliation_evidence"),
         "holdings_input_incomplete": holdings_input_incomplete,
     }
+    # v4.19.0 [D1b]: private post-earnings guard inputs (Calendar_Events via
+    # 10_My_Portfolio v1.5.17); the builder pops them, so meta.upstream never
+    # echoes them. Absent or not a mapping -> upstream_meta unchanged.
+    _post_earnings = merged_body.get("post_earnings")
+    if isinstance(_post_earnings, Mapping):
+        upstream_meta["post_earnings"] = dict(_post_earnings)
 
     build_started = time.monotonic()
     try:

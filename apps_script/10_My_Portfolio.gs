@@ -1,7 +1,269 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.13
+ * Version: 1.5.18
+ *
+ * v1.5.18 (2026-11-02)  (CASH EVIDENCE ROW + LAST-KNOWN CASH + FOLLOW-UP
+ *                        RETRY: _Cash_Snapshot GETS ONE CERTIFIABLE IBKR
+ *                        ROW PER RIYADH DAY, A STALE RENDER NAMES THE LAST
+ *                        KNOWN CASH, ONE RETRY AFTER A COCKPIT COLLISION --
+ *                        PD_CASH_SNAPSHOT_WRITE and PD_IBKR_FOLLOWUP_RETRY,
+ *                        both default off; ALL v1.5.17 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (workbook review 2 Nov 2026; owner: 'cash can be added automatically
+ * -- you have IBKR access, add it yourself'): three cash numbers disagree.
+ * Top_10's panel 'Cash Available (SAR)' reads 72,747 SAR from _Cash_Snapshot,
+ * whose last row is 27 Oct, typed by the operator (its note still reads
+ * 'Derayah ... Al Rajhi sukuk only'); Portfolio_Decision_v2 reads that
+ * panel; THIS page shows 'PF: Cash Available 0 SAR', KPI Cash 0, Cash % 0
+ * and Deployable 0 whenever the capture is older than 14 minutes at render
+ * time (the 1 Nov archive: 'BLOCKED; RECONCILIATION_REQUIRED:
+ * missing_evidence | [custody-unverified]'); IBKR itself holds 19,399.20 USD
+ * settled (~72,797 SAR). The read-only captures (TFB_IBKR_Capture_*.json:
+ * hourly 10:05-14:05 Sun-Thu, from 2 Nov also 17:35-23:35 Mon-Fri, plus
+ * 08:40 daily) already give this page a certifiable settled-cash figure
+ * several times a day (v1.5.12 pdIbkrPlan_: settled less working-BUY
+ * reservations at the declared 3.75 peg), and nothing writes it down.
+ * _Run_Log of 1 Nov also shows the evidence follow-up rendering five times
+ * (packet age 5-6 min) and skipped once with 'cockpit refresh in progress':
+ * the 11:10 scheduled cockpit refresh collided with the 11:06 capture.
+ * WHAT (two Script Properties; absent = off = every line, request, cell,
+ * row, trigger and property byte-identical to v1.5.17; the writer never
+ * touches _Cash_Snapshot when off):
+ *  (1) PD_CASH_SNAPSHOT_WRITE = off (default) | observe | on. Inside
+ *      pdIbkrApply_ -- the one place a capture becomes a plan, so the
+ *      watcher, the scheduled refresh and a manual refresh all pass here --
+ *      when the plan is valid, fresh under the existing 14-minute rule and
+ *      plan.cashCents is not null, pdCashSnapApply_ appends ONE
+ *      _Cash_Snapshot row per Riyadh day: the first certifiable capture of
+ *      the day; never a second row for the same Riyadh date (Script
+ *      Property PD_CASH_SNAPSHOT_LAST, then a scan of the tail rows' Date,
+ *      any writer); never an overwrite or a delete; append-only below the
+ *      last used row (appendRow). The cells land BY HEADER NAME, the names
+ *      and aliases the export audit certifies (scripts/tfb_export_audit.py,
+ *      cash certification contract v1.1.1; tests/test_cash_snapshot_
+ *      certification.py 'live v1.0.1 header with appended columns'):
+ *      Date (the capture's Riyadh day, a date cell), Time ('HH:mm:ss'
+ *      Riyadh), Balance SAR (= plan.cashCents / 100, the certified cash the
+ *      request carries), Account ('IBKR (<account_alias>)'), Currency,
+ *      Balance Type 'settled_cash', Balance (native settled cash less
+ *      working-BUY reservations -- the figure the SAR cents derive from, so
+ *      Balance SAR = Balance x FX within the audit's one halala), FX to SAR
+ *      (the declared peg, 3.75 for USD), FX As Of (the capture instant,
+ *      '+03:00'); when the header also carries them: As Of / Timestamp, Type
+ *      'SNAPSHOT (IBKR capture)', Amount SAR 0, Delta vs Prev (vs the newest
+ *      numeric Balance SAR), Note ('ibkr-capture:<file>; captured_at <iso>;
+ *      written <date HH:MM> Riyadh, age <Nm>; settled/reserved; FX
+ *      policy://sama-usd-peg-3.75 @ 3.75; writer 10_My_Portfolio v1.5.18'),
+ *      Source Ref / Source / Evidence Ref, FX Source, Writer. A missing tab,
+ *      an empty header, a header without Date / Time / Balance SAR / Account
+ *      / Currency / Balance Type (or without Balance / FX to SAR / FX As Of
+ *      for a non-SAR balance), several cash currencies in one capture, or a
+ *      withheld cash figure -> nothing is written and the reason is in the
+ *      status line (on: also one _Run_Log row, handler pdCashSnapApply_,
+ *      page _Cash_Snapshot, status SKIPPED). observe -> nothing is written;
+ *      the status line carries ' | [cash-snapshot-observe] would append
+ *      (<the cells>)' or ' | [cash-snapshot-observe] would not append:
+ *      <why>' and Logger one line (never amounts). on -> ' | cash snapshot
+ *      appended (...)' with one _Run_Log OK row, ' | cash snapshot NOT
+ *      appended: <why>' or ' | cash snapshot kept: row for <date> exists'.
+ *      The whole writer runs inside its own try/catch: a Sheets failure
+ *      becomes ' | cash snapshot ERROR (...)' (+ one FAILED row) and the
+ *      evidence send, the controls and the packet are untouched.
+ *  (2) Last-known cash, presentation only (same property, observe or on):
+ *      when the capture is NOT fresh at render time, or there is none, the
+ *      status line gains ' | last known cash <N> SAR (as of <date HH:MM>
+ *      Riyadh, <age> old; not applied to funding)' from the newest
+ *      _Cash_Snapshot row with a numeric Balance SAR (any writer; a row
+ *      without a time reads '(no time), at least <age> old'). The controls
+ *      sent to the backend, the funding rule, the 14-minute rule, the
+ *      packet, the all-cash gate and the KPI cells are unchanged: cash that
+ *      is not proven fresh is never sent as fundable.
+ *  (3) PD_IBKR_FOLLOWUP_RETRY = off (default) | on. When
+ *      pdIbkrEvidenceFollowUp skips with 'cockpit refresh in progress',
+ *      pdIbkrRetryAfterSkip_ arms ONE one-off trigger
+ *      pdIbkrEvidenceFollowUpRetry (+3 min; the follow-up's own mechanism)
+ *      only if the packet will still be inside PD_IBKR_FOLLOWUP_MAX_AGE_MS
+ *      when it fires; the retry run clears its trigger, runs the same
+ *      guards and render, logs ' (retry)' in its line and its _Run_Log row
+ *      (handler pdIbkrEvidenceFollowUpRetry) and never re-arms. The skip
+ *      line gains '; retry armed (+3m) (packet Nm old at the retry)' or
+ *      '; retry not armed: <why>'; the _Run_Log details gain 'retry'.
+ *  pdSelfTest reports the writer mode, the last date written here, the
+ *  tab's header verdict, row count and newest row day (never amounts, the
+ *  alias or the file name), a pure 'cash snapshot core' check, the retry
+ *  mode, the retry trigger state and a pure 'retry core' check.
+ * ES5. Functions added: 20 (pdCashSnapMode_, pdCashSnapRiyadh_,
+ * pdCashSnapHeaderMap_, pdCashSnapCents_, pdCashSnapStampMs_, pdCashSnapRead_,
+ * pdCashSnapTailScan_, pdCashSnapRow_, pdCashSnapToken_,
+ * pdCashSnapLastKnownNote_, pdCashSnapApply_, pdCashSnapSheetState_,
+ * pdCashSnapCoreOk_, pdIbkrRetryMode_, pdIbkrRetryCore_, pdIbkrRemoveRetry_,
+ * pdIbkrArmRetry_, pdIbkrRetryAfterSkip_, pdIbkrEvidenceFollowUpRetry,
+ * pdIbkrRetryState_). Changed: pdIbkrApply_ (gated hook + note suffix),
+ * pdIbkrRunLog_ (optional handler / page; defaults unchanged),
+ * pdIbkrEvidenceFollowUp (retry marker, line token, details), pdSelfTest
+ * (three lines). Vars added: 17 (PD_CASH_SNAP_PROP, PD_CASH_SNAP_LAST_PROP,
+ * PD_CASH_SNAP_SHEET, PD_CASH_SNAP_TYPE, PD_CASH_SNAP_BALANCE_TYPE,
+ * PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SCAN_ROWS, PD_CASH_SNAP_MAX_COLS,
+ * PD_CASH_SNAP_RIYADH_MS, PD_CASH_SNAP_DAY_MS, PD_CASH_SNAP_FIELDS,
+ * PD_CASH_SNAP_FOREIGN_KEYS, PD_IBKR_RETRY_PROP, PD_IBKR_RETRY_HANDLER,
+ * PD_IBKR_RETRY_DELAY_MS, PD_IBKR_RETRY_REASON, PD_IBKR_RETRY_RUN_).
+ * Removed: 0.
+ * Harness: tests/test_my_portfolio_v1518_cash_snapshot.js (REAL file in a
+ * vm with service stubs; off compared live with the v1.5.17 base; golden
+ * negative; mutants). Rollback: PD_CASH_SNAPSHOT_WRITE=off and
+ * PD_IBKR_FOLLOWUP_RETRY=off (or delete them) with no re-paste, or re-paste
+ * v1.5.17; rows already appended stay (they are evidence).
+ * LIMIT: no lock is taken around the same-day check (the watcher already
+ * holds the script lock while it renders), so two renders inside the same
+ * second could both append; the audits report a duplicate date as WARN.
+ * The Top_10 panel cell is not written here. ORDER: paste, run pdSelfTest
+ * once, PD_CASH_SNAPSHOT_WRITE=observe for one capture cycle (read the
+ * would-append line), then on; PD_IBKR_FOLLOWUP_RETRY=on.
+ *
+ * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS INPUTS: Calendar_Events REACHES
+ *                        THE PORTFOLIO_DECISION BACKEND GUARD; ALL v1.5.16
+ *                        logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (weekly review 28 Oct, defect D1): the page recommended 'ADD 48
+ * FRST.US (~2,671 SAR)' five sessions after a -22.2 % EPS miss (reported
+ * 22 Oct). The interim trading policy forbids adding inside 5 sessions of a
+ * report (10 after an EPS miss), and the Top-10 board already tags its seats
+ * from Calendar_Events (16_Decision_Top10 v1.18.0), but the backend that
+ * decides ADD never sees the calendar: the 122 My_Portfolio columns carry no
+ * report date. portfolio_actions 1.17.0 adds the guard (Render
+ * TFB_PF_ADD_POST_EARN = off | observe | enforce, default off) and needs the
+ * report dates in the request.
+ * WHAT: Script Property PD_POST_EARN = off (default: no Calendar_Events read,
+ * request and every line byte-identical to v1.5.16) | on. When on,
+ * refreshPortfolioDecision adds body.post_earnings = pdPostEarnBody_
+ * (schema tfb.pd-post-earnings/v1): status ok | unavailable | stale, asof
+ * (Riyadh date), updated (newest 'Updated At (Riyadh)' day), reports (recent
+ * reports in the calendar) and, for the held symbols only, {date, sessions,
+ * surprise} from the Top-10's own reader dt10PostEarnMapFromValues_ (same
+ * sessions, same 31-day window, Sun-Thu for KSA), plus a held name whose
+ * Last or Next Earnings Date is today at 0 sessions (review fix: that reader
+ * keeps strictly past reports only). A missing sheet, header or
+ * 16_Decision_Top10 parser, or any read error -> 'unavailable'; a newest
+ * update older than PD_POST_EARN_STALE_DAYS (7) -> 'stale'. The backend
+ * ignores the object unless the guard is armed, and pops it before meta, so
+ * with the guard off the page, the action log and every line are unchanged
+ * even when PD_POST_EARN is on; the field is never logged. Order: paste,
+ * set PD_POST_EARN=on, then arm the Render guard (an armed guard without
+ * inputs holds every ADD as 'earnings calendar absent'). pdMetaLine_ gains
+ * ' | post-earn <mode> (...)'
+ * and ' | tickets <open>/<cap> <mode> (...)' ONLY when the response carries
+ * meta.post_earn_guard / meta.ticket_cap (guards armed on Render).
+ * pdSelfTest reports the mode and the inputs a run would send now.
+ * ES5. Functions added: 4 (pdPostEarnMode_, pdPostEarnRiyadhDay_,
+ * pdPostEarnCore_, pdPostEarnBody_). Changed: refreshPortfolioDecision (one
+ * gated request field), pdMetaLine_ (two conditional tokens), pdSelfTest
+ * (one line). Vars added: 3 (PD_POST_EARN_PROP, PD_POST_EARN_SCHEMA,
+ * PD_POST_EARN_STALE_DAYS). Removed: 0.
+ * Harness: tests/test_pd_post_earn_inputs.js (REAL file; golden negative on
+ * the v1.5.16 base). Rollback: PD_POST_EARN=off (or delete it) with no
+ * re-paste, or re-paste v1.5.16; with either, an armed Render guard reads
+ * 'earnings calendar absent', so turn the guard off first.
+ *
+ * v1.5.16 (2026-10-26)  (EVIDENCE PUBLICATION: THE SENT PACKET BECOMES THE
+ *                        TOP_10 COCKPIT'S FUNDING EVIDENCE -- PD_IBKR_EVIDENCE_PUBLISH,
+ *                        default off; ALL v1.5.15 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): Top_10_Investments
+ * confirmed FRST.US / ZTO.US / CRC.US ACTIVE (day 3) and rendered them
+ * UNSIZED (Ticket 0 SAR, Shares 0, 'Research seat -- no executable
+ * allocation today', EXECUTABLE 0 of 10; Portfolio_Decision v2 read 'IBKR
+ * evidence UNKNOWN'). The backend's allocate stage certifies executable
+ * funding only from a fresh (<= 900 s) broker packet in
+ * portfolio.reconciliation_evidence. This page has built exactly that
+ * packet from the read-only IBKR capture since v1.5.12 and sent it with its
+ * own request (status line 'ibkr evidence SENT (...)'), but the cockpit
+ * forwards the DOCUMENT PROPERTY TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1,
+ * which nothing wrote ('Nothing writes it today', v1.5.11). Two producers,
+ * one packet, no hand-over.
+ * WHAT: Script Property PD_IBKR_EVIDENCE_PUBLISH = off (default: every
+ * line, request and property byte-identical to v1.5.15) | on. Under
+ * PD_IBKR_EVIDENCE=enforce, when the plan is fresh and the packet is SENT,
+ * pdIbkrPublish_ writes that SAME packet (JSON, <= 9,000 chars, the limit
+ * both readers apply) to the document property and the status line gains
+ * ' | evidence published' (or ' | evidence NOT published: <reason>').
+ * Not fresh, observe, off or a failed publication -> nothing is written
+ * and the previous property is left for the backend's own freshness check
+ * to reject. ORDER: the backend accepts the packet for 900 s, so Top_10
+ * must render within ~14 min of the capture; pdIbkrCaptureWatch, after a
+ * refresh that published, arms ONE one-off trigger pdIbkrEvidenceFollowUp
+ * (+60 s) which clears itself, re-reads the packet age (<= 840 s), asks the
+ * Decision Chain's guards when 26_Decision_Chain is present
+ * (tfbDcReadInputs_: automation paused, sync in flight, cockpit running,
+ * quiet window) and then calls refreshDecisionTop10() -- the cockpit takes
+ * its own lock and its own gates; nothing here changes a verdict. One
+ * _Run_Log row (handler pdIbkrEvidenceFollowUp, page Top_10_Investments,
+ * OK/FAILED/SKIPPED) and one Logger line; never the packet. The cockpit
+ * side (16_Decision_Top10 v1.16.0, DT10_FUNDING_EVIDENCE=on) applies the
+ * property to its request: certified cash, links, peg FX, exclusions.
+ * pdSelfTest reports the publish mode, the follow-up trigger state and a
+ * pure 'follow-up core' check.
+ * ES5. Functions added: 8 (pdIbkrPublishMode_, pdIbkrPublish_,
+ * pdIbkrRemoveFollowUp_, pdIbkrArmFollowUp_, pdIbkrFollowUpCore_,
+ * pdIbkrRunLog_, pdIbkrEvidenceFollowUp, pdIbkrFollowUpState_). Changed:
+ * pdIbkrApply_ (publication + note suffix, enforce/fresh/on only),
+ * pdIbkrCaptureWatch (marker + follow-up arming), pdSelfTest. Vars added: 5
+ * (PD_IBKR_PUBLISH_PROP, PD_IBKR_FOLLOWUP_HANDLER, PD_IBKR_FOLLOWUP_DELAY_MS,
+ * PD_IBKR_FOLLOWUP_MAX_AGE_MS, PD_IBKR_PUBLISHED_RUN_). Removed: 0.
+ * Harness: tests/test_pd_evidence_publish.js (REAL file; golden negative on
+ * the v1.5.15 base). Rollback: PD_IBKR_EVIDENCE_PUBLISH=off (and delete the
+ * document property if a stale packet should not linger), or v1.5.15.
+ * Arming is an owner step AFTER the first funded ticket of 26 Oct 2026 is
+ * recorded.
+ *
+ * v1.5.15 (2026-10-24)  (PD-ALLCASH: A BROKER-PROVEN ALL-CASH BOOK IS A
+ *                        DECIDED STATE -- PD_ALLCASH_OK, default enforce;
+ *                        ALL v1.5.14 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (verified 2026-10-24): the brokerage account has been all cash since
+ * the DDI sale on 22 Oct (0 positions). The only My_Portfolio row (5023.SR)
+ * is outside the execution scope, so the backend answers status 'empty'
+ * and pdReceiptNote_ withheld the receipt with 'decision status empty'.
+ * B2 read: 'Last run 2026-10-24 17:43:37 | status: empty | holdings 1 rows
+ * from My_Portfolio (qty/cost from cost-basis: 1) | source readiness
+ * WITHHELD: decision status empty | ibkr evidence SENT (capture 17:39 age
+ * 4m; linked 0/0; cash 82819.20 SAR; USD 3.75; excluded 5023.SR) | ...'.
+ * The release gate (audit_decision_surface_freshness PF_STATUS_NOT_OK and
+ * PF_SOURCE_CONSUMPTION_UNPROVEN) therefore failed on every attempt since
+ * 23 Oct and no Top-10 ticket could be sized. An empty book that the
+ * broker capture proves is a legitimate decided state.
+ * WHAT: Script Property PD_ALLCASH_OK = enforce (default; owner decision
+ * 2026-10-24) | off (every line byte-identical to v1.5.14). Any other value
+ * is enforce. Pure pdAllCashProof_(payload, ibkr) is true only when the
+ * decision status is 'empty' with no actions AND this run's IBKR evidence
+ * was SENT (enforce, capture within PD_IBKR_SEND_MAX_AGE_MS) AND that
+ * capture holds 0 positions and 0 links; anything missing or unknown is
+ * false (fail-closed). When it holds under enforce: (a) pdReceiptNote_
+ * accepts 'empty' as the decision status (source cohort, binding and every
+ * other readiness check unchanged); (b) the B2 status token is 'ok' and the
+ * line gains ' | book all-cash (broker 0 positions, decisions 0)' right
+ * after it. Otherwise (no capture, stale capture, positions > 0, any other
+ * status) every line is v1.5.14 byte-identical. The Logger line, the
+ * broker reads, the exclusion logic, the action log and the renderer are
+ * untouched; pdIbkrApply_ only exposes the plan's positions, linked and
+ * ageMs on its result (read-only). pdSelfTest reports the gate.
+ * ES5. Functions added: 2 (pdAllCashMode_, pdAllCashProof_). Changed:
+ * pdReceiptNote_ (optional 7th arg), pdIbkrApply_ (result fields),
+ * refreshPortfolioDecision, pdSelfTest. Removed: 0. Rollback:
+ * PD_ALLCASH_OK=off, or v1.5.14.
+ *
+ * v1.5.14 (2026-10-20)  (LEDGER READER EXCLUDES SOLD/CLOSED LOTS)
+ * ---------------------------------------------------------------
+ * WHY: _myPortfolioLedgerMap_ skipped only Status 'inactive', so Sold and
+ * Closed lots in _Portfolio_CostBasis were aggregated as active. Active 10
+ * @ 100 (fee 5) + Sold 10 @ 80 read as qty 20 / cost 90.5 instead of qty
+ * 10 / cost 100.5. The Python ledger readers (run_dashboard_sync
+ * _read_cost_basis, audit_full_refresh_coverage ledger_symbols) exclude
+ * {inactive, closed, sold}.
+ * WHAT: the same set is excluded here (trimmed, case-insensitive). Blank or
+ * absent Status still counts as active, exactly as ledger_symbols and the
+ * 21 dropdown default treat it. Functions changed: 1
+ * (_myPortfolioLedgerMap_). Added/removed: 0. Rollback: v1.5.13.
  *
  * v1.5.13 MAIN CHANGES  (RECEIPT BOUND TO THE ROWS ACTUALLY READ -- applies
  *                        only when PD_SOURCE_RECEIPT is observe/enforce;
@@ -2048,8 +2310,9 @@ function _myPortfolioCostBasisSymbols_() {
  *              14 v2.5.0's pfReadCostBasisV2_, so the feeders can never
  *              oscillate the Avg Cost cell between runs;
  *   buyDate  = earliest lot date.
- * A lot is INACTIVE only when Status trims to 'inactive' (case-
- * insensitive); blank status counts as active, matching the 21 dropdown
+ * A lot is EXCLUDED when Status trims to 'inactive', 'closed' or 'sold'
+ * (case-insensitive; v1.5.14 added closed/sold to mirror the Python
+ * ledger readers); blank status counts as active, matching the 21 dropdown
  * default and the diagnostics lot counting. Returns the {SYM: {qty,
  * buyPrice, buyDate, lots}} map (possibly empty — v2 with zero active
  * lots), keyed by trimmed upper-cased symbol, the same {qty, buyPrice}
@@ -2099,7 +2362,8 @@ function _myPortfolioLedgerMap_() {
           ? String(row[col.status - 1] == null ? '' : row[col.status - 1])
               .replace(/^\s+|\s+$/g, '').toLowerCase()
           : '';
-      if (status === 'inactive') { continue; }
+      if (status === 'inactive' || status === 'closed' ||
+          status === 'sold') { continue; }        // v1.5.14
       if (!Object.prototype.hasOwnProperty.call(map, sym)) {
         map[sym] = { qty: null, buyPrice: null, buyDate: null, lots: 0 };
         wSum[sym] = 0;
@@ -2552,7 +2816,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.13';
+var PD_VERSION = '1.5.18';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -2739,6 +3003,22 @@ function pdMetaLine_(meta) {
     parts.push(Math.round(route.duration_ms) + 'ms');
   }
   if (route.request_id) parts.push('req ' + route.request_id);
+  /* v1.5.17 [D1b/D1c]: guard read-back, only when the backend reports the
+   * guard armed (absent blocks -> the v1.5.16 line). */
+  var pg = meta.post_earn_guard;
+  if (pg && typeof pg === 'object') {
+    parts.push('post-earn ' + pdCell_(pg.mode) + ' (' +
+               pdCell_(pg.input_status) + '; held ' + pdCell_(pg.held) +
+               (pg.mode === 'observe' ? '; would ' + pdCell_(pg.would_hold) : '') +
+               ')');
+  }
+  var tc = meta.ticket_cap;
+  if (tc && typeof tc === 'object') {
+    parts.push('tickets ' + pdCell_(tc.open_tickets) + '/' + pdCell_(tc.cap) +
+               ' ' + pdCell_(tc.mode) + ' (held ' + pdCell_(tc.held) +
+               (tc.mode === 'observe' ? '; would ' + pdCell_(tc.would_hold) : '') +
+               ')');
+  }
   return parts.join(' | ');
 }
 
@@ -3056,14 +3336,17 @@ function pdSrcBindingCore_(pre, post, stampMs) {
 
 /** Status-line fragment. off -> '' (v1.5.10 byte-identical); observe -> a
  * tag the final audit does not parse; enforce -> exactly one receipt. */
-function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
+function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding, allCash) {
   if (mode !== 'observe' && mode !== 'enforce') return '';
   var src;
   try {
     src = pdSrcReadiness_(ss, ctx, consumedRows);
     var st = (payload && payload.status !== null && payload.status !== undefined)
         ? String(payload.status).toLowerCase() : '';
-    if (src.ready && st !== 'ok') {
+    /* v1.5.15: a broker-proven all-cash book ('empty' + IBKR 0 positions,
+     * 0 links) is a decided state; every other check here is unchanged. */
+    var stOk = st === 'ok' || (allCash === true && st === 'empty');
+    if (src.ready && !stOk) {
       src = {ready: false, reason: 'decision status ' + (st || 'unknown'), cohort: ''};
     }
     if (src.ready && binding) {
@@ -3079,6 +3362,45 @@ function pdReceiptNote_(mode, ss, ctx, consumedRows, payload, binding) {
   return mode === 'observe'
       ? ' | [receipt-observe] would publish ' + verdict
       : ' | source readiness ' + verdict;
+}
+
+/* ----- v1.5.15 PD-ALLCASH: a broker-proven all-cash book -------------------- */
+
+var PD_ALLCASH_PROP = 'PD_ALLCASH_OK';   /* enforce (default) | off */
+var PD_ALLCASH_TOKEN = 'book all-cash (broker 0 positions, decisions 0)';
+
+/** 'off' only when the property says so; anything else (unset, blank,
+ * unreadable, any other text) is 'enforce' (owner decision 2026-10-24). */
+function pdAllCashMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+        .getProperty(PD_ALLCASH_PROP);
+    var v = String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return v === 'off' ? 'off' : 'enforce';
+  } catch (e) {
+    return 'enforce';
+  }
+}
+
+/** PURE, fail-closed: true only when the decision status is 'empty' with
+ * no actions AND this run's IBKR evidence was SENT (pdIbkrApply_ result:
+ * enforce, capture inside PD_IBKR_SEND_MAX_AGE_MS) AND that capture holds
+ * 0 positions and 0 links. Any missing or unknown value -> false. */
+function pdAllCashProof_(payload, ibkr) {
+  if (!payload || payload.status === null || payload.status === undefined) {
+    return false;
+  }
+  if (String(payload.status).toLowerCase() !== 'empty') return false;
+  var acts = payload.actions;
+  if (Object.prototype.toString.call(acts) !== '[object Array]' ||
+      acts.length !== 0) return false;
+  if (!ibkr || ibkr.sent !== true) return false;
+  if (String(ibkr.note || '').indexOf('ibkr evidence SENT') < 0) return false;
+  if (typeof ibkr.ageMs !== 'number' || !isFinite(ibkr.ageMs) ||
+      ibkr.ageMs < 0 || ibkr.ageMs > PD_IBKR_SEND_MAX_AGE_MS) return false;
+  if (ibkr.positions !== 0 || ibkr.linked !== 0) return false;
+  return true;
 }
 
 /* ----- v1.5.12 IBKR capture evidence + execution scope ---------------------- */
@@ -3105,6 +3427,12 @@ var PD_IBKR_RATE_X100 = {USD: 375, SAR: 100};   /* exact SAR rate x 100 */
 var PD_IBKR_FX_SOURCE = 'policy://sama-usd-peg-3.75';
 var PD_IBKR_WATCH_HANDLER = 'pdIbkrCaptureWatch';
 var PD_IBKR_WATCH_EVERY_MIN = 5;
+/* v1.5.16: publish the SENT packet for 16_Decision_Top10 + one follow-up render */
+var PD_IBKR_PUBLISH_PROP = 'PD_IBKR_EVIDENCE_PUBLISH';   /* off (default) | on */
+var PD_IBKR_FOLLOWUP_HANDLER = 'pdIbkrEvidenceFollowUp';
+var PD_IBKR_FOLLOWUP_DELAY_MS = 60000;
+var PD_IBKR_FOLLOWUP_MAX_AGE_MS = 840000;   /* the packet's own acceptance window */
+var PD_IBKR_PUBLISHED_RUN_ = null;          /* set by pdIbkrPublish_ in this execution */
 var PD_IBKR_SAFE = 9007199254740991;
 var PD_IBKR_PROVENANCE_FIELDS = [
   { send: 'Data Provider', match: ['Data Provider'] },
@@ -3536,9 +3864,11 @@ function pdIbkrLatestCapture_(nowMs) {
 }
 
 /** v1.5.12: apply the observe/enforce mode to the request body IN PLACE.
- * Returns {note, excluded, controls, sent}. Never throws. */
+ * Returns {note, excluded, controls, sent} plus, from v1.5.15, the plan's
+ * {positions, linked, ageMs} (null without a valid capture). Never throws. */
 function pdIbkrApply_(mode, body) {
-  var res = {note: '', excluded: [], controls: null, sent: false};
+  var res = {note: '', excluded: [], controls: null, sent: false,
+             positions: null, linked: null, ageMs: null};   /* v1.5.15 */
   try {
     var nowMs = Date.now();
     var split = pdIbkrSplitRows_(body.rows,
@@ -3550,6 +3880,11 @@ function pdIbkrApply_(mode, body) {
         : {ok: false, reason: cap.reason};
     var fresh = plan.ok === true && plan.ageMs >= 0 &&
         plan.ageMs <= PD_IBKR_SEND_MAX_AGE_MS;
+    if (plan.ok === true) {   /* v1.5.15: counts for the all-cash proof */
+      res.positions = plan.positions;
+      res.linked = plan.linked;
+      res.ageMs = plan.ageMs;
+    }
     if (mode === 'enforce') {
       var rates = pdIbkrPegRates_(body.fx_rates);
       var controls = null;
@@ -3564,6 +3899,14 @@ function pdIbkrApply_(mode, body) {
       body.fx_rates = rates;
       delete body.reconciliation_evidence;     /* enforce: the capture only */
       if (fresh) body.reconciliation_evidence = plan.packet;
+      /* v1.5.16: the same packet becomes the Top_10 cockpit's funding
+       * evidence (document property); off -> nothing written. */
+      if (fresh && pdIbkrPublishMode_() === 'on') {
+        var pub = pdIbkrPublish_(plan.packet, nowMs);
+        res.published = pub.published;
+        res.publishNote = pub.published ? ' | evidence published'
+                                        : ' | evidence NOT published: ' + pub.reason;
+      }
       if (controls) {
         body.controls = controls;
         res.controls = controls;
@@ -3571,7 +3914,16 @@ function pdIbkrApply_(mode, body) {
       res.excluded = split.excluded;
       res.sent = fresh;
     }
-    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded);
+    /* v1.5.18: one certifiable settled-cash row per Riyadh day in
+     * _Cash_Snapshot, or the last-known token on a stale render
+     * (PD_CASH_SNAPSHOT_WRITE); off -> no sheet access and no token. The
+     * controls, the packet and res.sent above are already final. */
+    var snapMode = pdCashSnapMode_();
+    if (snapMode !== 'off') {
+      res.cashSnapNote = pdCashSnapApply_(snapMode, plan, fresh, cap.name, nowMs).note;
+    }
+    res.note = pdIbkrNote_(mode, plan, fresh, split.excluded) + (res.publishNote || '');
+    res.note += res.cashSnapNote || '';   /* v1.5.18 */
   } catch (e) {
     res.note = ' | ibkr evidence ERROR (' +
         String(e && e.message ? e.message : e).slice(0, 80) + ')';
@@ -3628,12 +3980,16 @@ function pdIbkrCaptureWatch() {
       props.setProperty(PD_IBKR_LAST_PROP, cap.id);
       return 'capture not usable for a decision';
     }
+    PD_IBKR_PUBLISHED_RUN_ = null;   /* v1.5.16 */
     var outcome = String(refreshPortfolioDecision() || '');
     if (/^(NETWORK ERROR|HTTP )/.test(outcome)) return 'refresh failed: ' + outcome;
     props.setProperty(PD_IBKR_LAST_PROP, cap.id);
+    /* v1.5.16: Top_10 must render inside the packet's window -> one-off trigger */
+    var armed = (PD_IBKR_PUBLISHED_RUN_ && pdIbkrPublishMode_() === 'on')
+        ? pdIbkrArmFollowUp_() : '';
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher refreshed (' +
-               mode + ', status ' + outcome + ')');
-    return 'refreshed';
+               mode + ', status ' + outcome + (armed ? ', ' + armed : '') + ')');
+    return 'refreshed' + (armed ? '; ' + armed : '');
   } catch (e) {
     Logger.log('[MP-DEC v' + PD_VERSION + '] capture watcher error: ' +
                String(e && e.message ? e.message : e).slice(0, 120));
@@ -3693,6 +4049,716 @@ function pdIbkrWatcherState_() {
              : 'not installed (run pdInstallCaptureWatcher)';
   } catch (e) {
     return 'unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/* ----- v1.5.16 evidence publication + follow-up render ------------------- */
+
+function pdIbkrPublishMode_() {
+  return pdIbkrProp_(PD_IBKR_PUBLISH_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** The SENT packet -> document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (the one 16_Decision_Top10 forwards; same 9,000-char limit). Records the
+ * publication for this execution only. Never logs the packet. */
+function pdIbkrPublish_(packet, nowMs) {
+  var out = {published: false, reason: ''};
+  try {
+    var text = JSON.stringify(packet);
+    if (!text || text.length > PD_EVIDENCE_MAX_CHARS) {
+      out.reason = 'packet oversized';
+      return out;
+    }
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) { out.reason = 'document properties unavailable'; return out; }
+    props.setProperty(PD_EVIDENCE_PROP, text);
+    PD_IBKR_PUBLISHED_RUN_ = {at_ms: nowMs,
+                              captured_at: String(packet && packet.captured_at || '')};
+    out.published = true;
+  } catch (e) {
+    out.reason = 'publish failed';
+  }
+  return out;
+}
+
+function pdIbkrRemoveFollowUp_() {
+  var n = 0;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) {
+        ScriptApp.deleteTrigger(all[i]);
+        n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+/** One-off trigger: Top_10 renders ~1 min after the publication, inside the
+ * packet's 14-minute acceptance window. Never throws. */
+function pdIbkrArmFollowUp_() {
+  try {
+    pdIbkrRemoveFollowUp_();
+    ScriptApp.newTrigger(PD_IBKR_FOLLOWUP_HANDLER).timeBased()
+        .after(PD_IBKR_FOLLOWUP_DELAY_MS).create();
+    return 'follow-up armed';
+  } catch (e) {
+    return 'follow-up not armed (' +
+        String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE: should the follow-up render Top_10 now? s = the Decision Chain's
+ * read inputs (26_Decision_Chain tfbDcReadInputs_) or null. */
+function pdIbkrFollowUpCore_(mode, packetAgeMs, hasTop10, s) {
+  if (mode !== 'on') return {go: false, reason: 'publish off'};
+  if (!hasTop10) return {go: false, reason: 'refreshDecisionTop10 unavailable'};
+  if (packetAgeMs === null || packetAgeMs === undefined) {
+    return {go: false, reason: 'no published packet'};
+  }
+  if (packetAgeMs < 0) return {go: false, reason: 'packet ahead of the clock'};
+  if (packetAgeMs > PD_IBKR_FOLLOWUP_MAX_AGE_MS) {
+    return {go: false, reason: 'packet too old (' + pdIbkrAge_(packetAgeMs) + ')'};
+  }
+  if (s) {
+    if (s.automationAllowed === false) return {go: false, reason: 'automation paused'};
+    if (s.inflight) return {go: false, reason: 'sync in flight'};
+    if (s.cockpitRunning) return {go: false, reason: 'cockpit refresh in progress'};
+    if (s.quiet) return {go: false, reason: 'quiet window'};
+  }
+  return {go: true, reason: 'packet age ' + pdIbkrAge_(packetAgeMs)};
+}
+
+/** One _Run_Log row (10-column house format). Never throws. v1.5.18: the
+ * optional handler / page default to the follow-up's own, so every earlier
+ * caller writes the same row. */
+function pdIbkrRunLog_(level, status, message, ms, details, handler, page) {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('_Run_Log');
+    if (!sh) return false;
+    var dj = '{}';
+    try { dj = JSON.stringify(details || {}); } catch (eJ) {}
+    sh.appendRow([new Date(), String(level || 'INFO'), String(handler || PD_IBKR_FOLLOWUP_HANDLER),
+                  String(page || 'Top_10_Investments'), String(status || ''),
+                  String(message || '').slice(0, 400), '', '',
+                  ms === null || ms === undefined ? '' : String(ms), dj]);
+    return true;
+  } catch (e) { return false; }
+}
+
+/** Time-driven once (pdIbkrArmFollowUp_): render Top_10 while the published
+ * packet is fresh, under the Decision Chain's guards when that file is
+ * present. Clears its own trigger first. Never throws. */
+function pdIbkrEvidenceFollowUp() {
+  var removed = pdIbkrRemoveFollowUp_();
+  var nowMs = Date.now();
+  var packet = pdEvidencePacket_();
+  var capMs = packet ? pdIbkrStampMs_(packet.captured_at) : null;
+  var age = capMs === null ? null : nowMs - capMs;
+  var s = null;
+  try {
+    if (typeof tfbDcReadInputs_ === 'function') {
+      s = tfbDcReadInputs_(SpreadsheetApp.getActiveSpreadsheet(), 'on',
+                           {pd: '', t10: '', claim: null, attempts: {}}, nowMs);
+    }
+  } catch (eS) { s = null; }
+  var d = pdIbkrFollowUpCore_(pdIbkrPublishMode_(), age,
+                              typeof refreshDecisionTop10 === 'function', s);
+  var t0 = Date.now(), outcome;
+  if (d.go) {
+    try {
+      refreshDecisionTop10();
+      outcome = 'rendered';
+    } catch (eR) {
+      outcome = 'error: ' + String(eR && eR.message ? eR.message : eR).slice(0, 120);
+    }
+  } else {
+    outcome = 'skipped: ' + d.reason;
+  }
+  /* v1.5.18: a retry run is marked; a cockpit collision on a first run may
+   * arm ONE retry (PD_IBKR_FOLLOWUP_RETRY=on). Off, or any other skip, adds
+   * nothing to the line, the row or the details. */
+  var isRetry = PD_IBKR_RETRY_RUN_ !== null;
+  if (isRetry && PD_IBKR_RETRY_RUN_.removed) removed = PD_IBKR_RETRY_RUN_.removed;
+  var retry = d.go ? '' : pdIbkrRetryAfterSkip_(d.reason, age, isRetry);
+  var line = '[MP-DEC v' + PD_VERSION + '] evidence follow-up' + (isRetry ? ' (retry)' : '') +
+      ' -> ' + outcome +
+      ' (' + d.reason + (removed ? '; trigger cleared' : '') + (retry ? '; ' + retry : '') + ')';
+  try { Logger.log(line); } catch (eL) {}
+  var details = {version: PD_VERSION, go: d.go};
+  if (retry) details.retry = retry;
+  pdIbkrRunLog_(outcome === 'rendered' || !d.go ? 'INFO' : 'ERROR',
+                outcome === 'rendered' ? 'OK' : (d.go ? 'FAILED' : 'SKIPPED'),
+                line, Date.now() - t0, details, isRetry ? PD_IBKR_RETRY_HANDLER : null);
+  return outcome;
+}
+
+function pdIbkrFollowUpState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_FOLLOWUP_HANDLER) n++;
+    }
+    return n ? n + ' armed' : 'none armed';
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+/* ----- v1.5.18 cash snapshot writer + last-known cash + follow-up retry -- */
+
+var PD_CASH_SNAP_PROP = 'PD_CASH_SNAPSHOT_WRITE';    /* off (default) | observe | on */
+var PD_CASH_SNAP_LAST_PROP = 'PD_CASH_SNAPSHOT_LAST'; /* Riyadh date of the last row written here */
+var PD_CASH_SNAP_SHEET = '_Cash_Snapshot';
+var PD_CASH_SNAP_TYPE = 'SNAPSHOT (IBKR capture)';
+var PD_CASH_SNAP_BALANCE_TYPE = 'settled_cash';
+var PD_CASH_SNAP_HANDLER = 'pdCashSnapApply_';
+var PD_CASH_SNAP_SCAN_ROWS = 400;        /* tail rows read for the same-day check */
+var PD_CASH_SNAP_MAX_COLS = 60;
+var PD_CASH_SNAP_RIYADH_MS = 3 * 3600000;
+var PD_CASH_SNAP_DAY_MS = 86400000;
+/* The header names the export audit certifies (scripts/tfb_export_audit.py,
+ * cash certification contract v1.1.1); the first alias found wins. */
+var PD_CASH_SNAP_FIELDS = [
+  {key: 'date', names: ['Date'], required: true},
+  {key: 'time', names: ['Time'], required: true},
+  {key: 'balance_sar', names: ['Balance SAR'], required: true},
+  {key: 'account', names: ['Account', 'Account ID'], required: true},
+  {key: 'currency', names: ['Currency', 'Ccy'], required: true},
+  {key: 'balance_type', names: ['Balance Type'], required: true},
+  {key: 'balance', names: ['Balance', 'Native Balance'], required: false},
+  {key: 'fx', names: ['FX to SAR'], required: false},
+  {key: 'fx_asof', names: ['FX As Of'], required: false},
+  {key: 'asof', names: ['As Of', 'Timestamp'], required: false},
+  {key: 'type', names: ['Type'], required: false},
+  {key: 'amount_sar', names: ['Amount SAR'], required: false},
+  {key: 'delta', names: ['Delta vs Prev'], required: false},
+  {key: 'note', names: ['Note'], required: false},
+  {key: 'source', names: ['Source Ref', 'Source', 'Evidence Ref'], required: false},
+  {key: 'fx_source', names: ['FX Source'], required: false},
+  {key: 'writer', names: ['Writer'], required: false}
+];
+var PD_CASH_SNAP_FOREIGN_KEYS = ['balance', 'fx', 'fx_asof'];   /* required for a non-SAR balance */
+var PD_IBKR_RETRY_PROP = 'PD_IBKR_FOLLOWUP_RETRY';   /* off (default) | on */
+var PD_IBKR_RETRY_HANDLER = 'pdIbkrEvidenceFollowUpRetry';
+var PD_IBKR_RETRY_DELAY_MS = 180000;
+var PD_IBKR_RETRY_REASON = 'cockpit refresh in progress';
+var PD_IBKR_RETRY_RUN_ = null;   /* set by pdIbkrEvidenceFollowUpRetry for its own execution */
+
+/** v1.5.18: observe | on when the property says so (trimmed, any case);
+ * anything else, absent included, 'off'. Never throws. */
+function pdCashSnapMode_() {
+  var v = pdIbkrProp_(PD_CASH_SNAP_PROP).toLowerCase();
+  return (v === 'observe' || v === 'on') ? v : 'off';
+}
+
+/** PURE: an instant -> its Riyadh calendar parts (UTC+3, no DST). */
+function pdCashSnapRiyadh_(ms) {
+  var iso = new Date(ms + PD_CASH_SNAP_RIYADH_MS).toISOString();
+  var y = +iso.slice(0, 4), mo = +iso.slice(5, 7), d = +iso.slice(8, 10);
+  return {date: iso.slice(0, 10), time: iso.slice(11, 19), hhmm: iso.slice(11, 16),
+          iso: iso.slice(0, 19) + '+03:00',
+          midnightMs: Date.UTC(y, mo - 1, d) - PD_CASH_SNAP_RIYADH_MS};
+}
+
+/** PURE: the header row -> {ok, reason, idx: {key: 0-based column}, width}.
+ * idx is filled for every name found even when a required one is missing,
+ * so a legacy header can still serve the last-known note. */
+function pdCashSnapHeaderMap_(header) {
+  var out = {ok: false, reason: '', idx: {}, width: 0};
+  var names = [];
+  for (var i = 0; i < (header || []).length; i++) {
+    names.push(String(header[i] === null || header[i] === undefined ? '' : header[i])
+        .replace(/^\s+|\s+$/g, ''));
+  }
+  out.width = names.length;
+  if (!names.length || !names.join('')) {
+    out.reason = 'header empty';
+    return out;
+  }
+  var missing = [];
+  for (var f = 0; f < PD_CASH_SNAP_FIELDS.length; f++) {
+    var field = PD_CASH_SNAP_FIELDS[f], at = -1;
+    for (var a = 0; a < field.names.length && at < 0; a++) {
+      for (var c = 0; c < names.length; c++) {
+        if (names[c] === field.names[a]) { at = c; break; }
+      }
+    }
+    if (at >= 0) out.idx[field.key] = at;
+    else if (field.required) missing.push(field.names[0]);
+  }
+  if (missing.length) {
+    out.reason = 'header lacks ' + missing.join(', ');
+    return out;
+  }
+  out.ok = true;
+  return out;
+}
+
+/** PURE: a Balance SAR cell -> integer cents, or null (text with thousands
+ * separators is accepted; anything that is not a plain amount is not). */
+function pdCashSnapCents_(value) {
+  if (typeof value === 'number') return pdIbkrUnits_(value, 2);
+  if (typeof value === 'string') return pdIbkrUnits_(value.replace(/,/g, ''), 2);
+  return null;
+}
+
+/** PURE: a row's Date / Time / As Of cells -> {ms, hasTime}. An As Of value
+ * wins when it parses (a Date keeps its instant; a naive string is Riyadh);
+ * else the Riyadh day of Date plus a Time cell (a Date's wall clock, a day
+ * fraction, or 'HH:mm[:ss]'); a day without a time is its Riyadh midnight
+ * with hasTime false; no day -> ms null. */
+function pdCashSnapStampMs_(dateCell, timeCell, asofCell) {
+  var out = {ms: null, hasTime: false};
+  if (asofCell !== null && asofCell !== undefined && asofCell !== '') {
+    var asMs = pdSrcStampMs_(asofCell);
+    if (asMs !== null) { out.ms = asMs; out.hasTime = true; return out; }
+  }
+  var day = pdPostEarnRiyadhDay_(dateCell);
+  if (day === null) return out;
+  out.ms = day * PD_CASH_SNAP_DAY_MS - PD_CASH_SNAP_RIYADH_MS;
+  var dayMs = null;
+  if (Object.prototype.toString.call(timeCell) === '[object Date]') {
+    if (isFinite(timeCell.getTime())) {
+      dayMs = (timeCell.getTime() + PD_CASH_SNAP_RIYADH_MS) % PD_CASH_SNAP_DAY_MS;
+      if (dayMs < 0) dayMs += PD_CASH_SNAP_DAY_MS;
+    }
+  } else if (typeof timeCell === 'number') {
+    if (isFinite(timeCell) && timeCell >= 0 && timeCell < 1) {
+      dayMs = Math.round(timeCell * PD_CASH_SNAP_DAY_MS);
+    }
+  } else if (typeof timeCell === 'string') {
+    var m = timeCell.replace(/^\s+|\s+$/g, '').match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (m && +m[1] <= 23 && +m[2] <= 59 && (!m[3] || +m[3] <= 59)) {
+      dayMs = ((+m[1]) * 3600 + (+m[2]) * 60 + (m[3] ? +m[3] : 0)) * 1000;
+    }
+  }
+  if (dayMs !== null) { out.ms += dayMs; out.hasTime = true; }
+  return out;
+}
+
+/** Bounded read of the tab: the header row (<= 60 columns) and the last
+ * <= 400 data rows. {header, map, rows, lastRow, firstRow}. */
+function pdCashSnapRead_(sh) {
+  var out = {header: [], map: null, rows: [], lastRow: 0, firstRow: 0};
+  var lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (!(lastRow >= 1 && lastCol >= 1)) {
+    out.map = pdCashSnapHeaderMap_([]);
+    return out;
+  }
+  var width = Math.min(lastCol, PD_CASH_SNAP_MAX_COLS);
+  out.header = sh.getRange(1, 1, 1, width).getValues()[0];
+  out.map = pdCashSnapHeaderMap_(out.header);
+  out.lastRow = lastRow;
+  if (lastRow >= 2) {
+    var from = Math.max(2, lastRow - PD_CASH_SNAP_SCAN_ROWS + 1);
+    out.firstRow = from;
+    out.rows = sh.getRange(from, 1, lastRow - from + 1, width).getValues();
+  }
+  return out;
+}
+
+/** PURE: the tail rows -> {exists: a row carries the Riyadh day dayInt (any
+ * writer), prev: the newest numeric Balance SAR, newest: {balanceCents,
+ * stampMs, hasTime}} -- the newest row is the last one with a numeric
+ * Balance SAR, the row the export audit certifies. */
+function pdCashSnapTailScan_(read, dayInt) {
+  var out = {exists: false, prev: null, newest: null};
+  var idx = read && read.map ? read.map.idx : {};
+  var rows = read && read.rows ? read.rows : [];
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var row = rows[r] || [];
+    var dcell = idx.hasOwnProperty('date') ? row[idx.date] : null;
+    if (dayInt !== null && !out.exists && pdPostEarnRiyadhDay_(dcell) === dayInt) {
+      out.exists = true;
+    }
+    if (!out.newest && idx.hasOwnProperty('balance_sar')) {
+      var cents = pdCashSnapCents_(row[idx.balance_sar]);
+      if (cents !== null) {
+        var st = pdCashSnapStampMs_(dcell,
+            idx.hasOwnProperty('time') ? row[idx.time] : null,
+            idx.hasOwnProperty('asof') ? row[idx.asof] : null);
+        out.newest = {balanceCents: cents, stampMs: st.ms, hasTime: st.hasTime};
+        out.prev = cents / 100;
+      }
+    }
+    if (out.newest && (dayInt === null || out.exists)) break;
+  }
+  return out;
+}
+
+/** PURE: the _Cash_Snapshot row for a certifiable plan -> {ok, reason, row,
+ * date, cells}. One cash currency only. Balance SAR is the plan's certified
+ * cents (the figure the request carries); Balance is the native settled
+ * cash less working-BUY reservations, the figure those cents are derived
+ * from, so Balance SAR = Balance x FX within the audit's one halala. */
+function pdCashSnapRow_(map, plan, capName, nowMs, prevBalance) {
+  var out = {ok: false, reason: '', row: null, date: '', cells: null};
+  if (!(map && map.ok)) { out.reason = map ? map.reason : 'header unknown'; return out; }
+  if (!(plan && plan.ok === true && plan.packet)) { out.reason = 'no valid plan'; return out; }
+  if (plan.cashCents === null || plan.cashCents === undefined) {
+    out.reason = 'cash withheld (' + (plan.cashNote || 'not certifiable') + ')';
+    return out;
+  }
+  var acct = plan.packet.accounts && plan.packet.accounts[0];
+  var cashRows = (acct && acct.cash) ? acct.cash : [];
+  if (cashRows.length !== 1) {
+    var ccys = [];
+    for (var i = 0; i < cashRows.length; i++) ccys.push(cashRows[i].currency);
+    out.reason = 'several cash currencies (' + ccys.join(',') + '); one-currency rows only';
+    return out;
+  }
+  var ccy = pdIbkrSym_(cashRows[0].currency);
+  var settled = pdIbkrUnits_(cashRows[0].settled_cash, 6);
+  var reserved = pdIbkrUnits_(cashRows[0].reserved_cash, 6);
+  if (settled === null || reserved === null || !PD_IBKR_RATE_X100.hasOwnProperty(ccy)) {
+    out.reason = 'native cash unreadable';
+    return out;
+  }
+  if (ccy !== 'SAR') {
+    var lacks = [];
+    for (var k = 0; k < PD_CASH_SNAP_FOREIGN_KEYS.length; k++) {
+      var key = PD_CASH_SNAP_FOREIGN_KEYS[k];
+      if (!map.idx.hasOwnProperty(key)) {
+        for (var f = 0; f < PD_CASH_SNAP_FIELDS.length; f++) {
+          if (PD_CASH_SNAP_FIELDS[f].key === key) lacks.push(PD_CASH_SNAP_FIELDS[f].names[0]);
+        }
+      }
+    }
+    if (lacks.length) { out.reason = 'header lacks ' + lacks.join(', '); return out; }
+  }
+  var native = Number(pdIbkrUnitsText_(settled - reserved, 6));
+  var rate = PD_IBKR_RATE_X100[ccy] / 100;
+  var cap = pdCashSnapRiyadh_(plan.capturedMs);
+  var now = pdCashSnapRiyadh_(nowMs);
+  var balance = plan.cashCents / 100;
+  var ref = 'ibkr-capture:' + String(capName || '');
+  var writer = '10_My_Portfolio v' + PD_VERSION;
+  var cells = {
+    date: new Date(cap.midnightMs),
+    time: cap.time,
+    asof: cap.iso,
+    type: PD_CASH_SNAP_TYPE,
+    amount_sar: 0,
+    balance_sar: balance,
+    delta: (typeof prevBalance === 'number' && isFinite(prevBalance))
+        ? Math.round((balance - prevBalance) * 100) / 100 : '',
+    note: ref + '; captured_at ' + String(plan.packet.captured_at || '') +
+        '; written ' + now.date + ' ' + now.hhmm + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) +
+        '; settled ' + pdIbkrUnitsText_(settled, 6) + ' ' + ccy +
+        ', reserved ' + pdIbkrUnitsText_(reserved, 6) + ' ' + ccy +
+        '; FX ' + PD_IBKR_FX_SOURCE + ' @ ' + rate + '; writer ' + writer,
+    account: 'IBKR (' + String(acct.account_id || '') + ')',
+    currency: ccy,
+    balance_type: PD_CASH_SNAP_BALANCE_TYPE,
+    balance: native,
+    fx: rate,
+    fx_asof: cap.iso,
+    source: ref,
+    fx_source: PD_IBKR_FX_SOURCE,
+    writer: writer
+  };
+  var row = [];
+  for (var c = 0; c < map.width; c++) row.push('');
+  for (var name in cells) {
+    if (cells.hasOwnProperty(name) && map.idx.hasOwnProperty(name)) row[map.idx[name]] = cells[name];
+  }
+  out.ok = true;
+  out.row = row;
+  out.date = cap.date;
+  out.cells = cells;
+  return out;
+}
+
+/** PURE: the status-line token (never the receipt phrase; bounded). */
+function pdCashSnapToken_(mode, ok, text) {
+  var token;
+  if (mode === 'observe') {
+    token = ok ? ' | [cash-snapshot-observe] would append (' + text + ')'
+               : ' | [cash-snapshot-observe] would not append: ' + text;
+  } else {
+    token = ok ? ' | cash snapshot appended (' + text + ')' : ' | cash snapshot ' + text;
+  }
+  return token.replace(/source\s+readiness/gi, 'source check').slice(0, 400);
+}
+
+/** The newest _Cash_Snapshot row (any writer) as a presentation-only token
+ * for a render whose capture is not fresh. Never throws. */
+function pdCashSnapLastKnownNote_(nowMs) {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    if (!sh) return ' | last known cash unavailable (' + PD_CASH_SNAP_SHEET + ' missing)';
+    var scan = pdCashSnapTailScan_(pdCashSnapRead_(sh), null);
+    if (!scan.newest) return ' | last known cash unavailable (no Balance SAR row)';
+    var n = scan.newest, when;
+    if (n.stampMs === null) {
+      when = 'date unknown';
+    } else {
+      var rp = pdCashSnapRiyadh_(n.stampMs);
+      if (n.hasTime) {
+        when = 'as of ' + rp.date + ' ' + rp.hhmm + ' Riyadh, ' + pdIbkrAge_(nowMs - n.stampMs) + ' old';
+      } else {
+        var endMs = n.stampMs + PD_CASH_SNAP_DAY_MS;
+        when = 'as of ' + rp.date + ' (no time), ' +
+            (nowMs >= endMs ? 'at least ' + pdIbkrAge_(nowMs - endMs) + ' old' : 'today');
+      }
+    }
+    return (' | last known cash ' + pdIbkrCentsText_(n.balanceCents) + ' SAR (' + when +
+            '; not applied to funding)').replace(/source\s+readiness/gi, 'source check');
+  } catch (e) {
+    return ' | last known cash unavailable (' +
+        String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** v1.5.18: the gated writer. mode is observe | on; plan / fresh / capName
+ * come from pdIbkrApply_. Not fresh -> the last-known token only. Fresh and
+ * certifiable -> one row per Riyadh day, append-only, by header name;
+ * observe -> the would-append line instead. Never throws; the funding path
+ * never sees this result. Returns {note, written, reason, date}. */
+function pdCashSnapApply_(mode, plan, fresh, capName, nowMs) {
+  var out = {note: '', written: false, reason: '', date: ''};
+  try {
+    if (!fresh) {
+      out.note = pdCashSnapLastKnownNote_(nowMs);
+      return out;
+    }
+    if (!(plan && plan.ok === true)) { out.reason = 'no valid plan'; }
+    else if (plan.cashCents === null || plan.cashCents === undefined) {
+      out.reason = 'cash withheld (' + (plan.cashNote || 'not certifiable') + ')';
+    }
+    if (out.reason) {
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'NOT appended: ' + out.reason : out.reason);
+      if (mode === 'on') {
+        pdIbkrRunLog_('INFO', 'SKIPPED', '[MP-DEC v' + PD_VERSION + '] cash snapshot not appended: ' +
+            out.reason, null, {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+      }
+      return out;
+    }
+    var day = pdCashSnapRiyadh_(plan.capturedMs).date;
+    out.date = day;
+    if (pdIbkrProp_(PD_CASH_SNAP_LAST_PROP) === day) {
+      out.reason = 'row for ' + day + ' exists';
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'kept: ' + out.reason : out.reason);
+      return out;
+    }
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    var built = null;
+    if (!sh) {
+      out.reason = PD_CASH_SNAP_SHEET + ' missing';
+    } else {
+      var read = pdCashSnapRead_(sh);
+      if (!read.map.ok) {
+        out.reason = read.map.reason;
+      } else {
+        var scan = pdCashSnapTailScan_(read, pdPostEarnRiyadhDay_(day));
+        if (scan.exists) {
+          out.reason = 'row for ' + day + ' exists';
+          out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'kept: ' + out.reason : out.reason);
+          return out;
+        }
+        built = pdCashSnapRow_(read.map, plan, capName, nowMs, scan.prev);
+        if (!built.ok) out.reason = built.reason;
+      }
+    }
+    if (out.reason) {
+      out.note = pdCashSnapToken_(mode, false, mode === 'on' ? 'NOT appended: ' + out.reason : out.reason);
+      try {
+        Logger.log('[MP-DEC v' + PD_VERSION + '] cash snapshot (' + mode + ') not written: ' + out.reason);
+      } catch (eL1) {}
+      if (mode === 'on') {
+        pdIbkrRunLog_('INFO', 'SKIPPED', '[MP-DEC v' + PD_VERSION + '] cash snapshot not appended: ' +
+            out.reason, null, {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+      }
+      return out;
+    }
+    var cells = built.cells;
+    var sar = pdIbkrCentsText_(plan.cashCents);
+    if (mode === 'observe') {
+      out.note = pdCashSnapToken_(mode, true, day + ' ' + cells.time + ' Riyadh; ' + cells.account +
+          '; ' + cells.currency + ' ' + cells.balance + ' ' + cells.balance_type + '; ' + sar +
+          ' SAR; FX ' + cells.fx + ' ' + cells.fx_source + '; delta ' +
+          (cells.delta === '' ? 'n/a' : cells.delta) + '; ' + cells.source);
+      try {
+        Logger.log('[MP-DEC v' + PD_VERSION + '] cash snapshot (observe) would append a row for ' +
+                   day + ' (capture ' + cells.time + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) + ')');
+      } catch (eL2) {}
+      return out;
+    }
+    var props = PropertiesService.getScriptProperties();
+    props.setProperty(PD_CASH_SNAP_LAST_PROP, day);
+    try {
+      sh.appendRow(built.row);
+    } catch (eW) {
+      try { props.deleteProperty(PD_CASH_SNAP_LAST_PROP); } catch (eD) {}
+      throw eW;
+    }
+    out.written = true;
+    out.note = pdCashSnapToken_(mode, true, day + ' ' + cells.time.slice(0, 5) + ' Riyadh; ' + sar +
+        ' SAR; ' + cells.currency + ' ' + cells.balance + ' ' + cells.balance_type +
+        '; FX ' + cells.fx);
+    var line = '[MP-DEC v' + PD_VERSION + '] cash snapshot appended for ' + day + ' (capture ' +
+        cells.time.slice(0, 5) + ' Riyadh, age ' + pdIbkrAge_(plan.ageMs) + ')';
+    try { Logger.log(line); } catch (eL3) {}
+    pdIbkrRunLog_('INFO', 'OK', line, null, {version: PD_VERSION, mode: mode, date: day,
+                  age_ms: plan.ageMs}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+  } catch (e) {
+    out.note = ' | cash snapshot ERROR (' +
+        String(e && e.message ? e.message : e).slice(0, 80) + ')';
+    try {
+      pdIbkrRunLog_('ERROR', 'FAILED', '[MP-DEC v' + PD_VERSION + '] cash snapshot write failed: ' +
+          String(e && e.message ? e.message : e).slice(0, 120), null,
+          {version: PD_VERSION, mode: mode}, PD_CASH_SNAP_HANDLER, PD_CASH_SNAP_SHEET);
+    } catch (eR) {}
+  }
+  return out;
+}
+
+/** Self-test: the tab's header verdict and newest row day (never amounts). */
+function pdCashSnapSheetState_() {
+  try {
+    var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PD_CASH_SNAP_SHEET);
+    if (!sh) return PD_CASH_SNAP_SHEET + ': missing';
+    var read = pdCashSnapRead_(sh);
+    var scan = pdCashSnapTailScan_(read, null);
+    var newest = 'none';
+    if (scan.newest) {
+      newest = scan.newest.stampMs === null ? 'date unknown'
+          : pdCashSnapRiyadh_(scan.newest.stampMs).date + (scan.newest.hasTime ? '' : ' (no time)');
+    }
+    return PD_CASH_SNAP_SHEET + ': ' + (read.map.ok ? 'header ok (' + read.map.width + ' columns)'
+                                                    : read.map.reason) +
+        '; rows ' + Math.max(0, read.lastRow - 1) + '; newest row ' + newest;
+  } catch (e) {
+    return PD_CASH_SNAP_SHEET + ': unknown (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** PURE self-check of the writer's core on synthetic values. */
+function pdCashSnapCoreOk_() {
+  try {
+    var full = pdCashSnapHeaderMap_(['Date', 'Time', 'Type', 'Amount SAR', 'Balance SAR',
+        'Delta vs Prev', 'Note', 'Account', 'Currency', 'Balance Type', 'Balance', 'FX to SAR',
+        'FX As Of']);
+    var legacy = pdCashSnapHeaderMap_(['Date', 'Time', 'Type', 'Amount SAR', 'Balance SAR',
+        'Delta vs Prev', 'Note']);
+    if (!full.ok || full.width !== 13 || legacy.ok ||
+        legacy.reason !== 'header lacks Account, Currency, Balance Type') return false;
+    if (pdCashSnapHeaderMap_([]).reason !== 'header empty') return false;
+    var capMs = Date.UTC(2026, 10, 2, 7, 6, 12);
+    var plan = {ok: true, cashCents: 7274700, cashNote: '', capturedMs: capMs, ageMs: 300000,
+                packet: {captured_at: '2026-11-02T07:06:12.000Z', accounts: [{account_id: 'alias',
+                         cash: [{currency: 'USD', settled_cash: '19399.2', reserved_cash: '0'}]}]}};
+    var r = pdCashSnapRow_(full, plan, 'TFB_IBKR_Capture_selftest.json', capMs + 300000, 72000);
+    if (!r.ok || r.date !== '2026-11-02' || r.row.length !== 13) return false;
+    var c = r.cells;
+    if (c.time !== '10:06:12' || c.asof !== '2026-11-02T10:06:12+03:00' ||
+        c.balance_sar !== 72747 || c.balance !== 19399.2 || c.fx !== 3.75 ||
+        c.currency !== 'USD' || c.balance_type !== 'settled_cash' || c.type !== PD_CASH_SNAP_TYPE ||
+        c.account !== 'IBKR (alias)' || c.delta !== 747 || c.fx_asof !== c.asof ||
+        Math.abs(c.balance * c.fx - c.balance_sar) > 0.01 ||
+        r.row[4] !== 72747 || r.row[7] !== 'IBKR (alias)' || r.row[9] !== 'settled_cash') return false;
+    if (pdCashSnapRow_(full, {ok: true, cashCents: null, cashNote: 'x', packet: {}}, 'f', 0, null)
+        .reason !== 'cash withheld (x)') return false;
+    if (pdCashSnapRow_(legacy, plan, 'f', 0, null).ok) return false;
+    var tail = {map: full, rows: [
+      [new Date(capMs - 2 * PD_CASH_SNAP_DAY_MS), '', 'SNAPSHOT', '', 72000, '', 'n'],
+      [new Date(capMs), '10:06:12', 'SNAPSHOT', '', 72747, '', 'n']]};
+    var scan = pdCashSnapTailScan_(tail, pdPostEarnRiyadhDay_('2026-11-02'));
+    if (!scan.exists || scan.prev !== 72747 || !scan.newest.hasTime) return false;
+    var other = pdCashSnapTailScan_(tail, pdPostEarnRiyadhDay_('2026-11-03'));
+    if (other.exists) return false;
+    var st = pdCashSnapStampMs_(new Date(capMs), null, null);
+    if (st.hasTime || st.ms !== Date.UTC(2026, 10, 1, 21, 0, 0)) return false;
+    return pdCashSnapMode_() === 'off' || pdCashSnapMode_() === 'observe' || pdCashSnapMode_() === 'on';
+  } catch (e) {
+    return false;
+  }
+}
+
+/** v1.5.18: 'on' only when PD_IBKR_FOLLOWUP_RETRY says so. */
+function pdIbkrRetryMode_() {
+  return pdIbkrProp_(PD_IBKR_RETRY_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** PURE: arm ONE retry? Only on the first run, only after a cockpit
+ * collision, only when the packet is still inside its window when the
+ * retry fires. The retry run never re-arms. */
+function pdIbkrRetryCore_(mode, reason, packetAgeMs, isRetry) {
+  if (mode !== 'on') return {arm: false, reason: 'retry off'};
+  if (isRetry) return {arm: false, reason: 'a retry never re-arms'};
+  if (reason !== PD_IBKR_RETRY_REASON) return {arm: false, reason: 'not a cockpit collision'};
+  if (typeof packetAgeMs !== 'number' || !isFinite(packetAgeMs) || packetAgeMs < 0) {
+    return {arm: false, reason: 'packet age unknown'};
+  }
+  var then = packetAgeMs + PD_IBKR_RETRY_DELAY_MS;
+  if (then > PD_IBKR_FOLLOWUP_MAX_AGE_MS) {
+    return {arm: false, reason: 'packet would be ' + pdIbkrAge_(then) + ' old at the retry (limit 14m)'};
+  }
+  return {arm: true, reason: 'packet ' + pdIbkrAge_(then) + ' old at the retry'};
+}
+
+function pdIbkrRemoveRetry_() {
+  var n = 0;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_RETRY_HANDLER) {
+        ScriptApp.deleteTrigger(all[i]);
+        n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+/** One-off trigger: the retry fires 3 minutes later. Never throws. */
+function pdIbkrArmRetry_() {
+  try {
+    pdIbkrRemoveRetry_();
+    ScriptApp.newTrigger(PD_IBKR_RETRY_HANDLER).timeBased()
+        .after(PD_IBKR_RETRY_DELAY_MS).create();
+    return 'retry armed (+3m)';
+  } catch (e) {
+    return 'retry not armed (' + String(e && e.message ? e.message : e).slice(0, 60) + ')';
+  }
+}
+
+/** After a skipped follow-up: the line token ('' when the gate is off or
+ * the skip is not a cockpit collision on a first run). */
+function pdIbkrRetryAfterSkip_(reason, packetAgeMs, isRetry) {
+  if (!isRetry && reason !== PD_IBKR_RETRY_REASON) return '';
+  var mode = pdIbkrRetryMode_();
+  if (mode !== 'on') return '';
+  var rc = pdIbkrRetryCore_(mode, reason, packetAgeMs, isRetry);
+  return rc.arm ? pdIbkrArmRetry_() + ' (' + rc.reason + ')' : 'retry not armed: ' + rc.reason;
+}
+
+/** Time-driven once (pdIbkrArmRetry_): the one retry of the follow-up.
+ * Clears its own trigger, marks the execution, runs the same guards and
+ * render as pdIbkrEvidenceFollowUp, never re-arms. */
+function pdIbkrEvidenceFollowUpRetry() {
+  var removed = pdIbkrRemoveRetry_();
+  PD_IBKR_RETRY_RUN_ = {removed: removed};
+  try {
+    return pdIbkrEvidenceFollowUp();
+  } finally {
+    PD_IBKR_RETRY_RUN_ = null;
+  }
+}
+
+function pdIbkrRetryState_() {
+  try {
+    var n = 0;
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === PD_IBKR_RETRY_HANDLER) n++;
+    }
+    return n ? n + ' armed' : 'none armed';
+  } catch (e) {
+    return 'unknown';
   }
 }
 
@@ -4039,6 +5105,186 @@ function pdApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 
 /* ----- main refresh --------------------------------------------------------------- */
 
+/* ----- v1.5.17 [D1b POST-EARN]: Calendar_Events inputs for the backend
+ * guard (portfolio_actions 1.17.0, Render TFB_PF_ADD_POST_EARN). ---------- */
+var PD_POST_EARN_PROP = 'PD_POST_EARN';
+var PD_POST_EARN_SCHEMA = 'tfb.pd-post-earnings/v1';
+var PD_POST_EARN_STALE_DAYS = 7;
+
+/** v1.5.17: 'on' when Script Property PD_POST_EARN is on (any case,
+ * surrounding blanks ignored); anything else, absent included, 'off'. */
+function pdPostEarnMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(PD_POST_EARN_PROP) || '');
+  } catch (ePm) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return raw === 'on' ? 'on' : 'off';
+}
+
+/** v1.5.17 PURE: integer day (UTC days since 1970) of a Riyadh calendar
+ * date: a Date is shifted +3 h; a string must start 'YYYY-MM-DD'. Else
+ * null. */
+function pdPostEarnRiyadhDay_(value) {
+  var text = '';
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (!isFinite(value.getTime())) return null;
+    text = new Date(value.getTime() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    text = value.replace(/^\s+/, '').slice(0, 10);
+  } else {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  var ms = Date.parse(text + 'T00:00:00.000Z');
+  if (!isFinite(ms) || new Date(ms).toISOString().slice(0, 10) !== text) return null;
+  return Math.round(ms / 86400000);
+}
+
+/** v1.5.17 PURE: the body.post_earnings object from a Calendar_Events grid
+ * (values; null when the sheet could not be read), the held symbols and the
+ * run time. Report dates, sessions and surprises come from the Top-10's
+ * reader dt10PostEarnMapFromValues_ (16_Decision_Top10 v1.18.0) so both
+ * pages count the same sessions; without it -> 'unavailable'. A held name
+ * whose Last or Next Earnings Date is today enters at 0 sessions (that
+ * reader keeps strictly past reports only). The newest
+ * 'Updated At (Riyadh)' day older than PD_POST_EARN_STALE_DAYS -> 'stale'.
+ * Never throws. */
+function pdPostEarnCore_(values, held, now) {
+  var nowDate = (now && Object.prototype.toString.call(now) === '[object Date]' &&
+                 isFinite(now.getTime())) ? now : new Date();
+  var today = pdPostEarnRiyadhDay_(nowDate);
+  var out = {schema: PD_POST_EARN_SCHEMA, status: 'unavailable',
+             asof: today === null ? '' : new Date(today * 86400000).toISOString().slice(0, 10),
+             updated: '', reports: 0, map: {}};
+  try {
+    if (typeof dt10PostEarnMapFromValues_ !== 'function') {
+      out.reason = 'post-earnings parser missing (16_Decision_Top10 v1.18.0)';
+      return out;
+    }
+    if (!values || !values.length) {
+      out.reason = 'Calendar_Events not readable';
+      return out;
+    }
+    var iSym = -1, iUpd = -1, iLast = -1, iNext = -1, iSur = -1, r, c, cells, tok;
+    for (r = 0; r < values.length && r < 10 && iSym < 0; r++) {
+      cells = values[r] || [];
+      var s = -1, u = -1, l = -1, x = -1, p = -1;
+      for (c = 0; c < cells.length; c++) {
+        tok = String(cells[c] === null || cells[c] === undefined ? '' : cells[c])
+            .toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (tok === 'symbol') s = c;
+        else if (tok === 'updatedatriyadh' || tok === 'updatedat') u = c;
+        else if (tok === 'lastearningsdate') l = c;
+        else if (tok === 'nextearningsdate' || tok === 'earningsdate') x = c;
+        else if (tok === 'epssurprise') p = c;
+      }
+      if (s >= 0 && (l >= 0 || x >= 0)) { iSym = s; iUpd = u; iLast = l; iNext = x; iSur = p; }
+    }
+    if (iSym < 0) {
+      out.reason = 'Calendar_Events header not found';
+      return out;
+    }
+    var firstBody = r;
+    var newest = null;
+    if (iUpd >= 0) {
+      for (; r < values.length; r++) {
+        var d = pdPostEarnRiyadhDay_((values[r] || [])[iUpd]);
+        if (d !== null && (newest === null || d > newest)) newest = d;
+      }
+    }
+    if (newest !== null) out.updated = new Date(newest * 86400000).toISOString().slice(0, 10);
+    var full = dt10PostEarnMapFromValues_(values, nowDate) || {};
+    var k, n = 0;
+    for (k in full) {
+      if (Object.prototype.hasOwnProperty.call(full, k)) n++;
+    }
+    out.reports = n;
+    var map = {}, heldSet = {};
+    for (var i = 0; i < (held || []).length; i++) {
+      var sym = String(held[i] === null || held[i] === undefined ? '' : held[i])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!sym) continue;
+      heldSet[sym] = true;
+      if (Object.prototype.hasOwnProperty.call(full, sym)) map[sym] = full[sym];
+    }
+    /* Review fix (Codex P1, PR #869): the Top-10 reader keeps strictly past
+     * reports, so a held name that reports, or reported, TODAY was missing
+     * and its ADD passed on the report day itself. Such a name enters at 0
+     * sessions (inside every window); the surprise is read only from a Last
+     * Earnings Date of today, as the Top-10 reader parses it. */
+    var dayOf = (typeof dt10CalendarDay_ === 'function') ? dt10CalendarDay_ : pdPostEarnRiyadhDay_;
+    for (var q = firstBody; today !== null && q < values.length; q++) {
+      cells = values[q] || [];
+      var hs = String(cells[iSym] === null || cells[iSym] === undefined ? '' : cells[iSym])
+          .replace(/^\s+|\s+$/g, '').toUpperCase();
+      if (!hs || !heldSet[hs] || Object.prototype.hasOwnProperty.call(map, hs)) continue;
+      var lastDay = iLast >= 0 ? dayOf(cells[iLast]) : null;
+      var nextDay = iNext >= 0 ? dayOf(cells[iNext]) : null;
+      if (lastDay !== today && nextDay !== today) continue;
+      var sur = null;
+      if (lastDay === today && iSur >= 0) {
+        var raw = cells[iSur];
+        if (typeof raw === 'string') raw = raw.replace(/[,%\s]/g, '');
+        if (typeof raw === 'number' && isFinite(raw)) {
+          sur = raw;
+        } else if (typeof raw === 'string' && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+          sur = parseFloat(raw);
+        }
+        if (sur !== null && Math.abs(sur) > 999999) sur = sur > 0 ? 999999 : -999999;
+      }
+      map[hs] = {date: out.asof, sessions: 0, surprise: sur};
+    }
+    out.map = map;
+    if (iUpd >= 0 && (newest === null || today === null ||
+        today - newest > PD_POST_EARN_STALE_DAYS)) {
+      out.status = 'stale';
+      out.reason = newest === null ? 'no Updated At day' :
+          'newest calendar update ' + out.updated;
+      return out;
+    }
+    out.status = 'ok';
+    return out;
+  } catch (ePc) {
+    out.status = 'unavailable';
+    out.map = {};
+    out.reason = 'Calendar_Events parse failed';
+    return out;
+  }
+}
+
+/** v1.5.17: live Calendar_Events read for pdPostEarnCore_; the held symbols
+ * are the request rows' Symbol cells. Any failure -> 'unavailable'. Never
+ * throws; never logged. */
+function pdPostEarnBody_(ss, rows) {
+  var now = new Date();
+  var held = [];
+  try {
+    for (var i = 0; i < (rows || []).length; i++) {
+      if (rows[i] && rows[i]['Symbol'] !== undefined) held.push(rows[i]['Symbol']);
+    }
+  } catch (eHs) {
+    held = [];
+  }
+  var values = null;
+  try {
+    var sh = ss.getSheetByName('Calendar_Events');
+    var maxRows = (typeof DT10_CALENDAR_MAX_ROWS === 'number') ? DT10_CALENDAR_MAX_ROWS : 5000;
+    if (sh) {
+      var nr = sh.getLastRow(), nc = Math.min(sh.getLastColumn(), 16);
+      if (isFinite(nr) && isFinite(nc) && nr >= 2 && nc >= 2 && nr <= maxRows + 1) {
+        values = sh.getRange(1, 1, nr, nc).getValues();
+      }
+    }
+  } catch (eRd) {
+    values = null;
+  }
+  return pdPostEarnCore_(values, held, now);
+}
+
 function refreshPortfolioDecision() {
   var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -4076,6 +5322,11 @@ function refreshPortfolioDecision() {
    * (absent -> request unchanged). Never logged. */
   var evidence = pdEvidencePacket_();
   if (evidence) body.reconciliation_evidence = evidence;
+  /* v1.5.17 [D1b]: Calendar_Events post-earnings inputs for the backend
+   * guard (portfolio_actions 1.17.0); off -> no read and the request is
+   * unchanged. Never logged; the backend ignores it unless
+   * TFB_PF_ADD_POST_EARN is armed. */
+  if (pdPostEarnMode_() === 'on') body.post_earnings = pdPostEarnBody_(ss, pool.rows);
   /* v1.5.12: IBKR capture evidence + execution scope; off -> no Drive
    * read and the request is unchanged. Never logged. */
   var ibkr = ibkrMode === 'off' ? null : pdIbkrApply_(ibkrMode, body);
@@ -4109,12 +5360,17 @@ function refreshPortfolioDecision() {
     try { postStamps = pdCollectHoldings_(null, true).stamps; } catch (eRb) {}
     binding = {pre: pool.stamps, post: postStamps};
   }
+  /* v1.5.15 PD-ALLCASH: 'empty' with this run's IBKR evidence SENT at 0
+   * positions / 0 links is a decided all-cash book; PD_ALLCASH_OK=off (or
+   * a failed proof) keeps every v1.5.14 line byte-identical. */
+  var allCash = pdAllCashMode_() === 'enforce' && pdAllCashProof_(payload, ibkr);
   var receiptNote = pdReceiptNote_(receiptMode, ss, sourceCtx,
-      pool.rows.length, payload, binding);
-  var statusLine = poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
+      pool.rows.length, payload, binding, allCash);
+  var statusLine = (allCash ? PD_ALLCASH_TOKEN + ' | ' : '') +
+      poolNote + receiptNote + (ibkr ? ibkr.note : '') + ' | ' +
       pdMetaLine_(payload.meta) +
       ' | ' + secs + 's';
-  statusCell.setValue(pdStatusLine_(String(payload.status || '?'),
+  statusCell.setValue(pdStatusLine_(allCash ? 'ok' : String(payload.status || '?'),
       logNote ? statusLine + ' | ' + logNote : statusLine));
   Logger.log('[MP-DEC v' + PD_VERSION + '] done status=' + payload.status +
              ' in ' + secs + 's' + (logNote ? ' | ' + logNote : ''));
@@ -4500,6 +5756,8 @@ function pdSelfTest() {
       (pdEvidencePacket_() ? 'present (schema 1)' : 'absent'));
   /* v1.5.12: IBKR capture evidence (read-only; never amounts or the packet). */
   report.push('IBKR evidence mode (PD_IBKR_EVIDENCE): ' + pdIbkrMode_());
+  /* v1.5.15: the all-cash gate (read-only). */
+  report.push('all-cash gate (PD_ALLCASH_OK): ' + pdAllCashMode_());
   var ibEx = pdIbkrExcludeList_(pdIbkrProp_(PD_IBKR_EXCLUDE_PROP));
   report.push('execution scope exclusions (PD_EXECUTION_EXCLUDE): ' +
       (ibEx.length ? ibEx.join(', ') : 'none'));
@@ -4521,6 +5779,46 @@ function pdSelfTest() {
         : 'rejected: ' + ibPlan.reason));
   }
   report.push('capture watcher: ' + pdIbkrWatcherState_());
+  /* v1.5.16: evidence publication (read-only; never the packet). */
+  report.push('evidence publish (PD_IBKR_EVIDENCE_PUBLISH): ' + pdIbkrPublishMode_() +
+      '; follow-up trigger: ' + pdIbkrFollowUpState_());
+  var fuOk = pdIbkrFollowUpCore_('on', 300000, true,
+      {automationAllowed: true, inflight: false, cockpitRunning: false, quiet: false}).go === true &&
+      pdIbkrFollowUpCore_('on', 841000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, true, {quiet: true}).go === false &&
+      pdIbkrFollowUpCore_('off', 1000, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', null, true, null).go === false &&
+      pdIbkrFollowUpCore_('on', 1000, false, null).go === false;
+  report.push('follow-up core: ' + (fuOk ? 'ok' : 'FAIL'));
+  /* v1.5.18: cash snapshot writer, last-known cash and the follow-up retry
+   * (read-only; never amounts, the alias or the capture file name). */
+  report.push('cash snapshot writer (PD_CASH_SNAPSHOT_WRITE): ' + pdCashSnapMode_() +
+      '; last written here: ' + (pdIbkrProp_(PD_CASH_SNAP_LAST_PROP) || 'none') +
+      '; ' + pdCashSnapSheetState_());
+  report.push('cash snapshot core: ' + (pdCashSnapCoreOk_() ? 'ok' : 'FAIL'));
+  var rtOk = pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, false).arm === true &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660000, false).arm === true &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660001, false).arm === false &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, true).arm === false &&
+      pdIbkrRetryCore_('on', 'quiet window', 300000, false).arm === false &&
+      pdIbkrRetryCore_('off', PD_IBKR_RETRY_REASON, 300000, false).arm === false &&
+      pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, null, false).arm === false;
+  report.push('follow-up retry (PD_IBKR_FOLLOWUP_RETRY): ' + pdIbkrRetryMode_() +
+      '; retry trigger: ' + pdIbkrRetryState_() + '; retry core: ' + (rtOk ? 'ok' : 'FAIL'));
+  /* v1.5.17 [D1b]: the post-earnings inputs the next run would send. */
+  var peNow = pdPostEarnBody_(ss, pool.rows);
+  var peList = [];
+  for (var pk in peNow.map) {
+    if (Object.prototype.hasOwnProperty.call(peNow.map, pk)) {
+      var pe = peNow.map[pk];
+      peList.push(pk + ' ' + pe.date + ' ' + pe.sessions + ' sess EPS ' +
+                  (pe.surprise === null ? 'n/a' : pe.surprise));
+    }
+  }
+  report.push('post-earnings inputs (PD_POST_EARN=' + pdPostEarnMode_() + '): ' + peNow.status +
+      (peNow.reason ? ' (' + peNow.reason + ')' : '') + '; calendar updated ' +
+      (peNow.updated || '-') + '; recent reports ' + peNow.reports +
+      '; held with a report: ' + (peList.length ? peList.join(', ') : 'none'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {

@@ -2,6 +2,8 @@
 
 Date: 2026-10-20. This is the follow-up to v1.0.10 (#807, merged as `97fa9915`) and answers Codex P2 on PR #808.
 
+Renumbered 2026-11-02 (merge of main `3bbf3c80`): main shipped a different v1.0.11 (#895, the cockpit's 'Exp. Gain TP1 (SAR)' KPI read into the D10-1c evidence). This build is now **v1.0.12** (sha256 `c4f40add2cff260b...`, 1,462 lines): #895's v1.0.11 WHY block and code are verbatim, this build's block sits after it with a renumber line and a MERGE NOTE (rollback is now v1.0.11), and its inline tags read v1.0.12. With the gate off the file runs exactly as main's v1.0.11 (N1 and N5 also pass with `TFB_TEST_ACC_BASE=<git show 3bbf3c80:scripts/tfb_acceptance.py>`); main's v1.0.11 as the delivered module fails W7 only. The harness digest is unchanged (`17f1218827b64e3d`). `tests/test_acceptance_kpi_plan_label.py` (#895) pinned 1.0.11 exactly; it is now a >= 1.0.11 floor. Every "v1.0.11" below names this build, now v1.0.12.
+
 - **Base:** main `97fa9915`. `scripts/tfb_acceptance.py` 1.0.10 (sha256 `bd187c7a78a398d0...`, 1,397 lines). Result: 1.0.11 (sha256 `67e5a2ef15a92ad2...`, 1,447 lines).
 - **Lane:** GitHub Actions (`acceptance_check.yml`), read-only. Nothing in Render, the backend or Apps Script changes. The workflow is unchanged.
 - **Gate:** the same repository Variable, `TFB_ACCEPTANCE_LIVE_WINDOW` (default `'0'`). Off is unchanged: v1.0.9 byte-identical, as in v1.0.10.

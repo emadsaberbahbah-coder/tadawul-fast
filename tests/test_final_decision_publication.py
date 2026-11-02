@@ -161,7 +161,12 @@ def reports(*, coverage_failure=False, decision_failure=False, warning=False):
         row = [symbol, "Synthetic name", 0 if coverage_failure and page == "Global_Markets" else 50,
                now.isoformat(), 1, 40, "eodhd"]
         grid = scoped_grid(page, now=now) if page in scope.pages else [headers, row]
-        full.pages.append(final.coverage.audit_grid(grid, rule, headers, now, [symbol], approved_scope=scope,
+        page_headers = headers
+        if page == "Insights_Analysis":
+            from core.sheets.schema_registry import get_sheet_headers
+            page_headers = get_sheet_headers(page)
+            grid = [page_headers, ["Overview", "Sources", "count", 0, "", "", 1]]
+        full.pages.append(final.coverage.audit_grid(grid, rule, page_headers, now, [symbol], approved_scope=scope,
                                                    source_column=symbol_column(grid) if page in scope.pages else None))
     if warning:
         full.pages[0].warnings.append("synthetic maintenance warning")

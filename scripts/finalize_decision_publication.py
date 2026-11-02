@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -28,8 +29,9 @@ from scripts import audit_full_refresh_coverage as coverage
 from scripts.approved_universe_scope import (
     approved_floors, load_scope, receipt_matches_policy,
 )
+from scripts.workflow_validation_scope import SOURCE_PAGES, strict_json
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.1.2"
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -39,6 +41,13 @@ REQUIRED_PAGES = {
 }
 MARKET_FLOORS = {"Market_Leaders": 255, "Global_Markets": 6512,
                  "Commodities_FX": 453, "Mutual_Funds": 2474}
+# The per-leg validator has always allowed these advisory WARNs (exit 1).
+# Moving validation stages must not turn them into a new release policy.
+SOFT_VALIDATION_WARNINGS = frozenset({
+    "sanity.no_duplicate_symbols", "sanity.price_in_day_range", "sanity.open_present",
+    "sanity.open_in_day_range", "sanity.price_in_52w_range", "sanity.roi12_within_softcap",
+    "decision.price_present",
+})
 
 
 def _bounded_env(name: str, default: float, *, minimum=None, maximum=None) -> float:
@@ -156,8 +165,84 @@ def publish_blocker(service: Any, spreadsheet_id: str, value: str) -> None:
         raise RuntimeError("decision blocker publication unconfirmed")
 
 
+def decision_structure(path: str | Path, spreadsheet_id: str, run_id: str) -> dict:
+    """Verify a same-job, bounded literal-source/native validation witness.
+
+    This supplements the freshness receipt checks: old OK status text cannot
+    certify a missing/half-rendered cockpit grid. An unavailable witness stays
+    a blocking decision result and still reaches the normal downgrade writer.
+    """
+    try:
+        source = Path(path)
+        if source.stat().st_size > 262144:
+            raise ValueError("structural report exceeds witness size")
+        report = strict_json(source.read_text(encoding="utf-8"))
+        meta, witness, checks = report["meta"], report["workflow_witness"], report["results"]
+        expected_sha = os.getenv("GITHUB_SHA", "")
+        if (not re.fullmatch(r"[0-9a-f]{40}", expected_sha)
+                or witness.get("source_sha") != expected_sha or witness.get("run_id") != str(run_id)
+                or witness.get("sheet_sha256") != hashlib.sha256(spreadsheet_id.encode()).hexdigest()):
+            raise ValueError("structural witness workflow/source/sheet identity differs")
+        stamp = datetime.strptime(meta["generated_riyadh"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone(timedelta(hours=3)))
+        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+        if not -5 <= age <= 600 or meta.get("reader") != "read_range" or meta.get("fatal"):
+            raise ValueError("structural witness clock/reader is unverified")
+        if not isinstance(checks, list) or not checks or len(checks) > 1000:
+            raise ValueError("structural results are unavailable or unbounded")
+        expected_pages = set(SOURCE_PAGES.values()) - {"Insights_Analysis", "Data_Dictionary"}
+        expected_pages.add("Top_10_Investments")
+        names, details, findings, statuses = {}, {}, [], []
+        for check in checks:
+            page, name, status = check["page"], check["name"], check["status"]
+            if page not in expected_pages or status not in {"PASS", "FAIL", "WARN", "SKIP"}:
+                raise ValueError("structural result vocabulary differs")
+            key = (page, name)
+            if key in names:
+                raise ValueError("duplicate structural check")
+            names[key] = status
+            details[key] = str(check.get("detail", ""))
+            statuses.append(status)
+            if status in {"FAIL", "WARN"}:
+                findings.append({"severity": status, "code": "STRUCTURE_" + str(name),
+                                 "surface": page, "message": str(check.get("detail", ""))})
+        code = 2 if "FAIL" in statuses else 1 if "WARN" in statuses else 0
+        if type(witness.get("process_exit_code")) is not int or witness["process_exit_code"] != code:
+            raise ValueError("structural process/report exit differs")
+        if code < 2:
+            for page in expected_pages - {"Top_10_Investments"}:
+                for name in ("contract.header_match", "scope.coverage"):
+                    if names.get((page, name)) != "PASS":
+                        raise ValueError("full source contract/scope proof is missing")
+            for name in ("decision.header_found", "decision.feed_banner_present"):
+                if names.get(("Top_10_Investments", name)) != "PASS":
+                    raise ValueError("native cockpit structure proof is missing")
+            banner = details[("Top_10_Investments", "decision.feed_banner_present")].upper()
+            if "FEED" not in banner or "ACTIONABLE" not in banner:
+                raise ValueError("native feed banner witness is unavailable")
+            sizing_key = ("Top_10_Investments", "decision.sizing_withheld_when_blocked")
+            if "NOT ACTIONABLE" in banner:
+                if names.get(sizing_key) != "PASS":
+                    raise ValueError("blocked native withholding proof is missing")
+            elif (names.get(sizing_key) != "SKIP" or details.get(sizing_key) != "feed not blocked"
+                  or names.get(("Top_10_Investments", "decision.price_present")) not in {"PASS", "WARN"}):
+                raise ValueError("actionable native sizing/price check is unverified")
+            if any(status == "WARN" and name not in SOFT_VALIDATION_WARNINGS
+                   for (_page, name), status in names.items()):
+                raise ValueError("critical or unrecognized warning cannot supply a structural certificate")
+        return {"exit_code": 0 if code == 1 else code, "validator_exit_code": code,
+                "soft_warnings_nonblocking": code == 1,
+                "same_job_witness": True, "findings": findings,
+                "generated_riyadh": meta["generated_riyadh"]}
+    except Exception as exc:
+        return {"exit_code": 3, "same_job_witness": False, "findings": [{
+            "severity": "FAIL", "code": "STRUCTURE_WITNESS_UNAVAILABLE",
+            "surface": "Top_10_Investments", "message": safe_error_text(exc)}]}
+
+
 async def run(spreadsheet_id: str, *, reader=None, registry=None,
-              service=None, publish=False, max_rows=20000, run_id="local") -> dict:
+              service=None, publish=False, max_rows=20000, run_id="local",
+              decision_structure_report=None) -> dict:
     """Reuse the actual audits; warning-only results never upgrade the feed."""
     if not spreadsheet_id:
         raise ValueError("spreadsheet ID is missing")
@@ -221,6 +306,28 @@ async def run(spreadsheet_id: str, *, reader=None, registry=None,
         audit_payloads[name] = payload
         if code >= 2:
             reasons.append(name + "_failed")
+    if decision_structure_report is not None:
+        structure = decision_structure(decision_structure_report, spreadsheet_id, str(run_id))
+        decision_payload = audit_payloads["decision"]
+        decision_payload["freshness_exit_code"] = codes[1]
+        decision_payload["structural_validation"] = structure
+        codes[1] = max(codes[1], structure["exit_code"])
+        decision_payload.setdefault("summary", {})["exit_code"] = codes[1]
+        if not isinstance(decision_payload.get("findings", []), list):
+            codes[1] = 3
+            decision_payload["summary"]["exit_code"] = 3
+            decision_payload["findings"] = [{"severity": "FAIL", "code": "STRUCTURE_DECISION_PAYLOAD_INVALID",
+                                               "surface": "Top_10_Investments", "message": "decision findings are unavailable"}]
+        # Release consumers require decision.findings == []; observational
+        # sanity WARNs must remain nested evidence, as they were before moving
+        # this check. Only blocking structural findings join the decision gate.
+        if structure["exit_code"] >= 2:
+            decision_payload.setdefault("findings", []).extend(structure["findings"])
+        if codes[1] > 0:
+            decision_payload["executable"] = False
+        if codes[1] >= 2 and "decision_failed" not in reasons:
+            reasons.append("decision_failed")
+        audit_payloads["decision"] = json.loads(redact_text(json.dumps(decision_payload, default=str)))
     result = {"script_version": SCRIPT_VERSION, "run_id": run_id,
               "policy": {**policy, **({"approved_scope": scope.receipt()} if scope else {})},
               "audits": audit_payloads, "audit_exit_codes": codes,
@@ -248,6 +355,7 @@ def main(argv=None) -> int:
     parser.add_argument("--sheet-id", default=os.getenv("DEFAULT_SPREADSHEET_ID", ""))
     parser.add_argument("--max-rows", type=int, default=20000)
     parser.add_argument("--publish-blockers", action="store_true")
+    parser.add_argument("--decision-structure-report", help="Required same-job native/source structure witness when supplied")
     parser.add_argument("--json-out", default="final_decision_publication.json")
     args = parser.parse_args(argv)
     try:
@@ -255,7 +363,8 @@ def main(argv=None) -> int:
             raise ValueError("final publication requires the full 20,000-row audit bound")
         result = asyncio.run(run(args.sheet_id, publish=args.publish_blockers,
                                  max_rows=args.max_rows,
-                                 run_id=os.getenv("GITHUB_RUN_ID", "local")))
+                                 run_id=os.getenv("GITHUB_RUN_ID", "local"),
+                                 decision_structure_report=args.decision_structure_report))
     except Exception as exc:
         result = {"script_version": SCRIPT_VERSION, "exit_code": 3,
                   "fatal": safe_error_text(exc), "feed_promoted": False}

@@ -2,10 +2,43 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.6.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.7.1 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.7.1 WHY (2026-10-28, final audit of sync run 40673830237): with
+TFB_YAHOO_ID_ALIAS=1 the seven aliased coins are priced again, but their
+Name cell is blank (warning identity_echo_refused), so Commodities_FX name
+coverage is 446/453 = 98.45 %, below the 99.00 % final-publication floor,
+and the cohort cannot be released. Cause: the engine's chart-meta name
+rescue (data_engine_v2 BB-1) compares the echoed id SUI20947-USD with the
+page symbol SUI-USD and refuses it as a borrowed identity, although
+SUI20947-USD is exactly the id this module sent to Yahoo.
+WHAT: yahoo_id_alias(symbol) returns the verified id that to_yahoo_symbol()
+sends for one of the nine page symbols while TFB_YAHOO_ID_ALIAS=1, else ''.
+Read at call time; nothing else in this module changes (to_yahoo_symbol
+and every route are byte-identical to v5.7.0).
+
+v5.7.0 WHY (2026-10-28, morning board WITHHELD): Commodities_FX was fresh
+on 430 of 453 rows (94.9 %, below the 95 % audit floor), and 9 of the 23
+stale rows fail every day because their Yahoo ticker is dead or collides:
+SUI-USD, GRT-USD, APT-USD, UNI-USD, COMP-USD, IMX-USD, STX-USD (short
+tickers Yahoo no longer serves; EODHD returns other coins or no price),
+LBS=F (CME replaced it with LBR=F) and DX=F. The provider read-back
+(scripts/provider_identity_probe.py, run 40643617016, 28 Oct 06:24 UTC)
+found the WP-05 EODHD route BASE-USD.CC without a price for all seven
+coins, and a fresh, correctly named Yahoo identifier for all nine rows:
+SUI20947-USD "Sui USD", GRT6719-USD "The Graph USD", APT21794-USD "Aptos
+USD", UNI7083-USD "Uniswap USD", COMP5692-USD "Compound USD" (EODHD search
+agrees, 21.29 vs 21.36), IMX10603-USD "Immutable USD", STX4847-USD
+"Stacks USD", LBR=F "Lumber Futures" and DX-Y.NYB "US Dollar Index".
+WHAT: to_yahoo_symbol() returns that verified identifier for exactly these
+nine page symbols when TFB_YAHOO_ID_ALIAS=1 (default off: byte-identical
+to v5.6.0). The page symbol, the universe and every other route stay as
+they are; the Yahoo adapter's response-identity guard compares against the
+mapped id and the engine's guard against the page symbol, as for every
+mapped ticker. Cached normalization needs a process restart after arming.
 
 v5.6.0 WHY (2026-10-10 work brief WP-05): seven wrong-identity crypto
 rows were preserved after Yahoo short-ticker collisions. Add a provider
@@ -118,7 +151,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.6.0"
+__version__ = "5.7.1"
 
 __all__ = [
     "MarketType",
@@ -147,6 +180,7 @@ __all__ = [
     "is_us_ticker_heuristic",
     "parse_occ_option",
     "to_yahoo_symbol",
+    "yahoo_id_alias",
     "to_finnhub_symbol",
     "to_eodhd_symbol",
     "to_bloomberg_symbol",
@@ -353,6 +387,20 @@ FX_EQUAL_RE = re.compile(r"^([A-Z]{3,6})=[X]$", re.IGNORECASE)
 # single, implied USD base) or exactly 6 (full pair) letters. Deliberately
 # narrower than FX_EQUAL_RE so 4/5-letter =X oddities never get mapped.
 _EODHD_FX_STRICT_RE = re.compile(r"^([A-Z]{3}|[A-Z]{6})=X$")
+# v5.7.0: Yahoo identifiers confirmed by the provider read-back (run
+# 40643617016, 28 Oct 2026) for page symbols whose Yahoo ticker is dead or
+# collides. Used only when TFB_YAHOO_ID_ALIAS=1 (default off).
+_YAHOO_ID_ALIAS: Dict[str, str] = {
+    "SUI-USD": "SUI20947-USD",
+    "GRT-USD": "GRT6719-USD",
+    "APT-USD": "APT21794-USD",
+    "UNI-USD": "UNI7083-USD",
+    "COMP-USD": "COMP5692-USD",
+    "IMX-USD": "IMX10603-USD",
+    "STX-USD": "STX4847-USD",
+    "LBS=F": "LBR=F",
+    "DX=F": "DX-Y.NYB",
+}
 FX_SLASH_RE = re.compile(r"^([A-Z]{3})/([A-Z]{3})$", re.IGNORECASE)
 FX_DASH_RE = re.compile(r"^([A-Z]{3})-([A-Z]{3})$", re.IGNORECASE)
 FX_SUFFIX_RE = re.compile(r"^([A-Z]{3,6})\.FOREX$", re.IGNORECASE)
@@ -1259,11 +1307,31 @@ def infer_symbol_metadata(symbol: str) -> Dict[str, Optional[str]]:
     return result
 
 
+def yahoo_id_alias(symbol: str) -> str:
+    """v5.7.1: the verified Yahoo id that to_yahoo_symbol() sends for this
+    page symbol while TFB_YAHOO_ID_ALIAS=1 (one of the nine v5.7.0 rows),
+    else ''. Read at call time (not cached), so an identity check and the
+    provider request agree on what was asked for. Never raises."""
+    try:
+        if not _env_bool("TFB_YAHOO_ID_ALIAS", False):
+            return ""
+        return _YAHOO_ID_ALIAS.get(normalize_symbol(symbol), "")
+    except Exception:
+        return ""
+
+
 @lru_cache(maxsize=20000)
 def to_yahoo_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if not s:
         return ""
+
+    # v5.7.0: verified Yahoo identifiers for dead / colliding tickers
+    # (TFB_YAHOO_ID_ALIAS=1, default off -> byte-identical to v5.6.0).
+    if _env_bool("TFB_YAHOO_ID_ALIAS", False):
+        alias = _YAHOO_ID_ALIAS.get(s)
+        if alias:
+            return alias
 
     if is_ksa(s):
         return s if s.endswith(".SR") else f"{s}.SR"

@@ -407,7 +407,7 @@ def test_de_fund_lkg_redis_cold_worker_restores_from_l2(monkeypatch):
     de._FUND_LKG_REDIS_STATE["client"] = fr
     assert de._fund_lkg_capture("HCI.US", _full_fund_row(de)) is True
     key = de._fund_lkg_redis_key("HCI.US")
-    assert key.startswith("tfb:fund_lkg:v1:") and key in fr.kv
+    assert key.startswith("tfb:fund_lkg:v2:") and key in fr.kv
     de._FUND_LKG_STORE.clear()                                  # Render restart
     degraded = {"symbol": "HCI.US", "name": "HCI Group, Inc.", "warnings": ""}
     tag = de._fund_lkg_restore("HCI.US", degraded)

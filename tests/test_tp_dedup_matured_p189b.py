@@ -192,7 +192,9 @@ def main():
       and a2.realized_roi is None and "[v6.41.0 DEDUP-MATURED] duplicate of AAA.US|1M|20260701 (was matured WIN 2.5000)" in a2.notes, (a2.status, a2.notes))
     T("P2 enforce: active-first / matured-later pair untouched (b2 stays matured)", [x for x in st(r_enf) if x[0] == "b2"][0][1] == "matured")
     T("P2 enforce: first copies a1/c1 untouched", [x for x in st(r_enf) if x[0] in ("a1", "c1")] == [x for x in st(r_off) if x[0] in ("a1", "c1")])
-    T("P2 analyze: matured off 5 -> enforce 4", s_off.matured_records == 5 and s_enf.matured_records == 4, (s_off.matured_records, s_enf.matured_records))
+    T("P2 analyze: unique matured 4 in either storage mode", s_off.matured_records == 4 and s_enf.matured_records == 4
+      and s_off.duplicate_matured_excluded == 1 and s_enf.duplicate_matured_excluded == 0,
+      (s_off.matured_records, s_enf.matured_records))
     if BASE:
         tpb = _load(BASE, "tp_base_v6400")
         assert tpb.SCRIPT_VERSION == "6.40.0", tpb.SCRIPT_VERSION

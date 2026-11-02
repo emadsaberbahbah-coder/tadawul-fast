@@ -2,12 +2,34 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.5)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.14.7)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+v8.14.7 (2026-10-24, FRAMEWORK COMPATIBILITY): /_debug/routes lists and
+counts the effective business routes inside lazy included routers, matching
+the existing signature, ownership and health diagnostics. Authentication,
+route registration and request handling are unchanged.
+
+v8.14.6 (2026-10-21, OBSERVABILITY / SYNC TRUTH): the global auth wall no
+longer answers 401 for a request it ALLOWED. Its fail-closed try/except
+wrapped `await call_next(request)` as well as the auth decision, so any
+exception raised downstream (a route timeout; Starlette's "No response
+returned" after a dropped request) became the wall's 401 "unauthorized" for
+a caller holding a valid token. Render log 2026-10-20 23:16:14Z shows each
+"Caught downstream no-response runtime error" followed by
+"POST /v1/analysis/sheet-rows 401"; run 39513589733 then reported 60 backend
+401s and told the operator to check TFB_TOKEN. The decision now runs alone
+inside the try (still fail-closed: an error while deciding is a 401), and an
+allowed request is handed downstream outside it, so its errors reach the
+app's own handling (500), as they did before v8.13.0 added the wall (from
+8.13.0 to 8.14.5 even the disarmed branch called downstream inside the try,
+so the masking applied with the wall armed or not). Every denial
+(status, headers, body) is byte-identical; no exemption, token source or
+kill-switch changed. Harness: tests/test_auth_wall_downstream_errors.py.
 
 v8.14.5 (2026-10-13, SECURITY): the global auth wall decides its probe/meta
 exemption on the ROUTED path (the ASGI scope path), not request.url.path.
@@ -445,7 +467,15 @@ class _StrictJSONResponse(JSONResponse):
 # v8.14.5 (2026-10-13, SECURITY): the global auth wall exempts on the ASGI
 # scope path the router matches, not on the Host-derived request.url.path.
 # See the module docstring for the WHY and the valid-Host identity proof.
-APP_ENTRY_VERSION = "8.14.5"
+# v8.14.6 (2026-10-21): the wall decides inside its fail-closed try and calls
+# downstream outside it, so a downstream error is a 500, not the wall's 401.
+# v8.14.7: debug inventory uses the existing effective-route traversal.
+# v8.14.8 (2026-10-28, D1b/D1c): /health pf_gates lists the five env names
+# portfolio_actions 1.17.0 reads per call for its post-earnings and
+# open-ticket ADD guards (no boot line; the v8.14.1 / v8.14.4 gap). Additive
+# keys only; an unset gate reports "unset". No route, auth or engine change.
+# Rollback: remove the keys and restore 8.14.7.
+APP_ENTRY_VERSION = "8.14.8"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -1475,30 +1505,52 @@ class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
     kill-switch, the exempt list and OPTIONS handling are unchanged."""
 
     async def dispatch(self, request: Request, call_next):
+        # v8.14.6 (2026-10-21): DECIDE inside the fail-closed try, CALL
+        # DOWNSTREAM outside it. Up to v8.14.5 every `return await
+        # call_next(request)` sat inside this try, so ANY exception raised by
+        # the route or an inner middleware (a timeout, "No response returned"
+        # after a dropped request) was swallowed by the except below and
+        # answered with the wall's 401 "unauthorized" — for a caller that had
+        # presented a VALID token. Render log 2026-10-20 23:16:14Z: each
+        # "Caught downstream no-response runtime error" is followed by
+        # "POST /v1/analysis/sheet-rows 401", and daily_sync then reported
+        # backend 401s and told the operator to check TFB_TOKEN. The
+        # decision, its fail-closed rule and every denial response are
+        # unchanged; an allowed request's errors now reach the app's own
+        # error handling (500), as before v8.13.0 (8.13.0-8.14.5 masked them
+        # whether the wall was armed or not).
+        allowed = False
+        platform_denied = False
         try:
             # This new key only reads the fixed Site source. It must never
             # become a general APP_TOKEN, and OPEN_MODE cannot open its route.
             if platform_source_boundary_required(request):
                 if platform_source_authorized(request):
-                    return await call_next(request)
-                return _StrictJSONResponse(
-                    status_code=401,
-                    headers={"Cache-Control": "no-store, private"},
-                    content={"status": "error", "error": "unauthorized"},
-                )
-            if not _global_auth_enforcement_active():
-                return await call_next(request)
-            if str(request.method or "").upper() == "OPTIONS":
-                return await call_next(request)
+                    allowed = True
+                else:
+                    platform_denied = True
+            elif not _global_auth_enforcement_active():
+                allowed = True
+            elif str(request.method or "").upper() == "OPTIONS":
+                allowed = True
             # v8.14.5: exempt on the ROUTED (scope) path, never on the
             # Host-derived request.url.path (see _global_auth_exempt_request).
-            if _global_auth_exempt_request(request):
-                return await call_next(request)
-            if _auth_ok(request):
-                return await call_next(request)
+            elif _global_auth_exempt_request(request):
+                allowed = True
+            elif _auth_ok(request):
+                allowed = True
         except Exception:
             # Fail-closed: an error while deciding must never open the wall.
-            pass
+            allowed = False
+            platform_denied = False
+        if allowed:
+            return await call_next(request)
+        if platform_denied:
+            return _StrictJSONResponse(
+                status_code=401,
+                headers={"Cache-Control": "no-store, private"},
+                content={"status": "error", "error": "unauthorized"},
+            )
         request_id = _request_id_from_request(request)
         return _StrictJSONResponse(
             status_code=401,
@@ -2174,6 +2226,13 @@ _PF_GATE_ENVS: Tuple[str, ...] = (
     # v8.14.4 (2026-10-13): P0-6 research view. portfolio_actions v1.16.0
     # reads it per call (_env_research_view_mode) and prints no boot line.
     "TFB_PF_RESEARCH_VIEW",
+    # v8.14.8 (2026-10-28): D1b post-earnings and D1c open-ticket ADD guards.
+    # portfolio_actions v1.17.0 reads these per call (_env_add_post_earn_mode,
+    # _env_post_earn_sessions, _env_post_earn_sessions_neg,
+    # _env_ticket_cap_mode, _env_ticket_cap) and prints no boot line.
+    "TFB_PF_ADD_POST_EARN", "TFB_PF_POST_EARN_SESSIONS",
+    "TFB_PF_POST_EARN_SESSIONS_NEG", "TFB_PF_MAX_OPEN_TICKETS_MODE",
+    "TFB_PF_MAX_OPEN_TICKETS",
 )
 _OB_GATE_ENVS: Tuple[str, ...] = (
     "TFB_FORECAST_BASIS", "TFB_T10_REQ_ROI_3M_PCT", "TFB_OPP_CASH_FLOOR_MODE",
@@ -2879,9 +2938,12 @@ def create_app() -> FastAPI:
                 content={"status": "error", "error": "unauthorized"},
             )
 
+        effective_routes = list(_iter_effective_routes(
+            getattr(request.app, "routes", []) or [],
+        ))
         route_paths = sorted({
             str(getattr(r, "path", "") or "")
-            for r in (getattr(request.app, "routes", []) or [])
+            for r in effective_routes
         })
         route_sigs = sorted([
             f"{path} [{method}]"
@@ -2903,7 +2965,7 @@ def create_app() -> FastAPI:
             "routes_snapshot": getattr(
                 request.app.state, "routes_snapshot", {}
             ),
-            "app_route_count": len(getattr(request.app, "routes", []) or []),
+            "app_route_count": len(effective_routes),
             "app_route_signature_count": _route_signature_count(
                 request.app, include_builtin=True,
             ),

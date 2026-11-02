@@ -2,10 +2,15 @@
 """
 core/symbols_reader.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.5.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.7.0)
 ================================================================================
 RENDER-ALIGNED | ENGINE-COMPATIBLE | SETTINGS-AWARE | SCHEMA-AWARE
 ASYNC-SAFE | CACHE-SAFE
+
+Why this revision (v8.7.0, 2026-10-21) - see the SCRIPT_VERSION block below:
+the Google Sheets service is built per calling thread, because one shared
+httplib2 transport across the 10-thread I/O pool corrupted TLS reads under
+load. Gate TFB_SR_THREAD_LOCAL_SERVICE (default on; 0 = v8.6.0 shared).
 
 Why this revision (v8.5.0)  [rebuilt directly on live v8.4.3 — all 8.4.1/8.4.2/
 8.4.3 fixes carried verbatim]
@@ -155,7 +160,23 @@ from typing import (
 # filtered and the canonical read heals in-place.
 # GATE: TFB_SR_TRANSIENT_RETRY, default ON (protective); =0 -> v8.5.0 exact.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "8.6.0"
+# v8.7.0 (2026-10-21) — THREAD-LOCAL SHEETS SERVICE (transport thread-safety)
+# WHY (Render log 2026-10-20 23:15:18Z, sync run 39513589733): one
+# GoogleSheetsReader built ONE googleapiclient service and every thread of the
+# 10-worker _IO_EXECUTOR used it. Its httplib2 transport is not thread-safe
+# (the client library documents one Http per thread), and concurrent reads
+# interleaved TLS records: "Failed to list sheets: 'NoneType' object has no
+# attribute 'close'", "Failed to list sheets: 00000001" and "[SR-RETRY
+# v8.6.0] transient SSLError on Market_Leaders!A2:A3001" in the same second,
+# then 25 s proxy timeouts on Market_Leaders and Commodities_FX whose dropped
+# responses the auth wall reported as 401 (main.py 8.14.6). A failed
+# list_sheets returns [] - indistinguishable from "no tabs" to its callers.
+# FIX: _get_service returns a service built for, and cached on, the calling
+# thread (credentials too). Same scopes, same discovery (cache_discovery off),
+# same retry/backoff around every call; only the sharing ends.
+# GATE: TFB_SR_THREAD_LOCAL_SERVICE, default ON; =0 -> v8.6.0 shared service.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "8.7.0"
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +294,14 @@ _TRACING_ENABLED = (
     or _env_truthy("CORE_TRACING_ENABLED")
     or _env_truthy("TRACING_ENABLED")
 )
+
+
+# --- v8.7.0 THREAD-LOCAL SERVICE ----------------------------------------------
+def _sr_thread_local_enabled() -> bool:
+    """v8.7.0: master switch (default ON). 0/false/off/no -> the v8.6.0
+    single shared service, verbatim."""
+    return (os.getenv("TFB_SR_THREAD_LOCAL_SERVICE") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
 
 
 # --- v8.6.0 TRANSIENT-RETRY ---------------------------------------------------
@@ -996,13 +1025,59 @@ class GoogleSheetsReader:
     def __init__(self):
         self._service = None
         self._lock = threading.Lock()
+        # v8.7.0 THREAD-LOCAL: one googleapiclient service (and so one
+        # httplib2 transport) per calling thread; see _get_service.
+        self._tls = threading.local()
+        self._thread_services = 0
         self.backoff = FullJitterBackoff(
             max_retries=config.MAX_RETRIES,
             base_delay=0.8,
             max_delay=20.0,
         )
 
+    def _get_thread_service(self):
+        """v8.7.0: this thread's own service, built on first use.
+
+        googleapiclient's transport (httplib2.Http) is not thread-safe, and
+        read_range_async / list_sheets run on the 10-thread _IO_EXECUTOR, so
+        one shared service interleaved TLS records across threads. Render log
+        2026-10-20 23:15:18Z: "Failed to list sheets: 'NoneType' object has no
+        attribute 'close'", "Failed to list sheets: 00000001" and "[SR-RETRY]
+        transient SSLError on Market_Leaders!A2:A3001" within one second,
+        followed by 25 s proxy timeouts on Market_Leaders and Commodities_FX.
+        The google-api-python-client documentation requires a separate
+        httplib2.Http per thread. Credentials are built per thread as well, so
+        no auth object is shared either. A failed build is not cached: the
+        next call on the thread tries again, exactly like the shared path."""
+        svc = getattr(self._tls, "service", None)
+        if svc is not None:
+            return svc
+        if not GOOGLE_API_AVAILABLE:
+            logger.error("Google API libraries not available")
+            return None
+        try:
+            creds_dict = _load_google_creds_dict_from_env()
+            if not creds_dict:
+                raise ValueError("No Google credentials found in environment")
+            scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)  # type: ignore
+            svc = build("sheets", "v4", credentials=credentials, cache_discovery=False)  # type: ignore
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets service: {e}")
+            return None
+        self._tls.service = svc
+        with self._lock:
+            self._thread_services += 1
+            if self._service is None:
+                self._service = svc  # keeps "initialized" checks on _service meaningful
+        logger.info("Google Sheets service initialized (thread-local, %s)",
+                    threading.current_thread().name)
+        return svc
+
     def _get_service(self):
+        if _sr_thread_local_enabled():
+            return self._get_thread_service()
+
         if self._service is not None:
             return self._service
 

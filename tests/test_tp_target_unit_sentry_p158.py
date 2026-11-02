@@ -300,10 +300,13 @@ def run_all():
     # T4 - ENFORCE measurement on the SAME stored (legacy) rows.
     _gate("enforce")
     enf = new.s1_checkpoint_calibration(orecs)
-    assert (enf["n"], enf["mean_abs_error_pp"], enf["mean_signed_error_pp"]) == (n, mae, sgn)
-    assert "[unit-sentry enforce:" in enf["detail"]
+    # v6.48.0: a price-consistent legacy tuple is not independent forecast
+    # provenance. These records have no schema receipt; enforcement cannot
+    # promote them using inferred units. Observe above remains diagnostic.
+    assert enf["n"] == 0 and enf["mean_abs_error_pp"] is None
+    assert enf["mean_signed_error_pp"] is None
     assert enf["unit_sentry"]["legacy"]["mean_abs_error_pp"] == off["mean_abs_error_pp"]
-    assert enf["state"] == ("PASS" if mae <= enf["band_pp"] else "FAIL")
+    assert enf["state"] == "PENDING"
     res["T4_enforce"] = {"state": enf["state"], "detail": enf["detail"]}
 
     # T5 - ENFORCE creation: pp targets, correct checkpoint price, and NO

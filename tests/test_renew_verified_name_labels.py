@@ -196,3 +196,57 @@ def test_check_mode_flags_expiring(tmp_path, capsys):
     assert renew.main(["--registry", str(path), "--check", "--report", str(report)]) == 1
     assert json.loads(report.read_text())["expiring"] == [item["page"] + "|" + item["symbol"]]
     assert renew.main(["--registry", str(path), "--check", "--warn-hours", "1"]) == 0
+
+
+# --- v1.1.0 --apply-renewal ---------------------------------------------------
+
+def _renewed_copy(item, days=3):
+    """The renewal re-stamp of one binding: same caption, newer review."""
+    new = copy.deepcopy(item)
+    reviewed = datetime.fromisoformat(item["reviewed_at_utc"]) + timedelta(days=days)
+    new["reviewed_at_utc"] = reviewed.isoformat()
+    new["expires_at_utc"] = (reviewed + timedelta(days=7)).isoformat()
+    for source in new["sources"]:
+        source["captured_at_utc"] = reviewed.isoformat()
+        source["sha256"] = "f" * 64
+    if "directory_creation_time" in new["identifiers"]:
+        new["identifiers"]["directory_creation_time"] = "Oct 21 2026 07:01"
+    new["review_receipt_sha256"] = labels._binding_digest(new)
+    return new
+
+
+def test_apply_renewal_takes_only_matching_newer_captions(tmp_path):
+    base = _registry()
+    a, b, c = (copy.deepcopy(x) for x in base["bindings"][:3])
+    renewed_a = _renewed_copy(a)
+    renewed_b = _renewed_copy(b)
+    renewed_b["name"] = renewed_b["name"] + " (changed upstream)"   # caption drift
+    stale_c = _renewed_copy(c, days=-1)                              # older review
+    ghost = _renewed_copy(a)
+    ghost["symbol"] = "GHOST.US"                                     # not in base
+    renewed = dict(base, bindings=[renewed_a, renewed_b, stale_c, ghost])
+    merged, report = renew.apply_renewal(base, renewed)
+    keys = [x["page"] + "|" + x["symbol"] for x in merged["bindings"]]
+    assert keys == [x["page"] + "|" + x["symbol"] for x in base["bindings"]]   # no add/drop/reorder
+    assert merged["bindings"][0] == renewed_a
+    assert merged["bindings"][1] == b and merged["bindings"][2] == c
+    assert report["applied"] == [a["page"] + "|" + a["symbol"]]
+    assert report["kept"][b["page"] + "|" + b["symbol"]] == "caption_changed_since_renewal"
+    assert report["kept"][c["page"] + "|" + c["symbol"]] == "not_newer"
+    assert "GHOST.US" not in json.dumps(merged)
+    assert _write_and_load(tmp_path, merged)
+
+
+def test_apply_renewal_cli_writes_validated_registry(tmp_path, capsys):
+    base = _registry()
+    reg = tmp_path / "labels.json"
+    reg.write_text(json.dumps(base, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    renewed = dict(base, bindings=[_renewed_copy(base["bindings"][0])])
+    art = tmp_path / "renewed.json"
+    art.write_text(json.dumps(renewed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert renew.main(["--registry", str(reg), "--apply-renewal", str(art)]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["applied"] == 1
+    assert labels._load_registry(reg)
+    nothing = tmp_path / "nothing.json"
+    nothing.write_text(json.dumps(dict(base, bindings=[]), indent=2) + "\n", encoding="utf-8")
+    assert renew.main(["--registry", str(reg), "--apply-renewal", str(nothing)]) == 3

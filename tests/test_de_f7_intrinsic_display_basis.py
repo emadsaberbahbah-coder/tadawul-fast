@@ -30,6 +30,13 @@ SOURCE = {
 MODEL_FIELDS = ("overall_score", "opportunity_score", "valuation_score", "forecast_confidence",
                 "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_price_1m",
                 "forecast_price_3m", "forecast_price_12m", "recommendation", "opportunity_source", "forecast_source")
+# data_engine_v2 v5.158.0 (F-7 v2b): the confidence-provenance markers that live
+# between pass 1 and _f7_settle_pass (never published).
+TRANSIENT = ("_f7_conf_derived", "_f7_conf_synthetic")
+
+
+def published(row):
+    return {key: value for key, value in row.items() if key not in TRANSIENT}
 
 
 @pytest.fixture(autouse=True)
@@ -57,12 +64,26 @@ def first(source=None):
 
 
 def raw_reference(monkeypatch):
-    """Independent actual-pair reference: display mapping never enters its inputs."""
+    """Independent actual-pair reference: display mapping never enters its inputs.
+    v5.158.0 (F-7 v2b): SOURCE carries no confidence, so while settlement is
+    armed the v2 trajectory (_f7_settle_result's default, enforce) re-derives
+    it on each re-pass: a phase_ii_synthetic row is re-scored with
+    forecast_confidence cleared (Phase-II's confidence_score is reused), any
+    other row with the scorer's confidence keys cleared."""
+    armed = os.environ.get("TFB_SCORING_SETTLE", "").strip().lower() in ("observe", "enforce")
+    input_conf = any(SOURCE.get(k) not in (None, "") for k in
+                     ("forecast_confidence", "ai_confidence", "confidence_score", "confidence"))
     with monkeypatch.context() as context:
         context.setenv("TFB_INTRINSIC_DISPLAY_CAP", "0")
         row = first()
-        pair(row)
-        pair(row)
+        for _ in range(2):
+            if armed and not input_conf:
+                cleared = (("forecast_confidence",) if row.get("forecast_source") == "phase_ii_synthetic"
+                           else ("forecast_confidence", "confidence_score", "confidence_bucket"))
+                for key in cleared:
+                    if key in row:
+                        row[key] = None
+            pair(row)
     return row
 
 
@@ -83,14 +104,17 @@ def test_actual_canonical_passes_read_fixed_raw_basis_and_preserve_mode_semantic
         assert result.row[field] == reference[field], field
     # Synthetic hand-computed canonical baseline; the old softcap loop instead
     # ended pass 4 at overall67.98/ROI.08959 and withheld a nonconverged row.
-    assert result.row["overall_score"] == 72.47 and result.row["expected_roi_12m"] == .3
+    # v5.158.0 (F-7 v2b): armed, the v2 result scores Phase-II's engine-made
+    # confidence as no data (completeness; quality 70.62 -> 69.60), so 72.47 -> 72.27.
+    assert result.row["overall_score"] == (72.47 if mode == "off" else 72.27)
+    assert result.row["expected_roi_12m"] == .3
     out = de._f7_settle_pass(row, "SYNTH.US", "Global_Markets")
     if mode == "off":
         assert out is row and row == before
     elif mode == "observe":
         assert out is row
         assert {key: value for key, value in out.items() if key != "warnings"} == \
-               {key: value for key, value in before.items() if key != "warnings"}
+               {key: value for key, value in published(before).items() if key != "warnings"}
         assert "f7_settle:observe:st3:p2" in out["warnings"]
     else:
         assert out is not row and not de._f7_settle_failed(out)
@@ -109,9 +133,13 @@ def test_repeated_cap_and_actual_settlement_are_idempotent(soft, monkeypatch):
         de._cap_intrinsic_display(row)
     assert row == before
     settled = de._f7_settle_pass(row)
-    again = de._f7_settle_pass(copy.deepcopy(settled))
+    # v5.158.0 (F-7 v2b): a settled row is a fixed point under its own
+    # provenance - SOURCE carried no confidence, so Phase-II's is not data. The
+    # transient marker is never published; the re-settle restores it.
+    again = de._f7_settle_pass(dict(copy.deepcopy(settled), _f7_conf_synthetic=True))
     assert all(again.get(key) == settled.get(key) for key in MODEL_FIELDS)
     assert again["intrinsic_value"] == settled["intrinsic_value"]
+    assert not any(key in settled or key in again for key in TRANSIENT)
 
 
 def test_cap_off_and_unmarked_settlement_off_keep_pristine_rows_untouched(monkeypatch):
@@ -122,7 +150,8 @@ def test_cap_off_and_unmarked_settlement_off_keep_pristine_rows_untouched(monkey
     assert row == before and de._INTRINSIC_DISPLAY_BASIS_KEY not in row
     monkeypatch.setenv("TFB_INTRINSIC_DISPLAY_CAP", "1")
     monkeypatch.setenv("TFB_SCORING_SETTLE", "off")
-    assert de._f7_settle_pass(row) is row and row == before
+    # v5.158.0: pass 1 ran armed, so only its transient F-7 marker is dropped
+    assert de._f7_settle_pass(row) is row and row == published(before)
 
 
 def test_known_raw_receipt_renews_current_policy_using_raw_value_not_last_display(monkeypatch):
@@ -216,7 +245,7 @@ def test_legacy_unwitnessed_display_is_bounded_but_never_minted_as_raw_model(mod
     assert result.status == "error" and result.reason == "intrinsic_model_basis_unproven"
     out = de._f7_settle_pass(row)
     if mode == "off":
-        assert row == before
+        assert row == published(before)  # v5.158.0: pass 1 ran armed; marker dropped
     else:
         assert out["overall_score"] is None and out["final_action"] == "DO_NOT_INVEST"
 

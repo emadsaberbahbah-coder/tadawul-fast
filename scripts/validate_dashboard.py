@@ -2,12 +2,54 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.4)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.4 (2026-10-28) — FULL FEED BANNER IN THE EVIDENCE
+--------------------------------------------------------------------------------
+WHY (audit 2026-10-28): decision.feed_banner_present kept only the first 120
+characters of the cockpit FEED banner, so every withheld verdict in the
+19 failed daily_sync runs since 21 Oct reached the log, Dashboard_Audit and
+final_dashboard_validation.json cut mid-reason ("... pool receipt cohort
+unverified; Glob"), and the blocking reason had to be reconstructed from
+other artifacts. WHAT: the detail keeps up to FEED_BANNER_DETAIL_MAX (1,000)
+characters. Statuses, exit codes and every other check are unchanged.
+
+v1.3.3 (2026-10-24) — SUPPORTED INSIGHTS REPORT CONTRACTS
+--------------------------------------------------------------------------------
+Match the sync writer's current and legacy seven-column Insights reports,
+including their preserved order and normalized header aliases. Resolve row
+checks using that actual contract. Mixed, duplicate and unsupported headers
+still fail; all other page contracts and full-scope gates are unchanged.
+
+v1.3.2 (2026-10-24) — FULL SOURCE SCOPE BY DEFAULT
+--------------------------------------------------------------------------------
+The old 1,500-row default left the tails of Global_Markets and Mutual_Funds
+unchecked. The default bounded read now covers 20,000 data rows per page with
+the existing over-read sentinel; the Sheets request count is unchanged. Any
+observed overflow is a failed incomplete audit, with an explicitly UNKNOWN
+tail, rather than a warning tolerated by daily_sync. An explicit lower bound
+still limits work, but cannot certify a longer page. No trade gate is relaxed.
+
+v1.3.1 (2026-10-21) — DECISION SURFACE: IN-PROGRESS RENDER + COCKPIT STATUS
+--------------------------------------------------------------------------------
+WHY: in sync run 39513589733 the global-markets and mutual-funds legs failed
+on "cockpit data-grid header (Rank|Symbol) not found in first 16 rows". The
+Top_10 cockpit run begun ~16:20 UTC had died hours earlier while its status
+line still read "status: running…" (it writes that line first, then the
+board), and the FAIL gave no hint why the grid was absent.
+WHAT: (1) a header FAIL quotes the cockpit status line ("Last run ... |
+status: ..."); (2) a running stamp older than VALIDATE_T10_INPROGRESS_MAX_AGE_MIN
+(default 8; Apps Script stops runs at 6 minutes) FAILs at once as a stuck
+cockpit run that must be re-run; (3) a RECENT running stamp (a render really
+in progress) is re-read VALIDATE_T10_INPROGRESS_READS times (default 3; 0 =
+v1.3.0) after VALIDATE_T10_INPROGRESS_WAIT_S (default 30). The checks, their
+statuses and the exit-code contract are unchanged: a board that never appears
+still FAILs, and nothing is skipped or downgraded.
+
 v1.3.0 (2026-08-23) — W1A-1: ROUTE-AWARE SCOPE, OPEN VALIDATION, HONEST SAMPLING
 --------------------------------------------------------------------------------
 WHY (external audits 2026-08-22/23, adjudicated): (a) P1-1 — this validator
@@ -238,7 +280,7 @@ ENVIRONMENT
 -----------
   VALIDATE_SHEET_ID / DEFAULT_SPREADSHEET_ID   spreadsheet id
   VALIDATE_PAGES                               comma-separated page list
-  VALIDATE_MAX_ROWS                            max data rows per page (default 1500)
+  VALIDATE_MAX_ROWS                            max data rows per page (default 20000)
   VALIDATE_JSON_OUT                            write JSON report to this path
   VALIDATE_WRITE_SHEET                         truthy = also write Dashboard_Audit tab
   VALIDATE_AUDIT_TAB                           audit tab name (default Dashboard_Audit)
@@ -270,7 +312,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.4"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -490,6 +532,11 @@ def _project_root_on_path() -> None:
 
 _project_root_on_path()
 
+from core.sheets.insights_contract import (  # noqa: E402
+    INSIGHTS_PAGE, aligned_keys as insights_keys, header_token as insights_header_token,
+    find_header_row as insights_header_row, trim_headers as insights_trim_headers,
+)
+
 # A1 end column wide enough to catch over-width sheets (DZ = 130 columns).
 _READ_END_COL = "DZ"
 
@@ -525,7 +572,7 @@ async def _resolve_get_sheet_rows() -> Optional[Tuple[Callable, bool, str]]:
 
 
 def _detect_header_row(
-    grid: List[List[Any]], expected_tokens: set, scan: int = 14
+    grid: List[List[Any]], expected_tokens: set, scan: int = 14, normalizer: Callable = _safe_str
 ) -> int:
     """Return the index of the row most resembling the header (max overlap
     with expected headers/keys). -1 if nothing plausible."""
@@ -533,7 +580,7 @@ def _detect_header_row(
     for i, row in enumerate(grid[:scan]):
         if not isinstance(row, list):
             continue
-        cells = {_safe_str(c) for c in row if _safe_str(c)}
+        cells = {normalizer(c) for c in row if normalizer(c)}
         if not cells:
             continue
         overlap = len(cells & expected_tokens)
@@ -543,7 +590,7 @@ def _detect_header_row(
 
 
 def _grid_to_rows(
-    header_cells: List[str], data_grid: List[List[Any]]
+    header_cells: List[Any], data_grid: List[List[Any]]
 ) -> List[Dict[str, Any]]:
     headers = [_safe_str(h) for h in header_cells]
     rows: List[Dict[str, Any]] = []
@@ -565,7 +612,7 @@ def _grid_to_rows(
 class _PageData:
     page: str
     source: str            # "read_range" | "get_sheet_rows" | "none"
-    header_cells: List[str]  # literal header row (empty on get_sheet_rows path)
+    header_cells: List[Any]  # literal header row (empty on get_sheet_rows path)
     rows: List[Dict[str, Any]]
     error: str = ""
     sampled: bool = False   # v1.3.0: more rows existed beyond max_rows
@@ -579,7 +626,8 @@ async def _read_page(
     rows_reader: Optional[Tuple[Callable, bool, str]],
     max_rows: int,
 ) -> _PageData:
-    expected_tokens = set(reg.headers(page)) | set(reg.keys(page))
+    normalizer = insights_header_token if page == INSIGHTS_PAGE else _safe_str
+    expected_tokens = {normalizer(value) for value in reg.headers(page) + reg.keys(page)}
 
     # PRIMARY: literal cells via read_range
     if read_range is not None and sid:
@@ -593,9 +641,11 @@ async def _read_page(
             logger.warning("read_range failed for %s: %s", page, e)
             grid = None
         if isinstance(grid, list) and len(grid) >= 1:
-            hr = _detect_header_row(grid, expected_tokens)
+            hr = insights_header_row(grid, 14) if page == INSIGHTS_PAGE else -1
+            if hr < 0:
+                hr = _detect_header_row(grid, expected_tokens, normalizer=normalizer)
             if hr >= 0:
-                header_cells = [_safe_str(c) for c in grid[hr]]
+                header_cells = list(grid[hr])
                 avail = max(0, len(grid) - (hr + 1))
                 rows = _grid_to_rows(header_cells, grid[hr + 1 : hr + 1 + max_rows])
                 # v1.3.0: the range already over-fetches (+25), so any grid
@@ -681,11 +731,17 @@ def check_contract(page: str, expected_headers: List[str], actual_headers: List[
     while act and act[-1] == "":
         act.pop()
 
-    if act == exp:
+    if page == INSIGHTS_PAGE and insights_keys(insights_trim_headers(actual_headers)) is not None:
+        return CheckResult(page, "contract.header_match", "PASS",
+                           detail="7 columns, supported current/legacy Insights report in its written order")
+
+    if act == exp and page != INSIGHTS_PAGE:
         return CheckResult(page, "contract.header_match", "PASS",
                            detail=f"{len(act)} columns, ends with '{act[-1] if act else ''}'")
 
     detail_bits: List[str] = [f"expected {len(exp)} cols, found {len(act)}"]
+    if page == INSIGHTS_PAGE:
+        detail_bits.append("headers do not match one complete supported Insights report")
     if exp:
         exp_last = exp[-1]
         act_last = act[-1] if act else "(none)"
@@ -1000,22 +1056,72 @@ def _find_feed_banner(grid: List[List[Any]], upto: int) -> str:
     return ""
 
 
+def _cockpit_status_line(grid: List[List[Any]]) -> str:
+    """v1.3.1: the cockpit's own run line ('Last run <stamp> | status: <s>
+    ...', 16_Decision_Top10.gs dt10StatusLine_) from the scanned rows, or ''.
+    Read-only; used to explain a missing grid and to detect a render in
+    progress."""
+    for row in grid or []:
+        if not isinstance(row, list):
+            continue
+        for c in row:
+            txt = _safe_str(c).strip()
+            if "| status:" in txt and txt.lower().startswith("last run"):
+                return txt
+    return ""
+
+
+def _cockpit_render_in_progress(grid: List[List[Any]]) -> bool:
+    """v1.3.1: True while the cockpit says 'status: running' (it writes that
+    line first, then the board). A grid read in that window is an
+    in-progress table, not a published one."""
+    line = _cockpit_status_line(grid).lower()
+    return "| status: running" in line
+
+
+def _cockpit_status_age_min(line: str, now_utc: Optional[datetime] = None) -> Optional[float]:
+    """v1.3.1: minutes since the cockpit's 'Last run yyyy-MM-dd HH:mm:ss'
+    stamp, or None when it cannot be read. dt10StatusLine_ formats the stamp
+    in the Apps Script project time zone (Riyadh, UTC+3);
+    VALIDATE_T10_COCKPIT_UTC_OFFSET_MIN overrides the 180-minute offset."""
+    txt = _safe_str(line).strip()
+    if not txt.lower().startswith("last run "):
+        return None
+    try:
+        stamp = datetime.strptime(txt[9:28], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+    offset = _env_int("VALIDATE_T10_COCKPIT_UTC_OFFSET_MIN", 180)
+    stamp_utc = (stamp - timedelta(minutes=offset)).replace(tzinfo=timezone.utc)
+    now = now_utc or datetime.now(timezone.utc)
+    return (now - stamp_utc).total_seconds() / 60.0
+
+
+# v1.3.4: the banner is the cockpit's own blocking reason; keep it whole.
+FEED_BANNER_DETAIL_MAX = 1000
+
+
 def check_top10_surface(page: str, grid: List[List[Any]]) -> List[CheckResult]:
     """Decision-surface checks for the Top_10 cockpit — the backend-side
     P0-5 tripwire. FAIL here exits 2 and daily_sync goes RED by design."""
     out: List[CheckResult] = []
     hr = _find_decision_header(grid)
     if hr < 0:
+        # v1.3.1: name the cockpit's own status line, so a FAIL says whether
+        # the board is mid-render, failed, or genuinely missing.
+        status_line = _cockpit_status_line(grid)
         out.append(CheckResult(page, "decision.header_found", "FAIL",
                                detail=f"cockpit data-grid header (Rank|Symbol) "
-                                      f"not found in first {len(grid)} rows"))
+                                      f"not found in first {len(grid)} rows"
+                                      + (f"; cockpit says: {status_line[:160]}"
+                                         if status_line else "")))
         return out
     out.append(CheckResult(page, "decision.header_found", "PASS"))
 
     banner = _find_feed_banner(grid, hr)
     out.append(CheckResult(page, "decision.feed_banner_present",
                            "PASS" if banner else "FAIL",
-                           detail=banner[:120] if banner
+                           detail=banner[:FEED_BANNER_DETAIL_MAX] if banner
                            else "no FEED verdict line above the data grid"))
     blocked = "NOT ACTIONABLE" in banner.upper()
 
@@ -1077,16 +1183,57 @@ async def _run_decision_surface(page: str, sid: str,
                                    "read_range reader")]
     depth = _env_int("VALIDATE_T10_HEADER_SCAN", 60, lo=20) + 60
     rng = f"{page}!A1:AZ{depth}"
-    try:
-        loop = asyncio.get_running_loop()
-        grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
-        grid = await _maybe_await(grid)
-    except Exception as e:
-        return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
-    if not isinstance(grid, list) or not grid:
-        return [CheckResult(page, "decision.read", "FAIL",
-                            detail="read_range returned no grid")]
-    return check_top10_surface(page, grid)
+    # v1.3.1 (2026-10-21): the cockpit writes "status: running…" before it
+    # draws the board, so a read in that short window sees banner rows and no
+    # grid. A RECENT running stamp (<= VALIDATE_T10_INPROGRESS_MAX_AGE_MIN,
+    # default 8: Apps Script stops any run at 6 minutes) is re-read up to
+    # VALIDATE_T10_INPROGRESS_READS times (default 3), waiting
+    # VALIDATE_T10_INPROGRESS_WAIT_S (default 30) before each. An OLDER
+    # running stamp is a run that died without finishing (sync run
+    # 39513589733: the cockpit run begun ~16:20 UTC still said running hours
+    # later and the validator found "no header in first 16 rows"): no re-read,
+    # and the FAIL says the cockpit is stuck. An unreadable stamp keeps the
+    # bounded re-read. Statuses are unchanged: a missing board still FAILs.
+    # VALIDATE_T10_INPROGRESS_READS=0 = v1.3.0 behaviour.
+    rereads = _env_int("VALIDATE_T10_INPROGRESS_READS", 3, lo=0)
+    wait_s = _env_int("VALIDATE_T10_INPROGRESS_WAIT_S", 30, lo=0)
+    max_age = _env_int("VALIDATE_T10_INPROGRESS_MAX_AGE_MIN", 8, lo=0)
+    attempt = 0
+    stuck_note = ""
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
+            grid = await _maybe_await(grid)
+        except Exception as e:
+            return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
+        if not isinstance(grid, list) or not grid:
+            return [CheckResult(page, "decision.read", "FAIL",
+                                detail="read_range returned no grid")]
+        if (_find_decision_header(grid) >= 0 or attempt >= rereads
+                or not _cockpit_render_in_progress(grid)):
+            break
+        age = _cockpit_status_age_min(_cockpit_status_line(grid))
+        if age is not None and age > max_age:
+            stuck_note = (f"cockpit still 'running' {age:.0f} min after its Last run stamp "
+                          f"(> {max_age} min): that run ended without finishing; "
+                          f"re-run refreshDecisionTop10")
+            break
+        attempt += 1
+        logger.info("v1.3.1 %s: cockpit render in progress (%s); re-read %d/%d in %ds",
+                    page, _cockpit_status_line(grid)[:80], attempt, rereads, wait_s)
+        await asyncio.sleep(wait_s)
+    results = check_top10_surface(page, grid)
+    for r in results:
+        if r.name == "decision.header_found" and r.status != "PASS":
+            notes = []
+            if attempt:
+                notes.append(f"after {attempt} in-progress re-read(s)")
+            if stuck_note:
+                notes.append(stuck_note)
+            if notes:
+                r.detail = "; ".join(([r.detail] if r.detail else []) + notes)
+    return results
 
 
 _DEFAULT_PAGES = [
@@ -1155,22 +1302,34 @@ async def validate(
             results.append(CheckResult(page, "read", "FAIL", detail=pdata.error))
             continue
 
-        # v1.3.0 (audit P1-1): every page verdict now carries its scope.
-        # WARN exits 1; daily_sync tolerates exit 1 by explicit design and
-        # reds only on >= 2 — the page is labeled, production is not broken.
+        # A bounded partial audit cannot certify the unchecked tail. Logical
+        # engine rows cannot establish the extent of the literal source sheet.
+        # The failed scope remains separate from checks on observed rows.
+        incomplete = pdata.sampled or pdata.source != "read_range"
         results.append(CheckResult(
             page, "scope.coverage",
-            "WARN" if pdata.sampled else "PASS",
+            "FAIL" if incomplete else "PASS",
             count=len(pdata.rows),
             detail=(f"SAMPLE_ONLY: first {len(pdata.rows)} rows validated; "
-                    "page has more — NOT a full-page certificate "
-                    "(--full / VALIDATE_FULL=1 to certify)")
-            if pdata.sampled else f"FULL ({len(pdata.rows)} rows)"))
+                    "unchecked tail UNKNOWN — NOT a full-page certificate; "
+                    "increase the verified row bound and rerun")
+            if pdata.sampled else
+            (f"UNKNOWN literal-sheet extent: {len(pdata.rows)} logical engine "
+             "rows checked; restore the literal sheet reader and rerun")
+            if pdata.source != "read_range" else
+            f"FULL ({len(pdata.rows)} rows)"))
 
         # CONTRACT
         if pdata.source == "read_range":
             results.append(check_contract(page, expected_headers, pdata.header_cells))
             actual_set = {_safe_str(h) for h in pdata.header_cells if _safe_str(h)}
+            if page == INSIGHTS_PAGE:
+                headers = insights_trim_headers(pdata.header_cells)
+                keys = insights_keys(headers)
+                if keys is not None:
+                    # Legacy Symbol and timestamp aliases must resolve against
+                    # the real written report, rather than the current registry.
+                    k2h = dict(zip(keys, headers))
         else:
             results.append(check_contract_logical(page, expected_keys, pdata.rows))
             actual_set = set()  # empty => _has_column relies on registry mapping
@@ -1295,7 +1454,7 @@ def create_parser() -> argparse.ArgumentParser:
                    help="Spreadsheet ID (also VALIDATE_SHEET_ID / DEFAULT_SPREADSHEET_ID env).")
     p.add_argument("--pages", nargs="+", default=_env_csv("VALIDATE_PAGES", _DEFAULT_PAGES),
                    help="Pages to validate (also VALIDATE_PAGES env as CSV).")
-    p.add_argument("--max-rows", type=int, default=_env_int("VALIDATE_MAX_ROWS", 1500, lo=1),
+    p.add_argument("--max-rows", type=int, default=_env_int("VALIDATE_MAX_ROWS", 20000, lo=1),
                    help="Max data rows per page (also VALIDATE_MAX_ROWS env).")
     p.add_argument("--full", action="store_true",
                    default=_env_bool("VALIDATE_FULL", False),

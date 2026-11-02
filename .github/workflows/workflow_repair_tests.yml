@@ -7,11 +7,18 @@ on:
     paths:
       - '.github/workflows/workflow_repair_tests.yml'
       - 'config/approved_universe_scope_v1.json'
+      - 'core/sheets/insights_contract.py'
+      - 'scripts/validate_dashboard.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'tests/test_sync_insights_publication.py'
+      - 'tests/test_validate_dashboard_decision_surface.py'
       - 'scripts/approved_universe_scope.py'
       - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_*coverage.py'
       - 'scripts/audit_decision_surface_freshness.py'
       - 'scripts/workflow_*.py'
+      - 'scripts/render_audit_summary.py'
+      - 'tests/test_render_audit_summary.py'
       - 'tests/test_workflow_*.py'
       - 'tests/test_full_refresh_coverage.py'
       - 'tests/test_decision_surface_freshness.py'
@@ -19,11 +26,18 @@ on:
     paths:
       - '.github/workflows/workflow_repair_tests.yml'
       - 'config/approved_universe_scope_v1.json'
+      - 'core/sheets/insights_contract.py'
+      - 'scripts/validate_dashboard.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'tests/test_sync_insights_publication.py'
+      - 'tests/test_validate_dashboard_decision_surface.py'
       - 'scripts/approved_universe_scope.py'
       - 'tests/test_approved_universe_*.py'
       - 'scripts/audit_*coverage.py'
       - 'scripts/audit_decision_surface_freshness.py'
       - 'scripts/workflow_*.py'
+      - 'scripts/render_audit_summary.py'
+      - 'tests/test_render_audit_summary.py'
       - 'tests/test_workflow_*.py'
       - 'tests/test_full_refresh_coverage.py'
       - 'tests/test_decision_surface_freshness.py'
@@ -57,11 +71,14 @@ jobs:
           python scripts/audit_decision_surface_freshness.py --selftest
           python -m pytest -q \
             tests/test_full_refresh_coverage.py \
+            tests/test_sync_insights_publication.py \
+            tests/test_validate_dashboard_decision_surface.py \
             tests/test_decision_surface_freshness.py \
             tests/test_workflow_audit_repairs.py \
             tests/test_repository_workflow_audit.py \
             tests/test_approved_universe_scope.py \
-            tests/test_approved_universe_workflow.py
+            tests/test_approved_universe_workflow.py \
+            tests/test_render_audit_summary.py
           python scripts/audit_repository_workflows.py
 
   verify-live:
@@ -154,12 +171,17 @@ jobs:
           payload = {'checked_at_utc': datetime.now(timezone.utc).isoformat(),
                      'commit': os.environ['GITHUB_SHA'], 'read_only': True, 'results': results}
           (out / 'verification.json').write_text(json.dumps(payload, indent=2) + '\n')
+          rendered = subprocess.run([sys.executable, 'scripts/render_audit_summary.py',
+                                     '--evidence-root', str(out)], capture_output=True, text=True)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('# Post-merge live control verification\n\n')
               stream.write('Workbook read-only; provider baseline frozen. Owner-approved 12 October roster scope; data-quality controls unchanged.\n\n')
               stream.write('| Audit | Exit | Result |\n|---|---:|---|\n')
               for r in results:
                   stream.write(f"| {r['audit']} | {r['exit_code']} | {'PASS' if r['passed'] else 'FAIL — see evidence'} |\n")
+              stream.write('\n' + rendered.stdout)
+              if rendered.returncode:
+                  stream.write('\nSummary evidence UNKNOWN; inspect retained reports.\n')
           raise SystemExit(0 if all(r['passed'] for r in results) else 1)
           PY
       - name: Preserve verification evidence

@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.45.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1584,7 +1584,389 @@ from urllib.error import HTTPError, URLError
 # TRACK_SIGNAL_PUBLICATION_MODE=immutable writes deterministic publication
 # identities, preserving successive states and refusing writes without a
 # readable identity index. Legacy and WP-7 measurement modes stay available.
-SCRIPT_VERSION = "6.45.0"
+# -----------------------------------------------------------------------------
+# v6.47.0 (2026-10-21) - HISTORICAL TARGET-SESSION CLOSE (TRACK_HIST_TARGET_CLOSE,
+# DEFAULT OFF = v6.45.0 byte-identical apart from the version string). 6.45.1,
+# 6.45.2 and 6.46.0 are claimed by open PRs #785, #795 and #809, so this build
+# takes 6.47.0; whichever lands second re-numbers.
+# MERGED 2026-10-22 onto main df99bcf3: 6.46.0 landed first, via #816 (the
+# #809 learning-metric fixes; its block follows this one), so DEFAULT OFF is
+# now v6.46.0 byte-identical apart from the version string.
+# -----------------------------------------------------------------------------
+# EVIDENCE. Since v6.43.0 a record matures only on a quote from its exact
+# target session (_outcome_target_session: "never use a later session"). Once
+# that session has passed, every later audit holds a later session's quote,
+# the reason is 'quote_outside_target_session', and the record stays ACTIVE
+# with no realized ROI for good: only 'price_unavailable' can EXPIRE, and
+# _outcome_quote_session refuses any older quote as 'quote_session_stale'.
+# Live: TFB Acceptance job 119219926330 (2026-10-21) prints 'D10-3b ... FAIL
+# 3208 records=23529 active=11606 matured=11791'; matured has been 11,791 since
+# about 10 Oct (Performance Clock job 118841772740). Arming #805
+# (TRACK_SCHEDULED_AUDIT=1) stops new losses only when a run lands inside the
+# target session's window; its own commit sheet says the 12-20 Oct target
+# sessions "stay unmeasured". The run start times (14:26-20:49Z) also miss the
+# US close on some weekdays, so the matured cohort is skewed by market.
+# docs/reviews/witnessed-outcomes-20261009.md names the follow-up: a separately
+# witnessed historical target-close price path, with corporate-action
+# endpoints bound to that same time.
+# WHAT CHANGED (gate TRACK_HIST_TARGET_CLOSE = off (DEFAULT) | observe |
+# enforce; exact words, anything else -> off):
+#   off     -> nothing new runs: no pull, no log line, no receipt key.
+#   observe -> for each ACTIVE record whose reason is exactly
+#              'quote_outside_target_session' (a current witnessed quote exists,
+#              so the target session and its close are known), fetch that
+#              session's daily close AFTER the loop (so these pulls never share
+#              the CA-GUARD's clock or Yahoo quota in that pass) and LOG ONLY one
+#              line '[HIST-CLOSE v6.47.0] mode=observe candidates=N witnessed=K
+#              (by horizon) matured=0 refused=M (reasons) pulls=P ok=A failed=F
+#              [first_error=<class>] breaker=closed|open deferred=D'. Records,
+#              Notes and every sheet are unchanged.
+#   enforce -> the same evidence becomes an OutcomePrice (quote_kind
+#              'historical_daily_close', provider 'yfinance-history', quote_asof
+#              = the target session's close) and the record continues down the
+#              UNCHANGED maturation path: CA-GUARD (ledger factor and adjusted
+#              series both bound to the same target session), WIN/LOSS and the
+#              [OUTCOME-WITNESS v1] receipt, which also carries hist_bar_date,
+#              hist_provider and the current quote it replaced. The ROI is
+#              recomputed from the bar close BEFORE the CA-GUARD reads it, so
+#              no record matures on today's price. A refused record stays
+#              ACTIVE with its v6.45.0 reason and a hist_close_reason in the
+#              receipt. A substituted record that the unchanged path then
+#              leaves unmatured (CA verification deferred, a CA refusal, or
+#              CORP_ACTION_SUSPECT) gets its live Current Price and Unrealized
+#              ROI back after the loop, so the sheet never shows the old close
+#              as the live mark.
+#   REFUSALS (the record stays ACTIVE, never EXPIRED): no bars, no bar dated the
+#   target session, conflicting closes that day, a close that is not finite or
+#   not positive, a Stock Splits event (or an unreadable split cell) on the
+#   target-session bar or any later bar (Yahoo back-adjusts Close for splits,
+#   and yfinance attaches an event dated on a day with no bar to the PREVIOUS
+#   bar, which can be the target session's own), a confirmed _Corporate_Actions
+#   entry dated after it, a close 10x or more away from the current witnessed
+#   quote (currency subunit or wrong instrument), a failed pull, an open
+#   breaker (3 failed pulls in a row or any rate-limit error stops pulling for
+#   the pass), or the pull budget spent (TRACK_HIST_CLOSE_BUDGET distinct
+#   symbols, default 60; TRACK_HIST_CLOSE_TIME_SEC, default 240). The 60 are
+#   a rotating daily window over the candidate symbols in a stable hash order
+#   (_hist_close_admit), so symbols refused on every pass cannot starve the
+#   rest: each candidate symbol is reached within ceil(N / budget) days
+#   (Codex P2 on #814). Enforce finds its candidates with a pure pre-pass
+#   (_hist_close_candidate); observe uses its own list. The pull has
+#   its own cache and budget; _CA_BARS_CACHE (ADJUSTED bars) is never touched,
+#   and each pull's wall-clock time is credited back to the CA-GUARD's window
+#   (_CA_BUDGET['t0']) so these pulls never spend its 240 s.
+#   No new EXPIRE path. Only 'quote_outside_target_session' triggers it:
+#   'quote_session_stale' carries no target-session context.
+# ENV LANE: GitHub Actions, .github/workflows/track_performance.yml 'Run
+#   performance clock' only (${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}).
+#   daily_sync.yml audits only on manual dispatch and is not changed; a maturity
+#   written by this lane is not undone by the other lane's record-only save.
+# KNOWN LIMITS: a record whose symbol has no current witnessed quote is not a
+#   candidate. maturity_date is the audit time, as for every maturity. The
+#   embedded self-test is unchanged (22 cases); tests/
+#   test_tracker_hist_target_close.py carries the coverage.
+# ZERO functions removed. Additions: _hist_target_close_mode,
+#   _hist_close_budget, _hist_close_time_sec, _hist_close_pull,
+#   _hist_close_bars, _hist_target_close, _hist_close_evidence,
+#   _hist_close_judge, _hist_close_admit, _hist_close_candidate (+ the
+#   _HIST_CLOSE_CACHE / _HIST_CLOSE_BUDGET /
+#   _LAST_HIST_CLOSE dicts, _HIST_CLOSE_BREAKER_AFTER and
+#   _HIST_CLOSE_EMPTY_ERRORS). The pull passes raise_errors=True: with the
+#   default, yfinance 0.2.66 turns every failure but a 429 into an empty
+#   frame, so an outage would read as "no bars" and never trip the breaker.
+# ROLLBACK: unset TRACK_HIST_TARGET_CLOSE (or set off). Records already matured
+#   under enforce keep their receipts (hist_bar_date marks them).
+# -----------------------------------------------------------------------------
+# v6.46.0 (2026-10-20): LEARNING-METRIC DEFINITION FIXES (report/aggregate
+# math only; no env, no Performance_Log cell changes).
+#   [DIR-OUTCOME] PerformanceAnalyzer / AttributionAnalyzer /
+#     ReliabilityCalibrator (buckets, Brier, decided count) and the report
+#     CI / cumulative win-rate plot scored every record by the SIGN OF THE
+#     PRICE CHANGE, so two SELL calls that rose +5% / +3% read 2 wins (100%).
+#     They now score the CALL (_record_outcome): BUY-family wins when price
+#     rose, sell-family (REDUCE / SELL / STRONG SELL / AVOID; EXIT and TRIM
+#     classify into these at entry) wins when it FELL, HOLD is neutral -
+#     excluded from every directional rate and counted in
+#     PerformanceSummary.neutral_records. The demo above now reads 0 W / 2 L.
+#     DELIBERATELY UNCHANGED: Realized ROI % (the price return) and the
+#     persisted Outcome column written at maturation, which stays the PRICE
+#     direction label - scripts/calibration_report.py audits Outcome ==
+#     sign(ROI) ('outcome_label_disagrees_with_roi') and tfb_backtest /
+#     tfb_workbook_dq_audit read it; relabelling ~11k historical rows is a
+#     published-value change that needs its own gate. Avg/median/best/worst
+#     ROI and regret / IC stay price-return aggregates.
+#   [HIT-DECIDED] hit_rate_by_horizon divided by ALL matured records while
+#     win_rate is decided-only: [2,-1,0,0] read win_rate 50 / hit_rate 25.
+#     Now w / (w + l) for both (50 / 50).
+#   [RISK-HORIZON] RiskCalculator treated per-record percent ROIs over 7-90
+#     day horizons as DAILY FRACTIONS (rfr/252, sqrt(252)): 1M ROIs
+#     [2,-1,3,1]% read Sharpe 13.42. Now percent -> fraction, rfr scaled to
+#     the horizon's trading days (1W=5 2W=10 1M=21 3M=63), annualised by
+#     sqrt(252/period), computed PER HORIZON (sharpe_by_horizon /
+#     sortino_by_horizon; the scalar is set only when one horizon is present,
+#     the panel prints '1M x | 3M y' otherwise). Same input -> 2.54. Sortino
+#     uses the standard downside deviation over all observations. Overlapping
+#     daily-opened windows still overstate significance (documented only).
+#   [CLAIMED-DECIDED] ReliabilityCalibrator buckets compared wins/decided
+#     with a claimed rate averaged over ALL records (HOLD and breakeven
+#     included), so a bucket with neutral records read as under-confident.
+#     claimed_win_rate (and the advisory factor) now average the stated
+#     reliability of the same decided records; mean_claimed_reliability
+#     keeps the all-n average.
+# Embedded self-test count unchanged (22). Tests: tests/test_learning_metric_fixes.py.
+# v6.48.0 (2026-10-24): outcome summaries use unique valid matured keys,
+# disclose directional versus price-return metrics and their denominators.
+# This is a read-only analytics correction; no historical row is changed.
+# -----------------------------------------------------------------------------
+# v6.49.0 (2026-10-25) [BOARD-COVERAGE]: the live decision board joins the
+# daily forecast record. ENV-gated, DEFAULT OFF (TFB_TRACK_BOARD_SYMBOLS).
+# EVIDENCE (workbook read 2026-10-25 09:40 Riyadh, gviz): Signal_History
+#   2026-10-24 held 176 rows - 44 tagged Origin Tab 'Top_10_Investments'
+#   (2222.SR, 2283.SR, BNY.US, 9961.HK, BRK-B.US, 7030.SR, ... all WATCH;
+#   the rows the backend's legacy /sheet-rows page=Top_10_Investments build
+#   returns) and 132 'Decision_Coverage' (ledger lots: AER, CARE, CWBC, DDI,
+#   EPRT, HCI, KRP, NMM, PFS, RCI, VEL, ...). NONE of the names seated on the
+#   live Top_10_Investments board that day (PHP.L, FRST.US, ZTO.US, CRC.US,
+#   CBAN.US, ORC.US, AX.US, PGC.US, UMBF.US, FBK.US) had a snapshot; the
+#   last Signal_History rows for ZTO.US / PHP.L / FRST.US date from August.
+#   Performance_Log records are built from the same row set, so the
+#   forecast-vs-outcome evidence (Brier, hit rate, calibration) never sees the
+#   recommendations the Apps Script board (16_Decision_Top10, stability layer,
+#   TFB_SCORING_SETTLE=enforce) actually publishes. Strategy requirement #2
+#   (daily recording for Top_10 + holdings) is met for holdings only.
+# WHAT: when TFB_TRACK_BOARD_SYMBOLS is on, _augment_with_decision_symbols
+#   also reads the board's SELECTED grid (Top_10_Investments A12:B130, the
+#   same window v6.33.0's champion read uses) and adds every seated symbol -
+#   confirmed seats, FAST-TRACK and GRACE-held ghosts alike (a grace hold is
+#   still a published recommendation under watch; the v6.33.0 CHAMPION stamp
+#   keeps excluding ghosts, unchanged) - to the forced-coverage priority set.
+#   Board symbols are treated like pinned extras in _force_plan (never cut by
+#   TFB_TRACK_FORCE_MAX). Fetched rows whose symbol came only from the board
+#   carry origin 'Decision_Board' (visible in Signal_History 'Origin Tab');
+#   rows that are also ledger lots keep 'Decision_Coverage'. One INFO line
+#   '[v6.49.0 BOARD-COVERAGE] board=n new=k ghosts=g' per run.
+#   Fail-open: an unreadable board adds nothing and logs one warning.
+# BYTE-IDENTICAL when off (default): no read, no log line, same rows.
+# ENV LANE: .github/workflows/track_performance.yml 'Run performance clock'
+#   AND daily_sync.yml's tracker step (ENV PARITY rule; both map
+#   ${{ vars.TFB_TRACK_BOARD_SYMBOLS || 'off' }}). Arm by setting the repo
+#   Variable to 1 after one observed run.
+# KNOWN LIMITS: rows come from TFB_TRACK_FORCE_ROWS_ENDPOINT with page
+#   TFB_TRACK_FORCE_ROWS_PAGE (Market_Leaders by default) - the engine's
+#   per-symbol verdict, not the board's sized ticket; stability state is not
+#   recorded (the board's own _Selection_Log keeps it).
+# ZERO functions removed. Additions: _board_symbols_enabled,
+#   _board_symbols_from_values, _load_board_symbols, _BOARD_TAG.
+# ROLLBACK: unset TFB_TRACK_BOARD_SYMBOLS (or set 0/off).
+# -----------------------------------------------------------------------------
+# v6.50.0 (2026-10-25) [LOG-READ]: Performance_Log numbers are read back at
+# full precision. ENV-gated, DEFAULT OFF (TRACK_LOG_UNFORMATTED_READ).
+# EVIDENCE: PerformanceStore.load_records read the log with ws.get(rng), so
+#   the Sheets API default valueRenderOption FORMATTED_VALUE applied and every
+#   number came back as its displayed text (about 10 significant digits under
+#   the Automatic format). The tracker writes the log RAW at full float
+#   precision, and canonical_performance_report proves a v2 target with
+#   math.isclose(stored, (target/entry - 1) * 100, rel_tol=1e-9,
+#   abs_tol=1e-8). A 1W/2W checkpoint target price is the interpolation
+#   entry*(1-frac) + forecast*frac (frac 7/30, 14/30) and carries about 16
+#   significant digits; rendered at about 10 it moves the price-implied ROI
+#   by up to about 5e-8 pp, past the 1e-8 absolute floor, whatever the ROI
+#   size, so a target that was exact when written failed as
+#   'schema_price_mismatch' once read back. 1M/3M target prices are the
+#   engine's 4 dp forecast prices and survive. The [CANONICAL-PERFORMANCE]
+#   lines show schema_price_mismatch 6 -> 6 -> 43 while percent_points went
+#   34 -> 222 -> 249 (jobs 120950277470, 121006724938, 121127954714; tracker
+#   steps at 24 Oct 18:21Z, 23:29Z and 25 Oct 10:08Z): the 188 rows recorded
+#   at 23:29Z (25 Oct Riyadh) were exact in memory on the run that wrote
+#   them, and 37 more targets failed on the next run, which read them back.
+#   An offline replay (400 sources x 4 horizons, '.10g' rendering) loses
+#   129/400 1W and 135/400 2W, 0 at 1M/3M, and 0 on a raw round-trip. An
+#   audit pass then makes the loss permanent:
+#   run_once -> audit -> _publish_s1_calibration -> save_records rewrote
+#   every row from the rounded floats. Consumers of the canonical target:
+#   S-1 criterion 4 (_S1_Calibration), the canonical unit counts and the
+#   outcome witness at maturity.
+# WHAT (load_records only; Signal_History and every other reader unchanged):
+#   off (DEFAULT; unset or any other word, '1' included): ws.get(rng) exactly
+#     as v6.49.0; no log line, no extra read.
+#   observe: the records are the off records. One extra read of the same
+#     range with valueRenderOption UNFORMATTED_VALUE (dateTimeRenderOption
+#     FORMATTED_STRING); both reads are parsed by from_sheet_row and compared
+#     field by field, and one WARNING line '[v6.50.0 LOG-READ] mode=observe
+#     ...' reports precision_only (numbers within 1e-6: absolute below 1,
+#     relative above), divergent {header: n} (numbers that differ beyond
+#     that, e.g. a percent number format), text_differs {header: n} (any
+#     other parsed difference, e.g. a typed boolean or a number in a text
+#     column), misaligned rows and the schema_price_mismatch count of both
+#     parses. A failed extra read logs one WARNING and changes nothing.
+#   enforce: the one read asks for UNFORMATTED_VALUE + FORMATTED_STRING and
+#     logs one INFO line '[v6.50.0 LOG-READ] mode=enforce rows=N'. Parsing is
+#     unchanged (from_sheet_row via _safe_float/_safe_str); the tracker's
+#     RAW-written strings and dates read back as the same strings.
+# ARMING (owner): repository Variable TRACK_LOG_UNFORMATTED_READ=observe for
+#   one Performance Clock run; require divergent={} and text_differs={} and an
+#   unformatted mismatch count below the formatted one; then set enforce. Both
+#   tracker lanes read the same Variable (ENV PARITY).
+# KNOWN LIMITS: rows already rewritten from a rounded read by an audit pass
+#   stay rounded (no repair here); a manually applied percent number format
+#   would change a cell's meaning under enforce, which observe reports.
+# ZERO functions removed. Additions: _log_read_mode, _log_read_observe,
+#   _LOG_READ_TAG, _LAST_LOG_READ.
+# ROLLBACK: unset TRACK_LOG_UNFORMATTED_READ (or set off).
+# -----------------------------------------------------------------------------
+# v6.53.0 (2026-11-02) [ARCHIVE-BAR + DUE-ONLY]: the historical target-session
+# close can come from the BigQuery bar archive, and an audit pass can price
+# only the symbols that are due. Two ENV gates, both DEFAULT OFF
+# (TRACK_HIST_CLOSE_SOURCE=yfinance, TRACK_AUDIT_DUE_ONLY=0) = v6.50.0
+# byte-identical apart from the version string. 6.51.0 and 6.52.0 are claimed
+# by the open PRs #845 and #857, so this build takes 6.53.0; whichever lands
+# later re-numbers.
+# EVIDENCE (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve
+#   today, results tomorrow"): Performance_Log holds 13,856 active forecast
+#   records over 1,376 symbols, 5,759 of them past their target, and the
+#   learning loop matures only a trickle. The outcome receipts of the 31 Oct
+#   22:54 audit say why: about 3,250 records carry
+#   'quote_session_unknown;quote_rate_limit_breaker' (SR 1,490, US 1,003, HK
+#   445), about 1,450 'quote_outside_target_session' (US 1,039), about 250 no
+#   receipt at all, about 100 'outcome_calendar_unknown' (MX and suffix-less
+#   names) and 43 'target_session_not_complete'. Three causes: (1)
+#   audit_active_records prices EVERY active symbol through the backend chain
+#   and then the Yahoo chart fallback, so the fallback's rate-limit breaker
+#   trips long before the due symbols are reached; (2) the two audit crons
+#   (11:47Z and 15:47Z, delivered 4-6 h late by GitHub) land inside the US
+#   session, so a US record can only mature through the v6.47.0 historical
+#   target-session close path (TRACK_HIST_TARGET_CLOSE, default off), whose
+#   yfinance pulls carry a 60-symbol budget and a breaker; (3) the maturation
+#   rule itself (_outcome_target_session: the first exchange-session close
+#   at/after the target, never a later session) is correct and is NOT
+#   changed here. BigQuery already holds daily OHLC bars for the symbols that
+#   matter (tfb_archive.symbol_bars_daily: symbol, yahoo_symbol, date, open,
+#   high, low, close, adj_close, volume, source, set_reason, captured_at,
+#   run_id; 315 symbols on 1 Nov, every symbol with an active record once
+#   #890 arms TFB_DEEP_OUTCOME_BARS; replaced nightly at 00:20 UTC from
+#   Yahoo's chart API, so 'close' is Yahoo's split-adjusted Close, the same
+#   series the yfinance path reads). The archive's service account
+#   (GOOGLE_SHEETS_CREDENTIALS) can query it.
+# WHAT (A) TRACK_HIST_CLOSE_SOURCE = yfinance (DEFAULT) | bq_archive |
+#   bq_archive_then_yfinance (exact words, case/space-insensitive; anything
+#   else -> yfinance). It only chooses WHERE _hist_close_evidence gets its
+#   bars; TRACK_HIST_TARGET_CLOSE (off | observe | enforce) keeps deciding
+#   whether the judge runs at all, so with that gate off nothing is read
+#   whatever the source says.
+#   bq_archive -> ONE parameterised BigQuery query per audit pass for every
+#     candidate symbol (SELECT symbol, date, open, high, low, close,
+#     adj_close, source FROM `<project>.<dataset>.symbol_bars_daily` WHERE
+#     symbol IN UNNEST(@symbols) AND date >= @since AND date <= @until; at
+#     most _ARCHIVE_BAR_MAX_SYMBOLS = 2000 symbols per pass, the dates
+#     bounded to the candidates' target sessions; jobs.query with the
+#     archive's 60 s timeoutMs, polled and paged under one
+#     _ARCHIVE_BAR_WALL_SEC wall clock) through the archive scripts' own REST
+#     pattern (scripts/archive_market_series.make_session -> google-auth
+#     AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS; no BigQuery client
+#     library). The rows become the SAME per-symbol bar structure
+#     _hist_close_bars returns ({"date", "close", "split": 0.0}), so
+#     _hist_close_evidence -> _hist_target_close -> _hist_close_judge -> the
+#     unchanged maturation path (CA-GUARD, WIN/LOSS, the [OUTCOME-WITNESS v1]
+#     receipt, dedup) are not touched. A matured receipt carries provider
+#     'bq_archive_bar' (hist_provider too), quote_kind
+#     'historical_daily_close', acquired_at = now and quote_asof = the target
+#     session's exchange close (the same context value the yfinance path
+#     uses). The archive symbol is the TFB symbol itself (2222.SR, AAPL.US).
+#     REFUSALS (the record stays ACTIVE, never EXPIRED): a failed, timed-out
+#     or over-paged query, or a session that cannot be built ->
+#     'hist_close_archive_unavailable' for every candidate (never an
+#     exception out of the pass); a symbol beyond the 2,000 cap ->
+#     'hist_close_archive_not_asked'; no archive bar dated the target session
+#     (symbol absent, or only other sessions present) ->
+#     'hist_close_archive_no_bar'; a bar for that day whose source is not
+#     Yahoo's daily chart (yahoo_chart_v8_1h: a day the archive rebuilt from
+#     hourly prints, whose close is the last print, not the witnessed close;
+#     Codex P2 on #894) -> 'hist_close_archive_not_daily'; then the v6.47.0
+#     judge's own refusals (conflict, invalid, scale mismatch, a confirmed
+#     ledger action after the target). The yfinance pull budget
+#     (TRACK_HIST_CLOSE_BUDGET), time budget and breaker apply to yfinance
+#     pulls only: under bq_archive no yfinance pull is made (pulls=0 on the
+#     HIST-CLOSE line).
+#   bq_archive_then_yfinance -> the archive first; a symbol with no archive
+#     bar for its target session (and every symbol when the query failed)
+#     falls back to the v6.47.0 yfinance path under its existing budget,
+#     rotating window and breaker.
+#   One extra WARNING line per armed pass: '[ARCHIVE-BAR v6.53.0] source=<src>
+#     candidates=N symbols=S asked=A rows=R served=K no_bar=M not_daily=H
+#     not_asked=X fallback=F unavailable=0|1 [error=<class>] query_sec=T'
+#     (served, no_bar, not_daily, not_asked and fallback count candidate
+#     RECORDS). The '[HIST-CLOSE
+#     v6.47.0]' line and _LAST_HIST_CLOSE keep their v6.47.0 shape under
+#     source=yfinance; the archive modes add 'source' and 'archive' keys.
+#   ENV: TFB_BQ_PROJECT (default project-2e3530e6-2311-4aa3-b36),
+#     TFB_BQ_DATASET (default tfb_archive), TFB_BQ_LOCATION (default US) -
+#     the archive scripts' own names and defaults.
+# WHAT (B) TRACK_AUDIT_DUE_ONLY = 0 (DEFAULT) | 1. Today an audit pass prices
+#   every active symbol. For a record that is NOT yet due (now < target) the
+#   pass writes, when its symbol was priced: Current Price and Unrealized
+#   ROI from the fresh quote and Last Updated = now; when its symbol was NOT
+#   priced (breaker, budget, no witnessed quote): Last Updated = now only.
+#   Status, Realized ROI, Outcome and Notes (no receipt) are never written
+#   for a not-due record either way. With TRACK_AUDIT_DUE_ONLY=1 only the
+#   symbols with at least one active record whose parsed target time is at
+#   or before now are sent to the backend chain and the Yahoo fallback; the
+#   not-due symbols are simply not priced, so their records take the exact
+#   'not priced in this pass' path that already exists (Last Updated = now,
+#   every other cell untouched, no receipt). The due symbols are ordered
+#   oldest target first (the backend chunks keep that order; the Yahoo
+#   fallback keeps it too, because its rotating shuffle is bypassed under
+#   this gate - the due set rotates by itself as symbols mature), so a
+#   breaker that still trips hits the youngest backlog. One INFO line per
+#   pass: '[v6.53.0 DUE-ONLY] audit due-only: N due symbols priced, M not-due
+#   symbols skipped (due records=R, oldest target=YYYY-MM-DD, witnessed=K)'.
+#   _last_audit_stats['total'] (the PERF-VERDICT 'priced n/N') counts the
+#   symbols actually sent for pricing and 'due_only_skipped' carries M. A
+#   record whose target time cannot be parsed is not due (it cannot mature).
+# WHAT (C) .github/workflows/track_performance.yml 1.0.7: a third cron
+#   '30 1 * * *' (04:30 Riyadh), after the US close (21:00 UTC since US DST
+#   ended on 1 Nov 2026); a quote taken then belongs to the target session,
+#   so 'quote_outside_target_session' stops for US records whose target
+#   session was that day. The scheduled-audit condition
+#   (TRACK_SCHEDULED_AUDIT=1 with TRACK_DEDUP_MATURED observe | enforce)
+#   applies to every scheduled run, the new one included.
+# ENV LANE: track_performance.yml 'Run performance clock' maps
+#   TRACK_HIST_CLOSE_SOURCE (|| 'yfinance'), TRACK_AUDIT_DUE_ONLY (|| '0'),
+#   TFB_BQ_PROJECT, TFB_BQ_DATASET and TFB_BQ_LOCATION; daily_sync.yml's
+#   tracker step maps the same five (ENV PARITY). The v6.47.0 gate itself
+#   stays mapped in the clock lane only, so the archive read never runs in
+#   the sync lane; due-only applies to any audit pass in either lane.
+# ARMING (owner, one Variable per evidence run): TRACK_HIST_CLOSE_SOURCE=
+#   bq_archive with TRACK_HIST_TARGET_CLOSE=observe for one Performance Clock
+#   audit (read the ARCHIVE-BAR and HIST-CLOSE lines), then enforce;
+#   TRACK_AUDIT_DUE_ONLY=1 after one observed pass.
+# KNOWN LIMITS: the archive carries no split events, so the v6.47.0
+#   post-target split refusal cannot fire on archive bars; the CA-GUARD
+#   (ledger factor, 15 pp adjusted-series verification) and the 10x scale
+#   check stay the protection. A symbol the nightly archive did not capture
+#   (outside the deep and outcome sets, or a Yahoo miss) is 'no_bar' until
+#   it is. The read costs one BigQuery query per audit pass (a few MB
+#   scanned, a few seconds). A record whose symbol has no current witnessed
+#   quote is still not a candidate (v6.47.0); due-only makes that quote
+#   likelier for exactly the due symbols.
+# ZERO functions removed. Additions: _hist_close_source, _bq_project,
+#   _bq_dataset, _bq_location, _archive_bar_module, _archive_bar_session,
+#   _archive_bar_scrub, _archive_bar_query, _archive_bar_rows,
+#   _hist_archive_prefetch, _hist_close_bars_for,
+#   _hist_close_candidate_session, _audit_due_only_enabled,
+#   _audit_due_symbols (+ _ARCHIVE_BAR_TAG, _ARCHIVE_BAR_PROVIDER,
+#   _ARCHIVE_BAR_TABLE, _ARCHIVE_BAR_DAILY_SOURCES, _ARCHIVE_BAR_MAX_SYMBOLS,
+#   _ARCHIVE_BAR_WALL_SEC, _ARCHIVE_BAR_QUERY_TIMEOUT_MS, _ARCHIVE_BAR_MAX_PAGES,
+#   _HIST_ARCHIVE_CACHE, _HIST_ARCHIVE_STATE, _ARCHIVE_BAR_MODULE,
+#   _DUE_ONLY_TAG, _LAST_DUE_ONLY). _hist_close_evidence asks
+#   _hist_close_bars_for (yfinance -> the v6.47.0 _hist_close_bars call);
+#   _yahoo_chart_fallback_prices gains keep_order (default False =
+#   unchanged); audit_active_records prices _price_syms (= every active
+#   symbol unless due-only is on).
+# ROLLBACK: unset TRACK_HIST_CLOSE_SOURCE (or set yfinance) and unset
+#   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
+#   own. Records matured from archive bars keep their receipts
+#   (hist_provider 'bq_archive_bar' marks them).
+SCRIPT_VERSION = "6.53.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -2132,6 +2514,94 @@ def _force_plan(active: List[str], closed: List[str], extras: List[str],
 def _costbasis_tab() -> str:
     return (os.getenv("TFB_TRACK_COSTBASIS_TAB")
             or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
+
+
+# --- v6.49.0 [BOARD-COVERAGE]: the live decision board joins the record ----
+_BOARD_TAG = "[v6.49.0 BOARD-COVERAGE]"
+_BOARD_TAB_DEFAULT = "Top_10_Investments"
+_BOARD_RANGE = "A12:B130"      # the v6.33.0 champion-read window
+_BOARD_MAX = 15                # the board never seats more than 10 + grace
+
+
+def _board_symbols_enabled() -> bool:
+    """v6.49.0: DEFAULT OFF (house convention). TFB_TRACK_BOARD_SYMBOLS=1/on/
+    true adds the live board's seated symbols to the forced-coverage set."""
+    return _env_bool("TFB_TRACK_BOARD_SYMBOLS", False)
+
+
+def _board_tab() -> str:
+    return (os.getenv("TFB_TRACK_BOARD_TAB") or _BOARD_TAB_DEFAULT).strip() \
+        or _BOARD_TAB_DEFAULT
+
+
+def _board_symbols_from_values(vals: Any) -> Tuple[List[str], int]:
+    """v6.49.0 PURE: from the board's A12:B130 value matrix return
+    (seated_symbols_in_board_order, ghost_count). Same walk as
+    _read_board_selected_symbols (header row 'Rank'|'Symbol', stop at the
+    'ALL QUALIFIED' zone or the first fully blank row, cap _BOARD_MAX) but
+    GRACE-held ghosts (Rank cell '—') are KEPT - they are published
+    recommendations under watch and must be recorded daily. Shape-validated
+    (SG-1 rule), deduped. Never throws: junk -> ([], 0)."""
+    out: List[str] = []
+    seen: set = set()
+    ghosts = 0
+    in_table = False
+    try:
+        for row in (vals or []):
+            row = row or []
+            a = _safe_str(row[0] if len(row) > 0 else "").strip()
+            b = _safe_str(row[1] if len(row) > 1 else "").strip().upper()
+            if not in_table:
+                if a == "Rank" and b == "SYMBOL":
+                    in_table = True
+                continue
+            if a.upper().startswith("ALL QUALIFIED") or (not a and not b):
+                break
+            if not b or b == "SYMBOL" or not _valid_symbol_shape(b):
+                continue
+            if a == "—":
+                ghosts += 1
+            if b not in seen:
+                seen.add(b)
+                out.append(b)
+            if len(out) >= _BOARD_MAX:
+                break
+    except Exception:
+        return [], 0
+    return out, ghosts
+
+
+def _load_board_symbols(spreadsheet_id: str) -> Tuple[List[str], int]:
+    """v6.49.0: ONE read of the board's SELECTED window via the stores'
+    SA-credential pattern (mirrors _load_costbasis_symbols). Fail-open:
+    any problem -> ([], 0) with one debug line."""
+    if not spreadsheet_id or not GSPREAD_AVAILABLE or gspread is None:
+        return [], 0
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return [], 0
+    s = raw
+    if not s.startswith("{"):
+        try:
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return [], 0
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(spreadsheet_id).worksheet(_board_tab())
+        vals = ws.get_values(_BOARD_RANGE) or []
+        return _board_symbols_from_values(vals)
+    except Exception as e:
+        logger.debug("%s board read skipped: %s", _BOARD_TAG, e)
+        return [], 0
 
 
 # =============================================================================
@@ -3260,11 +3730,13 @@ async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> floa
     return px
 
 
-async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
+async def _yahoo_chart_fallback_prices(symbols: List[str], keep_order: bool = False) -> Dict[str, float]:
     """v6.20.0 (PF-1): price the given symbols directly from Yahoo's v8
     chart API under a concurrency cap and wall-clock budget. Returns only
     witnessed positive prices, keyed by the ORIGINAL (TFB) symbol. Never raises.
     The numeric API is retained; OutcomePrices carries the required sidecar.
+    v6.53.0: keep_order=True (the due-only audit) keeps the caller's order
+    instead of the rotating shuffle; the default is unchanged.
     """
     syms = [
         _safe_str(x).strip().upper()
@@ -3276,7 +3748,8 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
         return {}
     # v6.28.0 FB-BRK: rotate the worklist so the same head symbols never
     # monopolise the budget leg after leg. Legacy flag keeps sheet order.
-    if _fallback_shuffle_enabled() and not _feed_legacy():
+    # v6.53.0 [DUE-ONLY]: an oldest-target-first worklist is kept as given.
+    if _fallback_shuffle_enabled() and not _feed_legacy() and not keep_order:
         random.shuffle(syms)
     t0 = time.time()
     budget = _fallback_budget_sec()
@@ -3536,6 +4009,599 @@ def _ca_adjusted_roi(symbol: str, entry_date: Any, target_session: Optional[str]
     except Exception:
         return None
 
+
+# v6.47.0 - HISTORICAL TARGET-SESSION CLOSE (TRACK_HIST_TARGET_CLOSE)
+# =============================================================================
+# A record whose target session closed before any audit priced it stays
+# ACTIVE for good: every later audit holds a LATER session's quote, which
+# _outcome_target_session refuses as 'quote_outside_target_session'. These
+# helpers fetch the close of EXACTLY that target session from a separate
+# daily-bar pull. They use their own cache and budget; _CA_BARS_CACHE holds
+# ADJUSTED bars for the CA-GUARD and is never touched here. The only contact
+# with _CA_BUDGET is a credit: the wall-clock time of each pull here is added
+# back to the CA-GUARD's window start, so these pulls never spend its budget.
+_HIST_CLOSE_TAG = "[HIST-CLOSE v6.47.0]"
+_HIST_CLOSE_PROVIDER = "yfinance-history"
+_HIST_CLOSE_KIND = "historical_daily_close"
+_HIST_CLOSE_CACHE: Dict[str, Any] = {}       # per-run yahoo symbol -> bars
+_HIST_CLOSE_BUDGET: Dict[str, Any] = {"pulls": 0, "t0": 0.0, "deferred": 0}
+_HIST_CLOSE_BREAKER_AFTER = 3                # consecutive failed pulls
+# yfinance errors that mean "Yahoo answered, with no rows" (unknown or delisted
+# symbol, empty range, a Yahoo error body): an empty answer, not a failed pull.
+_HIST_CLOSE_EMPTY_ERRORS = frozenset({"YFPricesMissingError"})
+_LAST_HIST_CLOSE: Dict[str, Any] = {}        # read-back of the last audit pass
+
+
+def _hist_target_close_mode() -> str:
+    """v6.47.0: TRACK_HIST_TARGET_CLOSE off (DEFAULT) | observe | enforce.
+    Exact words, case/space-insensitive; anything else (including '1') is
+    off, so an unset or mistyped Variable can never mature a record."""
+    v = (os.getenv("TRACK_HIST_TARGET_CLOSE") or "off").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _hist_close_budget() -> int:
+    """v6.47.0: max distinct symbol pulls per audit pass (0 = unlimited)."""
+    try:
+        return max(0, int(float(os.getenv("TRACK_HIST_CLOSE_BUDGET") or "60")))
+    except Exception:
+        return 60
+
+
+def _hist_close_time_sec() -> float:
+    """v6.47.0: wall-clock budget for historical-close pulls (0 = unlimited)."""
+    try:
+        return max(0.0, float(os.getenv("TRACK_HIST_CLOSE_TIME_SEC") or "240"))
+    except Exception:
+        return 240.0
+
+
+def _hist_close_pull(symbol: str) -> List[Dict[str, Any]]:
+    """v6.47.0: ONE yfinance daily pull, auto_adjust=False, with split events.
+    Each bar is {"date", "close", "split"}; 'close' is Yahoo's Close (split
+    back-adjusted, NOT dividend-adjusted, so a price ROI against a raw entry
+    print stays a price ROI) and 'split' is the Stock Splits ratio (0 = no
+    event). Returns [] when Yahoo answers with no rows. A FAILED call (rate
+    limit, network, timeout, an outage page, missing yfinance) RAISES, so
+    _hist_close_bars can count it apart from an empty answer; either way the
+    record stays ACTIVE. raise_errors=True is what makes it raise: with the
+    default, yfinance 0.2.66 logs every failure except a 429 and returns an
+    empty frame, which would read as "Yahoo has no bars"."""
+    import yfinance as yf  # type: ignore
+    try:
+        df = yf.Ticker(_yf_ticker(symbol)).history(period="1y", interval="1d", auto_adjust=False,
+                                                  actions=True, raise_errors=True)
+    except Exception as exc:
+        if type(exc).__name__ in _HIST_CLOSE_EMPTY_ERRORS:
+            return []
+        raise
+    if df is None or getattr(df, "empty", True):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for idx, r in df.iterrows():
+        try:
+            split = r.get("Stock Splits", 0.0)
+            rows.append({"date": idx.strftime("%Y-%m-%d"), "close": float(r["Close"]),
+                         "split": float(0.0 if split is None else split)})
+        except Exception:
+            continue
+    return rows
+
+
+def _hist_close_bars(symbol: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """v6.47.0: per-run cached bars, or (None, reason). An exhausted budget or
+    an open breaker DEFERS (the record stays ACTIVE and is retried next
+    pass); it never manufactures an expiry. A failed pull is counted apart
+    from an answered one ('ok' vs 'failed', first_error = its class name)
+    and is not retried this pass; after _HIST_CLOSE_BREAKER_AFTER failures
+    in a row, or any rate-limit error, the breaker opens and no further
+    pull is made this pass. When the pass set an admission window
+    (_hist_close_admit), a symbol outside it is deferred without a pull.
+    Each pull's wall-clock time is credited back to the CA-GUARD's window
+    (_CA_BUDGET['t0']) when that window is open."""
+    key = _yahoo_symbol(symbol)
+    if not key:
+        return None, "hist_close_unavailable"
+    if key in _HIST_CLOSE_CACHE:
+        cached = _HIST_CLOSE_CACHE[key]
+        return (None, "hist_close_pull_error") if cached is None else (cached, "")
+    if _HIST_CLOSE_BUDGET.get("breaker"):
+        _HIST_CLOSE_BUDGET["deferred"] += 1
+        return None, "hist_close_breaker_open"
+    admit = _HIST_CLOSE_BUDGET.get("admit")
+    if admit is not None and key not in admit:
+        _HIST_CLOSE_BUDGET["deferred"] += 1
+        return None, "hist_close_budget_exhausted"
+    if _HIST_CLOSE_BUDGET["t0"] == 0.0:
+        _HIST_CLOSE_BUDGET["t0"] = time.time()
+    b = _hist_close_budget()
+    t = _hist_close_time_sec()
+    if (b and _HIST_CLOSE_BUDGET["pulls"] >= b) or (
+            t and (time.time() - _HIST_CLOSE_BUDGET["t0"]) > t):
+        _HIST_CLOSE_BUDGET["deferred"] += 1
+        return None, "hist_close_budget_exhausted"
+    _HIST_CLOSE_BUDGET["pulls"] += 1
+    started = time.time()
+    try:
+        bars: Optional[List[Dict[str, Any]]] = list(_hist_close_pull(symbol) or [])
+        _HIST_CLOSE_BUDGET["ok"] = _HIST_CLOSE_BUDGET.get("ok", 0) + 1
+        _HIST_CLOSE_BUDGET["consecutive"] = 0
+    except Exception as exc:
+        bars = None
+        name = type(exc).__name__
+        _HIST_CLOSE_BUDGET["failed"] = _HIST_CLOSE_BUDGET.get("failed", 0) + 1
+        _HIST_CLOSE_BUDGET["consecutive"] = _HIST_CLOSE_BUDGET.get("consecutive", 0) + 1
+        _HIST_CLOSE_BUDGET["first_error"] = _HIST_CLOSE_BUDGET.get("first_error") or name
+        if (_HIST_CLOSE_BUDGET["consecutive"] >= _HIST_CLOSE_BREAKER_AFTER
+                or "ratelimit" in name.lower()):
+            _HIST_CLOSE_BUDGET["breaker"] = True
+    finally:
+        if _CA_BUDGET.get("t0"):
+            _CA_BUDGET["t0"] += max(0.0, time.time() - started)
+    _HIST_CLOSE_CACHE[key] = bars
+    if bars is None:
+        return None, "hist_close_pull_error"
+    return bars, ""
+
+
+def _hist_target_close(bars: Any, target_session: str,
+                       reference_price: Optional[float] = None) -> Tuple[Optional[float], str]:
+    """v6.47.0 PURE (no I/O, never raises): the close of EXACTLY the target
+    session, or (None, reason). Refuses, so the record stays ACTIVE, on:
+      no bars at all              hist_close_unavailable
+      no bar dated target_session hist_close_bar_missing
+      >1 distinct close that day  hist_close_bar_conflict
+      close not finite or <= 0    hist_close_invalid
+      a split/bonus event (or an unreadable split cell) on the target-session
+      bar or any later bar - Yahoo back-adjusts Close for splits, so that
+      close would no longer be in the entry print's share units. The
+      target bar itself counts because yfinance attaches an event dated on
+      a day with no bar (a suspension, a missing bar, a weekend) to the
+      PREVIOUS bar, which can be the target session's own
+                                  hist_close_post_target_split
+      close vs the current witnessed quote off by 10x or more (a currency
+      subunit such as GBp/ZAc/ILA, or a wrong instrument)
+                                  hist_close_scale_mismatch"""
+    try:
+        datetime.strptime(target_session, "%Y-%m-%d")
+        usable = [bar for bar in bars or [] if isinstance(bar, dict)]
+        if not usable:
+            return None, "hist_close_unavailable"
+        endings = [bar for bar in usable if _safe_str(bar.get("date"))[:10] == target_session]
+        if not endings:
+            return None, "hist_close_bar_missing"
+        closes = set()
+        for bar in endings:
+            raw = bar.get("close")
+            if isinstance(raw, bool) or raw is None:
+                return None, "hist_close_invalid"
+            closes.add(float(raw))
+        if len(closes) != 1:
+            return None, "hist_close_bar_conflict"
+        close = next(iter(closes))
+        if not math.isfinite(close) or close <= 0:
+            return None, "hist_close_invalid"
+        for bar in usable:
+            if _safe_str(bar.get("date"))[:10] >= target_session:
+                split = bar.get("split", 0.0)
+                try:
+                    split = float(0.0 if split is None else split)
+                except (TypeError, ValueError):
+                    split = float("nan")
+                if not math.isfinite(split) or split not in (0.0, 1.0):
+                    return None, "hist_close_post_target_split"
+        if reference_price is not None:
+            ref = float(reference_price)
+            if math.isfinite(ref) and ref > 0 and max(close / ref, ref / close) >= 10.0:
+                return None, "hist_close_scale_mismatch"
+        return close, ""
+    except Exception:
+        return None, "hist_close_invalid"
+
+
+def _hist_close_evidence(record: Any, context: Dict[str, Any], current: OutcomePrice,
+                         now: datetime) -> Tuple[Optional[OutcomePrice], str]:
+    """v6.47.0: value-bound evidence for the target-session close of a record
+    the current quote can no longer mature. Only called for
+    'quote_outside_target_session', whose context already names the witnessed
+    target session and its close. A confirmed _Corporate_Actions entry dated
+    after the target session refuses too (the ledger and the bars must agree
+    on the share units of that close). Never raises."""
+    try:
+        session = _safe_str(context.get("target_session"))
+        quote_session = _safe_str(context.get("quote_session"))
+        close_at = _outcome_timestamp(context.get("target_session_close"))
+        if not session or close_at is None or not quote_session or quote_session <= session:
+            return None, "hist_close_context_unknown"
+        if close_at > now:
+            return None, "hist_close_context_unknown"
+        if _ca_ledger_factor(record.symbol, session) is not None:
+            return None, "hist_close_post_target_action"
+        # v6.53.0 [ARCHIVE-BAR]: the source gate picks the bars; yfinance
+        # (DEFAULT) is the v6.47.0 _hist_close_bars call and provider.
+        bars, reason, provider = _hist_close_bars_for(record.symbol, session)
+        if reason:
+            return None, reason
+        close, reason = _hist_target_close(bars, session, current.price)
+        if reason:
+            return None, reason
+        return OutcomePrice(record.symbol, float(close), provider,
+                            _utc_now(), close_at, _HIST_CLOSE_KIND), ""
+    except Exception:
+        return None, "hist_close_unavailable"
+
+
+def _hist_close_admit(symbols: List[str], day_ordinal: int, budget: int) -> set:
+    """v6.47.0 PURE: which candidate symbols this pass may pull. The distinct
+    Yahoo symbols are put in a stable hash order and a window of `budget`
+    starting at (day_ordinal * budget) is taken, wrapping. Every candidate
+    symbol is therefore reached within ceil(N / budget) days, even when some
+    symbols are refused on every pass (a fixed sheet order would spend the
+    whole budget on the same first symbols for good). budget 0 = all."""
+    keys = sorted({_yahoo_symbol(s) for s in symbols if _yahoo_symbol(s)},
+                  key=lambda k: hashlib.sha256(k.encode("utf-8")).hexdigest())
+    if not budget or len(keys) <= budget:
+        return set(keys)
+    start = (int(day_ordinal) * int(budget)) % len(keys)
+    return set((keys + keys)[start:start + budget])
+
+
+def _hist_close_candidate(record: Any, prices: Any, now: datetime) -> bool:
+    """v6.47.0 PURE pre-pass for enforce: True when audit_active_records
+    will reach the 'quote_outside_target_session' branch for this record,
+    by the same tests in the same order (evidence, target passed, entry
+    price, finite ROI, target session). Never raises."""
+    try:
+        evidence, _reason = _outcome_map_evidence(prices, record.symbol, now)
+        target = _outcome_timestamp(record.target_date)
+        if evidence is None or target is None or now < target:
+            return False
+        if not math.isfinite(record.entry_price) or record.entry_price <= 0:
+            return False
+        if not math.isfinite((evidence.price / record.entry_price - 1.0) * 100.0):
+            return False
+        return _outcome_target_session(record, evidence, now)[1] == "quote_outside_target_session"
+    except Exception:
+        return False
+
+
+def _hist_close_judge(record: Any, context: Dict[str, Any], current: OutcomePrice, now: datetime,
+                      stats: Dict[str, Any]) -> Tuple[Optional[OutcomePrice], str, float]:
+    """v6.47.0: evidence + ROI (pp) against the entry print, tallied into
+    stats (witnessed by horizon, or refused by reason). Never raises."""
+    evidence, reason = _hist_close_evidence(record, context, current, now)
+    roi = float("nan")
+    if evidence is not None:
+        try:
+            roi = (evidence.price / float(record.entry_price) - 1.0) * 100.0
+        except Exception:
+            roi = float("nan")
+        if not math.isfinite(roi):
+            evidence, reason = None, "hist_close_invalid"
+    if evidence is None:
+        stats["refused"][reason] = stats["refused"].get(reason, 0) + 1
+    else:
+        stats["witnessed"] += 1
+        horizon = _safe_str(getattr(record.horizon, "value", record.horizon))
+        stats["by_horizon"][horizon] = stats["by_horizon"].get(horizon, 0) + 1
+    return evidence, reason, roi
+
+
+# v6.53.0 - ARCHIVE BAR SOURCE (TRACK_HIST_CLOSE_SOURCE) + DUE-ONLY AUDIT
+# =============================================================================
+# The historical target-session close can be read from the BigQuery bar
+# archive (tfb_archive.symbol_bars_daily) instead of one yfinance pull per
+# symbol: ONE parameterised query per audit pass through the archive scripts'
+# own session (archive_market_series.make_session -> google-auth
+# AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS), no client library. The
+# rows take the bar shape _hist_close_bars returns, so everything after
+# _hist_close_evidence is the v6.47.0 path. The credential never reaches a
+# log line: a failure is reported by its class name and a scrubbed message.
+# The source gate never arms the judge - TRACK_HIST_TARGET_CLOSE does - so
+# with that gate off nothing here runs.
+_ARCHIVE_BAR_TAG = "[ARCHIVE-BAR v6.53.0]"
+_ARCHIVE_BAR_PROVIDER = "bq_archive_bar"
+_ARCHIVE_BAR_TABLE = "symbol_bars_daily"
+# Only a bar from Yahoo's DAILY chart is a witnessed session close. The
+# archive also stores days rebuilt from hourly bars (source yahoo_chart_v8_1h:
+# archive_market_series.parse_hourly keeps the LAST hourly print of the day,
+# which need not be the close); those are refused, never a maturity.
+_ARCHIVE_BAR_DAILY_SOURCES = frozenset({"yahoo_chart_v8"})
+_ARCHIVE_BAR_MAX_SYMBOLS = 2000          # symbols asked per pass (sorted; the rest 'not_asked')
+_ARCHIVE_BAR_WALL_SEC = 150.0            # one query: post + polls + pages, then 'unavailable'
+_ARCHIVE_BAR_QUERY_TIMEOUT_MS = 60000    # jobs.query timeoutMs (the archive's own)
+_ARCHIVE_BAR_MAX_PAGES = 50
+_HIST_ARCHIVE_CACHE: Dict[str, Any] = {}   # per-pass TFB symbol -> bars ([] = asked, none)
+_HIST_ARCHIVE_STATE: Dict[str, Any] = {}   # per-pass read-back (loaded, unavailable, error, ...)
+_ARCHIVE_BAR_MODULE: Dict[str, Any] = {}   # lazily loaded archive_market_series
+_DUE_ONLY_TAG = "[v6.53.0 DUE-ONLY]"
+_LAST_DUE_ONLY: Dict[str, Any] = {}        # read-back of the last due-only audit pass
+
+
+def _hist_close_source() -> str:
+    """v6.53.0: TRACK_HIST_CLOSE_SOURCE yfinance (DEFAULT) | bq_archive |
+    bq_archive_then_yfinance. Exact words, case/space-insensitive; anything
+    else is yfinance, so an unset or mistyped Variable keeps the v6.47.0
+    pull. It never arms the judge: TRACK_HIST_TARGET_CLOSE does."""
+    v = (os.getenv("TRACK_HIST_CLOSE_SOURCE") or "yfinance").strip().lower()
+    return v if v in ("bq_archive", "bq_archive_then_yfinance") else "yfinance"
+
+
+def _bq_project() -> str:
+    """v6.53.0: the archive project (the archive scripts' own default)."""
+    return (os.getenv("TFB_BQ_PROJECT") or "project-2e3530e6-2311-4aa3-b36").strip()
+
+
+def _bq_dataset() -> str:
+    """v6.53.0: the archive dataset (default tfb_archive)."""
+    return (os.getenv("TFB_BQ_DATASET") or "tfb_archive").strip()
+
+
+def _bq_location() -> str:
+    """v6.53.0: the archive location (default US)."""
+    return (os.getenv("TFB_BQ_LOCATION") or "US").strip()
+
+
+def _audit_due_only_enabled() -> bool:
+    """v6.53.0: TRACK_AUDIT_DUE_ONLY=1/on/true/yes prices only the symbols
+    with a due active record. DEFAULT OFF (house convention)."""
+    return (os.getenv("TRACK_AUDIT_DUE_ONLY") or "0").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _audit_due_symbols(active: List[Any], now: datetime) -> Tuple[List[str], Dict[str, Any]]:
+    """v6.53.0 PURE: the symbols with at least one active record whose parsed
+    target time is at or before `now` (the loop's own test, now >= target),
+    oldest target first (ties: first seen), plus the read-back counts. A
+    record whose target cannot be parsed is not due: it cannot mature.
+    Never raises."""
+    oldest: Dict[str, datetime] = {}
+    first_seen: Dict[str, int] = {}
+    due_records = 0
+    all_syms = list(dict.fromkeys([r.symbol for r in active]))
+    for i, r in enumerate(active):
+        try:
+            target = _outcome_timestamp(getattr(r, "target_date", None))
+        except Exception:
+            target = None
+        if target is None or now < target:
+            continue
+        due_records += 1
+        if r.symbol not in oldest or target < oldest[r.symbol]:
+            oldest[r.symbol] = target
+        first_seen.setdefault(r.symbol, i)
+    due = sorted(oldest, key=lambda s: (oldest[s], first_seen[s]))
+    info = {"due_symbols": len(due), "skipped": len(all_syms) - len(due),
+            "due_records": due_records, "active_symbols": len(all_syms),
+            "oldest_target": (oldest[due[0]].astimezone(timezone.utc).strftime("%Y-%m-%d")
+                              if due else "")}
+    return due, info
+
+
+def _archive_bar_module() -> Any:
+    """v6.53.0: scripts/archive_market_series.py loaded from this file's own
+    folder (stdlib-only at import time; its make_session loads google-auth
+    lazily); cached. None when it cannot be loaded."""
+    if "mod" not in _ARCHIVE_BAR_MODULE:
+        try:
+            import importlib.util as _ilu
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive_market_series.py")
+            spec = _ilu.spec_from_file_location("_tfb_track_archive_market_series", path)
+            mod = _ilu.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)
+            _ARCHIVE_BAR_MODULE["mod"] = mod
+        except Exception:
+            _ARCHIVE_BAR_MODULE["mod"] = None
+    return _ARCHIVE_BAR_MODULE["mod"]
+
+
+def _archive_bar_session() -> Any:
+    """v6.53.0: the archive's own session builder (archive_market_series
+    .make_session -> archive_to_bigquery.make_session: a google-auth
+    AuthorizedSession over GOOGLE_SHEETS_CREDENTIALS, BigQuery scope).
+    Raises when the module or the credential is unavailable; the message
+    never carries the credential."""
+    ams = _archive_bar_module()
+    if ams is None:
+        raise RuntimeError("archive_market_series unavailable")
+    return ams.make_session()
+
+
+def _archive_bar_scrub(text: Any) -> str:
+    """v6.53.0: a message safe for a log line - never a credential."""
+    t = _safe_str(text)
+    for marker in ("private_key", "PRIVATE KEY", "client_secret", "refresh_token",
+                   "Bearer ", "\"token\"", "access_token"):
+        if marker in t:
+            return "<redacted>"
+    return t[:160]
+
+
+def _archive_bar_query(session: Any, project: str, dataset: str, location: str,
+                       symbols: List[str], since: str, until: str) -> List[Dict[str, Any]]:
+    """v6.53.0: ONE BigQuery jobs.query for `symbols` (named ARRAY<STRING>
+    parameter) over the dates since..until (DATE parameters), polled through
+    jobs.getQueryResults while the job is not complete and paged by
+    pageToken, all under _ARCHIVE_BAR_WALL_SEC. Rows come back as dicts of
+    column name -> the REST value (strings). Raises on any failure; the
+    caller turns that into 'hist_close_archive_unavailable'."""
+    ams = _archive_bar_module()
+    api = getattr(ams, "BQ_API", None) or "https://bigquery.googleapis.com/bigquery/v2"
+    err = getattr(ams, "_err", None) or (lambda r: "HTTP %s" % getattr(r, "status_code", "?"))
+    sql = ("SELECT symbol, date, open, high, low, close, adj_close, source "
+           "FROM `%s.%s.%s` WHERE symbol IN UNNEST(@symbols) "
+           "AND date >= @since AND date <= @until ORDER BY symbol, date"
+           % (project, dataset, _ARCHIVE_BAR_TABLE))
+    body = {
+        "query": sql, "useLegacySql": False, "location": location,
+        "timeoutMs": _ARCHIVE_BAR_QUERY_TIMEOUT_MS, "parameterMode": "NAMED",
+        "queryParameters": [
+            {"name": "symbols", "parameterType": {"type": "ARRAY", "arrayType": {"type": "STRING"}},
+             "parameterValue": {"arrayValues": [{"value": s} for s in symbols]}},
+            {"name": "since", "parameterType": {"type": "DATE"}, "parameterValue": {"value": since}},
+            {"name": "until", "parameterType": {"type": "DATE"}, "parameterValue": {"value": until}},
+        ],
+        "labels": {"tfb": "track-archive-bar"},
+    }
+    t0 = time.time()
+    resp = session.post("%s/projects/%s/queries" % (api, project), json=body,
+                        timeout=_ARCHIVE_BAR_WALL_SEC)
+    if getattr(resp, "status_code", 0) != 200:
+        raise RuntimeError("query: %s" % err(resp))
+    payload = resp.json() or {}
+    if payload.get("errors"):
+        raise RuntimeError("query: " + _safe_str((payload["errors"][0] or {}).get("message") or "failed")[:300])
+    job_id = _safe_str((payload.get("jobReference") or {}).get("jobId") or "")
+    rows: List[Dict[str, Any]] = []
+    pages = 0
+    while True:
+        if payload.get("jobComplete", True):
+            names = [f.get("name") for f in ((payload.get("schema") or {}).get("fields") or [])]
+            for row in payload.get("rows") or []:
+                rows.append({n: (c or {}).get("v") for n, c in zip(names, row.get("f") or [])})
+            token = _safe_str(payload.get("pageToken") or "")
+            if not token:
+                return rows
+            pages += 1
+            if pages > _ARCHIVE_BAR_MAX_PAGES:
+                raise RuntimeError("query: more than %d pages" % _ARCHIVE_BAR_MAX_PAGES)
+            params: Dict[str, Any] = {"location": location, "pageToken": token}
+        else:
+            params = {"location": location, "timeoutMs": _ARCHIVE_BAR_QUERY_TIMEOUT_MS}
+        if (time.time() - t0) > _ARCHIVE_BAR_WALL_SEC:
+            raise RuntimeError("query: wall clock of %.0fs exceeded" % _ARCHIVE_BAR_WALL_SEC)
+        if not job_id:
+            raise RuntimeError("query: no job reference to poll")
+        resp = session.get("%s/projects/%s/queries/%s" % (api, project, job_id), params=params,
+                           timeout=_ARCHIVE_BAR_WALL_SEC)
+        if getattr(resp, "status_code", 0) != 200:
+            raise RuntimeError("query poll: %s" % err(resp))
+        payload = resp.json() or {}
+        if payload.get("errors"):
+            raise RuntimeError("query poll: " + _safe_str((payload["errors"][0] or {}).get("message") or "failed")[:300])
+
+
+def _archive_bar_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """v6.53.0 PURE: archive rows -> {TFB symbol: [bar, ...]} in the shape
+    _hist_close_bars returns ({"date": "YYYY-MM-DD", "close": float,
+    "split": 0.0}; the archive carries no split events). An unparsable
+    close stays None, so _hist_target_close refuses it as hist_close_invalid
+    rather than this parser dropping the date. Never raises."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        sym = _safe_str(r.get("symbol") or "").upper()
+        date = _safe_str(r.get("date") or "")[:10]
+        if not sym or not date:
+            continue
+        raw = r.get("close")
+        try:
+            close: Optional[float] = None if raw in (None, "") or isinstance(raw, bool) else float(raw)
+        except (TypeError, ValueError):
+            close = None
+        out.setdefault(sym, []).append({"date": date, "close": close, "split": 0.0,
+                                        "source": _safe_str(r.get("source") or "")})
+    return out
+
+
+def _hist_archive_prefetch(pairs: List[Tuple[str, str]]) -> None:
+    """v6.53.0: the ONE archive read of an audit pass. `pairs` are the
+    candidate (TFB symbol, target session) couples; the distinct symbols
+    (sorted, at most _ARCHIVE_BAR_MAX_SYMBOLS) are asked for the bars dated
+    between the earliest and the latest target session. Fills
+    _HIST_ARCHIVE_CACHE (symbol -> bars; [] when the archive has none) and
+    _HIST_ARCHIVE_STATE (loaded | unavailable + error class). Never raises:
+    a failed session or query leaves every candidate
+    'hist_close_archive_unavailable'."""
+    _HIST_ARCHIVE_CACHE.clear()
+    _HIST_ARCHIVE_STATE.clear()
+    _HIST_ARCHIVE_STATE.update({"loaded": False, "unavailable": False, "error": "", "detail": "",
+                                "candidates": len(pairs), "symbols": 0, "asked": 0, "rows": 0,
+                                "since": "", "until": "", "query_sec": 0.0,
+                                "served": 0, "no_bar": 0, "not_daily": 0, "not_asked": 0, "fallback": 0})
+    syms = sorted({_safe_str(s or "").upper() for s, _d in pairs if _safe_str(s or "")})
+    dates = sorted({_safe_str(d or "")[:10] for _s, d in pairs if len(_safe_str(d or "")) >= 10})
+    _HIST_ARCHIVE_STATE["symbols"] = len(syms)
+    if not syms or not dates:
+        _HIST_ARCHIVE_STATE["loaded"] = True      # nothing to ask; lookups are 'not_asked'
+        return
+    asked = syms[:_ARCHIVE_BAR_MAX_SYMBOLS]
+    _HIST_ARCHIVE_STATE.update(asked=len(asked), since=dates[0], until=dates[-1])
+    t0 = time.time()
+    try:
+        session = _archive_bar_session()
+        rows = _archive_bar_query(session, _bq_project(), _bq_dataset(), _bq_location(),
+                                  asked, dates[0], dates[-1])
+        bars = _archive_bar_rows(rows)
+        for s in asked:
+            _HIST_ARCHIVE_CACHE[s] = bars.get(s, [])
+        _HIST_ARCHIVE_STATE.update(loaded=True, rows=len(rows or []))
+    except Exception as exc:
+        _HIST_ARCHIVE_STATE.update(unavailable=True, error=type(exc).__name__,
+                                   detail=_archive_bar_scrub(exc))
+    finally:
+        _HIST_ARCHIVE_STATE["query_sec"] = round(max(0.0, time.time() - t0), 2)
+
+
+def _hist_close_bars_for(symbol: str, session: str) -> Tuple[Optional[List[Dict[str, Any]]], str, str]:
+    """v6.53.0: (bars, reason, provider) for the target session `session`,
+    by TRACK_HIST_CLOSE_SOURCE. yfinance (DEFAULT) -> exactly the v6.47.0
+    _hist_close_bars call, provider 'yfinance-history'. bq_archive -> the
+    pass's archive read: 'hist_close_archive_unavailable' when it failed,
+    'hist_close_archive_not_asked' beyond the cap, 'hist_close_archive_no_bar'
+    when no bar is dated the target session, 'hist_close_archive_not_daily'
+    when that day's bar was rebuilt from hourly prints (source other than
+    Yahoo's daily chart: its close is the last print of the day, not the
+    witnessed close), else the bars with provider 'bq_archive_bar'.
+    bq_archive_then_yfinance -> the same, but every refusal above falls back
+    to the v6.47.0 pull under its own budget and breaker. Never raises."""
+    src = _hist_close_source()
+    if src == "yfinance":
+        bars, reason = _hist_close_bars(symbol)
+        return bars, reason, _HIST_CLOSE_PROVIDER
+    st = _HIST_ARCHIVE_STATE
+    key = _safe_str(symbol or "").upper()
+    want = _safe_str(session or "")[:10]
+    if not st.get("loaded"):
+        reason = "hist_close_archive_unavailable"
+    elif key not in _HIST_ARCHIVE_CACHE:
+        reason = "hist_close_archive_not_asked"
+    else:
+        bars = _HIST_ARCHIVE_CACHE[key]
+        hits = [b for b in bars or [] if isinstance(b, dict) and _safe_str(b.get("date") or "")[:10] == want]
+        if want and hits:
+            if all(_safe_str(b.get("source") or "") in _ARCHIVE_BAR_DAILY_SOURCES for b in hits):
+                st["served"] = int(st.get("served") or 0) + 1
+                return bars, "", _ARCHIVE_BAR_PROVIDER
+            reason = "hist_close_archive_not_daily"
+        else:
+            reason = "hist_close_archive_no_bar"
+    tally = {"hist_close_archive_no_bar": "no_bar", "hist_close_archive_not_asked": "not_asked",
+             "hist_close_archive_not_daily": "not_daily"}.get(reason)
+    if tally:
+        st[tally] = int(st.get(tally) or 0) + 1
+    if src == "bq_archive":
+        return None, reason, _ARCHIVE_BAR_PROVIDER
+    st["fallback"] = int(st.get("fallback") or 0) + 1
+    bars, reason = _hist_close_bars(symbol)
+    return bars, reason, _HIST_CLOSE_PROVIDER
+
+
+def _hist_close_candidate_session(record: Any, prices: Any, now: datetime) -> Optional[str]:
+    """v6.53.0 PURE: the target session of an enforce candidate (the same
+    pre-pass as _hist_close_candidate), or None. Never raises."""
+    try:
+        if not _hist_close_candidate(record, prices, now):
+            return None
+        evidence, _reason = _outcome_map_evidence(prices, record.symbol, now)
+        if evidence is None:
+            return None
+        context, _reason = _outcome_target_session(record, evidence, now)
+        session = _safe_str(context.get("target_session") or "")[:10]
+        return session or None
+    except Exception:
+        return None
 
 
 # v6.22.0 — CA-GUARD ledger layer (confirmed `_Corporate_Actions` truth)
@@ -4406,6 +5472,64 @@ def _s1_unit_sentry_measure(records: Any) -> Dict[str, Any]:
     return rep
 
 
+def _s1_canonical_checkpoint_measure(records: Any) -> Dict[str, Any]:
+    """Enforcement accepts proven canonical targets, never inferred legacy units.
+
+    The read-only migration audit rejects self-consistent legacy tuples
+    without forecast provenance, duplicate matured keys and ambiguous units.
+    Prospective schema receipts provide a valid positive path immediately;
+    only matured 1W/2W outcomes count toward unchanged S1 thresholds.
+    """
+    items = list(records or [])
+    audit = canonical_performance_report(items)
+    counts = {"fraction": 0, "percent": 0, "unresolved": 0}
+    allc = dict(counts)
+    reasons: Dict[str, int] = defaultdict(int)
+    errors: List[float] = []
+    per_hz: Dict[str, List[float]] = defaultdict(list)
+    zero_errors: List[float] = []
+    zero_per_hz: Dict[str, List[float]] = defaultdict(list)
+    tiny = 0
+    for record, evidence in zip(items, audit["records"]):
+        hz = record.horizon.value
+        if hz not in ("1W", "2W") or record.target_roi == 0.0:
+            continue
+        canonical = evidence.get("canonical_target_roi_pp")
+        label = ("fraction" if evidence.get("unit_evidence") == "fraction" else "percent")
+        if canonical is None or evidence.get("reason"):
+            label = "unresolved"
+        allc[label] += 1
+        if record.status != PerformanceStatus.MATURED or record.realized_roi is None:
+            continue
+        error = evidence.get("forecast_error_pp")
+        if error is None:
+            counts["unresolved"] += 1
+            reasons[evidence.get("reason") or "invalid_realized_evidence"] += 1
+            continue
+        counts[label] += 1
+        value = float(error)
+        if not math.isfinite(value):
+            raise ValueError("nonfinite canonical checkpoint error")
+        errors.append(value)
+        per_hz[hz].append(value)
+        zero_errors.append(abs(float(record.realized_roi)))
+        zero_per_hz[hz].append(abs(float(record.realized_roi)))
+        tiny += int(label == "percent" and abs(canonical) < _PERF_UNIT_TINY_PP)
+    n = len(errors)
+    return {
+        "n": n, "basis": "canonical_forecast_provenance",
+        "mean_abs_error_pp": round(sum(abs(e) for e in errors) / n, 2) if n else None,
+        "mean_signed_error_pp": round(sum(errors) / n, 2) if n else None,
+        "zero_mae_pp": _s1_zero_mae(zero_errors),
+        "by_horizon": {h: {"n": len(values),
+                           "mean_abs_pp": round(sum(abs(e) for e in values) / len(values), 2),
+                           "zero_mae_pp": _s1_zero_mae(zero_per_hz[h])}
+                       for h, values in sorted(per_hz.items())},
+        "counts": counts, "all_checkpoints": allc,
+        "unresolved_why": dict(reasons), "percent_tiny": tiny,
+    }
+
+
 def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
                           mode: str) -> Dict[str, Any]:
     """observe: the legacy result plus a 'unit_sentry' report. enforce: the
@@ -4414,7 +5538,8 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
     metrics; legacy results remain diagnostic only. Never raises."""
     new = dict(out)
     try:
-        rep = _s1_unit_sentry_measure(records)
+        rep = (_s1_canonical_checkpoint_measure(records) if mode == "enforce"
+               else _s1_unit_sentry_measure(records))
     except Exception as exc:
         rep = {"n": 0, "error": "unit_sentry_error:" + type(exc).__name__}
     rep["mode"] = mode
@@ -4451,7 +5576,7 @@ def _s1_unit_sentry_apply(out: Dict[str, Any], records: Any,
             raise ValueError("nonfinite corrected calibration")
         c = rep.get("counts") or {}
         _leg = rep["legacy"].get("mean_abs_error_pp")
-        tail = (" [unit-sentry enforce: targets in pp; %d fraction-scale "
+        tail = (" [unit-sentry enforce: canonical forecast provenance; targets in pp; %d fraction-scale "
                 "rescaled, %d already pp, %d unresolved excluded; legacy "
                 "mean |err| %spp]" % (
                     int(c.get("fraction", 0)), int(c.get("percent", 0)),
@@ -4495,7 +5620,7 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
     n = int(rep.get("n") or 0)
     basis = rep.get("error") or rep.get("enforce_note") or (
         "criterion-4 basis: "
-        + ("unit-corrected" if (mode == "enforce" and n > 0) else "legacy"))
+        + ("canonical forecast provenance" if (mode == "enforce" and n > 0) else "legacy"))
 
     def _v(x: Any) -> Any:
         return "" if x is None else x
@@ -4512,9 +5637,11 @@ def _perf_unit_block_rows(rep: Dict[str, Any], ts: str) -> List[List[Any]]:
          "fraction %d" % int(c.get("fraction", 0)),
          "percent %d (tiny %d)" % (int(c.get("percent", 0)),
                                    int(rep.get("percent_tiny") or 0)),
-         "unresolved %d (no_sibling %d, mismatch %d)" % (
+         ("unresolved %d: %s" % (int(c.get("unresolved", 0)), json_dumps(w))
+          if rep.get("basis") == "canonical_forecast_provenance" else
+          "unresolved %d (no_sibling %d, mismatch %d)" % (
              int(c.get("unresolved", 0)), int(w.get("no_sibling", 0)),
-             int(w.get("mismatch", 0)))],
+             int(w.get("mismatch", 0))))],
         ["all checkpoint rows / creation this run",
          "fraction %d / percent %d / unresolved %d" % (
              int(a.get("fraction", 0)), int(a.get("percent", 0)),
@@ -4959,12 +6086,23 @@ class PerformanceSummary:
     win_rate: float = 0.0
     hit_rate_by_horizon: Dict[str, float] = field(default_factory=dict)
     performance_by_sector: Dict[str, Any] = field(default_factory=dict)
+    # v6.46.0: matured HOLD (no directional claim) records, outside W/L/BE;
+    # Sharpe/Sortino per horizon (never pooled; see RiskCalculator).
+    neutral_records: int = 0
+    sharpe_by_horizon: Dict[str, float] = field(default_factory=dict)
+    sortino_by_horizon: Dict[str, float] = field(default_factory=dict)
     # v6.6.0: win-rate / ROI segmented by the ENTRY investability verdict.
     # hit_rate_by_investability maps bucket -> win-rate %; the richer
     # performance_by_investability maps bucket -> {win_rate, avg_roi, wins,
     # losses, count}. Both empty until matured gate-tagged records exist.
     hit_rate_by_investability: Dict[str, float] = field(default_factory=dict)
     performance_by_investability: Dict[str, Any] = field(default_factory=dict)
+    duplicate_matured_excluded: int = 0
+    invalid_matured_excluded: int = 0
+    price_positive: int = 0
+    price_negative: int = 0
+    price_breakeven: int = 0
+    price_positive_rate: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -5174,6 +6312,8 @@ class CalibrationReport:
     regret_picked_minus_alt: Optional[float] = None
     regret_n_board: int = 0
     regret_n_alt: int = 0
+    duplicate_matured_excluded: int = 0
+    invalid_matured_excluded: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -5772,6 +6912,88 @@ def _evidence_append_failures() -> List[str]:
         return list(_EVIDENCE_APPEND_FAILURES)
 
 
+# --- v6.50.0 [LOG-READ]: Performance_Log numbers read at full precision ------
+_LOG_READ_TAG = "[v6.50.0 LOG-READ]"
+_LAST_LOG_READ: Dict[str, Any] = {}          # read-back of the last armed load
+
+
+def _log_read_mode() -> str:
+    """v6.50.0: TRACK_LOG_UNFORMATTED_READ off (DEFAULT) | observe | enforce.
+    Exact words, case/space-insensitive; anything else (including '1') is
+    off, so an unset or mistyped Variable keeps the v6.49.0 read."""
+    v = (os.getenv("TRACK_LOG_UNFORMATTED_READ") or "off").strip().lower()
+    return v if v in ("observe", "enforce") else "off"
+
+
+def _log_read_observe(store: Any, rng: str, rows_fmt: Any) -> Dict[str, Any]:
+    """v6.50.0 observe: ONE extra unformatted read of the same range; both
+    reads are parsed by from_sheet_row and compared field by field (what
+    enforce would change), and ONE WARNING line. Read-only and never raises:
+    the caller's records are the formatted (off) records."""
+    out: Dict[str, Any] = {"mode": "observe", "rows": 0, "unformatted_rows": 0,
+                           "precision_only": 0, "divergent": {}, "text_differs": {},
+                           "misaligned": 0, "canonical_mismatch_formatted": 0,
+                           "canonical_mismatch_unformatted": 0, "error": ""}
+    try:
+        rows_unf = store.backoff.execute_sync(
+            lambda: store.ws.get(rng, value_render_option="UNFORMATTED_VALUE",
+                                 date_time_render_option="FORMATTED_STRING"))
+        headers = list(store.HEADERS)
+        width = len(headers)
+
+        def _parse(rows: Any) -> List[Any]:
+            out_rows = []
+            for r in rows or []:
+                if r and _safe_str(r[0]):
+                    padded = list(r) + [""] * max(0, width - len(r))
+                    out_rows.append((padded, PerformanceRecord.from_sheet_row(padded, headers)))
+            return out_rows
+
+        fmt, unf = _parse(rows_fmt), _parse(rows_unf)
+        out["rows"], out["unformatted_rows"] = len(fmt), len(unf)
+        divergent: Dict[str, int] = defaultdict(int)
+        text_differs: Dict[str, int] = defaultdict(int)
+        for (pf, rf), (pu, ru) in zip(fmt, unf):
+            if _safe_str(pf[0]) != _safe_str(pu[0]):
+                out["misaligned"] += 1
+                continue
+            of, ou = store._record_to_row(rf), store._record_to_row(ru)
+            for i in range(width):
+                if _safe_str(pf[i]) == "" and _safe_str(pu[i]) == "":
+                    continue           # both blank: only parse fallbacks differ
+                a, b = of[i], ou[i]
+                if a == b:
+                    continue
+                if (isinstance(a, (int, float)) and not isinstance(a, bool)
+                        and isinstance(b, (int, float)) and not isinstance(b, bool)):
+                    fa, fb = float(a), float(b)
+                    if math.isfinite(fa) and math.isfinite(fb) and abs(fa - fb) <= 1e-6 * max(1.0, abs(fb)):
+                        out["precision_only"] += 1
+                    else:
+                        divergent[headers[i]] += 1
+                else:
+                    text_differs[headers[i]] += 1
+        out["divergent"] = dict(sorted(divergent.items()))
+        out["text_differs"] = dict(sorted(text_differs.items()))
+
+        def _mismatch(parsed: List[Any]) -> int:
+            return int(canonical_performance_report([rec for _r, rec in parsed])["unit_counts"]
+                       .get("schema_price_mismatch", 0))
+
+        out["canonical_mismatch_formatted"] = _mismatch(fmt)
+        out["canonical_mismatch_unformatted"] = _mismatch(unf)
+        logger.warning(
+            "%s mode=observe rows=%d unformatted_rows=%d precision_only=%d divergent=%s "
+            "text_differs=%s misaligned=%d canonical_mismatch formatted=%d unformatted=%d",
+            _LOG_READ_TAG, out["rows"], out["unformatted_rows"], out["precision_only"],
+            out["divergent"], out["text_differs"], out["misaligned"],
+            out["canonical_mismatch_formatted"], out["canonical_mismatch_unformatted"])
+    except Exception as e:
+        out["error"] = "%s: %s" % (type(e).__name__, str(e)[:200])
+        logger.warning("%s mode=observe comparison skipped: %s", _LOG_READ_TAG, out["error"])
+    return out
+
+
 class PerformanceStore:
     SHEET_DEFAULT = "Performance_Log"
     START_ROW = 5  # headers at row 5, data from row 6
@@ -5954,8 +7176,12 @@ class PerformanceStore:
             end_row = min(end_row, _rc)
         end_col = len(self.HEADERS)
         rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
+        _lr_mode = _log_read_mode()   # v6.50.0 [LOG-READ]: off -> the v6.49.0 read
 
         def _load() -> List[List[Any]]:
+            if _lr_mode == "enforce":
+                return self.ws.get(rng, value_render_option="UNFORMATTED_VALUE",  # type: ignore
+                                   date_time_render_option="FORMATTED_STRING")
             return self.ws.get(rng)  # type: ignore
 
         try:
@@ -6029,6 +7255,14 @@ class PerformanceStore:
                     _dm_mode, "would_expire" if _dm_mode == "observe" else "expired",
                     _dm["count"], _dm["wins"], _dm["losses"], _dm["breakeven"],
                     _dm["keys"][:6])
+            # v6.50.0 [LOG-READ]: armed modes only (off reads and logs nothing).
+            if _lr_mode == "enforce":
+                _LAST_LOG_READ.clear()
+                _LAST_LOG_READ.update({"mode": "enforce", "rows": len(rows or [])})
+                logger.info("%s mode=enforce rows=%d", _LOG_READ_TAG, len(rows or []))
+            elif _lr_mode == "observe":
+                _LAST_LOG_READ.clear()
+                _LAST_LOG_READ.update(_log_read_observe(self, rng, rows))
             return records
         except Exception as e:
             logger.error("Failed to load records: %s", e)
@@ -6181,16 +7415,16 @@ class PerformanceStore:
             ["Performance Summary", "", "", f"Updated: {RiyadhTime.format()}", ""],
             ["Total Records", summary.total_records, "", "", ""],
             ["Active Records", summary.active_records, "", "", ""],
-            ["Matured Records", summary.matured_records, "", "", ""],
-            ["Wins", summary.wins, "", "", ""],
-            ["Losses", summary.losses, "", "", ""],
-            ["Win Rate", f"{summary.win_rate:.1f}%", "", "", ""],
-            ["Avg ROI", f"{summary.avg_roi:.2f}%", "", "", ""],
-            ["Median ROI", f"{summary.median_roi:.2f}%", "", "", ""],
-            ["Best ROI", f"{summary.best_roi:.2f}%", "", "", ""],
-            ["Worst ROI", f"{summary.worst_roi:.2f}%", "", "", ""],
-            ["Sharpe Ratio", f"{summary.sharpe_ratio:.2f}", "", "", ""],
-            ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
+            ["Matured Outcomes (unique valid keys)", summary.matured_records, "", "Duplicate matured excluded", summary.duplicate_matured_excluded],
+            ["Directional Wins", summary.wins, "", "HOLD / neutral excluded", summary.neutral_records],
+            ["Directional Losses", summary.losses, "", "Directional breakeven excluded", summary.breakeven],
+            ["Directional Win Rate", f"{summary.win_rate:.1f}%" if summary.wins + summary.losses else "unavailable", "", "Denominator: directional wins + losses", summary.wins + summary.losses],
+            ["Avg Price ROI", f"{summary.avg_roi:.2f}%", "", "Price-positive / price-negative", f"{summary.price_positive} / {summary.price_negative}"],
+            ["Median Price ROI", f"{summary.median_roi:.2f}%", "", "Price-positive rate (nonzero returns)", f"{summary.price_positive_rate:.1f}%" if summary.price_positive_rate is not None else "unavailable"],
+            ["Best Price ROI", f"{summary.best_roi:.2f}%", "", "Price breakeven", summary.price_breakeven],
+            ["Worst Price ROI", f"{summary.worst_roi:.2f}%", "", "Invalid matured ROI excluded", summary.invalid_matured_excluded],
+            ["Sharpe Ratio (price, by horizon)", _fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio), "", "Directional wins score the call", "SELL + falling price = WIN"],
+            ["Sortino Ratio (price, by horizon)", _fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio), "", "Price ROI is not net trade P&L", "Overlapping horizons are correlated"],
         ]
         # v6.20.0 (VT-1 hygiene): clear every historical panel footprint
         # first (A1:E4 legacy top-left stub, AG1:AK13 side block) so a
@@ -6767,36 +8001,140 @@ class SignalTrendStore:
 # =============================================================================
 # Analytics
 # =============================================================================
+# v6.46.0 [DIR-OUTCOME]: the CALL's direction, mirroring the engine's
+# canonical capital-action map (core/data_engine_v2._RECO_DIRECTION: ADD /
+# HOLD / TRIM). +1 = long call (wins when price rose), -1 = sell-family call
+# (wins when price FELL), 0 = neutral HOLD (no directional claim, so it is
+# excluded from every directional hit rate and counted as neutral instead).
+# EXIT / TRIM / UNDERWEIGHT etc. already classify to SELL / REDUCE at entry
+# (_classify_recommendation); the raw aliases below only protect a caller
+# that passes an unparsed string.
+_RECO_TRADE_SIGN: Dict[str, int] = {
+    RecommendationType.STRONG_BUY.value: 1,
+    RecommendationType.BUY.value: 1,
+    RecommendationType.ACCUMULATE.value: 1,
+    RecommendationType.HOLD.value: 0,
+    RecommendationType.REDUCE.value: -1,
+    RecommendationType.SELL.value: -1,
+    RecommendationType.STRONG_SELL.value: -1,
+    RecommendationType.AVOID.value: -1,
+}
+_RECO_TRADE_SIGN_ALIASES: Dict[str, int] = {"EXIT": -1, "TRIM": -1}
+
+
+def _reco_trade_sign(rec: Any) -> int:
+    """v6.46.0 PURE: +1 long / -1 sell-family / 0 neutral-or-unknown."""
+    m = rec if isinstance(rec, RecommendationType) else _parse_enum_value(
+        RecommendationType, rec, None)
+    if m is None:
+        return _RECO_TRADE_SIGN_ALIASES.get(_safe_str(rec).upper().strip(), 0)
+    return _RECO_TRADE_SIGN.get(m.value, 0)
+
+
+def _directional_outcome(rec: Any, roi: Any) -> Optional[str]:
+    """v6.46.0 PURE: WIN / LOSS / BREAKEVEN of the CALL, not of the price.
+    roi is the PRICE return in percent points (the stored Realized ROI %,
+    never altered here). A sell-family call wins when the price fell; a HOLD
+    (or unknown) call returns None = neutral, never a directional outcome;
+    a missing / non-finite roi returns None."""
+    if roi is None:
+        return None
+    try:
+        v = float(roi)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    sign = _reco_trade_sign(rec)
+    if sign == 0:
+        return None
+    edge = v * sign
+    return "WIN" if edge > 0 else ("LOSS" if edge < 0 else "BREAKEVEN")
+
+
+def _record_outcome(r: Any) -> Optional[str]:
+    """v6.46.0: _directional_outcome of a PerformanceRecord's entry call."""
+    return _directional_outcome(getattr(r, "entry_recommendation", None),
+                                getattr(r, "realized_roi", None))
+
+
+# v6.46.0 [RISK-HORIZON]: approximate TRADING days spanned by one record of
+# each horizon. HorizonType.days are CALENDAR days (target_date =
+# date_recorded + days); 5 trading days per 7 calendar days -> 1W=5, 2W=10,
+# 1M=21, 3M=63 (252/yr convention).
+_HORIZON_TRADING_DAYS: Dict[str, int] = {
+    "1W": 5, "2W": 10, "1M": 21, "3M": 63, "6M": 126,
+    "1Y": 252, "3Y": 756, "5Y": 1260,
+}
+
+
+def _fmt_ratio_by_horizon(by_h: Dict[str, float], scalar: float) -> str:
+    """v6.46.0: summary-panel cell. One horizon -> '0.53' (as before);
+    several -> '1M 0.53 | 3M 0.21' (never a pooled number)."""
+    if len(by_h or {}) > 1:
+        order = {h: i for i, h in enumerate(_HORIZON_TRADING_DAYS)}
+        return " | ".join(f"{h} {by_h[h]:.2f}"
+                          for h in sorted(by_h, key=lambda k: order.get(k, 99)))
+    return f"{scalar:.2f}"
+
+
 class RiskCalculator:
+    """v6.46.0: Sharpe / Sortino over PER-RECORD horizon returns.
+
+    Inputs are PERCENT-POINT returns of records that all share ONE horizon
+    spanning `period_days` trading days. Each is converted to a fraction, the
+    annual risk-free rate is scaled to the period (rfr * period_days / 252)
+    and the ratio is annualised by sqrt(252 / period_days). Callers must
+    never pool horizons (PerformanceAnalyzer groups by horizon).
+
+    Before v6.46.0 the percent ROIs of 7-90 day horizons were treated as
+    DAILY FRACTIONAL returns (rfr/252 subtracted, sqrt(252) applied): 1M
+    ROIs [2,-1,3,1]% read Sharpe 13.42 instead of ~2.54.
+
+    CAVEAT (documented, not solved): records are opened daily on the same
+    symbols, so their horizon windows OVERLAP; the observations are not
+    independent and the annualised ratio overstates significance. Read it as
+    descriptive, never as a test statistic. Population std (ddof=0) is kept
+    from the prior implementation.
+    """
     def __init__(self, risk_free_rate: float = 0.02):
         self.rfr = float(risk_free_rate)
 
-    def sharpe_ratio(self, returns: List[float]) -> float:
-        if not returns:
+    def _excess(self, returns_pct: List[float], period_days: float):
+        arr = np.asarray(returns_pct, dtype=float) / 100.0
+        pd_ = max(1.0, float(period_days))
+        return arr, arr - self.rfr * pd_ / 252.0, math.sqrt(252.0 / pd_)
+
+    def sharpe_ratio(self, returns_pct: List[float], period_days: float = 1.0) -> float:
+        if not returns_pct:
             return 0.0
         if not NUMPY_AVAILABLE or np is None:
             return 0.0
-        arr = np.asarray(returns, dtype=float)
+        arr, excess, ann = self._excess(returns_pct, period_days)
         if arr.size < 2:
             return 0.0
         if float(np.std(arr)) == 0.0:
             return 0.0
-        excess = arr - (self.rfr / 252.0)
-        return float(np.mean(excess) / np.std(arr) * math.sqrt(252))
+        return float(np.mean(excess) / np.std(arr) * ann)
 
-    def sortino_ratio(self, returns: List[float]) -> float:
-        if not returns:
+    def sortino_ratio(self, returns_pct: List[float], period_days: float = 1.0) -> float:
+        """Downside deviation = sqrt(mean(min(excess, 0)^2)) over ALL
+        observations (target = the period risk-free rate). 0.0 when there is
+        no downside observation (ratio undefined)."""
+        if not returns_pct:
             return 0.0
         if not NUMPY_AVAILABLE or np is None:
             return 0.0
-        arr = np.asarray(returns, dtype=float)
-        excess = arr - (self.rfr / 252.0)
-        downside = arr[arr < 0]
-        if downside.size < 2:
+        arr, excess, ann = self._excess(returns_pct, period_days)
+        if arr.size < 2:
             return 0.0
-        if float(np.std(downside)) == 0.0:
+        downside = np.minimum(excess, 0.0)
+        if not bool(np.any(downside < 0.0)):
             return 0.0
-        return float(np.mean(excess) / np.std(downside) * math.sqrt(252))
+        dd = float(np.sqrt(np.mean(downside ** 2)))
+        if dd == 0.0:
+            return 0.0
+        return float(np.mean(excess) / dd * ann)
 
 
 class MonteCarloSimulator:
@@ -6847,9 +8185,10 @@ class AttributionAnalyzer:
                 bucket[sec] = {"wins": 0.0, "losses": 0.0, "total_roi": 0.0, "count": 0.0}
             bucket[sec]["count"] += 1.0
             bucket[sec]["total_roi"] += float(r.realized_roi)
-            if (r.realized_roi or 0.0) > 0:
+            _oc = _record_outcome(r)   # v6.46.0: direction-aware
+            if _oc == "WIN":
                 bucket[sec]["wins"] += 1.0
-            elif (r.realized_roi or 0.0) < 0:
+            elif _oc == "LOSS":
                 bucket[sec]["losses"] += 1.0
         out: Dict[str, Dict[str, float]] = {}
         for sec, d in bucket.items():
@@ -6866,6 +8205,38 @@ class AttributionAnalyzer:
         return out
 
 
+def _summary_outcome_cohort(records: List[PerformanceRecord]) -> Tuple[List[PerformanceRecord], int, int]:
+    """First valid matured outcome per stable key, without editing history.
+
+    Active, unpriced and malformed copies cannot hide a later measured
+    outcome. First valid decided evidence wins for a repeated key; the
+    exclusion count makes the reduction visible rather than inflating n.
+    """
+    cohort: List[PerformanceRecord] = []
+    seen: set = set()
+    duplicates = invalid = 0
+    for record in records:
+        if record.status != PerformanceStatus.MATURED:
+            continue
+        try:
+            valid = (record.realized_roi is not None
+                     and record.realized_roi_source_valid
+                     and not isinstance(record.realized_roi, bool)
+                     and math.isfinite(float(record.realized_roi)))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            invalid += 1
+            continue
+        key = record.key
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        cohort.append(record)
+    return cohort, duplicates, invalid
+
+
 class PerformanceAnalyzer:
     def __init__(self):
         self.risk = RiskCalculator()
@@ -6877,18 +8248,24 @@ class PerformanceAnalyzer:
         s.active_records = sum(
             1 for r in records if r.status == PerformanceStatus.ACTIVE
         )
-        matured = [
-            r
-            for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
+        matured, s.duplicate_matured_excluded, s.invalid_matured_excluded = _summary_outcome_cohort(records)
         s.matured_records = len(matured)
 
         if matured:
             rois = [float(r.realized_roi or 0.0) for r in matured]
-            wins = sum(1 for r in matured if (r.realized_roi or 0.0) > 0)
-            losses = sum(1 for r in matured if (r.realized_roi or 0.0) < 0)
-            breakeven = len(matured) - wins - losses
+            s.price_positive = sum(roi > 0 for roi in rois)
+            s.price_negative = sum(roi < 0 for roi in rois)
+            s.price_breakeven = len(rois) - s.price_positive - s.price_negative
+            price_decided = s.price_positive + s.price_negative
+            s.price_positive_rate = 100.0 * s.price_positive / price_decided if price_decided else None
+            # v6.46.0 [DIR-OUTCOME]: WIN/LOSS of the CALL (a SELL that fell
+            # wins); HOLD records are neutral and excluded from every
+            # directional rate. ROI aggregates below stay PRICE returns.
+            outcomes = [_record_outcome(r) for r in matured]
+            wins = outcomes.count("WIN")
+            losses = outcomes.count("LOSS")
+            breakeven = outcomes.count("BREAKEVEN")
+            s.neutral_records = outcomes.count(None)
             s.wins, s.losses, s.breakeven = wins, losses, breakeven
             total_outcomes = wins + losses
             s.win_rate = (wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
@@ -6903,21 +8280,35 @@ class PerformanceAnalyzer:
             else:
                 rois_sorted = sorted(rois)
                 s.avg_roi = sum(rois) / max(1, len(rois))
-                s.median_roi = rois_sorted[len(rois_sorted) // 2]
+                middle = len(rois_sorted) // 2
+                s.median_roi = (rois_sorted[middle] if len(rois_sorted) % 2
+                                else (rois_sorted[middle - 1] + rois_sorted[middle]) / 2)
                 s.best_roi = max(rois_sorted)
                 s.worst_roi = min(rois_sorted)
-
-            if len(rois) > 2:
-                s.sharpe_ratio = self.risk.sharpe_ratio(rois)
-                s.sortino_ratio = self.risk.sortino_ratio(rois)
 
             groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
             for r in matured:
                 groups[r.horizon.value].append(r)
             for h, grp in groups.items():
-                w = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
-                t = len(grp)
-                s.hit_rate_by_horizon[h] = (w / t * 100.0) if t else 0.0
+                # v6.46.0: decided-only (w / (w + l)), the same definition as
+                # win_rate (breakevens were in the denominator before).
+                _go = [_record_outcome(r) for r in grp]
+                w, l = _go.count("WIN"), _go.count("LOSS")
+                s.hit_rate_by_horizon[h] = (w / (w + l) * 100.0) if (w + l) else 0.0
+                # v6.46.0 [RISK-HORIZON]: Sharpe/Sortino per horizon, never
+                # pooled across horizons (see RiskCalculator).
+                _hr = [float(r.realized_roi or 0.0) for r in grp]
+                if len(_hr) > 2:
+                    _pd = _HORIZON_TRADING_DAYS.get(h, max(1, round(grp[0].horizon.days * 5 / 7)))
+                    s.sharpe_by_horizon[h] = self.risk.sharpe_ratio(_hr, _pd)
+                    s.sortino_by_horizon[h] = self.risk.sortino_ratio(_hr, _pd)
+            # The scalar fields carry a value only when every matured record
+            # shares ONE horizon; mixed horizons leave them 0.0 and the
+            # per-horizon dicts are authoritative (no pooling).
+            if len(groups) == 1:
+                (_h,) = groups.keys()
+                s.sharpe_ratio = s.sharpe_by_horizon.get(_h, 0.0)
+                s.sortino_ratio = s.sortino_by_horizon.get(_h, 0.0)
 
             s.performance_by_sector = self.attr.by_sector(matured)
 
@@ -6934,8 +8325,9 @@ class PerformanceAnalyzer:
                 bucket = (r.entry_investability_status or "UNSPECIFIED").upper()
                 inv_groups[bucket].append(r)
             for bucket, grp in inv_groups.items():
-                gw = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
-                gl = sum(1 for r in grp if (r.realized_roi or 0.0) < 0)
+                _io = [_record_outcome(r) for r in grp]   # v6.46.0
+                gw = _io.count("WIN")
+                gl = _io.count("LOSS")
                 decided = gw + gl
                 grp_rois = [float(r.realized_roi or 0.0) for r in grp]
                 wr = (gw / decided * 100.0) if decided else 0.0
@@ -7177,16 +8569,25 @@ class ReliabilityCalibrator:
             _safe_float(r.realized_roi, default=0.0)
             for r in recs if r.realized_roi is not None
         ]
-        wins = sum(1 for v in rois if v > 0.0)
-        losses = sum(1 for v in rois if v < 0.0)
-        breakeven = len(rois) - wins - losses
+        # v6.46.0 [DIR-OUTCOME]: outcome of the CALL; HOLD records are
+        # neutral (in n, never in wins/losses/breakeven/decided).
+        _oc = [_record_outcome(r) for r in recs if r.realized_roi is not None]
+        wins = _oc.count("WIN")
+        losses = _oc.count("LOSS")
+        breakeven = _oc.count("BREAKEVEN")
         decided = wins + losses
         wr = (wins / decided * 100.0) if decided else 0.0
         lo, hi = wilson_interval(wins, decided)
         mean_roi = (sum(rois) / len(rois)) if rois else 0.0
         rels = [_safe_float(r.entry_forecast_reliability, default=0.0) for r in recs]
         mean_rel = (sum(rels) / len(rels)) if rels else 0.0
-        claimed_wr = mean_rel  # stated reliability is already on a 0..100 scale
+        # v6.46.0 [CLAIMED-DECIDED]: the claimed rate is compared with
+        # wins/decided, so it averages the stated reliability of the SAME
+        # decided (WIN/LOSS) records; HOLD and breakeven records stay in
+        # mean_claimed_reliability (all n, descriptive) only.
+        _drels = [_safe_float(r.entry_forecast_reliability, default=0.0)
+                  for r in recs if _record_outcome(r) in ("WIN", "LOSS")]
+        claimed_wr = (sum(_drels) / len(_drels)) if _drels else 0.0  # 0..100 scale
 
         if decided >= 1 and claimed_wr > 0.0:
             raw = max(0.1, min(2.0, wr / claimed_wr))
@@ -7210,11 +8611,11 @@ class ReliabilityCalibrator:
     def _brier(self, matured: List[PerformanceRecord]) -> Optional[float]:
         pts: List[float] = []
         for r in matured:
-            v = r.realized_roi
-            if v is None or v == 0.0:
-                continue  # decided-only
+            oc = _record_outcome(r)   # v6.46.0: direction-aware
+            if oc not in ("WIN", "LOSS"):
+                continue  # decided-only (HOLD neutral excluded)
             p = max(0.0, min(1.0, _safe_float(r.entry_forecast_reliability, 0.0) / 100.0))
-            o = 1.0 if v > 0.0 else 0.0
+            o = 1.0 if oc == "WIN" else 0.0
             pts.append((p - o) ** 2)
         return round(sum(pts) / len(pts), 4) if pts else None
 
@@ -7246,12 +8647,10 @@ class ReliabilityCalibrator:
 
     def calibrate(self, records: List[PerformanceRecord],
                   signal_mix: Optional[Dict[str, int]] = None) -> CalibrationReport:
-        matured = [
-            r for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
+        matured, duplicate_count, invalid_count = _summary_outcome_cohort(records)
         total = len(records)
-        decided_total = sum(1 for r in matured if (r.realized_roi or 0.0) != 0.0)
+        decided_total = sum(1 for r in matured
+                            if _record_outcome(r) in ("WIN", "LOSS"))   # v6.46.0
         global_sufficient = decided_total >= self.min_sample
 
         inv_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
@@ -7387,6 +8786,8 @@ class ReliabilityCalibrator:
             generated_riyadh=RiyadhTime.format(),
             total_records=total,
             matured_records=len(matured),
+            duplicate_matured_excluded=duplicate_count,
+            invalid_matured_excluded=invalid_count,
             decided_records=decided_total,
             min_sample=self.min_sample,
             shrinkage_k=self.shrink_k,
@@ -7503,12 +8904,9 @@ class ReportGenerator:
     def generate_json(
         self, records: List[PerformanceRecord], summary: PerformanceSummary
     ) -> str:
-        matured = [
-            r
-            for r in records
-            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
-        ]
-        outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+        matured, _, _ = _summary_outcome_cohort(records)
+        outcomes = [o == "WIN" for o in map(_record_outcome, matured)
+                    if o in ("WIN", "LOSS")]   # v6.46.0: decided, direction-aware
         ci = (
             self.analyzer.sim.simulate_win_rate(
                 outcomes, iterations=10000, confidence=0.95
@@ -7553,12 +8951,7 @@ class ReportGenerator:
         plots: Dict[str, str] = {}
         if PLOT_AVAILABLE and Figure is not None and NUMPY_AVAILABLE and np is not None:
             try:
-                matured = [
-                    r
-                    for r in records
-                    if r.status == PerformanceStatus.MATURED
-                    and r.realized_roi is not None
-                ]
+                matured, _, _ = _summary_outcome_cohort(records)
                 matured.sort(key=lambda x: (x.maturity_date or x.date_recorded))
 
                 if matured:
@@ -7568,15 +8961,17 @@ class ReportGenerator:
                         (r.maturity_date or r.date_recorded).astimezone(_RIYADH_TZ)
                         for r in matured
                     ]
-                    wins = np.cumsum(
-                        [1 if (r.realized_roi or 0.0) > 0 else 0 for r in matured]
-                    )
-                    denom = np.arange(1, len(matured) + 1, dtype=float)
-                    win_rate = (wins / denom) * 100.0
+                    # v6.46.0: direction-aware, decided-only cumulative rate
+                    # (matches summary.win_rate).
+                    _po = [_record_outcome(r) for r in matured]
+                    wins = np.cumsum([1 if o == "WIN" else 0 for o in _po])
+                    denom = np.cumsum([1 if o in ("WIN", "LOSS") else 0 for o in _po]).astype(float)
+                    win_rate = np.divide(wins * 100.0, denom,
+                                         out=np.zeros_like(denom), where=denom > 0)
                     ax1.plot(dates, win_rate, linewidth=2)
-                    ax1.set_title("Cumulative Win Rate (%)")
+                    ax1.set_title("Cumulative Directional Win Rate (%) — unique decided keys")
                     ax1.set_xlabel("Date")
-                    ax1.set_ylabel("Win Rate %")
+                    ax1.set_ylabel("Directional Win Rate %")
                     ax1.grid(True, alpha=0.25)
                     plots["win_rate"] = self._plot_png_base64(fig1)
 
@@ -7587,7 +8982,7 @@ class ReportGenerator:
                     ax2 = fig2.add_subplot(111)
                     ax2.hist(roi, bins=30)
                     ax2.axvline(0.0, linestyle="--", linewidth=1.5)
-                    ax2.set_title("ROI Distribution (%)")
+                    ax2.set_title("Price ROI Distribution (%) — unique matured keys")
                     ax2.set_xlabel("ROI %")
                     ax2.set_ylabel("Frequency")
                     ax2.grid(True, alpha=0.2)
@@ -7621,9 +9016,9 @@ class ReportGenerator:
 
   <div class="grid" style="margin-top:12px;">
     <div class="card"><div>Total Records</div><div style="font-size:22px;font-weight:bold;">{summary.total_records}</div></div>
-    <div class="card"><div>Win Rate</div><div style="font-size:22px;font-weight:bold;">{summary.win_rate:.1f}%</div></div>
-    <div class="card"><div>Avg ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div></div>
-    <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{summary.sharpe_ratio:.2f}</div></div>
+    <div class="card"><div>Directional Win Rate (wins / decided)</div><div style="font-size:22px;font-weight:bold;">{f'{summary.win_rate:.1f}%' if summary.wins + summary.losses else 'unavailable'}</div><div>{summary.wins} / {summary.wins + summary.losses}; HOLD {summary.neutral_records}, breakeven {summary.breakeven} excluded</div></div>
+    <div class="card"><div>Avg Price ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div><div>{summary.matured_records} unique valid matured keys; {summary.duplicate_matured_excluded} duplicates and {summary.invalid_matured_excluded} invalid outcomes excluded</div></div>
+    <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)}</div></div>
   </div>
 
   {"<div class='plot'><img style='max-width:100%;' src='data:image/png;base64," + plots.get("win_rate","") + "'/></div>" if plots.get("win_rate") else ""}
@@ -9011,6 +10406,23 @@ class PerformanceTrackerApp:
         }
         priority: set = set(_force_extra_symbols())
         _by_status: Optional[Tuple[List[str], List[str]]] = None   # v6.40.0
+        # v6.49.0 [BOARD-COVERAGE]: the live board's seated symbols join the
+        # priority set as pinned extras. OFF (default) -> nothing below runs.
+        _board: List[str] = []
+        _board_ghosts = 0
+        if _board_symbols_enabled() and self.spreadsheet_id:
+            try:
+                _board, _board_ghosts = await asyncio.get_running_loop().run_in_executor(
+                    _get_executor(), _load_board_symbols, self.spreadsheet_id
+                )
+            except Exception as e:
+                logger.warning("%s board read failed: %s", _BOARD_TAG, e)
+                _board, _board_ghosts = [], 0
+            if _board:
+                priority |= set(_board)
+            else:
+                logger.warning("%s board read returned no seated symbol "
+                               "(unreadable or empty board) - nothing added", _BOARD_TAG)
         if self.spreadsheet_id:
             loop = asyncio.get_running_loop()
             try:
@@ -9047,8 +10459,10 @@ class PerformanceTrackerApp:
                 priority = {x for x in priority if _valid_symbol_shape(x)}
         missing = sorted(s for s in priority if s and s not in covered)
         if _by_status is not None:                        # v6.40.0 P-180
+            # v6.49.0: board symbols ride as extras -> never cut by the cap.
+            _extras = sorted(set(_force_extra_symbols()) | set(_board))
             _plan = _force_plan(_by_status[0], _by_status[1],
-                                sorted(_force_extra_symbols()), covered,
+                                _extras, covered,
                                 _force_max(), _force_scope())
             logger.info(
                 "[v6.40.0 COVERAGE] scope=%s active=%d closed=%d extras=%d "
@@ -9078,6 +10492,9 @@ class PerformanceTrackerApp:
                 "[v6.16.0 COVERAGE] full: %d priority symbol(s) already in the "
                 "%d prefetched row(s)", len(priority), len(rows),
             )
+            if _board:
+                logger.info("%s board=%d new=0 ghosts=%d (all prefetched)",
+                            _BOARD_TAG, len(_board), _board_ghosts)
             return rows
         if not self.backend.base_url:
             logger.warning(
@@ -9088,12 +10505,28 @@ class PerformanceTrackerApp:
         fetched, meta = await self.backend.get_rows_for_symbols(
             missing, _force_rows_page()
         )
+        # v6.49.0: a symbol that is on the board and NOT a ledger lot or a
+        # pinned extra is tagged 'Decision_Board'; everything else keeps
+        # the v6.16.0 'Decision_Coverage' tag byte for byte.
+        _board_only: set = set()
+        if _board:
+            _ledger: set = set(_force_extra_symbols())
+            if _by_status is not None:
+                _ledger |= set(_by_status[0]) | set(_by_status[1])
+            else:
+                _ledger |= {s for s in priority if s not in set(_board)}
+            _board_only = {s for s in _board if s not in _ledger}
         got: set = set()
+        _board_new = 0
         for r in fetched:
             sym = _safe_str(r.get("symbol")).strip().upper()
             if not sym or sym in covered:
                 continue
-            r.setdefault("origin", "Decision_Coverage")
+            if sym in _board_only:
+                r.setdefault("origin", "Decision_Board")
+                _board_new += 1
+            else:
+                r.setdefault("origin", "Decision_Coverage")
             rows.append(r)
             covered.add(sym)
             got.add(sym)
@@ -9103,6 +10536,9 @@ class PerformanceTrackerApp:
             "unresolved=%s", len(priority), len(rows) - len(got), len(missing),
             len(got), ",".join(unresolved) if unresolved else "-",
         )
+        if _board:
+            logger.info("%s board=%d new=%d ghosts=%d", _BOARD_TAG,
+                        len(_board), _board_new, _board_ghosts)
         return rows
 
     async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
@@ -9231,26 +10667,37 @@ class PerformanceTrackerApp:
             return records
 
         syms = list(dict.fromkeys([r.symbol for r in active]))
+        # v6.53.0 [DUE-ONLY]: '0' (DEFAULT) prices every active symbol, as
+        # before (_price_syms is syms). '1' prices only the symbols with a
+        # due record, oldest target first; a not-due symbol is not priced in
+        # this pass, so its records take the existing 'no price' path (Last
+        # Updated only, no receipt) that a breaker-skipped symbol takes today.
+        _due_only = _audit_due_only_enabled()
+        _price_syms = syms
+        if _due_only:
+            _price_syms, _due_info = _audit_due_symbols(active, RiyadhTime.now())
+            _LAST_DUE_ONLY.clear()
+            _LAST_DUE_ONLY.update(_due_info)
         if not self.backend.base_url:
             # v6.18.0 (PRICE-FEED-LOUD): this exact silent {} froze all 2,264
             # records at entry price on 2026-07-12 — and would have expired the
             # whole first cohort UNPRICED. Never silent again.
             price_map = OutcomePrices()
-            price_map.reasons.update({s: "backend_unavailable" for s in syms})
+            price_map.reasons.update({s: "backend_unavailable" for s in _price_syms})
             global _LAST_FEED_DIAGNOSIS
             _LAST_FEED_DIAGNOSIS = "base_url_EMPTY"
             logger.error(
                 "%s backend base_url is EMPTY — %d active symbols cannot be "
                 "priced; fresh-only maturation will hold/expire the cohort. "
                 "Set the backend URL env for this job.",
-                _PRICE_FEED_TAG, len(syms),
+                _PRICE_FEED_TAG, len(_price_syms),
             )
         else:
-            fetched = await self.backend.fetch_prices(syms)
+            fetched = await self.backend.fetch_prices(_price_syms)
             price_map = fetched if isinstance(fetched, OutcomePrices) else OutcomePrices()
             if not isinstance(fetched, OutcomePrices):
-                price_map.reasons.update({s: "outcome_price_evidence_missing" for s in syms})
-            _dead = _price_feed_dead(syms, price_map)
+                price_map.reasons.update({s: "outcome_price_evidence_missing" for s in _price_syms})
+            _dead = _price_feed_dead(_price_syms, price_map)
             if _dead and not str(_LAST_FEED_DIAGNOSIS).startswith("backend_dead"):
                 _LAST_FEED_DIAGNOSIS = "backend_dead: " + str(_dead)[:160]
             if _dead:
@@ -9264,9 +10711,9 @@ class PerformanceTrackerApp:
         global _LAST_FALLBACK_FILLED
         _LAST_FALLBACK_FILLED = 0
         if _price_fallback_enabled():
-            _missing = [s for s in syms if _outcome_map_evidence(price_map, s, _utc_now())[0] is None]
+            _missing = [s for s in _price_syms if _outcome_map_evidence(price_map, s, _utc_now())[0] is None]
             if _missing:
-                _fb = await _yahoo_chart_fallback_prices(_missing)
+                _fb = await _yahoo_chart_fallback_prices(_missing, keep_order=_due_only)
                 for _k in _missing:
                     _evidence, _reason = _outcome_map_evidence(_fb, _k, _utc_now())
                     if _evidence is not None:
@@ -9275,6 +10722,16 @@ class PerformanceTrackerApp:
                     else:
                         _prior = price_map.reasons.get(_k, "")
                         price_map.reasons[_k] = ";".join(dict.fromkeys(x for x in (_prior, _reason) if x))
+
+        if _due_only:
+            # v6.53.0 [DUE-ONLY]: one read-back line per pass.
+            _LAST_DUE_ONLY["witnessed"] = sum(1 for s in _price_syms if s in price_map.evidence)
+            logger.info(
+                "%s audit due-only: %d due symbols priced, %d not-due symbols skipped "
+                "(due records=%d, oldest target=%s, witnessed=%d)",
+                _DUE_ONLY_TAG, len(_price_syms), int(_LAST_DUE_ONLY.get("skipped") or 0),
+                int(_LAST_DUE_ONLY.get("due_records") or 0),
+                _LAST_DUE_ONLY.get("oldest_target") or "-", int(_LAST_DUE_ONLY["witnessed"]))
 
         now_r = RiyadhTime.now()
 
@@ -9287,6 +10744,38 @@ class PerformanceTrackerApp:
         _CA_BARS_CACHE.clear()   # v6.37.0: per-run cache + budget reset
         _CA_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
         _loop_i = 0
+        # v6.47.0 [HIST-CLOSE]: 'off' (DEFAULT) runs nothing new below.
+        _hist_mode = _hist_target_close_mode()
+        _hist_stats: Dict[str, Any] = {}
+        _hist_used: List[Any] = []       # enforce: (record, live price, live ROI)
+        _hist_observe: List[Any] = []    # observe: judged after the loop
+        _hist_source = "yfinance"        # v6.53.0: read only when the judge is armed
+        if _hist_mode != "off":
+            _HIST_CLOSE_CACHE.clear()
+            _HIST_CLOSE_BUDGET.clear()
+            _HIST_CLOSE_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0, "ok": 0, "failed": 0,
+                                       "consecutive": 0, "breaker": False, "first_error": ""})
+            _hist_stats = {"mode": _hist_mode, "candidates": 0, "witnessed": 0,
+                           "by_horizon": {}, "refused": {}}
+            _hist_day = now_r.astimezone(timezone.utc).date().toordinal()
+            if _hist_mode == "enforce":
+                # Rotating admission window (see _hist_close_admit); observe
+                # sets its window after the loop from its own candidate list.
+                _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
+                    [r.symbol for r in active if _hist_close_candidate(r, price_map, now_r)],
+                    _hist_day, _hist_close_budget())
+            # v6.53.0 [ARCHIVE-BAR]: with an archive source the bars of EVERY
+            # candidate come from ONE BigQuery read per pass - before the loop
+            # under enforce (the same pre-pass), after it under observe (its
+            # own list). yfinance (DEFAULT) reads nothing here.
+            _hist_source = _hist_close_source()
+            if _hist_mode == "enforce" and _hist_source != "yfinance":
+                _hist_pairs: List[Tuple[str, str]] = []
+                for r in active:
+                    _hist_session = _hist_close_candidate_session(r, price_map, now_r)
+                    if _hist_session:
+                        _hist_pairs.append((r.symbol, _hist_session))
+                _hist_archive_prefetch(_hist_pairs)
 
         for r in active:
             _loop_i += 1
@@ -9320,6 +10809,40 @@ class PerformanceTrackerApp:
                     _outcome_reason = "entry_price_invalid"
                 elif _roi_nonfinite:
                     _outcome_reason = "outcome_roi_nonfinite"
+                if (_hist_mode != "off" and _evidence is not None
+                        and _outcome_reason == "quote_outside_target_session"):
+                    # v6.47.0 [HIST-CLOSE]: the target session closed before
+                    # any audit priced it. Only THAT session's own close may
+                    # stand in. observe is judged after the loop, so its pulls
+                    # never share the CA-GUARD's clock or quota in this pass.
+                    _hist_stats["candidates"] += 1
+                    if _hist_mode == "observe":
+                        _hist_observe.append((r, dict(_context), _evidence))
+                    else:
+                        _hist_ev, _hist_reason, _hist_roi = _hist_close_judge(
+                            r, _context, _evidence, now_r, _hist_stats)
+                        if _hist_ev is None:
+                            _context = dict(_context, hist_close_reason=_hist_reason)
+                        else:
+                            _entry_at = _outcome_timestamp(r.date_recorded)
+                            _context = dict(
+                                _context, quote_session=_context["target_session"],
+                                current_quote_session=_context.get("quote_session"),
+                                current_quote_price=_evidence.price,
+                                current_quote_asof=_evidence.quote_asof.isoformat(),
+                                hist_bar_date=_context["target_session"],
+                                hist_provider=_hist_ev.provider,
+                                actual_horizon_days=((_hist_ev.quote_asof - _entry_at).total_seconds() / 86400.0
+                                                     if _entry_at is not None else None))
+                            # The CA-GUARD below reads r.unrealized_roi, so the
+                            # bar close goes in now; a record that does not
+                            # mature gets its live mark back after the loop.
+                            _hist_used.append((r, r.current_price, r.unrealized_roi))
+                            _evidence = _hist_ev
+                            px = _hist_ev.price
+                            r.current_price = px
+                            r.unrealized_roi = _hist_roi
+                            _outcome_reason = ""
                 if _outcome_reason:
                     # Known price with an unknown/wrong target basis remains
                     # ACTIVE even beyond grace. Never invent a target close.
@@ -9452,10 +10975,63 @@ class PerformanceTrackerApp:
                 f" ({', '.join(_expired_syms[:8])}{'…' if len(_expired_syms) > 8 else ''})" if _expired_syms else "",
             )
 
+        if _hist_mode != "off":
+            # v6.47.0 [HIST-CLOSE]: observe judges its candidates only now;
+            # enforce restores the live mark on every substituted record the
+            # unchanged path left unmatured (pending, deferred or expired).
+            if _hist_mode == "observe":
+                _HIST_CLOSE_BUDGET["admit"] = _hist_close_admit(
+                    [_r.symbol for _r, _ctx, _ev in _hist_observe], _hist_day, _hist_close_budget())
+                if _hist_source != "yfinance":
+                    # v6.53.0 [ARCHIVE-BAR]: observe's one archive read.
+                    _hist_archive_prefetch([(_r.symbol, _safe_str(_ctx.get("target_session") or "")[:10])
+                                            for _r, _ctx, _ev in _hist_observe])
+            for _r, _ctx, _ev in _hist_observe:
+                _hist_close_judge(_r, _ctx, _ev, now_r, _hist_stats)
+            for _r, _px0, _roi0 in _hist_used:
+                if _r.status != PerformanceStatus.MATURED:
+                    _r.current_price, _r.unrealized_roi = _px0, _roi0
+            _hist_stats.update(
+                matured=sum(1 for _r, _a, _b in _hist_used if _r.status == PerformanceStatus.MATURED),
+                pulls=int(_HIST_CLOSE_BUDGET["pulls"]), ok=int(_HIST_CLOSE_BUDGET["ok"]),
+                failed=int(_HIST_CLOSE_BUDGET["failed"]), breaker=bool(_HIST_CLOSE_BUDGET["breaker"]),
+                first_error=str(_HIST_CLOSE_BUDGET["first_error"]),
+                deferred=int(_HIST_CLOSE_BUDGET["deferred"]))
+            logger.warning(
+                "%s mode=%s candidates=%d witnessed=%d (%s) matured=%d refused=%d (%s) "
+                "pulls=%d ok=%d failed=%d%s breaker=%s deferred=%d",
+                _HIST_CLOSE_TAG, _hist_mode, _hist_stats["candidates"], _hist_stats["witnessed"],
+                " ".join("%s:%d" % kv for kv in sorted(_hist_stats["by_horizon"].items())) or "-",
+                _hist_stats["matured"], sum(_hist_stats["refused"].values()),
+                " ".join("%s:%d" % kv for kv in sorted(_hist_stats["refused"].items())) or "-",
+                _hist_stats["pulls"], _hist_stats["ok"], _hist_stats["failed"],
+                (" first_error=" + _hist_stats["first_error"]) if _hist_stats["first_error"] else "",
+                "open" if _hist_stats["breaker"] else "closed", _hist_stats["deferred"])
+            if _hist_source != "yfinance":
+                # v6.53.0 [ARCHIVE-BAR]: one read-back line and two stats keys
+                # (yfinance keeps the v6.47.0 line and dict exactly).
+                _arch = dict(_HIST_ARCHIVE_STATE)
+                _hist_stats.update(source=_hist_source, archive=_arch)
+                logger.warning(
+                    "%s source=%s candidates=%d symbols=%d asked=%d rows=%d served=%d no_bar=%d "
+                    "not_daily=%d not_asked=%d fallback=%d unavailable=%d%s query_sec=%.2f",
+                    _ARCHIVE_BAR_TAG, _hist_source, int(_arch.get("candidates") or 0),
+                    int(_arch.get("symbols") or 0), int(_arch.get("asked") or 0),
+                    int(_arch.get("rows") or 0), int(_arch.get("served") or 0),
+                    int(_arch.get("no_bar") or 0), int(_arch.get("not_daily") or 0),
+                    int(_arch.get("not_asked") or 0),
+                    int(_arch.get("fallback") or 0), 1 if _arch.get("unavailable") else 0,
+                    (" error=" + _safe_str(_arch.get("error"))) if _arch.get("error") else "",
+                    float(_arch.get("query_sec") or 0.0))
+            _LAST_HIST_CLOSE.clear()
+            _LAST_HIST_CLOSE.update(_hist_stats)
+
         # v6.20.0 (VT-1): stash this pass's feed stats for the verdict line.
+        # v6.53.0 [DUE-ONLY]: priced / total count the symbols sent for
+        # pricing (_price_syms is syms unless due-only is on).
         try:
             _priced = sum(
-                1 for s in syms if float(price_map.get(s, 0.0) or 0.0) > 0.0
+                1 for s in _price_syms if float(price_map.get(s, 0.0) or 0.0) > 0.0
             )
             _roi_nz = sum(
                 1 for r in active
@@ -9465,7 +11041,7 @@ class PerformanceTrackerApp:
             )
             self._last_audit_stats = {
                 "priced": _priced,
-                "total": len(syms),
+                "total": len(_price_syms),
                 "roi_nonzero": _roi_nz,
                 "fallback_filled": int(_LAST_FALLBACK_FILLED),
                 "matured": int(_n_matured),
@@ -9476,6 +11052,8 @@ class PerformanceTrackerApp:
                 "outcome_evidence_version": "tfb.outcome-price.v1",
                 "outcome_skipped_reasons": dict(_skipped_outcome_reasons),
             }
+            if _due_only:   # v6.53.0 [DUE-ONLY]: the key exists only when armed
+                self._last_audit_stats["due_only_skipped"] = int(_LAST_DUE_ONLY.get("skipped") or 0)
         except Exception:
             self._last_audit_stats = {}
 
@@ -10290,13 +11868,16 @@ class PerformanceTrackerApp:
                 f"| Matured: {summary.matured_records}"
             )
             _out(
-                f"Wins: {summary.wins} | Losses: {summary.losses} "
-                f"| WinRate: {summary.win_rate:.1f}%"
+                f"Directional wins: {summary.wins} | Losses: {summary.losses} "
+                f"| WinRate: {summary.win_rate:.1f}% (decided n={summary.wins + summary.losses}) "
+                f"| Neutral(HOLD): {summary.neutral_records} | Breakeven: {summary.breakeven} "
+                f"| Duplicates excluded: {summary.duplicate_matured_excluded} "
+                f"| Invalid matured excluded: {summary.invalid_matured_excluded}"
             )
             _out(
-                f"Avg ROI: {summary.avg_roi:.2f}% "
-                f"| Sharpe: {summary.sharpe_ratio:.2f} "
-                f"| Sortino: {summary.sortino_ratio:.2f}"
+                f"Avg price ROI: {summary.avg_roi:.2f}% "
+                f"| Sharpe: {_fmt_ratio_by_horizon(summary.sharpe_by_horizon, summary.sharpe_ratio)} "
+                f"| Sortino: {_fmt_ratio_by_horizon(summary.sortino_by_horizon, summary.sortino_ratio)}"
             )
             # v6.6.0: surface the investability segmentation -- the gate KPI
             # that the whole "95%" question reduces to. Decided-only win-rate
@@ -10350,13 +11931,9 @@ class PerformanceTrackerApp:
                          f"{' (CHANGED - see _Run_Log)' if _pub.get('changed') else ''}")
 
         if self.args.simulate:
-            matured = [
-                r
-                for r in records
-                if r.status == PerformanceStatus.MATURED
-                and r.realized_roi is not None
-            ]
-            outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+            matured, _, _ = _summary_outcome_cohort(records)
+            outcomes = [o == "WIN" for o in map(_record_outcome, matured)
+                        if o in ("WIN", "LOSS")]   # v6.46.0
             if outcomes:
                 ci = self.analyzer.sim.simulate_win_rate(
                     outcomes,

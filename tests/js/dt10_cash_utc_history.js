@@ -1,5 +1,17 @@
 /* Preserve the immutable v1.13.8 source without duplicating a 438 KB fixture.
- * Every v1.13.9 edit is reversed exactly once and the full historical digest
+ * Every v1.20.0 edit (ticket guard / KPI plan gain / venue line,
+ * tests/js/dt10_edits_v1200.json), then
+ * every v1.19.0 edit (hold / live fill / owner rule, tests/js/dt10_edits_v1190.json),
+ * then every v1.18.0 edit (post-earnings tag, tests/js/dt10_edits_v1180.json),
+ * then every v1.17.1 edit (shadow momentum, tests/js/dt10_edits_v1171.json), then
+ * every v1.17.0 edit (shadow rank log, tests/js/dt10_edits_v1170.json), then
+ * every v1.16.0 edit (funding evidence, tests/js/dt10_edits_v1160.json),
+ * then every v1.15.0 edit (pending grace), then every v1.14.0 edit (confirmation
+ * basis), then every v1.13.11 edit (bulk
+ * render formatting), then every v1.13.10 edit
+ * (holding subunit FX, null value_sar for a missing rate, terminal FAILED
+ * refresh state) and then every v1.13.9 edit is reversed exactly once and
+ * the full historical digest
  * must match. Any unrelated edit or code hidden in an approved region fails.
  * Historical D1-D5 use this hash-proven source; current behavior tests use
  * the delivered source. This helper is a test fixture, never runtime code. */
@@ -19,7 +31,171 @@ const WHY = [
   ' *',
   ''
 ].join('\n');
-const EDITS = [
+/* v1.15.0 edits, reversed FIRST (current -> v1.14.0 text). The result is
+ * hash-pinned (V1140_SHA256 = the reviewed v1.14.0 file, origin/main
+ * 115200ab / f598fea2), so tests/test_dt10_pending_grace.js can run the
+ * v1.14.0 clocks as its golden negative and kill-identity oracle without a
+ * fixture copy. Twelve insertions (prior '') and three rewrites (the two
+ * version lines and the core's return block); three insertions carry one
+ * neighbouring line of context because the inserted line repeats. */
+const V1140_SHA256 = 'b888d7fd0f0b90f3170bd0e84cabb9c0efd1e665a1a55914746df9fdb9eda52c';
+/* v1.16.0 edits (funding evidence), reversed FIRST of all (current -> v1.15.0
+ * text). Seven hunks derived from the reviewed diff and stored verbatim in
+ * tests/js/dt10_edits_v1160.json; pure insertions carry one following line
+ * of context so each 'current' is unique. The result is hash-pinned
+ * (V1150_SHA256 = the reviewed v1.15.0 file, origin/main ab19432e). */
+const V1150_SHA256 = 'e099e187c82ed03fe137b88d789d9a383da5d3f452b6bd854c4d6e1bf757c1a8';
+const EDITS_V1160 = require('./dt10_edits_v1160.json');
+/* v1.17.0 edits (shadow rank log), reversed FIRST of all (current -> v1.16.0
+ * text). Seven hunks derived from the reviewed diff and stored verbatim in
+ * tests/js/dt10_edits_v1170.json; each insertion carries its anchor line so
+ * every 'current' is unique. The result is hash-pinned (V1160_SHA256 = the
+ * reviewed v1.16.0 file, origin/main 53c8544e, live sha e1c43659). */
+const V1160_SHA256 = 'e1c4365942a2bcd60d98cb7f007c29a932b85de140a2b7df8004daef9ac3d43a';
+const EDITS_V1170 = require('./dt10_edits_v1170.json');
+/* v1.17.1 edits (shadow momentum), reversed FIRST of all (current -> v1.17.0
+ * text). Eight hunks derived from the reviewed diff and stored verbatim in
+ * tests/js/dt10_edits_v1171.json; each insertion carries its anchor lines so
+ * every 'current' is unique. The result is hash-pinned (V1170_SHA256 = the
+ * reviewed v1.17.0 file, origin/main 1b095a82 / f60cff37, live 27 Oct 10:47). */
+const V1170_SHA256 = 'cefeedeb056f7388fb166e57c524d8675d38f3d6c1d40484d03ea0024bd2db35';
+const EDITS_V1171 = require('./dt10_edits_v1171.json');
+/* v1.18.0 edits (post-earnings tag), reversed FIRST of all (current ->
+ * v1.17.1 text). Seven hunks derived from the reviewed diff and stored
+ * verbatim in tests/js/dt10_edits_v1180.json; each insertion carries its
+ * anchor line so every 'current' is unique. The result is hash-pinned
+ * (V1171_SHA256 = the reviewed v1.17.1 file, origin/main 6f24a5b3, saved in
+ * the bound project 27 Oct; the server copy lacks only the final newline). */
+const V1171_SHA256 = 'd209ca3e9926a9d136167a7ed0c703140db434ffa42ae93bc5ebaad27388aa9f';
+const EDITS_V1180 = require('./dt10_edits_v1180.json');
+/* v1.19.0 edits (qualified-member hold, seat live fill, owner-rule marker),
+ * reversed FIRST of all (current -> v1.18.0 text). Twenty-two hunks derived
+ * from the reviewed diff and stored verbatim in tests/js/dt10_edits_v1190.json;
+ * every 'current' is unique in the delivered file. The result is hash-pinned
+ * (V1180_SHA256 = the reviewed v1.18.0 file, origin/main 11af45c3, the file
+ * `git show origin/main:apps_script/16_Decision_Top10.gs` on 2026-11-01). */
+const V1180_SHA256 = '0b560e3dd9642ec13321da23ca62e59ce7db4b227c92e232f78296d9c9d54a1b';
+const EDITS_V1190 = require('./dt10_edits_v1190.json');
+/* v1.20.0 edits (ticket guard, KPI plan gain, venue line), reversed FIRST of
+ * all (current -> v1.19.0 text). Fifteen hunks derived from the reviewed diff
+ * and stored verbatim in tests/js/dt10_edits_v1200.json; each carries its
+ * anchor line so every 'current' is unique at its turn. The result is
+ * hash-pinned (V1190_SHA256 = the reviewed v1.19.0 file, origin/main
+ * a90c4fb9 / 59c4c56c, the file the live workbook runs on 2026-11-02). */
+const V1190_SHA256 = '4dae966a591b9b6ab91855522e44ba8efe005a11e344fd1f7e94b4120fc3b3f9';
+const EDITS_V1200 = require('./dt10_edits_v1200.json');
+const EDITS_V1150 = [
+  [" * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" *\n * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT\n * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails\n * ONE criteria day (still on the audited grid, no structural block, not a\n * hard-out verdict, inside the rank buffer, but DO_NOT_INVEST because a\n * floor was missed) had its count reset to 0 by dt10StabCore_'s\n * `else { st.ci = 0; ... }` -- the same branch a hard exit uses. Live case,\n * 25 Oct 08:10 board (first run on the 2026-10-25 epoch): PHP.L sat at 1/3\n * on 24 Oct with reliability 71.5 / DQ 100; on 25 Oct -- a weekend, no LSE\n * session, price unchanged at 92.05 -- its Expected ROI 3M read 8.13% (<12%)\n * and the name fell to GRACE with its count gone. Members already enjoy this\n * tolerance ('plain DO_NOT_INVEST criteria-misses ARE grace-holdable', exit\n * clock, v1.2.0); challengers did not. The owner asked (24 Oct 19:32) for a\n * rule that does not restart a positive name's count on one such day.\n * WHAT: Script Property TFB_T10_PENDING_GRACE_DAYS (integer 0..5; default\n * absent/0/junk = v1.14.0 clocks byte for byte). When > 0, on a day-advance\n * a NON-member with ci > 0 that is absent from raw and not qualifiedWithin\n * but is a SOFT MISS (dt10StabSoftMiss_: audited row present, verdict not\n * INVEST, structural_block !== true, not hardOut, global rank inside the\n * rank buffer) keeps ci and increments st.cp (consecutive pending-grace\n * days); the day's score point is still recorded. Once cp would exceed the\n * grace, the v1.14.0 reset applies (ci 0, cp cleared). Any raw or qualified\n * day clears cp. Members, hard exits, outage pauses, seating (still needs a\n * raw ticket), fast-track, displacement, capacity and sizing are unchanged.\n * SECTION 8 KEPT: no gate, score or verdict is recomputed -- the soft miss is\n * read from the backend's own audited row (verdict + structural_block + rank).\n * SURFACE: status note gains ', pgrace=<n>' and ', pheld <k> SYM(ci/n) ...'\n * (up to 3) only when the property is armed; audit gains `pending_held`\n * only when armed; the state blob writes `cp` only while > 0 (a blob that\n * never paused is byte-identical). dt10SelfTest gains 'pending grace core'.\n * Functions added (0 removed): dt10StabSoftMiss_, dt10StabPendingGrace_;\n * var added: DT10_T10_PENDING_GRACE_PROP.\n * Harness: tests/test_dt10_pending_grace.js (REAL file; golden negative on\n * the v1.14.0 base rebuilt by reversing these edits, SHA-256 pinned; kill\n * identity with the property absent/0; ES5/ASCII lint; inventory).\n * Rollback: delete the property (no re-paste) or re-paste v1.14.0.\n * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped\n * in lockstep. Arming is an owner step AFTER the first funded ticket of\n * 26 Oct 2026 (the Monday path runs on v1.14.0 clocks).\n",
+    ""],
+  ["var DT10_VERSION = '1.15.0';\n",
+    "var DT10_VERSION = '1.14.0';\n"],
+  ["// v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances a NON-member\n// challenger with ci > 0 may absorb without its count resetting -- see the\n// v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.\nvar DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';\nvar DT10_T10_PENDING_GRACE_MAX = 5;\n",
+    ""],
+  ["      // v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances absorbed\n      // by a pending challenger. Absent in older blobs => 0; written only\n      // when > 0 so a blob that never paused stays byte-identical to v1.14.0.\n      var vcp = Math.max(0, parseInt(v.cp, 10) || 0);\n      if (vcp > 0) out.symbols[sym].cp = vcp;\n",
+    ""],
+  ["/** v1.15.0 [PENDING-GRACE] PURE: is today's miss for `sym` a SOFT miss?\n * True when the deduped audited grid (candBySym) has a row for it whose\n * verdict is NOT INVEST (a criteria miss the backend itself reports),\n * structural_block is not true, hardOut(sym) is false and its all-pool rank\n * is inside the rank buffer. Never recomputes a gate, score or verdict\n * (section 8): the row, its verdict and its rank are the backend's own.\n * A row absent from the grid, a structural block, a hard-out verdict or a\n * rank outside the buffer is a HARD miss (v1.14.0 reset). Never throws. */\nfunction dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut) {\n  var c = candBySym ? candBySym[sym] : null;\n  if (!c || typeof c !== 'object') return false;\n  if (String(c.verdict || '').toUpperCase() === 'INVEST') return false;\n  if (c.structural_block === true) return false;\n  if (typeof hardOut === 'function' && hardOut(sym)) return false;\n  var buf = knobs ? Number(knobs.rank_buffer) : 0;\n  if (!(buf > 0)) return false;\n  var r = globalRank ? Number(globalRank[sym]) : 0;\n  return r > 0 && r <= buf;\n}\n",
+    ""],
+  ["  // v1.15.0 [PENDING-GRACE]: the grace rides as a plain knob (service read in\n  // dt10ApplyStability_); absent/0 (older callers, the self-test replays,\n  // the property unset) is the v1.14.0 clock byte for byte.\n  var pgDays = Math.max(0, Math.min(DT10_T10_PENDING_GRACE_MAX,\n                                    parseInt(knobs.pending_grace, 10) || 0));\n  var pendingHeld = [];\n  function softMiss(sym) {\n    return dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut);\n  }\n",
+    ""],
+  ["          st.co = 0;\n          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n",
+    "          st.co = 0;\n        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n"],
+  ["          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n        } else if (pgDays > 0 && !st.member && (st.ci || 0) > 0 &&\n                   (st.cp || 0) < pgDays && softMiss(sym)) {\n          // v1.15.0 [PENDING-GRACE]: a NON-member challenger with a live count\n          // misses on a SOFT criteria day (audited row present, not INVEST, no\n          // structural block, not hard-out, inside the rank buffer): the count\n          // PAUSES (ci kept) and the grace counter advances; the score point\n          // below is still recorded. Members never enter this branch (their\n          // exit clock already pauses inside the buffer); a hard miss, or a\n          // grace already spent, falls through to the v1.14.0 reset.\n          st.cp = (st.cp || 0) + 1;\n          pendingHeld.push(sym);\n",
+    ""],
+  ["          st.ci = 0;\n          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]\n          if (st.member) {\n",
+    "          st.ci = 0;\n          if (st.member) {\n"],
+  ["  // v1.15.0 [PENDING-GRACE]: read-back tokens only while the grace is armed\n  // (0 leaves the note and the audit byte-identical to v1.14.0): the armed\n  // grace and the challengers whose count was paused on this day-advance.\n  if (pgDays > 0) {\n    pendingHeld.sort(function (a, b) {\n      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);\n      if (dci) return dci;\n      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);\n      if (drk) return drk;\n      return a < b ? -1 : (a > b ? 1 : 0);\n    });\n    note += ', pgrace=' + pgDays;\n    if (pendingHeld.length) {\n      var phParts = [];\n      for (var phi = 0; phi < pendingHeld.length && phParts.length < 3; phi++) {\n        phParts.push(pendingHeld[phi] + '(' + (symbols[pendingHeld[phi]].ci || 0) +\n                     '/' + knobs.confirm_days + ')');\n      }\n      note += ', pheld ' + pendingHeld.length + ' ' + phParts.join(' ');\n    }\n  }\n  var coreOut = {\n",
+    "  return {\n"],
+  ["  if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0\n  return coreOut;\n",
+    ""],
+  ["}\n\n/**\n * v1.15.0 [PENDING-GRACE]: pending grace days -- Script Property\n * TFB_T10_PENDING_GRACE_DAYS (DT10_T10_PENDING_GRACE_PROP). An integer\n * 1..DT10_T10_PENDING_GRACE_MAX arms the grace (larger values clamp to the\n * max); absent, blank, 0, negative, junk or a PropertiesService fault read\n * as 0 = the v1.14.0 clocks. Mirrors dt10StabConfirmBasis_ (service read\n * outside the pure core); never throws.\n */\nfunction dt10StabPendingGrace_() {\n  try {\n    var raw = String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_T10_PENDING_GRACE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '');\n    if (!/^\\d+$/.test(raw)) return 0;\n    var n = parseInt(raw, 10);\n    if (!(n > 0)) return 0;\n    return Math.min(DT10_T10_PENDING_GRACE_MAX, n);\n  } catch (ePg) {}\n  return 0;\n",
+    ""],
+  ["  // v1.15.0 [PENDING-GRACE]: same pattern -- one service read here; the knob\n  // is set ONLY when armed (> 0) so an unarmed run publishes the v1.14.0\n  // knobs object byte for byte.\n  var pgRead = dt10StabPendingGrace_();\n  if (pgRead > 0) knobs.pending_grace = pgRead;\n",
+    ""],
+  ["  /* v1.15.0 [PENDING-GRACE]: property line (one read) + pure battery on the\n     same board. CHAL confirmed days 1-2 (raw), day 3 a SOFT miss (absent from\n     raw, audited row verdict WATCH at rank 12, no block), day 4 raw again.\n     grace 1: day 3 pauses (ci 2, cp 1, 'pgrace=1', 'pheld 1 CHAL.US(2/3)'),\n     day 4 NEW 3/3 sized. grace absent/0: identical to the v1.14.0 cbW replay.\n     Two consecutive soft misses with grace 1: day 4 resets. Hard miss\n     (structural_block) with grace 1: reset. Member B untouched either way. */\n  report.push('pending grace (TFB_T10_PENDING_GRACE_DAYS): ' + dt10StabPendingGrace_() +\n              ' (0 = v1.14.0 clocks; 1..' + DT10_T10_PENDING_GRACE_MAX + ' arms)');\n  function pgKnobs(pg) {\n    var k = cbKnobs('qualified');\n    if (pg !== undefined) k.pending_grace = pg;\n    return k;\n  }\n  function pgRun(knobs, grids, raw) {\n    var st = dt10StabParseState_(cbSeed);\n    var outs = [];\n    for (var pd = 0; pd < 4; pd++) {\n      var o = dt10StabCore_(raw[pd], grids[pd], st, knobs, 2, cbDays[pd]);\n      st = dt10StabParseState_(o.state);\n      outs.push(o);\n    }\n    return outs;\n  }\n  var pgG = cbGrid(86);\n  var pgSoft = cbGrid(86, 'WATCH');\n  var pgBlk = cbGrid(86);\n  pgBlk[pgBlk.length - 1].structural_block = true;\n  var pgRaw2 = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n                [cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n                [cbTk('A.US', 95), cbTk('NEWC.US', 97)],\n                [cbTk('A.US', 95), cbTk('NEWC.US', 97)]];\n  var pg1 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pg0 = pgRun(pgKnobs(0), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pgA = pgRun(pgKnobs(undefined), [pgG, pgG, pgSoft, pgG], cbRaw);\n  var pg1x2 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgSoft], pgRaw2);\n  var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);\n  var pgChal4 = cbTk4(pg1, 'CHAL.US');\n  var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);\n  report.push('pending grace core: ' +\n      ((JSON.stringify(pg0) === JSON.stringify(cbW) &&\n        JSON.stringify(pgA) === JSON.stringify(cbW) &&\n        pg1[1].state.symbols['CHAL.US'].ci === 2 &&\n        pg1[2].state.symbols['CHAL.US'].ci === 2 &&\n        pg1[2].state.symbols['CHAL.US'].cp === 1 &&\n        pg1[2].state.symbols['CHAL.US'].member === false &&\n        pgBlob2.indexOf('\"cp\":1') > 0 &&\n        pg1[2].note.indexOf('pgrace=1') > 0 &&\n        pg1[2].note.indexOf('pheld 1 CHAL.US(2/3)') > 0 &&\n        pg1[2].audit.pending_held.length === 1 &&\n        pg1[3].state.symbols['CHAL.US'].ci === 3 &&\n        pg1[3].state.symbols['CHAL.US'].cp === undefined &&\n        pg1[3].note.indexOf('pheld') < 0 &&\n        pgChal4 !== null && pgChal4._stab_status === 'NEW (confirmed 3/3)' &&\n        pgChal4.suggested_sar === 5000 &&\n        pg1x2[2].state.symbols['CHAL.US'].ci === 2 &&\n        pg1x2[3].state.symbols['CHAL.US'].ci === 0 &&\n        pg1x2[3].state.symbols['CHAL.US'].cp === undefined &&\n        pg1h[2].state.symbols['CHAL.US'].ci === 0 &&\n        pg1h[2].note.indexOf('pheld') < 0 &&\n        JSON.stringify(pg1[2].state.symbols['B.US']) ===\n            JSON.stringify(cbW[2].state.symbols['B.US']) &&\n        cbW[2].audit.pending_held === undefined &&\n        cbW[2].note.indexOf('pgrace') < 0)\n       ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +\n         'two soft misses -> reset, structural block -> reset, member untouched)'\n       : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));\n",
+    ""]
+];
+/* v1.14.0 edits, reversed NEXT (current -> v1.13.11 text). The result is
+ * hash-pinned (V11311_SHA256 = the reviewed v1.13.11 file, origin/main
+ * ca2f87c7), so tests/test_dt10_confirm_basis.js can run the v1.13.11 clocks
+ * as its golden negative and kill-identity oracle without a fixture copy.
+ * Nine insertions (prior '') and two version-line rewrites. */
+const V11311_SHA256 = '268b85adafa64b9d8e026646f5227f266541a7fd6a178352fb3d62a3c290b979';
+const EDITS_V1140 = [
+  [" * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" * v1.14.0 (2026-10-24) [CONFIRM-BASIS] -- QUALIFIED DAYS COUNT TOWARD CONFIRMATION\n * WHY (owner, 24 Oct 2026): a stock that qualifies on day 1 and day 2 is\n * pushed out of the backend's raw top-10 on day 3 by a higher-ranked\n * newcomer. It is still INVEST on the audited grid, only ranked lower, yet\n * its confirmation count fell to 0 and it had to start over. Live trail:\n * the 22 Oct board seated XIOR.BR, GBCI.US and PINE.US at FAST-TRACK 1/3;\n * on the 24 Oct advance none of them was in the raw set and every count\n * read 0 again (those three had also left INVEST, so the rule below would\n * not have kept them; it keeps a name that stays INVEST inside the\n * buffer). Mechanism, pinned on v1.13.11: the dt10StabCore_ counter pass\n * advances ci only for a symbol present in rawSet (payload.selected, the\n * sized top-N); any other day-advance sets ci = 0, and for a member only\n * the exit clock honours the rank buffer (pause). Confirmation was keyed\n * to the sized list, not to qualification.\n * WHAT: Script Property TFB_T10_CONFIRM_BASIS, read ONCE in\n *   dt10ApplyStability_ (dt10StabConfirmBasis_, the dt10HardVerdictStrict_\n *   pattern: the service read stays outside the pure core) into\n *   knobs.confirm_basis. 'qualified' (DEFAULT, owner decision 2026-10-24)\n *   | 'raw' (legacy). Anything else, blank or a service fault reads as\n *   'qualified'. Under 'raw' every clock, label, note and state byte is\n *   v1.13.11.\n * (a) new PURE dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs,\n *   hardOut): the symbol has an audited row whose verdict is exactly\n *   INVEST (any case), no structural_block, not hardOut, and its\n *   opportunity-score rank across the deduped audited grid is <= 'T10:\n *   Stability Rank Buffer' (> 0) -- the SAME window the exit-clock pause\n *   has used since v1.3.0 (rank <= buffer, default 15), so the panel knob\n *   keeps one meaning.\n * (b) counter pass, day-advance, not outage-paused: when the symbol is NOT\n *   in rawSet and knobs.confirm_basis === 'qualified' and (a) holds, the\n *   day counts exactly like a raw sighting: ci + 1, co = 0, score point\n *   recorded. Otherwise the v1.13.11 branch runs unchanged (ci = 0; a\n *   member pauses inside the buffer or takes a miss). Members benefit the\n *   same way: a GRACE or FAST-TRACK seat still INVEST inside the buffer\n *   has co reset and ci advanced instead of a pause, so a fast-track seat\n *   can graduate on a qualified day (its label that day stays GRACE, ghost\n *   path, sizing suspended -- no raw ticket, no sizing).\n * (c) NOT changed: seating. Entry as 'NEW (confirmed n/n)' still requires\n *   presence in rawSyms (a sized ticket); fast-track fills only from\n *   rawSyms; displacement, capacity, hard/soft exit and every label are\n *   v1.13.11. The rule applies to symbols already tracked in the state\n *   blob (members and past raw sightings inside the 14-day prune window);\n *   a symbol never seen in raw is not tracked and accrues nothing.\n * (d) Read-back: under 'qualified' the stab note gains ', confirm=qualified'\n *   and, when a non-raw challenger inside the buffer has ci > 0, ', near\n *   <k> SYM(ci/confirm_days) ...' (up to 3, the 'pending' style). Under\n *   'raw' no token is added (byte-identical note).\n * (e) dt10SelfTest gains 'confirm basis (TFB_T10_CONFIRM_BASIS): ...' and\n *   the pure battery 'confirm basis core: ok' (raw replay identity; day-1/2\n *   raw, day-3 qualified at rank 12 -> ci 3, day-4 seated NEW 3/3 with the\n *   raw ticket's sizing; WATCH -> 0; rank buffer + 1 -> 0; buffer 0 ->\n *   legacy; GRACE member -> co 0, ci advanced).\n * Functions added (0 removed): dt10StabQualifiedWithin_,\n * dt10StabConfirmBasis_; var added: DT10_T10_CONFIRM_BASIS_PROP.\n * Harness: tests/test_dt10_confirm_basis.js (REAL file; golden negative on\n * the v1.13.11 base rebuilt by reversing these edits, SHA-256 pinned; kill\n * deep-equal; ES5/ASCII lint; inventory). Rollback: Script Property\n * TFB_T10_CONFIRM_BASIS = raw (no re-paste) or re-paste v1.13.11.\n * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped\n * in lockstep.\n *\n",
+    ""],
+  ["var DT10_VERSION = '1.14.0';\n",
+    "var DT10_VERSION = '1.13.11';\n"],
+  ["// v1.14.0 [CONFIRM-BASIS]: which days count toward entry confirmation --\n// see the v1.14.0 header block. 'qualified' (default) | 'raw' (v1.13.11).\nvar DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';\n",
+    ""],
+  ["/** v1.14.0 [CONFIRM-BASIS] PURE: is `sym` INVEST-qualified inside the rank\n * buffer on this run? True when the deduped audited grid (candBySym) has a\n * row for it whose verdict is exactly INVEST (any case), structural_block is\n * not true, hardOut(sym) is false, knobs.rank_buffer > 0 and its\n * opportunity-score rank (globalRank, 1 = best) is <= knobs.rank_buffer --\n * the same window the exit-clock pause has used since v1.3.0. Never throws;\n * a symbol absent from the grid is false (absence is jitter, not a\n * qualification). hardOut is the caller's closure over candBySym + knobs. */\nfunction dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut) {\n  var c = candBySym ? candBySym[sym] : null;\n  if (!c || typeof c !== 'object') return false;\n  if (String(c.verdict || '').toUpperCase() !== 'INVEST') return false;\n  if (c.structural_block === true) return false;\n  if (typeof hardOut === 'function' && hardOut(sym)) return false;\n  var buf = knobs ? Number(knobs.rank_buffer) : 0;\n  if (!(buf > 0)) return false;\n  var r = globalRank ? Number(globalRank[sym]) : 0;\n  return r > 0 && r <= buf;\n}\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: the basis rides as a plain knob (service read in\n  // dt10ApplyStability_). Only the exact string 'qualified' arms the\n  // qualified branch; an absent knob (older callers, the self-test replays)\n  // is the v1.13.11 raw basis.\n  var qualifiedBasis = knobs.confirm_basis === 'qualified';\n  function qualifiedWithin(sym) {\n    return dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut);\n  }\n",
+    ""],
+  ["        } else if (qualifiedBasis && qualifiedWithin(sym)) {\n          // v1.14.0 [CONFIRM-BASIS]: absent from the sized top-N but INVEST\n          // on the audited grid inside the rank buffer -- the day counts\n          // exactly like a raw sighting (ci + 1, co = 0; the score point\n          // below is recorded as for raw). The 'raw' basis never gets here.\n          st.ci = (st.ci || 0) + 1;\n          st.co = 0;\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: read-back tokens under the qualified basis only\n  // ('raw' leaves the note byte-identical to v1.13.11): the armed basis and\n  // the non-raw challengers inside the buffer whose count is alive.\n  if (qualifiedBasis) {\n    var nearSyms = [];\n    for (var nqk in symbols) {\n      if (!symbols.hasOwnProperty(nqk) || symbols[nqk].member || rawSet[nqk]) continue;\n      if ((symbols[nqk].ci || 0) > 0 && qualifiedWithin(nqk)) nearSyms.push(nqk);\n    }\n    nearSyms.sort(function (a, b) {\n      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);\n      if (dci) return dci;\n      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);\n      if (drk) return drk;\n      return a < b ? -1 : (a > b ? 1 : 0);\n    });\n    note += ', confirm=qualified';\n    if (nearSyms.length) {\n      var nqParts = [];\n      for (var nqi = 0; nqi < nearSyms.length && nqParts.length < 3; nqi++) {\n        nqParts.push(nearSyms[nqi] + '(' + (symbols[nearSyms[nqi]].ci || 0) +\n                     '/' + knobs.confirm_days + ')');\n      }\n      note += ', near ' + nearSyms.length + ' ' + nqParts.join(' ');\n    }\n  }\n",
+    ""],
+  ["  // v1.14.0 [CONFIRM-BASIS]: same pattern -- one service read here, the\n  // core consumes the basis as a plain knob ('qualified' default | 'raw').\n  knobs.confirm_basis = dt10StabConfirmBasis_();\n",
+    ""],
+  ["\n/**\n * v1.14.0 [CONFIRM-BASIS]: confirmation basis -- Script Property\n * TFB_T10_CONFIRM_BASIS (DT10_T10_CONFIRM_BASIS_PROP). Exactly 'raw'\n * (trimmed, any case) selects the v1.13.11 clocks; anything else, a blank\n * or a PropertiesService fault reads as 'qualified' (the owner's default of\n * 2026-10-24). Mirrors dt10HardVerdictStrict_ (service read outside the\n * pure core); never throws.\n */\nfunction dt10StabConfirmBasis_() {\n  try {\n    var v = String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_T10_CONFIRM_BASIS_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase();\n    return v === 'raw' ? 'raw' : 'qualified';\n  } catch (eCb) {}\n  return 'qualified';\n}\n",
+    ""],
+  ["  /* v1.14.0 [CONFIRM-BASIS]: basis line (one property read) + pure battery\n     (no services). Board of 2 seats: A (ACTIVE) and B (GRACE 1/3, INVEST at\n     rank 15 = the buffer boundary); challenger CHAL in raw on days 1-2,\n     displaced from raw by NEWC on day 3 while INVEST at rank 12, back on\n     day 4. Grid ranks: NEWC 97 (1), A 95 (2), F1..F12 94.5..83.5, CHAL 86\n     (12), B 84 (15). */\n  report.push('confirm basis (TFB_T10_CONFIRM_BASIS): ' + dt10StabConfirmBasis_() +\n              ' (default qualified; raw = v1.13.11 clocks)');\n  function cbKnobs(basis, buf) {\n    return { enabled: true, confirm_days: 3, exit_days: 3,\n             rank_buffer: (buf === undefined ? 15 : buf), smooth_days: 5,\n             hard_strict: true, confirm_basis: basis };\n  }\n  function cbCand(sym, sc, verdict) {\n    return { symbol: sym, name: sym, opportunity_score: sc,\n             verdict: (verdict === undefined ? 'INVEST' : verdict), price: 10 };\n  }\n  function cbTk(sym, sc) {\n    return { symbol: sym, name: sym, opportunity_score: sc, suggested_sar: 5000,\n             suggested_shares: 50, entry_zone: '9-11', stop_sar: 8, tp1_sar: 12,\n             tp2_sar: 14, exp_gain_12m_sar: 900, advisor_note: 'INVEST',\n             detail: { funds_from: 'Cash 5,000 SAR' } };\n  }\n  function cbGrid(chalScore, chalVerdict) {\n    var g = [cbCand('NEWC.US', 97), cbCand('A.US', 95)];\n    for (var cf = 1; cf <= 12; cf++) g.push(cbCand('F' + cf + '.US', 95.5 - cf));\n    g.push(cbCand('B.US', 84));\n    g.push(cbCand('CHAL.US', chalScore, chalVerdict));\n    return g;\n  }\n  var cbSeed = { v: 1, date: '2026-10-20', symbols: {\n      'A.US': { ci: 3, co: 0, member: true, since: '2026-10-15',\n                ls: '2026-10-20', hist: [95], ft: false },\n      'B.US': { ci: 3, co: 1, member: true, since: '2026-10-15',\n                ls: '2026-10-20', hist: [84], ft: false } } };\n  var cbRaw = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n               [cbTk('A.US', 95), cbTk('CHAL.US', 86)],\n               [cbTk('A.US', 95), cbTk('NEWC.US', 97)],\n               [cbTk('A.US', 95), cbTk('CHAL.US', 86)]];\n  var cbDays = ['2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'];\n  function cbRun(knobs, day3Score, day3Verdict) {\n    var st = dt10StabParseState_(cbSeed);\n    var outs = [];\n    for (var cd = 0; cd < 4; cd++) {\n      var grid = (cd === 2) ? cbGrid(day3Score, day3Verdict) : cbGrid(86);\n      var o = dt10StabCore_(cbRaw[cd], grid, st, knobs, 2, cbDays[cd]);\n      st = dt10StabParseState_(o.state);\n      outs.push(o);\n    }\n    return outs;\n  }\n  function cbTk4(outs, sym) {\n    for (var ct = 0; ct < outs[3].tickets.length; ct++) {\n      if (outs[3].tickets[ct].symbol === sym) return outs[3].tickets[ct];\n    }\n    return null;\n  }\n  function cbClocks(outs) {   // everything but the armed-basis token\n    var cc = [];\n    for (var ck = 0; ck < outs.length; ck++) {\n      cc.push({ t: outs[ck].tickets, s: outs[ck].state, a: outs[ck].audit,\n                n: outs[ck].note.replace(', confirm=qualified', '') });\n    }\n    return JSON.stringify(cc);\n  }\n  var cbQ = cbRun(cbKnobs('qualified'), 86);\n  var cbR = cbRun(cbKnobs('raw'), 86);\n  var cbN = cbRun(cbKnobs(undefined), 86);               // knob absent\n  var cbW = cbRun(cbKnobs('qualified'), 86, 'WATCH');   // (c)\n  var cbO = cbRun(cbKnobs('qualified'), 83);            // (d) rank 16\n  var cbE = cbRun(cbKnobs('qualified'), 84.2);          // rank 15 boundary\n  var cbZ = cbRun(cbKnobs('qualified', 0), 86);         // (e)\n  var cbZr = cbRun(cbKnobs('raw', 0), 86);\n  var opKraw = { enabled: true, confirm_days: 3, exit_days: 3, rank_buffer: 15,\n                 smooth_days: 5, hard_strict: true, confirm_basis: 'raw' };\n  var opRraw = dt10StabCore_([], [], dt10StabParseState_(opSeed), opKraw, 10,\n                             '2026-09-26', opMap);       // (a) P-168 replay\n  var cbChal4 = cbTk4(cbQ, 'CHAL.US');\n  report.push('confirm basis core: ' +\n      ((JSON.stringify(opRraw) === JSON.stringify(opR) &&\n        JSON.stringify(cbR) === JSON.stringify(cbN) &&\n        cbR[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbR[3].state.symbols['CHAL.US'].ci === 1 &&\n        cbR[3].tickets.length === 2 && cbTk4(cbR, 'CHAL.US') === null &&\n        cbR[2].note.indexOf('confirm=') < 0 && cbR[2].note.indexOf('near') < 0 &&\n        cbR[0].state.symbols['B.US'].co === 1 && cbR[0].state.symbols['B.US'].ci === 0 &&\n        cbQ[1].state.symbols['CHAL.US'].ci === 2 &&\n        cbQ[2].state.symbols['CHAL.US'].ci === 3 &&\n        cbQ[2].state.symbols['CHAL.US'].member === false &&\n        cbQ[2].tickets.length === 2 &&\n        cbQ[2].note.indexOf('pending NEWC.US(1/3)') > 0 &&\n        cbQ[2].note.indexOf('confirm=qualified') > 0 &&\n        cbQ[2].note.indexOf('near 1 CHAL.US(3/3)') > 0 &&\n        cbChal4 !== null && cbChal4._stab_status === 'NEW (confirmed 3/3)' &&\n        cbChal4.suggested_sar === 5000 && cbChal4.suggested_shares === 50 &&\n        cbChal4._grace_hold !== true && cbChal4._ft_suspended !== true &&\n        cbQ[3].audit.entered.length === 1 &&\n        cbQ[3].audit.exited_displaced.length === 1 &&\n        cbQ[3].audit.exited_displaced[0] === 'B.US' &&\n        cbQ[3].note.indexOf('near 1 NEWC.US(2/3)') > 0 &&\n        cbQ[0].state.symbols['B.US'].co === 0 && cbQ[0].state.symbols['B.US'].ci === 4 &&\n        cbQ[0].state.symbols['A.US'].ci === 4 && cbR[0].state.symbols['A.US'].ci === 4 &&\n        cbW[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbO[2].state.symbols['CHAL.US'].ci === 0 &&\n        cbE[2].state.symbols['CHAL.US'].ci === 3 &&\n        cbClocks(cbZ) === cbClocks(cbZr))\n       ? 'ok (raw = v1.13.11 clocks; qualified: day-3 rank 12 -> 3/3, day-4 NEW 3/3 sized, ' +\n         'WATCH -> 0, rank 16 -> 0, rank 15 -> 3, buffer 0 = legacy, GRACE member co 0)'\n       : 'FAIL [' + cbQ[2].note + ' | ' + cbQ[3].note + ' | ' + cbR[3].note + ']'));\n",
+    ""]
+];
+/* v1.13.11 edits, reversed next (current -> v1.13.10 text). The result is
+ * hash-pinned (V11310_SHA256 = the reviewed v1.13.10 file), so the bulk
+ * formatting harness can run the previous per-cell code as its oracle. */
+const V11310_SHA256 = '914592a3a103815e9d26ecc6b485233623c21cec5382aea68ef5c2b5b1cb32d8';
+const EDITS_V11311 = [
+  [" * Version: 1.13.11 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.13.10 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10\n * refresh that followed the first decision-feed release logged 'upstream\n * verdict: EXECUTABLE; final board: HELD' at 23:48:42 Riyadh and was\n * killed at 23:50:59 ('Exceeded maximum execution time') before it wrote\n * its status line. B2 stayed 'running', the next scheduled release check\n * read T10_STATUS_NOT_OK and withdrew the release (decision_failed). The\n * 19:40 run was killed the same way; completed runs took 127-232 s. The\n * render painted formats cell by cell: one setBackground per zebra row in\n * dt10WriteTable_, and setBackground + setFontColor + setFontWeight per\n * coloured cell in dt10ColorVerdicts_, dt10ColorQualified_ and\n * dt10ColorStability_ -- about 1,750 range calls for the 500-row CANDIDATES\n * grid alone, each one slower while other scripts write the workbook.\n * WHAT: the same formats are written in bulk. dt10WriteTable_ reads the\n * body backgrounds once, sets the zebra rows and writes them back once.\n * The three colourers build one token per row and call the new\n * dt10BulkPaint_, which reads backgrounds, font colours and font weights\n * once, sets tok.bg / tok.fg / bold on the token rows and writes each\n * attribute once (nothing is read or written when no row has a token).\n * Rows the old loops left alone keep their current format (read back and\n * written unchanged), so the painted board is the same. Values, verdicts,\n * withholding, funding, stability, receipts and the status line are\n * unchanged. Harness: tests/js/dt10_bulk_format.test.js (cell-model\n * equivalence against the v1.13.10 code, bounded call counts).\n *\n",
+    ""],
+  ["var DT10_VERSION = '1.13.11';\n",
+    "var DT10_VERSION = '1.13.10';\n"],
+  ["function dt10WriteTable_(sheet, row, headers, dataRows, emptyText) {\n  // v1.1.0 reskin: column-header row is the brand navy band with white text.\n  sheet.getRange(row, 1, 1, headers.length).setValues([headers])\n      .setFontWeight('bold').setFontSize(9).setWrap(true)\n      .setBackground(DT10_NAVY).setFontColor('#FFFFFF');\n  row++;\n  if (!dataRows.length) {\n    sheet.getRange(row, 1, 1, DT10_LAST_COL).merge().setValue(emptyText)\n        .setFontStyle('italic').setFontColor(DT10_MUTED);\n    return { next: row + 1, firstDataRow: -1, count: 0 };\n  }\n  sheet.getRange(row, 1, dataRows.length, headers.length).setValues(dataRows);\n  // Body text in proposal ink; alternate rows in the proposal zebra tint.\n  var body = sheet.getRange(row, 1, dataRows.length, headers.length);\n  body.setFontColor(DT10_INK);\n  // v1.13.11: one read + one write instead of one call per zebra row; the\n  // other rows keep the background they already had.\n  var zebra = body.getBackgrounds();\n  for (var i = 0; i < dataRows.length; i += 2) {\n    for (var zc = 0; zc < headers.length; zc++) zebra[i][zc] = DT10_ZEBRA;\n  }\n  body.setBackgrounds(zebra);\n  sheet.getRange(row - 1, 1, dataRows.length + 1, headers.length)\n      .setBorder(true, true, true, true, true, true, DT10_BORDER,\n                 SpreadsheetApp.BorderStyle.SOLID);\n  return { next: row + dataRows.length, firstDataRow: row,\n           count: dataRows.length };\n}\n",
+    "function dt10WriteTable_(sheet, row, headers, dataRows, emptyText) {\n  // v1.1.0 reskin: column-header row is the brand navy band with white text.\n  sheet.getRange(row, 1, 1, headers.length).setValues([headers])\n      .setFontWeight('bold').setFontSize(9).setWrap(true)\n      .setBackground(DT10_NAVY).setFontColor('#FFFFFF');\n  row++;\n  if (!dataRows.length) {\n    sheet.getRange(row, 1, 1, DT10_LAST_COL).merge().setValue(emptyText)\n        .setFontStyle('italic').setFontColor(DT10_MUTED);\n    return { next: row + 1, firstDataRow: -1, count: 0 };\n  }\n  sheet.getRange(row, 1, dataRows.length, headers.length).setValues(dataRows);\n  // Body text in proposal ink; alternate rows in the proposal zebra tint.\n  sheet.getRange(row, 1, dataRows.length, headers.length)\n      .setFontColor(DT10_INK);\n  for (var i = 0; i < dataRows.length; i += 2) {\n    sheet.getRange(row + i, 1, 1, headers.length).setBackground(DT10_ZEBRA);\n  }\n  sheet.getRange(row - 1, 1, dataRows.length + 1, headers.length)\n      .setBorder(true, true, true, true, true, true, DT10_BORDER,\n                 SpreadsheetApp.BorderStyle.SOLID);\n  return { next: row + dataRows.length, firstDataRow: row,\n           count: dataRows.length };\n}\n"],
+  ["function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {\n  if (firstDataRow < 0 || !count) return;\n  var rng = sheet.getRange(firstDataRow, col, count, 1);\n  var vals = rng.getValues(), toks = [];\n  for (var i = 0; i < count; i++) {\n    var v = String(vals[i][0] || '');\n    var tok = null;\n    if (v.indexOf('ACTIVE') === 0 || v.indexOf('NEW') === 0) {\n      tok = tokens.VERDICT_POSITIVE;\n    } else if (v.indexOf('GRACE') === 0 || v.indexOf('FAST-TRACK') === 0) {\n      tok = tokens.VERDICT_WATCH;\n    }\n    toks.push(tok || null);\n  }\n  dt10BulkPaint_(rng, toks);   // v1.13.11\n}\n",
+    "function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {\n  if (firstDataRow < 0 || !count) return;\n  var vals = sheet.getRange(firstDataRow, col, count, 1).getValues();\n  for (var i = 0; i < count; i++) {\n    var v = String(vals[i][0] || '');\n    var tok = null;\n    if (v.indexOf('ACTIVE') === 0 || v.indexOf('NEW') === 0) {\n      tok = tokens.VERDICT_POSITIVE;\n    } else if (v.indexOf('GRACE') === 0 || v.indexOf('FAST-TRACK') === 0) {\n      tok = tokens.VERDICT_WATCH;\n    }\n    if (tok) {\n      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)\n          .setFontColor(tok.fg).setFontWeight('bold');\n    }\n  }\n}\n"],
+  ["function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,\n                             tokens) {\n  if (firstDataRow < 0 || !count) return;\n  var toks = [];\n  for (var i = 0; i < count; i++) {\n    var c = qualified[i] || {};\n    var tok;\n    if (c.selected === true) tok = tokens.VERDICT_POSITIVE;\n    else if (dt10HasValue_(c.deferral)) tok = tokens.VERDICT_WATCH;\n    else tok = tokens.VERDICT_BLOCK;\n    toks.push(tok || null);\n  }\n  dt10BulkPaint_(sheet.getRange(firstDataRow, col, count, 1), toks);   // v1.13.11\n}\n",
+    "function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,\n                             tokens) {\n  if (firstDataRow < 0 || !count) return;\n  for (var i = 0; i < count; i++) {\n    var c = qualified[i] || {};\n    var tok;\n    if (c.selected === true) tok = tokens.VERDICT_POSITIVE;\n    else if (dt10HasValue_(c.deferral)) tok = tokens.VERDICT_WATCH;\n    else tok = tokens.VERDICT_BLOCK;\n    if (tok) {\n      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)\n          .setFontColor(tok.fg).setFontWeight('bold');\n    }\n  }\n}\n"],
+  ["/** v1.13.11: paint a one-column range from per-row tokens in bulk. toks[i]\n * is a {bg, fg} token or null. A token row gets tok.bg, tok.fg and bold,\n * exactly what the per-cell setBackground/setFontColor/setFontWeight calls\n * wrote; a null row keeps its current background, font colour and weight\n * (read back and written unchanged). One read and one write per attribute;\n * nothing is read or written when no row has a token. */\nfunction dt10BulkPaint_(rng, toks) {\n  var any = false;\n  for (var a = 0; a < toks.length; a++) {\n    if (toks[a]) { any = true; break; }\n  }\n  if (!any) return;\n  var bg = rng.getBackgrounds(), fg = rng.getFontColors(),\n      fw = rng.getFontWeights();\n  for (var i = 0; i < toks.length; i++) {\n    var tok = toks[i];\n    if (!tok) continue;\n    bg[i][0] = tok.bg === undefined ? null : tok.bg;\n    fg[i][0] = tok.fg === undefined ? null : tok.fg;\n    fw[i][0] = 'bold';\n  }\n  rng.setBackgrounds(bg);\n  rng.setFontColors(fg);\n  rng.setFontWeights(fw);\n}\n/** Verdict/conf cell coloring via §3.4 tokens on a written table column. */\nfunction dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {\n  if (firstDataRow < 0 || !count) return;\n  var rng = sheet.getRange(firstDataRow, col, count, 1);\n  var vals = rng.getValues(), toks = [];\n  for (var i = 0; i < count; i++) {\n    var v = String(vals[i][0] || '');\n    var tok = null;\n    if (v === 'INVEST') tok = tokens.VERDICT_POSITIVE;\n    else if (v === 'WATCH') tok = tokens.VERDICT_WATCH;\n    else if (v === 'DO_NOT_INVEST') tok = tokens.VERDICT_NEGATIVE;\n    else if (v) tok = tokens.VERDICT_BLOCK;\n    toks.push(tok || null);\n  }\n  dt10BulkPaint_(rng, toks);   // v1.13.11\n}\n",
+    "/** Verdict/conf cell coloring via §3.4 tokens on a written table column. */\nfunction dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {\n  if (firstDataRow < 0 || !count) return;\n  var rng = sheet.getRange(firstDataRow, col, count, 1);\n  var vals = rng.getValues();\n  for (var i = 0; i < count; i++) {\n    var v = String(vals[i][0] || '');\n    var tok = null;\n    if (v === 'INVEST') tok = tokens.VERDICT_POSITIVE;\n    else if (v === 'WATCH') tok = tokens.VERDICT_WATCH;\n    else if (v === 'DO_NOT_INVEST') tok = tokens.VERDICT_NEGATIVE;\n    else if (v) tok = tokens.VERDICT_BLOCK;\n    if (tok) {\n      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)\n          .setFontColor(tok.fg).setFontWeight('bold');\n    }\n  }\n}\n"]
+];
+/* v1.13.10 edits, reversed next (v1.13.10 -> v1.13.9 text). */
+const EDITS_V11310 = [
+  [" * Version: 1.13.10 (see DT10_VERSION; header kept in lockstep — restored\n",
+    " * Version: 1.13.9 (see DT10_VERSION; header kept in lockstep — restored\n"],
+  [" *\n * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE\n * (1) dt10HoldingFromRow_ upper-cased the currency before the FX lookup, so\n * a GBp (pence) holding converted at the GBP rate (100x too large). The new\n * dt10HoldingFxRate_ mirrors opportunity_builder._resolve_fx (USX gate off):\n * GBX/GBp, ZAC/ZAc, ILA/ILa are detected on the RAW token and use an exact\n * raw FX key, else parent / 100. USX keeps needing its own 'USX' FX row.\n * (2) A currency with no FX rate kept its NATIVE value labelled value_sar.\n * It now sends value_sar null and marks holdings_input_incomplete, so\n * funding stays withheld; the builder never sums a native amount as SAR.\n * (3) refreshDecisionTop10 wrote 'running...' and a throw left it there\n * (20 Oct: cockpit stuck RUNNING, no grid, validation failed). The body is\n * now dt10RefreshDecisionTop10Run_; on a throw dt10RefreshFailed_ writes\n * 'status: FAILED | failed_at_utc=<ISO Z> | <error>', upserts _Status ERROR,\n * clears the P-195 marker this run stored (a throw before the marker check\n * leaves a previous run's marker for ABORTED_PREV) and rethrows. The\n * freshness audit reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script\n * hard timeout (6 min) kills the script without running catch; that case\n * still shows RUNNING and is reported by the next run's P-195 ABORTED_PREV\n * row.\n",
+    ""],
+  ["var DT10_VERSION = '1.13.10';\n",
+    "var DT10_VERSION = '1.13.9';\n"],
+  ["/** v1.13.10 PURE: SAR per unit of a holding's native currency cell, mirroring\n * opportunity_builder._resolve_fx with TFB_OPP_FX_USX_SUBUNIT off (default).\n * Subunits are detected on the RAW token BEFORE case folding ('GBp' would\n * otherwise fold into pounds): GBX/GBp, ZAC/ZAc, ILA/ILa (and gbx/zac/ila\n * spellings) are 1/100 of GBP/ZAR/ILS. An exact raw key in the map wins\n * (already per subunit); otherwise the parent rate / 100. USX is not folded\n * here (its gate is backend-only and DEFAULT OFF): it needs its own 'USX'\n * row, as before. Returns null for SAR/blank (no conversion), NaN when no\n * rate exists, else the positive rate. */\nvar DT10_FX_SUBUNIT_PARENT = { GBp: 'GBP', GBX: 'GBP', ZAC: 'ZAR', ZAc: 'ZAR',\n                               ILA: 'ILS', ILa: 'ILS' };\nfunction dt10HoldingFxRate_(cell, fx) {\n  var raw = String(cell === null || cell === undefined ? '' : cell).trim();\n  var up = raw.toUpperCase();\n  if (!raw || up === 'SAR') return null;\n  fx = fx || {};\n  var exact = Number(fx[raw]);\n  if (isFinite(exact) && exact > 0) return exact;\n  var parent = Object.prototype.hasOwnProperty.call(DT10_FX_SUBUNIT_PARENT, raw) ?\n      DT10_FX_SUBUNIT_PARENT[raw] :\n      (up === 'GBX' || up === 'ZAC' || up === 'ILA') ? DT10_FX_SUBUNIT_PARENT[up] : '';\n  var rate = Number(fx[parent || up]);\n  if (!(isFinite(rate) && rate > 0)) return NaN;\n  return parent ? rate / 100 : rate;\n}\n",
+    ""],
+  ["  // currency column and an FX map (SAR per unit). SAR rows and rows without a\n  // currency keep the native value. v1.13.10: subunits resolve on the RAW\n  // token and a currency missing from the map sends value_sar null and\n  // marks the row _input_incomplete instead of a native amount labelled SAR.\n",
+    "  // currency column and an FX map (SAR per unit). SAR rows, rows without a\n  // currency and currencies missing from the map keep the native value.\n"],
+  ["    var rate = dt10HoldingFxRate_(row[extra.iCcy], extra.fx);\n    if (rate === null) {\n      // SAR or blank currency: the value is already SAR (unchanged).\n    } else if (isFinite(rate) && rate > 0) {\n      val = val * rate;\n      extra._converted = (extra._converted || 0) + 1;\n    } else {\n      val = null;\n      extra._unconverted = (extra._unconverted || 0) + 1;\n",
+    "    var ccy = String(row[extra.iCcy] === null || row[extra.iCcy] === undefined ?\n                     '' : row[extra.iCcy]).trim().toUpperCase();\n    if (ccy && ccy !== 'SAR') {\n      var rate = Number(extra.fx[ccy]);\n      if (isFinite(rate) && rate > 0) {\n        val = val * rate;\n        extra._converted = (extra._converted || 0) + 1;\n      } else {\n        extra._unconverted = (extra._unconverted || 0) + 1;\n      }\n"],
+  ["      if (h.value_sar === null) out._input_incomplete = true;   // v1.13.10: no FX\n",
+    ""],
+  ["  dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run\n  var run = { statusCell: null, markerOwned: false };   // v1.13.10: a throw ends in FAILED\n  try {\n    dt10RefreshDecisionTop10Run_(run);\n  } catch (eRun) {\n    dt10RefreshFailed_(run, eRun);\n    throw eRun;\n  }\n}\n/** v1.13.10: a refresh that THROWS must not leave the banner at 'running...'\n * (live 20 Oct: cockpit stuck RUNNING with no grid). Writes a terminal\n * 'status: FAILED' line (the Riyadh 'Last run' stamp the audit parses, plus\n * failed_at_utc and a short error), upserts cockpit _Status ERROR and clears\n * the P-195 marker THIS run stored (a reported failure is not an abort); a\n * throw before the marker check leaves a previous run's stale marker for the\n * next check to report as ABORTED_PREV. Never throws; the caller rethrows. A\n * hard Apps Script timeout cannot be caught: that case still leaves RUNNING\n * and is reported by the next run's P-195 check. */\nfunction dt10RefreshFailed_(run, err) {\n  var msg = String(err && err.message ? err.message : err)\n      .replace(/\\s+/g, ' ').slice(0, 200);\n  var utc = '';\n  try { utc = new Date().toISOString().replace(/\\.\\d{3}Z$/, 'Z'); } catch (eIso) {}\n  try {\n    var cell = run && run.statusCell;\n    if (!cell) {\n      var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DT10_SHEET);\n      cell = sh ? sh.getRange(DT10_ROW_STATUS, 2) : null;\n    }\n    if (cell) {\n      cell.setValue(dt10StatusLine_('FAILED',\n          'failed_at_utc=' + utc + ' | ' + msg + dt10StaleNote_()));\n    }\n  } catch (eCell) {}\n  try {\n    dt10WritePageStatus_('ERROR', 'Decision cockpit: FAILED at ' + utc + ' \\u2014 ' + msg,\n        '', '', '', []);\n  } catch (eSt) {}\n  if (run && run.markerOwned) {   // only the marker this run stored\n    try { dt10RunMarkerClear_(); } catch (eMk) {}\n  }\n  try { SpreadsheetApp.flush(); } catch (eFl) {}\n}\nfunction dt10RefreshDecisionTop10Run_(run) {\n",
+    ""],
+  ["  var t0 = new Date().getTime();\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n",
+    "  var t0 = new Date().getTime();\n  dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n"],
+  ["  run.statusCell = statusCell;                              // v1.13.10\n",
+    ""],
+  ["  dt10RunMarkerCheck_('refreshDecisionTop10');\n  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker\n",
+    "  dt10RunMarkerCheck_('refreshDecisionTop10');\n"],
+  ["  var hxE = dt10HoldingFromRow_(['VOD.L', 'Telecom', 1000, 'GBp'], 0, 1, 2,\n                                { iCcy: 3, fx: { GBP: 5 } });   // v1.13.10\n  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; GBp 1000 -> 50; ' +\n      'SAR/SAR-column untouched; unknown -> null): ' +\n",
+    "  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; SAR/unknown/SAR-column untouched): ' +\n"],
+  ["        hxC.value_sar === null && hxD.value_sar === 445.08 &&\n        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +\n       hxD.value_sar + '/' + hxE.value_sar + ']'));\n",
+    "        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :\n       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));\n"]
+];
+const EDITS = EDITS_V1150.concat(EDITS_V1140, EDITS_V11311, EDITS_V11310, [
   [' * Version: 1.13.9 ', ' * Version: 1.13.8 '],
   [WHY, ''],
   ["var DT10_VERSION = '1.13.9';", "var DT10_VERSION = '1.13.8';"],
@@ -40,16 +216,141 @@ const EDITS = [
   [" * (withheld)'. Pool/research stats stay real: Entered cash (the operator's",
     " * (withheld)'. Pool/research stats stay real: Deployable (the operator's"],
   ['  sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);\n', '']
-];
+]);
 function feedHistorySource(source) {
-  let historical = source;
+  let historical = v1150Source(source);
   for (const [current, prior] of EDITS) {
     assert.equal(historical.split(current).length - 1, 1,
-      'exactly one approved v1.13.9 edit: ' + current.split('\n')[0]);
+      'exactly one approved v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 edit: ' + current.split('\n')[0]);
     historical = historical.replace(current, prior);
   }
   assert.equal(crypto.createHash('sha256').update(historical).digest('hex'), HISTORY_SHA256,
-    'v1.13.9 may change only the enumerated cash label and UTC holdings edits');
+    'v1.13.9/v1.13.10/v1.13.11/v1.14.0/v1.15.0 may change only their enumerated edits');
   return historical;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256};
+/* v1.19.0 source (the ticket-guard / KPI / venue-line oracle): only the
+ * v1.20.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v1190Source(source) {
+  let prior = source;
+  for (const [current, previous] of EDITS_V1200) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.20.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1190_SHA256,
+    'v1.20.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.18.0 source (the hold / live-fill / owner-rule oracle): the v1.20.0 and
+ * then the v1.19.0 edits are reversed, each exactly once, and the result must
+ * be the reviewed file. (2026-11-02: starts from v1190Source since v1.20.0.) */
+function v1180Source(source) {
+  let prior = v1190Source(source);
+  for (const [current, previous] of EDITS_V1190) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.19.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1180_SHA256,
+    'v1.19.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.17.1 source (the post-earnings oracle): the v1.19.0 and then the v1.18.0
+ * edits are reversed, each exactly once, and the result must be the reviewed
+ * file. (2026-11-01: starts from v1180Source since v1.19.0.) */
+function v1171Source(source) {
+  let prior = v1180Source(source);
+  for (const [current, previous] of EDITS_V1180) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.18.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1171_SHA256,
+    'v1.18.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.17.0 source (the shadow-momentum oracle): the v1.18.0 and then the
+ * v1.17.1 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. (2026-10-27: starts from v1171Source since v1.18.0.) */
+function v1170Source(source) {
+  let prior = v1171Source(source);
+  for (const [current, previous] of EDITS_V1171) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.17.1 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1170_SHA256,
+    'v1.17.1 may change only its enumerated edits');
+  return prior;
+}
+/* v1.16.0 source (the shadow-rank-log oracle): the v1.17.1 and then the
+ * v1.17.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v1160Source(source) {
+  let prior = v1170Source(source);
+  for (const [current, previous] of EDITS_V1170) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.17.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1160_SHA256,
+    'v1.17.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.15.0 source (the funding-evidence oracle): the v1.17.0 and then the
+ * v1.16.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v1150Source(source) {
+  let prior = v1160Source(source);
+  for (const [current, previous] of EDITS_V1160) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.16.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1150_SHA256,
+    'v1.16.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.14.0 source (the pending-grace oracle): the v1.16.0 and then the v1.15.0
+ * edits are reversed, each exactly once, and the result must be the reviewed file. */
+function v1140Source(source) {
+  let prior = v1150Source(source);
+  for (const [current, previous] of EDITS_V1150) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.15.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1140_SHA256,
+    'v1.15.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.13.11 source (the confirm-basis oracle): the v1.15.0 and then the
+ * v1.14.0 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. */
+function v11311Source(source) {
+  let prior = v1140Source(source);
+  for (const [current, previous] of EDITS_V1140) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.14.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V11311_SHA256,
+    'v1.14.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.13.10 source (the bulk-format oracle): the v1.14.0 and then the v1.13.11
+ * edits are reversed, each exactly once, and the result must be the reviewed
+ * file. */
+function v11310Source(source) {
+  let prior = v11311Source(source);
+  for (const [current, previous] of EDITS_V11311) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.13.11 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V11310_SHA256,
+    'v1.13.11 may change only its enumerated edits');
+  return prior;
+}
+module.exports = {feedHistorySource, HISTORY_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256, v1160Source, V1160_SHA256, v1170Source, V1170_SHA256, v1171Source, V1171_SHA256, v1180Source, V1180_SHA256, v1190Source, V1190_SHA256};

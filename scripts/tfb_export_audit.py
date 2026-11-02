@@ -87,6 +87,15 @@ and numeric zero placeholders. Performance_Log headers at row 5 are by
 design (the KPI panel occupies AG1:AK13). _Cash_Snapshot also permits operator
 template rows marked _Status; only actual appended cash records certify cash.
 No sheet/provider calls or production recommendation changes are introduced.
+
+WHY (v1.2.1, 2026-10-24): independent v2 display checks
+----------------------------------------------------
+The read-only v2 views were absent from the six-gate audit. Check their
+declared cash/reserve arithmetic while keeping the engine budget and PF
+percentage-floor basis distinct. A Top10 EXECUTABLE header over a held/zero
+ticket view is a presentation failure, not evidence of a feed release.
+Missing/ambiguous v2 evidence remains NOT_CHECKED. These checks certify no
+account balance or execution and perform no live Sheet or source update.
 """
 from __future__ import annotations
 
@@ -103,7 +112,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 try:
     import openpyxl
@@ -764,6 +773,131 @@ def _status_line(rows, row=1, col=1):
         return ""
 
 
+_DISPLAY_SAR_NUMBER = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+
+
+def _display_sar(value):
+    """Parse one rendered amount; never use narrative text as cash evidence."""
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        number = _cash_decimal(value)
+    else:
+        match = re.fullmatch(r"(" + _DISPLAY_SAR_NUMBER + r")\s+SAR", _s(value), re.I)
+        number = _cash_decimal(match.group(1).replace(",", "")) if match else None
+    return number if number is not None and number >= 0 else None
+
+
+def _view_kpis(rows, labels):
+    """Resolve a single labelled KPI band, rejecting ambiguous layouts."""
+    matches = []
+    for ri, row in enumerate(rows[:-1]):
+        names = [_s(cell).upper() for cell in row]
+        if all(names.count(label) == 1 for label in labels):
+            matches.append({label: (rows[ri + 1][names.index(label)]
+                                    if names.index(label) < len(rows[ri + 1]) else None)
+                            for label in labels})
+    return matches[0] if len(matches) == 1 else None
+
+
+def check_portfolio_research_cash(book):
+    """Reconcile v2 display bases without turning research amounts into funding.
+
+    The engine reserve and PF percentage floor are different declared policies.
+    Different post-reserve amounts are valid when each reconciles to its basis;
+    their equality is deliberately not an invariant.
+    """
+    rows = book.rows("Portfolio_Decision_v2") or []
+    if not rows:
+        return [], {}
+    name = "portfolio_v2_research_cash_arithmetic"
+    bands = [(label, _view_kpis(rows, ("NAV", "CASH", label)))
+             for label in ("DEPLOYABLE", "ENGINE BUDGET")]
+    bands = [(label, values) for label, values in bands if values is not None]
+    kpis = bands[0][1] if len(bands) == 1 else None
+    metrics = {"scope": "display_arithmetic_only", "execution_clearance": False}
+    if kpis is None:
+        return [F("book", "BOOK", name, "NOT_CHECKED", None,
+                  "v2 KPI band is missing or ambiguous; no cash/funding certification")], metrics
+    nav, cash, deployable = (_display_sar(kpis[key]) for key in ("NAV", "CASH", bands[0][0]))
+    if None in (nav, cash, deployable):
+        return [F("book", "BOOK", name, "FAIL", 1,
+                  "v2 NAV/cash/deployable display contains an invalid amount; no funding certification")], metrics
+    cells = [_s(cell) for row in rows for cell in row if _s(cell)]
+    reserve_re = re.compile(r"\bengine\s+reserve\s+(" + _DISPLAY_SAR_NUMBER + r")\s+SAR\b", re.I)
+    floor_re = re.compile(r"\bPF\s+(" + _DISPLAY_SAR_NUMBER + r")%\s+policy\s+floor\s+(" + _DISPLAY_SAR_NUMBER + r")\b", re.I)
+    reserves = {Decimal(match.group(1).replace(",", "")) for text in cells for match in reserve_re.finditer(text)}
+    floors = {(Decimal(match.group(1).replace(",", "")), Decimal(match.group(2).replace(",", "")))
+              for text in cells for match in floor_re.finditer(text)}
+    metrics.update(nav_sar=float(nav), displayed_cash_sar=float(cash), displayed_deployable_sar=float(deployable))
+    if len(reserves) != 1 or len(floors) != 1:
+        return [F("book", "BOOK", name, "NOT_CHECKED", None,
+                  "v2 engine reserve or PF policy floor is missing/ambiguous; no funding certification")], metrics
+    reserve = next(iter(reserves))
+    floor_pct, floor = next(iter(floors))
+    if reserve < 0 or floor < 0 or not 0 <= floor_pct <= 100:
+        return [F("book", "BOOK", name, "FAIL", 1, "invalid declared reserve/floor")], metrics
+    engine_cash = max(Decimal(0), cash - reserve)
+    pf_cash = max(Decimal(0), cash - floor)
+    metrics.update(engine_reserve_sar=float(reserve), pf_floor_pct=float(floor_pct), pf_floor_sar=float(floor),
+                   engine_post_reserve_sar=float(engine_cash), pf_post_floor_sar=float(pf_cash))
+    errors = []
+    # One-SAR tolerance reflects the displayed whole-SAR inputs, not a funding tolerance.
+    if abs(deployable - engine_cash) > 1:
+        errors.append("DEPLOYABLE KPI disagrees with displayed cash minus engine reserve")
+    if abs(floor - nav * floor_pct / 100) > 1:
+        errors.append("PF policy floor disagrees with displayed NAV and percentage")
+    narrative_re = re.compile(r"\bdeployable\s+(" + _DISPLAY_SAR_NUMBER + r")\s+SAR\b", re.I)
+    narratives = [Decimal(match.group(1).replace(",", "")) for text in cells for match in narrative_re.finditer(text)]
+    for amount in narratives:
+        if min(abs(amount - engine_cash), abs(amount - pf_cash)) > 1:
+            errors.append("narrative deployable amount matches neither declared reserve basis")
+    pf_narrative_re = re.compile(r"\bcash\s+after\s+(?:the\s+)?PF\s+" + _DISPLAY_SAR_NUMBER +
+                                r"%\s*NAV\s+floor(?:\s+is)?\s*[:=]?\s*(" + _DISPLAY_SAR_NUMBER + r")\s+SAR\b", re.I)
+    pf_narratives = [Decimal(match.group(1).replace(",", "")) for text in cells for match in pf_narrative_re.finditer(text)]
+    for amount in pf_narratives:
+        if abs(amount - pf_cash) > 1:
+            errors.append("PF-floor narrative disagrees with displayed cash minus PF policy floor")
+    narratives.extend(pf_narratives)
+    metrics["narrative_deployable_sar"] = [float(amount) for amount in narratives]
+    return [F("book", "BOOK", name, "FAIL" if errors else "PASS", len(errors),
+              "research display arithmetic only; engine reserve and PF policy floor are distinct bases; "
+              "does not certify account cash, S1, or execution", errors)], metrics
+
+
+def check_top10_v2_presentation(book):
+    """An actionable feed badge must not imply executable tickets on a held view."""
+    rows = book.rows("Top_10_Investments_v2") or []
+    if not rows:
+        return [], {}
+    states = {"EXECUTABLE", "HELD", "WITHHELD", "NO_TRADE", "EMPTY", "QUALIFIED_UNFUNDED", "UNCERTIFIED"}
+    badge = []
+    for cell in rows[0]:
+        text = _s(cell).upper()
+        board = re.fullmatch(r"BOARD:\s*([A-Z_]+)", text)
+        state = board.group(1) if board else text
+        if state in states or text == "FEED VERIFIED":
+            badge.append(state)
+    status_text = " ".join(_s(cell) for row in rows[:4] for cell in row)
+    outputs = set(re.findall(r"\boutput:\s*(EXECUTABLE|HELD|WITHHELD|NO_TRADE|EMPTY|QUALIFIED_UNFUNDED)\b", status_text, re.I))
+    outputs = {output.upper() for output in outputs}
+    kpis = _view_kpis(rows, ("SCANNED", "ENGINE INVESTABLE", "EXECUTABLE"))
+    count = _num(kpis["EXECUTABLE"]) if kpis else None
+    if count is not None and (not math.isfinite(count) or count < 0 or int(count) != count):
+        count = None
+    metrics = {"scope": "presentation_only", "badge": badge[0] if len(badge) == 1 else None,
+               "output": next(iter(outputs)) if len(outputs) == 1 else None, "executable_tickets": count}
+    known = len(badge) == 1 and len(outputs) == 1 and count is not None
+    # FEED VERIFIED declares source availability only. Every board-state badge
+    # must agree with the output, and the output must agree with its ticket count.
+    mismatch = known and (
+        (metrics["badge"] != "FEED VERIFIED" and metrics["badge"] != metrics["output"])
+        or (metrics["output"] == "EXECUTABLE" and count == 0)
+        or (metrics["output"] != "EXECUTABLE" and count > 0))
+    status = "FAIL" if mismatch else "PASS" if known else "NOT_CHECKED"
+    return [F("b", "DECISION", "top10_v2_execution_presentation", status, int(mismatch) if known else None,
+              "presentation only: header badge must distinguish verified feed from executable tickets; "
+              "this check neither releases nor retracts a decision feed")], metrics
+
+
 def check_portfolio(book, tz_offset, since_days, now_utc, cash_max_age_hours=24.0):
     out, metrics = [], {}
     # Ledger
@@ -911,6 +1045,10 @@ def check_portfolio(book, tz_offset, since_days, now_utc, cash_max_age_hours=24.
     metrics["trade_notes"] = notes
     out.append(F("gov", "GOVERNANCE", "trade_notes_vs_fills", "PASS" if notes >= fills else "FAIL",
                  fills - notes, f"{fills} fills in the last {since_days} days vs {notes} trade notes"))
+    findings, view_metrics = check_portfolio_research_cash(book)
+    out.extend(findings)
+    if view_metrics:
+        metrics["portfolio_v2_research_cash"] = view_metrics
     return out, metrics
 
 
@@ -993,6 +1131,10 @@ def check_cockpit(book, tz_offset, sector_cap):
         bad.append(f"PF Max Sector % {pf_pct:g} (policy {want_pct})")
     out.append(F("b", "DECISION", "sector_caps_vs_policy", "PASS" if not bad else "FAIL", len(bad),
                  f"policy {want_n} names / {want_pct} %", bad))
+    findings, view_metrics = check_top10_v2_presentation(book)
+    out.extend(findings)
+    if view_metrics:
+        metrics["top10_v2_presentation"] = view_metrics
     return out, metrics
 
 

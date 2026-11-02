@@ -207,25 +207,25 @@ def main():
         nb2 = [(e[0], e[1], e[2], {**e[3], "version": "X"}) if e[0] == "append_row" and e[1] == "_Run_Log" else e for e in nb]
         nf2 = [(e[0], e[1], e[2], {**e[3], "version": "X"}) if e[0] == "append_row" and e[1] == "_Run_Log" else e for e in nf]
         nb2 = [(e[0], e[1], e[2], e[3], str(e[4]).replace("1.4.0", "V")) if e[0] == "update" else e for e in nb2]
-        nf2 = [(e[0], e[1], e[2], e[3], str(e[4]).replace("1.5.0", "V")) if e[0] == "update" else e for e in nf2]
+        nf2 = [(e[0], e[1], e[2], e[3], str(e[4]).replace(fix.SCRIPT_VERSION, "V")) if e[0] == "update" else e for e in nf2]   # 2026-10-28: delivered version, not a literal
         T("F2 off == base call sequence (version cells masked)", nb2 == nf2, f"base={len(nb2)} fix={len(nf2)}")
-        T("F2 off == base stdout (version masked)", out_b.replace("1.4.0", "V") == out_off.replace("1.5.0", "V"))
+        T("F2 off == base stdout (version masked)", out_b.replace("1.4.0", "V") == out_off.replace(fix.SCRIPT_VERSION, "V"))
     # F3 observe on Sunday: same writes + note + freeze_observe key
     rc_obs, log_obs, out_obs = run_main(fix, dict(sun, TFB_BOARD_FREEZE_NONTRADING="observe"))
     T("F3 observe rc", rc_obs == 0)
     T("F3 observe writes identical to off", norm([e for e in log_obs if e[0] != "append_row" or e[1] != "_Run_Log"]) == norm([e for e in log_off if e[0] != "append_row" or e[1] != "_Run_Log"]))
     T("F3 observe note printed once", out_obs.count("would freeze (observe): weekend:Sun") == 1)
     rl_obs = [e for e in log_obs if e[0] == "append_row" and e[1] == "_Run_Log"]
-    T("F3 observe Run_Log JSON carries freeze_observe", len(rl_obs) == 1 and rl_obs[0][2] == "OK" and json.loads(rl_obs[0][3]) == {"version": "1.5.0", "freeze_observe": "weekend:Sun"}, rl_obs)
+    T("F3 observe Run_Log JSON carries freeze_observe", len(rl_obs) == 1 and rl_obs[0][2] == "OK" and json.loads(rl_obs[0][3]) == {"version": fix.SCRIPT_VERSION, "freeze_observe": "weekend:Sun"}, rl_obs)
     rl_off = [e for e in log_off if e[0] == "append_row" and e[1] == "_Run_Log"]
-    T("F3 off Run_Log JSON has no freeze key", json.loads(rl_off[0][3]) == {"version": "1.5.0"})
+    T("F3 off Run_Log JSON has no freeze key", json.loads(rl_off[0][3]) == {"version": fix.SCRIPT_VERSION})
     # F4 enforce on Sunday: nothing but the FROZEN row
     rc_enf, log_enf, out_enf = run_main(fix, dict(sun, TFB_BOARD_FREEZE_NONTRADING="enforce"))
     T("F4 enforce rc", rc_enf == 0)
     T("F4 enforce no board/history writes", not any(e[0] in ("update", "clear", "append_rows") for e in log_enf), log_enf)
     T("F4 enforce no Top_10 read", not any(e[0] == "read" for e in log_enf))
-    T("F4 enforce exactly one FROZEN Run_Log row", [e for e in log_enf if e[0] == "append_row"] == [("append_row", "_Run_Log", "FROZEN", json.dumps({"version": "1.5.0", "freeze": "weekend:Sun", "date": "2026-09-27"}))], log_enf)
-    T("F4 enforce note printed", "frozen: weekend:Sun - board kept, nothing written" in out_enf and "[SHADOW-BOARD v1.5.0]" not in out_enf)
+    T("F4 enforce exactly one FROZEN Run_Log row", [e for e in log_enf if e[0] == "append_row"] == [("append_row", "_Run_Log", "FROZEN", json.dumps({"version": fix.SCRIPT_VERSION, "freeze": "weekend:Sun", "date": "2026-09-27"}))], log_enf)
+    T("F4 enforce note printed", "frozen: weekend:Sun - board kept, nothing written" in out_enf and "[SHADOW-BOARD v" + fix.SCRIPT_VERSION + "]" not in out_enf)
     # F5 enforce on Monday == off
     mon = {"TFB_BOARD_FREEZE_TODAY": "2026-09-28"}
     rc_m, log_m, out_m = run_main(fix, dict(mon, TFB_BOARD_FREEZE_NONTRADING="enforce"))

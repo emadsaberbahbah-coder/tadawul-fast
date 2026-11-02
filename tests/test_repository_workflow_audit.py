@@ -60,6 +60,33 @@ on:
         self.assertEqual(findings[0].severity, "WARN")
         self.assertEqual(findings[0].code, "TEMPORARY_OVERRIDE_ACTIVE")
 
+    def test_blank_literals_are_not_active_overrides(self):
+        for value in ('', '""', "''", '"  "', "null", "~", "'' # operator default"):
+            with self.subTest(value=value):
+                self.assertEqual(self.codes('env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: ' + value + '\n'), set())
+
+    def test_variable_mapping_with_blank_default_is_unknown_not_active(self):
+        for value in ("${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || '' }}",
+                      '${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || "" }}',
+                      '${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS }}'):
+            with self.subTest(value=value):
+                findings = audit_workflow_text('workflow.yml',
+                    'env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: ' + value + '\n')
+                self.assertEqual([(f.code, f.severity) for f in findings],
+                                 [('RUNTIME_OVERRIDE_UNVERIFIED', 'NOTICE')])
+
+    def test_nonempty_fallback_stays_visible_without_claiming_runtime_readback(self):
+        findings = audit_workflow_text('workflow.yml',
+            "env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ vars.TFB_SYNC_FORCE_REFETCH_SYMBOLS || 'BK.US' }}\n")
+        self.assertEqual(findings[0].code, 'TEMPORARY_OVERRIDE_ACTIVE')
+        self.assertEqual(findings[0].severity, 'WARN')
+        self.assertIn('runtime value is unverified', findings[0].detail)
+
+    def test_literal_expression_is_classified_without_evaluating_runtime(self):
+        self.assertEqual(self.codes("env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ '' }}\n"), set())
+        self.assertIn('TEMPORARY_OVERRIDE_ACTIVE',
+                      self.codes("env:\n  TFB_SYNC_FORCE_REFETCH_SYMBOLS: ${{ 'BK.US' }}\n"))
+
     def test_used_oidc_permission_is_not_flagged(self):
         text = """
 permissions:

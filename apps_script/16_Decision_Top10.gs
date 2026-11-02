@@ -1,11 +1,586 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.13.9 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.20.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.20.0 (2026-11-02) [TICKET-GUARD / KPI-PLAN-GAIN / VENUE-LINE] -- THREE GATES, DEFAULT OFF
+ * WHY (live review, Mon 2 Nov 2026 09:50 Riyadh; the 08:49:43 render read
+ * 'FEED ACTIONABLE -- EXECUTABLE (verdict age 367m) -- SELECTED -- 6
+ * EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN
+ * TODAY)'): six tickets -- ITRN.US 12,199 SAR, DDI.US 12,334, CRC.US 8,527,
+ * GLPI.US 12,133, EFC.US 11,467, INDV.US 12,335 = 68,995 SAR, 75 % of NAV.
+ * (a) CRC.US reports TODAY (Calendar_Events 0 days to earnings) and EFC.US
+ *   in 2 days, both funded: the v1.6.0 earnings tag is annotation-only by
+ *   design and the backend rule that entries avoid the pre-earnings window
+ *   was never built.
+ * (b) The owner's own rules (24 Oct): the first live execution is limited
+ *   to 1-2 tickets while evidence accumulates, and the interim buy rule is
+ *   Confidence High AND Engine ROI 12M < 34 % (v1.19.0 only marks seats).
+ *   The board issued 6 tickets.
+ * (c) The KPI 'Exp. Gain 12M (SAR)' read 56,203 SAR on 68,997 SAR deployed:
+ *   the sum of ticket x the compounded-annualised TP1 ROI (P-141). Every
+ *   advisor note already says the truth in the backend's '[f1b-observe]
+ *   gain ann-basis X SAR vs plan payoff Y SAR' tag: the plan payoffs add up
+ *   to 11,078 SAR (ticket x (TP1 / price - 1)). A 5x inflated KPI on the
+ *   decision page (owner, 1 Nov: 'avoid misleading').
+ * (d) The feed verdict (stamp 02:42:14+03:00) is honoured for 480 minutes,
+ *   i.e. until 10:42 Riyadh, while all six tickets are US listings whose
+ *   session opens 17:30 Riyadh (winter time). Nothing on the board said so.
+ * WHAT -- three Script Properties, each DEFAULT OFF; absent, blank or any
+ * other word = the v1.19.0 run byte for byte (cells, banner, B2 status
+ * line, KPI strip, _Run_Log and Logger lines, _Selection_Log rows, state
+ * blob); the only difference is four property reads in the refresh:
+ * (1) DT10_TICKET_GUARD = off | observe | enforce. Read once in
+ *   dt10RefreshDecisionTop10Run_ (dt10TicketGuardConfig_); only when armed
+ *   are its knobs read and payload._dt10_tguard attached:
+ *   DT10_GUARD_EARN_DAYS (integer, default 3, clamped 0..30),
+ *   DT10_GUARD_OWNER_RULE (exactly 'on'; default off) and
+ *   DT10_GUARD_MAX_TICKETS (integer, default 0 = no cap, clamped 0..50).
+ *   In dt10RenderPayload_, after the finalization, the live fill and the
+ *   earnings / post-earnings annotations and before the KPI strip,
+ *   dt10TicketGuardCore_ (pure) walks the EXECUTABLE tickets (Ticket SAR > 0,
+ *   shares > 0, not grace, not fast-track) in board order on an EXECUTABLE
+ *   feed; the first failing filter holds a ticket: earnings (0 <= days to
+ *   earnings <= DT10_GUARD_EARN_DAYS, from the v1.6.0 tagger's own
+ *   Calendar_Events map of the same render -- one read per render), owner
+ *   rule (only when armed: dt10OwnerRuleCell_ is not 'rule: yes' -- the
+ *   very predicate of the v1.19.0 Owner Rule column), cap (a ticket past
+ *   the first N survivors). observe: nothing changes in any cell; B2 gains
+ *   'tguard: would hold CRC.US(earn 0d) EFC.US(earn 2d)' (or 'would hold
+ *   none') and one Logger line. enforce: dt10TicketGuardApply_ sends each
+ *   held ticket through the EXISTING research / no-allocation path -- it is
+ *   marked _board_unfunded (the replay's own marker for a seat it did not
+ *   fund) and dt10FinalizeBoard_ runs again: Ticket SAR 0, shares 0, gains
+ *   0, entry / stop / TPs dashed, the research note, and every KPI
+ *   recomputed over the remaining tickets (Exp. Gain, Unallocated gains the
+ *   held SAR, Fundable Now, Selected, Blended Reliability / R-R, the meta
+ *   footer 'funding=final/Nexec', the cash-floor observation, the
+ *   candidate flags). Funds From then reads 'Held -- earnings in 0d' /
+ *   'Held -- owner rule' / 'Held -- ticket cap 2' and the Advisor Note gains
+ *   '[held: <reason>] ' in front of the research-context tags the
+ *   annotations had put on the ticket; every other seat's note is restored
+ *   byte for byte. The banner reads 'N EXECUTABLE TICKETS + ... + K HELD BY
+ *   GUARD' (the Selected KPI keeps the v1.19.0 vocabulary -- a held ticket
+ *   counts as research there, the words tfb_workbook_dq_audit parses); B2
+ *   gains 'tguard: held K (CRC.US earn 0d, EFC.US earn 2d)'. No ticket is
+ *   resized, no freed cash is redistributed (it shows as Unallocated), no
+ *   executable count can rise, no gate, score or verdict is recomputed.
+ * (2) DT10_KPI_PLAN_GAIN = off | on. Read once in the refresh
+ *   (dt10KpiPlanGainMode_). on: the KPI label 'Exp. Gain 12M (SAR)' becomes
+ *   'Exp. Gain TP1 (SAR)' and its value the plan payoff of the executable
+ *   tickets after the guard, sum Ticket SAR x (TP1 SAR / Price SAR - 1)
+ *   rounded to SAR (dt10KpiPlanGain_, pure; an em dash with no ticket). The
+ *   per-row 'Gain 12M SAR' column and payload.kpis are unchanged. The
+ *   marker DT10_KPI_PLAN_LABEL_STATE ('tp1', set before an armed render)
+ *   lets the first render after a rollback write the v1.19.0 label back
+ *   (then it is deleted); while the KPI gate is off the refresh reads it.
+ * (3) DT10_VENUE_LINE = off | on. Read once in the refresh
+ *   (dt10VenueLineOn_). on: when the feed is EXECUTABLE the banner gains
+ *   ' -- <venue> opens HH:MM Riyadh (feed valid until HH:MM)' for each venue
+ *   of the executable tickets whose next regular session opens after the
+ *   feed expires (dt10VenueLine_, pure; the expiry is the cockpit's own
+ *   clock: 480 minutes after the verdict stamp). DT10_VENUES, by symbol
+ *   suffix, APPROXIMATE (no holidays, half days or lunch breaks): US (.US /
+ *   no suffix) 09:30-16:00 New York = 17:30-00:00 Riyadh in winter,
+ *   16:30-23:00 in US summer time; Tadawul (.SR / four digits) 10:00-15:00
+ *   Sun-Thu; London (.L) 11:00-19:30 winter; Euronext (.PA .AS .BR .LS) and
+ *   Xetra (.DE) 11:00-19:30 winter (10:00-18:30 in EU summer time); Hong
+ *   Kong (.HK) 04:30-11:00; Tokyo (.T) 03:00-09:30; Mon-Fri elsewhere.
+ *   Display only.
+ * GATES: DT10_TICKET_GUARD off | observe | enforce (+ DT10_GUARD_EARN_DAYS,
+ *   DT10_GUARD_OWNER_RULE, DT10_GUARD_MAX_TICKETS); DT10_KPI_PLAN_GAIN off
+ *   | on; DT10_VENUE_LINE off | on. One property per evidence run: the KPI
+ *   and the venue line first (display only), then the guard in observe for
+ *   one render, then enforce; the owner rule and the cap only when the
+ *   owner wants his 1-2 ticket rule enforced by the board.
+ * Functions added (0 removed): dt10TicketGuardMode_, dt10TicketGuardConfig_,
+ * dt10TicketGuardExec_ (pure), dt10TicketGuardCore_ (pure),
+ * dt10TicketGuardToken_ (pure), dt10TicketGuardHeldCount_ (pure),
+ * dt10TicketGuardApply_, dt10TicketGuard_, dt10KpiPlanGainMode_,
+ * dt10KpiPlanLabelMark_, dt10KpiPlanGain_ (pure), dt10VenueLineOn_,
+ * dt10VenueOf_ (pure), dt10VenueSummer_ (pure), dt10VenueSession_ (pure),
+ * dt10RiyadhClock_ (pure), dt10VenueLine_ (pure). Changed:
+ * dt10SelectedTitle_ (the held-by-guard segment), dt10RenderPayload_ (the
+ * guard, the KPI pair, the venue line), dt10RefreshDecisionTop10Run_ (three
+ * gate reads, the payload keys, the label marker, one status token),
+ * dt10SelfTest (one line per gate). Vars added: DT10_TICKET_GUARD_PROP,
+ * DT10_GUARD_EARN_DAYS_PROP, DT10_GUARD_EARN_DAYS_DEF,
+ * DT10_GUARD_EARN_DAYS_MAX, DT10_GUARD_OWNER_RULE_PROP,
+ * DT10_GUARD_MAX_TICKETS_PROP, DT10_GUARD_MAX_TICKETS_MAX,
+ * DT10_TGUARD_TAGS_RE, DT10_TGUARD_LIVE_RE, DT10_KPI_PLAN_GAIN_PROP,
+ * DT10_KPI_PLAN_GAIN_LABEL, DT10_KPI_PLAN_LABEL_PROP, DT10_VENUE_LINE_PROP,
+ * DT10_VENUES.
+ * Harness: tests/test_dt10_v1200_ticket_guard.js (REAL file; golden
+ * negative on the v1.19.0 base rebuilt by reversing these edits, SHA-256
+ * pinned, or a base file given as the second argument; kill identity with
+ * the three properties absent / off / junk / faulted through the REAL
+ * render and the REAL refresh; the live board of 2 Nov; ES5/ASCII lint;
+ * inventory).
+ * ROLLBACK: set the three properties off (or delete them) with no re-paste
+ * (the next render writes the v1.19.0 KPI label back); or re-paste v1.19.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
+ *
+ * v1.19.0 (2026-11-01) [QUALIFIED-HOLD / SEAT-LIVE-FILL / OWNER-RULE] -- THREE GATES, DEFAULT OFF
+ * WHY (recommendation pages review, 31 Oct 2026, items R2.0 / R3.1 / R4.1):
+ * of the 258 board episodes since 1 Oct, 248 had exited, 225 of them within
+ * 3 days; 46 exits happened while the source row still read INVESTABLE /
+ * BUY with reliability >= 70 and DQ >= 80. Mechanism on this file: a seat
+ * is labelled GRACE whenever it is absent from the backend's sized
+ * `selected` list (`!rawSet[sym] || co > 0`), even when the audited grid
+ * still rates it INVEST inside the rank buffer -- the v1.14.0 qualified
+ * day that already keeps its miss clock at 0. GRACE suspends sizing and
+ * dt10BoardEligible_ excludes every GRACE seat, so a top-ranked qualified
+ * name (DDI.US, qualified #2, 'GRACE (0/3 missed)') was shown with no plan
+ * and never offered to the allocation replay. Grace seats absent from the
+ * audited grid rendered blank Rel / DQ / FX and a stale stash price (ZTO.US
+ * 19.88 while Global_Markets read 20.15, INVESTABLE / BUY, Rel 71.5, DQ
+ * 100). And the owner's interim buy rule (Confidence High AND Engine ROI
+ * 12M < 34 %) was visible nowhere on the board.
+ * WHAT -- three Script Properties, each DEFAULT OFF; absent, blank or any
+ * other word = the v1.18.0 run byte for byte (cells, status line, _Run_Log
+ * and Logger lines, _Selection_Log rows, state blob, knobs object):
+ * (1) DT10_QUALIFIED_HOLD = off | observe | enforce (R2.0). Read ONCE in
+ *   dt10ApplyStability_ (dt10StabQualifiedHoldMode_, the
+ *   dt10StabConfirmBasis_ pattern) into knobs.qualified_hold, set ONLY when
+ *   armed. In dt10StabCore_ a seat is HOLDABLE when it is a confirmed
+ *   member (ft !== true), absent from rawSet, co === 0, not outage-paused,
+ *   the basis is 'qualified' and dt10StabQualifiedWithin_ rates it INVEST
+ *   inside the rank buffer (the very test the counter pass applied).
+ *   observe: the stab note gains ', qhold: would hold N SYM ...' (up to 3
+ *   names, board order) and audit.qualified_held lists them; nothing else
+ *   moves. enforce: such a seat keeps 'ACTIVE (day n)' instead of 'GRACE
+ *   (0/n missed)', leaves the grace ledger ('N grace', held_by_grace), and
+ *   its ticket shell (dt10StabQualifiedHoldSeat_: the audited-row metrics
+ *   of the ghost, no _grace_hold, a countable _qhold marker, no plan) is
+ *   board-eligible, so dt10ReallocateBoard_ names it in
+ *   board_funding_symbols and the EXISTING replay decides; the note token
+ *   reads ', qhold: held N SYM ...'. Nothing here recomputes a gate, score
+ *   or verdict (section 8), lowers a threshold, adds a seat or sizes
+ *   anything: an unsized held seat finalizes as 'Research seat -- no
+ *   executable allocation today. ACTIVE (day n)' like any other unfunded
+ *   seat. Unconfirmed fast-track seats are never held (a fast-track seat
+ *   must not carry executable sizing under strict, v1.8.10). KNOWN LIMIT:
+ *   the backend's frozen snapshot carries only the research picks; a seat
+ *   the research pass deferred (sector / market cap, lot or floor, held
+ *   target, issuer dedup, price cross-check) is offered but cannot be sized
+ *   by the replay until the backend widens the snapshot.
+ * (2) DT10_SEAT_LIVE_FILL = off | on (R3.1). Read once in
+ *   dt10RefreshDecisionTop10Run_; when on, payload._dt10_live carries a
+ *   PURE index of the sheet pool rows the cockpit already collected
+ *   (dt10SeatLiveIndex_: Symbol -> Current Price, Forecast Reliability
+ *   Score, Data Quality Score, Currency, Investability Status) and the FX
+ *   map already read for the POST body; nothing new is fetched. After the
+ *   render's finalization dt10SeatLiveFillCore_ fills, on GRACE /
+ *   FAST-TRACK / held seats only, a blank Rel, DQ and FX (SAR = 1, else the
+ *   lookup rate through dt10HoldingFxRate_), replaces a ghost's stash price
+ *   with today's row price (audited grid row first, else the pool row) and
+ *   fills a blank or replaced Price SAR (grid price_sar, else price x FX at
+ *   2 dp); when the source row is investable (grid verdict INVEST, or
+ *   Investability Status INVESTABLE) the Advisor Note gains ' Source row
+ *   today: investable (...)'. Status, sizing, eligibility, clocks and the
+ *   state blob are untouched. Status token ' | live-fill k/n (m investable
+ *   at source)'. A NOT_ACTIONABLE feed still replaces the note cell with
+ *   the withhold text (v1.10.0); the numbers stay.
+ * (3) DT10_OWNER_RULE_MARK = off | on (R4.1). Read once in
+ *   dt10RefreshDecisionTop10Run_; when on, payload._dt10_rule is set and
+ *   the render appends ONE column after the seat block (after the v1.13.4
+ *   vintage columns when those are enforced; the same insertColumnsAfter
+ *   path), header 'Owner Rule', cell dt10OwnerRuleCell_(ticket): 'rule:
+ *   yes' when confidence_band is High (any case) AND engine_roi_pct <
+ *   DT10_OWNER_RULE_ROI_MAX (34), else 'rule: no (<band or conf unknown>;
+ *   ROI <x.x> or ROI unknown)' naming only the failing parts. Display only;
+ *   the withhold indices (<= 29), the LAYOUT_PRESERVE panel logic and every
+ *   existing column are untouched. Status token ' | owner-rule k/n yes'.
+ * Functions added (0 removed): dt10StabQualifiedHoldSeat_ (pure),
+ * dt10StabQualifiedHoldMode_, dt10SeatLiveFillOn_, dt10SeatLiveIndex_
+ * (pure), dt10SeatLiveFillCore_ (pure), dt10SeatLiveFill_,
+ * dt10OwnerRuleMarkOn_, dt10OwnerRuleCell_ (pure), dt10OwnerRuleNote_
+ * (pure). Changed: dt10StabCore_ (hold list, enforce branch, note token,
+ * audit key), dt10ApplyStability_ (one read), dt10RefreshDecisionTop10Run_
+ * (two reads, two status tokens), dt10RenderPayload_ (fill after
+ * finalization; the extra column), dt10SelfTest (three property lines,
+ * three 'core: ok' lines). Vars added: DT10_QUALIFIED_HOLD_PROP,
+ * DT10_SEAT_LIVE_FILL_PROP, DT10_OWNER_RULE_PROP, DT10_OWNER_RULE_ROI_MAX,
+ * DT10_OWNER_RULE_HEADERS.
+ * Harness: tests/test_dt10_v1190_hold_live_rule.js (REAL file; golden
+ * negative on the v1.18.0 base rebuilt by reversing these edits, SHA-256
+ * pinned, or a base file given as the second argument; kill identity with
+ * the three properties absent / off / junk / faulted through the pure
+ * core, dt10ApplyStability_, the REAL render and the REAL refresh;
+ * ES5/ASCII lint; inventory).
+ * Rollback: set the three properties off (or delete them) with no
+ * re-paste; or re-paste v1.18.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep. Operator order: observe the hold for several evidence runs
+ * and compare the 'would hold' names with the owner's judgement before
+ * enforce; one property per evidence run.
+ *
+ * v1.18.0 (2026-10-27) [POST-EARNINGS] -- THE BOARD SAYS WHEN A NAME HAS JUST REPORTED
+ * WHY (program register A4 part 2; FRST post-mortem P1): the first funded
+ * ticket (FRST.US, 26 Oct 2026) was bought two sessions after a 22% EPS miss
+ * (Q3 reported 22 Oct after the close; -4.1% and -3.7% on heavy volume the
+ * next sessions). Every calendar signal on this board looks FORWARD (v1.6.0
+ * '\u26a0 earnings \u2264Nd'); nothing showed that a seat had just reported,
+ * let alone missed. Calendar_Events now carries the last report
+ * (calendar_sync v1.2.0 with TFB_CAL_LAST_REPORT, calendar_provider v1.3.1
+ * and v1.3.2): Last Earnings Date | Days Since Earnings | EPS Surprise %.
+ * WHAT (only when Script Property DT10_POST_EARN is observe or on; absent,
+ * blank or anything else = off = v1.17.1 byte for byte): every SELECTED
+ * ticket whose symbol reported inside its quarantine gets
+ *   '\u26a0 post-earnings S/L \u00b7 EPS x% \u00b7 '
+ * on its Advisor Note - after the v1.6.0 forward tag when the note carries
+ * one (that tagger looks for its own prefix at position 0), else at the
+ * start - where S = trading sessions after the report date up to today
+ * (Riyadh calendar day; Mon-Fri, Sun-Thu for KSA symbols; exchange
+ * holidays not known) = the session an entry today would be, and L = 5, or
+ * 10 when the EPS surprise is negative (interim trading policy rule 3,
+ * program doc section 5). The report is the latest PAST date of Last
+ * Earnings Date and Next Earnings Date: the 08:07 morning render runs before
+ * the 08:15 calendar sync, so a name that reported after the previous close
+ * still shows its report as the Next Earnings Date (independent review of
+ * PR #855) - that case counts with its surprise unknown. A blank surprise is
+ * unknown -> 5; text surprises accept '%' and ','. Reports older than 31
+ * days are ignored (the session walk is bounded). One Calendar_Events read
+ * per render (A1 to the last column, at most 16), only when armed; any read
+ * fault -> no tag and the token 'post-earn n/a'. The status line gains
+ * 'post-earn \u26a0N/M' (tagged / selected) after the forward 'earn' token.
+ * A withheld row (feed NOT_ACTIONABLE) keeps both research prefixes, forward
+ * then post-earnings (dt10UvWithholdRow_; with no post-earnings tag on the
+ * note the kept prefix is the v1.17.1 one).
+ * OBSERVE ONLY on this board: nothing gates, blocks, resizes or re-ranks.
+ * Downstream, the daily brief (run_daily_brief v1.19.0) holds a tagged seat
+ * back from its executable picks and says so in one line, like its earnings
+ * line - interim rule 3; the v2 decision pages show the tag once 01_Menu
+ * reads it (register A12). Interim rule 3 stays a hand check at every
+ * GO/NO-GO until the enforce step (no new money for a tagged seat) ships
+ * after a week of observed tags. KSA names carry no last report today
+ * (EODHD has no Saudi coverage); only a past Next Earnings Date can tag one.
+ * Functions added (0 removed): dt10PostEarnMode_, dt10WeekdaysBetween_
+ * (pure), dt10PostEarnMapFromValues_ (pure), dt10PostEarnMap_,
+ * dt10ApplyPostEarnTags_ (pure), dt10PostEarnAnnotate_. Changed:
+ * dt10RenderPayload_ (one call after the forward tag), dt10UvWithholdRow_
+ * (keeps the new prefix), dt10SelfTest (new 'post-earnings core' line).
+ * Vars added: DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS,
+ * DT10_POST_EARN_SESSIONS_NEG, DT10_POST_EARN_MAX_DAYS.
+ * Harness: tests/test_dt10_post_earnings.js (REAL file; golden negative on
+ * the v1.17.1 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent / off / junk / faulted; ES5/ASCII lint;
+ * inventory).
+ * Rollback: DT10_POST_EARN off (or delete it) with no re-paste; or re-paste
+ * v1.17.1.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep.
+ *
+ * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM] -- THE CHALLENGER GETS ITS MOMENTUM INPUT
+ * WHY (first shadow day, 27 Oct 2026): the pre-registered challenger order
+ * (opportunity_builder v1.28.0, program register A2) breaks reliability-band
+ * ties by sector-relative momentum, read from momentum_score on each pool
+ * row. DT10_POOL_FIELDS never sent the 'Momentum Score' column, so the
+ * backend logged momentum=0/26 on every call that day and the first
+ * _Shadow_Rank_Log event (10:48 Riyadh) shows the challenger as the exact
+ * reverse of the champion (smaller engine ROI first inside one reliability
+ * band) -- not the order that was pre-registered. The column is filled on
+ * the pages (Global_Markets 6,605 of 6,611 rows, column BK). Same defect
+ * class as v1.6.1, v1.8.1 and v1.11.12: an input starved by the pool
+ * contract.
+ * WHAT: var DT10_SHADOW_POOL_FIELDS = [Momentum Score]. The per-execution
+ * pool projection (dt10PoolFieldsActive_ with no argument, memoized) appends
+ * it ONLY while DT10_SHADOW_RANK_LOG is on or all (dt10PoolFieldsWithShadow_;
+ * a send already in the list is never added twice). Off -> the very list
+ * object of v1.17.0: every header map, pool row and POST body is byte for
+ * byte unchanged. Under TFB_OPP_RANK_MODE=legacy the builder never reads the
+ * field; under shadow it feeds only the challenger's second key, so the live
+ * order, gates, verdicts, sizing and funding are unchanged either way. The
+ * mode is read ONCE per execution (memo 'shadow_log_mode') and the log
+ * written after the POST (dt10AppendShadowRankLog_) reuses it, so a property
+ * flipped mid-run cannot log a day whose rows went without momentum. The
+ * send follows the LOG switch, not TFB_OPP_RANK_MODE: with the log off and
+ * the backend in shadow the challenger runs without momentum (harmless while
+ * enforce is reserved); the promotion PR must send it whenever the backend
+ * ranks by it. (Independent review before merge, 27 Oct: mode read once,
+ * self-test memo swap in try/finally, field-count-proof self-test check.)
+ * SECTION 8 KEPT: the value is the engine's own sheet column, sent as is.
+ * Functions added (0 removed): dt10PoolFieldsWithShadow_. Changed:
+ * dt10PoolFieldsActive_ (the memoized no-argument branch only),
+ * dt10AppendShadowRankLog_ (the memoized mode when the projection ran),
+ * dt10SelfTest ('property memo core' counts the armed field; new 'shadow
+ * pool fields core'). Var added: DT10_SHADOW_POOL_FIELDS.
+ * Harness: tests/test_dt10_shadow_momentum.js (REAL file; golden negative on
+ * the v1.17.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent / off / junk; the builder alias read from
+ * core/analysis/opportunity_builder.py; ES5/ASCII lint; inventory).
+ * Rollback: DT10_SHADOW_RANK_LOG off stops the send (and the log) with no
+ * re-paste; or re-paste v1.17.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep. Days logged without momentum (27 Oct) are not counted by the
+ * nightly scorecard (score_selection_log v1.2.1).
+ *
+ * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG] -- THE RANKING CHALLENGER, LOGGED
+ * WHY (October review + first nightly scorecard, 27 Oct 2026): the live
+ * order of the INVEST pool does not predict outcomes (engine ROI vs excess
+ * Spearman -0.38 in October, -0.17 since 1 Sep; names at the ROI cap beat
+ * their sector/venue reference 34-35% of the time vs 53-61% below it).
+ * opportunity_builder v1.28.0 (TFB_OPP_RANK_MODE=shadow, program register A2)
+ * computes a second, pre-registered order of the same pool and publishes it
+ * in meta.rank_challenger (champion and challenger top 10) plus shadow_rank
+ * on the INVEST audit rows and tickets. Nothing in the workbook recorded it,
+ * so the nightly scorecard could not compare the two orders on the same days.
+ * WHAT: Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT: one property
+ * read and nothing else -- no tab, no write, no status token; every render is
+ * v1.16.0 byte for byte) | on | all. When armed and the payload carries
+ * meta.rank_challenger without an error, dt10AppendShadowRankLog_ appends one
+ * event to the hidden tab _Shadow_Rank_Log (created on first use): CHAMPION
+ * rows (the backend's live order, top 10), CHALLENGER rows (the shadow order,
+ * top 10) and BOARD rows (the seats this render shows: board rank, seat class,
+ * and the shadow rank when the name is in today's INVEST pool). Columns:
+ * Logged At, Day (UTC key), Cohort (source run), Order, Rank, Symbol, Market,
+ * Sector, Seat, Live Rank, Shadow Rank, Engine ROI %, Rel, Conf, Momentum,
+ * Strength, Strength Ref, Cap, Floor OK, Mode, Rule, Builder, Pool, Overlap
+ * Top5 (Rule and Builder written as 'v1.0' / 'v1.28.0' so Sheets cannot turn
+ * them into numbers or dates). Cadence: 'on' = the first event of each UTC
+ * day only -- exactly what the nightly scorecard reads, about 30 rows a day;
+ * 'all' = also whenever an order changes (audit trail, about 180 rows a day;
+ * the workbook's cell budget is why it is not the default). State
+ * DT10_SHADOW_LOG_STATE_V1. Row 1 must be the header: it is written whenever
+ * row 1 is blank (new, emptied or cleared tab; a first run cut short after
+ * the tab was created) and a tab whose row 1 carries another layout is never
+ * written ('ERROR header mismatch at column N'). Rows are added before a write
+ * that would pass the grid. Creating the tab drops its two unused columns,
+ * hides it and returns the view to Top_10_Investments. The status line gains
+ * ' | ShadowLog: +N' / 'logged today' / 'unchanged' / 'none (<reason>)' /
+ * 'ERROR ...' only when armed. The log holds ranks, symbols and the backend's
+ * own figures -- no ticket, price or amount -- so it is research evidence,
+ * never an order sheet. (Review before merge, 27 Oct: header on an empty tab,
+ * cadence default, text-safe version cells, view and grid handling.)
+ * SECTION 8 KEPT: nothing is ranked, scored or gated here; both orders are the
+ * backend's. _Selection_Log is untouched (schema and cadence).
+ * Functions added (0 removed): dt10ShadowLogMode_, dt10ShadowLogRows_,
+ * dt10AppendShadowRankLog_. Changed: dt10RefreshDecisionTop10Run_ (the
+ * refreshDecisionTop10 body: one call after the exit log; shadowNote in the
+ * final status line), dt10SelfTest ('shadow rank log core'). Vars added:
+ * DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET,
+ * DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS.
+ * Harness: tests/test_dt10_shadow_rank_log.js (REAL file; golden negative on
+ * the v1.16.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent; ES5/ASCII lint; inventory).
+ * Rollback: delete DT10_SHADOW_RANK_LOG (no re-paste) or re-paste v1.16.0;
+ * 'all' -> 'on' stops the on-change rows.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ * lockstep. Arm after the backend runs TFB_OPP_RANK_MODE=shadow.
+ *
+ * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE] -- THE BROKER PACKET CERTIFIES THE REQUEST
+ * WHY (Monday 26 Oct 2026, the first 3/3 board): FRST.US, ZTO.US and CRC.US
+ * confirmed ACTIVE (day 3) and the board rendered them UNSIZED -- Ticket 0
+ * SAR, Shares 0, Entry/Stop/TP '--', 'Research seat -- no executable
+ * allocation today', funding=final/0exec, EXECUTABLE 0 of 10. Trace: the
+ * allocate replay (dt10ReallocateBoard_) POSTs the same body as the first
+ * request; the backend's allocate stage (opportunity_builder
+ * _portfolio_input_assessment -> core/portfolio_reconciliation
+ * certify_portfolio_inputs) withholds executable funding unless
+ * portfolio.reconciliation_evidence is a fresh (<= 900 s) broker packet
+ * whose certified cash equals cash_available_sar to the cent, whose FX
+ * proofs equal the request's fx_rates, whose positions link to every
+ * holding row sent, and holdings_input_incomplete is false. This file
+ * forwarded the document property TFB_PORTFOLIO_RECONCILIATION_EVIDENCE_V1
+ * (v1.11.x) but nothing wrote it ('Nothing writes it today', 14 Oct), the
+ * cash came from the Top_10 panel (82,819.20, before the day's BUY
+ * reservation), fx_rates.USD came from TFB_FX_LOOKUP (3.7448, not the 3.75
+ * peg the proof declares) and the Sukuk row 5023.SR (Tadawul custody) can
+ * never link to an IBKR position. The executable funding path had never
+ * been exercisable in production; it surfaced on the first 3/3 day.
+ * WHAT: Script Property DT10_FUNDING_EVIDENCE = off (DEFAULT: the request
+ * body, the status line and every render are v1.15.0 byte for byte) | on.
+ * When on, after the holdings and cash-source blocks build the body,
+ * dt10FundingApply_ reads the packet 10_My_Portfolio v1.5.16 publishes
+ * (PD_IBKR_EVIDENCE_PUBLISH=on, from the read-only IBKR capture the
+ * 08:30-10:30 watcher consumes) and the PURE dt10FundingApplyCore_ applies
+ * it IN PLACE when, and only when, every check holds: schema 1, captured_at
+ * with an explicit offset, age 0..840 s (the backend's 900 s less a 60 s
+ * request margin), holdings sent (DT10_SEND_HOLDINGS) and read complete,
+ * FX proofs readable at 2 decimals. Then: rows whose Symbol is in
+ * PD_EXECUTION_EXCLUDE (the same property 10_My_Portfolio uses; 5023.SR)
+ * leave the funding cohort; holding_links are rebuilt for THIS request's
+ * rows (native symbol + currency, each positive packet position must be
+ * represented -- the backend decides, the note discloses); cash_available_sar
+ * becomes the packet's certified cash (settled - reserved) x proven rate,
+ * integer cents, round half-even exactly as the backend compares it;
+ * pending_proceeds_sar = 0; fx_rates gains the proven rates (USD 3.75) and a
+ * kept row with a proven currency, a quantity and a price has value_sar
+ * recomputed at that rate (the backend's price x fx x quantity check). The
+ * allocate replay deep-copies the applied body, so one apply covers both
+ * stages. Any failed check leaves the body untouched and the status line
+ * says ' | funding evidence NOT APPLIED (<reason>)'; success says
+ * ' | funding evidence APPLIED (capture age Nm; cash X SAR; linked a/b;
+ * excluded ...; USD 3.75)'. The packet is never logged or rendered.
+ * ORDER: the backend's 900 s window means Top_10 must render within ~14 min
+ * of the capture: 10_My_Portfolio v1.5.16's watcher arms a one-off
+ * follow-up render after it publishes (chain-style guards). SECTION 8 KEPT:
+ * no gate, score or verdict is recomputed here; sizing stays the backend's.
+ * Functions added (0 removed): dt10FundingMode_, dt10FundingExcludeList_,
+ * dt10FundingSym_, dt10FundingUnits_, dt10FundingDiv_, dt10FundingAge_,
+ * dt10FundingNative_, dt10FundingRates_, dt10FundingCashCents_,
+ * dt10FundingLinks_, dt10FundingDecimal_, dt10FundingValueSar_,
+ * dt10FundingApplyCore_,
+ * dt10FundingNote_, dt10FundingApply_. Changed: refreshDecisionTop10 (one
+ * call after the cash block; fundingNote in the status line), dt10SelfTest
+ * ('funding evidence core'). Vars added: DT10_FUNDING_PROP,
+ * DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS,
+ * DT10_FUNDING_SAFE. Harness: tests/test_dt10_funding_evidence.js (REAL
+ * file; golden negative on the v1.15.0 base; kill identity with the property
+ * absent; ES5/ASCII lint). Rollback: delete DT10_FUNDING_EVIDENCE (no
+ * re-paste) or re-paste v1.15.0. ES5; ASCII; all prior WHYs verbatim;
+ * DT10_VERSION and the header bumped in lockstep. Arming is an owner step
+ * AFTER the first funded ticket of 26 Oct 2026 is recorded.
+ *
+ * v1.15.0 (2026-10-25) [PENDING-GRACE] -- A SOFT MISS PAUSES A PENDING COUNT
+ * WHY (owner, 24-25 Oct 2026): a challenger confirmed on days 1-2 that fails
+ * ONE criteria day (still on the audited grid, no structural block, not a
+ * hard-out verdict, inside the rank buffer, but DO_NOT_INVEST because a
+ * floor was missed) had its count reset to 0 by dt10StabCore_'s
+ * `else { st.ci = 0; ... }` -- the same branch a hard exit uses. Live case,
+ * 25 Oct 08:10 board (first run on the 2026-10-25 epoch): PHP.L sat at 1/3
+ * on 24 Oct with reliability 71.5 / DQ 100; on 25 Oct -- a weekend, no LSE
+ * session, price unchanged at 92.05 -- its Expected ROI 3M read 8.13% (<12%)
+ * and the name fell to GRACE with its count gone. Members already enjoy this
+ * tolerance ('plain DO_NOT_INVEST criteria-misses ARE grace-holdable', exit
+ * clock, v1.2.0); challengers did not. The owner asked (24 Oct 19:32) for a
+ * rule that does not restart a positive name's count on one such day.
+ * WHAT: Script Property TFB_T10_PENDING_GRACE_DAYS (integer 0..5; default
+ * absent/0/junk = v1.14.0 clocks byte for byte). When > 0, on a day-advance
+ * a NON-member with ci > 0 that is absent from raw and not qualifiedWithin
+ * but is a SOFT MISS (dt10StabSoftMiss_: audited row present, verdict not
+ * INVEST, structural_block !== true, not hardOut, global rank inside the
+ * rank buffer) keeps ci and increments st.cp (consecutive pending-grace
+ * days); the day's score point is still recorded. Once cp would exceed the
+ * grace, the v1.14.0 reset applies (ci 0, cp cleared). Any raw or qualified
+ * day clears cp. Members, hard exits, outage pauses, seating (still needs a
+ * raw ticket), fast-track, displacement, capacity and sizing are unchanged.
+ * SECTION 8 KEPT: no gate, score or verdict is recomputed -- the soft miss is
+ * read from the backend's own audited row (verdict + structural_block + rank).
+ * SURFACE: status note gains ', pgrace=<n>' and ', pheld <k> SYM(ci/n) ...'
+ * (up to 3) only when the property is armed; audit gains `pending_held`
+ * only when armed; the state blob writes `cp` only while > 0 (a blob that
+ * never paused is byte-identical). dt10SelfTest gains 'pending grace core'.
+ * Functions added (0 removed): dt10StabSoftMiss_, dt10StabPendingGrace_;
+ * var added: DT10_T10_PENDING_GRACE_PROP.
+ * Harness: tests/test_dt10_pending_grace.js (REAL file; golden negative on
+ * the v1.14.0 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * identity with the property absent/0; ES5/ASCII lint; inventory).
+ * Rollback: delete the property (no re-paste) or re-paste v1.14.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep. Arming is an owner step AFTER the first funded ticket of
+ * 26 Oct 2026 (the Monday path runs on v1.14.0 clocks).
+ *
+ * v1.14.0 (2026-10-24) [CONFIRM-BASIS] -- QUALIFIED DAYS COUNT TOWARD CONFIRMATION
+ * WHY (owner, 24 Oct 2026): a stock that qualifies on day 1 and day 2 is
+ * pushed out of the backend's raw top-10 on day 3 by a higher-ranked
+ * newcomer. It is still INVEST on the audited grid, only ranked lower, yet
+ * its confirmation count fell to 0 and it had to start over. Live trail:
+ * the 22 Oct board seated XIOR.BR, GBCI.US and PINE.US at FAST-TRACK 1/3;
+ * on the 24 Oct advance none of them was in the raw set and every count
+ * read 0 again (those three had also left INVEST, so the rule below would
+ * not have kept them; it keeps a name that stays INVEST inside the
+ * buffer). Mechanism, pinned on v1.13.11: the dt10StabCore_ counter pass
+ * advances ci only for a symbol present in rawSet (payload.selected, the
+ * sized top-N); any other day-advance sets ci = 0, and for a member only
+ * the exit clock honours the rank buffer (pause). Confirmation was keyed
+ * to the sized list, not to qualification.
+ * WHAT: Script Property TFB_T10_CONFIRM_BASIS, read ONCE in
+ *   dt10ApplyStability_ (dt10StabConfirmBasis_, the dt10HardVerdictStrict_
+ *   pattern: the service read stays outside the pure core) into
+ *   knobs.confirm_basis. 'qualified' (DEFAULT, owner decision 2026-10-24)
+ *   | 'raw' (legacy). Anything else, blank or a service fault reads as
+ *   'qualified'. Under 'raw' every clock, label, note and state byte is
+ *   v1.13.11.
+ * (a) new PURE dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs,
+ *   hardOut): the symbol has an audited row whose verdict is exactly
+ *   INVEST (any case), no structural_block, not hardOut, and its
+ *   opportunity-score rank across the deduped audited grid is <= 'T10:
+ *   Stability Rank Buffer' (> 0) -- the SAME window the exit-clock pause
+ *   has used since v1.3.0 (rank <= buffer, default 15), so the panel knob
+ *   keeps one meaning.
+ * (b) counter pass, day-advance, not outage-paused: when the symbol is NOT
+ *   in rawSet and knobs.confirm_basis === 'qualified' and (a) holds, the
+ *   day counts exactly like a raw sighting: ci + 1, co = 0, score point
+ *   recorded. Otherwise the v1.13.11 branch runs unchanged (ci = 0; a
+ *   member pauses inside the buffer or takes a miss). Members benefit the
+ *   same way: a GRACE or FAST-TRACK seat still INVEST inside the buffer
+ *   has co reset and ci advanced instead of a pause, so a fast-track seat
+ *   can graduate on a qualified day (its label that day stays GRACE, ghost
+ *   path, sizing suspended -- no raw ticket, no sizing).
+ * (c) NOT changed: seating. Entry as 'NEW (confirmed n/n)' still requires
+ *   presence in rawSyms (a sized ticket); fast-track fills only from
+ *   rawSyms; displacement, capacity, hard/soft exit and every label are
+ *   v1.13.11. The rule applies to symbols already tracked in the state
+ *   blob (members and past raw sightings inside the 14-day prune window);
+ *   a symbol never seen in raw is not tracked and accrues nothing.
+ * (d) Read-back: under 'qualified' the stab note gains ', confirm=qualified'
+ *   and, when a non-raw challenger inside the buffer has ci > 0, ', near
+ *   <k> SYM(ci/confirm_days) ...' (up to 3, the 'pending' style). Under
+ *   'raw' no token is added (byte-identical note).
+ * (e) dt10SelfTest gains 'confirm basis (TFB_T10_CONFIRM_BASIS): ...' and
+ *   the pure battery 'confirm basis core: ok' (raw replay identity; day-1/2
+ *   raw, day-3 qualified at rank 12 -> ci 3, day-4 seated NEW 3/3 with the
+ *   raw ticket's sizing; WATCH -> 0; rank buffer + 1 -> 0; buffer 0 ->
+ *   legacy; GRACE member -> co 0, ci advanced).
+ * Functions added (0 removed): dt10StabQualifiedWithin_,
+ * dt10StabConfirmBasis_; var added: DT10_T10_CONFIRM_BASIS_PROP.
+ * Harness: tests/test_dt10_confirm_basis.js (REAL file; golden negative on
+ * the v1.13.11 base rebuilt by reversing these edits, SHA-256 pinned; kill
+ * deep-equal; ES5/ASCII lint; inventory). Rollback: Script Property
+ * TFB_T10_CONFIRM_BASIS = raw (no re-paste) or re-paste v1.13.11.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
+ *
+ * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)
+ * WHY (21 Oct 2026, Apps Script execution log): the automatic Top-10
+ * refresh that followed the first decision-feed release logged 'upstream
+ * verdict: EXECUTABLE; final board: HELD' at 23:48:42 Riyadh and was
+ * killed at 23:50:59 ('Exceeded maximum execution time') before it wrote
+ * its status line. B2 stayed 'running', the next scheduled release check
+ * read T10_STATUS_NOT_OK and withdrew the release (decision_failed). The
+ * 19:40 run was killed the same way; completed runs took 127-232 s. The
+ * render painted formats cell by cell: one setBackground per zebra row in
+ * dt10WriteTable_, and setBackground + setFontColor + setFontWeight per
+ * coloured cell in dt10ColorVerdicts_, dt10ColorQualified_ and
+ * dt10ColorStability_ -- about 1,750 range calls for the 500-row CANDIDATES
+ * grid alone, each one slower while other scripts write the workbook.
+ * WHAT: the same formats are written in bulk. dt10WriteTable_ reads the
+ * body backgrounds once, sets the zebra rows and writes them back once.
+ * The three colourers build one token per row and call the new
+ * dt10BulkPaint_, which reads backgrounds, font colours and font weights
+ * once, sets tok.bg / tok.fg / bold on the token rows and writes each
+ * attribute once (nothing is read or written when no row has a token).
+ * Rows the old loops left alone keep their current format (read back and
+ * written unchanged), so the painted board is the same. Values, verdicts,
+ * withholding, funding, stability, receipts and the status line are
+ * unchanged. Harness: tests/js/dt10_bulk_format.test.js (cell-model
+ * equivalence against the v1.13.10 code, bounded call counts).
+ *
+ * v1.13.10 (2026-10-20) -- HOLDING SUBUNIT FX, NO NATIVE-AS-SAR, FAILED STATE
+ * (1) dt10HoldingFromRow_ upper-cased the currency before the FX lookup, so
+ * a GBp (pence) holding converted at the GBP rate (100x too large). The new
+ * dt10HoldingFxRate_ mirrors opportunity_builder._resolve_fx (USX gate off):
+ * GBX/GBp, ZAC/ZAc, ILA/ILa are detected on the RAW token and use an exact
+ * raw FX key, else parent / 100. USX keeps needing its own 'USX' FX row.
+ * (2) A currency with no FX rate kept its NATIVE value labelled value_sar.
+ * It now sends value_sar null and marks holdings_input_incomplete, so
+ * funding stays withheld; the builder never sums a native amount as SAR.
+ * (3) refreshDecisionTop10 wrote 'running...' and a throw left it there
+ * (20 Oct: cockpit stuck RUNNING, no grid, validation failed). The body is
+ * now dt10RefreshDecisionTop10Run_; on a throw dt10RefreshFailed_ writes
+ * 'status: FAILED | failed_at_utc=<ISO Z> | <error>', upserts _Status ERROR,
+ * clears the P-195 marker this run stored (a throw before the marker check
+ * leaves a previous run's marker for ABORTED_PREV) and rethrows. The
+ * freshness audit reads FAILED as T10_STATUS_NOT_OK. LIMIT: an Apps Script
+ * hard timeout (6 min) kills the script without running catch; that case
+ * still shows RUNNING and is reported by the next run's P-195 ABORTED_PREV
+ * row.
  *
  * v1.13.9 (2026-10-14) -- ENTERED CASH LABEL AND HOLDING UTC PROVENANCE
  * The cash KPI echoes an entered amount and cannot certify custody or
@@ -1757,7 +2332,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.13.9';
+var DT10_VERSION = '1.20.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2621,6 +3196,65 @@ var DT10_STAB_DEF_BUFFER = 15;    // audit-grid rank <= buffer pauses exit clock
 var DT10_STAB_DEF_SMOOTH = 5;     // score-history window (days)
 var DT10_STAB_TREND_EPS = 2.0;    // |first-last| below this = 'steady'
 var DT10_STAB_PRUNE_DAYS = 14;    // drop non-member entries unseen this long
+// v1.14.0 [CONFIRM-BASIS]: which days count toward entry confirmation --
+// see the v1.14.0 header block. 'qualified' (default) | 'raw' (v1.13.11).
+var DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';
+// v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances a NON-member
+// challenger with ci > 0 may absorb without its count resetting -- see the
+// v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.
+var DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';
+var DT10_T10_PENDING_GRACE_MAX = 5;
+// v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
+// that the audited grid still rates INVEST inside the rank buffer -- see the
+// v1.19.0 header block. off (default) | observe | enforce.
+var DT10_QUALIFIED_HOLD_PROP = 'DT10_QUALIFIED_HOLD';
+// v1.19.0 [SEAT-LIVE-FILL]: live price / Rel / DQ / FX on grace, fast-track
+// and held seats from today's pool or grid row. off (default) | on.
+var DT10_SEAT_LIVE_FILL_PROP = 'DT10_SEAT_LIVE_FILL';
+// v1.19.0 [OWNER-RULE]: the owner's interim buy rule shown per seat
+// (Confidence High AND Engine ROI 12M < DT10_OWNER_RULE_ROI_MAX). Display
+// only; off (default) | on. The column rides after the seat block.
+var DT10_OWNER_RULE_PROP = 'DT10_OWNER_RULE_MARK';
+var DT10_OWNER_RULE_ROI_MAX = 34;
+var DT10_OWNER_RULE_HEADERS = ['Owner Rule'];
+// v1.20.0 [TICKET-GUARD]: executable tickets held back from today's plan
+// (earnings window, the owner's rule, a ticket cap) through the existing
+// research path -- see the v1.20.0 header block. off (default) | observe |
+// enforce; the three knobs are read only while the guard is armed.
+var DT10_TICKET_GUARD_PROP = 'DT10_TICKET_GUARD';
+var DT10_GUARD_EARN_DAYS_PROP = 'DT10_GUARD_EARN_DAYS';
+var DT10_GUARD_EARN_DAYS_DEF = 3;
+var DT10_GUARD_EARN_DAYS_MAX = 30;
+var DT10_GUARD_OWNER_RULE_PROP = 'DT10_GUARD_OWNER_RULE';
+var DT10_GUARD_MAX_TICKETS_PROP = 'DT10_GUARD_MAX_TICKETS';
+var DT10_GUARD_MAX_TICKETS_MAX = 50;
+// The research-context tags a held note keeps: the forward / post-earnings
+// prefix (the dt10UvWithholdRow_ pattern) and the v1.19.0 live-fill suffix.
+var DT10_TGUARD_TAGS_RE = /^((?:\u26a0 earnings \u2264\d+d \u00b7 )?(?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?)/;
+var DT10_TGUARD_LIVE_RE = / Source row today: investable \((?:INVEST on the audited grid|Investability Status INVESTABLE)\)\.$/;
+// v1.20.0 [KPI-PLAN-GAIN]: the KPI pair 'Exp. Gain TP1 (SAR)' = the plan
+// payoff of the executable tickets. off (default) | on. The marker records
+// an armed relabel so the render after a rollback writes the label back.
+var DT10_KPI_PLAN_GAIN_PROP = 'DT10_KPI_PLAN_GAIN';
+var DT10_KPI_PLAN_GAIN_LABEL = 'Exp. Gain TP1 (SAR)';
+var DT10_KPI_PLAN_LABEL_PROP = 'DT10_KPI_PLAN_LABEL_STATE';
+// v1.20.0 [VENUE-LINE]: the banner names a venue that opens after the feed
+// expires. off (default) | on. Regular sessions: venue-local minutes after
+// midnight, the standard UTC offset in minutes, the summer-time rule ('us':
+// second Sunday of March to the first Sunday of November; 'eu': last Sunday
+// of March to the last Sunday of October; +60 inside it) and the trading
+// week (Sun-Thu for Tadawul, else Mon-Fri). APPROXIMATE: no holidays, half
+// days, lunch breaks or auctions.
+var DT10_VENUE_LINE_PROP = 'DT10_VENUE_LINE';
+var DT10_VENUES = {
+  US: { name: 'US', open: 570, close: 960, utc: -300, dst: 'us', sunThu: false },
+  SR: { name: 'Tadawul', open: 600, close: 900, utc: 180, dst: '', sunThu: true },
+  L: { name: 'London', open: 480, close: 990, utc: 0, dst: 'eu', sunThu: false },
+  EU: { name: 'Euronext', open: 540, close: 1050, utc: 60, dst: 'eu', sunThu: false },
+  DE: { name: 'Xetra', open: 540, close: 1050, utc: 60, dst: 'eu', sunThu: false },
+  HK: { name: 'Hong Kong', open: 570, close: 960, utc: 480, dst: '', sunThu: false },
+  T: { name: 'Tokyo', open: 540, close: 930, utc: 540, dst: '', sunThu: false }
+};
 // v1.11.10 [P-168]: outage pause -- see the v1.11.10 header block.
 var DT10_P168_MAX_PAUSE_DAYS = 5;         // consecutive paused day-advances
 var DT10_P168_OUTAGE_RE = /fetch_failed/i; // engine tag family on 'Warnings'
@@ -2884,6 +3518,15 @@ var DT10_POOL_EVIDENCE_TOKENS = {
 /** v1.11.12 [P-181b]: the four sends the kill switch removes. */
 var DT10_P181B_SENDS = { '52W High': true, '52W Low': true,
                          '52W Position %': true, 'Percent Change': true };
+/** v1.17.1 [SHADOW-MOMENTUM]: the ranking challenger's inputs that ride on
+ * the pool row ONLY while the shadow rank log is armed (DT10_SHADOW_RANK_LOG
+ * on/all; dt10PoolFieldsWithShadow_). opportunity_builder v1.28.0 reads
+ * momentum_score (alias 'momentumscore') only under TFB_OPP_RANK_MODE
+ * shadow/enforce, for the challenger's second key; the live order never
+ * reads it. */
+var DT10_SHADOW_POOL_FIELDS = [
+  { send: 'Momentum Score', match: ['momentumscore'] }
+];
 /** v1.11.13 [P-202]: per-execution memo for Script Property reads that sit
  * on per-row paths. Apps Script gives each execution a fresh global scope,
  * so this object lives exactly one run; refreshDecisionTop10 also resets it
@@ -2917,7 +3560,14 @@ function dt10W52FieldsLegacy_() {
 function dt10PoolFieldsActive_(legacy) {
   if (legacy === undefined) {   // v1.11.13 [P-202]: ONE list per execution
     return dt10PropMemoGet_('pool_fields_active', function () {
-      return dt10PoolFieldsActive_(dt10W52FieldsLegacy_());
+      // v1.17.1 [SHADOW-MOMENTUM]: + the challenger's inputs while the shadow
+      // rank log is armed; off -> the v1.17.0 list (the same object). The
+      // mode is read once and kept for this execution: the log written after
+      // the POST (dt10AppendShadowRankLog_) uses the same value.
+      var shadowMode = dt10PropMemoGet_('shadow_log_mode', dt10ShadowLogMode_);
+      return dt10PoolFieldsWithShadow_(
+          dt10PoolFieldsActive_(dt10W52FieldsLegacy_()),
+          shadowMode !== 'off');
     });
   }
   var leg = !!legacy;
@@ -2951,6 +3601,23 @@ function dt10FindHeaderRow_(values, scanRows) {
     if (hasSymbol && hasSecond) return r;
   }
   return -1;
+}
+/** v1.17.1 [SHADOW-MOMENTUM] PURE: `fields` plus DT10_SHADOW_POOL_FIELDS
+ * when `armed`; `fields` itself (the same array) when not, so an unarmed
+ * projection is the v1.17.0 list object. A send already present is not
+ * added again. Never mutates `fields`. */
+function dt10PoolFieldsWithShadow_(fields, armed) {
+  if (!armed) return fields;
+  var out = fields.slice();
+  var have = {};
+  for (var i = 0; i < out.length; i++) have[out[i].send] = true;
+  for (var j = 0; j < DT10_SHADOW_POOL_FIELDS.length; j++) {
+    if (!have[DT10_SHADOW_POOL_FIELDS[j].send]) {
+      out.push(DT10_SHADOW_POOL_FIELDS[j]);
+      have[DT10_SHADOW_POOL_FIELDS[j].send] = true;
+    }
+  }
+  return out;
 }
 /** Map DT10_POOL_FIELDS → column index from a header row array; null=absent */
 function dt10MapHeaderCols_(headerRow) {
@@ -3054,6 +3721,31 @@ function dt10PoolRowFromSheetRow_(row, colMap, pageName) {
 function dt10NormSym_(v) {
   return String(v === null || v === undefined ? '' : v).trim().toUpperCase();
 }
+/** v1.13.10 PURE: SAR per unit of a holding's native currency cell, mirroring
+ * opportunity_builder._resolve_fx with TFB_OPP_FX_USX_SUBUNIT off (default).
+ * Subunits are detected on the RAW token BEFORE case folding ('GBp' would
+ * otherwise fold into pounds): GBX/GBp, ZAC/ZAc, ILA/ILa (and gbx/zac/ila
+ * spellings) are 1/100 of GBP/ZAR/ILS. An exact raw key in the map wins
+ * (already per subunit); otherwise the parent rate / 100. USX is not folded
+ * here (its gate is backend-only and DEFAULT OFF): it needs its own 'USX'
+ * row, as before. Returns null for SAR/blank (no conversion), NaN when no
+ * rate exists, else the positive rate. */
+var DT10_FX_SUBUNIT_PARENT = { GBp: 'GBP', GBX: 'GBP', ZAC: 'ZAR', ZAc: 'ZAR',
+                               ILA: 'ILS', ILa: 'ILS' };
+function dt10HoldingFxRate_(cell, fx) {
+  var raw = String(cell === null || cell === undefined ? '' : cell).trim();
+  var up = raw.toUpperCase();
+  if (!raw || up === 'SAR') return null;
+  fx = fx || {};
+  var exact = Number(fx[raw]);
+  if (isFinite(exact) && exact > 0) return exact;
+  var parent = Object.prototype.hasOwnProperty.call(DT10_FX_SUBUNIT_PARENT, raw) ?
+      DT10_FX_SUBUNIT_PARENT[raw] :
+      (up === 'GBX' || up === 'ZAC' || up === 'ILA') ? DT10_FX_SUBUNIT_PARENT[up] : '';
+  var rate = Number(fx[parent || up]);
+  if (!(isFinite(rate) && rate > 0)) return NaN;
+  return parent ? rate / 100 : rate;
+}
 /** v1.5.0 (Fix H1) PURE: one My_Portfolio sheet row -> holdings entry for
  * the builder's Portfolio gate, or null. Exclusion needs symbol only;
  * sector/value are best-effort context for the builder's sector-cap math.
@@ -3075,19 +3767,20 @@ function dt10HoldingFromRow_(row, iSym, iSec, iVal, extra) {
   }
   extra = extra || {};
   // v1.11.4 [P-78]: a NATIVE value converts to SAR when the caller supplies a
-  // currency column and an FX map (SAR per unit). SAR rows, rows without a
-  // currency and currencies missing from the map keep the native value.
+  // currency column and an FX map (SAR per unit). SAR rows and rows without a
+  // currency keep the native value. v1.13.10: subunits resolve on the RAW
+  // token and a currency missing from the map sends value_sar null and
+  // marks the row _input_incomplete instead of a native amount labelled SAR.
   if (DT10_V1114_HOLDINGS_FX && val > 0 && extra.fx && extra.iCcy >= 0) {
-    var ccy = String(row[extra.iCcy] === null || row[extra.iCcy] === undefined ?
-                     '' : row[extra.iCcy]).trim().toUpperCase();
-    if (ccy && ccy !== 'SAR') {
-      var rate = Number(extra.fx[ccy]);
-      if (isFinite(rate) && rate > 0) {
-        val = val * rate;
-        extra._converted = (extra._converted || 0) + 1;
-      } else {
-        extra._unconverted = (extra._unconverted || 0) + 1;
-      }
+    var rate = dt10HoldingFxRate_(row[extra.iCcy], extra.fx);
+    if (rate === null) {
+      // SAR or blank currency: the value is already SAR (unchanged).
+    } else if (isFinite(rate) && rate > 0) {
+      val = val * rate;
+      extra._converted = (extra._converted || 0) + 1;
+    } else {
+      val = null;
+      extra._unconverted = (extra._unconverted || 0) + 1;
     }
   }
   var h = { symbol: sym, sector: sector || 'Unknown', value_sar: val };
@@ -3218,6 +3911,7 @@ function dt10CollectHoldings_(ss) {
     for (var r = hIdx + 1; r < values.length; r++) {
       var h = dt10HoldingFromRow_(values[r], iSym, iSec, useVal, extra);
       if (!h) continue;
+      if (h.value_sar === null) out._input_incomplete = true;   // v1.13.10: no FX
       if (seen[h.symbol]) { out._input_incomplete = true; continue; }
       if (out.length >= 500) { out._input_incomplete = true; continue; }
       seen[h.symbol] = true;
@@ -3271,6 +3965,328 @@ function dt10PortfolioInputs_(ss, panel) {
     portfolio.holdings_input_incomplete = holdings._input_incomplete === true;
   }
   return portfolio;
+}
+// ---------------------------------------------------------------------------
+// v1.16.0 [FUNDING-EVIDENCE] -- apply the published broker packet to THIS
+// request (PURE core + thin orchestrator). Script Property
+// DT10_FUNDING_EVIDENCE = off (DEFAULT: the request body is v1.15.0 byte for
+// byte) | on. The packet is the document property 10_My_Portfolio publishes
+// from a read-only IBKR capture (PD_IBKR_EVIDENCE_PUBLISH=on); this file only
+// reads it. Nothing here invents a position, a quantity, a quote or a cash
+// figure: every number sent is read from the packet or from My_Portfolio.
+// ---------------------------------------------------------------------------
+var DT10_FUNDING_PROP = 'DT10_FUNDING_EVIDENCE';        // off (default) | on
+var DT10_FUNDING_EXCLUDE_PROP = 'PD_EXECUTION_EXCLUDE';  // shared with 10_My_Portfolio
+var DT10_FUNDING_MAX_AGE_MS = 840000;   // backend 900 s less a 60 s request margin
+var DT10_FUNDING_MAX_ITEMS = 500;
+var DT10_FUNDING_SAFE = 9007199254740991;
+
+function dt10FundingMode_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_PROP);
+    return String(raw === null || raw === undefined ? '' : raw)
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on' ? 'on' : 'off';
+  } catch (eFm) { return 'off'; }
+}
+
+/** PURE: 'a, B;c' -> ['A', 'B', 'C'] (trimmed, upper, unique). */
+function dt10FundingExcludeList_(raw) {
+  var out = [], seen = {};
+  var parts = String(raw === null || raw === undefined ? '' : raw).split(/[,;\s]+/);
+  for (var i = 0; i < parts.length; i++) {
+    var s = parts[i].toUpperCase();
+    if (s && !seen.hasOwnProperty(s)) { seen[s] = true; out.push(s); }
+  }
+  return out;
+}
+
+function dt10FundingSym_(v) {
+  return String(v === null || v === undefined ? '' : v)
+      .replace(/^\s+|\s+$/g, '').toUpperCase();
+}
+
+/** PURE: a plain decimal (text exactly; a number via toFixed(scale)) ->
+ * integer units of 10^-scale, or null (port of 10_My_Portfolio pdIbkrUnits_). */
+function dt10FundingUnits_(value, scale) {
+  if (typeof value === 'boolean' || value === null || value === undefined) return null;
+  var text;
+  if (typeof value === 'number') {
+    if (!isFinite(value) || Math.abs(value) >= 1e15) return null;
+    text = value.toFixed(scale);
+  } else {
+    text = String(value).replace(/^\s+|\s+$/g, '');
+  }
+  var m = text.match(/^(-)?(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  var frac = m[3] || '';
+  if (frac.length > scale) {
+    if (/[^0]/.test(frac.slice(scale))) return null;
+    frac = frac.slice(0, scale);
+  }
+  while (frac.length < scale) frac += '0';
+  var digits = (m[2] + frac).replace(/^0+(?=\d)/, '');
+  if (digits.length > 15) return null;
+  var n = Number(digits);
+  return (m[1] && n !== 0) ? -n : n;
+}
+
+/** PURE: exact integer division of safe integers; 'even' = round half to
+ * even (Python Decimal default, the backend's rounding). */
+function dt10FundingDiv_(num, div, mode) {
+  var q = Math.floor(num / div);
+  var r = num - q * div;
+  while (r < 0) { q -= 1; r += div; }
+  while (r >= div) { q += 1; r -= div; }
+  if (r === 0) return q;
+  if (mode === 'up') return q + 1;
+  if (r * 2 > div) return q + 1;
+  if (r * 2 < div) return q;
+  return q % 2 === 0 ? q : q + 1;
+}
+
+function dt10FundingAge_(ms) {
+  var m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60) + 'm';
+}
+
+/** PURE: the decision Symbol an IBKR position stands for (same rule as
+ * 10_My_Portfolio pdIbkrNative_ for the packet, which carries USD stocks
+ * only): 'BRK B'/USD -> 'BRK-B.US'; anything else links nothing. */
+function dt10FundingNative_(symbol, currency) {
+  if (dt10FundingSym_(currency) !== 'USD') return '';
+  var s = dt10FundingSym_(symbol).replace(/\s+/g, '-');
+  return /^[A-Z0-9][A-Z0-9.\-]{0,15}$/.test(s) ? s + '.US' : '';
+}
+
+/** PURE: {CCY: rate x100} from the packet's FX proofs (SAR fixed at 100).
+ * A proof finer than 2 decimals, repeated or unreadable -> null. */
+function dt10FundingRates_(packet) {
+  var rates = {SAR: 100};
+  var proofs = packet && Object.prototype.toString.call(packet.fx_rates) === '[object Array]'
+      ? packet.fx_rates : [];
+  if (proofs.length > DT10_FUNDING_MAX_ITEMS) return null;
+  for (var i = 0; i < proofs.length; i++) {
+    var p = proofs[i] || {};
+    var ccy = dt10FundingSym_(p.currency);
+    var x100 = dt10FundingUnits_(p.rate_to_sar, 2);
+    if (!/^[A-Z]{3}$/.test(ccy) || x100 === null || x100 <= 0) return null;
+    if (rates.hasOwnProperty(ccy)) return null;
+    rates[ccy] = x100;
+  }
+  return rates;
+}
+
+/** PURE: certified cash in cents from the funding accounts' settled cash
+ * less reservations, at the proven rates. {cents|null, reason}. */
+function dt10FundingCashCents_(packet, rates) {
+  var out = {cents: null, reason: ''};
+  function fail(why) { out.cents = null; out.reason = why; return out; }
+  var funding = packet && Object.prototype.toString.call(packet.funding_accounts) === '[object Array]'
+      ? packet.funding_accounts : [];
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  if (!funding.length || accounts.length > DT10_FUNDING_MAX_ITEMS) return fail('funding accounts missing');
+  var total = 0, rows = 0;
+  for (var f = 0; f < funding.length; f++) {
+    var aid = String(funding[f]);
+    var acc = null;
+    for (var a = 0; a < accounts.length; a++) {
+      if (accounts[a] && String(accounts[a].account_id) === aid) { acc = accounts[a]; break; }
+    }
+    if (!acc) return fail('funding account unknown');
+    var cash = Object.prototype.toString.call(acc.cash) === '[object Array]' ? acc.cash : [];
+    if (!cash.length || cash.length > DT10_FUNDING_MAX_ITEMS) return fail('cash rows missing');
+    for (var c = 0; c < cash.length; c++) {
+      var row = cash[c] || {};
+      var ccy = dt10FundingSym_(row.currency);
+      var settled = dt10FundingUnits_(row.settled_cash, 6);
+      var reserved = dt10FundingUnits_(row.reserved_cash, 6);
+      if (settled === null || reserved === null) return fail('cash unreadable (' + ccy + ')');
+      if (row.reservations_complete !== true) return fail('reservations incomplete (' + ccy + ')');
+      var net = settled - reserved;
+      if (net < 0) return fail('cash over-reserved (' + ccy + ')');
+      if (!rates.hasOwnProperty(ccy)) return fail('cash currency without FX proof (' + ccy + ')');
+      var rate = rates[ccy];
+      if (net > Math.floor(DT10_FUNDING_SAFE / rate) || total > DT10_FUNDING_SAFE - net * rate) {
+        return fail('cash too large for an exact check');
+      }
+      total += net * rate;             /* SAR at 10^-8 */
+      rows++;
+    }
+  }
+  if (!rows) return fail('cash rows missing');
+  out.cents = dt10FundingDiv_(total, 1000000, 'even');
+  return out;
+}
+
+/** PURE: links for THIS request's rows (row_index = position in holdings),
+ * matched on the native symbol + currency; every positive packet position
+ * must be represented. {links, unlinked, unrepresented, reason}. */
+function dt10FundingLinks_(holdings, packet) {
+  var out = {links: [], unlinked: [], unrepresented: [], reason: ''};
+  var accounts = packet && Object.prototype.toString.call(packet.accounts) === '[object Array]'
+      ? packet.accounts : [];
+  var positions = [];
+  for (var a = 0; a < accounts.length; a++) {
+    var acc = accounts[a] || {};
+    var list = Object.prototype.toString.call(acc.positions) === '[object Array]' ? acc.positions : [];
+    if (list.length > DT10_FUNDING_MAX_ITEMS) { out.reason = 'positions oversized'; return out; }
+    for (var p = 0; p < list.length; p++) {
+      var pos = list[p] || {};
+      var qty = dt10FundingUnits_(pos.quantity, 6);
+      positions.push({account_id: String(acc.account_id), instrument_id: String(pos.instrument_id),
+                      symbol: dt10FundingSym_(pos.symbol), currency: dt10FundingSym_(pos.currency),
+                      native: dt10FundingNative_(pos.symbol, pos.currency),
+                      positive: qty !== null && qty > 0});
+    }
+  }
+  var used = {};
+  for (var i = 0; i < holdings.length; i++) {
+    var h = holdings[i] || {};
+    var s = dt10FundingSym_(h.symbol), c = dt10FundingSym_(h.currency);
+    var hit = null, hits = 0;
+    for (var q = 0; q < positions.length; q++) {
+      if (positions[q].native && positions[q].native === s && positions[q].currency === c) {
+        hit = positions[q]; hits++;
+      }
+    }
+    var key = hit ? hit.account_id + '|' + hit.instrument_id : '';
+    if (hits === 1 && !used.hasOwnProperty(key)) {
+      used[key] = true;
+      out.links.push({row_index: i, account_id: hit.account_id, instrument_id: hit.instrument_id,
+                      position_symbol: hit.symbol, symbol: s, currency: c});
+    } else {
+      out.unlinked.push(s || '?');
+    }
+  }
+  for (var u = 0; u < positions.length; u++) {
+    var k2 = positions[u].account_id + '|' + positions[u].instrument_id;
+    if (positions[u].positive && !used.hasOwnProperty(k2)) out.unrepresented.push(positions[u].symbol);
+  }
+  return out;
+}
+
+/** PURE: a non-negative plain decimal at its own minimal scale (<= 6):
+ * 15.2 -> {units: 152, scale: 1}; 174 -> {units: 174, scale: 0}; else null. */
+function dt10FundingDecimal_(value) {
+  var u = dt10FundingUnits_(value, 6);
+  if (u === null || u < 0) return null;
+  var scale = 6;
+  while (scale > 0 && u % 10 === 0) { u = u / 10; scale--; }
+  return {units: u, scale: scale};
+}
+
+/** PURE: price x quantity x proven rate, rounded half-even to the cent, or
+ * null when any input is not a plain non-negative number or the exact
+ * product would leave the safe-integer range (the backend then decides). */
+function dt10FundingValueSar_(price, quantity, rateX100) {
+  var p = dt10FundingDecimal_(price), q = dt10FundingDecimal_(quantity);
+  if (!p || !q || !(rateX100 > 0)) return null;
+  if (p.units > 0 && q.units > Math.floor(DT10_FUNDING_SAFE / p.units)) return null;
+  var pq = p.units * q.units;
+  if (pq > Math.floor(DT10_FUNDING_SAFE / rateX100)) return null;
+  var div = Math.pow(10, p.scale + q.scale);     /* -> cents */
+  return dt10FundingDiv_(pq * rateX100, div, 'even') / 100;
+}
+
+/** PURE core. Mutates body IN PLACE only when it returns applied=true.
+ * exclude = symbols outside the broker's custody (e.g. 5023.SR). */
+function dt10FundingApplyCore_(body, packet, exclude, nowMs) {
+  var out = {applied: false, reason: '', ageMs: null, cashCents: null, rows: 0,
+             linked: 0, unlinked: [], unrepresented: [], excluded: [], rates: null};
+  function fail(why) { out.applied = false; out.reason = why; return out; }
+  if (!body || !body.portfolio || typeof body.portfolio !== 'object') return fail('request body unavailable');
+  if (!packet || Object.prototype.toString.call(packet) !== '[object Object]' ||
+      packet.schema_version !== 1) return fail('no evidence packet');
+  var capMs = dt10SourceStampMs_(packet.captured_at);
+  if (capMs === null || typeof packet.captured_at !== 'string' ||
+      !/(Z|[+-]\d{2}:?\d{2})$/.test(packet.captured_at)) return fail('captured_at unreadable');
+  out.ageMs = nowMs - capMs;
+  if (out.ageMs < 0) return fail('capture time ahead of the clock');
+  if (out.ageMs > DT10_FUNDING_MAX_AGE_MS) return fail('capture too old (' + dt10FundingAge_(out.ageMs) + ')');
+  var holdings = body.portfolio.holdings;
+  if (Object.prototype.toString.call(holdings) !== '[object Array]') return fail('holdings not sent (DT10_SEND_HOLDINGS)');
+  if (body.portfolio.holdings_input_incomplete !== false) return fail('holdings read incomplete');
+  if (holdings.length > DT10_FUNDING_MAX_ITEMS) return fail('holdings oversized');
+  var rates = dt10FundingRates_(packet);
+  if (!rates) return fail('fx proofs unreadable');
+  var set = {};
+  for (var e = 0; e < (exclude || []).length; e++) set[exclude[e]] = true;
+  var kept = [];
+  for (var r = 0; r < holdings.length; r++) {
+    var s = dt10FundingSym_(holdings[r] ? holdings[r].symbol : '');
+    if (s && set.hasOwnProperty(s)) out.excluded.push(s); else kept.push(holdings[r]);
+  }
+  var cash = dt10FundingCashCents_(packet, rates);
+  if (cash.cents === null) return fail(cash.reason);
+  var linkRes = dt10FundingLinks_(kept, packet);
+  if (linkRes.reason) return fail(linkRes.reason);
+  var evidence;
+  try { evidence = JSON.parse(JSON.stringify(packet)); } catch (eCp) { return fail('packet not serializable'); }
+  evidence.holding_links = linkRes.links;
+  var fx = {};
+  for (var k in body.fx_rates) { if (body.fx_rates.hasOwnProperty(k)) fx[k] = body.fx_rates[k]; }
+  for (var ccy in rates) {
+    if (rates.hasOwnProperty(ccy) && ccy !== 'SAR') fx[ccy] = rates[ccy] / 100;
+  }
+  for (var v = 0; v < kept.length; v++) {
+    var h = kept[v];
+    var hc = dt10FundingSym_(h.currency);
+    if (hc && hc !== 'SAR' && rates.hasOwnProperty(hc) &&
+        typeof h.quantity === 'number' && typeof h.current_price === 'number') {
+      var val = dt10FundingValueSar_(h.current_price, h.quantity, rates[hc]);
+      if (val !== null) h.value_sar = val;
+    }
+  }
+  body.portfolio.holdings = kept;
+  body.portfolio.reconciliation_evidence = evidence;
+  body.portfolio.cash_available_sar = cash.cents / 100;
+  body.portfolio.pending_proceeds_sar = 0;
+  body.fx_rates = fx;
+  out.applied = true;
+  out.cashCents = cash.cents;
+  out.rows = kept.length;
+  out.linked = linkRes.links.length;
+  out.unlinked = linkRes.unlinked;
+  out.unrepresented = linkRes.unrepresented;
+  out.rates = rates;
+  return out;
+}
+
+/** PURE: the status-line fragment (never the packet). */
+function dt10FundingNote_(res) {
+  if (!res) return '';
+  if (!res.applied) return ' | funding evidence NOT APPLIED (' + String(res.reason || '?').slice(0, 80) + ')';
+  var cents = res.cashCents, a = Math.abs(cents), c = a % 100;
+  var cashText = (cents < 0 ? '-' : '') + Math.floor(a / 100) + '.' + (c < 10 ? '0' : '') + c;
+  var fxText = [];
+  for (var k in res.rates) {
+    if (res.rates.hasOwnProperty(k) && k !== 'SAR') fxText.push(k + ' ' + (res.rates[k] / 100));
+  }
+  return ' | funding evidence APPLIED (capture age ' + dt10FundingAge_(res.ageMs) +
+      '; cash ' + cashText + ' SAR; linked ' + res.linked + '/' + res.rows +
+      (res.unlinked.length ? '; unlinked ' + res.unlinked.slice(0, 3).join(',') : '') +
+      (res.unrepresented.length ? '; unrepresented ' + res.unrepresented.slice(0, 3).join(',') : '') +
+      (res.excluded.length ? '; excluded ' + res.excluded.slice(0, 3).join(',') : '') +
+      (fxText.length ? '; ' + fxText.join(' ') : '') + ')';
+}
+
+/** Orchestrator: DT10_FUNDING_EVIDENCE=on only. Never throws; a fault leaves
+ * the body untouched and says so in the note. */
+function dt10FundingApply_(body, nowMs) {
+  try {
+    if (dt10FundingMode_() !== 'on') return '';
+    var exclude = dt10FundingExcludeList_(
+        PropertiesService.getScriptProperties().getProperty(DT10_FUNDING_EXCLUDE_PROP));
+    var res = dt10FundingApplyCore_(body, dt10ReconciliationEvidence_(), exclude, nowMs);
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] funding evidence ' +
+                 (res.applied ? 'applied' : 'not applied: ' + res.reason));
+    } catch (eLg) {}
+    return dt10FundingNote_(res);
+  } catch (eFa) {
+    return ' | funding evidence ERROR (' + String(eFa && eFa.message ? eFa.message : eFa).slice(0, 80) + ')';
+  }
 }
 // ---------------------------------------------------------------------------
 // v1.3.0 — SELECTION STABILITY LAYER (pure core; node-parity-tested against
@@ -3371,6 +4387,11 @@ function dt10StabParseState_(raw) {
       // stays byte-identical to v1.11.9.
       var vop = Math.max(0, parseInt(v.op, 10) || 0);
       if (vop > 0) out.symbols[sym].op = vop;
+      // v1.15.0 [PENDING-GRACE]: consecutive soft-miss day-advances absorbed
+      // by a pending challenger. Absent in older blobs => 0; written only
+      // when > 0 so a blob that never paused stays byte-identical to v1.14.0.
+      var vcp = Math.max(0, parseInt(v.cp, 10) || 0);
+      if (vcp > 0) out.symbols[sym].cp = vcp;
     }
   }
   return out;
@@ -3480,6 +4501,24 @@ function dt10GraceSuspend_(tk, label) {
       'executable ticket).';
   return tk;
 }
+/** v1.19.0 [QUALIFIED-HOLD] PURE: the ticket shell of a seat HELD under
+ * DT10_QUALIFIED_HOLD = enforce. `tk` is the dt10StabGhost_ shell built
+ * from the seat's audited row (no raw ticket exists, so no plan exists):
+ * the grace marker goes (no _grace_hold, so dt10BoardEligible_ offers the
+ * seat to the allocation replay and the D-4 rank dash, the grace tint and
+ * the grace counts no longer apply), a countable _qhold marker rides for
+ * read-back and the note says what the hold is. Sizing keeps the dash
+ * vocabulary until the backend's replay funds it; nothing here sizes.
+ * Mutates and returns tk; never throws. */
+function dt10StabQualifiedHoldSeat_(tk) {
+  if (!tk || typeof tk !== 'object') return tk;
+  if (Object.prototype.hasOwnProperty.call(tk, '_grace_hold')) delete tk._grace_hold;
+  tk._qhold = true;
+  tk.advisor_note = 'Qualified hold: INVEST on the audited grid inside the ' +
+      'rank buffer, absent from the sized list today; offered to the ' +
+      'allocation replay (a plan appears only if the backend funds it).';
+  return tk;
+}
 /** v1.11.10 [P-168] PURE: outage map from the sheet pool rows the cockpit
  * POSTs (dt10CollectPoolRows_ output; keys are the source headers). A row
  * whose 'Warnings' cell carries the engine's own fetch_failed tag (the
@@ -3497,6 +4536,44 @@ function dt10OutageMapFromPool_(rows) {
     if (DT10_P168_OUTAGE_RE.test(String(r['Warnings'] || ''))) map[sym] = true;
   }
   return map;
+}
+/** v1.14.0 [CONFIRM-BASIS] PURE: is `sym` INVEST-qualified inside the rank
+ * buffer on this run? True when the deduped audited grid (candBySym) has a
+ * row for it whose verdict is exactly INVEST (any case), structural_block is
+ * not true, hardOut(sym) is false, knobs.rank_buffer > 0 and its
+ * opportunity-score rank (globalRank, 1 = best) is <= knobs.rank_buffer --
+ * the same window the exit-clock pause has used since v1.3.0. Never throws;
+ * a symbol absent from the grid is false (absence is jitter, not a
+ * qualification). hardOut is the caller's closure over candBySym + knobs. */
+function dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut) {
+  var c = candBySym ? candBySym[sym] : null;
+  if (!c || typeof c !== 'object') return false;
+  if (String(c.verdict || '').toUpperCase() !== 'INVEST') return false;
+  if (c.structural_block === true) return false;
+  if (typeof hardOut === 'function' && hardOut(sym)) return false;
+  var buf = knobs ? Number(knobs.rank_buffer) : 0;
+  if (!(buf > 0)) return false;
+  var r = globalRank ? Number(globalRank[sym]) : 0;
+  return r > 0 && r <= buf;
+}
+/** v1.15.0 [PENDING-GRACE] PURE: is today's miss for `sym` a SOFT miss?
+ * True when the deduped audited grid (candBySym) has a row for it whose
+ * verdict is NOT INVEST (a criteria miss the backend itself reports),
+ * structural_block is not true, hardOut(sym) is false and its all-pool rank
+ * is inside the rank buffer. Never recomputes a gate, score or verdict
+ * (section 8): the row, its verdict and its rank are the backend's own.
+ * A row absent from the grid, a structural block, a hard-out verdict or a
+ * rank outside the buffer is a HARD miss (v1.14.0 reset). Never throws. */
+function dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut) {
+  var c = candBySym ? candBySym[sym] : null;
+  if (!c || typeof c !== 'object') return false;
+  if (String(c.verdict || '').toUpperCase() === 'INVEST') return false;
+  if (c.structural_block === true) return false;
+  if (typeof hardOut === 'function' && hardOut(sym)) return false;
+  var buf = knobs ? Number(knobs.rank_buffer) : 0;
+  if (!(buf > 0)) return false;
+  var r = globalRank ? Number(globalRank[sym]) : 0;
+  return r > 0 && r <= buf;
 }
 /**
  * Membership-hysteresis core. Inputs:
@@ -3591,6 +4668,29 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     var v = Number(c.opportunity_score);
     return isFinite(v) ? v : null;
   }
+  // v1.14.0 [CONFIRM-BASIS]: the basis rides as a plain knob (service read in
+  // dt10ApplyStability_). Only the exact string 'qualified' arms the
+  // qualified branch; an absent knob (older callers, the self-test replays)
+  // is the v1.13.11 raw basis.
+  var qualifiedBasis = knobs.confirm_basis === 'qualified';
+  function qualifiedWithin(sym) {
+    return dt10StabQualifiedWithin_(sym, candBySym, globalRank, knobs, hardOut);
+  }
+  // v1.15.0 [PENDING-GRACE]: the grace rides as a plain knob (service read in
+  // dt10ApplyStability_); absent/0 (older callers, the self-test replays,
+  // the property unset) is the v1.14.0 clock byte for byte.
+  var pgDays = Math.max(0, Math.min(DT10_T10_PENDING_GRACE_MAX,
+                                    parseInt(knobs.pending_grace, 10) || 0));
+  var pendingHeld = [];
+  function softMiss(sym) {
+    return dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut);
+  }
+  // v1.19.0 [QUALIFIED-HOLD]: the hold mode rides as a plain knob (service
+  // read in dt10ApplyStability_); absent / anything else (older callers, the
+  // self-test replays, the property off) is the v1.18.0 board byte for byte.
+  var qhMode = (knobs.qualified_hold === 'observe' ||
+                knobs.qualified_hold === 'enforce') ? knobs.qualified_hold : 'off';
+  var qualifiedHeld = [];
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -3637,8 +4737,29 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
         if (rawSet[sym]) {
           st.ci = (st.ci || 0) + 1;
           st.co = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
+        } else if (qualifiedBasis && qualifiedWithin(sym)) {
+          // v1.14.0 [CONFIRM-BASIS]: absent from the sized top-N but INVEST
+          // on the audited grid inside the rank buffer -- the day counts
+          // exactly like a raw sighting (ci + 1, co = 0; the score point
+          // below is recorded as for raw). The 'raw' basis never gets here.
+          st.ci = (st.ci || 0) + 1;
+          st.co = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
+        } else if (pgDays > 0 && !st.member && (st.ci || 0) > 0 &&
+                   (st.cp || 0) < pgDays && softMiss(sym)) {
+          // v1.15.0 [PENDING-GRACE]: a NON-member challenger with a live count
+          // misses on a SOFT criteria day (audited row present, not INVEST, no
+          // structural block, not hard-out, inside the rank buffer): the count
+          // PAUSES (ci kept) and the grace counter advances; the score point
+          // below is still recorded. Members never enter this branch (their
+          // exit clock already pauses inside the buffer); a hard miss, or a
+          // grace already spent, falls through to the v1.14.0 reset.
+          st.cp = (st.cp || 0) + 1;
+          pendingHeld.push(sym);
         } else {
           st.ci = 0;
+          if (st.cp) delete st.cp;                       // v1.15.0 [PENDING-GRACE]
           if (st.member) {
             var r = globalRank[sym];
             var within = knobs.rank_buffer > 0 && r && r <= knobs.rank_buffer;
@@ -3764,6 +4885,18 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     if (mst.ft === true && (mst.ci || 0) >= knobs.confirm_days) {
       mst.ft = false;                                    // v1.11.2 [P-61] graduated
     }
+    // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
+    // with a clean miss clock that the audited grid still rates INVEST inside
+    // the rank buffer (the v1.14.0 qualified day) is HOLDABLE. observe only
+    // lists it; enforce keeps it out of the grace ledger here and gives it
+    // the ACTIVE label in the output pass. Unconfirmed fast-track seats
+    // never qualify (v1.8.10: no executable sizing under strict).
+    if (qhMode !== 'off' && qualifiedBasis && !rawSet[msym] &&
+        (mst.co || 0) === 0 && mst.ft !== true &&
+        !dt10InList_(pausedSyms, msym) && qualifiedWithin(msym)) {
+      qualifiedHeld.push(msym);
+      if (qhMode === 'enforce') continue;
+    }
     if (!rawSet[msym] || (mst.co || 0) > 0) {
       heldByGrace.push({ symbol: msym, missed_days: mst.co || 0,
                          exit_days: knobs.exit_days,
@@ -3821,6 +4954,12 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     else if (inList(entered, osym)) {
       status = 'NEW (confirmed ' + knobs.confirm_days + '/' +
                knobs.confirm_days + ')';
+    } else if (qhMode === 'enforce' && inList(qualifiedHeld, osym)) {
+      // v1.19.0 [QUALIFIED-HOLD] enforce: the seat keeps the status the grid
+      // gives it. tk is the ghost shell (no raw ticket): strip its grace
+      // marker so the allocation replay is offered the seat; no sizing here.
+      status = 'ACTIVE (day ' + daysIn + ')';
+      dt10StabQualifiedHoldSeat_(tk);
     } else if (!rawSet[osym] || (ost.co || 0) > 0) {
       status = 'GRACE (' + (ost.co || 0) + '/' + knobs.exit_days + ' missed)';
       // v1.11.10 [P-168]: disclose the pause on the label (paint and the
@@ -3922,7 +5061,65 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   }
   var note = 'stab: ' + (noteBits.length ? noteBits.join(', ') :
                          'steady — no membership change');
-  return {
+  // v1.14.0 [CONFIRM-BASIS]: read-back tokens under the qualified basis only
+  // ('raw' leaves the note byte-identical to v1.13.11): the armed basis and
+  // the non-raw challengers inside the buffer whose count is alive.
+  if (qualifiedBasis) {
+    var nearSyms = [];
+    for (var nqk in symbols) {
+      if (!symbols.hasOwnProperty(nqk) || symbols[nqk].member || rawSet[nqk]) continue;
+      if ((symbols[nqk].ci || 0) > 0 && qualifiedWithin(nqk)) nearSyms.push(nqk);
+    }
+    nearSyms.sort(function (a, b) {
+      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);
+      if (dci) return dci;
+      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);
+      if (drk) return drk;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+    note += ', confirm=qualified';
+    if (nearSyms.length) {
+      var nqParts = [];
+      for (var nqi = 0; nqi < nearSyms.length && nqParts.length < 3; nqi++) {
+        nqParts.push(nearSyms[nqi] + '(' + (symbols[nearSyms[nqi]].ci || 0) +
+                     '/' + knobs.confirm_days + ')');
+      }
+      note += ', near ' + nearSyms.length + ' ' + nqParts.join(' ');
+    }
+  }
+  // v1.15.0 [PENDING-GRACE]: read-back tokens only while the grace is armed
+  // (0 leaves the note and the audit byte-identical to v1.14.0): the armed
+  // grace and the challengers whose count was paused on this day-advance.
+  if (pgDays > 0) {
+    pendingHeld.sort(function (a, b) {
+      var dci = (symbols[b].ci || 0) - (symbols[a].ci || 0);
+      if (dci) return dci;
+      var drk = (globalRank[a] || 1e9) - (globalRank[b] || 1e9);
+      if (drk) return drk;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+    note += ', pgrace=' + pgDays;
+    if (pendingHeld.length) {
+      var phParts = [];
+      for (var phi = 0; phi < pendingHeld.length && phParts.length < 3; phi++) {
+        phParts.push(pendingHeld[phi] + '(' + (symbols[pendingHeld[phi]].ci || 0) +
+                     '/' + knobs.confirm_days + ')');
+      }
+      note += ', pheld ' + pendingHeld.length + ' ' + phParts.join(' ');
+    }
+  }
+  // v1.19.0 [QUALIFIED-HOLD]: read-back token only while armed (off leaves
+  // the note and the audit byte-identical to v1.18.0): the seats held, or
+  // that would be held, in board order, up to 3 names.
+  if (qhMode !== 'off') {
+    var qhParts = [];
+    for (var qhi = 0; qhi < qualifiedHeld.length && qhParts.length < 3; qhi++) {
+      qhParts.push(qualifiedHeld[qhi]);
+    }
+    note += ', qhold: ' + (qhMode === 'enforce' ? 'held ' : 'would hold ') +
+            qualifiedHeld.length + (qhParts.length ? ' ' + qhParts.join(' ') : '');
+  }
+  var coreOut = {
     tickets: tickets,
     state: state,
     audit: { entered: entered, fast_tracked: fastTracked,
@@ -3936,6 +5133,9 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
              state_pruned: pruned },
     note: note
   };
+  if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0
+  if (qhMode !== 'off') coreOut.audit.qualified_held = qualifiedHeld;   // v1.19.0
+  return coreOut;
 }
 // ---------------------------------------------------------------------------
 // Payload → render-row mappers (pure; verified by node exec-test)
@@ -3991,7 +5191,11 @@ function dt10UvWithholdRow_(row, idxList, noteIdx, reason) {
   if (noteIdx < row.length) {
     // Calendar proximity is research context. Keep only the generated
     // prefix; never preserve the previous order narrative or numbers.
-    var earnings = String(row[noteIdx] || '').match(/^(\u26a0 earnings \u2264\d+d \u00b7 )/);
+    // v1.18.0 [POST-EARNINGS]: the post-earnings tag is research context too
+    // (it follows a forward tag when there is one). It can only exist while
+    // DT10_POST_EARN is armed, so without it the kept prefix is the v1.17.1 one.
+    var earnings = String(row[noteIdx] || '').match(
+        /^((?:\u26a0 earnings \u2264\d+d \u00b7 )?(?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?)/);
     row[noteIdx] = (earnings ? earnings[1] : '') + dt10UvWithholdNote_(reason);
   }
   return row;
@@ -4063,6 +5267,62 @@ function dt10EpochKeyLegacy_() {
         .getProperty('DT10_P144_EPOCH_KEY_LEGACY') || '') === '1';
   } catch (eEk) {}
   return false;
+}
+
+/**
+ * v1.14.0 [CONFIRM-BASIS]: confirmation basis -- Script Property
+ * TFB_T10_CONFIRM_BASIS (DT10_T10_CONFIRM_BASIS_PROP). Exactly 'raw'
+ * (trimmed, any case) selects the v1.13.11 clocks; anything else, a blank
+ * or a PropertiesService fault reads as 'qualified' (the owner's default of
+ * 2026-10-24). Mirrors dt10HardVerdictStrict_ (service read outside the
+ * pure core); never throws.
+ */
+function dt10StabConfirmBasis_() {
+  try {
+    var v = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_CONFIRM_BASIS_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return v === 'raw' ? 'raw' : 'qualified';
+  } catch (eCb) {}
+  return 'qualified';
+}
+
+/**
+ * v1.15.0 [PENDING-GRACE]: pending grace days -- Script Property
+ * TFB_T10_PENDING_GRACE_DAYS (DT10_T10_PENDING_GRACE_PROP). An integer
+ * 1..DT10_T10_PENDING_GRACE_MAX arms the grace (larger values clamp to the
+ * max); absent, blank, 0, negative, junk or a PropertiesService fault read
+ * as 0 = the v1.14.0 clocks. Mirrors dt10StabConfirmBasis_ (service read
+ * outside the pure core); never throws.
+ */
+function dt10StabPendingGrace_() {
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_PENDING_GRACE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n > 0)) return 0;
+    return Math.min(DT10_T10_PENDING_GRACE_MAX, n);
+  } catch (ePg) {}
+  return 0;
+}
+
+/**
+ * v1.19.0 [QUALIFIED-HOLD]: hold mode -- Script Property DT10_QUALIFIED_HOLD
+ * (DT10_QUALIFIED_HOLD_PROP). Exactly 'observe' or 'enforce' (trimmed, any
+ * case) arms it; absent, blank, 'off', junk or a PropertiesService fault
+ * read as 'off' = the v1.18.0 board. Mirrors dt10StabPendingGrace_ (service
+ * read outside the pure core); never throws.
+ */
+function dt10StabQualifiedHoldMode_() {
+  try {
+    var v = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_QUALIFIED_HOLD_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (v === 'observe' || v === 'enforce') return v;
+  } catch (eQh) {}
+  return 'off';
 }
 
 /** v1.11.11 [P-144] PURE: UTC date key ('yyyy-MM-dd') of a feed-stamp
@@ -5044,6 +6304,543 @@ function dt10VintageNote_(selected, idx, mode) {
       '/' + sel.length + (idx ? '' : ' (no sheet pool)') +
       (mode === 'observe' ? ' [observe]' : '');
 }
+/** v1.19.0 [SEAT-LIVE-FILL]: Script Property DT10_SEAT_LIVE_FILL. Exactly
+ * 'on' (trimmed, any case) arms the fill; absent, blank, 'off', junk or a
+ * PropertiesService fault read as off (the v1.18.0 render). Never throws. */
+function dt10SeatLiveFillOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_SEAT_LIVE_FILL_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eLf) {}
+  return false;
+}
+/** v1.19.0 [SEAT-LIVE-FILL] PURE: {SYM: {price, rel, dq, ccy, status}} from
+ * the sheet pool rows the cockpit already POSTs (dt10CollectPoolRows_
+ * output; keys are the DT10_POOL_FIELDS sends). The first row per symbol
+ * wins (the collector already de-duplicates). Non-array or empty input
+ * => {}; never throws. */
+function dt10SeatLiveIndex_(rows) {
+  var idx = {};
+  if (!rows || !rows.length) return idx;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || typeof r !== 'object') continue;
+    var sym = dt10NormSym_(r['Symbol']);
+    if (!sym || Object.prototype.hasOwnProperty.call(idx, sym)) continue;
+    idx[sym] = { price: r['Current Price'],
+                 rel: r['Forecast Reliability Score'],
+                 dq: r['Data Quality Score'],
+                 ccy: r['Currency'],
+                 status: r['Investability Status'] };
+  }
+  return idx;
+}
+/** v1.19.0 [SEAT-LIVE-FILL] PURE: fills, on the GRACE / FAST-TRACK / held
+ * seats of `selected` only, the live numbers a seat without a raw ticket
+ * lacks. Source row: the audited grid row (cands, deduped by symbol, the
+ * highest opportunity_score wins -- the dt10StabCore_ rule) first, else
+ * the pool index row (dt10SeatLiveIndex_). Per seat: a blank reliability
+ * / dq is filled from the row; a blank fx_to_sar from `fx` (SAR = 1, else
+ * dt10HoldingFxRate_ on the seat's currency, else the row's); a ghost's
+ * price (no raw ticket: _grace_hold without _p145_suspended, or _qhold) is
+ * replaced by the row's positive price, and a blank or replaced Price SAR
+ * becomes the grid price_sar, else price x FX at 2 dp. When the row is
+ * investable (grid verdict INVEST, or Investability Status INVESTABLE) the
+ * note gains ' Source row today: investable (...)' once. Status, sizing,
+ * eligibility and every other field are untouched; a second pass changes
+ * nothing. Returns { seats, filled, investable }. */
+function dt10SeatLiveFillCore_(selected, cands, idx, fx) {
+  var out = { seats: 0, filled: 0, investable: 0 };
+  selected = selected || [];
+  cands = cands || [];
+  idx = idx || {};
+  fx = fx || {};
+  var grid = {};
+  for (var gi = 0; gi < cands.length; gi++) {
+    var gc = cands[gi];
+    if (!gc || typeof gc !== 'object') continue;
+    var gs = dt10NormSym_(gc.symbol);
+    if (!gs) continue;
+    var gsc = Number(gc.opportunity_score);
+    if (!grid[gs] ||
+        (isFinite(gsc) && gsc > (Number(grid[gs].opportunity_score) || -1e9))) {
+      grid[gs] = gc;
+    }
+  }
+  for (var i = 0; i < selected.length; i++) {
+    var t = selected[i];
+    if (!t || typeof t !== 'object') continue;
+    var seat = t._grace_hold === true || t._ft_suspended === true ||
+        t._qhold === true ||
+        /^(GRACE|FAST-TRACK)\b/.test(String(t._stab_status || ''));
+    if (!seat) continue;
+    out.seats++;
+    var sym = dt10NormSym_(t.symbol);
+    var g = sym && grid[sym] ? grid[sym] : null;
+    var p = sym && Object.prototype.hasOwnProperty.call(idx, sym) ? idx[sym] : null;
+    if (!g && !p) continue;
+    var ghost = (t._grace_hold === true && t._p145_suspended !== true) ||
+        t._qhold === true;
+    var touched = false, priceSet = false;
+    var rowPrice = Number(g ? g.price : p.price);
+    var rowRel = g ? g.reliability : p.rel;
+    var rowDq = g ? g.dq : p.dq;
+    var rowCcy = String((g ? g.currency : p.ccy) || '');
+    var investable = g ? String(g.verdict || '').toUpperCase() === 'INVEST' :
+        String(p.status || '').replace(/^\s+|\s+$/g, '').toUpperCase() === 'INVESTABLE';
+    if (ghost && isFinite(rowPrice) && rowPrice > 0 && t.price !== rowPrice) {
+      t.price = rowPrice;
+      priceSet = true;
+      touched = true;
+    }
+    if (!dt10HasValue_(t.reliability) && dt10HasValue_(rowRel) &&
+        isFinite(Number(rowRel))) {
+      t.reliability = Number(rowRel);
+      touched = true;
+    }
+    if (!dt10HasValue_(t.dq) && dt10HasValue_(rowDq) && isFinite(Number(rowDq))) {
+      t.dq = Number(rowDq);
+      touched = true;
+    }
+    var ccy = String(t.currency || rowCcy || '').replace(/^\s+|\s+$/g, '');
+    if (!dt10HasValue_(t.fx_to_sar) && ccy) {
+      var rate = ccy.toUpperCase() === 'SAR' ? 1 : dt10HoldingFxRate_(ccy, fx);
+      if (typeof rate === 'number' && isFinite(rate) && rate > 0) {
+        t.fx_to_sar = rate;
+        touched = true;
+      }
+    }
+    if (priceSet || !dt10HasValue_(t.price_sar)) {
+      var gps = g ? Number(g.price_sar) : NaN;
+      var fxv = Number(t.fx_to_sar), pxv = Number(t.price);
+      if (g && isFinite(gps) && gps > 0) {
+        t.price_sar = gps;
+        touched = true;
+      } else if (isFinite(fxv) && fxv > 0 && isFinite(pxv) && pxv > 0) {
+        t.price_sar = Math.round(pxv * fxv * 100) / 100;
+        touched = true;
+      }
+    }
+    if (investable) {
+      var note = String(t.advisor_note || '');
+      if (note.indexOf(' Source row today: investable') < 0) {
+        t.advisor_note = note + ' Source row today: investable (' +
+            (g ? 'INVEST on the audited grid' : 'Investability Status INVESTABLE') + ').';
+        out.investable++;
+      }
+    }
+    if (touched) out.filled++;
+  }
+  return out;
+}
+/** v1.19.0 [SEAT-LIVE-FILL]: render-side orchestrator. '' when the refresh
+ * attached no payload._dt10_live (gate off -> nothing touched); else fills
+ * the seats in place and returns the status token
+ * 'live-fill k/n (m investable at source)'. Guarded end to end. */
+function dt10SeatLiveFill_(payload) {
+  var lv = payload && payload._dt10_live;
+  if (!lv || typeof lv !== 'object') return '';
+  try {
+    var r = dt10SeatLiveFillCore_(payload.selected || [],
+        payload.candidates_rows || [], lv.idx || {}, lv.fx || {});
+    return 'live-fill ' + r.filled + '/' + r.seats +
+        (r.investable ? ' (' + r.investable + ' investable at source)' : '') +
+        (lv.idx ? '' : ' (no sheet pool)');
+  } catch (eLv) {
+    return 'live-fill n/a';
+  }
+}
+/** v1.19.0 [OWNER-RULE]: Script Property DT10_OWNER_RULE_MARK. Exactly 'on'
+ * (trimmed, any case) arms the per-seat marker; absent, blank, 'off', junk
+ * or a PropertiesService fault read as off (the v1.18.0 render). Never
+ * throws. */
+function dt10OwnerRuleMarkOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_OWNER_RULE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eOr) {}
+  return false;
+}
+/** v1.19.0 [OWNER-RULE] PURE: the 'Owner Rule' cell of one seat. The
+ * owner's interim buy rule (31 Oct 2026): Confidence band High AND Engine
+ * ROI 12M < DT10_OWNER_RULE_ROI_MAX. 'rule: yes' when both hold; else
+ * 'rule: no (<parts>)' naming only the failing parts: the band as printed
+ * ('Medium', 'Low'; 'conf unknown' when blank) and 'ROI <x.x>' ('ROI
+ * unknown' when not a number). Display only; never throws. */
+function dt10OwnerRuleCell_(t) {
+  t = t || {};
+  var band = String(t.confidence_band === null || t.confidence_band === undefined ?
+      '' : t.confidence_band).replace(/^\s+|\s+$/g, '');
+  var roi = Number(t.engine_roi_pct);
+  var roiKnown = dt10HasValue_(t.engine_roi_pct) && isFinite(roi);
+  var parts = [];
+  if (band.toUpperCase() !== 'HIGH') parts.push(band ? band : 'conf unknown');
+  if (!(roiKnown && roi < DT10_OWNER_RULE_ROI_MAX)) {
+    parts.push(roiKnown ? 'ROI ' + roi.toFixed(1) : 'ROI unknown');
+  }
+  return parts.length ? 'rule: no (' + parts.join('; ') + ')' : 'rule: yes';
+}
+/** v1.19.0 [OWNER-RULE] PURE: the status token 'owner-rule k/n yes'. */
+function dt10OwnerRuleNote_(selected) {
+  var sel = selected || [], yes = 0;
+  for (var i = 0; i < sel.length; i++) {
+    if (dt10OwnerRuleCell_(sel[i]) === 'rule: yes') yes++;
+  }
+  return 'owner-rule ' + yes + '/' + sel.length + ' yes';
+}
+/** v1.20.0 [TICKET-GUARD]: Script Property DT10_TICKET_GUARD. Exactly
+ * 'observe' or 'enforce' (trimmed, any case) arm the guard; absent, blank,
+ * 'off', junk or a PropertiesService fault read as off (the v1.19.0 board).
+ * Never throws. */
+function dt10TicketGuardMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_TICKET_GUARD_PROP) || '');
+  } catch (eTg) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'observe' || raw === 'enforce') ? raw : 'off';
+}
+/** v1.20.0 [TICKET-GUARD]: null while the guard is off (one property read);
+ * else its knobs, read once each: {mode, earnDays (DT10_GUARD_EARN_DAYS,
+ * integer, default 3, clamped 0..30), ownerRule (DT10_GUARD_OWNER_RULE is
+ * exactly 'on'), maxTickets (DT10_GUARD_MAX_TICKETS, integer, default 0 =
+ * no cap, clamped 0..50)}. A read fault gives that knob's default. Never
+ * throws. */
+function dt10TicketGuardConfig_() {
+  var mode = dt10TicketGuardMode_();
+  if (mode === 'off') return null;
+  function read(key) {
+    try {
+      return String(PropertiesService.getScriptProperties().getProperty(key) || '')
+          .replace(/^\s+|\s+$/g, '');
+    } catch (eTk) {
+      return '';
+    }
+  }
+  return { mode: mode,
+           earnDays: dt10StabInt_(read(DT10_GUARD_EARN_DAYS_PROP),
+                                  DT10_GUARD_EARN_DAYS_DEF, 0, DT10_GUARD_EARN_DAYS_MAX),
+           ownerRule: read(DT10_GUARD_OWNER_RULE_PROP).toLowerCase() === 'on',
+           maxTickets: dt10StabInt_(read(DT10_GUARD_MAX_TICKETS_PROP), 0, 0,
+                                    DT10_GUARD_MAX_TICKETS_MAX) };
+}
+/** v1.20.0 [TICKET-GUARD] PURE: is `t` an EXECUTABLE ticket of the final
+ * board -- the dt10TicketClasses_ exec class (neither a grace ghost nor a
+ * fast-track suspension, shares > 0) with Ticket SAR > 0? dt10FinalizeBoard_
+ * zeroes every other seat. */
+function dt10TicketGuardExec_(t) {
+  return !!t && typeof t === 'object' && t._grace_hold !== true &&
+      t._ft_suspended !== true && Number(t.suggested_shares) > 0 &&
+      Number(t.suggested_sar) > 0;
+}
+/** v1.20.0 [TICKET-GUARD] PURE: which EXECUTABLE tickets the guard holds,
+ * in board order, on an EXECUTABLE feed only (feedOk). The first failing
+ * filter wins: (1) earnings -- 0 <= map[SYMBOL] <= cfg.earnDays, map being
+ * the v1.6.0 tagger's Calendar_Events {SYMBOL: days to earnings}; (2) owner
+ * rule -- only when cfg.ownerRule, a ticket for which dt10OwnerRuleCell_
+ * (the v1.19.0 Owner Rule predicate) is not 'rule: yes'; (3) cap -- when
+ * cfg.maxTickets > 0, a ticket after the first maxTickets survivors.
+ * Returns {checked, kept, held: [{index, symbol, kind, reason, tag}]}.
+ * Never mutates its input. */
+function dt10TicketGuardCore_(selected, feedOk, map, cfg) {
+  var out = { checked: 0, kept: 0, held: [] };
+  if (feedOk !== true) return out;
+  var sel = selected || [];
+  cfg = cfg || {};
+  map = map || {};
+  var earnDays = dt10StabInt_(cfg.earnDays, DT10_GUARD_EARN_DAYS_DEF, 0,
+                              DT10_GUARD_EARN_DAYS_MAX);
+  var cap = dt10StabInt_(cfg.maxTickets, 0, 0, DT10_GUARD_MAX_TICKETS_MAX);
+  for (var i = 0; i < sel.length; i++) {
+    var t = sel[i];
+    if (!dt10TicketGuardExec_(t)) continue;
+    out.checked++;
+    var sym = dt10NormSym_(t.symbol);
+    var d = Object.prototype.hasOwnProperty.call(map, sym) ? map[sym] : null;
+    var h = null;
+    if (typeof d === 'number' && isFinite(d) && d >= 0 && d <= earnDays) {
+      h = { kind: 'earn', reason: 'earnings in ' + d + 'd', tag: 'earn ' + d + 'd' };
+    } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t) !== 'rule: yes') {
+      h = { kind: 'rule', reason: 'owner rule', tag: 'owner rule' };
+    } else if (cap > 0 && out.kept >= cap) {
+      h = { kind: 'cap', reason: 'ticket cap ' + cap, tag: 'cap ' + cap };
+    }
+    if (h) {
+      h.index = i;
+      h.symbol = sym;
+      out.held.push(h);
+    } else {
+      out.kept++;
+    }
+  }
+  return out;
+}
+/** v1.20.0 [TICKET-GUARD] PURE: the status token (ASCII). observe: 'tguard:
+ * would hold SYM(tag) SYM(tag)' or 'tguard: would hold none'; enforce:
+ * 'tguard: held N (SYM tag, SYM tag)' or 'tguard: held 0'. */
+function dt10TicketGuardToken_(res, mode) {
+  var held = (res && res.held) || [];
+  var parts = [], i;
+  if (mode === 'enforce') {
+    for (i = 0; i < held.length; i++) parts.push(held[i].symbol + ' ' + held[i].tag);
+    return 'tguard: held ' + held.length +
+        (parts.length ? ' (' + parts.join(', ') + ')' : '');
+  }
+  for (i = 0; i < held.length; i++) parts.push(held[i].symbol + '(' + held[i].tag + ')');
+  return 'tguard: would hold ' + (parts.length ? parts.join(' ') : 'none');
+}
+/** v1.20.0 [TICKET-GUARD] PURE: seats the ENFORCED guard sent to the
+ * research path on this render (the _tguard_held marker); 0 while the
+ * guard is off or observing. */
+function dt10TicketGuardHeldCount_(selected) {
+  var n = 0, sel = selected || [];
+  for (var i = 0; i < sel.length; i++) {
+    if (sel[i] && typeof sel[i]._tguard_held === 'string') n++;
+  }
+  return n;
+}
+/** v1.20.0 [TICKET-GUARD]: enforce `res` (dt10TicketGuardCore_ on this
+ * board) through the EXISTING research / no-allocation path: each held
+ * ticket is marked _board_unfunded (the replay's own marker for a seat it
+ * did not fund) and dt10FinalizeBoard_ runs again -- Ticket SAR, shares and
+ * gains 0, entry / stop / TPs dashed, the research note, every KPI and the
+ * board_execution / cash-floor / candidate state recomputed over the
+ * remaining tickets. Funds From then reads 'Held -- <reason>' and the note
+ * '[held: <reason>] ' + the research-context tags the annotations had put
+ * on the ticket (DT10_TGUARD_TAGS_RE prefix, DT10_TGUARD_LIVE_RE suffix)
+ * around the research note. Every other seat's note is restored byte for
+ * byte (the re-finalization rewrites the notes of unfunded seats, which the
+ * annotations had already tagged). No ticket is resized and no freed cash
+ * is redistributed. Returns {before, after} executable counts; a rise
+ * throws. */
+function dt10TicketGuardApply_(payload, res) {
+  var sel = payload.selected || [];
+  var before = dt10TicketClasses_(sel).exec;
+  var heldAt = {}, keep = [], i, h, t, m;
+  for (i = 0; i < res.held.length; i++) heldAt[res.held[i].index] = true;
+  for (i = 0; i < sel.length; i++) {
+    t = sel[i];
+    if (!t || typeof t !== 'object' || heldAt[i] === true) continue;
+    keep.push({ t: t, has: Object.prototype.hasOwnProperty.call(t, 'advisor_note'),
+                note: t.advisor_note });
+  }
+  for (i = 0; i < res.held.length; i++) {
+    h = res.held[i];
+    t = sel[h.index];
+    var note = String(t.advisor_note === null || t.advisor_note === undefined ?
+        '' : t.advisor_note);
+    m = note.match(DT10_TGUARD_TAGS_RE);
+    h.pre = m ? m[1] : '';
+    m = note.match(DT10_TGUARD_LIVE_RE);
+    h.suf = m ? m[0] : '';
+    t._board_unfunded = true;
+    t._tguard_held = h.reason;
+  }
+  dt10FinalizeBoard_(payload);
+  for (i = 0; i < keep.length; i++) {
+    if (keep[i].has) keep[i].t.advisor_note = keep[i].note;
+    else delete keep[i].t.advisor_note;
+  }
+  for (i = 0; i < res.held.length; i++) {
+    h = res.held[i];
+    t = sel[h.index];
+    t.detail = t.detail || {};
+    t.detail.funds_from = 'Held \u2014 ' + h.reason;
+    t.advisor_note = '[held: ' + h.reason + '] ' + h.pre +
+        String(t.advisor_note === null || t.advisor_note === undefined ? '' : t.advisor_note) +
+        h.suf;
+  }
+  var after = dt10TicketClasses_(payload.selected || []).exec;
+  if (after > before) throw new Error('ticket guard raised the executable count');
+  return { before: before, after: after };
+}
+/** v1.20.0 [TICKET-GUARD]: render-side orchestrator, after the earnings
+ * annotations and before the KPI strip. '' when the refresh attached no
+ * payload._dt10_tguard (gate off -> nothing read, nothing touched, no key
+ * stored). Else decides on the earnings map of this render (the v1.6.0
+ * tagger's, so Calendar_Events is read once per render; read here only when
+ * the tagger did not run), applies under enforce, logs one Logger line and
+ * returns the status token; 'tguard: n/a' on a fault. */
+function dt10TicketGuard_(payload, map, ss) {
+  var tg = payload && payload._dt10_tguard;
+  if (!tg || typeof tg !== 'object' ||
+      (tg.mode !== 'observe' && tg.mode !== 'enforce')) return '';
+  try {
+    if (!map || typeof map !== 'object') map = dt10EarningsMap_(ss);
+    var feedOk = !!(payload._dt10_uv && payload._dt10_uv.state === 'EXECUTABLE');
+    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg);
+    var tail = '';
+    if (tg.mode === 'enforce' && res.held.length) {
+      var k = payload.kpis || {};
+      var unBefore = Number(k.capital_unallocated_sar) || 0;
+      var ap = dt10TicketGuardApply_(payload, res);
+      tail = ' | executable ' + ap.before + ' -> ' + ap.after + ', unallocated +' +
+          Math.round((Number((payload.kpis || {}).capital_unallocated_sar) || 0) - unBefore) +
+          ' SAR';
+    }
+    var parts = [];
+    for (var i = 0; i < res.held.length; i++) {
+      parts.push(res.held[i].symbol + '(' + res.held[i].tag + ')');
+    }
+    var cap = dt10StabInt_(tg.maxTickets, 0, 0, DT10_GUARD_MAX_TICKETS_MAX);
+    Logger.log('[DT10 v' + DT10_VERSION + '] ticket guard (' + tg.mode + '): ' +
+        (tg.mode === 'enforce' ? 'held ' : 'would hold ') + res.held.length + ' of ' +
+        res.checked + ' executable ticket(s)' + (parts.length ? ': ' + parts.join(' ') : '') +
+        ' | earnings <= ' + dt10StabInt_(tg.earnDays, DT10_GUARD_EARN_DAYS_DEF, 0,
+                                         DT10_GUARD_EARN_DAYS_MAX) + 'd, owner rule ' +
+        (tg.ownerRule === true ? 'on' : 'off') + ', cap ' + (cap > 0 ? cap : 'none') + tail);
+    return dt10TicketGuardToken_(res, tg.mode);
+  } catch (eTg) {
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] ticket guard FAILED: ' + eTg);
+    } catch (eLg) {}
+    return 'tguard: n/a';
+  }
+}
+/** v1.20.0 [KPI-PLAN-GAIN]: 'on' when DT10_KPI_PLAN_GAIN is exactly 'on'
+ * (trimmed, any case); else 'restore' when the marker
+ * DT10_KPI_PLAN_LABEL_STATE says an armed render relabelled the KPI (the
+ * next render writes the v1.19.0 label back), else 'off' (the v1.19.0 KPI
+ * strip). A fault reads off. Never throws. */
+function dt10KpiPlanGainMode_() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (String(props.getProperty(DT10_KPI_PLAN_GAIN_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on') return 'on';
+    return String(props.getProperty(DT10_KPI_PLAN_LABEL_PROP) || '') === 'tp1' ?
+        'restore' : 'off';
+  } catch (eKp) {}
+  return 'off';
+}
+/** v1.20.0 [KPI-PLAN-GAIN]: sets ('tp1') or deletes the label marker.
+ * Never throws. */
+function dt10KpiPlanLabelMark_(on) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (on) props.setProperty(DT10_KPI_PLAN_LABEL_PROP, 'tp1');
+    else props.deleteProperty(DT10_KPI_PLAN_LABEL_PROP);
+  } catch (eKm) {}
+}
+/** v1.20.0 [KPI-PLAN-GAIN] PURE: the plan payoff of the EXECUTABLE tickets
+ * (dt10TicketGuardExec_), sum Ticket SAR x (TP1 SAR / Price SAR - 1) rounded
+ * to SAR -- the figure each advisor note's '[f1b-observe] ... plan payoff'
+ * tag discloses -- or an em dash when no executable ticket carries a
+ * positive Price SAR and a positive TP1 SAR. */
+function dt10KpiPlanGain_(selected) {
+  var sel = selected || [], sum = 0, n = 0;
+  for (var i = 0; i < sel.length; i++) {
+    var t = sel[i];
+    if (!dt10TicketGuardExec_(t)) continue;
+    var px = Number(t.price_sar), tp1 = Number(t.tp1_sar);
+    if (!(isFinite(px) && px > 0 && isFinite(tp1) && tp1 > 0)) continue;
+    sum += Number(t.suggested_sar) * (tp1 / px - 1);
+    n++;
+  }
+  return n ? Math.round(sum) : '\u2014';
+}
+/** v1.20.0 [VENUE-LINE]: Script Property DT10_VENUE_LINE. Exactly 'on'
+ * (trimmed, any case) arms the banner line; anything else or a fault = off
+ * (the v1.19.0 banner). Never throws. */
+function dt10VenueLineOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_VENUE_LINE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eVl) {}
+  return false;
+}
+/** v1.20.0 [VENUE-LINE] PURE: the DT10_VENUES key of a symbol by suffix --
+ * .SR or four digits = SR, .US or no suffix = US, .L = L, .PA / .AS / .BR /
+ * .LS = EU, .DE = DE, .HK = HK, .T = T; '' for any other suffix (no line). */
+function dt10VenueOf_(symbol) {
+  var s = dt10NormSym_(symbol);
+  if (!s) return '';
+  if (/\.SR$/.test(s) || /^\d{4}$/.test(s)) return 'SR';
+  if (/\.US$/.test(s) || s.indexOf('.') < 0) return 'US';
+  if (/\.L$/.test(s)) return 'L';
+  if (/\.(PA|AS|BR|LS)$/.test(s)) return 'EU';
+  if (/\.DE$/.test(s)) return 'DE';
+  if (/\.HK$/.test(s)) return 'HK';
+  if (/\.T$/.test(s)) return 'T';
+  return '';
+}
+/** v1.20.0 [VENUE-LINE] PURE: is the venue-local calendar day `day`
+ * (integer UTC days since 1970-01-01) inside summer time under `rule` --
+ * 'us': from the second Sunday of March to the first Sunday of November;
+ * 'eu': from the last Sunday of March to the last Sunday of October;
+ * anything else: never. */
+function dt10VenueSummer_(rule, day) {
+  if (rule !== 'us' && rule !== 'eu') return false;
+  var y = new Date(day * 86400000).getUTCFullYear();
+  function sunday(month, nth) {   // nth >= 1: that Sunday; 0: the last one
+    var first = Math.floor(Date.UTC(y, month, 1) / 86400000);
+    if (nth > 0) return first + (7 - (((first % 7) + 11) % 7)) % 7 + (nth - 1) * 7;
+    var last = Math.floor(Date.UTC(y, month + 1, 0) / 86400000);
+    return last - (((last % 7) + 11) % 7);
+  }
+  if (rule === 'us') return day >= sunday(2, 2) && day < sunday(10, 1);
+  return day >= sunday(2, 0) && day < sunday(9, 0);
+}
+/** v1.20.0 [VENUE-LINE] PURE: the regular session of venue `v` (a
+ * DT10_VENUES entry) on its local calendar day `day` (integer UTC days) as
+ * {open, close} epoch ms, or null on a day it does not trade. */
+function dt10VenueSession_(v, day) {
+  var dow = ((day % 7) + 11) % 7;   // 0 = Sunday (dt10WeekdaysBetween_)
+  if (v.sunThu === true ? dow > 4 : (dow < 1 || dow > 5)) return null;
+  var off = v.utc + (dt10VenueSummer_(v.dst, day) ? 60 : 0);
+  return { open: day * 86400000 + (v.open - off) * 60000,
+           close: day * 86400000 + (v.close - off) * 60000 };
+}
+/** v1.20.0 [VENUE-LINE] PURE: 'HH:MM' in Riyadh (UTC+3, no summer time) of
+ * `ms`, with the weekday in front when it is not the Riyadh day of nowMs. */
+function dt10RiyadhClock_(ms, nowMs) {
+  var a = new Date(ms + 10800000), b = new Date(nowMs + 10800000);
+  var hm = a.toISOString().slice(11, 16);
+  if (a.toISOString().slice(0, 10) === b.toISOString().slice(0, 10)) return hm;
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][a.getUTCDay()] + ' ' + hm;
+}
+/** v1.20.0 [VENUE-LINE] PURE: ' \u2014 <venue> opens HH:MM Riyadh[, ...]
+ * (feed valid until HH:MM)' for the venues of the EXECUTABLE tickets
+ * (dt10TicketGuardExec_) whose next regular session opens after the feed
+ * expires, earliest first; '' when the verdict is not EXECUTABLE or its age
+ * is unknown, or when every such venue is open now or opens before the
+ * expiry. The expiry is the cockpit's own clock: DT10_UV_MAX_AGE_MIN after
+ * the verdict stamp = nowMs + (DT10_UV_MAX_AGE_MIN - ageMin) minutes.
+ * Display only. */
+function dt10VenueLine_(selected, uv, nowMs) {
+  if (!uv || uv.state !== 'EXECUTABLE' || typeof uv.ageMin !== 'number' ||
+      !isFinite(uv.ageMin) || typeof nowMs !== 'number' || !isFinite(nowMs)) return '';
+  var expiry = nowMs + (DT10_UV_MAX_AGE_MIN - uv.ageMin) * 60000;
+  var today = Math.floor(nowMs / 86400000);
+  var sel = selected || [], seen = {}, hits = [];
+  for (var i = 0; i < sel.length; i++) {
+    if (!dt10TicketGuardExec_(sel[i])) continue;
+    var key = dt10VenueOf_(sel[i].symbol);
+    if (!key || seen[key] === true) continue;
+    seen[key] = true;
+    var v = DT10_VENUES[key], next = null;
+    for (var d = today - 1; d <= today + 8 && next === null; d++) {
+      var s = dt10VenueSession_(v, d);
+      if (s && s.close > nowMs) next = s;
+    }
+    if (next && next.open > nowMs && next.open > expiry) {
+      hits.push({ at: next.open, name: v.name });
+    }
+  }
+  if (!hits.length) return '';
+  hits.sort(function (a, b) { return a.at - b.at; });
+  var parts = [];
+  for (var j = 0; j < hits.length; j++) {
+    parts.push(hits[j].name + ' opens ' + dt10RiyadhClock_(hits[j].at, nowMs) + ' Riyadh');
+  }
+  return ' \u2014 ' + parts.join(', ') + ' (feed valid until ' +
+      dt10RiyadhClock_(expiry, nowMs) + ')';
+}
 var DT10_KPI_LABELS = ['Entered cash (SAR)', 'Exp. Gain 12M (SAR)', 'Selected',
   'Blended Reliability', 'Blended R/R (TP2)', 'Scanned', 'Passed',
   'Unallocated (SAR)',
@@ -5288,10 +7085,15 @@ function dt10SelectedTitle_(payload, showFeed) {
     return t && t._ft_suspended === true && t._grace_hold !== true;
   }).length;
   var researchN = Math.max(0, cls.suspended - fastN);
+  // v1.20.0 [TICKET-GUARD]: tickets the enforced guard sent to the research
+  // path are counted apart (0 while the guard is off or observing).
+  var guardN = dt10TicketGuardHeldCount_(selected);
+  researchN = Math.max(0, researchN - guardN);
   var title = 'SELECTED — ' + execN + ' EXECUTABLE TICKET' + (execN === 1 ? '' : 'S') +
       (fastN > 0 ? ' + ' + fastN + ' FAST-TRACK (SIZING SUSPENDED)' : '') +
       (researchN > 0 ? ' + ' + researchN + ' RESEARCH (NO ALLOCATION)' : '') +
       (cls.grace > 0 ? ' + ' + cls.grace + ' GRACE-HELD (NO PLAN TODAY)' : '');
+  if (guardN > 0) title += ' + ' + guardN + ' HELD BY GUARD';   // v1.20.0
   var uv = p._dt10_uv || {};
   if (showFeed && uv.state !== 'EXECUTABLE') {
     var qualN = cls.exec + cls.suspended;
@@ -5647,6 +7449,179 @@ function dt10EarningsAnnotate_(payload, ss) {
     return { note: n ? 'earn \u26a0' + n + '/' + sel.length : '', map: map };
   } catch (eEa) {
     return { note: '' };
+  }
+}
+/** v1.18.0 [POST-EARNINGS]: Script Property that arms the post-earnings
+ * advisor tag (observe | on; anything else = off), the quarantine lengths of
+ * the interim trading policy (rule 3) - sessions after any report and after
+ * a report with a negative EPS surprise - and how far back a report can
+ * matter at all (calendar days; no quarantine reaches further). */
+var DT10_POST_EARN_PROP = 'DT10_POST_EARN';
+var DT10_POST_EARN_SESSIONS = 5;
+var DT10_POST_EARN_SESSIONS_NEG = 10;
+var DT10_POST_EARN_MAX_DAYS = 31;
+/** v1.18.0 [POST-EARNINGS]: 'observe' when DT10_POST_EARN is observe or on
+ * (any case, surrounding blanks ignored); else 'off'. Never throws. */
+function dt10PostEarnMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_POST_EARN_PROP) || '');
+  } catch (ePe) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'observe' || raw === 'on') ? 'observe' : 'off';
+}
+/** v1.18.0 [POST-EARNINGS] PURE: trading sessions after `fromDay` up to and
+ * including `toDay` (integer UTC days from dt10CalendarDay_): Mon-Fri, or
+ * Sun-Thu when `sunThu` is true (Tadawul). Exchange holidays are not known
+ * here. The walk is bounded to the last 366 days (callers pass at most
+ * DT10_POST_EARN_MAX_DAYS). */
+function dt10WeekdaysBetween_(fromDay, toDay, sunThu) {
+  var n = 0;
+  if (typeof fromDay !== 'number' || typeof toDay !== 'number') return n;
+  if (toDay - fromDay > 366) fromDay = toDay - 366;
+  for (var d = fromDay + 1; d <= toDay; d++) {
+    var dow = ((d % 7) + 11) % 7;   // day 0 (1970-01-01) was a Thursday; 0 = Sunday
+    if (sunThu === true ? dow <= 4 : (dow >= 1 && dow <= 5)) n++;
+  }
+  return n;
+}
+/** v1.18.0 [POST-EARNINGS] PURE: {SYMBOL: {date, sessions, surprise}} from a
+ * Calendar_Events grid as of `asOfDate` (a Riyadh calendar day; default
+ * now). The header row is the first one carrying 'Symbol' and a 'Last
+ * Earnings Date' or 'Next Earnings Date' column ('EPS Surprise %'
+ * optional). The report is the latest PAST date of the two: a Next Earnings
+ * Date already behind today is a report the calendar has not caught up with
+ * yet (the morning render runs before the calendar sync), its surprise
+ * unknown. Reports older than DT10_POST_EARN_MAX_DAYS are left out.
+ * surprise = the cell's number (text accepted with '%' / ',' stripped,
+ * clamped to +-999999), or null. KSA symbols count Sun-Thu sessions. */
+function dt10PostEarnMapFromValues_(values, asOfDate) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iLast = -1, iNext = -1, iSur = -1;
+  var r, c, cells, tok, rs, rl, rn, rp;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    rs = -1; rl = -1; rn = -1; rp = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol') rs = c;
+      else if (tok === 'lastearningsdate') rl = c;
+      else if (tok === 'nextearningsdate' || tok === 'earningsdate') rn = c;
+      else if (tok === 'epssurprise') rp = c;
+    }
+    if (rs >= 0 && (rl >= 0 || rn >= 0)) {
+      iSym = rs; iLast = rl; iNext = rn; iSur = rp;
+    }
+  }
+  if (iSym < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL' ||
+        Object.prototype.hasOwnProperty.call(map, sym)) continue;
+    var last = iLast >= 0 ? dt10CalendarDay_(cells[iLast]) : null;
+    var next = iNext >= 0 ? dt10CalendarDay_(cells[iNext]) : null;
+    if (last !== null && last >= today) last = null;
+    if (next !== null && next >= today) next = null;
+    var day = last, fromNext = false;
+    if (next !== null && (day === null || next > day)) {
+      day = next;
+      fromNext = true;
+    }
+    if (day === null || today - day > DT10_POST_EARN_MAX_DAYS) continue;
+    var sur = null;
+    if (!fromNext && iSur >= 0) {
+      var raw = cells[iSur];
+      if (typeof raw === 'string') raw = raw.replace(/[,%\s]/g, '');
+      if (typeof raw === 'number' && isFinite(raw)) {
+        sur = raw;
+      } else if (typeof raw === 'string' && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+        sur = parseFloat(raw);
+      }
+      if (sur !== null && Math.abs(sur) > 999999) sur = sur > 0 ? 999999 : -999999;
+    }
+    map[sym] = { date: new Date(day * 86400000).toISOString().slice(0, 10),
+                 sessions: dt10WeekdaysBetween_(day, today,
+                     /\.SR$/.test(sym) || /^\d{4}$/.test(sym)),
+                 surprise: sur };
+  }
+  return map;
+}
+/** v1.18.0 [POST-EARNINGS]: live Calendar_Events read (A1 to the last
+ * column, at most 16). ANY failure => empty map => zero tags. */
+function dt10PostEarnMap_(ss, asOfDate) {
+  try {
+    var sh = ss.getSheetByName('Calendar_Events');
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 16);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10PostEarnMapFromValues_(
+        sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
+  } catch (ePm) {
+    return {};
+  }
+}
+/** v1.18.0 [POST-EARNINGS] PURE: puts
+ * '\u26a0 post-earnings S/L \u00b7 EPS x% \u00b7 ' on advisor_note for the
+ * tickets inside their quarantine (S sessions since the report, L = 5, or
+ * 10 after a negative EPS surprise) - after a leading v1.6.0 forward tag
+ * when there is one (that tagger checks for its own prefix at position 0),
+ * else at the start. Idempotent: a note already carrying the tag is never
+ * tagged again. Returns the tag count. */
+function dt10ApplyPostEarnTags_(tickets, map) {
+  var n = 0;
+  if (!tickets || !tickets.length || !map) return n;
+  for (var i = 0; i < tickets.length; i++) {
+    var t = tickets[i];
+    if (!t) continue;
+    var sym = dt10NormSym_(t.symbol);
+    if (!sym || !Object.prototype.hasOwnProperty.call(map, sym)) continue;
+    var e = map[sym];
+    var lim = (e.surprise !== null && e.surprise < 0) ?
+        DT10_POST_EARN_SESSIONS_NEG : DT10_POST_EARN_SESSIONS;
+    if (!(e.sessions >= 0 && e.sessions <= lim)) continue;
+    var note = String(t.advisor_note || '');
+    if (note.indexOf('\u26a0 post-earnings ') >= 0) continue;
+    var eps = e.surprise === null ? 'n/a' :
+        (e.surprise > 0 ? '+' : '') + e.surprise.toFixed(1) + '%';
+    var tag = '\u26a0 post-earnings ' + e.sessions + '/' + lim +
+        ' \u00b7 EPS ' + eps + ' \u00b7 ';
+    var fwd = note.match(/^\u26a0 earnings \u2264\d+d \u00b7 /);
+    t.advisor_note = fwd ? fwd[0] + tag + note.slice(fwd[0].length) : tag + note;
+    n++;
+  }
+  return n;
+}
+/** v1.18.0 [POST-EARNINGS]: orchestrator - '' when DT10_POST_EARN is off
+ * (no sheet read, nothing touched); else tags the SELECTED board in place
+ * and returns the status token 'post-earn \u26a0N/M' ('post-earn 0/M' when
+ * no seat is inside a quarantine, 'post-earn n/a' when the calendar holds no
+ * recent report or the read failed). Guarded end to end. */
+function dt10PostEarnAnnotate_(payload, ss) {
+  if (dt10PostEarnMode_() === 'off') return '';
+  try {
+    var map = dt10PostEarnMap_(ss);
+    var sel = (payload && payload.selected) || [];
+    var n = dt10ApplyPostEarnTags_(sel, map);
+    var k = 0, q;
+    for (q in map) {
+      if (Object.prototype.hasOwnProperty.call(map, q)) k++;
+    }
+    Logger.log('[DT10 v' + DT10_VERSION + '] post-earnings tags: ' + n + '/' +
+               sel.length + ' tickets (recent reports ' + k + '; quarantine ' +
+               DT10_POST_EARN_SESSIONS + '/' + DT10_POST_EARN_SESSIONS_NEG +
+               ' sessions)');
+    if (!k) return 'post-earn n/a';
+    return 'post-earn ' + (n ? '\u26a0' : '') + n + '/' + sel.length;
+  } catch (ePa) {
+    return 'post-earn n/a';
   }
 }
 function dt10WritePageStatus_(status, message, httpCode, rows, durationMs,
@@ -6116,6 +8091,19 @@ function dt10ApplyStability_(payload, panel, outage) {
   // v1.8.0 (BE-2): the service read lives HERE so dt10StabCore_ stays
   // pure/node-testable; the core consumes the choice as a plain knob.
   knobs.hard_strict = dt10HardVerdictStrict_();
+  // v1.14.0 [CONFIRM-BASIS]: same pattern -- one service read here, the
+  // core consumes the basis as a plain knob ('qualified' default | 'raw').
+  knobs.confirm_basis = dt10StabConfirmBasis_();
+  // v1.15.0 [PENDING-GRACE]: same pattern -- one service read here; the knob
+  // is set ONLY when armed (> 0) so an unarmed run publishes the v1.14.0
+  // knobs object byte for byte.
+  var pgRead = dt10StabPendingGrace_();
+  if (pgRead > 0) knobs.pending_grace = pgRead;
+  // v1.19.0 [QUALIFIED-HOLD]: same pattern -- one service read here; the knob
+  // is set ONLY when armed so an unarmed run publishes the v1.18.0 knobs
+  // object byte for byte.
+  var qhRead = dt10StabQualifiedHoldMode_();
+  if (qhRead !== 'off') knobs.qualified_hold = qhRead;
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -6602,6 +8590,229 @@ function dt10AppendExitLog_(ss, audit, runInfo) {
     return 'ExitLog: ERROR';
   }
 }
+// ---------------------------------------------------------------------------
+// v1.17.0 [SHADOW-RANK-LOG] -- the backend's ranking challenger, logged.
+// Script Property DT10_SHADOW_RANK_LOG = off (DEFAULT) | on | all; see the
+// v1.17.0 header block. Research evidence only: ranks, symbols and the backend's own
+// figures, never a ticket, price or amount.
+// ---------------------------------------------------------------------------
+var DT10_SHADOW_LOG_PROP = 'DT10_SHADOW_RANK_LOG';
+var DT10_SHADOW_LOG_SHEET = '_Shadow_Rank_Log';
+var DT10_SHADOW_LOG_STATE_PROP = 'DT10_SHADOW_LOG_STATE_V1';
+var DT10_SHADOW_LOG_HEADERS = ['Logged At', 'Day', 'Cohort', 'Order', 'Rank',
+  'Symbol', 'Market', 'Sector', 'Seat', 'Live Rank', 'Shadow Rank',
+  'Engine ROI %', 'Rel', 'Conf', 'Momentum', 'Strength', 'Strength Ref',
+  'Cap', 'Floor OK', 'Mode', 'Rule', 'Builder', 'Pool', 'Overlap Top5'];
+/** v1.17.0: 'on' (first event of each UTC day) or 'all' (also on change)
+ * for those exact words (trimmed, any case), else 'off'. Never throws. */
+function dt10ShadowLogMode_() {
+  var raw = '';
+  try {
+    raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_SHADOW_LOG_PROP) || '');
+  } catch (e) {
+    raw = '';
+  }
+  raw = raw.replace(/^\s+|\s+$/g, '').toLowerCase();
+  return (raw === 'on' || raw === 'all') ? raw : 'off';
+}
+/** v1.17.0 PURE: the rows of one logging event and its signature, from
+ * payload.meta.rank_challenger (opportunity_builder v1.28.0, shadow) and the
+ * seats this render shows (payload.selected). Returns { rows, sig, reason };
+ * rows is empty -- nothing to log -- when the block is absent (backend at
+ * legacy), carries an error, or both lists are empty. Orders: CHAMPION (the
+ * backend's live order; Rank = live rank), CHALLENGER (the shadow order;
+ * Rank = shadow rank), BOARD (Rank = board rank; Shadow Rank from the seat,
+ * else from the INVEST audit row; blank when the name is not in today's
+ * INVEST pool, e.g. a grace hold). Every row is DT10_SHADOW_LOG_HEADERS wide. */
+function dt10ShadowLogRows_(payload, stamp, day, cohort) {
+  var meta = (payload && payload.meta) || {};
+  var rc = meta.rank_challenger;
+  if (!rc || typeof rc !== 'object') {
+    return { rows: [], sig: '', reason: 'no challenger block' };
+  }
+  if (rc.error) {
+    return { rows: [], sig: '', reason: 'challenger error ' + String(rc.error) };
+  }
+  var champ = rc.champion || [];
+  var chal = rc.challenger || [];
+  if (!champ.length && !chal.length) {
+    return { rows: [], sig: '', reason: 'empty challenger lists' };
+  }
+  var detail = {};
+  var i, r, s;
+  var lists = [chal, champ];
+  for (var li = 0; li < lists.length; li++) {
+    for (i = 0; i < lists[li].length; i++) {
+      r = lists[li][i] || {};
+      s = dt10NormSym_(r.symbol);
+      if (s && !detail.hasOwnProperty(s)) detail[s] = r;
+    }
+  }
+  var auditRank = {};
+  var cands = (payload && payload.candidates_rows) || [];
+  for (i = 0; i < cands.length; i++) {
+    r = cands[i] || {};
+    s = dt10NormSym_(r.symbol);
+    if (s && r.shadow_rank !== undefined && r.shadow_rank !== null &&
+        !auditRank.hasOwnProperty(s)) {
+      auditRank[s] = r.shadow_rank;
+    }
+  }
+  function vtag(v) {
+    var c = dt10Cell_(v);
+    return c === '' ? '' : 'v' + String(c);
+  }
+  var tail = [dt10Cell_(rc.mode), vtag(rc.version), vtag(rc.builder),
+              dt10Cell_(rc.pool), dt10Cell_(rc.overlap_top5)];
+  function flag(v) {
+    return v === true ? 'Y' : (v === false ? 'N' : '');
+  }
+  function line(order, rank, sym, x, seat, live, shadow, eng, rel, conf) {
+    return [stamp, day, cohort, order, dt10Cell_(rank), dt10Cell_(sym),
+            dt10Cell_(x.market), dt10Cell_(x.sector), seat, dt10Cell_(live),
+            dt10Cell_(shadow), dt10Cell_(eng), dt10Cell_(rel), dt10Cell_(conf),
+            dt10Cell_(x.momentum), dt10Cell_(x.strength),
+            dt10Cell_(x.strength_ref), flag(x.cap), flag(x.floor_ok)]
+        .concat(tail);
+  }
+  var rows = [], cSyms = [], sSyms = [], bToks = [];
+  for (i = 0; i < champ.length; i++) {
+    r = champ[i] || {};
+    rows.push(line('CHAMPION', r.live_rank, r.symbol, r, '', r.live_rank,
+                   r.shadow_rank, r.engine_roi_pct, r.rel, r.conf));
+    cSyms.push(dt10NormSym_(r.symbol));
+  }
+  for (i = 0; i < chal.length; i++) {
+    r = chal[i] || {};
+    rows.push(line('CHALLENGER', r.shadow_rank, r.symbol, r, '', r.live_rank,
+                   r.shadow_rank, r.engine_roi_pct, r.rel, r.conf));
+    sSyms.push(dt10NormSym_(r.symbol));
+  }
+  var seats = (payload && payload.selected) || [];
+  for (i = 0; i < seats.length; i++) {
+    var t = seats[i] || {};
+    s = dt10NormSym_(t.symbol);
+    if (!s) continue;
+    var x = detail.hasOwnProperty(s) ? detail[s] : {};
+    var seat = '';
+    try {
+      seat = String(t._stab_status || '').split(' ')[0].split('(')[0]
+          .toUpperCase();
+    } catch (eS) {
+      seat = '';
+    }
+    var shadow = (t.shadow_rank !== undefined && t.shadow_rank !== null) ?
+        t.shadow_rank : (auditRank.hasOwnProperty(s) ? auditRank[s] : '');
+    var bRank = (t.rank !== undefined && t.rank !== null && t.rank !== '') ?
+        t.rank : i + 1;
+    rows.push(line('BOARD', bRank, t.symbol,
+                   { market: t.market, sector: t.sector,
+                     momentum: x.momentum, strength: x.strength,
+                     strength_ref: x.strength_ref, cap: x.cap,
+                     floor_ok: x.floor_ok },
+                   seat, x.live_rank, shadow, t.engine_roi_pct, t.reliability,
+                   t.confidence_band));
+    bToks.push(bRank + ':' + s);
+  }
+  return { rows: rows, reason: '',
+           sig: day + '|C:' + cSyms.join(',') + '|S:' + sSyms.join(',') +
+               '|B:' + bToks.join(',') };
+}
+/** v1.17.0: append one event to _Shadow_Rank_Log when DT10_SHADOW_RANK_LOG
+ * is on or all. '' when off (no further read, no tab, no write: the v1.16.0
+ * status line). Cadence: 'on' = the first event of each UTC day (what the
+ * nightly scorecard reads); 'all' = also whenever an order changes (state
+ * DT10_SHADOW_LOG_STATE_V1). The tab is created hidden on first use; row 1
+ * must be the header (written when blank; another layout is never written).
+ * Returns the status token. NEVER throws. */
+function dt10AppendShadowRankLog_(ss, payload, cohort) {
+  // v1.17.1 [SHADOW-MOMENTUM]: the mode the pool projection used in this
+  // execution when it ran (the logged day and the sent rows agree); else the
+  // property itself, as in v1.17.0.
+  var mode = (typeof DT10_PROP_MEMO_ === 'object' && DT10_PROP_MEMO_ &&
+      Object.prototype.hasOwnProperty.call(DT10_PROP_MEMO_, 'shadow_log_mode')) ?
+      DT10_PROP_MEMO_.shadow_log_mode : dt10ShadowLogMode_();
+  if (mode === 'off') return '';
+  try {
+    var stamp = '';
+    try {
+      stamp = Utilities.formatDate(new Date(),
+          Session.getScriptTimeZone() || 'Asia/Riyadh',
+          'yyyy-MM-dd HH:mm:ss');
+    } catch (eT) {
+      stamp = String(new Date());
+    }
+    var day = dt10StabToday_();
+    var built = dt10ShadowLogRows_(payload, stamp, day,
+        String(cohort === null || cohort === undefined ? '' : cohort));
+    if (!built.rows.length) return 'ShadowLog: none (' + built.reason + ')';
+    var props = PropertiesService.getScriptProperties();
+    var prev = {};
+    try {
+      prev = JSON.parse(props.getProperty(DT10_SHADOW_LOG_STATE_PROP) ||
+                        '{}') || {};
+    } catch (eP) {
+      prev = {};
+    }
+    if (prev.date === day && (mode === 'on' || prev.sig === built.sig)) {
+      return mode === 'on' ? 'ShadowLog: logged today' :
+          'ShadowLog: unchanged';
+    }
+    var want = DT10_SHADOW_LOG_HEADERS.length;
+    var sh = ss.getSheetByName(DT10_SHADOW_LOG_SHEET);
+    if (!sh) {
+      sh = ss.insertSheet(DT10_SHADOW_LOG_SHEET);
+      try {
+        if (sh.getMaxColumns() > want) {
+          sh.deleteColumns(want + 1, sh.getMaxColumns() - want);
+        }
+      } catch (eC) {}
+      try {
+        sh.hideSheet();
+      } catch (eH) {}
+      try {
+        ss.setActiveSheet(ss.getSheetByName(DT10_SHEET));
+      } catch (eF) {}
+    }
+    if (sh.getMaxColumns() < want) {
+      sh.insertColumnsAfter(sh.getMaxColumns(), want - sh.getMaxColumns());
+    }
+    var head = sh.getLastRow() > 0 ?
+        (sh.getRange(1, 1, 1, want).getValues()[0] || []) : [];
+    var blank = false;
+    for (var hi = 0; hi < want; hi++) {
+      var hv = String(head[hi] === null || head[hi] === undefined ?
+          '' : head[hi]).replace(/^\s+|\s+$/g, '');
+      if (hv === '') {
+        blank = true;
+      } else if (hv !== DT10_SHADOW_LOG_HEADERS[hi]) {
+        return 'ShadowLog: ERROR header mismatch at column ' + (hi + 1);
+      }
+    }
+    if (blank) {
+      sh.getRange(1, 1, 1, want).setValues([DT10_SHADOW_LOG_HEADERS])
+          .setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    var first = Math.max(sh.getLastRow(), 1) + 1;
+    var need = first + built.rows.length - 1;
+    if (sh.getMaxRows() < need) {
+      sh.insertRowsAfter(sh.getMaxRows(), need - sh.getMaxRows());
+    }
+    sh.getRange(first, 1, built.rows.length, want).setValues(built.rows);
+    try {
+      props.setProperty(DT10_SHADOW_LOG_STATE_PROP,
+          JSON.stringify({ date: day, sig: built.sig }));
+    } catch (eS) {}
+    return 'ShadowLog: +' + built.rows.length;
+  } catch (e) {
+    try {
+      Logger.log('[DT10 v' + DT10_VERSION + '] ShadowLog ERROR: ' + e);
+    } catch (e2) {}
+    return 'ShadowLog: ERROR ' + String(e).slice(0, 60);
+  }
+}
 /**
  * Append the rendered board to _Selection_Log. Modes (ScriptProperty
  * DT10_SELECTION_LOG): 'off' kill-switch; 'always' every run; unset =
@@ -6827,11 +9038,15 @@ function dt10WriteTable_(sheet, row, headers, dataRows, emptyText) {
   }
   sheet.getRange(row, 1, dataRows.length, headers.length).setValues(dataRows);
   // Body text in proposal ink; alternate rows in the proposal zebra tint.
-  sheet.getRange(row, 1, dataRows.length, headers.length)
-      .setFontColor(DT10_INK);
+  var body = sheet.getRange(row, 1, dataRows.length, headers.length);
+  body.setFontColor(DT10_INK);
+  // v1.13.11: one read + one write instead of one call per zebra row; the
+  // other rows keep the background they already had.
+  var zebra = body.getBackgrounds();
   for (var i = 0; i < dataRows.length; i += 2) {
-    sheet.getRange(row + i, 1, 1, headers.length).setBackground(DT10_ZEBRA);
+    for (var zc = 0; zc < headers.length; zc++) zebra[i][zc] = DT10_ZEBRA;
   }
+  body.setBackgrounds(zebra);
   sheet.getRange(row - 1, 1, dataRows.length + 1, headers.length)
       .setBorder(true, true, true, true, true, true, DT10_BORDER,
                  SpreadsheetApp.BorderStyle.SOLID);
@@ -6857,7 +9072,8 @@ function dt10TintGraceRows_(sheet, firstDataRow, count, selected, tokens) {
  *  ACTIVE/NEW -> positive green; GRACE/FAST-TRACK -> watch amber. */
 function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
-  var vals = sheet.getRange(firstDataRow, col, count, 1).getValues();
+  var rng = sheet.getRange(firstDataRow, col, count, 1);
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6866,17 +9082,40 @@ function dt10ColorStability_(sheet, firstDataRow, count, col, tokens) {
     } else if (v.indexOf('GRACE') === 0 || v.indexOf('FAST-TRACK') === 0) {
       tok = tokens.VERDICT_WATCH;
     }
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
+}
+/** v1.13.11: paint a one-column range from per-row tokens in bulk. toks[i]
+ * is a {bg, fg} token or null. A token row gets tok.bg, tok.fg and bold,
+ * exactly what the per-cell setBackground/setFontColor/setFontWeight calls
+ * wrote; a null row keeps its current background, font colour and weight
+ * (read back and written unchanged). One read and one write per attribute;
+ * nothing is read or written when no row has a token. */
+function dt10BulkPaint_(rng, toks) {
+  var any = false;
+  for (var a = 0; a < toks.length; a++) {
+    if (toks[a]) { any = true; break; }
+  }
+  if (!any) return;
+  var bg = rng.getBackgrounds(), fg = rng.getFontColors(),
+      fw = rng.getFontWeights();
+  for (var i = 0; i < toks.length; i++) {
+    var tok = toks[i];
+    if (!tok) continue;
+    bg[i][0] = tok.bg === undefined ? null : tok.bg;
+    fg[i][0] = tok.fg === undefined ? null : tok.fg;
+    fw[i][0] = 'bold';
+  }
+  rng.setBackgrounds(bg);
+  rng.setFontColors(fg);
+  rng.setFontWeights(fw);
 }
 /** Verdict/conf cell coloring via §3.4 tokens on a written table column. */
 function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
   if (firstDataRow < 0 || !count) return;
   var rng = sheet.getRange(firstDataRow, col, count, 1);
-  var vals = rng.getValues();
+  var vals = rng.getValues(), toks = [];
   for (var i = 0; i < count; i++) {
     var v = String(vals[i][0] || '');
     var tok = null;
@@ -6884,11 +9123,9 @@ function dt10ColorVerdicts_(sheet, firstDataRow, count, col, tokens) {
     else if (v === 'WATCH') tok = tokens.VERDICT_WATCH;
     else if (v === 'DO_NOT_INVEST') tok = tokens.VERDICT_NEGATIVE;
     else if (v) tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(rng, toks);   // v1.13.11
 }
 function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
   if (firstDataRow < 0 || !count) return;
@@ -6909,24 +9146,66 @@ function dt10ApplyColFormats_(sheet, firstDataRow, count, fmtByCol) {
 function dt10ColorQualified_(sheet, firstDataRow, count, col, qualified,
                              tokens) {
   if (firstDataRow < 0 || !count) return;
+  var toks = [];
   for (var i = 0; i < count; i++) {
     var c = qualified[i] || {};
     var tok;
     if (c.selected === true) tok = tokens.VERDICT_POSITIVE;
     else if (dt10HasValue_(c.deferral)) tok = tokens.VERDICT_WATCH;
     else tok = tokens.VERDICT_BLOCK;
-    if (tok) {
-      sheet.getRange(firstDataRow + i, col).setBackground(tok.bg)
-          .setFontColor(tok.fg).setFontWeight('bold');
-    }
+    toks.push(tok || null);
   }
+  dt10BulkPaint_(sheet.getRange(firstDataRow, col, count, 1), toks);   // v1.13.11
 }
 // ---------------------------------------------------------------------------
 // Main refresh
 // ---------------------------------------------------------------------------
 function refreshDecisionTop10() {
-  var t0 = new Date().getTime();
   dt10PropMemoReset_();   // v1.11.13 [P-202]: fresh property reads per run
+  var run = { statusCell: null, markerOwned: false };   // v1.13.10: a throw ends in FAILED
+  try {
+    dt10RefreshDecisionTop10Run_(run);
+  } catch (eRun) {
+    dt10RefreshFailed_(run, eRun);
+    throw eRun;
+  }
+}
+/** v1.13.10: a refresh that THROWS must not leave the banner at 'running...'
+ * (live 20 Oct: cockpit stuck RUNNING with no grid). Writes a terminal
+ * 'status: FAILED' line (the Riyadh 'Last run' stamp the audit parses, plus
+ * failed_at_utc and a short error), upserts cockpit _Status ERROR and clears
+ * the P-195 marker THIS run stored (a reported failure is not an abort); a
+ * throw before the marker check leaves a previous run's stale marker for the
+ * next check to report as ABORTED_PREV. Never throws; the caller rethrows. A
+ * hard Apps Script timeout cannot be caught: that case still leaves RUNNING
+ * and is reported by the next run's P-195 check. */
+function dt10RefreshFailed_(run, err) {
+  var msg = String(err && err.message ? err.message : err)
+      .replace(/\s+/g, ' ').slice(0, 200);
+  var utc = '';
+  try { utc = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'); } catch (eIso) {}
+  try {
+    var cell = run && run.statusCell;
+    if (!cell) {
+      var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DT10_SHEET);
+      cell = sh ? sh.getRange(DT10_ROW_STATUS, 2) : null;
+    }
+    if (cell) {
+      cell.setValue(dt10StatusLine_('FAILED',
+          'failed_at_utc=' + utc + ' | ' + msg + dt10StaleNote_()));
+    }
+  } catch (eCell) {}
+  try {
+    dt10WritePageStatus_('ERROR', 'Decision cockpit: FAILED at ' + utc + ' \u2014 ' + msg,
+        '', '', '', []);
+  } catch (eSt) {}
+  if (run && run.markerOwned) {   // only the marker this run stored
+    try { dt10RunMarkerClear_(); } catch (eMk) {}
+  }
+  try { SpreadsheetApp.flush(); } catch (eFl) {}
+}
+function dt10RefreshDecisionTop10Run_(run) {
+  var t0 = new Date().getTime();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(DT10_SHEET);
   // v1.3.0 layout guard: the panel grew a row (KPI head moved 13 -> 14), so a
@@ -6938,6 +9217,7 @@ function refreshDecisionTop10() {
   }
   var tokens = dt10Tokens_(ss);
   var statusCell = sheet.getRange(DT10_ROW_STATUS, 2);
+  run.statusCell = statusCell;                              // v1.13.10
   statusCell.setValue(dt10StatusLine_('running\u2026', ''));
   SpreadsheetApp.flush();
   var panel = dt10ReadPanel_(sheet, ss);
@@ -6947,6 +9227,17 @@ function refreshDecisionTop10() {
   var itMode = dt10InputTruthMode_();
   var candMode = dt10CandTabMode_();
   var vintMode = dt10VintageColsMode_();
+  // v1.19.0 [SEAT-LIVE-FILL] / [OWNER-RULE]: one read each; off (default)
+  // => nothing is attached to the payload and the render is v1.18.0.
+  var liveOn = dt10SeatLiveFillOn_();
+  var ruleOn = dt10OwnerRuleMarkOn_();
+  // v1.20.0 [TICKET-GUARD] / [KPI-PLAN-GAIN] / [VENUE-LINE]: one read per
+  // gate (the guard's knobs only while it is armed; the KPI label marker
+  // only while the KPI gate is not on); off (default) => nothing is
+  // attached to the payload and the render is v1.19.0.
+  var tguardCfg = dt10TicketGuardConfig_();
+  var kpiPlanMode = dt10KpiPlanGainMode_();
+  var venueOn = dt10VenueLineOn_();
   if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
@@ -6955,6 +9246,7 @@ function refreshDecisionTop10() {
   }
   // v1.11.12 [P-195]: judge the previous run's marker, then store ours.
   dt10RunMarkerCheck_('refreshDecisionTop10');
+  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker
   // v1.11.12 [SYNC-INFLIGHT]: observe => token only; enforce => HELD.
   var inflight = dt10SyncInflight_(ss);
   var inflightNote = '';
@@ -7013,6 +9305,10 @@ function refreshDecisionTop10() {
     body.portfolio.cash_available_sar = dt10Chosen.sent;
     cashNote = dt10Chosen.note;
   }
+  // v1.16.0 [FUNDING-EVIDENCE]: the published broker packet certifies THIS
+  // request (cash after reservations, links, proven FX). Default off = the
+  // body above byte for byte; the replay deep-copies the applied body.
+  var fundingNote = dt10FundingApply_(body, Date.now());
   var poolNote = 'backend selector';
   var dt10Outage = null;   // v1.11.10 [P-168]: sheet-pool outage sightings
   // Capture source generations BEFORE reading pool rows. A late source
@@ -7091,6 +9387,21 @@ function refreshDecisionTop10() {
     payload._dt10_vint = { mode: vintMode,
                            idx: pool ? dt10PoolVintageIndex_(pool.rows) : null };
   }
+  // v1.19.0 [SEAT-LIVE-FILL]: the live index of the sheet pool rows already
+  // collected and the FX map already read for the body; attached only when
+  // armed (off => the payload object is byte-identical).
+  if (liveOn) {
+    payload._dt10_live = { idx: pool ? dt10SeatLiveIndex_(pool.rows) : null,
+                           fx: body.fx_rates || {} };
+  }
+  // v1.19.0 [OWNER-RULE]: the marker column rides only when armed.
+  if (ruleOn) payload._dt10_rule = { mode: 'on' };
+  // v1.20.0: the three gates ride only when armed (off => the payload object
+  // is byte-identical); the label marker is set before a relabelling render.
+  if (tguardCfg) payload._dt10_tguard = tguardCfg;
+  if (kpiPlanMode !== 'off') payload._dt10_kpi_plan = { mode: kpiPlanMode };
+  if (kpiPlanMode === 'on') dt10KpiPlanLabelMark_(true);
+  if (venueOn) payload._dt10_venue = { mode: 'on' };
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   // Incomplete source evidence must not advance confirmation/miss memory.
   var stab = payload._dt10_uv.source_blocked === true ?
@@ -7113,6 +9424,12 @@ function refreshDecisionTop10() {
   }
   var candNote = payload._dt10_cand_note || '';
   var vintNote = payload._dt10_vint_note || '';
+  // v1.19.0: status tokens the render stored ('' when a gate is off).
+  var liveNote = payload._dt10_live_note || '';
+  var ruleNote = payload._dt10_rule_note || '';
+  // v1.20.0: the guard's status token; a restored KPI label clears the marker.
+  var tguardNote = payload._dt10_tguard_note || '';
+  if (kpiPlanMode === 'restore') dt10KpiPlanLabelMark_(false);
   var finalSource = payload._dt10_uv.source_readiness;
   if (pool) poolNote = dt10PoolNote_(pool, finalSource);
   else poolNote += ' | source readiness ' + (finalSource.ready ? 'VERIFIED (run ' + finalSource.cohort + ')' : 'WITHHELD: ' + finalSource.reason);
@@ -7121,7 +9438,7 @@ function refreshDecisionTop10() {
   seatNote = dt10SeatCheckNote_(payload);
   var secs = Math.round((new Date().getTime() - t0) / 100) / 10;
   var statusLine = dt10StatusLine_(payload._dt10_uv.source_blocked === true ? 'WITHHELD' : String(payload.status || '?'),
-      poolNote + heldNote + cashNote + ' | ' + dt10MetaLine_(payload.meta) +
+      poolNote + heldNote + cashNote + fundingNote + ' | ' + dt10MetaLine_(payload.meta) +
       (stab && stab.note ? ' | ' + stab.note : '') +
       (earn && earn.note ? ' | ' + earn.note : '') +
       (kpiNote ? ' | ' + kpiNote : '') +
@@ -7130,6 +9447,9 @@ function refreshDecisionTop10() {
       (itNote ? ' | ' + itNote : '') +               // v1.13.4 [WP-8]
       (candNote ? ' | ' + candNote : '') +
       (vintNote ? ' | ' + vintNote : '') +
+      (liveNote ? ' | ' + liveNote : '') +               // v1.19.0 [SEAT-LIVE-FILL]
+      (ruleNote ? ' | ' + ruleNote : '') +               // v1.19.0 [OWNER-RULE]
+      (tguardNote ? ' | ' + tguardNote : '') +           // v1.20.0 [TICKET-GUARD]
       dt10FunnelNote_(payload) + ' | ' + secs + 's',
       dt10OutputStatus_(payload));   // v1.11.0 (2)
   // v1.3.1: the cockpit OWNS the selection audit trail — log the board it
@@ -7141,9 +9461,14 @@ function refreshDecisionTop10() {
   // v1.6.6 (S-4): membership departures logged with an Outcome stamp.
   var exitNote = dt10AppendExitLog_(ss,
       (stab && stab.audit) ? stab.audit : {}, statusLine);
+  // v1.17.0 [SHADOW-RANK-LOG]: the backend's ranking challenger, logged
+  // ('' when DT10_SHADOW_RANK_LOG is off -> the v1.16.0 status line).
+  var shadowNote = dt10AppendShadowRankLog_(ss, payload,
+      finalSource && finalSource.ready ? finalSource.cohort : '');
   var finalStatusLine = selLogNote ? statusLine + ' | ' + selLogNote
                                    : statusLine;
   if (exitNote) finalStatusLine += ' | ' + exitNote;
+  if (shadowNote) finalStatusLine += ' | ' + shadowNote;   // v1.17.0
   statusCell.setValue(finalStatusLine);
   // v1.13.4 [WP-8]: ONE _Run_Log INPUT-TRUTH row when any gate is armed.
   dt10InputTruthRunLog_(itMode, candMode, vintMode, payload, itRef,
@@ -7360,9 +9685,23 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // painted. The pre-pool generation must still match the latest sources.
   payload._dt10_uv = dt10BoardVerdict_(sheet.getParent(), payload._dt10_source_context || {});
   dt10FinalizeBoard_(payload);
+  // v1.19.0 [SEAT-LIVE-FILL]: live numbers on grace / fast-track / held
+  // seats after the last note-replacing finalization ('' when the refresh
+  // attached no payload._dt10_live -> nothing touched, no key stored).
+  var liveFillNote = dt10SeatLiveFill_(payload);
+  if (liveFillNote) payload._dt10_live_note = liveFillNote;
   // v1.13.2: annotate after the last note-replacing finalization, before
   // painting the board. The refresh status and selection log use this result.
   var earn = dt10EarningsAnnotate_(payload, sheet.getParent());
+  // v1.18.0 [POST-EARNINGS]: the post-earnings advisor tag ('' when
+  // DT10_POST_EARN is off -> no sheet read, earn and every note untouched).
+  var postEarn = dt10PostEarnAnnotate_(payload, sheet.getParent());
+  if (postEarn) earn.note = earn.note ? earn.note + ' | ' + postEarn : postEarn;
+  // v1.20.0 [TICKET-GUARD]: after the annotations and before the KPI strip
+  // ('' when the refresh attached no payload._dt10_tguard -> nothing read,
+  // nothing touched, no key stored).
+  var tguardNote = dt10TicketGuard_(payload, earn && earn.map, sheet.getParent());
+  if (tguardNote) payload._dt10_tguard_note = tguardNote;
   // KPI strip
   sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
@@ -7373,6 +9712,16 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   if (dt10SeatTruthOn_()) {   // v1.11.12 [P-149]
     var _stKpi = dt10SeatTruthKpi_(payload);
     if (_stKpi) sheet.getRange(DT10_ROW_KPI_VALUES, 3).setValue(_stKpi);
+  }
+  // v1.20.0 [KPI-PLAN-GAIN]: on -> the KPI pair 'Exp. Gain TP1 (SAR)' = the
+  // plan payoff of the executable tickets (after the guard); restore -> the
+  // v1.19.0 label written back once after a rollback; no key = v1.19.0.
+  var _kp = payload._dt10_kpi_plan;
+  if (_kp && _kp.mode === 'on') {
+    sheet.getRange(DT10_ROW_KPI_LABELS, 2).setValue(DT10_KPI_PLAN_GAIN_LABEL);
+    sheet.getRange(DT10_ROW_KPI_VALUES, 2).setValue(dt10KpiPlanGain_(payload.selected));
+  } else if (_kp && _kp.mode === 'restore') {
+    sheet.getRange(DT10_ROW_KPI_LABELS, 2).setValue(DT10_KPI_LABELS[1]);
   }
   var kpiFmts = [DT10_FMT_SAR, DT10_FMT_SAR, '@', '0.0', '0.00',
                  DT10_FMT_INT, DT10_FMT_INT, DT10_FMT_SAR];
@@ -7410,6 +9759,11 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // The upstream token may label input readiness but never invent a ticket.
   var dt10Uv = payload._dt10_uv;
   var dt10SelTitle = dt10SelectedTitle_(payload, dt10UvOn_() || dt10Uv.source_blocked === true);
+  // v1.20.0 [VENUE-LINE]: display only; '' unless a venue of an executable
+  // ticket opens after the feed expires (no payload key = v1.19.0 banner).
+  if (payload._dt10_venue && payload._dt10_venue.mode === 'on') {
+    dt10SelTitle += dt10VenueLine_(payload.selected || [], dt10Uv, new Date().getTime());
+  }
   if (dt10UvOn_()) {
     Logger.log('[DT10 v' + DT10_VERSION + '] upstream verdict: ' +
         (dt10Uv.state === 'EXECUTABLE' ? 'EXECUTABLE' : dt10Uv.reason) +
@@ -7438,6 +9792,18 @@ function dt10RenderPayload_(sheet, payload, tokens) {
                                selHeaders.length - sheet.getMaxColumns());
     }
   }
+  // v1.19.0 [OWNER-RULE]: one extra column after the seat block (after the
+  // vintage columns when those are enforced); off => the headers above and
+  // no key stored on the payload.
+  var _or = !!(payload._dt10_rule && payload._dt10_rule.mode === 'on');
+  if (_or) {
+    selHeaders = selHeaders.concat(DT10_OWNER_RULE_HEADERS);
+    if (sheet.getMaxColumns() < selHeaders.length) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(),
+                               selHeaders.length - sheet.getMaxColumns());
+    }
+    payload._dt10_rule_note = dt10OwnerRuleNote_(selected);
+  }
   var selRows = [];
   for (var s = 0; s < selected.length; s++) {
     selRows.push(dt10TicketToRow_(selected[s]));
@@ -7445,6 +9811,7 @@ function dt10RenderPayload_(sheet, payload, tokens) {
       var _vc = dt10VintageCells_(selected[s], _vt.idx);
       selRows[selRows.length - 1].push(_vc[0], _vc[1]);
     }
+    if (_or) selRows[selRows.length - 1].push(dt10OwnerRuleCell_(selected[s]));   // v1.19.0
   }
   if (dt10Uv.state !== 'EXECUTABLE') {          /* v1.9.0 W1A-4a */
     for (var uvI = 0; uvI < selRows.length; uvI++) {
@@ -7470,6 +9837,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   if (_vt.mode === 'enforce' && selT.firstDataRow > 0) {   // v1.13.4 [WP-8]
     sheet.getRange(selT.firstDataRow, DT10_SELECTED_HEADERS.length + 1,
                    selT.count, DT10_VINTAGE_HEADERS.length).setNumberFormat('@');
+  }
+  if (_or && selT.firstDataRow > 0) {   // v1.19.0 [OWNER-RULE]: text cells
+    sheet.getRange(selT.firstDataRow, selHeaders.length, selT.count, 1)
+        .setNumberFormat('@');
   }
   if (_vt.mode !== 'off') {
     payload._dt10_vint_note = dt10VintageNote_(selected, _vt.idx, _vt.mode);
@@ -7719,6 +10090,25 @@ function dt10SelfTest() {
               ' rowCells=' + slRow.length + ' mode=' + slMode +
               ' sig(B,A)=' +
               dt10SelLogSignature_([{ symbol: 'B' }, { symbol: 'A' }]));
+  // v1.17.0 [SHADOW-RANK-LOG]: pure rows core (nothing is written).
+  var srlBuilt = dt10ShadowLogRows_({ meta: { rank_challenger: {
+      version: '1.0', mode: 'shadow', builder: '1.28.0', pool: 2,
+      overlap_top5: 2,
+      champion: [{ symbol: 'A.US', live_rank: 1, shadow_rank: 2 },
+                 { symbol: 'B.US', live_rank: 2, shadow_rank: 1 }],
+      challenger: [{ symbol: 'B.US', live_rank: 2, shadow_rank: 1 },
+                   { symbol: 'A.US', live_rank: 1, shadow_rank: 2 }] } },
+      selected: [{ symbol: 'A.US', rank: 1, shadow_rank: 2 }] },
+      'stamp', 'day', 'run');
+  report.push('shadow rank log (' + DT10_SHADOW_LOG_PROP + '): ' +
+              dt10ShadowLogMode_());
+  report.push('shadow rank log core: ' +
+      ((srlBuilt.rows.length === 5 &&
+        srlBuilt.rows[0].length === DT10_SHADOW_LOG_HEADERS.length &&
+        srlBuilt.sig === 'day|C:A.US,B.US|S:B.US,A.US|B:1:A.US' &&
+        srlBuilt.rows[0][20] === 'v1.0' && srlBuilt.rows[0][21] === 'v1.28.0' &&
+        dt10ShadowLogRows_({}, 's', 'd', 'c').rows.length === 0) ?
+       'ok' : 'FAIL'));
   // v1.4.0: page-status dry check (pure — nothing is written).
   report.push('page-status upsert: writePageStatus_ ' +
               (typeof writePageStatus_ === 'function' ?
@@ -7999,10 +10389,15 @@ function dt10SelfTest() {
                                 { iCcy: 3, fx: { USD: 3.7528 } });
   var hxD = dt10HoldingFromRow_(['PFS', 'Financials', 445.08, 'USD'], 0, 1, 2,
                                 { iCcy: 3, fx: null });
-  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; SAR/unknown/SAR-column untouched): ' +
+  var hxE = dt10HoldingFromRow_(['VOD.L', 'Telecom', 1000, 'GBp'], 0, 1, 2,
+                                { iCcy: 3, fx: { GBP: 5 } });   // v1.13.10
+  report.push('holdings value_sar via FX (native USD 118.6 -> 445.08; GBp 1000 -> 50; ' +
+      'SAR/SAR-column untouched; unknown -> null): ' +
       ((Math.abs(hxA.value_sar - 445.08) < 0.01 && hxB.value_sar === 10250 &&
-        hxC.value_sar === 5852 && hxD.value_sar === 445.08) ? 'ok' :
-       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' + hxD.value_sar + ']'));
+        hxC.value_sar === null && hxD.value_sar === 445.08 &&
+        Math.abs(hxE.value_sar - 50) < 1e-9) ? 'ok' :
+       'FAIL [' + hxA.value_sar + '/' + hxB.value_sar + '/' + hxC.value_sar + '/' +
+       hxD.value_sar + '/' + hxE.value_sar + ']'));
   var gcS = dt10StabParseState_({ v: 1, date: '2026-09-05', symbols: {
       'GHOST.US': { ci: 0, co: 1, member: true, since: '2026-09-05', ls: '', hist: [70], ft: true } } });
   var gcR = dt10StabCore_([], [], gcS, ftKnobs, 10, '2026-09-05');
@@ -8214,9 +10609,86 @@ function dt10SelfTest() {
   report.push('property memo core: ' +
       ((pmA === pmB && pmB === pmC && pmKeys >= 2 &&
         pmA.length === (dt10W52FieldsLegacy_() ? DT10_POOL_FIELDS.length - 4
-                                               : DT10_POOL_FIELDS.length))
+                                               : DT10_POOL_FIELDS.length) +
+            (DT10_PROP_MEMO_.shadow_log_mode !== 'off' ?
+             DT10_SHADOW_POOL_FIELDS.length : 0))   // v1.17.1
        ? 'ok (pool fields memoized; keys=' + pmKeys + '; reads=1/execution)'
        : 'FAIL'));
+  /* v1.17.1 [SHADOW-MOMENTUM]: the challenger's momentum input travels on
+     the pool row only while the shadow rank log is armed. Pure: the memo is
+     swapped for the two projections and restored (finally). */
+  var spOff = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, false);
+  var spOn = dt10PoolFieldsWithShadow_(DT10_POOL_FIELDS, true);
+  var spTwice = dt10PoolFieldsWithShadow_(spOn, true);
+  var spTail = spOn.slice(DT10_POOL_FIELDS.length);
+  var spTailOk = spTail.length === DT10_SHADOW_POOL_FIELDS.length;
+  for (var spi = 0; spTailOk && spi < spTail.length; spi++) {
+    if (spTail[spi] !== DT10_SHADOW_POOL_FIELDS[spi]) spTailOk = false;
+  }
+  var spHdr = ['Symbol', 'Name', 'Momentum Score'];
+  var spMemo = DT10_PROP_MEMO_;
+  var spMap = null, spRow = null, spBlank = null, spOffMap = null;
+  var spOffRow = null;
+  try {
+    DT10_PROP_MEMO_ = { pool_fields_active: spOn };
+    spMap = dt10MapHeaderCols_(spHdr);
+    spRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spMap, 'Global_Markets');
+    spBlank = dt10PoolRowFromSheetRow_(['WPC.US', 'W. P. Carey', ''],
+        spMap, 'Global_Markets');
+    DT10_PROP_MEMO_ = { pool_fields_active: spOff };
+    spOffMap = dt10MapHeaderCols_(spHdr);
+    spOffRow = dt10PoolRowFromSheetRow_(['OPBK.US', 'OP Bancorp', 57.03],
+        spOffMap, 'Global_Markets');
+  } finally {
+    DT10_PROP_MEMO_ = spMemo;
+  }
+  report.push('shadow pool fields core: ' +
+      ((spOff === DT10_POOL_FIELDS && spOn !== DT10_POOL_FIELDS && spTailOk &&
+        spTwice.length === spOn.length &&
+        spMap && spMap['Momentum Score'] === 2 && spRow !== null &&
+        spRow['Momentum Score'] === 57.03 && spBlank !== null &&
+        spBlank['Momentum Score'] === undefined &&
+        spOffMap && spOffMap['Momentum Score'] === undefined &&
+        spOffRow !== null && spOffRow['Momentum Score'] === undefined) ?
+       'ok (Momentum Score sent only while the shadow log is armed)' :
+       'FAIL') +
+      ' | sent now: ' + (dt10ShadowLogMode_() !== 'off' ? 'yes' : 'no'));
+  /* v1.18.0 [POST-EARNINGS]: pure core on the FRST case (reported Thu 22 Oct
+     after the close, EPS -22.2%; read on Tue 27 Oct = 3 sessions later) and
+     a report the calendar has not caught up with (Next Earnings Date Mon 26
+     Oct, already past: 1 session, surprise unknown). */
+  var peVals = [['Symbol', 'Next Earnings Date', 'Days To Earnings',
+      'Next Ex-Div Date', 'Days To ExDiv', 'Updated At (Riyadh)', 'Source',
+      'Last Earnings Date', 'Days Since Earnings', 'EPS Surprise %'],
+    ['FRST.US', '2027-01-28', 93, '', '', '', 's', '2026-10-22', 5, -22.2],
+    ['OPBK.US', '', '', '', '', '', 's', '2026-10-13', 14, 3.1],
+    ['WTFC.US', '', '', '', '', '', 's', '2026-10-20', 7, ''],
+    ['AER.US', '2026-10-28', 1, '', '', '', 's', '', '', ''],
+    ['WPC.US', '2026-10-26', 0, '', '', '', 's', '', '', '']];
+  var peMap = dt10PostEarnMapFromValues_(peVals, '2026-10-27');
+  var peT = [{ symbol: 'FRST.US', advisor_note: 'n1' },
+             { symbol: 'OPBK.US', advisor_note: 'n2' },
+             { symbol: 'WTFC.US', advisor_note: 'n3' },
+             { symbol: 'AER.US', advisor_note: 'n4' },
+             { symbol: 'WPC.US', advisor_note: '\u26a0 earnings \u22649d \u00b7 n5' }];
+  var peN = dt10ApplyPostEarnTags_(peT, peMap);
+  var peN2 = dt10ApplyPostEarnTags_(peT, peMap);
+  var peKept = dt10UvWithholdRow_(['x', peT[4].advisor_note], [], 1, 'r');
+  report.push('post-earnings core: ' +
+      ((peN === 3 && peN2 === 0 && peMap['OPBK.US'].sessions === 10 &&
+        peT[0].advisor_note ===
+            '\u26a0 post-earnings 3/10 \u00b7 EPS -22.2% \u00b7 n1' &&
+        peT[1].advisor_note === 'n2' &&
+        peT[2].advisor_note === '\u26a0 post-earnings 5/5 \u00b7 EPS n/a \u00b7 n3' &&
+        peT[3].advisor_note === 'n4' &&
+        peT[4].advisor_note === '\u26a0 earnings \u22649d \u00b7 ' +
+            '\u26a0 post-earnings 1/5 \u00b7 EPS n/a \u00b7 n5' &&
+        peKept[1].indexOf('\u26a0 earnings \u22649d \u00b7 \u26a0 post-earnings 1/5 ' +
+                          '\u00b7 EPS n/a \u00b7 SIZING WITHHELD') === 0) ?
+       'ok (FRST 3/10; +EPS at 10 sessions untagged; blank EPS 5/5; past next date 1/5)' :
+       'FAIL') +
+      ' | mode now: ' + dt10PostEarnMode_());
   /* v1.11.12 [SYNC-INFLIGHT]: pure core on the 2026-10-03 13:05 race
      (ML run 37114669145 at 12:59, GM still run 37079471147 at 03:43) and
      the clean 10-04 case (both legs run 37160795404). */
@@ -8388,6 +10860,489 @@ function dt10SelfTest() {
             'feed run token missing/ambiguous' &&
         dt10FeedCohortCheck_('x | superseded_by_run=7.1', '7').ok === false &&
         dt10FeedCohortCheck_('EXECUTABLE | run=7', '').ok === false) ? 'ok' : 'FAIL'));
+  /* v1.14.0 [CONFIRM-BASIS]: basis line (one property read) + pure battery
+     (no services). Board of 2 seats: A (ACTIVE) and B (GRACE 1/3, INVEST at
+     rank 15 = the buffer boundary); challenger CHAL in raw on days 1-2,
+     displaced from raw by NEWC on day 3 while INVEST at rank 12, back on
+     day 4. Grid ranks: NEWC 97 (1), A 95 (2), F1..F12 94.5..83.5, CHAL 86
+     (12), B 84 (15). */
+  report.push('confirm basis (TFB_T10_CONFIRM_BASIS): ' + dt10StabConfirmBasis_() +
+              ' (default qualified; raw = v1.13.11 clocks)');
+  function cbKnobs(basis, buf) {
+    return { enabled: true, confirm_days: 3, exit_days: 3,
+             rank_buffer: (buf === undefined ? 15 : buf), smooth_days: 5,
+             hard_strict: true, confirm_basis: basis };
+  }
+  function cbCand(sym, sc, verdict) {
+    return { symbol: sym, name: sym, opportunity_score: sc,
+             verdict: (verdict === undefined ? 'INVEST' : verdict), price: 10 };
+  }
+  function cbTk(sym, sc) {
+    return { symbol: sym, name: sym, opportunity_score: sc, suggested_sar: 5000,
+             suggested_shares: 50, entry_zone: '9-11', stop_sar: 8, tp1_sar: 12,
+             tp2_sar: 14, exp_gain_12m_sar: 900, advisor_note: 'INVEST',
+             detail: { funds_from: 'Cash 5,000 SAR' } };
+  }
+  function cbGrid(chalScore, chalVerdict) {
+    var g = [cbCand('NEWC.US', 97), cbCand('A.US', 95)];
+    for (var cf = 1; cf <= 12; cf++) g.push(cbCand('F' + cf + '.US', 95.5 - cf));
+    g.push(cbCand('B.US', 84));
+    g.push(cbCand('CHAL.US', chalScore, chalVerdict));
+    return g;
+  }
+  var cbSeed = { v: 1, date: '2026-10-20', symbols: {
+      'A.US': { ci: 3, co: 0, member: true, since: '2026-10-15',
+                ls: '2026-10-20', hist: [95], ft: false },
+      'B.US': { ci: 3, co: 1, member: true, since: '2026-10-15',
+                ls: '2026-10-20', hist: [84], ft: false } } };
+  var cbRaw = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+               [cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+               [cbTk('A.US', 95), cbTk('NEWC.US', 97)],
+               [cbTk('A.US', 95), cbTk('CHAL.US', 86)]];
+  var cbDays = ['2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'];
+  function cbRun(knobs, day3Score, day3Verdict) {
+    var st = dt10StabParseState_(cbSeed);
+    var outs = [];
+    for (var cd = 0; cd < 4; cd++) {
+      var grid = (cd === 2) ? cbGrid(day3Score, day3Verdict) : cbGrid(86);
+      var o = dt10StabCore_(cbRaw[cd], grid, st, knobs, 2, cbDays[cd]);
+      st = dt10StabParseState_(o.state);
+      outs.push(o);
+    }
+    return outs;
+  }
+  function cbTk4(outs, sym) {
+    for (var ct = 0; ct < outs[3].tickets.length; ct++) {
+      if (outs[3].tickets[ct].symbol === sym) return outs[3].tickets[ct];
+    }
+    return null;
+  }
+  function cbClocks(outs) {   // everything but the armed-basis token
+    var cc = [];
+    for (var ck = 0; ck < outs.length; ck++) {
+      cc.push({ t: outs[ck].tickets, s: outs[ck].state, a: outs[ck].audit,
+                n: outs[ck].note.replace(', confirm=qualified', '') });
+    }
+    return JSON.stringify(cc);
+  }
+  var cbQ = cbRun(cbKnobs('qualified'), 86);
+  var cbR = cbRun(cbKnobs('raw'), 86);
+  var cbN = cbRun(cbKnobs(undefined), 86);               // knob absent
+  var cbW = cbRun(cbKnobs('qualified'), 86, 'WATCH');   // (c)
+  var cbO = cbRun(cbKnobs('qualified'), 83);            // (d) rank 16
+  var cbE = cbRun(cbKnobs('qualified'), 84.2);          // rank 15 boundary
+  var cbZ = cbRun(cbKnobs('qualified', 0), 86);         // (e)
+  var cbZr = cbRun(cbKnobs('raw', 0), 86);
+  var opKraw = { enabled: true, confirm_days: 3, exit_days: 3, rank_buffer: 15,
+                 smooth_days: 5, hard_strict: true, confirm_basis: 'raw' };
+  var opRraw = dt10StabCore_([], [], dt10StabParseState_(opSeed), opKraw, 10,
+                             '2026-09-26', opMap);       // (a) P-168 replay
+  var cbChal4 = cbTk4(cbQ, 'CHAL.US');
+  report.push('confirm basis core: ' +
+      ((JSON.stringify(opRraw) === JSON.stringify(opR) &&
+        JSON.stringify(cbR) === JSON.stringify(cbN) &&
+        cbR[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbR[3].state.symbols['CHAL.US'].ci === 1 &&
+        cbR[3].tickets.length === 2 && cbTk4(cbR, 'CHAL.US') === null &&
+        cbR[2].note.indexOf('confirm=') < 0 && cbR[2].note.indexOf('near') < 0 &&
+        cbR[0].state.symbols['B.US'].co === 1 && cbR[0].state.symbols['B.US'].ci === 0 &&
+        cbQ[1].state.symbols['CHAL.US'].ci === 2 &&
+        cbQ[2].state.symbols['CHAL.US'].ci === 3 &&
+        cbQ[2].state.symbols['CHAL.US'].member === false &&
+        cbQ[2].tickets.length === 2 &&
+        cbQ[2].note.indexOf('pending NEWC.US(1/3)') > 0 &&
+        cbQ[2].note.indexOf('confirm=qualified') > 0 &&
+        cbQ[2].note.indexOf('near 1 CHAL.US(3/3)') > 0 &&
+        cbChal4 !== null && cbChal4._stab_status === 'NEW (confirmed 3/3)' &&
+        cbChal4.suggested_sar === 5000 && cbChal4.suggested_shares === 50 &&
+        cbChal4._grace_hold !== true && cbChal4._ft_suspended !== true &&
+        cbQ[3].audit.entered.length === 1 &&
+        cbQ[3].audit.exited_displaced.length === 1 &&
+        cbQ[3].audit.exited_displaced[0] === 'B.US' &&
+        cbQ[3].note.indexOf('near 1 NEWC.US(2/3)') > 0 &&
+        cbQ[0].state.symbols['B.US'].co === 0 && cbQ[0].state.symbols['B.US'].ci === 4 &&
+        cbQ[0].state.symbols['A.US'].ci === 4 && cbR[0].state.symbols['A.US'].ci === 4 &&
+        cbW[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbO[2].state.symbols['CHAL.US'].ci === 0 &&
+        cbE[2].state.symbols['CHAL.US'].ci === 3 &&
+        cbClocks(cbZ) === cbClocks(cbZr))
+       ? 'ok (raw = v1.13.11 clocks; qualified: day-3 rank 12 -> 3/3, day-4 NEW 3/3 sized, ' +
+         'WATCH -> 0, rank 16 -> 0, rank 15 -> 3, buffer 0 = legacy, GRACE member co 0)'
+       : 'FAIL [' + cbQ[2].note + ' | ' + cbQ[3].note + ' | ' + cbR[3].note + ']'));
+  /* v1.15.0 [PENDING-GRACE]: property line (one read) + pure battery on the
+     same board. CHAL confirmed days 1-2 (raw), day 3 a SOFT miss (absent from
+     raw, audited row verdict WATCH at rank 12, no block), day 4 raw again.
+     grace 1: day 3 pauses (ci 2, cp 1, 'pgrace=1', 'pheld 1 CHAL.US(2/3)'),
+     day 4 NEW 3/3 sized. grace absent/0: identical to the v1.14.0 cbW replay.
+     Two consecutive soft misses with grace 1: day 4 resets. Hard miss
+     (structural_block) with grace 1: reset. Member B untouched either way. */
+  report.push('pending grace (TFB_T10_PENDING_GRACE_DAYS): ' + dt10StabPendingGrace_() +
+              ' (0 = v1.14.0 clocks; 1..' + DT10_T10_PENDING_GRACE_MAX + ' arms)');
+  function pgKnobs(pg) {
+    var k = cbKnobs('qualified');
+    if (pg !== undefined) k.pending_grace = pg;
+    return k;
+  }
+  function pgRun(knobs, grids, raw) {
+    var st = dt10StabParseState_(cbSeed);
+    var outs = [];
+    for (var pd = 0; pd < 4; pd++) {
+      var o = dt10StabCore_(raw[pd], grids[pd], st, knobs, 2, cbDays[pd]);
+      st = dt10StabParseState_(o.state);
+      outs.push(o);
+    }
+    return outs;
+  }
+  var pgG = cbGrid(86);
+  var pgSoft = cbGrid(86, 'WATCH');
+  var pgBlk = cbGrid(86);
+  pgBlk[pgBlk.length - 1].structural_block = true;
+  var pgRaw2 = [[cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+                [cbTk('A.US', 95), cbTk('CHAL.US', 86)],
+                [cbTk('A.US', 95), cbTk('NEWC.US', 97)],
+                [cbTk('A.US', 95), cbTk('NEWC.US', 97)]];
+  var pg1 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pg0 = pgRun(pgKnobs(0), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pgA = pgRun(pgKnobs(undefined), [pgG, pgG, pgSoft, pgG], cbRaw);
+  var pg1x2 = pgRun(pgKnobs(1), [pgG, pgG, pgSoft, pgSoft], pgRaw2);
+  var pg1h = pgRun(pgKnobs(1), [pgG, pgG, pgBlk, pgG], cbRaw);
+  var pgChal4 = cbTk4(pg1, 'CHAL.US');
+  var pgBlob2 = JSON.stringify(pg1[2].state.symbols['CHAL.US']);
+  // v1.16.0 [FUNDING-EVIDENCE]: pure core dry run (nothing is sent).
+  var fundProbe = {fx_rates: {USD: 3.7448}, portfolio: {cash_available_sar: 1, pending_proceeds_sar: 0,
+      holdings_input_incomplete: false, holdings: [{symbol: '5023.SR', currency: 'SAR', value_sar: 9390}]}};
+  var fundPacket = {schema_version: 1, source_ref: 'selftest', captured_at: '2026-10-26T05:40:00Z',
+      accounts: [{account_id: 'ibkr-primary', positions_asof: '2026-10-26T05:40:00Z', positions_complete: true,
+                  positions: [], cash_asof: '2026-10-26T05:40:00Z', cash_complete: true,
+                  cash: [{currency: 'USD', settled_cash: '22085.12', reserved_cash: '2644.8', reservations_complete: true}]}],
+      holding_links: [], funding_accounts: ['ibkr-primary'],
+      fx_rates: [{currency: 'USD', rate_to_sar: '3.75', asof: '2026-10-26T05:40:00Z', source_ref: 'policy://sama-usd-peg-3.75'}]};
+  var fundRes = dt10FundingApplyCore_(fundProbe, fundPacket, ['5023.SR'], Date.UTC(2026, 9, 26, 5, 45));
+  report.push('funding evidence core: ' + ((fundRes.applied && fundRes.cashCents === 7290120 &&
+      fundProbe.portfolio.cash_available_sar === 72901.2 && fundProbe.fx_rates.USD === 3.75 &&
+      fundProbe.portfolio.holdings.length === 0 && fundRes.excluded.length === 1 &&
+      dt10FundingApplyCore_({fx_rates: {}, portfolio: {holdings: [], holdings_input_incomplete: false}},
+          fundPacket, [], Date.UTC(2026, 9, 26, 6)).reason.indexOf('capture too old') === 0) ? 'ok' : 'FAIL') +
+      ' (mode ' + dt10FundingMode_() + ', packet ' + (dt10ReconciliationEvidence_() ? 'present' : 'absent') + ')');
+  report.push('pending grace core: ' +
+      ((JSON.stringify(pg0) === JSON.stringify(cbW) &&
+        JSON.stringify(pgA) === JSON.stringify(cbW) &&
+        pg1[1].state.symbols['CHAL.US'].ci === 2 &&
+        pg1[2].state.symbols['CHAL.US'].ci === 2 &&
+        pg1[2].state.symbols['CHAL.US'].cp === 1 &&
+        pg1[2].state.symbols['CHAL.US'].member === false &&
+        pgBlob2.indexOf('"cp":1') > 0 &&
+        pg1[2].note.indexOf('pgrace=1') > 0 &&
+        pg1[2].note.indexOf('pheld 1 CHAL.US(2/3)') > 0 &&
+        pg1[2].audit.pending_held.length === 1 &&
+        pg1[3].state.symbols['CHAL.US'].ci === 3 &&
+        pg1[3].state.symbols['CHAL.US'].cp === undefined &&
+        pg1[3].note.indexOf('pheld') < 0 &&
+        pgChal4 !== null && pgChal4._stab_status === 'NEW (confirmed 3/3)' &&
+        pgChal4.suggested_sar === 5000 &&
+        pg1x2[2].state.symbols['CHAL.US'].ci === 2 &&
+        pg1x2[3].state.symbols['CHAL.US'].ci === 0 &&
+        pg1x2[3].state.symbols['CHAL.US'].cp === undefined &&
+        pg1h[2].state.symbols['CHAL.US'].ci === 0 &&
+        pg1h[2].note.indexOf('pheld') < 0 &&
+        JSON.stringify(pg1[2].state.symbols['B.US']) ===
+            JSON.stringify(cbW[2].state.symbols['B.US']) &&
+        cbW[2].audit.pending_held === undefined &&
+        cbW[2].note.indexOf('pgrace') < 0)
+       ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +
+         'two soft misses -> reset, structural block -> reset, member untouched)'
+       : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));
+  /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
+     confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
+     the buffer boundary: off / junk = the v1.14.0 qualified replay byte for
+     byte; observe = the same board plus ', qhold: would hold 1 B.US' and
+     audit.qualified_held; enforce = B 'ACTIVE (day 7)' with no _grace_hold,
+     a _qhold marker, out of the grace ledger, board-eligible, still unsized,
+     state identical; B WATCH on the grid = 'GRACE (1/3 missed)' as before. */
+  report.push('qualified hold (DT10_QUALIFIED_HOLD): ' + dt10StabQualifiedHoldMode_() +
+              ' (off = v1.18.0 board; observe lists; enforce holds)');
+  function qhKnobs(mode) {
+    var k = cbKnobs('qualified');
+    if (mode !== undefined) k.qualified_hold = mode;
+    return k;
+  }
+  function qhRun(knobs, grid) {
+    return dt10StabCore_(cbRaw[0], grid, dt10StabParseState_(cbSeed), knobs, 2,
+                         cbDays[0]);
+  }
+  function qhSeat(o, sym) {
+    for (var qs = 0; qs < o.tickets.length; qs++) {
+      if (o.tickets[qs].symbol === sym) return o.tickets[qs];
+    }
+    return null;
+  }
+  function qhStrip(o) {   // everything but the armed token / audit key
+    var qa = {};
+    for (var qk in o.audit) {
+      if (o.audit.hasOwnProperty(qk) && qk !== 'qualified_held') qa[qk] = o.audit[qk];
+    }
+    return JSON.stringify({ t: o.tickets, s: o.state, a: qa,
+                            n: o.note.replace(/, qhold: [^,]*$/, '') });
+  }
+  var qhGridW = cbGrid(86);
+  qhGridW[14].verdict = 'WATCH';
+  var qhBase = cbQ[0];
+  var qhBaseStr = JSON.stringify({ t: qhBase.tickets, s: qhBase.state,
+                                   a: qhBase.audit, n: qhBase.note });
+  var qhOff = qhRun(qhKnobs(undefined), cbGrid(86));
+  var qhOffX = qhRun(qhKnobs('junk'), cbGrid(86));
+  var qhObs = qhRun(qhKnobs('observe'), cbGrid(86));
+  var qhEnf = qhRun(qhKnobs('enforce'), cbGrid(86));
+  var qhEnfW = qhRun(qhKnobs('enforce'), qhGridW);
+  var qhB = qhSeat(qhEnf, 'B.US'), qhBo = qhSeat(qhObs, 'B.US');
+  var qhBw = qhSeat(qhEnfW, 'B.US');
+  report.push('qualified hold core: ' +
+      ((JSON.stringify(qhOff) === JSON.stringify(qhBase) &&
+        JSON.stringify(qhOffX) === JSON.stringify(qhBase) &&
+        qhStrip(qhObs) === qhBaseStr &&
+        qhObs.note.indexOf(', qhold: would hold 1 B.US') > 0 &&
+        qhObs.audit.qualified_held.length === 1 &&
+        qhObs.audit.qualified_held[0] === 'B.US' &&
+        qhBo !== null && qhBo._stab_status === 'GRACE (0/3 missed)' &&
+        qhBo._grace_hold === true && !dt10BoardEligible_(qhBo) &&
+        qhB !== null && qhB._stab_status === 'ACTIVE (day 7)' &&
+        qhB._grace_hold !== true && qhB._qhold === true && qhB.rank === 2 &&
+        qhB.suggested_sar === '\u2014' && dt10BoardEligible_(qhB) &&
+        qhEnf.state.symbols['B.US'].co === 0 &&
+        qhEnf.state.symbols['B.US'].member === true &&
+        qhEnf.audit.held_by_grace.length === 0 &&
+        qhEnf.note.indexOf('grace') < 0 &&
+        qhEnf.note.indexOf(', qhold: held 1 B.US') > 0 &&
+        JSON.stringify(qhEnf.state) === JSON.stringify(qhBase.state) &&
+        JSON.stringify(qhSeat(qhEnf, 'A.US')) === JSON.stringify(qhSeat(qhBase, 'A.US')) &&
+        qhBw !== null && qhBw._stab_status === 'GRACE (1/3 missed)' &&
+        qhBw._grace_hold === true && qhEnfW.note.indexOf(', qhold: held 0') > 0)
+       ? 'ok (off/junk = v1.18.0 replay; observe adds the token only; enforce: B ACTIVE (day 7), ' +
+         'eligible, unsized, out of the grace ledger, state identical; B WATCH -> GRACE 1/3)'
+       : 'FAIL [' + qhObs.note + ' | ' + qhEnf.note + ' | ' + qhEnfW.note + ']'));
+  /* v1.19.0 [SEAT-LIVE-FILL]: property line (one read) + pure core. A stash
+     ghost (blank Rel / DQ / FX, stale price 19.88) with a pool row (20.15,
+     Rel 71.5, DQ 100, INVESTABLE) is filled and noted; a grid ghost takes
+     the grid price, Price SAR and FX and is noted (INVEST); a WATCHLIST pool
+     row fills but is not noted; a ghost without any row stays blank; an
+     ACTIVE seat and a fast-track seat with no row are untouched; a second
+     pass changes nothing; no _dt10_live gives ''. */
+  report.push('seat live fill (DT10_SEAT_LIVE_FILL): ' +
+              (dt10SeatLiveFillOn_() ? 'on' : 'off') + ' (off = v1.18.0 render)');
+  var lfIdx = dt10SeatLiveIndex_([
+      { 'Symbol': 'ZTO.US', 'Current Price': 20.15, 'Forecast Reliability Score': 71.5,
+        'Data Quality Score': 100, 'Currency': 'USD', 'Investability Status': 'INVESTABLE' },
+      { 'Symbol': 'ZTO.US', 'Current Price': 1 },
+      { 'Symbol': 'BHF.US', 'Current Price': 50.1, 'Forecast Reliability Score': 65,
+        'Data Quality Score': 90, 'Currency': 'USD', 'Investability Status': 'WATCHLIST' },
+      { 'Symbol': '' }, null]);
+  var lfSel = [
+      { symbol: 'ZTO.US', currency: 'USD', price: 19.88, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (2/3 missed)',
+        advisor_note: 'n1' },
+      { symbol: 'DDI.US', currency: 'USD', price: 13.2, price_sar: 49.5, fx_to_sar: '',
+        reliability: 71.5, dq: 100, _grace_hold: true, _stab_status: 'GRACE (0/3 missed)',
+        advisor_note: 'n2' },
+      { symbol: 'BHF.US', currency: 'USD', price: 49, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (2/3 missed)',
+        advisor_note: 'n3' },
+      { symbol: 'NONE.US', currency: 'USD', price: 5, price_sar: '', fx_to_sar: '',
+        reliability: '', dq: '', _grace_hold: true, _stab_status: 'GRACE (1/3 missed)',
+        advisor_note: 'n4' },
+      { symbol: 'ACT.US', currency: 'USD', price: 7, price_sar: 26.25, fx_to_sar: 3.75,
+        reliability: 80, dq: 95, _stab_status: 'ACTIVE (day 3)', advisor_note: 'n5' },
+      { symbol: 'FT.US', currency: 'USD', price: 9, price_sar: 33.75, fx_to_sar: 3.75,
+        reliability: 77, dq: 90, _ft_suspended: true, _stab_status: 'FAST-TRACK (day 1)',
+        advisor_note: 'n6' }];
+  var lfCands = [{ symbol: 'DDI.US', verdict: 'INVEST', price: 13.4, price_sar: 50.25,
+                   reliability: 71.5, dq: 100, currency: 'USD', opportunity_score: 80 },
+                 { symbol: 'ACT.US', verdict: 'INVEST', price: 7.5, price_sar: 28.13,
+                   reliability: 80, dq: 95, currency: 'USD', opportunity_score: 70 }];
+  var lfBefore = JSON.stringify([lfSel[4], lfSel[5]]);
+  var lfRes = dt10SeatLiveFillCore_(lfSel, lfCands, lfIdx, { USD: 3.75 });
+  var lfOnce = JSON.stringify(lfSel);
+  var lfRes2 = dt10SeatLiveFillCore_(lfSel, lfCands, lfIdx, { USD: 3.75 });
+  report.push('seat live fill core: ' +
+      ((lfRes.seats === 5 && lfRes.filled === 3 && lfRes.investable === 2 &&
+        lfSel[0].price === 20.15 && lfSel[0].reliability === 71.5 && lfSel[0].dq === 100 &&
+        lfSel[0].fx_to_sar === 3.75 && lfSel[0].price_sar === 75.56 &&
+        lfSel[0].advisor_note ===
+            'n1 Source row today: investable (Investability Status INVESTABLE).' &&
+        lfSel[0]._stab_status === 'GRACE (2/3 missed)' && lfSel[0]._grace_hold === true &&
+        lfSel[1].price === 13.4 && lfSel[1].price_sar === 50.25 &&
+        lfSel[1].fx_to_sar === 3.75 &&
+        lfSel[1].advisor_note === 'n2 Source row today: investable (INVEST on the audited grid).' &&
+        lfSel[2].price === 50.1 && lfSel[2].reliability === 65 && lfSel[2].dq === 90 &&
+        lfSel[2].advisor_note === 'n3' &&
+        lfSel[3].price === 5 && lfSel[3].reliability === '' && lfSel[3].fx_to_sar === '' &&
+        JSON.stringify([lfSel[4], lfSel[5]]) === lfBefore &&
+        lfRes2.filled === 0 && lfRes2.investable === 0 && JSON.stringify(lfSel) === lfOnce &&
+        lfIdx['ZTO.US'].price === 20.15 && dt10SeatLiveIndex_(null)['X'] === undefined &&
+        dt10SeatLiveFill_({ selected: lfSel }) === '')
+       ? 'ok (stash ghost filled from the pool row and noted; grid ghost from the grid; ' +
+         'WATCHLIST row not noted; no row = blank; ACTIVE / fast-track untouched; idempotent)'
+       : 'FAIL [' + JSON.stringify(lfRes) + ' ' + JSON.stringify(lfSel[0]) + ']'));
+  /* v1.19.0 [OWNER-RULE]: property line (one read) + pure cell / note. */
+  report.push('owner rule mark (DT10_OWNER_RULE_MARK): ' +
+              (dt10OwnerRuleMarkOn_() ? 'on' : 'off') +
+              ' (High + Engine ROI 12M < ' + DT10_OWNER_RULE_ROI_MAX + '; display only)');
+  var orSel = [{ confidence_band: 'High', engine_roi_pct: 31.6 },
+               { confidence_band: 'Medium', engine_roi_pct: 34.8 },
+               { confidence_band: 'High', engine_roi_pct: 34 },
+               { confidence_band: 'Medium', engine_roi_pct: 20 },
+               { confidence_band: '', engine_roi_pct: '' },
+               { confidence_band: 'high', engine_roi_pct: '33.9' },
+               { confidence_band: 'Low' }];
+  var orCells = [];
+  for (var ori = 0; ori < orSel.length; ori++) orCells.push(dt10OwnerRuleCell_(orSel[ori]));
+  report.push('owner rule core: ' +
+      ((orCells.join('|') === 'rule: yes|rule: no (Medium; ROI 34.8)|rule: no (ROI 34.0)|' +
+            'rule: no (Medium)|rule: no (conf unknown; ROI unknown)|rule: yes|' +
+            'rule: no (Low; ROI unknown)' &&
+        dt10OwnerRuleNote_(orSel) === 'owner-rule 2/7 yes' &&
+        dt10OwnerRuleNote_([]) === 'owner-rule 0/0 yes' &&
+        dt10OwnerRuleCell_(null) === 'rule: no (conf unknown; ROI unknown)')
+       ? 'ok (High + ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' = yes; the failing part is named)'
+       : 'FAIL [' + orCells.join('|') + ']'));
+  /* v1.20.0 [TICKET-GUARD]: property line (one read; the knobs only while
+     armed) + pure battery on a five-seat board -- A High ROI 30 earnings in
+     0d, B Medium 20, C High 31 earnings in 5d, D High 25, E research (no
+     plan, earnings in 1d): earnings 3 holds A; 5 holds A and C; the owner
+     rule adds B; cap 1 keeps B only; a withheld feed holds nothing. When
+     allocation is enabled the enforce path runs through the REAL
+     dt10FinalizeBoard_: A Ticket 0 / 'Held -- earnings in 0d' / '[held:
+     earnings in 0d] ' + its earnings tag + the research note, unallocated
+     +1,000, three tickets left, B / C / D / E byte-identical. */
+  var tgCfgNow = dt10TicketGuardConfig_();
+  function tgBoard() {
+    function seat(sym, rank, sar, band, roi, tp1) {
+      return { symbol: sym, rank: rank, suggested_sar: sar, suggested_shares: sar / 100,
+               price_sar: 100, tp1_sar: tp1, stop_sar: 90, tp2_sar: tp1 + 10,
+               entry_zone: '99-101 SAR', exp_gain_12m_sar: sar / 2, confidence_band: band,
+               engine_roi_pct: roi, reliability: 80, _stab_status: 'ACTIVE (day 3)',
+               advisor_note: 'INVEST ' + sym, detail: { funds_from: 'Cash', rr_tp2: 2 } };
+    }
+    var tgRes = seat('E.US', 5, 0, 'High', 20, 110);
+    tgRes._board_unfunded = true;
+    return [seat('A.US', 1, 1000, 'High', 30, 120), seat('B.US', 2, 2000, 'Medium', 20, 110),
+            seat('C.US', 3, 3000, 'High', 31, 115), seat('D.US', 4, 4000, 'High', 25, 105),
+            tgRes];
+  }
+  var tgMap = { 'A.US': 0, 'C.US': 5, 'E.US': 1 };
+  function tgSyms(r) {
+    var tgOut = [];
+    for (var tgi = 0; tgi < r.held.length; tgi++) {
+      tgOut.push(r.held[tgi].symbol + ':' + r.held[tgi].kind);
+    }
+    return tgOut.join(',') + '/' + r.checked + '/' + r.kept;
+  }
+  var tgE = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3 });
+  var tgE5 = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 5 });
+  var tgR = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3, ownerRule: true });
+  var tgC = dt10TicketGuardCore_(tgBoard(), true, tgMap, { earnDays: 3, maxTickets: 1 });
+  var tgW = dt10TicketGuardCore_(tgBoard(), false, tgMap, { earnDays: 30, maxTickets: 1 });
+  var tgApply = 'apply skipped (DT10_BOARD_FUNDING_MODE research)';
+  if (dt10BoardFundingMode_() === 'enabled') {
+    var tgPay = { version: 'st', selected: tgBoard(), kpis: { deployable_sar: 12000 },
+                  candidates_rows: [], alerts: [], near_miss: [],
+                  meta: { board_funding: { contract_version: 1, stage: 'allocate',
+                                           finalized: true, allocation_version: 'st',
+                                           eligible_symbols: ['A.US', 'B.US', 'C.US',
+                                                              'D.US', 'E.US'] } },
+                  _dt10_uv: { state: 'EXECUTABLE' } };
+    dt10FinalizeBoard_(tgPay);
+    tgPay.selected[0].advisor_note = '\u26a0 earnings \u22640d \u00b7 ' +
+        tgPay.selected[0].advisor_note;
+    tgPay.selected[4].advisor_note = '\u26a0 earnings \u22641d \u00b7 ' +
+        tgPay.selected[4].advisor_note;
+    var tgKeep = JSON.stringify(tgPay.selected.slice(1));
+    var tgUn0 = tgPay.kpis.capital_unallocated_sar;
+    var tgAp = dt10TicketGuardApply_(tgPay, dt10TicketGuardCore_(tgPay.selected, true, tgMap,
+                                                                 { earnDays: 3 }));
+    var tgA = tgPay.selected[0];
+    tgApply = (tgAp.before === 4 && tgAp.after === 3 && tgA.suggested_sar === 0 &&
+        tgA.suggested_shares === 0 && tgA.stop_sar === '\u2014' && tgA.tp1_sar === '\u2014' &&
+        tgA.detail.funds_from === 'Held \u2014 earnings in 0d' &&
+        tgA.advisor_note === '[held: earnings in 0d] \u26a0 earnings \u22640d \u00b7 ' +
+            'Research seat \u2014 no executable allocation today. ACTIVE (day 3)' &&
+        tgPay.kpis.capital_unallocated_sar === tgUn0 + 1000 &&
+        tgPay.kpis.fundable_now === 3 && tgPay.kpis.selected_count === 3 &&
+        JSON.stringify(tgPay.selected.slice(1)) === tgKeep &&
+        dt10TicketGuardHeldCount_(tgPay.selected) === 1 &&
+        dt10SelectedTitle_(tgPay, false).indexOf(
+            '3 EXECUTABLE TICKETS + 1 RESEARCH (NO ALLOCATION) + 1 HELD BY GUARD') > 0) ?
+        'apply ok' : 'apply FAIL';
+  }
+  report.push('ticket guard (DT10_TICKET_GUARD): ' +
+      (tgCfgNow ? tgCfgNow.mode + ' [earnings <= ' + tgCfgNow.earnDays + 'd, owner rule ' +
+                  (tgCfgNow.ownerRule ? 'on' : 'off') + ', cap ' +
+                  (tgCfgNow.maxTickets > 0 ? tgCfgNow.maxTickets : 'none') + ']' : 'off') +
+      ' (off = v1.19.0 board; observe names; enforce holds) | core: ' +
+      ((tgSyms(tgE) === 'A.US:earn/4/3' && tgSyms(tgE5) === 'A.US:earn,C.US:earn/4/2' &&
+        tgSyms(tgR) === 'A.US:earn,B.US:rule/4/2' &&
+        tgSyms(tgC) === 'A.US:earn,C.US:cap,D.US:cap/4/1' && tgSyms(tgW) === '/0/0' &&
+        dt10TicketGuardToken_(tgR, 'enforce') ===
+            'tguard: held 2 (A.US earn 0d, B.US owner rule)' &&
+        dt10TicketGuardToken_(tgC, 'observe') ===
+            'tguard: would hold A.US(earn 0d) C.US(cap 1) D.US(cap 1)' &&
+        dt10TicketGuardToken_(tgW, 'observe') === 'tguard: would hold none' &&
+        dt10TicketGuardToken_(tgW, 'enforce') === 'tguard: held 0' &&
+        dt10TicketGuard_({ selected: tgBoard() }, tgMap, null) === '' &&
+        tgApply !== 'apply FAIL')
+       ? 'ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; ' + tgApply + ')'
+       : 'FAIL [' + tgSyms(tgE) + ' | ' + tgSyms(tgR) + ' | ' + tgSyms(tgC) + ' | ' +
+         tgApply + ']'));
+  /* v1.20.0 [KPI-PLAN-GAIN]: property line (the gate, and the label marker
+     while the gate is not on) + the pure sum on the same board: 1000 x 0.20
+     + 2000 x 0.10 + 3000 x 0.15 + 4000 x 0.05 = 1,050 SAR (E has no plan);
+     no executable ticket, or none with a usable TP1, = an em dash. */
+  var kpModeNow = dt10KpiPlanGainMode_();
+  var kpNoTp1 = tgBoard();
+  for (var kpi1 = 0; kpi1 < kpNoTp1.length; kpi1++) kpNoTp1[kpi1].tp1_sar = '\u2014';
+  report.push('kpi plan gain (DT10_KPI_PLAN_GAIN): ' +
+      (kpModeNow === 'restore' ? 'off (label restore pending)' : kpModeNow) +
+      ' (' + DT10_KPI_PLAN_GAIN_LABEL + ' = sum Ticket SAR x (TP1 SAR / Price SAR - 1); ' +
+      'off = v1.19.0 KPI) | core: ' +
+      ((dt10KpiPlanGain_(tgBoard()) === 1050 && dt10KpiPlanGain_([]) === '\u2014' &&
+        dt10KpiPlanGain_([tgBoard()[4]]) === '\u2014' && dt10KpiPlanGain_(kpNoTp1) === '\u2014' &&
+        dt10KpiPlanGain_(null) === '\u2014')
+       ? 'ok (four tickets 1050 SAR; no ticket = em dash)'
+       : 'FAIL [' + dt10KpiPlanGain_(tgBoard()) + ']'));
+  /* v1.20.0 [VENUE-LINE]: property line + the pure line at the 2 Nov 2026
+     08:49:43 render (verdict age 367.5m): US opens 17:30 Riyadh, the feed
+     is valid until 10:42; London 11:00 comes first; US summer time 16:30
+     (26 Oct); a Tadawul Sunday 10:00; a Friday-night board names Monday;
+     a venue open now, a withheld feed, an unknown age or an unsized ticket
+     give nothing. */
+  var vlNow = Date.UTC(2026, 10, 2, 5, 49, 43);
+  var vlUv = { state: 'EXECUTABLE', ageMin: 367.5 };
+  function vlT(sym, sar) {
+    return { symbol: sym, suggested_sar: sar === undefined ? 1000 : sar,
+             suggested_shares: sar === undefined ? 10 : sar };
+  }
+  var vl1 = dt10VenueLine_([vlT('CRC.US'), vlT('EFC.US')], vlUv, vlNow);
+  var vl2 = dt10VenueLine_([vlT('CRC.US'), vlT('BBOX.L')], vlUv, vlNow);
+  var vlSummer = dt10VenueLine_([vlT('CRC.US')], vlUv, Date.UTC(2026, 9, 26, 5, 49, 43));
+  var vlSr = dt10VenueLine_([vlT('2222.SR')], { state: 'EXECUTABLE', ageMin: 400 },
+                            Date.UTC(2026, 10, 1, 5, 0, 0));
+  var vlWk = dt10VenueLine_([vlT('CRC.US')], { state: 'EXECUTABLE', ageMin: 0 },
+                            Date.UTC(2026, 9, 30, 21, 30, 0));
+  report.push('venue line (DT10_VENUE_LINE): ' + (dt10VenueLineOn_() ? 'on' : 'off') +
+      ' (approximate regular sessions in Riyadh time, no holidays; display only) | core: ' +
+      ((vl1 === ' \u2014 US opens 17:30 Riyadh (feed valid until 10:42)' &&
+        vl2 === ' \u2014 London opens 11:00 Riyadh, US opens 17:30 Riyadh (feed valid until 10:42)' &&
+        vlSummer === ' \u2014 US opens 16:30 Riyadh (feed valid until 10:42)' &&
+        vlSr === ' \u2014 Tadawul opens 10:00 Riyadh (feed valid until 09:20)' &&
+        vlWk === ' \u2014 US opens Mon 17:30 Riyadh (feed valid until 08:30)' &&
+        dt10VenueLine_([vlT('CRC.US')], vlUv, Date.UTC(2026, 10, 2, 15, 0, 0)) === '' &&
+        dt10VenueLine_([vlT('CRC.US')], { state: 'NOT_ACTIONABLE', ageMin: 10 }, vlNow) === '' &&
+        dt10VenueLine_([vlT('CRC.US')], { state: 'EXECUTABLE', ageMin: null }, vlNow) === '' &&
+        dt10VenueLine_([vlT('CRC.US', 0)], vlUv, vlNow) === '' &&
+        dt10VenueOf_('1120') === 'SR' && dt10VenueOf_('BRK-B') === 'US' &&
+        dt10VenueOf_('MC.PA') === 'EU' && dt10VenueOf_('X.TO') === '')
+       ? 'ok (US 17:30 winter / 16:30 summer, London 11:00, Tadawul Sun 10:00, ' +
+         'Friday night -> Mon; open now / withheld / unsized = none)'
+       : 'FAIL [' + vl1 + ' | ' + vl2 + ' | ' + vlSummer + ' | ' + vlSr + ' | ' + vlWk + ']'));
   var msg = report.join('\n');
   Logger.log(msg);
   try {
