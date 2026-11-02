@@ -305,7 +305,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.4.1", "bigquery looker views"),
+    ("apply_bq_views", "1.5.0", "bigquery looker views"),  # 2 Nov 2026: views 1.5.0
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -315,7 +315,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
-    ("archive_symbol_deep", "1.0.0", "bigquery symbol deep data"),
+    # 2026-11-02 (same rule): 1.0.0 -> 1.1.0 (the symbols with an active
+    # Performance_Log record join the bars load for the BigQuery outcome
+    # engine; TFB_DEEP_OUTCOME_BARS, default off).
+    ("archive_symbol_deep", "1.1.0", "bigquery symbol deep data"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
