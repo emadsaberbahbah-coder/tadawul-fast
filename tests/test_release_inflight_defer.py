@@ -49,6 +49,11 @@ Cases
   N1  workflow: step-level mapping, job env unchanged; version floor,
       verifier pin, WHY order
   N2  added lines ASCII; no function removed; exactly two added
+  N3  (2026-11-02, merge of main #893) coexists with workflow 1.3.0's
+      'Defer while a production sync is running' step: a workflow deferral
+      skips the release step (one deferral per slot), this gate is mapped
+      in the release step env only, and an armed sticky kill with a busy
+      superseding sync answers in the kill branch (no probe, no deferral)
 
 Golden negative: TFB_TEST_RDF_DELIVERED=<base copy> runs every case against
 v1.2.0 as the delivered module (all but I5 fail; N2 skips). Base copy: TFB_TEST_RDF_BASE=<path>, else
@@ -518,6 +523,34 @@ def test_n1_workflow_mapping_version_and_pin():
     assert (src.index("VERSION 1.3.1 (2026-10-24") < src.index("VERSION 1.3.0 (2026-10-29)")
             < src.index("VERSION 1.2.0 (2026-10-19)"))
     assert R.INFLIGHT_DEFER_ENV == GATE and R.KEY_READ_RETRIES == 2
+
+
+# ---------------------------------------------------------------- N3 -----
+def test_n3_coexists_with_the_workflow_defer_step():
+    """2026-11-02 (merge of main #893, workflow 1.3.0): the workflow's own
+    defer step and this gate never both defer one slot, and an armed sticky
+    kill always reaches the script's kill branch."""
+    import yaml
+    text = (ROOT / ".github/workflows/release_decision_feed.yml").read_text(encoding="utf-8")
+    job = yaml.safe_load(text)["jobs"]["release-decision-feed"]
+    names = [s["name"] for s in job["steps"]]
+    defer = job["steps"][names.index("Defer while a production sync is running")]
+    release = job["steps"][names.index("Release or retract the decision feed")]
+    # one deferral per slot: a workflow deferral skips the script, so this gate
+    assert names.index(defer["name"]) < names.index(release["name"])
+    assert release["if"] == "${{ steps.defer.outputs.deferred != 'true' }}"
+    # this gate lives in the release step env only; the defer step never reads it
+    assert GATE not in json.dumps(defer) and GATE not in json.dumps(job["env"])
+    assert [s["name"] for s in job["steps"] if GATE in json.dumps(s.get("env", {}))] == [release["name"]]
+    assert (text.index("# VERSION 1.3.1 (2026-10-24") < text.index("# VERSION 1.3.0 (2026-11-02)")
+            < text.index("# VERSION 1.2.0 (2026-10-29)"))
+    # the sticky kill wins in the script too: armed with the superseding sync
+    # busy, the kill branch answers before steps 4/5 and nothing defers
+    for feed in (SUP, VETO_OLD):
+        out, seen, svc = drive(R, grid(feed=feed), gate="1", kill_var=True, inflight=busy(NEW))
+        assert (out["outcome"], out["deferred"]) == ("killed", False), feed
+        assert "inflight_defer" not in out and "production_run_in_flight" not in out["reasons"]
+        assert seen["probe"] == 0 and seen["provenance"] == [] and svc.updates() == []
 
 
 # ---------------------------------------------------------------- N2 -----

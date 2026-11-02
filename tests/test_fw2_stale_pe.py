@@ -834,7 +834,10 @@ def _mapped(doc):
 def test_w1_both_page_writing_jobs_map_the_gate_default_off():
     text = WORKFLOW.read_text(encoding="utf-8")
     assert _mapped(yaml.safe_load(text)) == {job: EXPR for job in JOBS}
-    assert any(line.startswith("# VERSION 1.0.8 (2026-10-29)") for line in text.splitlines()[:6])
+    # The header block is every comment line before the first trigger key;
+    # daily_sync.yml 1.0.9 (2026-11-02, sync-render handshake) sits above 1.0.8.
+    head = text.split("\non:\n", 1)[0].splitlines()
+    assert any(line.startswith("# VERSION 1.0.8 (2026-10-29)") for line in head)
     assert ENV not in (yaml.safe_load(text).get("env") or {})
 
 
