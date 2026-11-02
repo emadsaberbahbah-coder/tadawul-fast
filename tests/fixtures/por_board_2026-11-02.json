@@ -1,0 +1,656 @@
+{
+ "source": "Live workbook read-back (gviz, read-only) on 2026-11-03 01:20-01:40 Riyadh: _Selection_Log renders of 2 Nov, My_Portfolio, _Status 'TFB Decision Feed'; IBKR read-only working orders of 2 Nov. Advisor notes shortened; numbers exact. Plus one synthetic CANCELLED INDV stop (remaining 95) that only exercises the working-order status filter.",
+ "selection_log_header": [
+  "Logged At",
+  "Run Info",
+  "Source Page",
+  "Rank",
+  "Symbol",
+  "Name",
+  "Market",
+  "Sector",
+  "Ccy",
+  "FX\u2192SAR",
+  "Price",
+  "Price SAR",
+  "Entry Zone",
+  "Ticket SAR",
+  "Shares",
+  "Stop SAR",
+  "TP1 SAR",
+  "TP2 SAR",
+  "ROI %",
+  "Engine ROI %",
+  "Ann ROI %",
+  "Gain 12M SAR",
+  "Rel",
+  "DQ",
+  "Conf",
+  "Funds From",
+  "Review By",
+  "Advisor Note",
+  "Panel Snapshot",
+  "Outcome",
+  "Review Notes",
+  "Stability"
+ ],
+ "renders": [
+  {
+   "at": "2026-11-02 4:33:22",
+   "output": "QUALIFIED_UNFUNDED",
+   "run": "41363258387",
+   "rows": [
+    {
+     "rank": "1",
+     "symbol": "ITRN.US",
+     "shares": 0,
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "3",
+     "symbol": "DDI.US",
+     "shares": 0,
+     "stability": "ACTIVE (day 7)"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 8:49:43",
+   "output": "EXECUTABLE",
+   "run": "41363258387",
+   "rows": [
+    {
+     "rank": "1",
+     "symbol": "ITRN.US",
+     "name": "Ituran Location and Control Ltd.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Information Technology",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 52.47,
+     "priceSar": 196.76,
+     "zone": "190.86\u2013198.73 SAR",
+     "ticket": 12199,
+     "shares": 62,
+     "stop": 181.02,
+     "tp1": 230.75,
+     "tp2": 264.73,
+     "roi": 17.3,
+     "eroi": 34.5,
+     "rel": 71.5,
+     "dq": 100,
+     "conf": "Medium",
+     "note": "INVEST \u2014 12,199 SAR (62 sh) @ entry 190.86\u2013198.73 SAR, stop 181.02, TP1 230.75, TP2 264.73 SAR",
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "2",
+     "symbol": "BBOX.L",
+     "name": "Tritax Big Box Ord",
+     "market": "LSE",
+     "sector": "Real Estate",
+     "ccy": "GBX",
+     "fx": "",
+     "price": 145.5,
+     "priceSar": 7.33,
+     "zone": "\u2014",
+     "ticket": 0,
+     "shares": 0,
+     "stop": "\u2014",
+     "tp1": "\u2014",
+     "tp2": "\u2014",
+     "roi": 16.2,
+     "eroi": 32.5,
+     "rel": 71.5,
+     "dq": 100,
+     "conf": "Medium",
+     "note": "Research \u2014 no allocation",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "3",
+     "symbol": "DDI.US",
+     "name": "DoubleDown Interactive Co., Ltd.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Communication Services",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 13.48,
+     "priceSar": 50.55,
+     "zone": "49.03\u201351.06 SAR",
+     "ticket": 12334,
+     "shares": 244,
+     "stop": 46.51,
+     "tp1": 58.82,
+     "tp2": 67.08,
+     "roi": 16.4,
+     "eroi": 32.7,
+     "rel": 71.5,
+     "dq": 100,
+     "conf": "Medium",
+     "note": "\u26a0 earnings \u22649d \u00b7 INVEST \u2014 12,334 SAR (244 sh)",
+     "stability": "ACTIVE (day 7)"
+    },
+    {
+     "rank": "4",
+     "symbol": "CRC.US",
+     "name": "California Resources Corporation",
+     "market": "NYSE/NASDAQ",
+     "sector": "Energy",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 55.46,
+     "priceSar": 207.97,
+     "zone": "201.74\u2013210.05 SAR",
+     "ticket": 8527,
+     "shares": 41,
+     "stop": 189.04,
+     "tp1": 242.75,
+     "tp2": 277.53,
+     "roi": 16.7,
+     "eroi": 33.4,
+     "rel": 70.4,
+     "dq": 100,
+     "conf": "Medium",
+     "note": "\u26a0 earnings \u22640d \u00b7 INVEST \u2014 8,527 SAR (41 sh)",
+     "stability": "ACTIVE (day 10)"
+    },
+    {
+     "rank": "5",
+     "symbol": "GLPI.US",
+     "name": "Gaming and Leisure Properties, Inc.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Real Estate",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 38.98,
+     "priceSar": 146.17,
+     "zone": "141.79\u2013147.64 SAR",
+     "ticket": 12133,
+     "shares": 83,
+     "stop": 132.03,
+     "tp1": 167.53,
+     "tp2": 188.89,
+     "roi": 14.6,
+     "eroi": 29.2,
+     "rel": 76.5,
+     "dq": 100,
+     "conf": "High",
+     "note": "\u26a0 post-earnings 2/5 \u00b7 EPS +4.0% \u00b7 INVEST \u2014 12,133 SAR (83 sh)",
+     "stability": "ACTIVE (day 1)"
+    },
+    {
+     "rank": "6",
+     "symbol": "EFC.US",
+     "name": "Ellington Financial Inc.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Real Estate",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 11.41,
+     "priceSar": 42.79,
+     "zone": "41.50\u201343.22 SAR",
+     "ticket": 11467,
+     "shares": 268,
+     "stop": 38.76,
+     "tp1": 48.85,
+     "tp2": 54.91,
+     "roi": 14.2,
+     "eroi": 28.3,
+     "rel": 76.5,
+     "dq": 100,
+     "conf": "High",
+     "note": "\u26a0 earnings \u22642d \u00b7 INVEST \u2014 11,467 SAR (268 sh)",
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "7",
+     "symbol": "OLP.US",
+     "name": "One Liberty Properties, Inc.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Real Estate",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 22.31,
+     "priceSar": 83.66,
+     "zone": "\u2014",
+     "ticket": 0,
+     "shares": 0,
+     "stop": "\u2014",
+     "tp1": "\u2014",
+     "tp2": "\u2014",
+     "roi": 10.9,
+     "eroi": 21.8,
+     "rel": 76.5,
+     "dq": 100,
+     "conf": "High",
+     "note": "Research \u2014 no allocation",
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "8",
+     "symbol": "KB.US",
+     "name": "KB Financial Group Inc.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Financials",
+     "ccy": "USD",
+     "fx": "",
+     "price": 112.7,
+     "priceSar": "",
+     "zone": "\u2014",
+     "ticket": 0,
+     "shares": 0,
+     "stop": "\u2014",
+     "tp1": "\u2014",
+     "tp2": "\u2014",
+     "roi": "",
+     "eroi": "",
+     "rel": "",
+     "dq": "",
+     "conf": "",
+     "note": "Grace seat \u2014 no plan today",
+     "stability": "GRACE (2/3 missed)"
+    },
+    {
+     "rank": "9",
+     "symbol": "2020.HK",
+     "name": "ANTA Sports Products Limited",
+     "market": "HKEX",
+     "sector": "Consumer Discretionary",
+     "ccy": "HKD",
+     "fx": "",
+     "price": 74.35,
+     "priceSar": "",
+     "zone": "\u2014",
+     "ticket": 0,
+     "shares": 0,
+     "stop": "\u2014",
+     "tp1": "\u2014",
+     "tp2": "\u2014",
+     "roi": "",
+     "eroi": "",
+     "rel": "",
+     "dq": "",
+     "conf": "",
+     "note": "Grace seat \u2014 no plan today",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "10",
+     "symbol": "INDV.US",
+     "name": "Indivior Pharmaceuticals, Inc.",
+     "market": "NYSE/NASDAQ",
+     "sector": "Health Care",
+     "ccy": "USD",
+     "fx": 3.75,
+     "price": 35.37,
+     "priceSar": 132.64,
+     "zone": "128.66\u2013133.96 SAR",
+     "ticket": 12335,
+     "shares": 93,
+     "stop": 115.94,
+     "tp1": 155.4,
+     "tp2": 178.15,
+     "roi": 17.2,
+     "eroi": 34.3,
+     "rel": 71.5,
+     "dq": 100,
+     "conf": "Medium",
+     "note": "\u26a0 post-earnings 2/5 \u00b7 EPS +41.9% \u00b7 INVEST \u2014 12,335 SAR (93 sh)",
+     "stability": "ACTIVE (day 3)"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 11:19:08",
+   "output": "WITHHELD",
+   "run": "41363258387",
+   "rows": [
+    {
+     "rank": "1",
+     "symbol": "ITRN.US",
+     "shares": "\u2014",
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "3",
+     "symbol": "DDI.US",
+     "shares": "\u2014",
+     "stability": "ACTIVE (day 7)"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 17:32:16",
+   "output": "WITHHELD",
+   "run": "41445971593",
+   "rows": [
+    {
+     "rank": "1",
+     "symbol": "ITRN.US",
+     "shares": "\u2014",
+     "stability": "ACTIVE (day 2)"
+    },
+    {
+     "rank": "4",
+     "symbol": "CRC.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "7",
+     "symbol": "OLP.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 17:39:39",
+   "output": "HELD",
+   "run": "41445971593",
+   "rows": [
+    {
+     "rank": "1",
+     "symbol": "BBOX.L",
+     "shares": 0,
+     "note": "Research seat \u2014 no executable allocation today. GRACE (0/3 missed)",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "2",
+     "symbol": "ITRN.US",
+     "shares": 0,
+     "note": "Research seat \u2014 no executable allocation today. GRACE (0/3 missed)",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "3",
+     "symbol": "DDI.US",
+     "shares": 0,
+     "note": "\u26a0 earnings \u22649d \u00b7 Research seat \u2014 no executable allocation today. GRACE (0/3 missed)",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "4",
+     "symbol": "CRC.US",
+     "shares": 0,
+     "note": "\u26a0 earnings \u22640d \u00b7 Research seat \u2014 no executable allocation today. GRACE (0/3 missed)",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "5",
+     "symbol": "KB.US",
+     "shares": 0,
+     "note": "\u26a0 earnings \u226411d \u00b7 Research seat \u2014 no executable allocation today. GRACE (2/3 missed)",
+     "stability": "GRACE (2/3 missed)"
+    },
+    {
+     "rank": "6",
+     "symbol": "INDV.US",
+     "shares": 0,
+     "note": "\u26a0 post-earnings 2/5 \u00b7 EPS +41.9% \u00b7 Research seat \u2014 no executable allocation today. GRACE (0/3 missed)",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "7",
+     "symbol": "0440.HK",
+     "shares": 0,
+     "note": "Research seat \u2014 no executable allocation today. FAST-TRACK (day 1)",
+     "stability": "FAST-TRACK (day 1, 0/3 confirm)"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 17:39:57",
+   "output": "HELD",
+   "run": "41445971593",
+   "rows": [
+    {
+     "rank": "",
+     "symbol": "OLP.US",
+     "outcome": "EXIT: hard"
+    },
+    {
+     "rank": "",
+     "symbol": "GLPI.US",
+     "outcome": "EXIT: hard"
+    },
+    {
+     "rank": "",
+     "symbol": "EFC.US",
+     "outcome": "EXIT: hard"
+    },
+    {
+     "rank": "",
+     "symbol": "2020.HK",
+     "outcome": "EXIT: hard"
+    }
+   ]
+  },
+  {
+   "at": "2026-11-02 23:42:44",
+   "output": "WITHHELD",
+   "run": "41445971593",
+   "rows": [
+    {
+     "rank": "\u2014",
+     "symbol": "BBOX.L",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "\u2014",
+     "symbol": "ITRN.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "\u2014",
+     "symbol": "DDI.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "\u2014",
+     "symbol": "CRC.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    },
+    {
+     "rank": "\u2014",
+     "symbol": "KB.US",
+     "shares": "\u2014",
+     "stability": "GRACE (2/3 missed)"
+    },
+    {
+     "rank": "\u2014",
+     "symbol": "INDV.US",
+     "shares": "\u2014",
+     "stability": "GRACE (0/3 missed)"
+    }
+   ]
+  }
+ ],
+ "portfolio_header": [
+  "Symbol",
+  "Name",
+  "Current Price",
+  "Position Qty",
+  "Avg Cost",
+  "Position Value",
+  "Buy Date"
+ ],
+ "portfolio_after": [
+  [
+   "INDV.US",
+   "Indivior Pharmaceuticals",
+   36.45,
+   95,
+   35.45,
+   3462.75,
+   "2026-11-02"
+  ],
+  [
+   "ITRN.US",
+   "Ituran Location and Control",
+   52.23,
+   67,
+   52.38,
+   3499.41,
+   "2026-11-02"
+  ],
+  [
+   "DDI.US",
+   "DoubleDown Interactive",
+   13.42,
+   240,
+   13.44,
+   3220.8,
+   "2026-11-02"
+  ],
+  [
+   "GLPI.US",
+   "Gaming and Leisure Properties",
+   38.96,
+   79,
+   38.88,
+   3077.84,
+   "2026-11-02"
+  ],
+  [
+   "FRST.US",
+   "Primis Financial Corp.",
+   14.84,
+   174,
+   15.44,
+   2582.16,
+   "2026-10-26"
+  ],
+  [
+   "5023.SR",
+   "Arabian Centres Sukuk",
+   96.5,
+   100,
+   95.8,
+   9650,
+   "2026-08-20"
+  ]
+ ],
+ "portfolio_before": [
+  [
+   "FRST.US",
+   "Primis Financial Corp.",
+   15.0,
+   174,
+   15.44,
+   2610,
+   "2026-10-26"
+  ],
+  [
+   "5023.SR",
+   "Arabian Centres Sukuk",
+   96.5,
+   100,
+   95.8,
+   9650,
+   "2026-08-20"
+  ]
+ ],
+ "feeds": {
+  "morning_executable": "EXECUTABLE | run=41363258387 | 2026-11-02 04:19:00+03:00 | release=41371798113",
+  "stale": "NOT_ACTIONABLE(final_publication) | run=41363258387 | 2026-11-02 10:42:00+03:00 | expired | release=41402819909",
+  "afternoon_executable": "EXECUTABLE | run=41445971593 | 2026-11-02 17:35:50+03:00 | release=41463134866",
+  "withdrawn": "NOT_ACTIONABLE(final_publication) | run=41445971593 | 2026-11-02 23:32:56+03:00 | decision_failed | release=41519935330",
+  "killed": "NOT_ACTIONABLE(final_publication) | run=41445971593 | 2026-11-02 18:05:00+03:00 | release_killed | release=41500000000"
+ },
+ "capture": {
+  "schema": "tfb.ibkr-capture/v1",
+  "captured_at": "2026-11-03T01:35:07.000000+03:00",
+  "account_alias": "ibkr-primary",
+  "orders": {
+   "orders": [
+    {
+     "order_id": 324550175,
+     "order_status": "REPLACED",
+     "order_type": "STOP",
+     "side": "SELL",
+     "total_shares_qty": "79",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "79",
+     "primary_description": "Sell 79 GLPI",
+     "secondary_description": "STP 37.33, GTC"
+    },
+    {
+     "order_id": 324550100,
+     "order_status": "REPLACED",
+     "order_type": "STOP",
+     "side": "SELL",
+     "total_shares_qty": "240",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "240",
+     "primary_description": "Sell 240 DDI",
+     "secondary_description": "STP 12.90, GTC"
+    },
+    {
+     "order_id": 324550024,
+     "order_status": "REPLACED",
+     "order_type": "STOP",
+     "side": "SELL",
+     "total_shares_qty": "67",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "67",
+     "primary_description": "Sell 67 ITRN",
+     "secondary_description": "STP 49.94, GTC"
+    },
+    {
+     "order_id": 50436593,
+     "order_status": "REPLACED",
+     "order_type": "STOP",
+     "side": "SELL",
+     "total_shares_qty": "174",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "174",
+     "primary_description": "Sell 174 FRST",
+     "secondary_description": "STP 14.56, GTC"
+    },
+    {
+     "order_id": 50436592,
+     "order_status": "REPLACED",
+     "order_type": "LIMIT",
+     "side": "SELL",
+     "limit_price": "17.9",
+     "total_shares_qty": "174",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "174",
+     "primary_description": "Sell 174 FRST",
+     "secondary_description": "Limit 17.90, GTC"
+    },
+    {
+     "order_id": 324550328,
+     "order_status": "EXPIRED",
+     "order_type": "LIMIT",
+     "side": "SELL",
+     "limit_price": "45",
+     "total_shares_qty": "95",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "0",
+     "primary_description": "Sell 95 INDV",
+     "secondary_description": "Limit 45.00, Day"
+    },
+    {
+     "order_id": 999000001,
+     "order_status": "CANCELLED",
+     "order_type": "STOP",
+     "side": "SELL",
+     "total_shares_qty": "95",
+     "cum_shares_qty": "0",
+     "remaining_shares_qty": "95",
+     "primary_description": "Sell 95 INDV",
+     "secondary_description": "STP 31.86, GTC",
+     "synthetic": true
+    }
+   ]
+  }
+ }
+}
