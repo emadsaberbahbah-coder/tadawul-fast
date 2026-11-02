@@ -102,7 +102,7 @@ What the page would have shown at 01:40 on 3 Nov (harness T3, the real board):
 **Rollback:** `POR_MODE=off` (or `porRemoveTrigger`), or delete the file. The two sheets and `POR_HOLDINGS_SNAPSHOT` can then be deleted by hand.
 
 ## 6. Verification
-- `node tests/test_por_v100.js` → **PASS 50/50**. The harness runs the real file in a vm with a recording GAS shim. It covers:
+- `node tests/test_por_v100.js` → **PASS 51/51**. The harness runs the real file in a vm with a recording GAS shim. It covers:
   - T0–T6:
     - compile, ES5 / ASCII and the function inventory;
     - gates;
@@ -111,7 +111,7 @@ What the page would have shown at 01:40 on 3 Nov (harness T3, the real board):
     - pre-open re-lock and in-session freeze;
     - kill switch.
   - T7: the snapshot baseline.
-  - T8: robustness — Date cells, header drift fails closed, a board read fault, determinism.
+  - T8: robustness — Date cells, including a workbook in Auckland (Date cells read in `getSpreadsheetTimeZone`), header drift fails closed, a board read fault, determinism.
   - T9: write isolation, including Script Properties; `porSelfTest` writes nothing.
   - T10–T15:
     - board capture;
@@ -120,16 +120,17 @@ What the page would have shown at 01:40 on 3 Nov (harness T3, the real board):
     - aliases;
     - the contract with `16_Decision_Top10.gs`: `DT10_SELECTED_HEADERS`, B2, `Last run`, `output:`, `SelLog: +N`, `VERIFIED (run N)`, log headers and clock constants, all read from that file;
     - merge order.
-  - 17 mutants killed.
+  - 18 mutants killed.
   - Two runs with matching digests.
 - The same harness fails on the reviewed commit `f3a0c4b7`, for the reviewed reasons (T12 "an EXECUTABLE cell past its clock: OPEN").
 - `pytest tests/test_por_v100.py` → 2 passed. `node tests/js/apps_script_syntax.test.js` → 7 sources compiled.
-- File: `apps_script/28_Plan_Of_Record.gs`, 1,184 lines, SHA-256 `795bde8f19f9b5aa05feea1d550d3efaee373f141e1a0d8d47d6920f64dc3197`, 61 functions (prefix `por`), removed 0.
+- File: `apps_script/28_Plan_Of_Record.gs`, 1,205 lines, SHA-256 `6a53f7697351af2f02e42907e7876930c791883de3d4b0fb47b6c7ca6731ab7b`, 62 functions (prefix `por`), removed 0.
 
 ## 7. Known limits
 - Exchange holidays and half days are not modelled: a ticket on a holiday expires at that day's close without a fill.
 - Venues outside US, Tadawul, HKEX, LSE, TSE and the main EU markets follow the feed only.
 - Fills appear after they reach My_Portfolio, which is fed from `_Portfolio_CostBasis`.
+- Date cells are read in the workbook's own time zone (`getSpreadsheetTimeZone`), as `27_Decision_Pages_v2` does, so the cockpit's Riyadh text keeps its meaning whatever the workbook setting.
 - IBKR matching is by base symbol (ITRN.US ↔ ITRN) or `POR_IBKR_ALIASES`.
 - The board is read every 15 minutes. If the cockpit replaces an unlogged render within that window, POR never sees it: the plan stays on its previous lock, and feed validity shows NOT EXECUTABLE when the release has moved to a newer run.
 - A pre-open render first seen after the open still takes the plan's place, because it was the plan at the open. `Replaced Lock` shows it.

@@ -120,13 +120,15 @@
  * 'venue calendar unknown' and follow the feed only. A US ticket is matched
  * to IBKR by its base symbol (ITRN.US <-> ITRN, or POR_IBKR_ALIASES); other
  * venues by base symbol without leading zeros. Holdings come from
- * My_Portfolio, so a fill shows after it reaches that page. The board is
+ * My_Portfolio, so a fill shows after it reaches that page. Date cells are
+ * read in the workbook's own time zone (getSpreadsheetTimeZone), so the
+ * cockpit's Riyadh text keeps its meaning in any workbook. The board is
  * read every 15 minutes: an unlogged render that the cockpit replaces within
  * that window is not seen (the plan stays on its previous lock, and 'feed'
  * validity shows NOT EXECUTABLE when the release moved to a newer run).
  *
  * Not a licensed financial adviser; the owner decides and executes every
- * trade. ES5, ASCII. Functions: 61, all new (prefix por). Removed: 0.
+ * trade. ES5, ASCII. Functions: 62, all new (prefix por). Removed: 0.
  * ============================================================================
  */
 
@@ -156,6 +158,7 @@ var POR_FEED_SKEW_MIN = 15;               // = DT10_UV_FUTURE_SKEW_MIN (16_Decis
 var POR_STOP_TOL = 0.01;                  // 1%: IBKR stop vs plan stop
 var POR_RUN_KEY = 'POR_RUNNING';
 var POR_RUN_TTL_S = 240;
+var POR_SHEET_TZ = POR_TZ;                // the workbook's time zone, set at the start of each run
 
 var POR_VENUES = {
   US: {label: 'NYSE/NASDAQ', tz: 'America/New_York', open: [9, 30], close: [16, 0], days: [1, 2, 3, 4, 5]},
@@ -281,11 +284,27 @@ function porRiyadh_(ms, fmt) {
   return ms === null || ms === undefined ? '' : Utilities.formatDate(new Date(ms), POR_TZ, fmt || 'yyyy-MM-dd HH:mm');
 }
 
-/** A 'Logged At' cell: a Date, or Riyadh text 'yyyy-MM-dd H:mm[:ss]'. null when unreadable. */
+/** The workbook's time zone for this run (a Date cell shows its wall clock in it); Riyadh on any fault. */
+function porUseSheetTz_(ss) {
+  try {
+    POR_SHEET_TZ = porStr_(ss.getSpreadsheetTimeZone()) || POR_TZ;
+  } catch (e) {
+    POR_SHEET_TZ = POR_TZ;
+  }
+  return POR_SHEET_TZ;
+}
+
+/** A 'Logged At' cell: a Date, or Riyadh text 'yyyy-MM-dd H:mm[:ss]'. null when unreadable. The cockpit
+ * writes Riyadh text; when Sheets turned it into a Date, its wall clock in the workbook's time zone is that
+ * Riyadh text, so a workbook outside Riyadh is read back without a shift. */
 function porParseAt_(v) {
   if (v && typeof v.getTime === 'function') {
     var t = v.getTime();
-    return isFinite(t) ? t : null;
+    if (!isFinite(t)) return null;
+    if (POR_SHEET_TZ === POR_TZ) return t;
+    var w = porWall_(t, POR_SHEET_TZ);
+    var ms = w ? porLocalToMs_(w.y, w.mo, w.d, w.h, w.mi, POR_TZ) : null;
+    return ms === null ? null : ms + w.s * 1000;
   }
   var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(porStr_(v));
   if (!m) return null;
@@ -293,9 +312,9 @@ function porParseAt_(v) {
   return ms === null ? null : ms + (m[6] ? (+m[6]) * 1000 : 0);
 }
 
-/** A 'Buy Date' cell -> 'yyyy-MM-dd' (Riyadh) or ''. */
+/** A 'Buy Date' cell -> 'yyyy-MM-dd' (the date the cell shows) or ''. */
 function porDateText_(v) {
-  if (v && typeof v.getTime === 'function') return porRiyadh_(v.getTime(), 'yyyy-MM-dd');
+  if (v && typeof v.getTime === 'function') return Utilities.formatDate(v, POR_SHEET_TZ, 'yyyy-MM-dd');
   var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(porStr_(v));
   return m ? m[1] + '-' + m[2] + '-' + m[3] : '';
 }
@@ -721,9 +740,9 @@ function porDerivePlans_(renders) {
   return porSortPlans_(out);
 }
 
-/** A ledger time cell (Sheets may have turned the text into a Date) -> 'yyyy-MM-dd HH:mm' Riyadh. */
+/** A ledger time cell (Sheets may have turned the text into a Date) -> 'yyyy-MM-dd HH:mm' as written. */
 function porAtText_(v) {
-  if (v && typeof v.getTime === 'function') return porRiyadh_(v.getTime(), 'yyyy-MM-dd HH:mm');
+  if (v && typeof v.getTime === 'function') return Utilities.formatDate(v, POR_SHEET_TZ, 'yyyy-MM-dd HH:mm');
   return porStr_(v);
 }
 
@@ -1096,6 +1115,7 @@ function porRefresh() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var nowMs = porNow_();
     var validity = porValidityOf_(porProp_(POR_VALIDITY_PROP));
+    porUseSheetTz_(ss);
     var log = porReadLog_(ss, nowMs);
     if (!log.ok) return {mode: mode, version: POR_VERSION, error: log.reason};
     var src = porRenders_(ss, log);
@@ -1151,6 +1171,7 @@ function porSelfTest() {
   var out = ['Plan of Record ' + POR_VERSION];
   out.push('POR_MODE=' + porModeOf_(porProp_(POR_MODE_PROP)) + ' POR_VALIDITY=' + porValidityOf_(porProp_(POR_VALIDITY_PROP)));
   var ss = SpreadsheetApp.getActiveSpreadsheet(), nowMs = porNow_();
+  out.push('workbook time zone: ' + porUseSheetTz_(ss));
   var log = porReadLog_(ss, nowMs);
   out.push(POR_LOG_SHEET + ': ' + (log.ok ? log.renders.length + ' renders in 4 days' : log.reason));
   var h = porReadHoldings_(ss);

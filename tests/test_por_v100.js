@@ -12,7 +12,7 @@
  * with the cockpit's own DT10_SELECTED_HEADERS read out of apps_script/16_Decision_Top10.gs, and the feed clock
  * is compared with the cockpit's own dt10UvParse_ run from that file.
  * Sections:
- *   T0  the file compiles, version, ES5 / ASCII lint, function inventory (61, prefix por)
+ *   T0  the file compiles, version, ES5 / ASCII lint, function inventory (62, prefix por)
  *   T1  gates: POR_MODE off (default, junk, property fault) -> nothing read or written; observe -> ledger and
  *       snapshot only; on -> ledger + page; POR_VALIDITY feed default, session only for 'session'
  *   T2  sessions: US DST / standard time, weekend roll, Tadawul Sun-Thu, LSE BST / GMT, HKEX; venue codes
@@ -29,7 +29,8 @@
  *   T7  lock-time quantity (Codex on #898): only from the snapshot of a refresh at or before the lock (<= 60
  *       min), carried in the ledger; a fill between the lock and the first refresh is EXECUTED (and its missing
  *       stop flagged); a snapshot after the lock or older than 60 min is never the baseline
- *   T8  robustness: Logged At as Date cells == text cells; a ledger whose times Sheets turned into Dates keeps the
+ *   T8  robustness: Logged At as Date cells == text cells, also in a workbook whose time zone is Auckland (Date cells
+ *       read in getSpreadsheetTimeZone); a ledger whose times Sheets turned into Dates keeps the
  *       lock-time quantity; a header without Shares fails closed (no write); missing My_Portfolio / capture reader
  *       degrade to notes; two refreshes are identical
  *   T9  only _Plan_Of_Record, Plan_Of_Record and POR_HOLDINGS_SNAPSHOT are ever written; porSelfTest writes
@@ -209,7 +210,8 @@ function makeWorld(opts) {
   for (const s of opts.extraSheets || []) add(s.name, s.rows);
   world.ss = {
     getSheetByName: n => world.sheets[n] || null,
-    insertSheet: n => { if (world.sheets[n]) throw new Error('sheet exists ' + n); world.writes.push([n, 'insertSheet']); world.sheets[n] = new Sheet(n, [], world, 1000, 26); return world.sheets[n]; }
+    insertSheet: n => { if (world.sheets[n]) throw new Error('sheet exists ' + n); world.writes.push([n, 'insertSheet']); world.sheets[n] = new Sheet(n, [], world, 1000, 26); return world.sheets[n]; },
+    getSpreadsheetTimeZone: () => opts.sheetTz || 'Asia/Riyadh'
   };
   return world;
 }
@@ -247,6 +249,18 @@ function load(src, world, nowMs, capture) {
   vm.runInContext(src, ctx, {filename: '28_Plan_Of_Record.gs'});
   return ctx;
 }
+function wallMs(text, tz) {   // the instant whose wall clock in tz reads 'yyyy-MM-dd[ H:mm[:ss]]' (DST aware)
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{1,2}):(\d{2})(?::(\d{2}))?)?$/.exec(text);
+  const target = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+  let guess = target;
+  for (let k = 0; k < 4; k++) {
+    const p = fmtParts(guess, tz);
+    const diff = target - Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+    if (diff === 0) break;
+    guess += diff;
+  }
+  return guess;
+}
 function riyadhMs(text) {   // 'yyyy-MM-dd H:mm[:ss]' Riyadh (UTC+3, no DST)
   const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(text);
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5], +(m[6] || 0));
@@ -259,7 +273,7 @@ function runInfo(r) {
 const FIELD = {rank: 'Rank', symbol: 'Symbol', name: 'Name', market: 'Market', sector: 'Sector', ccy: 'Ccy', price: 'Price',
   priceSar: 'Price SAR', zone: 'Entry Zone', ticket: 'Ticket SAR', shares: 'Shares', stop: 'Stop SAR', tp1: 'TP1 SAR', tp2: 'TP2 SAR',
   rel: 'Rel', dq: 'DQ', conf: 'Conf', note: 'Advisor Note', stability: 'Stability'};
-function buildLog(renders, asDates) {
+function buildLog(renders, asDates, tz) {
   const H = FIX.selection_log_header;
   const idx = n => H.indexOf(n);
   const map = Object.assign({fx: H[9], roi: 'ROI %', eroi: 'Engine ROI %', outcome: 'Outcome'}, FIELD);
@@ -267,7 +281,7 @@ function buildLog(renders, asDates) {
   for (const r of renders) {
     for (const x of r.rows) {
       const row = new Array(H.length).fill('');
-      row[idx('Logged At')] = asDates ? new Date(riyadhMs(r.at)) : r.at;
+      row[idx('Logged At')] = asDates ? new Date(tz ? wallMs(r.at, tz) : riyadhMs(r.at)) : r.at;
       row[idx('Run Info')] = runInfo(r);
       row[idx('Source Page')] = 'Top_10_Investments';
       for (const k of Object.keys(map)) if (x[k] !== undefined) row[idx(map[k])] = x[k];
@@ -330,15 +344,15 @@ function battery(src, label) {
   const SES = {POR_MODE: 'on', POR_VALIDITY: 'session'};
   const AFTER_CLOSE = T('2026-11-03 1:40');
 
-  test(label + 'T0 compiles, version, ES5 / ASCII, 61 functions prefixed por', () => {
+  test(label + 'T0 compiles, version, ES5 / ASCII, 62 functions prefixed por', () => {
     const ctx = load(src, makeWorld({}), AFTER_CLOSE);
     eq(ctx.POR_VERSION, '1.0.0', 'version');
     ok(!/[^\x00-\x7e]/.test(src.replace(/\r/g, '')), 'ASCII only');
     ok(!/=>|\blet\s|\bconst\s|`|\.startsWith\(|\.includes\(|Object\.assign|\.padStart\(/.test(src), 'ES5 only');
     const fns = src.match(/^function [A-Za-z0-9_]+/mg) || [];
-    eq(fns.length, 61, 'function count');
+    eq(fns.length, 62, 'function count');
     ok(fns.every(f => /^function por/.test(f)), 'prefix por');
-    ok(/Functions: 61, all new \(prefix por\)/.test(src), 'header inventory');
+    ok(/Functions: 62, all new \(prefix por\)/.test(src), 'header inventory');
   });
 
   test(label + 'T1 gates: off by default, junk and faults are off; observe = ledger + snapshot; on = page', () => {
@@ -514,6 +528,11 @@ function battery(src, label) {
     const asText = refresh({src, now: AFTER_CLOSE, props: ON});
     const asDate = refresh({src, now: AFTER_CLOSE, props: ON, log: buildLog(FIX.renders, true)});
     eq(JSON.stringify(ledger(asDate.world)), JSON.stringify(ledger(asText.world)), 'Date Logged At == text');
+    const nz = 'Pacific/Auckland';
+    const nzPf = FIX.portfolio_after.map(r => { const x = r.slice(); x[6] = new Date(wallMs(x[6], nz)); return x; });
+    const asNz = refresh({src, now: AFTER_CLOSE, props: ON, sheetTz: nz, log: buildLog(FIX.renders, true, nz), portfolio: nzPf});
+    eq(JSON.stringify(ledger(asNz.world).map(r => Object.assign({}, r, {'Updated At (Riyadh)': ''}))),
+      JSON.stringify(ledger(asText.world).map(r => Object.assign({}, r, {'Updated At (Riyadh)': ''}))), 'a workbook in Auckland reads the same plan');
     const older = [['ITRN.US', 'Ituran', 52.0, 10, 50.0, 520, '2026-09-01']].concat(FIX.portfolio_before);
     const first = refresh({src, now: T('2026-11-02 9:10'), props: Object.assign({POR_HOLDINGS_SNAPSHOT: snapAt('2026-11-02 8:45', {'ITRN.US': 10})}, ON),
       feed: FIX.feeds.morning_executable, portfolio: older, log: logTo(T('2026-11-02 9:10'))});
@@ -736,6 +755,7 @@ const MUTANTS = [
   ['ledger plans ignored', "var plans = porMergePlans_(porDerivePlans_(src.renders), ledger.plans);\n    var built",
     "var plans = porMergePlans_(porDerivePlans_(src.renders), []);\n    var built"],
   ['alias ignored', "if (m) out[m[1]] = porIbkrBase_(m[2]);", "if (false) out[m[1]] = porIbkrBase_(m[2]);"],
+  ['workbook time zone ignored', "if (POR_SHEET_TZ === POR_TZ) return t;", "return t;"],
   ['writes _Status', "var POR_LEDGER_SHEET = '_Plan_Of_Record';", "var POR_LEDGER_SHEET = '_Status';"]
 ];
 for (const [name, from, to] of MUTANTS) {
