@@ -53,8 +53,13 @@ persisted. This verifies the tested reader/coverage date separation, not a
 global five-minute cross-page symbol reset. Native field-info pop-ups
 for `news_date` and `freshness_state` showed Arabic descriptions after reload;
 descriptions for `time_basis` and `polarity` were also written. Reader data
-freshness was changed from 12 hours to 15 minutes before Done, but persisted
-15-minute configuration after reopening remains unverified.
+freshness persistence is now verified: after report reload, reopening reader
+source `ds194` showed **15 minutes**. Coverage source `ds195` initially showed
+12 hours; it was set to 15 minutes, saved with Set Data Freshness and Done, and
+the exact `ds195` row was reopened to confirm **15 minutes** again. Both source
+editors therefore passed the saved/reopened cache-threshold check.
+Their internal names still read `symbol_news`; the native chart titles and
+Arabic labels distinguish reader and coverage. No source rename is claimed.
 This setting controls Looker's query cache. It does not turn the nightly,
 partial source collector into a 15-minute acquisition job; refreshing can show
 newly archived rows when they exist, not fetch new provider articles by itself.
@@ -183,7 +188,7 @@ That schema and quota change is outside this reader patch.
   and permissive URL syntax. All three are corrected and covered by tests.
   Final independent review reran all 12 reader tests and found no blocking
   static/behavioral defect. The later live samples above supplement these tests;
-  they do not replace the pending cost and remaining functional checks.
+  they do not replace the pending BigQuery server/cost audit.
 
 Custom-query route: the root agent attached both SELECTs using the existing
 owner-credential connection and observed live samples as recorded above. A
@@ -197,10 +202,12 @@ Keep coverage fixed at 30 days and label it accordingly, **without** the report
 date filter. Its Date range dimension was removed and the live ITRN date-change
 test above passed. Put date filtering on the article table only. Keep the quality box
 outside publication-date filtering so missing/future dates do not disappear.
-The live recent-news and zero-row samples above are verified. A stale-only
-symbol, an undated symbol and broader filter behavior still need live checks.
-Symbol changes must update both article and coverage panels; source-field names
-alone do not prove cross-source filtering works.
+The live recent-news, zero-row, reader/coverage date separation and saved-cache
+checks above are verified. Stale/undated exception behavior is tested offline;
+the live sample is not an exhaustive all-symbol validation. Symbol changes must
+update both article and coverage panels; source-field names alone do not prove
+cross-source filtering works. Five-minute cross-page synchronization remains
+unconnected, and collection remains partial as described above.
 
 Optional installed-view route: review/merge first, apply with the existing
 controlled BigQuery workflow, and read back all 43 definitions/hashes. This also
