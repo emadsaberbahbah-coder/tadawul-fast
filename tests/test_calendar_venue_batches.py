@@ -181,7 +181,8 @@ def _warnings(caplog, mod):
 @pytest.fixture
 def cp():
     import core.providers.calendar_provider as mod
-    assert mod.__version__ == "1.3.2"
+    # 2026-11-03: v1.4.0 (fetch_next_exdiv_detail, additive) stacked; pin moved
+    assert mod.__version__ == "1.4.0"
     return mod
 
 
