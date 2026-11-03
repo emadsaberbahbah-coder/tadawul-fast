@@ -1,0 +1,46 @@
+[
+ [
+  " * Version: 1.2.32 (2026-11-03)\n *   1.2.32: A PREVIEW READS AS A PREVIEW (owner, Tue 3 Nov 2026 12:14 Riyadh: 'my top 10 investment page 2 showing that\n *           there is cash allocated to symbols but the page at top showing red no execution'). On 3 Nov the release of\n *           run 41566014627 was withdrawn at 10:08 and the cockpit finished WITHHELD (Executable 0); Top_10_Investments_v2\n *           then sized the active seats with the research water-fill and printed each seat's 'Alloc SAR' / 'Buy qty' in\n *           bold green under the red NOT ACTIONABLE header. 1.2.26 greyed the Allocated tile only; the seat table, its\n *           section line and the ALLOCATION block still read like tickets. Now, with Script Property DP2_PREVIEW_LABEL =\n *           1 / on / true / yes (default OFF: absent, blank or any other word = the 1.2.31 page byte for byte), a page\n *           that cannot be acted on -- no engine ticket on the board, or the release is not live (EXPIRED, SYNC RUNNING,\n *           NOT ACTIONABLE): dp2PreviewWhy_, pure -- labels its sizing as a preview: the seat columns read 'Preview SAR' /\n *           'Preview qty', a sized seat's cells are grey italic (not bold green) and its Flags start 'preview . not a\n *           ticket', the SEATS line starts 'PREVIEW ONLY -- not tickets (<why>).' and the ALLOCATION block title reads\n *           'SIZING PREVIEW (not tickets) -- ..' (research mirror) or 'ENGINE TICKETS NOT LIVE (<why>) -- ..' (an engine\n *           board whose release is no longer live). A live EXECUTABLE release with engine tickets is unchanged; no\n *           number, seat, class, tile, chart, gate, ticket, order or broker call changes. DP2_COHORT_LEGACY keeps the\n *           1.2.30 page whatever this property says. Rollback: delete DP2_PREVIEW_LABEL, or Project History -> 1.2.31.\n",
+  " * Version: 1.2.31 (2026-11-02)\n"
+ ],
+ [
+  " *   DP2_PREVIEW_LABEL 1|on|true|yes (v1.2.32, default off: on a page that cannot be acted on, the seat sizing reads as\n *                     a preview -- 'Preview SAR' / 'Preview qty', grey cells, 'preview . not a ticket')\n",
+  ""
+ ],
+ [
+  "var DP2_VERSION = '1.2.32';   // lockstep with the header\n",
+  "var DP2_VERSION = '1.2.31';   // lockstep with the header\n"
+ ],
+ [
+  "var DP2_PREVIEW_LABEL_PROP = 'DP2_PREVIEW_LABEL';   // v1.2.32 gate: 1 / on / true / yes = a page that cannot be acted on labels its sizing a preview\nfunction dp2PreviewLabelOn_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_PREVIEW_LABEL_PROP)).trim()); }\n/* v1.2.32 PURE: why the seat sizing of this Top-10 page is a preview, or '' when it can be acted on (an engine ticket on\n * the board AND a live EXECUTABLE release, dp2FeedView_ live). 'nothing executable today' (+ the feed when it is not live)\n * / 'feed EXPIRED' / 'feed SYNC RUNNING' / 'feed NOT ACTIONABLE'. */\nfunction dp2PreviewWhy_(executable, fv) {\n  var live = !!(fv && fv.live === true), lbl = (fv && fv.label) || 'n/a';\n  if (executable > 0 && live) return '';\n  if (executable > 0) return 'feed ' + lbl;\n  return 'nothing executable today' + (live ? '' : ' \\u00b7 feed ' + lbl);\n}\n",
+  ""
+ ],
+ [
+  "  var pvWhy = (!cohort.legacy && dp2PreviewLabelOn_()) ? dp2PreviewWhy_(executable, fv) : '';   // v1.2.32: '' = the 1.2.31 page\n",
+  ""
+ ],
+ [
+  "  if (!cohort.legacy) row = dp2Section_(sh, row, 1, 16, dp2SeatsTitle_(seats.length, cohort, coN), (pvWhy ? 'PREVIEW ONLY \\u2014 not tickets (' + pvWhy + '). ' : '') + dp2SeatsSub_(cohort, alloc, feed, fv));   // v1.2.31: engine tickets / research mirror, every class counted; v1.2.32: the preview prefix\n",
+  "  if (!cohort.legacy) row = dp2Section_(sh, row, 1, 16, dp2SeatsTitle_(seats.length, cohort, coN), dp2SeatsSub_(cohort, alloc, feed, fv));   // v1.2.31: engine tickets / research mirror, every class counted\n"
+ ],
+ [
+  "  if (pvWhy) { sHdr[5] = 'Preview SAR'; sHdr[6] = 'Preview qty'; }   // v1.2.32\n",
+  ""
+ ],
+ [
+  "    if (pvWhy && shares !== null) flags.unshift('preview \\u00b7 not a ticket');   // v1.2.32: a sized seat on a page that cannot be acted on\n",
+  ""
+ ],
+ [
+  "    if (sState[i] === 'FUNDED' && pvWhy) ac.setFontColor(DP2C.grey).setFontWeight('normal').setFontStyle('italic');   // v1.2.32: a preview, not cash\n    else if (sState[i] === 'FUNDED') ac.setFontColor(DP2C.green); else if (sState[i] === 'NEED') ac.setFontColor(DP2C.amber);\n",
+  "    if (sState[i] === 'FUNDED') ac.setFontColor(DP2C.green); else if (sState[i] === 'NEED') ac.setFontColor(DP2C.amber);\n"
+ ],
+ [
+  "  if (cohort.basis === 'engine') row = dp2Section_(sh, row, 1, 8, (pvWhy ? 'ENGINE TICKETS NOT LIVE (' + pvWhy + ')' : 'ALLOCATION') + ' \\u2014 the engine\\'s tickets, mirrored', 'Ticket SAR / Shares exactly as Top_10_Investments issued them (feed ' + dp2FeedTag_(feed, fv) + '): nothing is re-sized while the board carries engine tickets; the conviction water-fill applies only to a board without them.');   // v1.2.31\n",
+  "  if (cohort.basis === 'engine') row = dp2Section_(sh, row, 1, 8, 'ALLOCATION \\u2014 the engine\\'s tickets, mirrored', 'Ticket SAR / Shares exactly as Top_10_Investments issued them (feed ' + dp2FeedTag_(feed, fv) + '): nothing is re-sized while the board carries engine tickets; the conviction water-fill applies only to a board without them.');   // v1.2.31\n"
+ ],
+ [
+  "  row = dp2Section_(sh, row, 1, 8, (pvWhy ? 'SIZING PREVIEW (not tickets)' : 'ALLOCATION') + ' \\u2014 research mirror of the engine\\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');\n",
+  "  row = dp2Section_(sh, row, 1, 8, 'ALLOCATION \u2014 research mirror of the engine\\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');\n"
+ ]
+]

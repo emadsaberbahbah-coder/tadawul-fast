@@ -60,6 +60,21 @@ const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edi
 const STEPS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_steps_v1230.json'), 'utf8'));
 const V1228_SHA256 = 'a99af66a40ed71923e9828952c4d1da339c6d864b215579071d95733554d7193';   // live v1.2.28 (mirror ae4a03f0)
 const V1230_SHA256 = '484806384b0d815d3f18aa8c2a6ab0d83b1dfd1652f080ff4990e9e53717b806';   // v1.2.28 + the 11 steps of 28 Oct
+// 2026-11-03: v1.2.32 (preview label, DP2_PREVIEW_LABEL default off) stacked on this change; pins moved. Behaviour runs on
+// the delivered file; the oracle chain and the v1.2.31 lint / inventory / hunks (T10) start from the v1.2.31 file rebuilt
+// from it (the v1.2.32 hunks of tests/js/dp2_edits_v1232.json reversed, SHA-256 pinned).
+const EDITS1232 = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1232.json'), 'utf8'));
+const V1231_SHA256 = 'd789cf502c08ed00278196707b4f6d3057c5c1bbd00b86ad47254ed77e3cac20';   // v1.2.31 (origin/main 8478029d)
+function v1231Of(src) {
+  if (src.indexOf("var DP2_VERSION = '1.2.31';") > 0) return src;
+  let s = src;
+  for (const [cur, prev] of EDITS1232) {
+    if (s.split(cur).length - 1 !== 1) throw new Error('exactly one approved v1.2.32 hunk: ' + cur.split('\n')[0].slice(0, 90));
+    s = s.replace(cur, () => prev);
+  }
+  if (sha256(s) !== V1231_SHA256) throw new Error('v1.2.32 changes only its enumerated hunks (their reversal = the v1.2.31 file)');
+  return s;
+}
 const NOW = Date.parse(FIX.frozen_now);   // 2026-11-02T06:24:00Z = 09:24 Riyadh (the owner's build)
 const LEGACY = 'DP2_COHORT_LEGACY';
 const DOT = '·', DASH = '—', ARROW = '→', NDASH = '–';
@@ -111,14 +126,15 @@ function unapplySteps(src) {
   eq(sha256(s), V1228_SHA256, 'the eleven steps reversed = the live v1.2.28');
   return s;
 }
-let ORACLE = null, BASE = null, oracleErr = '';
+let ORACLE = null, BASE = null, S1231 = null, oracleErr = '';
 try {
+  S1231 = v1231Of(NEW);
   if (BASE_PATH) {
     BASE = fs.readFileSync(BASE_PATH, 'utf8');
     eq(sha256(BASE), V1228_SHA256, 'explicit base = the live v1.2.28');
     ORACLE = applySteps(BASE);
   } else {
-    ORACLE = reverseEdits(NEW);
+    ORACLE = reverseEdits(S1231);
     BASE = unapplySteps(ORACLE);
   }
 } catch (e) { oracleErr = String(e && e.message || e); }
@@ -398,7 +414,7 @@ function build(source, which, opts) {
 }
 function norm(b) {   // the only bytes v1.2.31 under its kill switch may differ in: the version printed on both footers / the toast title
   const strip = o => { const x = Object.assign({}, o); delete x.env; return x; };
-  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
+  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.32').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
 }
 function sheet(b, name) { return b.env.book.getSheetByName(name); }
 function val(sh, r, c) { const x = sh._cells.get(r + ':' + c); return x && x.v !== undefined && x.v !== null ? x.v : ''; }
@@ -642,8 +658,10 @@ function battery() {
   test('T0 oracles: v1.2.30 = the eleven prepared steps on the live v1.2.28 (SHA-256 pinned); version lockstep 1.2.31; the three files compile', () => {
     eq(sha256(BASE), V1228_SHA256, 'base'); eq(sha256(ORACLE), V1230_SHA256, 'oracle');
     eq(applySteps(BASE), ORACLE, 'steps forward = oracle'); eq(unapplySteps(ORACLE), BASE, 'steps reversed = base');
-    ok(/^ \* Version: 1\.2\.31 \(2026-11-02\)$/m.test(NEW), 'header Version line 1.2.31');
-    ok(NEW.indexOf("var DP2_VERSION = '1.2.31';   // lockstep with the header") > 0, 'DP2_VERSION 1.2.31');
+    ok(/^ \* Version: 1\.2\.32 \(2026-11-03\)$/m.test(NEW), 'header Version line 1.2.32');
+    ok(NEW.indexOf("var DP2_VERSION = '1.2.32';   // lockstep with the header") > 0, 'DP2_VERSION 1.2.32');
+    eq(sha256(S1231), V1231_SHA256, 'rebuilt v1.2.31');
+    ok(/^ \* Version: 1\.2\.31 \(2026-11-02\)$/m.test(S1231) && S1231.indexOf("var DP2_VERSION = '1.2.31';   // lockstep with the header") > 0, 'rebuilt v1.2.31 lockstep');
     ok(/^ \* Version: 1\.2\.30 \(2026-10-28\) - 1\.2\.30: /m.test(ORACLE) && ORACLE.indexOf("var DP2_VERSION = '1.2.30';") > 0, 'oracle is 1.2.30');
     ok(/^ \* Version: 1\.2\.28 \(2026-10-26\)$/m.test(BASE) && BASE.indexOf("var DP2_VERSION = '1.2.28';") > 0, 'base is 1.2.28');
     for (const s of [NEW, ORACLE, BASE]) new vm.Script(s, { filename: '27_Decision_Pages_v2.gs' });
@@ -673,7 +691,7 @@ function battery() {
     const tileRow = v.tile('HELD SEATS').row; for (let r = tileRow; r <= tileRow + 2; r++) allowed.add(r);
     for (let r = v.titleRow; r <= v.hdr + 10; r++) allowed.add(r);
     for (let r = v.allocTitleRow; r <= v.aTop + 11; r++) allowed.add(r);
-    const footer = firstRow(v.sh, 1, x => x.indexOf('Decision Pages v2 1.2.31') === 0); allowed.add(footer);
+    const footer = firstRow(v.sh, 1, x => /^Decision Pages v2 1\.2\.3[12]/.test(x)); allowed.add(footer);
     const nb = norm(b), no = norm(o);
     const diffRows = new Set();
     const cn = new Map(nb.sheets['Top_10_Investments_v2'].cells.map(x => [x.split('=')[0], x])), co = new Map(no.sheets['Top_10_Investments_v2'].cells.map(x => [x.split('=')[0], x]));
@@ -768,8 +786,10 @@ function battery() {
     digest.push(String(killed));
   });
 
+  // 2026-11-03: T10 reads the rebuilt v1.2.31 file (S1231); the v1.2.32 diff has its own lint in
+  // tests/test_dp2_v1232_preview_label.js.
   test('T10 ES5 / ASCII lint of the added lines; inventory (10 functions + 1 var added to v1.2.28, 0 removed); hunks whose reversal is the v1.2.30 oracle; LF only; WHY block', () => {
-    const bl = BASE.split('\n'), nl = NEW.split('\n');
+    const bl = BASE.split('\n'), nl = S1231.split('\n');
     const baseSet = new Set(bl), newSet = new Set(nl);
     const added = nl.filter(l => !baseSet.has(l));
     ok(added.length >= 150 && added.length <= 260, 'added lines ' + added.length);
@@ -782,20 +802,20 @@ function battery() {
         ok(baseSet.has(back), 'non-ASCII added line: ' + l.slice(0, 120));
       }
     }
-    ok(NEW.indexOf('\r') < 0, 'LF only');
+    ok(S1231.indexOf('\r') < 0, 'LF only');
     for (const name of ['dp2SeatClass_', 'dp2CohortLegacy_', 'dp2Cohort_', 'dp2SeatFlag_', 'dp2SeatsTitle_', 'dp2FeedTag_', 'dp2SeatsSub_', 'dp2BoardTicketsAction_', 'dp2CoverQty_']) {
-      const start = NEW.indexOf('function ' + name + '(');
+      const start = S1231.indexOf('function ' + name + '(');
       ok(start > 0, 'defined ' + name);
-      const body = NEW.slice(start, NEW.indexOf('\n}\n', start) + 3);
+      const body = S1231.slice(start, S1231.indexOf('\n}\n', start) + 3);
       ok(/^[\x00-\x7f]*$/.test(body), 'ASCII ' + name);
       new vm.Script('(function(){' + body + '})');
     }
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
-    const fb = names(BASE, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(NEW, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+    const fb = names(BASE, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(S1231, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'top-level functions removed');
     deq(Object.keys(fn).filter(k => !fb[k]).sort(), ['dp2BoardTicketsAction_', 'dp2Cohort_', 'dp2CohortLegacy_', 'dp2CoverQty_', 'dp2FeedTag_', 'dp2SeatClass_', 'dp2SeatFlag_', 'dp2SeatsSub_', 'dp2SeatsTitle_'].sort(), 'top-level functions added at the start of a line');
-    ok(NEW.indexOf('} function dp2EvidenceExpiry_(pd, nowMs) {') > 0, 'step 6 keeps dp2EvidenceExpiry_ on the dp2Today_ line (one-line step, as prepared)');
-    const vb = names(BASE, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(NEW, /^var\s+([A-Za-z_$][\w$]*)/mg);
+    ok(S1231.indexOf('} function dp2EvidenceExpiry_(pd, nowMs) {') > 0, 'step 6 keeps dp2EvidenceExpiry_ on the dp2Today_ line (one-line step, as prepared)');
+    const vb = names(BASE, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(S1231, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]), ['DP2_COHORT_LEGACY_PROP'], 'vars added');
     // exactly these v1.2.28 lines are gone: eleven rewritten by the prepared steps (two of them, the version lines, again
@@ -811,11 +831,11 @@ function battery() {
     eq(removed.length, REMOVED.length, 'base lines replaced');
     for (let i = 0; i < removed.length; i++) ok(removed[i].indexOf(REMOVED[i]) === 0, 'replaced base line ' + i + ': ' + removed[i].slice(0, 120));
     let pos = 0; for (const l of bl) { if (!newSet.has(l)) continue; const at = nl.indexOf(l, pos); ok(at >= pos, 'base line out of order: ' + l.slice(0, 80)); pos = at + 1; }
-    const why = NEW.slice(NEW.indexOf(' *   1.2.31: '), NEW.indexOf(' *   1.2.28: '));
+    const why = S1231.slice(S1231.indexOf(' *   1.2.31: '), S1231.indexOf(' *   1.2.28: '));
     ok(why.length > 3000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block (1.2.31, 1.2.30, 1.2.29) present, newest first, ASCII');
     ok(why.indexOf('1.2.30 (prepared 28 Oct 2026, never installed') > 0 && why.indexOf('1.2.29 (D4; prepared 28 Oct 2026 with 1.2.30, never installed)') > 0, 'the never-installed note');
-    for (const l of bl.filter(x => /^ \*   1\.\d+\.\d+: /.test(x))) ok(NEW.indexOf(l) > 0, 'prior WHY entry kept: ' + l.slice(0, 60));
-    eq(reverseEdits(NEW), ORACLE, 'hunk reversal = the v1.2.30 oracle');
+    for (const l of bl.filter(x => /^ \*   1\.\d+\.\d+: /.test(x))) ok(S1231.indexOf(l) > 0, 'prior WHY entry kept: ' + l.slice(0, 60));
+    eq(reverseEdits(S1231), ORACLE, 'hunk reversal = the v1.2.30 oracle');
     ok(EDITS.length >= 10 && EDITS.length <= 40, 'hunks ' + EDITS.length);
     digest.push(String(EDITS.length));
   });
