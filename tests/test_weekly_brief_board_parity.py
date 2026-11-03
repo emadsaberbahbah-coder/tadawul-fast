@@ -20,25 +20,35 @@ DEFAULT_SPREADSHEET_ID like the real one), board fundamentals, the regime
 block, the clock, time.sleep and send_mail. No network.
 
 P1  off (unset / blank / off / 0 / false / no / enforce / observe / onn):
-    stdout, mail (subject, text, HTML), every sheet read and write, the
-    _Run_Log row and os.environ equal the untouched v1.0.3, for the default
-    run, --no-mail and --dry-run (version string aside)
+    stdout, stderr, mail (subject, text, HTML), every sheet read and write,
+    the _Run_Log row and os.environ equal the untouched v1.0.3, for the
+    default run, --no-mail, --dry-run and --sheet-id, on six book / env
+    variants (default, no _Brief_State, empty Top_10, lane knobs preset,
+    authority readable, no TARGET_SHEET_ID); only the brief's own version
+    tokens are normalized
 P1b the on-spellings; P1c junk stays off
 P2  on, end to end on one fake book: the REAL shadow_board.main (dry run,
     shadow_board.yml job env) and the memo agree on eligible count, blocked
     counts, switch verdict and every board row (after the documented seam);
-    authority read from this sheet
+    authority read from this sheet; the memo env is weekly_brief.yml's own
+P2b the same with four hard blocks (two BROKER_UNTRADABLE, two floor-locked),
+    with and without TFB_SB_COST_LEGACY=1: every hard block reads BLOCKED
+    with ROI / RT / Net Edge suppressed, also when the board scored it
 P3  off on the same book is the 1 Nov defect: NO_ACTION against the board's
     SWITCH_CANDIDATES, every row BLOCKED, authority sheet_id_missing
 P4  on, columns: the memo header ends with Gen2 Eligible (not ROI Src),
     TRADE rows keep ROI / RT / Net Edge, _Brief_State saves gen2 YES / NO
 P5  the seam table: TRADE + NO -> BLOCKED - <status>, economics suppressed;
-    BLOCKED + NO keeps its verdict, economics suppressed; EDGE_BELOW_COST /
-    NO_ROI / NO_COST_MODEL / TRADE + YES untouched; short rows and non-lists
-    untouched; v1.0.3's _hard_gate_rows unchanged on the 17-column board
+    BLOCKED + NO keeps its verdict, economics suppressed; a hard block by
+    its own evidence (status not invest-ok, Floor OK not YES) is
+    terminalized whatever its verdict; compliant EDGE_BELOW_COST / NO_ROI /
+    NO_COST_MODEL, TRADE + YES and GATE_DISABLED untouched; short rows and
+    non-lists untouched; v1.0.3's _hard_gate_rows unchanged on 17 columns
 P6  _apply_board_lane_env: unset / blank knobs take the board value, preset
     knobs are kept; DEFAULT_SPREADSHEET_ID from --sheet-id, TARGET_SHEET_ID,
-    TRACK_SHEET_ID, or kept; the evidence never carries the sheet id
+    TRACK_SHEET_ID, or kept; authority_sheet names TFB_SHARIAH_SHEET_ID when
+    that takes precedence; the evidence never carries a sheet id
+P6b main passes --sheet-id through (no TARGET_SHEET_ID: authority still read)
 P7  on, settled read: a rendering Top_10 is re-read (two 30 s sleeps) and
     the memo carries the settled candidates; off reads once
 P8  on, engine ROI: blank ROI filled from Global_Markets / Market_Leaders;
@@ -49,11 +59,18 @@ P10 on, evidence: one [WEEKLY-BRIEF-PARITY v...] line, the BOARD LANE memo
     line (text and HTML) and _Run_Log details.board_parity; off has none
 P11 drift: every literal knob in shadow_board.yml's job env is in
     BOARD_LANE_ENV (same value) or set identically by weekly_brief.yml, and
-    every vars knob there is mapped here too or is DEFAULT_SPREADSHEET_ID
+    every vars knob there is mapped here too or is DEFAULT_SPREADSHEET_ID;
+    weekly_brief.yml presets no lane knob; no TFB_ knob sits outside either
+    job env; a TFB_BOARD_FREEZE_* knob in shadow_board.yml fails (code, not
+    env, must follow it)
+P12 legacy cost on: _Brief_State keeps the memo's verdict (BLOCKED), never
+    TRADE for a name that is not Gen2-eligible
 G1  golden negative: the untouched v1.0.3 with the gate set still mails
-    NO_ACTION against the board's SWITCH_CANDIDATES (P2 fails on it)
+    NO_ACTION against the board's SWITCH_CANDIDATES (P2 fails on it, on
+    exactly that assertion)
 V1  version floor, verify_deployment pin, weekly_brief.yml maps the gate
-    once with default 'off', ci.yml runs this file, WHY order, ASCII file
+    once with default 'off', ci.yml's blocking heavy job runs this file after
+    fetching the base, WHY order, ASCII file
 V1b against the base: ASCII added lines, the exact removed lines, exactly
     six functions added, none removed
 
@@ -179,6 +196,24 @@ FND = {"AAPL.US": {"market_cap": 3.4e12, "interest_debt": 9.5e10,
                    "sector": "Energy", "industry": "Oil & Gas"},
        "1120.SR": {"market_cap": 3.0e11, "interest_debt": 1.0e10,
                    "sector": "Financials", "industry": "Banks"}}
+# P2b: hard blocks next to the 4 candidates above - 1015.KL / 1016.KL are
+# BROKER_UNTRADABLE, 0700.HK / 0005.HK are floor-locked at 130K SAR equity.
+# With TFB_SB_COST_LEGACY=1 the board scores them (TRADE / NO_ROI /
+# EDGE_BELOW_COST with Gen2 NO); without it they arrive BLOCKED.
+TOP10_BLOCKED = TOP10 + [
+    ["5", "1015.KL", "AMMB Holdings", "BUY", "Financials", "40%", "High", "20000"],
+    ["6", "0700.HK", "Tencent", "BUY", "Communication", "25%", "High", "20000"],
+    ["7", "1016.KL", "Malayan Banking", "BUY", "Financials", "", "High", "20000"],
+    ["8", "0005.HK", "HSBC Holdings", "BUY", "Financials", "2%", "Medium", "20000"]]
+FND.update({"1015.KL": {"market_cap": 1.0e10, "interest_debt": 1.0e9,
+                        "sector": "Financials", "industry": "Banks"},
+            "0700.HK": {"market_cap": 4.0e12, "interest_debt": 3.0e11,
+                        "sector": "Communication", "industry": "Internet"},
+            "1016.KL": {"market_cap": 9.0e9, "interest_debt": 1.0e9,
+                        "sector": "Financials", "industry": "Banks"},
+            "0005.HK": {"market_cap": 1.5e12, "interest_debt": 2.0e11,
+                        "sector": "Financials", "industry": "Banks"}})
+HARD = ("1015.KL", "0700.HK", "1016.KL", "0005.HK")
 PREV_STATE = {"date": "2026-10-25 07:10", "switch": "NO_ACTION",
               "board": {"AAPL.US": {"status": "MODEL_SCREEN_PASS_NOT_FATWA",
                                     "verdict": "NO_ROI", "gen2": ""},
@@ -237,7 +272,7 @@ class FakeWS:
 
 
 class FakeBook:
-    def __init__(self, t10_seq=None, top10=None):
+    def __init__(self, t10_seq=None, top10=None, no_state=False):
         self.calls, self.writes = [], []
         self.t10_seq = [copy.deepcopy(v) for v in (t10_seq or [])]
         tabs = {"Top_10_Investments": top10 if top10 is not None else TOP10,
@@ -245,6 +280,8 @@ class FakeBook:
                 "_Brief_State": [["Weekly Brief State (JSON, machine-managed)"],
                                  [json.dumps(PREV_STATE)]],
                 "_Run_Log": [["ts"]]}
+        if no_state:
+            del tabs["_Brief_State"]
         tabs.update(ENGINE)
         self.tabs = {k: FakeWS(self, k, v) for k, v in tabs.items()}
 
@@ -306,24 +343,31 @@ def _patch(mod, monkeypatch, book, out):
     _reset_authority()
 
 
-WEEKLY_ENV = {"TARGET_SHEET_ID": SHEET, "TFB_COMPLIANCE_GATE_ENABLED": "1"}
+def _weekly_env(target=True):
+    """The literal knobs of weekly_brief.yml's job env (the lane the memo
+    really runs in) + the sheet id its vars mapping supplies."""
+    lit, _exprs = _job_env(".github/workflows/weekly_brief.yml", "brief")
+    env = dict(lit)
+    if target:
+        env["TARGET_SHEET_ID"] = SHEET
+    return env
 
 
-def run_brief(mod, monkeypatch, gate=None, argv=(), book=None, extra=None):
-    """-> dict: rc, stdout, mail, writes, calls, env (lane keys after)."""
+def run_brief(mod, monkeypatch, gate=None, argv=(), book=None, extra=None, target=True):
+    """-> dict: rc, stdout, stderr, mail, writes, calls, env (lane keys after)."""
     book = book or FakeBook()
     out = {"mail": [], "auth_sheet": [], "sleeps": []}
-    env = dict(WEEKLY_ENV)
+    env = _weekly_env(target)
     if gate is not None:
         env[GATE] = gate
     env.update(extra or {})
     with _env(env):
         _patch(mod, monkeypatch, book, out)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
             out["rc"] = mod.main(list(argv))
         out["env"] = {k: os.environ.get(k) for k in _ENV_KEYS}
-    out["stdout"] = buf.getvalue()
+    out["stdout"], out["stderr"] = buf.getvalue(), err.getvalue()
     out["writes"], out["calls"] = book.writes, book.calls
     return out
 
@@ -336,11 +380,13 @@ def _shadow_board_env():
     return env
 
 
-def run_board(mod, monkeypatch, book=None):
+def run_board(mod, monkeypatch, book=None, extra=None):
     """The REAL shadow_board.main --dry-run on the same fake book."""
     book = book or FakeBook()
     out = {"mail": [], "auth_sheet": [], "sleeps": []}
-    with _env(_shadow_board_env()):
+    env = _shadow_board_env()
+    env.update(extra or {})
+    with _env(env):
         _patch(mod, monkeypatch, book, out)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -374,9 +420,13 @@ def _job_env(rel, job):
 
 
 def _norm(mod, obj):
+    """Normalize only the brief's own version tokens (shariah_authority's
+    '[shariah_authority v1.1.0]' banner must stay as it is)."""
     s = json.dumps(obj, ensure_ascii=False, default=str)
     v = mod.SCRIPT_VERSION
-    return s.replace("v" + v, "vX").replace('\\"version\\": \\"%s\\"' % v, '\\"version\\": \\"X\\"')
+    for tok in ("[WEEKLY-BRIEF v", "run_weekly_brief v", "[weekly_brief v"):
+        s = s.replace(tok + v, tok + "X")
+    return s.replace('\\"version\\": \\"%s\\"' % v, '\\"version\\": \\"X\\"')
 
 
 def _strip_ts(writes):
@@ -398,16 +448,32 @@ def _memo_board_lines(text):
 OFF_WORDS = [None, "", "off", "0", "false", "no", "enforce", "observe", "onn"]
 
 
-@pytest.mark.parametrize("argv", [(), ("--no-mail",), ("--dry-run",)])
-def test_p1_off_equals_the_untouched_v103(monkeypatch, argv):
+P1_VARIANTS = {
+    "default": (lambda: FakeBook(), {}, True),
+    "no_state": (lambda: FakeBook(no_state=True), {}, True),
+    "empty_top10": (lambda: FakeBook(top10=[]), {}, True),
+    "lane_preset": (lambda: FakeBook(), {"TFB_COMPLIANCE_SCREEN_RETIRED": "1",
+                                         "TFB_BOARD_ENGINE_ROI": "enforce",
+                                         "TFB_SHADOW_T10_READ_RETRIES": "6"}, True),
+    "authority_ok": (lambda: FakeBook(), {"DEFAULT_SPREADSHEET_ID": SHEET}, True),
+    "no_target": (lambda: FakeBook(), {}, False),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(P1_VARIANTS))
+@pytest.mark.parametrize("argv", [(), ("--no-mail",), ("--dry-run",),
+                                  ("--sheet-id", SHEET, "--no-mail")])
+def test_p1_off_equals_the_untouched_v103(monkeypatch, argv, variant):
     b = base()
     d = delivered()
+    make_book, extra, target = P1_VARIANTS[variant]
     for gate in OFF_WORDS:
-        mine = run_brief(d, monkeypatch, gate, argv)
-        theirs = run_brief(b, monkeypatch, gate, argv)
-        for key in ("rc", "stdout", "mail", "calls", "env", "auth_sheet", "sleeps"):
-            assert _norm(d, mine[key]) == _norm(b, theirs[key]), (gate, argv, key)
-        assert _norm(d, _strip_ts(mine["writes"])) == _norm(b, _strip_ts(theirs["writes"])), (gate, argv)
+        mine = run_brief(d, monkeypatch, gate, argv, make_book(), extra, target)
+        theirs = run_brief(b, monkeypatch, gate, argv, make_book(), extra, target)
+        for key in ("rc", "stdout", "stderr", "mail", "calls", "env", "auth_sheet", "sleeps"):
+            assert _norm(d, mine[key]) == _norm(b, theirs[key]), (gate, argv, variant, key)
+        assert _norm(d, _strip_ts(mine["writes"])) == _norm(b, _strip_ts(theirs["writes"])), \
+            (gate, argv, variant)
         assert "[WEEKLY-BRIEF-PARITY" not in mine["stdout"]
     assert d._board_parity_enabled() is False
 
@@ -425,9 +491,9 @@ def test_p1c_junk_is_off(monkeypatch, gate):
 
 
 # ----------------------------------------------------------------- P2 ------
-def check_parity(mod, monkeypatch):
-    board = run_board(mod, monkeypatch)
-    memo = run_brief(mod, monkeypatch, "on", ("--dry-run",))
+def check_parity(mod, monkeypatch, top10=None, extra=None):
+    board = run_board(mod, monkeypatch, FakeBook(top10=top10), extra)
+    memo = run_brief(mod, monkeypatch, "on", ("--dry-run",), FakeBook(top10=top10), extra)
     assert memo["rc"] == 0
     text = memo["stdout"]
     wl = next(ln for ln in text.splitlines() if ln.startswith("[WEEKLY-BRIEF v"))
@@ -451,6 +517,45 @@ def test_p2_on_memo_equals_the_real_shadow_board(monkeypatch):
     assert "SELL 7010.SR" in memo["stdout"]
     # the board's own Gen2 column decides eligibility; the memo shows it
     assert {r[0] for r in board["rows"] if r[-1] == "YES"} >= {"AAPL.US", "MSFT.US", "2222.SR"}
+
+
+@pytest.mark.parametrize("legacy", [None, "1"])
+def test_p2b_hard_blocks_end_to_end(monkeypatch, legacy):
+    """Hard-blocked names next to the candidates, with and without the board's
+    TFB_SB_COST_LEGACY kill switch: the memo still equals the board row for
+    row (after the seam), and every hard block reads BLOCKED with ROI / RT /
+    Net Edge suppressed - also when the board scored it."""
+    extra = {"TFB_SB_COST_LEGACY": legacy} if legacy else None
+    board, memo = check_parity(delivered(), monkeypatch, TOP10_BLOCKED, extra)
+    raw = {r[0]: r for r in board["rows"]}
+    assert set(HARD) <= set(raw)
+    if legacy:   # the legacy shapes really occur on the board
+        assert {raw[s][14] for s in HARD} >= {"TRADE", "NO_ROI", "EDGE_BELOW_COST"}, raw
+    else:
+        assert all(str(raw[s][14]).startswith("BLOCKED") for s in HARD)
+    _hdr, _cols, lines = _memo_board_lines(memo["stdout"])
+    by = {ln.split(" | ")[0]: ln.split(" | ") for ln in lines}
+    for sym in HARD:
+        cells = by[sym]
+        assert cells[7].startswith("BLOCKED " + DASH), cells
+        assert [cells[2], cells[5], cells[6]] == [DASH] * 3, cells
+    # compliant rows are untouched in both modes
+    assert by["1120.SR"][7] == "EDGE_BELOW_COST" and by["AAPL.US"][7] == "TRADE"
+
+
+def test_p12_state_verdict_is_the_memo_verdict(monkeypatch):
+    """With the legacy switch the board says TRADE for a hard block; the
+    saved _Brief_State must say what the memo says, so next week's CHANGES
+    never reports a blocked name turning TRADE."""
+    d = delivered()
+    memo = run_brief(d, monkeypatch, "on", (), FakeBook(top10=TOP10_BLOCKED),
+                     {"TFB_SB_COST_LEGACY": "1"})
+    upd = [w for w in memo["writes"] if w[0] == "update" and w[1] == "_Brief_State"]
+    state = json.loads(json.loads(upd[-1][3])[1][0])["board"]
+    for sym in HARD:
+        assert state[sym]["verdict"].startswith("BLOCKED " + DASH) and state[sym]["gen2"] == "NO", state[sym]
+    assert all(v["verdict"] != "TRADE" for v in state.values() if v["gen2"] != "YES")
+    assert state["AAPL.US"]["verdict"] == "TRADE" and state["1120.SR"]["verdict"] == "EDGE_BELOW_COST"
 
 
 # ----------------------------------------------------------------- P3 ------
@@ -513,6 +618,33 @@ def test_p5_seam_table():
     assert out[2:] == keep
     empty_status = _row("H.SR", "", "TRADE", "NO")
     assert g([empty_status])[0][14] == "BLOCKED " + DASH + " INELIGIBLE"
+    # legacy-scored hard blocks: the row's own gate evidence decides
+    untr_ebc = _row("I.KL", "BROKER_UNTRADABLE", "EDGE_BELOW_COST", "NO")
+    untr_noroi = _row("J.KL", "BROKER_UNTRADABLE", "NO_ROI", "NO", roi="", ne="")
+    floor_ebc = _row("K.HK", "SCREEN_RETIRED", "EDGE_BELOW_COST", "NO")
+    floor_ebc[10] = "NO"
+    model_fail = _row("L.US", "MODEL_SCREEN_FAIL", "NO_COST_MODEL", "NO", rt="", ne="")
+    hard = g([untr_ebc, untr_noroi, floor_ebc, model_fail])
+    assert [h[14] for h in hard] == ["BLOCKED " + DASH + " BROKER_UNTRADABLE",
+                                     "BLOCKED " + DASH + " BROKER_UNTRADABLE",
+                                     "BLOCKED " + DASH + " SCREEN_RETIRED",
+                                     "BLOCKED " + DASH + " MODEL_SCREEN_FAIL"]
+    assert all([h[i] for i in (4, 11, 12)] == [DASH] * 3 for h in hard)
+    # a compliant row needs Floor OK = YES; the gate-disabled pass-through has no floor
+    floor_blank = _row("M.SR", "SCREEN_RETIRED", "EDGE_BELOW_COST", "NO")
+    floor_blank[10] = ""
+    assert g([floor_blank])[0][14] == "BLOCKED " + DASH + " SCREEN_RETIRED"
+    gate_off = _row("N.SR", "GATE_DISABLED", "EDGE_BELOW_COST", "NO")
+    gate_off[10] = ""
+    assert g([gate_off]) == [gate_off]
+    # TRADE + NO is terminalized even when its evidence cells look compliant
+    # (the v1.0.3 1015.KL rule, kept as a backstop for an inconsistent row)
+    odd_trade = _row("O.SR", "SCREEN_RETIRED", "TRADE", "NO")
+    assert g([odd_trade])[0][14] == "BLOCKED " + DASH + " SCREEN_RETIRED"
+    # a verdict the board already wrote as BLOCKED is kept word for word
+    worded = _row("P.HK", "SCREEN_RETIRED", "BLOCKED " + DASH + " FLOOR_LOCKED", "NO", rt="", ne="")
+    worded[10] = "NO"
+    assert g([worded])[0][14] == "BLOCKED " + DASH + " FLOOR_LOCKED"
     # v1.0.3's seam is untouched on the 17-column board it was written for
     r17 = ["1015.KL", "AMMB", "", "Fin", 13.5, "High", "BROKER_UNTRADABLE", "SHADOW",
            "BROKER_UNTRADABLE", "KLSE", "NO", 0.55, 8.23, 1.2, "TRADE", 109.2, "NO"]
@@ -532,7 +664,8 @@ def test_p6_lane_env():
     with _env({}):
         got = d._apply_board_lane_env(None)
         assert got == {"TFB_COMPLIANCE_SCREEN_RETIRED": "1", "TFB_BOARD_ENGINE_ROI": "enforce",
-                       "TFB_SHADOW_T10_READ_RETRIES": "6", "DEFAULT_SPREADSHEET_ID": "missing"}
+                       "TFB_SHADOW_T10_READ_RETRIES": "6", "DEFAULT_SPREADSHEET_ID": "missing",
+                       "authority_sheet": "missing"}
         assert "DEFAULT_SPREADSHEET_ID" not in os.environ
         assert all(os.environ[k] == v for k, v in d.BOARD_LANE_ENV)
     with _env({"TFB_BOARD_ENGINE_ROI": "observe", "TFB_COMPLIANCE_SCREEN_RETIRED": "  ",
@@ -551,6 +684,22 @@ def test_p6_lane_env():
     with _env({"DEFAULT_SPREADSHEET_ID": "D-ID", "TARGET_SHEET_ID": "T-ID"}):
         got = d._apply_board_lane_env("CLI-ID")
         assert os.environ["DEFAULT_SPREADSHEET_ID"] == "D-ID" and got["DEFAULT_SPREADSHEET_ID"] == "preset"
+        assert got["authority_sheet"] == "preset"
+    # the authority reader takes TFB_SHARIAH_SHEET_ID first; the evidence says so
+    with _env({"TFB_SHARIAH_SHEET_ID": "S-ID", "TARGET_SHEET_ID": "T-ID"}):
+        got = d._apply_board_lane_env(None)
+        assert got["DEFAULT_SPREADSHEET_ID"] == "this_sheet" and got["authority_sheet"] == "shariah_sheet_id"
+        assert "S-ID" not in json.dumps(got) and "T-ID" not in json.dumps(got)
+
+
+def test_p6b_sheet_id_argument_reaches_the_authority(monkeypatch):
+    """main passes --sheet-id to the lane env: with no TARGET_SHEET_ID the
+    authority still reads this sheet (gate on) and still fails (gate off)."""
+    d = delivered()
+    on = run_brief(d, monkeypatch, "on", ("--sheet-id", SHEET, "--dry-run"), target=False)
+    assert on["auth_sheet"] == [SHEET] and "authority_sheet=this_sheet" in on["stdout"]
+    off = run_brief(d, monkeypatch, None, ("--sheet-id", SHEET, "--dry-run"), target=False)
+    assert off["auth_sheet"] == [None]
 
 
 # ----------------------------------------------------------------- P7 ------
@@ -631,6 +780,24 @@ def test_p11_lane_drift_against_shadow_board_yml():
         assert lit.get(key) == val, (key, val)           # nothing extra or stale
     for key, val in exprs.items():
         assert key == "DEFAULT_SPREADSHEET_ID" or wexprs.get(key) == val, (key, val)
+    # the weekly lane must not preset a lane knob: _apply_board_lane_env keeps
+    # a preset, so a different value there would split memo and board again
+    for key, val in lane.items():
+        assert key not in wexprs and wlit.get(key, val) == val, (key, wlit.get(key), wexprs.get(key))
+    # every TFB_ / DEFAULT_ knob either workflow sets must sit in its job env
+    # (a step-level env would escape both this check and P2's board run)
+    for rel, job_lit, job_exprs in ((".github/workflows/shadow_board.yml", lit, exprs),
+                                    (".github/workflows/weekly_brief.yml", wlit, wexprs)):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        anywhere = set(re.findall(r"^\s+((?:TFB|DEFAULT)_[A-Z0-9_]+):", text, re.M))
+        assert anywhere <= set(job_lit) | set(job_exprs), (rel, anywhere - set(job_lit) - set(job_exprs))
+    # the board's non-trading freeze is code (shadow_board.main calls
+    # freeze_verdict), not env: mirroring it into BOARD_LANE_ENV would do
+    # nothing, so a freeze armed in shadow_board.yml must change this script
+    for key in ("TFB_BOARD_FREEZE_NONTRADING", "TFB_BOARD_FREEZE_HOLIDAYS", "TFB_BOARD_FREEZE_TODAY"):
+        assert key not in lit and key not in exprs, \
+            "%s armed in shadow_board.yml: run_weekly_brief must apply freeze_verdict" % key
+        assert key not in lane
     try:
         import yaml  # optional: the contract lane has no PyYAML
     except Exception:
@@ -647,7 +814,7 @@ def test_g1_golden_negative_base_disagrees_with_the_board(monkeypatch):
     memo = run_brief(b, monkeypatch, "on", ("--dry-run",))
     assert board["switch"] == "SWITCH_CANDIDATES" and "switch=NO_ACTION" in memo["stdout"]
     assert memo["auth_sheet"] == [None]
-    with pytest.raises((AssertionError, AttributeError, StopIteration)):
+    with pytest.raises(AssertionError, match=r"\[WEEKLY-BRIEF v1\.0\.3\] cands=4 switch=NO_ACTION"):
         check_parity(b, monkeypatch)
 
 
@@ -668,7 +835,9 @@ def test_v1_version_pin_workflow_ci_why():
     lines = [ln for ln in wf.splitlines() if GATE + ":" in ln and not ln.lstrip().startswith("#")]
     assert lines == ["      %s: %s" % (GATE, MAPPING)], lines
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert re.search(r"python -m pytest -q tests/test_weekly_brief_board_parity\.py", ci)
+    heavy = ci.split("\n  heavy:\n", 1)[1].split("\n  summary:\n", 1)[0]
+    assert re.search(r"\n          python -m pytest -q tests/test_weekly_brief_board_parity\.py\n", heavy)
+    assert "git fetch --no-tags --depth=1 origin 3e326e26a66393bcf26d725184507f8c1772b290" in heavy
     src = Path(mod.__tfb_src__).read_text(encoding="utf-8")
     i11 = src.index("# v1.1.0 (2026-11-03) - BOARD PARITY")
     assert src.index("# v1.0.3 (2026-08-30) - HARD-GATE TERMINAL") < i11 < src.index("SCRIPT_VERSION = ")

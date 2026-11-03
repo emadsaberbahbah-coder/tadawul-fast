@@ -117,21 +117,29 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 #   * on, columns: snapshot_by_header(), _hard_gate_rows_by_header() and the
 #     memo columns bind by shadow_board.OUT_HEADER name; a missing name
 #     raises, so no memo is mailed on a schema it cannot read.
-#   * on, the render seam: a row that is not Gen2-eligible and still reads
-#     TRADE (the 1015.KL class, reachable only with TFB_SB_COST_LEGACY=1) is
-#     terminalized as v1.0.3 does; a row the board already BLOCKED keeps its
-#     verdict and loses ROI / RT / Net Edge; every other row (EDGE_BELOW_COST,
-#     NO_ROI, NO_COST_MODEL, TRADE + YES) reads as the tab reads. v1.0.3's
-#     rule also relabelled compliant EDGE_BELOW_COST / NO_ROI rows "BLOCKED -
-#     <status>", which under the retired screen reads "BLOCKED -
-#     SCREEN_RETIRED" on rows the board calls EDGE_BELOW_COST.
+#   * on, the render seam: a row that is not Gen2-eligible is terminalized
+#     as v1.0.3 does ('BLOCKED - <status>', ROI / RT / Net Edge suppressed)
+#     when it reads TRADE, when the board already BLOCKED it (verdict kept),
+#     or when its own gate evidence says hard block (status outside
+#     compliance_gate.INVEST_OK_STATUSES and not GATE_DISABLED, or Floor OK
+#     not YES) - the TFB_SB_COST_LEGACY=1 shapes. A compliant row the board
+#     calls EDGE_BELOW_COST / NO_ROI / NO_COST_MODEL, and TRADE + YES, read
+#     as the tab reads. v1.0.3's rule also relabelled those compliant rows
+#     "BLOCKED - <status>" ("BLOCKED - SCREEN_RETIRED" under the retired
+#     screen). The saved state (snapshot_by_header) takes the verdict after
+#     the seam, so a CHANGES line never shows TRADE for a blocked name.
 #   * on, evidence: one "[WEEKLY-BRIEF-PARITY v1.1.0] ..." line, a BOARD LANE
 #     line under PROVENANCE (text and HTML), and "board_parity" in the
 #     _Run_Log details.
-# KNOWN: the first memo after arming reports a FLIP for every row whose
-# status moves from the model-screen codes to SCREEN_RETIRED (a one-time
-# diff against the last v1.0.3 state). shadow_board's non-trading freeze
-# (TFB_BOARD_FREEZE_NONTRADING) is not mirrored: neither lane sets it.
+# KNOWN: the first memo after arming diffs against the last v1.0.3 state
+# once: a status FLIP per row (model-screen code -> SCREEN_RETIRED) and, for
+# most rows, a verdict FLIP too (NO_ROI / BLOCKED - MODEL_SCREEN_* -> TRADE /
+# EDGE_BELOW_COST), so flips= reads about twice the row count that Sunday.
+# The first memo after a rollback shows the reverse diff once (the gate-off
+# code is v1.0.3's; the saved state is the armed one). shadow_board's
+# non-trading freeze (TFB_BOARD_FREEZE_*) is not mirrored and cannot be by
+# env: this script never calls freeze_verdict, and neither lane sets it (the
+# harness fails if shadow_board.yml ever does).
 # ROLLBACK: unset the TFB_WEEKLY_BOARD_PARITY Variable (= v1.0.3).
 # Functions added: 6 (_board_parity_enabled, _apply_board_lane_env,
 # _board_cols, snapshot_by_header, _hard_gate_rows_by_header,
@@ -197,6 +205,10 @@ def _apply_board_lane_env(sheet_id: Optional[str]) -> Dict[str, str]:
             out["DEFAULT_SPREADSHEET_ID"] = "this_sheet"
         else:
             out["DEFAULT_SPREADSHEET_ID"] = "missing"
+    # the Shariah authority reader takes TFB_SHARIAH_SHEET_ID first
+    out["authority_sheet"] = ("shariah_sheet_id"
+                              if (os.getenv("TFB_SHARIAH_SHEET_ID") or "").strip()
+                              else out["DEFAULT_SPREADSHEET_ID"])
     return out
 
 
@@ -221,7 +233,7 @@ def _board_lane_line(lane: Dict[str, Any]) -> str:
             f" roi_errors={roi.get('errors', 0)}"
             f" t10_read={t10.get('first', 'single')}->{t10.get('final', 'single')}"
             f"/{t10.get('retries', 0)}"
-            f" authority_sheet={env.get('DEFAULT_SPREADSHEET_ID', '')}")
+            f" authority_sheet={env.get('authority_sheet', '')}")
 
 
 # --------------------------------------------------------------------------- #
@@ -238,9 +250,12 @@ def snapshot(rows: List[List[Any]], scan_verdict: str) -> Dict[str, Any]:
 def snapshot_by_header(rows: List[List[Any]],
                        scan_verdict: str) -> Dict[str, Any]:
     """v1.1.0 (parity on): snapshot() with the four fields bound by
-    Shadow_Board header name, so "gen2" is Gen2 Eligible, not ROI Src."""
+    Shadow_Board header name, so "gen2" is Gen2 Eligible, not ROI Src. The
+    verdict is the one the memo shows (after _hard_gate_rows_by_header), so
+    a CHANGES line never says a blocked name turned TRADE."""
     sym, status, verdict, gen2 = _board_cols(
         "Symbol", "Shariah Status", "Edge Verdict", "Gen2 Eligible")
+    rows = _hard_gate_rows_by_header(rows)
     return {"date": _now_riyadh(),
             "switch": scan_verdict,
             "board": {r[sym]: {"status": r[status], "verdict": r[verdict],
@@ -315,26 +330,36 @@ def _hard_gate_rows(rows: List[List[Any]]) -> List[List[Any]]:
 
 def _hard_gate_rows_by_header(rows: List[List[Any]]) -> List[List[Any]]:
     """v1.1.0 (parity on): the render seam on the current board schema,
-    columns bound by header name. A row that is not Gen2-eligible and still
-    reads TRADE is terminalized as v1.0.3 does ('BLOCKED - <status>', edge
-    economics suppressed); a row the board already BLOCKED keeps its verdict
-    and loses ROI / RT / Net Edge; every other row reads as the Shadow_Board
-    tab reads it. Pure (copies), FAIL-OPEN per row like v1.0.3; a missing
-    header name raises (see _board_cols)."""
-    gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c = _board_cols(
+    columns bound by header name. A row that is not Gen2-eligible is
+    terminalized as v1.0.3 does ('BLOCKED - <status>', ROI / RT / Net Edge
+    suppressed) when it reads TRADE, when the board already BLOCKED it (its
+    verdict is kept), or when its own gate evidence says hard block: a status
+    outside compliance_gate.INVEST_OK_STATUSES (GATE_DISABLED aside) or Floor
+    OK not YES - the rows TFB_SB_COST_LEGACY=1 scores. Every other row (a
+    compliant EDGE_BELOW_COST / NO_ROI / NO_COST_MODEL, TRADE + YES) reads as
+    the Shadow_Board tab reads it. Pure (copies), FAIL-OPEN per row like
+    v1.0.3; a missing header name raises (see _board_cols)."""
+    gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c, floor_c = _board_cols(
         "Gen2 Eligible", "Shariah Status", "Edge Verdict", "ROI %",
-        "RT Cost %", "Net Edge %")
-    need = max(gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c)
+        "RT Cost %", "Net Edge %", "Floor OK")
+    need = max(gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c, floor_c)
+    ok_statuses = set(getattr(sb.cg, "INVEST_OK_STATUSES", ()))
+    gate_off = getattr(sb.cg, "GATE_DISABLED", "GATE_DISABLED")
     out: List[List[Any]] = []
     for r in rows or []:
         try:
             if (isinstance(r, list) and len(r) > need
                     and str(r[gen2_c] or "").strip().upper() != "YES"):
                 verdict = str(r[verdict_c] or "").strip()
-                if verdict == "TRADE" or verdict.upper().startswith("BLOCKED"):
+                st = str(r[status_c] or "").strip()
+                hard = not (st == gate_off or (
+                    st in ok_statuses
+                    and str(r[floor_c] or "").strip().upper() == "YES"))
+                if (verdict == "TRADE" or hard
+                        or verdict.upper().startswith("BLOCKED")):
                     c = list(r)
-                    if verdict == "TRADE":
-                        status = str(c[status_c] or "").strip() or "INELIGIBLE"
+                    if not verdict.upper().startswith("BLOCKED"):
+                        status = st or "INELIGIBLE"
                         c[verdict_c] = "BLOCKED \u2014 " + status
                     c[roi_c] = c[rt_c] = c[ne_c] = "\u2014"
                     out.append(c)
@@ -693,36 +718,64 @@ def _selftest() -> int:
                    "Shariah Status" not in t3 and "Shariah Status" not in h3
                    and "Status" in t3 and "BLOCKED — BROKER_UNTRADABLE" in h3))
     # v1.1.0: board parity on the current 18-column board (ROI Src at 16).
+    # b2 = a compliant EDGE_BELOW_COST row; b3 = TRADE + NO (legacy cost);
+    # b4 = the production blocked shape (evaluate_board v1.3.0: no cost
+    # model, verdict BLOCKED - <status>); b5 = a legacy-scored hard block
+    # (BROKER_UNTRADABLE, EDGE_BELOW_COST, Gen2 NO).
+    dash = "\u2014"
     b1 = r1[:16] + ["engine", "YES"]
-    b2 = (r2[:11] + [0.6, "", "", "EDGE_BELOW_COST", 18.2]
+    b2 = (r2[:11] + [0.6, 1.2, 1.8, "EDGE_BELOW_COST", 18.2]
           + ["", "NO"])
     b3 = r3[:16] + ["", "NO"]
+    b4 = (["1016.KL", "Maybank", "", "Financial Services", 11.0, "High",
+           "BROKER_UNTRADABLE", "SHADOW", "BROKER_UNTRADABLE", "KLSE", "NO",
+           "", "", "", "BLOCKED " + dash + " BROKER_UNTRADABLE", 95.0]
+          + ["", "NO"])
+    b5 = (["1017.KL", "CIMB", "", "Financial Services", 2.5, "High",
+           "BROKER_UNTRADABLE", "SHADOW", "BROKER_UNTRADABLE", "KLSE", "NO",
+           0.55, 1.08, 1.65, "EDGE_BELOW_COST", 88.0] + ["", "NO"])
     lane_fx = {"env": {"TFB_COMPLIANCE_SCREEN_RETIRED": "1",
-                       "DEFAULT_SPREADSHEET_ID": "this_sheet"},
+                       "DEFAULT_SPREADSHEET_ID": "this_sheet",
+                       "authority_sheet": "this_sheet"},
                "engine_roi": {"mode": "enforce", "applied": 1, "blank": 1,
                               "unresolved": 0, "errors": 0}}
-    _, t4, h4 = render_memo([b1, b2, b3],
+    _, t4, h4 = render_memo([b1, b2, b3, b4, b5],
                             {"compliance_eligible": 2,
-                             "blocked": {"BROKER_UNTRADABLE": 1}},
+                             "blocked": {"BROKER_UNTRADABLE": 3}},
                             scan_na, regime, {"rows": 0, "as_of": None},
-                            2, 3, d0, 130000, lane=lane_fx)
+                            2, 5, d0, 130000, lane=lane_fx)
     lines4 = {l.split(" | ")[0]: l for l in t4.splitlines()
-              if l.startswith(("7010.SR", "2269.T", "1015.KL"))}
+              if l.startswith(("7010.SR", "2269.T", "1015.KL", "1016.KL",
+                               "1017.KL"))}
+    _econ_dashed = (lambda line: [line.split(" | ")[i] for i in (2, 5, 6)]
+                    == [dash] * 3)
     checks.append(("v1.1.0 parity: columns bound by name (Gen2 Eligible, "
                    "not ROI Src); TRADE + YES row untouched",
                    "Gen2 Eligible" in t4 and "| ROI Src" not in t4
                    and lines4["7010.SR"].endswith("| TRADE | 12.1 | YES")))
-    checks.append(("v1.1.0 parity: EDGE_BELOW_COST row reads as the board; "
-                   "TRADE + NO still terminalized",
-                   "EDGE_BELOW_COST" in lines4["2269.T"]
-                   and "BLOCKED" not in lines4["2269.T"]
-                   and "BLOCKED \u2014 BROKER_UNTRADABLE" in lines4["1015.KL"]
+    checks.append(("v1.1.0 parity: compliant EDGE_BELOW_COST row reads as "
+                   "the board; TRADE + NO terminalized, economics dashed",
+                   "| 17.5 | High | MODEL_SCREEN_PASS_NOT_FATWA | 0.6 | 1.2 | "
+                   "EDGE_BELOW_COST |" in lines4["2269.T"]
+                   and "BLOCKED " + dash + " BROKER_UNTRADABLE" in lines4["1015.KL"]
+                   and _econ_dashed(lines4["1015.KL"])
                    and "BOARD LANE | lane=shadow_board" in t4
                    and "board lane=shadow_board" in h4))
-    snap4 = snapshot_by_header([b1, b2], "NO_ACTION")
-    checks.append(("v1.1.0 parity: state gen2 is Gen2 Eligible",
+    checks.append(("v1.1.0 parity: a board-BLOCKED row keeps its verdict, "
+                   "economics dashed; a legacy-scored hard block is "
+                   "terminalized",
+                   "BLOCKED " + dash + " BROKER_UNTRADABLE" in lines4["1016.KL"]
+                   and _econ_dashed(lines4["1016.KL"])
+                   and "EDGE_BELOW_COST" not in lines4["1017.KL"]
+                   and "BLOCKED " + dash + " BROKER_UNTRADABLE" in lines4["1017.KL"]
+                   and _econ_dashed(lines4["1017.KL"])))
+    snap4 = snapshot_by_header([b1, b2, b3], "NO_ACTION")
+    checks.append(("v1.1.0 parity: state gen2 is Gen2 Eligible; state "
+                   "verdict is the memo's (never TRADE for a block)",
                    snap4["board"]["7010.SR"]["gen2"] == "YES"
                    and snap4["board"]["2269.T"]["gen2"] == "NO"
+                   and snap4["board"]["1015.KL"]["verdict"]
+                   == "BLOCKED " + dash + " BROKER_UNTRADABLE"
                    and dict(BOARD_LANE_ENV).get(
                        "TFB_COMPLIANCE_SCREEN_RETIRED") == "1"))
     passed = sum(1 for _, ok in checks if ok)
