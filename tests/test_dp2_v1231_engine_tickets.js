@@ -65,7 +65,22 @@ const V1230_SHA256 = '484806384b0d815d3f18aa8c2a6ab0d83b1dfd1652f080ff4990e9e537
 // from it (the v1.2.32 hunks of tests/js/dp2_edits_v1232.json reversed, SHA-256 pinned).
 const EDITS1232 = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1232.json'), 'utf8'));
 const V1231_SHA256 = 'd789cf502c08ed00278196707b4f6d3057c5c1bbd00b86ad47254ed77e3cac20';   // v1.2.31 (origin/main 8478029d)
+// 2026-11-03: v1.2.33 (exit sanity, DP2_EXIT_SANITY default off) stacked on v1.2.32; the chain first reverses the
+// v1.2.33 hunks of tests/js/dp2_edits_v1233.json (the v1.2.32 file, SHA-256 pinned), then the v1.2.32 hunks.
+const EDITS1233 = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1233.json'), 'utf8'));
+const V1232_SHA256 = '5ac92c367d86a344ed7beefff33d490d292b82fb68b4ede7fd0c0a9afb18a723';   // v1.2.32 (origin/main 3e326e26)
+function v1232Of(src) {
+  if (src.indexOf("var DP2_VERSION = '1.2.33';") < 0) return src;
+  let s = src;
+  for (const [cur, prev] of EDITS1233) {
+    if (s.split(cur).length - 1 !== 1) throw new Error('exactly one approved v1.2.33 hunk: ' + cur.split('\n')[0].slice(0, 90));
+    s = s.replace(cur, () => prev);
+  }
+  if (sha256(s) !== V1232_SHA256) throw new Error('v1.2.33 changes only its enumerated hunks (their reversal = the v1.2.32 file)');
+  return s;
+}
 function v1231Of(src) {
+  src = v1232Of(src);
   if (src.indexOf("var DP2_VERSION = '1.2.31';") > 0) return src;
   let s = src;
   for (const [cur, prev] of EDITS1232) {
@@ -414,7 +429,7 @@ function build(source, which, opts) {
 }
 function norm(b) {   // the only bytes v1.2.31 under its kill switch may differ in: the version printed on both footers / the toast title
   const strip = o => { const x = Object.assign({}, o); delete x.env; return x; };
-  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.32').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
+  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.33').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.32').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
 }
 function sheet(b, name) { return b.env.book.getSheetByName(name); }
 function val(sh, r, c) { const x = sh._cells.get(r + ':' + c); return x && x.v !== undefined && x.v !== null ? x.v : ''; }
@@ -658,8 +673,9 @@ function battery() {
   test('T0 oracles: v1.2.30 = the eleven prepared steps on the live v1.2.28 (SHA-256 pinned); version lockstep 1.2.31; the three files compile', () => {
     eq(sha256(BASE), V1228_SHA256, 'base'); eq(sha256(ORACLE), V1230_SHA256, 'oracle');
     eq(applySteps(BASE), ORACLE, 'steps forward = oracle'); eq(unapplySteps(ORACLE), BASE, 'steps reversed = base');
-    ok(/^ \* Version: 1\.2\.32 \(2026-11-03\)$/m.test(NEW), 'header Version line 1.2.32');
-    ok(NEW.indexOf("var DP2_VERSION = '1.2.32';   // lockstep with the header") > 0, 'DP2_VERSION 1.2.32');
+    ok(/^ \* Version: 1\.2\.3[23] \(2026-11-03\)$/m.test(NEW), 'header Version line 1.2.32 or later');
+    const S1232 = v1232Of(NEW);
+    ok(/^ \* Version: 1\.2\.32 \(2026-11-03\)$/m.test(S1232) && S1232.indexOf("var DP2_VERSION = '1.2.32';   // lockstep with the header") > 0, 'v1.2.32 lockstep');
     eq(sha256(S1231), V1231_SHA256, 'rebuilt v1.2.31');
     ok(/^ \* Version: 1\.2\.31 \(2026-11-02\)$/m.test(S1231) && S1231.indexOf("var DP2_VERSION = '1.2.31';   // lockstep with the header") > 0, 'rebuilt v1.2.31 lockstep');
     ok(/^ \* Version: 1\.2\.30 \(2026-10-28\) - 1\.2\.30: /m.test(ORACLE) && ORACLE.indexOf("var DP2_VERSION = '1.2.30';") > 0, 'oracle is 1.2.30');
