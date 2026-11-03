@@ -588,7 +588,40 @@ from __future__ import annotations
 #   date. Regular sessions only: exchange holidays are not checked, and the
 #   footer says so. Recommendations, numbers and layout are unchanged.
 # ZERO functions removed. Added: _send_window.
-__version__ = "1.20.0"
+# ---------------------------------------------------------------------------
+# v1.22.0 (2026-11-02) -- [STATUS-READ-VETO] an unreadable _Status withholds
+#   execution (v1.21.0 is claimed by open PR #882, built on the same v1.20.0;
+#   whichever merges second renumbers)
+# WHY (daily routine 2 Nov, owner item of 1 Nov): the final TFB Decision Feed
+#   receipt on _Status is the brief's ONLY guard on the Portfolio_Decision
+#   SELL / TRIM / ADD tickets and its first guard on the Top-10 picks
+#   (build_model -> _extract_final_feed -> _apply_final_feed_veto and
+#   _top10_execution_veto). read_pages_live turns any failed page read into
+#   [] ("one bad page must not kill the brief"), and [] carries no feed key,
+#   so one Sheets error on _Status (integrations read_range re-raises after
+#   its retries) drops the veto. Offline replay with the feed
+#   NOT_ACTIONABLE(final_publication): read ok -> every ticket withheld and
+#   the picks withheld; _Status read raising -> the email offers 'add
+#   ADD.US', TRIM and EXIT tickets with shares, stops and targets, and the
+#   Top-10 buy. send_digest is fail-closed on the same read (_read_status_rows
+#   / _manifest_gate: '_Status read failed' withholds and still sends a
+#   research-only digest). Latent: the 1 Nov briefs logged no failed read.
+#   Open Codex PR #785 (and its copies #791 / #792 / #795) carries an
+#   ungated abort-on-failure variant; it is stale and conflicted.
+# CHANGE (TFB_BRIEF_STATUS_READ_VETO = on / 1 / true / yes, any case;
+#   default off = v1.20.0 byte for byte, stderr included): when the _Status
+#   read raises, read_pages_live keeps its WARN line, adds one line saying
+#   the feed is treated as withheld, and stands in one receipt row
+#   ['TFB Decision Feed', 'WITHHELD(status_unreadable) | _Status read
+#   failed: <ExceptionType>'] - the exception's type name only, never its
+#   text. The existing veto then withholds every SELL / TRIM / ADD (0 SAR,
+#   no shares, stop or targets) and the Top-10 picks, and the brief still
+#   sends with its "Final decision feed withheld execution" banner: the
+#   send_digest withhold-and-send, not an abort. Every other page, a
+#   readable _Status, and a readable _Status without the key (legacy: no
+#   veto) are unchanged. Rollback: unset the Variable.
+# ZERO functions removed. Added: _status_read_veto_enabled.
+__version__ = "1.22.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -811,7 +844,21 @@ def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[Lis
         except Exception as exc:  # one bad page must not kill the brief
             sys.stderr.write(f"[brief] WARN could not read {p}: {exc}\n")
             out[p] = []
+            if p == PAGE_STATUS and _status_read_veto_enabled():
+                # v1.22.0 [STATUS-READ-VETO]: an unreadable final-feed receipt
+                # is a veto, not a blank (type name only, never API text).
+                out[p] = [["TFB Decision Feed",
+                           "WITHHELD(status_unreadable) | _Status read failed: "
+                           + type(exc).__name__]]
+                sys.stderr.write("[brief] _Status unreadable - final decision feed "
+                                 "treated as WITHHELD(status_unreadable)\n")
     return out
+
+
+def _status_read_veto_enabled() -> bool:
+    """v1.22.0: TFB_BRIEF_STATUS_READ_VETO = on|1|true|yes (any case). Default off."""
+    return (os.getenv("TFB_BRIEF_STATUS_READ_VETO") or "").strip().lower() in (
+        "on", "1", "true", "yes")
 
 
 # v1.6.0 (B1b): columns the WORKBOOK stores as FRACTIONS (0.0149) but the
