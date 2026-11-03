@@ -1025,6 +1025,9 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
+            tests/test_archive_coherent_snapshot.py \
+            tests/test_coherent_real_audits.py \
+            tests/test_coherent_staging.py \
             tests/test_bq_views.py \
             tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \

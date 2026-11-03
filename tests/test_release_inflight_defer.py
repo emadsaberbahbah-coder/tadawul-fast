@@ -11,6 +11,12 @@ main's v1.3.0 at 05b51ebe; with both gates unset it returns the same
 results as v1.2.0, so OFF_GOLDEN is unchanged (I5 proves it against that
 base copy).
 
+Renumbered 2026-11-03 (merge of main #898-#906): the module is v1.4.1 over
+main's v1.4.0 (#904, render hold, TFB_RELEASE_RENDER_HOLD, default off).
+The off base is now main's v1.4.0 at 658a72c2; with every gate unset it
+returns the same results as v1.3.0 and v1.2.0, so OFF_GOLDEN is unchanged.
+New case N4 pins that this gate and the render hold never act in one run.
+
 WHY (2026-10-24)
 ----------------
 4 of the 5 red release runs since 19 Oct were this collision, not a
@@ -54,11 +60,21 @@ Cases
       skips the release step (one deferral per slot), this gate is mapped
       in the release step env only, and an armed sticky kill with a busy
       superseding sync answers in the kill branch (no probe, no deferral)
+  N4  (2026-11-03, merge of main #904) never meets the v1.4.0 render hold:
+      with the hold (and the settle) armed, a step-4/5 deferral is the same
+      answer before any audit; a scheduled auto re-verification of a live
+      release caught mid-render is held exactly as with this gate off (only
+      the read's retry differs, no inflight_defer); the sticky kill retracts
+      the live release first with both armed
 
 Golden negative: TFB_TEST_RDF_DELIVERED=<base copy> runs every case against
-v1.2.0 as the delivered module (all but I5 fail; N2 skips). Base copy: TFB_TEST_RDF_BASE=<path>, else
-`git show 05b51ebe:scripts/release_decision_feed.py` (v1.3.0 since the
-2026-10-31 merge; 83283c61, v1.2.0, before it).
+v1.2.0 as the delivered module (all but I5 fail; N2 skips; since the 2026-11-02
+merge N3 also passes there, it pins the workflow and the kill branch, which
+the base shares; on 2026-11-03 with v1.4.0 delivered: 7 failed, I5 and N3
+passed, N2 skipped). Base copy: TFB_TEST_RDF_BASE=<path>, else
+`git show 658a72c2:scripts/release_decision_feed.py` (v1.4.0 since the
+2026-11-03 merge; 05b51ebe, v1.3.0, from 2026-10-31; 83283c61, v1.2.0,
+before it).
 
 Run:  python3 -m pytest -q tests/test_release_inflight_defer.py
   or  python3 tests/test_release_inflight_defer.py   (PASS k/k + digest)
@@ -87,11 +103,16 @@ from scripts import finalize_decision_publication as final  # noqa: E402
 
 SCRIPT = ROOT / "scripts/release_decision_feed.py"
 DELIVERED = Path(os.getenv("TFB_TEST_RDF_DELIVERED", "").strip() or SCRIPT)
-BASE_SHA = "05b51ebe"   # main 2026-10-31; release_decision_feed.py is v1.3.0 there (was 83283c61, v1.2.0)
+# main 2026-11-03; release_decision_feed.py is v1.4.0 there (was 05b51ebe, v1.3.0,
+# and 83283c61, v1.2.0, before it).
+BASE_SHA = "658a72c277297fa63f5e09698e5978c9ce9db2b7"
 GATE = "TFB_RELEASE_INFLIGHT_DEFER"
 ENV_NAMES = (GATE, "GITHUB_EVENT_NAME", "TFB_DECISION_RELEASE", "TFB_DECISION_RELEASE_KILL",
              "GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_ACTIONS", "GITHUB_RUN_ID",
-             "GITHUB_RUN_ATTEMPT")
+             "GITHUB_RUN_ATTEMPT",
+             # 2026-11-03: main's render settle (v1.3.0) and render hold (v1.4.0)
+             # gates, cleared so every case starts from them off (N4 arms them).
+             "TFB_RELEASE_RENDER_SETTLE", "TFB_RELEASE_RENDER_HOLD")
 OLD, NEW = "39931603565", "40079965055"
 NOW = datetime(2026, 10, 24, 9, 43, 30, tzinfo=timezone.utc)
 SUP = ("NOT_ACTIONABLE(final_publication) | run=" + OLD +
@@ -219,7 +240,8 @@ def _no_finalize():
 
 
 def drive(mod, rows, source="auto", *, mode="release", gate=None, event="schedule",
-          inflight=None, provenance=None, service=None, release_armed=False, kill_var=False):
+          inflight=None, provenance=None, service=None, release_armed=False, kill_var=False,
+          extra_env=None):
     saved = {k: os.environ.get(k) for k in ENV_NAMES}
     for k in ENV_NAMES:
         os.environ.pop(k, None)
@@ -233,6 +255,9 @@ def drive(mod, rows, source="auto", *, mode="release", gate=None, event="schedul
         os.environ["TFB_DECISION_RELEASE_KILL"] = "1"
     if event is not None:
         os.environ["GITHUB_EVENT_NAME"] = event
+    for k, v in (extra_env or {}).items():   # 2026-11-03 (N4): names in ENV_NAMES only
+        assert k in ENV_NAMES, k
+        os.environ[k] = v
     seen = {"provenance": [], "probe": 0}
 
     def prov(run_id):
@@ -520,8 +545,9 @@ def test_n1_workflow_mapping_version_and_pin():
     assert '("release_decision_feed", "%s",' % R.SCRIPT_VERSION in vd
     src = DELIVERED.read_text(encoding="utf-8")
     # 2026-10-31: authored as 1.2.1; renumbered 1.3.1 above main's 1.3.0 block.
-    assert (src.index("VERSION 1.3.1 (2026-10-24") < src.index("VERSION 1.3.0 (2026-10-29)")
-            < src.index("VERSION 1.2.0 (2026-10-19)"))
+    # 2026-11-03: renumbered 1.3.1 -> 1.4.1 above main's 1.4.0 block (#904).
+    assert (src.index("VERSION 1.4.1 (2026-10-24") < src.index("VERSION 1.4.0 (2026-11-03)")
+            < src.index("VERSION 1.3.0 (2026-10-29)") < src.index("VERSION 1.2.0 (2026-10-19)"))
     assert R.INFLIGHT_DEFER_ENV == GATE and R.KEY_READ_RETRIES == 2
 
 
@@ -542,8 +568,9 @@ def test_n3_coexists_with_the_workflow_defer_step():
     # this gate lives in the release step env only; the defer step never reads it
     assert GATE not in json.dumps(defer) and GATE not in json.dumps(job["env"])
     assert [s["name"] for s in job["steps"] if GATE in json.dumps(s.get("env", {}))] == [release["name"]]
-    assert (text.index("# VERSION 1.3.1 (2026-10-24") < text.index("# VERSION 1.3.0 (2026-11-02)")
-            < text.index("# VERSION 1.2.0 (2026-10-29)"))
+    # 2026-11-03: renumbered 1.3.1 -> 1.4.1 above main's 1.4.0 block (#904)
+    assert (text.index("# VERSION 1.4.1 (2026-10-24") < text.index("# VERSION 1.4.0 (2026-11-03)")
+            < text.index("# VERSION 1.3.0 (2026-11-02)") < text.index("# VERSION 1.2.0 (2026-10-29)"))
     # the sticky kill wins in the script too: armed with the superseding sync
     # busy, the kill branch answers before steps 4/5 and nothing defers
     for feed in (SUP, VETO_OLD):
@@ -553,11 +580,94 @@ def test_n3_coexists_with_the_workflow_defer_step():
         assert seen["probe"] == 0 and seen["provenance"] == [] and svc.updates() == []
 
 
+# ---------------------------------------------------------------- N4 -----
+class _Retries:
+    """Wraps a fake request whose execute() takes no argument and records the
+    num_retries the release passes (the real HttpRequest takes it)."""
+
+    def __init__(self, req, log):
+        self._req, self._log = req, log
+
+    def execute(self, num_retries=None):
+        self._log.append(num_retries)
+        return self._req.execute()
+
+
+def _hold_run(mp, tmp, *, gate, kill=False):
+    """One scheduled source=auto release of a LIVE release of SOURCE whose
+    re-verification reads Top_10 mid-render (tests/test_release_render_hold.py
+    fixtures), with the render hold armed; returns (result, writes, reads)."""
+    from tests import test_release_decision_feed as T
+    from tests import test_release_render_hold as H
+    ctx = T.setup(mp, tmp, feed=T.live_release_value(), grids=H.Board(running=99))
+    ctx.service.rows[2][11:13] = ["TFB Feed Global_Markets",
+                                  "PARTIAL_FRESH | cov=99.6 | run=" + T.SOURCE
+                                  + " | 2026-07-31 20:00:00+03:00"]
+    reads, get = [], ctx.service.get
+    mp.setattr(ctx.service, "get", lambda **kw: _Retries(get(**kw), reads), raising=False)
+    H.arm(mp, settle=False)                      # TFB_RELEASE_RENDER_HOLD=1, armed release
+    mp.setenv("GITHUB_EVENT_NAME", "schedule")
+    for name, value in ((GATE, gate), ("TFB_DECISION_RELEASE_KILL", "1" if kill else None)):
+        if value is None:
+            mp.delenv(name, raising=False)
+        else:
+            mp.setenv(name, value)
+    out = asyncio.run(R.run("synthetic-sheet", "auto", mode="release", service=ctx.service,
+                            now_utc=ctx.clock["now"], inflight=ctx.inflight,
+                            provenance=ctx.provenance))
+    return out, ctx.updates(), reads
+
+
+def test_n4_never_meets_the_render_hold():
+    """2026-11-03 (merge of main #904, v1.4.0 render hold): this gate defers
+    only at steps 4 and 5, before any audit; the hold acts only at step 7a,
+    after them. A run ends in at most one deferral, and the sticky kill
+    still answers first."""
+    hold_on = {"TFB_RELEASE_RENDER_HOLD": "1", "TFB_RELEASE_RENDER_SETTLE": "1"}
+    # (a) step-4 and step-5 deferrals: the same answer with the hold armed,
+    #     and no audit runs (_no_finalize asserts it), so no hold can follow
+    for name in ("i1", "i2"):
+        c = dict(FIXTURES[name])
+        rows = c.pop("rows")
+        for release_armed in (False, True):
+            plain, _s, svc_plain = drive(R, rows, gate="1", release_armed=release_armed, **c)
+            held, seen, svc = drive(R, rows, gate="1", release_armed=release_armed,
+                                    extra_env=hold_on, **c)
+            assert (held["exit_code"], held["outcome"]) == (1, "deferred"), name
+            assert "production_run_in_flight" in held["reasons"] and "render_hold" not in held
+            assert norm(held) == norm(plain) and svc.updates() == svc_plain.updates() == []
+            assert seen["probe"] == 1, name
+    from tests import test_release_render_settle as S
+
+    def same(x, y):                          # the audits' own wall-clock stamps aside
+        return S.stable(norm(x)) == S.stable(norm(y))
+    with pytest.MonkeyPatch.context() as mp, tempfile.TemporaryDirectory() as tmp:
+        # (b) a live release mid-render on a scheduled auto slot: held exactly
+        #     as with this gate off; only the key read's retry differs
+        on, w_on, r_on = _hold_run(mp, Path(tmp) / "on", gate="1")
+        off, w_off, r_off = _hold_run(mp, Path(tmp) / "off", gate=None)
+        assert (on["exit_code"], on["outcome"], on["reasons"]) == (1, "deferred", ["render_still_running"])
+        assert on["render_hold"]["cockpits"] == ["Top_10_Investments"]
+        assert "inflight_defer" not in on and on["source_mode"] == "auto"
+        assert w_on == w_off == [] and r_on[0] == R.KEY_READ_RETRIES and r_off[0] is None
+        assert same(on, off)
+        # (c) the sticky kill with both armed: the kill branch retracts the
+        #     live release before steps 4, 5 and 7a (one write, no deferral)
+        kon, wk_on, rk_on = _hold_run(mp, Path(tmp) / "kon", gate="1", kill=True)
+        koff, wk_off, _r = _hold_run(mp, Path(tmp) / "koff", gate=None, kill=True)
+        assert (kon["exit_code"], kon["outcome"], kon["deferred"]) == (3, "killed", False)
+        assert "render_hold" not in kon and "inflight_defer" not in kon
+        assert len(wk_on) == 1 and "release_killed" in wk_on[0]["body"]["values"][0][1]
+        assert rk_on[0] == R.KEY_READ_RETRIES and same(kon, koff)
+        assert json.dumps(wk_on, sort_keys=True) == json.dumps(wk_off, sort_keys=True)
+
+
 # ---------------------------------------------------------------- N2 -----
 def test_n2_added_lines_are_ascii_and_nothing_removed():
     b = base()
-    if R.SCRIPT_VERSION != "1.3.1":   # 2026-10-31: was 1.2.1 over 83283c61
-        pytest.skip("exact 05b51ebe -> 1.3.1 diff checks apply to 1.3.1 only")
+    # 2026-10-31: was 1.2.1 over 83283c61; 2026-11-03: was 1.3.1 over 05b51ebe
+    if R.SCRIPT_VERSION != "1.4.1":
+        pytest.skip("exact 658a72c2 -> 1.4.1 diff checks apply to 1.4.1 only")
     import ast
     import difflib
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
@@ -568,7 +678,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
                and ln[1:].strip()]
     assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()][:3]
     assert removed == [
-        'SCRIPT_VERSION = "1.3.0"',
+        'SCRIPT_VERSION = "1.4.0"',
         '        grid = service.spreadsheets().values().get(',
         '            valueRenderOption="UNFORMATTED_VALUE").execute().get("values")',
     ], removed
