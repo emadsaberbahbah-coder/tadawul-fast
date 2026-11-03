@@ -129,7 +129,7 @@ T10_TAIL = ("Last run 2026-10-28 22:45:00 | status: ok | sheets pool 9694 rows "
 BUSY_WRITER = [{"workflow": "page_refresh_recovery.yml", "id": 41, "event": "workflow_dispatch",
                 "status": "in_progress"}]
 BUSY_RELEASE = [{"id": 42, "event": "workflow_dispatch", "status": "pending"}]
-_ENV = ("TFB_RELEASE_AFTER_SYNC", "TFB_RELEASE_AFTER_SYNC_WAIT_MIN", "GITHUB_TOKEN",
+_ENV = ("TFB_RELEASE_AFTER_SYNC", "TFB_RELEASE_AFTER_SYNC_WAIT_MIN", "TFB_RELEASE_AFTER_SYNC_PRIOR", "GITHUB_TOKEN",
         "GITHUB_REPOSITORY", "GITHUB_API_URL", "GITHUB_RUN_ID", "DEFAULT_SPREADSHEET_ID")
 
 
@@ -781,7 +781,8 @@ def case_w14_workflow_contract(mp, tmp_path):
         "TARGET_SHEET_ID": "${{ vars.DEFAULT_SPREADSHEET_ID }}",
         "TFB_RELEASE_AFTER_SYNC": "${{ vars.TFB_RELEASE_AFTER_SYNC || '0' }}",
         "TFB_RELEASE_AFTER_SYNC_WAIT_MIN": "${{ vars.TFB_RELEASE_AFTER_SYNC_WAIT_MIN || '%d' }}"
-                                           % W.DEFAULT_WAIT_MIN}
+                                           % W.DEFAULT_WAIT_MIN,
+        "TFB_RELEASE_AFTER_SYNC_PRIOR": "${{ vars.TFB_RELEASE_AFTER_SYNC_PRIOR || 'strict' }}"}
     steps = {step["name"]: step for step in job["steps"]}
     for step in job["steps"]:
         assert "${{" not in step.get("run", ""), step["name"]
@@ -1511,6 +1512,73 @@ def case_w25_executed_shell_blocks(mp, tmp_path):
                     '| reasons | ["' + reason + '"] |'):
             assert row in rendered, row
         assert "DRY-RUN (TFB_DECISION_RELEASE off)" in rendered and "render_settle" not in rendered
+
+
+def case_w26_prior_release_rule_for_an_older_runs_veto(mp, tmp_path):
+    """v1.2.0 (3 Nov 2026): a clean sync's final job writes no veto, so the feed
+    still names the previous run. 'release' weighs that value with the release's
+    own classify_prior; 'strict' (default) stops exactly as v1.0.0."""
+    supersede = ("NOT_ACTIONABLE(final_publication) | run=" + OLDER +
+                 " | 2026-10-28 21:00:00+03:00 | superseded_by_run=" + SOURCE + ".1")
+    withdrawn = veto(OLDER) + " | release=41519935330"     # the live 3 Nov shape
+    for word in (None, "", "strict", "releases", "on", "1", "observe"):
+        _clean(mp)
+        arm(mp)
+        if word is not None:
+            mp.setenv("TFB_RELEASE_AFTER_SYNC_PRIOR", word)
+        assert W.prior_rule() == "strict", word
+        for feed in (veto(OLDER), supersede, withdrawn):
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["prior_rule"] == "strict"
+            assert result["outcome"] == "stopped" and result["reasons"] == ["decision_feed_not_this_run"], (word, result)
+            assert h.calls["dispatch"] == [] and h.writers.calls == 0 and h.releases.calls == 0
+    for word in ("release", " Release ", "RELEASE"):
+        _clean(mp)
+        arm(mp)
+        mp.setenv("TFB_RELEASE_AFTER_SYNC_PRIOR", word)
+        assert W.prior_rule() == "release", word
+        for feed, why in ((veto(OLDER), "older_run_veto"), (withdrawn, "older_run_veto"),
+                          (supersede, "superseded_older_run")):
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["prior_rule"] == "release"
+            assert result["outcome"] == "dispatched" and result["reasons"] == ["both_receipts_verified"], (feed, result)
+            assert h.calls["dispatch"] == [SOURCE] and result["dispatch_status"] == 204
+            assert result["last"]["prior"] == why and result["last"]["decision_run"] == OLDER
+            assert result["last"]["decision_executable"] is False and result["last"]["state"] == "ready"
+            assert R.classify_prior(feed, SOURCE) == ("eligible", why)
+        stops = [
+            (live(OLDER), "prior_executable_other_run"),
+            ("NOT_ACTIONABLE(final_publication) | run=" + OLDER + " | 2026-10-28 21:00:00+03:00"
+             " | superseded_by_run=" + NEWER + ".1", "prior_superseded_by_run"),
+            (veto(NEWER), "superseded_by_newer_cohort"),
+            ("NOT_ACTIONABLE(owner_hold) | 2026-10-28 22:00:00+03:00", "decision_feed_unreadable"),
+            (None, "decision_feed_unreadable"),
+            (live(), "already_executable"),
+        ]
+        for feed, reason in stops:
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["outcome"] == "stopped" and result["reasons"] == [reason], (feed, result)
+            assert h.calls["dispatch"] == [] and h.writers.calls == 0 and h.releases.calls == 0
+        # this run's own veto: unchanged (no classify_prior, prior stays null)
+        h = Harness([state()])
+        result = h.run()
+        assert result["outcome"] == "dispatched" and result["last"]["prior"] is None
+        # the older veto still needs both receipts: a cockpit on another run times out, never dispatches
+        h = Harness([state(key=key_grid(feed=veto(OLDER)), t10_grid=t10(verified(OLDER)))])
+        result = h.run(wait_min=3, poll_s=90)
+        assert result["outcome"] == "timeout" and result["reasons"] == ["receipts_timeout"]
+        assert h.calls["dispatch"] == [] and result["last"]["prior"] == "older_run_veto"
+        # a newer cohort mid-wait still stops the attempt
+        h = Harness([state(key=key_grid(feed=veto(OLDER)), t10_grid=t10("")),
+                     state(key=key_grid(gm_value=gm(NEWER), feed=veto(OLDER)), t10_grid=t10(""))])
+        result = h.run()
+        assert result["reasons"] == ["superseded_by_newer_cohort"] and h.calls["dispatch"] == []
+    # the module default and the workflow default agree
+    _clean(mp)
+    assert W.PRIOR_ENV == "TFB_RELEASE_AFTER_SYNC_PRIOR" and W.prior_rule() == "strict"
 
 
 # --------------------------------------------------------------------------- runner
