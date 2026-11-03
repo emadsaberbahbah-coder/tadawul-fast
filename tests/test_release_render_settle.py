@@ -111,6 +111,9 @@ def release(ctx, module=R, *, sleeps=None, mode="release", moving_clock=False):
 
 
 def arm(mp, *, settle=True, release_gate=True):
+    # release_decision_feed 1.4.0: these cases judge the v1.3.0 settle, so the
+    # render hold (tests/test_release_render_hold.py) stays off here.
+    mp.delenv("TFB_RELEASE_RENDER_HOLD", raising=False)
     if release_gate:
         mp.setenv("TFB_DECISION_RELEASE", "1")
     if settle:
