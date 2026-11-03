@@ -231,7 +231,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-27 (same rule): 1.3.0 -> 1.3.1 (404 batch split, gated).
     # 2026-10-27 (same rule): 1.3.1 -> 1.3.2 (venue batches + EODHD exchange
     # codes for the calendar, both gated).
-    ("core.providers.calendar_provider", "__version__", "1.3.2",
+    # 2026-11-03 (same rule): 1.3.2 -> 1.4.0 (fetch_next_exdiv_detail, additive;
+    # its only caller is run_calendar_sync 1.3.0 behind TFB_CAL_DIVIDENDS).
+    ("core.providers.calendar_provider", "__version__", "1.4.0",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
@@ -307,7 +309,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_daily_brief", "1.20.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
-    ("run_calendar_sync", "1.2.0", "calendar sync"),
+    # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (the
+    # Dividend_Events tab behind vars.TFB_CAL_DIVIDENDS, default off;
+    # workflow-scoped, never on Render).
+    ("run_calendar_sync", "1.3.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
     ("archive_to_bigquery", "1.1.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
