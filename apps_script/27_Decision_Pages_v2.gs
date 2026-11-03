@@ -1,7 +1,30 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.32 (2026-11-03)
+ * Version: 1.2.33 (2026-11-03)
+ *   1.2.33: AN EXIT SIGNAL NEEDS THE LOT'S OWN PRICES (owner portfolio, Tue 3 Nov 2026 16:15 Riyadh, dp2ExitStatus:
+ *           'SUPN.US . SELL NOW -- stop 38.32 hit . last 36.28 . dyn stop 38.32 . high 41.92'). IBKR moved the 95 INDV
+ *           shares (bought 2 Nov at 35.45) to the new contract SUPN (Supernus Inc) and the ledger row was renamed
+ *           SUPN.US, but the chart key SUPN and the feed's SUPN.US still carried the OLD Supernus Pharmaceuticals line
+ *           (41.92 on 2 Nov). The replay took that line's 2 Nov close as the highest close since the entry, its 2 x ATR
+ *           trail (38.32) as the stop and the price of the shares actually held (36.28) as the last: STOP_HIT, an
+ *           immediate SELL NOW e-mail once the alerts are on. The same day the shares went ex-dividend 8.13 USD (a
+ *           special, about 22 % of the price): even a correct history would have read the ex-dividend price (30.00
+ *           pre-market) as a stop hit. Now, with Script Property DP2_EXIT_SANITY = 1 / on / true / yes (default OFF:
+ *           absent, blank or any other word = the 1.2.32 engine byte for byte), on Portfolio_Decision_v2:
+ *           (a) dp2ExitAnchorMiss_ (pure): the first bar on or after the lot's entry date (within 5 days) must hold the
+ *           entry price inside its low-high range widened by 8 %. A history of another listing (a ticker change),
+ *           another unit (GBp vs GBP) or a split the ledger does not carry fails: the lot gets no exit signal and no
+ *           alert ('HOLD -- exit engine n/a'), its engine cell says why and a CHECK action names the bar and the entry.
+ *           (b) dp2ExitDivAdjust_ (pure): cash dividends inside the history are back-adjusted (every bar before an
+ *           ex-date x (1 - amount / the cum-dividend close), the entry too when the lot was bought before the
+ *           ex-date), so an ex-dividend gap is not a fall and the stop stays in today's price terms. The amounts come
+ *           from the chart's own dividend events (the Yahoo request adds events=div) and, for an ex-date the chart
+ *           does not list yet, from the Dividend_Events row of the same symbol in the quote's own currency
+ *           (calendar_sync TFB_CAL_DIVIDENDS). The engine cell names each adjustment ('dividend-adjusted (8.13 ex
+ *           2026-11-03)'). dp2SelfTest adds one line while the gate is on. Nothing else changes: no number on the
+ *           board, no gate, ticket, order or broker call. Rollback: delete DP2_EXIT_SANITY, or Project History ->
+ *           1.2.32.
  *   1.2.32: A PREVIEW READS AS A PREVIEW (owner, Tue 3 Nov 2026 12:14 Riyadh: 'my top 10 investment page 2 showing that
  *           there is cash allocated to symbols but the page at top showing red no execution'). On 3 Nov the release of
  *           run 41566014627 was withdrawn at 10:08 and the cockpit finished WITHHELD (Executable 0); Top_10_Investments_v2
@@ -320,7 +343,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.32';   // lockstep with the header
+var DP2_VERSION = '1.2.33';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1457,6 +1480,7 @@ function dp2RangeFor_(sinceDate) {
 }
 function dp2FetchYahoo_(key, range) {
   var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(key) + '?interval=1d&range=' + (range || DP2X.RANGE) + '&includePrePost=false';
+  if (dp2ExitSanityOn_()) url += '&events=div';   // v1.2.33 [EXIT-SANITY]: the chart's own dividend events (gate on only)
   var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TFB-DecisionPages/' + DP2_VERSION + ')', 'Accept': 'application/json' } });
   var code = resp.getResponseCode();
   if (code !== 200) throw new Error('yahoo HTTP ' + code);
@@ -1472,7 +1496,9 @@ function dp2FetchYahoo_(key, range) {
     bars.push({ date: Utilities.formatDate(new Date(r.timestamp[i] * 1000), tz, 'yyyy-MM-dd'), o: (o === null || o === undefined) ? c : o, h: h, l: l, c: c });
   }
   if (!bars.length) throw new Error('yahoo: empty series');
-  return { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };
+  var outY = { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };
+  if (dp2ExitSanityOn_()) outY.divs = dp2YahooDivs_(r, tz);   // v1.2.33 [EXIT-SANITY] (gate on only)
+  return outY;
 }
 function dp2FetchStooq_(key, keep) {
   var url = 'https://stooq.com/q/d/l/?s=' + encodeURIComponent(key.toLowerCase() + '.us') + '&i=d';
@@ -1690,6 +1716,151 @@ function dp2EngineNaWhy_(xb, entryDate) {
   if (entryDate && xb.bars[0].date > entryDate) return 'exit engine n/a — history starts ' + xb.bars[0].date + ', after the entry ' + entryDate + ' (fetched ' + (xb.range || DP2X.RANGE) + '); widen the range or check the entry date';
   if (xb.bars.length < DP2X.ATR_N + 1) return 'exit engine n/a — only ' + xb.bars.length + ' bars';
   return 'exit engine n/a';
+}
+/* ========================================================= v1.2.33 [EXIT-SANITY]: the lot's own prices, dividends */
+var DP2_EXIT_SANITY_PROP = 'DP2_EXIT_SANITY';   // 1 / on / true / yes = on; default OFF (the 1.2.32 engine)
+var DP2_EXIT_ANCHOR_PCT = 8;                    // the entry may sit at most 8 % outside the entry day's low-high range
+var DP2_EXIT_ANCHOR_GAP_D = 5;                  // a first bar more than 5 days after the entry cannot judge the fill
+var DP2_EXIT_DIV_MAX = 0.6;                     // a distribution above 60 % of the close before it is not adjusted
+var DP2_EXIT_DIV_NEAR_D = 3;                    // a tab ex-date within 3 days of a chart dividend is that dividend
+var DP2_DIVIDEND_SHEET = 'Dividend_Events';     // calendar_sync TFB_CAL_DIVIDENDS (the 16_Decision_Top10 guard's tab)
+var DP2_EXIT_SUBUNIT_ = { GBp: true, GBX: true, ZAc: true, ZAC: true, ILA: true, ILa: true };   // quote units the upper-cased tab cannot match
+var DP2X_SAN_ = null;                           // the gate, read once per execution
+function dp2ExitSanityOn_() {
+  if (DP2X_SAN_ === null) DP2X_SAN_ = /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_EXIT_SANITY_PROP)).trim());
+  return DP2X_SAN_;
+}
+function dp2DayMs_(d) { return new Date(String(d) + 'T00:00:00Z').getTime(); }
+/* PURE: does this history belong to the lot? The first bar on or after the entry date (within DP2_EXIT_ANCHOR_GAP_D
+ * days) must hold the entry price inside its low-high range widened by DP2_EXIT_ANCHOR_PCT %. A history of another
+ * listing (3 Nov: SUPN charted the old Supernus line at 41.92 for a lot bought at 35.45), another unit or a split the
+ * ledger does not carry fails. -> null (it matches, or it cannot be judged) | { date, low, high, close, entry, pct } */
+function dp2ExitAnchorMiss_(bars, entry, entryDate) {
+  if (!bars || !bars.length || !(entry > 0) || !entryDate) return null;
+  var b = null;
+  for (var i = 0; i < bars.length; i++) { if (bars[i].date >= entryDate) { b = bars[i]; break; } }
+  if (!b) return null;
+  var gap = (dp2DayMs_(b.date) - dp2DayMs_(entryDate)) / 86400000;
+  if (!(gap >= 0) || gap > DP2_EXIT_ANCHOR_GAP_D) return null;
+  var lo = Math.min(b.l, b.o, b.c), hi = Math.max(b.h, b.o, b.c);
+  if (!(lo > 0) || !(hi >= lo)) return null;
+  var tol = DP2_EXIT_ANCHOR_PCT / 100;
+  if (entry >= lo * (1 - tol) && entry <= hi * (1 + tol)) return null;
+  return { date: b.date, low: lo, high: hi, close: b.c, entry: entry, pct: (b.c / entry - 1) * 100 };
+}
+function dp2ExitAnchorWhy_(m) {
+  return 'exit engine n/a \u2014 the price history does not match this lot: the ' + m.date + ' bar (low ' + dp2Fmt_(m.low, 2) + ', high ' + dp2Fmt_(m.high, 2) + ', close ' + dp2Fmt_(m.close, 2) + ') is ' + dp2Pct_(m.pct, 1) + ' from the entry ' + dp2Fmt_(m.entry, 2) + ' (a ticker change, another listing, another unit or a split); check the symbol';
+}
+/* Yahoo chart events.dividends -> [{ date 'yyyy-MM-dd' (exchange zone), amount, source }] sorted by date. */
+function dp2YahooDivs_(r, tz) {
+  var out = [], ev = r && r.events && r.events.dividends;
+  if (!ev || typeof ev !== 'object') return out;
+  for (var k in ev) {
+    if (!Object.prototype.hasOwnProperty.call(ev, k)) continue;
+    var d = ev[k] || {}, amt = dp2Num_(d.amount), ts = dp2Num_(d.date !== undefined ? d.date : k);
+    if (amt === null || !(amt > 0) || ts === null || !(ts > 0)) continue;
+    out.push({ date: Utilities.formatDate(new Date(ts * 1000), tz, 'yyyy-MM-dd'), amount: amt, source: 'chart' });
+  }
+  out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  return out;
+}
+/* PURE: Dividend_Events values -> { SYMBOL: { date 'yyyy-MM-dd', amount, currency } }: the header row is found by
+ * name (Symbol, Ex-Div Date, Amount, Currency), the first row per symbol counts. */
+function dp2DivTabFromValues_(vals) {
+  var out = {}, hdr = -1, iS = -1, iD = -1, iA = -1, iC = -1, r, c, h;
+  vals = vals || [];
+  for (r = 0; r < vals.length && hdr < 0; r++) {
+    var s0 = -1, d0 = -1, a0 = -1, c0 = -1;
+    for (c = 0; c < (vals[r] || []).length; c++) {
+      h = dp2Str_(vals[r][c]).toLowerCase().replace(/[^a-z]/g, '');
+      if (h === 'symbol') s0 = c; else if (h === 'exdivdate') d0 = c; else if (h === 'amount') a0 = c; else if (h === 'currency') c0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0 && a0 >= 0) { hdr = r; iS = s0; iD = d0; iA = a0; iC = c0; }
+  }
+  if (hdr < 0) return out;
+  for (r = hdr + 1; r < vals.length; r++) {
+    var row = vals[r] || [], sym = dp2Str_(row[iS]).trim().toUpperCase();
+    if (!sym || Object.prototype.hasOwnProperty.call(out, sym)) continue;
+    var date = dp2DateStr_(row[iD]), amt = dp2Num_(row[iA]);
+    if (!date || amt === null || !(amt > 0)) continue;
+    out[sym] = { date: date, amount: amt, currency: iC >= 0 ? dp2Str_(row[iC]).trim().toUpperCase() : '' };
+  }
+  return out;
+}
+/* Dividend_Events read once per Portfolio_Decision_v2 build; any failure or an absent tab -> {} (no fallback). */
+function dp2DivTab_() {
+  try {
+    var sh = dp2Sheet_(DP2_DIVIDEND_SHEET, false);
+    if (!sh || sh.getLastRow() < 2) return {};
+    return dp2DivTabFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), 2000), Math.min(Math.max(sh.getLastColumn(), 1), 12)).getValues());
+  } catch (e) { return {}; }
+}
+/* PURE: the dividends to adjust one lot's history by: the chart's own (xb.divs) first; the Dividend_Events row of the
+ * same symbol fills an ex-date the chart does not list yet (none within DP2_EXIT_DIV_NEAR_D days of it), once it has
+ * arrived (<= today) and only in the quote's own currency (a subunit quote never matches the upper-cased tab). */
+function dp2ExitDivsFor_(xb, sym, tab, today) {
+  var out = (xb && xb.divs) ? xb.divs.slice() : [];
+  var t = tab ? tab[dp2Str_(sym).trim().toUpperCase()] : null;
+  var ccy = xb ? dp2Str_(xb.ccy) : '';
+  if (t && t.date && today && t.date <= today && ccy && !DP2_EXIT_SUBUNIT_.hasOwnProperty(ccy) && t.currency === ccy.toUpperCase()) {
+    var near = false;
+    for (var i = 0; i < out.length; i++) { if (Math.abs(dp2DayMs_(out[i].date) - dp2DayMs_(t.date)) <= DP2_EXIT_DIV_NEAR_D * 86400000) near = true; }
+    if (!near) out.push({ date: t.date, amount: t.amount, source: 'Dividend_Events' });
+  }
+  out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  return out;
+}
+/* PURE: back-adjusts a daily history for cash dividends (total-return view). Every bar BEFORE an ex-date is scaled by
+ * f = 1 - amount / the cum-dividend close (the bar before the ex-date; the last bar when the ex-date has arrived but
+ * its bar has not), and the entry by the same f when the lot was bought before the ex-date, so an ex-dividend gap is
+ * not a fall and the stop stays in today's price terms. A dividend with no bar before it, or above DP2_EXIT_DIV_MAX
+ * of that close, is skipped. -> { bars, entry, applied: [{ date, amount, factor, source }] }; none applied = the input. */
+function dp2ExitDivAdjust_(bars, entry, entryDate, divs, today) {
+  var n = bars ? bars.length : 0, applied = [], f = [], entryF = 1, i, j;
+  if (!n || !divs || !divs.length) return { bars: bars, entry: entry, applied: applied };
+  for (i = 0; i < n; i++) f.push(1);
+  for (j = 0; j < divs.length; j++) {
+    var d = divs[j], k = -1;
+    if (!d || !d.date || !(d.amount > 0)) continue;
+    for (i = 0; i < n; i++) { if (bars[i].date >= d.date) { k = i; break; } }
+    if (k < 0) { if (today && d.date <= today) k = n; else continue; }
+    if (k === 0) continue;
+    var prev = bars[k - 1].c;
+    if (!(prev > 0) || d.amount / prev > DP2_EXIT_DIV_MAX) continue;
+    var fac = 1 - d.amount / prev;
+    for (i = 0; i < k; i++) f[i] *= fac;
+    if (entryDate ? d.date > entryDate : k === n) entryF *= fac;
+    applied.push({ date: d.date, amount: d.amount, factor: fac, source: d.source || '' });
+  }
+  if (!applied.length) return { bars: bars, entry: entry, applied: applied };
+  var out = [];
+  for (i = 0; i < n; i++) { var b = bars[i], m = f[i]; out.push(m === 1 ? b : { date: b.date, o: b.o * m, h: b.h * m, l: b.l * m, c: b.c * m }); }
+  return { bars: out, entry: entry * entryF, applied: applied };
+}
+/* The dp2SelfTest core (pure): the 3 Nov shape (a history of another listing), a GBp history for a GBP entry, and the
+ * 8.13 USD ex-dividend gap (the raw replay reads it as a stop hit, the adjusted one does not; also before its bar). */
+function dp2ExitSanityCoreOk_() {
+  try {
+    var mk = function (from, n, base, step) {
+      var out = [], t0 = dp2DayMs_(from);
+      for (var q = 0; q < n; q++) { var c = Math.round((base + (q % 3) * step) * 100) / 100; out.push({ date: new Date(t0 + q * 86400000).toISOString().slice(0, 10), o: c, h: c + 0.5, l: c - 0.5, c: c }); }
+      return out;
+    };
+    var old = mk('2026-10-14', 20, 41.5, 0.2);   // the old listing: 41.5-41.9 through 2 Nov
+    var own = mk('2026-10-14', 20, 35.5, 0.39);  // the shares held: 35.5-36.28 through 2 Nov
+    var okA = dp2ExitAnchorMiss_(old, 35.45, '2026-11-02') !== null && dp2ExitAnchorMiss_(own, 35.45, '2026-11-02') === null &&
+              dp2ExitAnchorMiss_(mk('2026-10-14', 20, 510, 2), 5.10, '2026-11-02') !== null && dp2ExitAnchorMiss_(own, 35.45, '') === null;
+    var ex = own.concat([{ date: '2026-11-03', o: 29.6, h: 30.4, l: 29.4, c: 30.0 }]);
+    var divs = [{ date: '2026-11-03', amount: 8.13, source: 'chart' }];
+    var raw = dp2ExitCompute_(ex, 35.45, '2026-11-02', 30.0);
+    var adj = dp2ExitDivAdjust_(ex, 35.45, '2026-11-02', divs, '2026-11-03');
+    var xa = dp2ExitCompute_(adj.bars, adj.entry, '2026-11-02', 30.0);
+    var pre = dp2ExitDivAdjust_(own, 35.45, '2026-11-02', divs, '2026-11-03');   // the ex-day before its bar
+    var xp = dp2ExitCompute_(pre.bars, pre.entry, '2026-11-02', 30.0);
+    var fut = dp2ExitDivAdjust_(own, 35.45, '2026-11-02', [{ date: '2026-11-06', amount: 0.1 }], '2026-11-03');
+    var okD = !!(raw && raw.last <= raw.stop && adj.applied.length === 1 && xa && xa.last > xa.stop && xp && xp.last > xp.stop && fut.applied.length === 0);
+    return okA && okD;
+  } catch (e) { return false; }
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
@@ -2779,6 +2950,8 @@ function buildPortfolioDecisionV2() {
   var oldestEntry = '';
   for (var oe = 0; oe < eq.length; oe++) { var od = dp2DateStr_(eq[oe].buyDate); if (od && (!oldestEntry || od < oldestEntry)) oldestEntry = od; }
   try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; }), oldestEntry); } catch (eX) { xbars = {}; }   // v1.2.11: history back to the oldest entry
+  // v1.2.33 [EXIT-SANITY]: the gate (read once per execution); the dividend tab and today's date only while it is on
+  var xSan = dp2ExitSanityOn_(), divTab = xSan ? dp2DivTab_() : null, xToday = xSan ? dp2Today_().slice(0, 10) : '';
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
   var alloc = null;
   try {
@@ -2934,6 +3107,16 @@ function buildPortfolioDecisionV2() {
     // actionable alert is issued — the signal is shown and flagged, mailed at most as an advisory.
     var lastOv = (xb && xb.last !== null && !xb.stale) ? xb.last : ((xb && xb.stale && l.price) ? l.price : null);
     var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, lastOv) : null;
+    // v1.2.33 [EXIT-SANITY] (gate on only): a history that is not this lot's gives no signal; a dividend is not a fall
+    var xMiss = null, xDiv = null;
+    if (xSan && xb && xb.bars && xb.bars.length) {
+      xMiss = dp2ExitAnchorMiss_(xb.bars, cost, entryDate);
+      if (xMiss) x = null;
+      else {
+        xDiv = dp2ExitDivAdjust_(xb.bars, cost, entryDate, dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), xToday);
+        if (xDiv.applied.length) x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv); else xDiv = null;
+      }
+    }
     xTotal++;
     if (xb && !xb.stale && x) xFresh++;
     if (xb && xb.source) xSources[xb.source] = true;
@@ -2959,6 +3142,8 @@ function buildPortfolioDecisionV2() {
     var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
                    : (dp2EngineNaWhy_(xb, entryDate) + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
     if (x && x.atrApprox) engTxt += ' · entry ATR approximated (' + x.barsBeforeEntry + ' bars before the entry)';
+    if (xMiss) engTxt = dp2ExitAnchorWhy_(xMiss);   // v1.2.33 [EXIT-SANITY]
+    else if (xDiv && x) engTxt += ' \u00b7 dividend-adjusted (' + xDiv.applied.map(function (a) { return dp2Fmt_(a.amount, 2) + ' ex ' + a.date; }).join(', ') + ')';
     var ostat;
     if (!ib.ordersKnown && br.n > 0) { ostat = 'UNVERIFIED — ' + ib.unknownWhy + ' · last listed: ' + br.statuses.join(', ') + ' → paste a fresh connector read'; }
     else if (br.state === 'working' && posShares && br.stopQty > 0 && br.stopQty < posShares - 1e-9) { ostat = 'working since ' + br.placed + ' — stop covers ' + dp2Fmt_(br.stopQty) + ' of the position\'s ' + dp2Fmt_(posShares) + ' sh (partial' + (lotOfMany ? '; this lot ' + dp2Fmt_(l.shares) + ' sh, covered ' + dp2Fmt_(lotCov || 0) : '') + ')'; }   // v1.2.11/12/13
@@ -2987,6 +3172,7 @@ function buildPortfolioDecisionV2() {
       actions.push({ p: 2, t: l.symbol + ' is ' + dp2Pct_(tpPct, 1) + ' from the broker take-profit ' + dp2Fmt_(br.tp, 2) + '; a fill returns ≈ ' + dp2Fmt_(l.shares * br.tp * lfx) + ' SAR to cash. Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.' });
     }
     if (xb && xb.stale && x) actions.push({ p: 3, t: l.symbol + ' exit engine is running on cached bars (' + dp2Str_(xb.fetched) + '): ' + dp2Str_(xb.error || 'fetch failed').slice(0, 120) + '.' });
+    if (xMiss) actions.push({ p: 1, t: 'CHECK ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitAnchorWhy_(xMiss).replace(/^exit engine n\/a \u2014 /, '') + '. No exit signal or alert is given for this lot until its symbol prices the shares the broker holds.' });   // v1.2.33
     // rotation (switch) advisory — research mirror of the engine's funding plans
     // v1.2.14 (review finding): only the PRODUCTION basis (dp2RotationBasis_) raises a SWITCH action / advisory; the
     // other basis is a research note on the row, never an instruction
@@ -3511,6 +3697,7 @@ function dp2SelfTest() {
   checks.push({ name: 'production configuration: ' + cfgS.summary, ok: true });
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
+  if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
   var probe = null;
   var probeSym = 'SPY';
   for (var li = 0; li < led.lots.length; li++) { if (/\.US$/i.test(led.lots[li].symbol)) { probeSym = led.lots[li].symbol; break; } }
