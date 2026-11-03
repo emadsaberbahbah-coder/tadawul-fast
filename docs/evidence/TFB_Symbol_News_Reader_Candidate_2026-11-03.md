@@ -43,21 +43,38 @@ remain different measures. No gate polarity is fabricated or blended into a
 provider score.
 
 The coverage source's **Date range dimension was removed** to keep its fixed
-30-day measure separate from reader-date filtering. A date-change functional
-test is still pending at this evidence checkpoint. Native field-info pop-ups
+30-day measure separate from reader-date filtering. The viewer date-change test
+passed after reload: with `ITRN.US` selected, native Apply produced the observed
+26 October–1 November 2026 range (the UI's Last 7 days relative-clock selection).
+The reader changed from three rows to zero; coverage stayed on `ITRN.US` with
+three recent linked / three archived / zero undated / zero invalid-link articles,
+and its Arabic partial-coverage note remained visible. The symbol selection
+persisted. This verifies the tested reader/coverage date separation, not a
+global five-minute cross-page symbol reset. Native field-info pop-ups
 for `news_date` and `freshness_state` showed Arabic descriptions after reload;
 descriptions for `time_basis` and `polarity` were also written. Reader data
 freshness was changed from 12 hours to 15 minutes before Done, but persisted
 15-minute configuration after reopening remains unverified.
+This setting controls Looker's query cache. It does not turn the nightly,
+partial source collector into a 15-minute acquisition job; refreshing can show
+newly archived rows when they exist, not fetch new provider articles by itself.
 
 The news page height is 1500; its coverage table is at top 1200 with height 250,
 Arabic labels and wrapped text. All six symbol selectors previously used
 Show top 5000, which hid supported `ITRN.US` in viewer search. Raising the limit
-to 10000 restored that search. All six selectors now use Show top 10000 and
-have their `snapshot_date` restrictions removed, preserving page-local symbol
-selection. A 10000-item cap is still a cap, not unlimited symbol coverage.
+to 10000 restored that search. All six selectors now explicitly read back Show
+top 10000 in Setup and have Date range dimension removed, preserving page-local
+symbol selection. The Overview selector required a second commit on blur before
+10000 persisted. A 10000-item cap is still a cap, not unlimited symbol coverage.
 No five-minute cross-page symbol-reset integration has been implemented or
 verified by this work.
+
+Related presentation checks: the Arabic Guide is the second navigation item,
+after Global Overview, and persists after reload. A global help button was
+removed after the viewer clipped it. The candlestick title and Arabic price
+footer were corrected and persisted after reload; Top 25 / My Portfolio header
+and navigation labels were also corrected. These are report configuration
+changes, not new reader SQL or pricing-data verification.
 
 These are browser-observed sample and configuration checks reported by the
 root agent. They do not establish comprehensive collection, complete article
@@ -177,8 +194,8 @@ Looker filter may not be pushed ahead of its windows. Measure query cost and
 refresh latency instead of assuming they are free. No new grant was added.
 
 Keep coverage fixed at 30 days and label it accordingly, **without** the report
-date filter. Its Date range dimension was removed; date-change behavior remains
-pending. Put date filtering on the article table only. Keep the quality box
+date filter. Its Date range dimension was removed and the live ITRN date-change
+test above passed. Put date filtering on the article table only. Keep the quality box
 outside publication-date filtering so missing/future dates do not disappear.
 The live recent-news and zero-row samples above are verified. A stale-only
 symbol, an undated symbol and broader filter behavior still need live checks.
