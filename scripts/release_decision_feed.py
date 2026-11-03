@@ -1,6 +1,77 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.4.0 (2026-11-03) -- A LIVE RELEASE IS HELD, NOT WITHDRAWN, WHILE A
+COCKPIT IS STILL MID-RENDER (gate TFB_RELEASE_RENDER_HOLD, default OFF =
+v1.3.0 byte-identical apart from script_version). Nothing removed; every
+acceptance rule, gate, write and exit code is unchanged when the gate is
+off. (1.3.1 is claimed by open PR #831.)
+
+WHY (3 Nov 2026: _Status 'TFB Decision Feed', the release run summary and
+the Apps Script execution log, all Riyadh time)
+-------------------------------------------------------------------------
+Run 41566014627 was released at 09:55 (expiry 13:26:59). Renders followed
+back to back: the decision chain re-rendered Top_10_Investments (tick
+10:02:15, 'done status=ok in 273.5s' at 10:07:35), then the IBKR capture
+watcher re-rendered Portfolio_Decision (tick 10:08:05, POST 10:08:18,
+'done status=ok in 15s' at 10:08:29). A second release run re-verified
+the live release: its first strict audit read Top_10 mid-render
+(render_settle attempt 1, cockpits ['Top_10_Investments']), the v1.3.0
+settle waited 150 s once, the re-audit failed (audits [0,2]) and step 7
+withdrew the release:
+  NOT_ACTIONABLE(final_publication) | run=41566014627 |
+  2026-11-03 10:08:41+03:00 | decision_failed | release=41593890530
+The release artifact with the re-audit's findings cannot be read from
+here; the timeline puts that re-audit inside the Portfolio_Decision
+render, and the finished line still carries 'source readiness VERIFIED
+(run 41566014627)'. classify_prior then refuses every later release of
+that run (release_window_consumed) until the next sync: the Top_10
+follow-up render the watcher armed (10:10:20, finished 10:12:58) showed
+WITHHELD. One 150 s settle cannot outlast a cascade; the 21 Oct
+withdrawal (16_Decision_Top10.gs v1.13.11 WHY) had the same shape. A
+render the cockpit itself declares is not a verdict, and v1.3.0 already
+keeps a live release with zero writes when a production writer starts
+during the settle (exit 1).
+
+WHAT CHANGED (only when TFB_RELEASE_RENDER_HOLD is armed with the _ARMED
+words; mode=release only - kill and sweep run before any audit):
+- step 7a, new PURE render_hold(result, source, prior, now). A
+  re-verification of a LIVE release of SOURCE that is not accepted is
+  held only when ALL of these are true:
+  * the result has exactly the shape a render produces: exit 2, audit
+    exit codes [0, 2], blockers ['decision_failed'], and every accepted()
+    reason is one a render explains (_RENDER_HOLD_REASONS: never
+    run_id_not_source, not_strict, coverage_summary_not_zero or
+    cockpit_run_stamps_missing);
+  * settle_candidates(result) is not empty (the unchanged v1.3.0 rule:
+    the coverage audit passed and EVERY decision finding is explained by
+    a cockpit whose own B2 line says 'status: running...');
+  * every running cockpit's own 'Last run' stamp (its render START) is at
+    most RENDER_HOLD_MAX_AGE_MIN = 10 minutes old and at most
+    FUTURE_SKEW_MIN in the future at the judgement. Apps Script kills an
+    execution at 6 minutes without running catch, which leaves B2 at
+    'running...' (16_Decision_Top10.gs v1.13.10 LIMIT); 10 = that hard
+    limit plus 4 minutes for the strict audits' own read time. An older
+    running stamp is a dead render: judged exactly as v1.3.0 (withdrawn);
+  * the live value is still well-formed and unexpired (sweep_reason None).
+  Then: exit 1, outcome 'deferred', reason render_still_running, ZERO
+  writes (the live value, its expiry and its release= token stay as they
+  are) and out['render_hold'] = {cockpits, render_started, age_min,
+  max_age_min, reasons (the audit's)}. The next re-verification judges
+  the finished board: accepted -> already_released (no write, no expiry
+  extension); any failure, or a running stamp past the bound, withdraws
+  exactly as today.
+- The hold never promotes, never extends an expiry and never applies to a
+  first release (a veto prior is judged as today: exit 2, no write) or to
+  a failure a render does not explain. The dry run (TFB_DECISION_RELEASE
+  off) reports the same hold instead of would_downgrade.
+- Independent of TFB_RELEASE_RENDER_SETTLE; with both armed a run settles
+  once (150 s) and holds only when the board is still mid-render then.
+- The workflow maps the gate in the release STEP env (release_decision_
+  feed.yml 1.4.0) and prints a render_hold row only when the key exists.
+ROLLBACK: unset the repository variable TFB_RELEASE_RENDER_HOLD (or set it
+to anything outside 1/true/yes/on).
+
 VERSION 1.3.0 (2026-10-29) -- A COCKPIT CAUGHT MID-RENDER SETTLES INSTEAD OF
 FAILING (gate TFB_RELEASE_RENDER_SETTLE, default OFF = v1.2.0 byte-identical
 apart from script_version). Nothing removed; every acceptance rule, gate,
@@ -235,8 +306,19 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 RELEASE_ENV = "TFB_DECISION_RELEASE"
+# v1.4.0: a live release whose re-verification fails only on a recent render
+# is held (deferred, zero writes) instead of withdrawn (default off).
+RENDER_HOLD_ENV = "TFB_RELEASE_RENDER_HOLD"
+RENDER_HOLD_MAX_AGE_MIN = 10
+# The audit payload key that carries each cockpit's own 'Last run' stamp.
+_RENDER_STAMP_KEYS = {"Top_10_Investments": "top10_run_riyadh",
+                      "Portfolio_Decision": "portfolio_run_riyadh"}
+# The accepted() reasons a render-only decision failure produces.
+_RENDER_HOLD_REASONS = frozenset({"exit_code_nonzero", "audit_exit_codes", "blockers_present",
+                                  "decision_not_executable", "decision_summary_not_zero",
+                                  "decision_findings_present"})
 # v1.3.0: a cockpit caught mid-render settles instead of failing (default off).
 RENDER_SETTLE_ENV = "TFB_RELEASE_RENDER_SETTLE"
 RENDER_SETTLE_S = 150
@@ -320,6 +402,12 @@ def render_settle_enabled() -> bool:
     """v1.3.0 TFB_RELEASE_RENDER_SETTLE, default OFF: on => a cockpit caught
     mid-render is re-audited after a bounded settle instead of failing."""
     return (os.getenv(RENDER_SETTLE_ENV) or "0").strip().lower() in _ARMED
+
+
+def render_hold_enabled() -> bool:
+    """v1.4.0 TFB_RELEASE_RENDER_HOLD, default OFF: on => a live release whose
+    re-verification fails only because a cockpit is mid-render is held."""
+    return (os.getenv(RENDER_HOLD_ENV) or "0").strip().lower() in _ARMED
 
 
 # --------------------------------------------------------------------------- clocks
@@ -602,6 +690,46 @@ def settle_candidates(result: Any) -> list[str]:
         if surface not in running or finding.get("code") not in _RENDER_EXPLAINED[surface]:
             return []
     return running
+
+
+def render_hold(result: Any, source: Any, prior: Any, now: datetime) -> Optional[dict]:
+    """PURE (v1.4.0). The hold evidence when a not-accepted re-verification of
+    the LIVE release `prior` of SOURCE failed only because a cockpit is still
+    mid-render; None otherwise (judged exactly as v1.3.0). Requires the exact
+    shape a render produces (exit 2, audits [0, 2], blockers
+    ['decision_failed'], every accepted() reason in _RENDER_HOLD_REASONS),
+    settle_candidates(result) not empty, every running cockpit's own render
+    start within [-FUTURE_SKEW_MIN, RENDER_HOLD_MAX_AGE_MIN] minutes of now,
+    and the live value still well-formed and unexpired at now."""
+    if not isinstance(result, dict) or not isinstance(source, str) or not isinstance(prior, str):
+        return None
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        return None
+    if (type(result.get("exit_code")) is not int or result.get("exit_code") != 2
+            or result.get("audit_exit_codes") != [0, 2]
+            or result.get("blockers") != ["decision_failed"]):
+        return None
+    ok, reasons = accepted(result, source)
+    if ok or not reasons or not set(reasons) <= _RENDER_HOLD_REASONS:
+        return None
+    if _single_run(prior) != source or sweep_reason(prior, now) is not None:
+        return None
+    running = settle_candidates(result)
+    if not running:
+        return None
+    decision = result["audits"]["decision"]      # settle_candidates proved the shape
+    started, ages = {}, {}
+    for cockpit in running:
+        stamp = _payload_stamp(decision.get(_RENDER_STAMP_KEYS[cockpit]))
+        if stamp is None:
+            return None
+        age = (now - stamp).total_seconds() / 60.0
+        if age < -FUTURE_SKEW_MIN or age > RENDER_HOLD_MAX_AGE_MIN:
+            return None
+        started[cockpit] = riyadh_stamp(stamp)
+        ages[cockpit] = round(age, 2)
+    return {"cockpits": running, "render_started": started, "age_min": ages,
+            "max_age_min": RENDER_HOLD_MAX_AGE_MIN, "reasons": list(reasons)}
 
 
 def release_window(result: dict, now: datetime) -> tuple[Optional[dict], list[str]]:
@@ -1000,6 +1128,16 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         code = result.get("exit_code")
         code = code if type(code) is int and code in (1, 2, 3) else 3
         if executable_prior and prior_run == source:
+            # 7a. v1.4.0 (TFB_RELEASE_RENDER_HOLD, default off): a live release
+            #     whose re-verification failed ONLY because a cockpit is still
+            #     mid-render (a recent render start) is held: exit 1, zero
+            #     writes; the next re-verification judges the finished board.
+            hold = render_hold(result, source, prior, clock()) if render_hold_enabled() else None
+            if hold is not None:
+                out["render_hold"] = hold
+                out["deferred"] = True
+                out["reasons"] = list(pre_audit_reasons)
+                return _finish(out, 1, "deferred", "render_still_running")
             blockers = result.get("blockers") or reasons or ["release_reverify_failed"]
             why = ",".join(str(item) for item in blockers)
             if armed:

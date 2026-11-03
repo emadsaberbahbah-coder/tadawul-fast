@@ -16,6 +16,8 @@ Merged 2026-10-31 (bundle re-merged with main #873-#881, `e0cbb684`): main's #87
 
 Merged 2026-11-02 (bundle re-merged with main #890-#896, `7a680475`): a clean automatic merge; this PR's delta is unchanged and no default moved. #895 shipped 16_Decision_Top10 v1.20.0, so the bundle's held seats are now v1.20.1 (this PR does not touch the cockpit). #893 took daily_sync.yml 1.0.9 (sync-render handshake, default off); this PR's 1.0.6 block (`TFB_SYNC_FW2_SCOPE` fallback enforce) is unchanged. The three G1 module blobs at `7a680475` equal `974bc418`'s; G1 PASS 11/11 with either.
 
+Merged 2026-11-03 (bundle re-merged with main #898-#906, `6650e1fc`): a clean automatic merge; this PR's delta is unchanged and no default moved. #906 shipped 16_Decision_Top10 v1.21.0 (ex-dividend ticket guard, default off), so the bundle's held seats are now v1.21.1 (this PR does not touch the cockpit). #904, #901 and #905 moved the verify_deployment pins of release_decision_feed (1.4.0), await_cockpit_receipts (1.2.0), calendar_provider (1.4.0) and run_calendar_sync (1.3.0); they merged beside this PR's builder 1.28.2 / actions 1.17.2 / engine 5.160.0 pins without a conflict. The three G1 module blobs at `6650e1fc` equal `974bc418`'s; G1 PASS 11/11 with either.
+
 ## S0 - Decision and base
 | Item | Value |
 |---|---|

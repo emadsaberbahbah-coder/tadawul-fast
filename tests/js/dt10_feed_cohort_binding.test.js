@@ -539,7 +539,7 @@ test('C11 pure helper edge cases', () => {
 test('C11 version lockstep, WHY block, census additions and ES5/ASCII of the new functions', () => {
   const ctx = load(source, {});
   const atLeast = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
-  assert(atLeast(ctx.DT10_VERSION, [1, 20, 0]), ctx.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved; merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0
+  assert(atLeast(ctx.DT10_VERSION, [1, 21, 0]), ctx.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved; merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
   assert(source.split('\n')[3].startsWith(' * Version: ' + ctx.DT10_VERSION + ' '));   // 2026-10-27: v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0, pin moved; 2026-11-02: v1.20.0, pin moved
   assert(source.includes(' * v1.13.8 (2026-10-13) -- FEED RUN BOUND TO THE SOURCE COHORT (P0-1 PREREQ 2)'));
   assert(source.includes(' * v1.13.7 (2026-10-12) -- PROVED CROSS-PAGE POOL EXCLUSIONS'), 'prior WHY kept');
