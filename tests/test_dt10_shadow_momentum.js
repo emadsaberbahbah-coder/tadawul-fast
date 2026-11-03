@@ -45,6 +45,8 @@ const src = fs.readFileSync(SRC, 'utf8');
 // v1.19.1 held-seat regions, so the layer is main's v1.19.0 byte for byte.
 // merge note 2026-11-02 (#778): the delivered file is now main's v1.20.0 plus the
 // v1.20.1 held-seat regions, so the layer is main's v1.20.0 byte for byte.
+// merge note 2026-11-03 (#778): the delivered file is now main's v1.21.0 plus the
+// v1.21.1 held-seat regions, so the layer is main's v1.21.0 byte for byte.
 const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
 const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
 const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
@@ -248,15 +250,15 @@ console.log('M7 PASS embedded self-test lines');
 // (v1.18.0 edits reversed, SHA-256 pinned) with v1.17.0.
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
 // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
-// merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0: the rebuild starts from the layer (the delivered file with
-// this bundle's regions stripped = main's v1.20.0); the delivered file sits above it.
+// merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: the rebuild starts from the layer (the delivered file with
+// this bundle's regions stripped = main's v1.21.0); the delivered file sits above it.
 const s1171 = history.v1171Source(layerSrc);
-ok((layerSrc.match(/^var DT10_VERSION = '1\.20\.0';$/m) || []).length === 1 && /^ \* Version: 1\.20\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]) &&
+ok((layerSrc.match(/^var DT10_VERSION = '1\.21\.0';$/m) || []).length === 1 && /^ \* Version: 1\.21\.0 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]) &&
    (s1171.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(s1171.split('\n')[3]),
-   'M8 version lockstep 1.20.0 (layer) and 1.17.1 (rebuilt)');
-ok(dt10Floor(deliveredVersion, [1, 20, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+   'M8 version lockstep 1.21.0 (layer) and 1.17.1 (rebuilt)');
+ok(dt10Floor(deliveredVersion, [1, 21, 0]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
    src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
-   'M8 delivered version floor 1.20.0 in lockstep: ' + deliveredVersion);
+   'M8 delivered version floor 1.21.0 in lockstep: ' + deliveredVersion);
 const why = src.slice(src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), src.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'));
 ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'M8 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'), base.indexOf(' * v1.16.0 (2026-10-26) [FUNDING-EVIDENCE]'))) > 0,

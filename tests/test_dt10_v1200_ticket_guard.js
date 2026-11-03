@@ -73,7 +73,9 @@ const newSource = fs.readFileSync(NEW_PATH, 'utf8');
 /* merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0. The structural checks
  * (V0 pins, V10 diff inventory and reversal) read the layer: the delivered file with the bundle's
  * designed regions stripped (tests/js/dt10_audit_keep_regions.js), which is main's v1.20.0 byte for
- * byte; the behavioural checks run the delivered file. */
+ * byte; the behavioural checks run the delivered file.
+ * merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0; the layer is now main's
+ * v1.21.0 byte for byte, and s1200 (the v1.20.0 rebuild V0 / V10 read) starts from the layer. */
 const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
 const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
@@ -85,6 +87,10 @@ try {
   console.log('FAIL 0/1');
   process.exit(1);
 }
+// 2026-11-03: v1.21.0 (ex-dividend guard) stacked on this change; pins moved. Behaviour runs on
+// the delivered file; the v1.20.0 lint / inventory / hunks (V10) compare the v1.20.0 file rebuilt
+// from it (v1.21.0 edits reversed, SHA-256 pinned) with the base.
+const s1200 = /^var DT10_VERSION = '1\.20\.0';$/m.test(layerSource) ? layerSource : history.v1200Source(layerSource);   // merge note 2026-11-03 (#778): from the layer
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const GUARD = 'DT10_TICKET_GUARD', KPI = 'DT10_KPI_PLAN_GAIN', VENUE = 'DT10_VENUE_LINE', MARK = 'DT10_KPI_PLAN_LABEL_STATE';
@@ -117,7 +123,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and the run-marker property;
  * comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.20\.\d+/g, 'v1.19.0'));   // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0: v1.20.0 or the bundle's v1.20.1
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.2[01]\.\d+/g, 'v1.19.0'));   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: v1.20.0, v1.21.0 or the bundle's v1.21.1
 
 /* ============================================================ the live board of 2 Nov 2026 */
 const LIVE = [
@@ -569,10 +575,12 @@ function battery() {
   test('V0 base oracle is the reviewed v1.19.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1190_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.19.0', 'base version');
-    ok(/^1\.(2\d|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.20.0: ' + N.DT10_VERSION);   // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0
+    ok(/^1\.(2[1-9]|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.21.0: ' + N.DT10_VERSION);   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
     ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    ok(/^ \* Version: 1\.20\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'layer pins 1.20.0');
+    ok(/^ \* Version: 1\.21\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'layer pins 1.21.0');
+    eq(sha256(s1200), history.V1200_SHA256, 'rebuilt v1.20.0 SHA-256');
+    ok(/^ \* Version: 1\.20\.0 /.test(s1200.split('\n')[3]) && s1200.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'rebuilt v1.20.0 lockstep');
     eq(N.DT10_TICKET_GUARD_PROP, GUARD); eq(N.DT10_KPI_PLAN_GAIN_PROP, KPI); eq(N.DT10_VENUE_LINE_PROP, VENUE); eq(N.DT10_KPI_PLAN_LABEL_PROP, MARK);
     deq([N.DT10_GUARD_EARN_DAYS_PROP, N.DT10_GUARD_OWNER_RULE_PROP, N.DT10_GUARD_MAX_TICKETS_PROP], KNOBS);
     deq([N.DT10_GUARD_EARN_DAYS_DEF, N.DT10_GUARD_EARN_DAYS_MAX, N.DT10_GUARD_MAX_TICKETS_MAX], [3, 30, 50]);
@@ -631,7 +639,7 @@ function battery() {
       deq(nv(n.logs), baseRefresh.logs, 'Logger lines ' + label);
       deq(n.posted, baseRefresh.posted, 'POST bodies (research + replay) ' + label);
       deq(n.saved, baseRefresh.saved, 'saved state blob ' + label);
-      // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0: the bundle adds its own memoized DT10_AUDIT_KEEP read
+      // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0 (v1.21.1 over #906's v1.21.0 since 2026-11-03): the bundle adds its own memoized DT10_AUDIT_KEEP read
       eq(n.propReads.total - (n.propReads.byKey['DT10_AUDIT_KEEP'] || 0), baseRefresh.propReads.total + 4, 'exactly four property reads added ' + label);
       ok((n.propReads.byKey['DT10_AUDIT_KEEP'] || 0) <= 1, 'the bundle reads DT10_AUDIT_KEEP at most once ' + label);
       deq([n.propReads.byKey[GUARD], n.propReads.byKey[KPI], n.propReads.byKey[MARK], n.propReads.byKey[VENUE]], [1, 1, 1, 1], 'each read once ' + label);
@@ -908,7 +916,7 @@ function battery() {
       return String(ctx.dt10SelfTest());
     };
     const rep = mini(newSource, {}), repB = mini(baseSource, {});
-    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0
+    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
     const lines = ['ticket guard (DT10_TICKET_GUARD): off (off = v1.19.0 board; observe names; enforce holds) | core: ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; apply ok)',
       'kpi plan gain (DT10_KPI_PLAN_GAIN): off (Exp. Gain TP1 (SAR) = sum Ticket SAR x (TP1 SAR / Price SAR - 1); off = v1.19.0 KPI) | core: ok (four tickets 1050 SAR; no ticket = em dash)',
       'venue line (DT10_VENUE_LINE): off (approximate regular sessions in Riyadh time, no holidays; display only) | core: ok (US 17:30 winter / 16:30 summer, London 11:00, Tadawul Sun 10:00, Friday night -> Mon; open now / withheld / unsized = none)'];
@@ -927,9 +935,11 @@ function battery() {
        faulted.indexOf('venue line (DT10_VENUE_LINE): off') > 0, 'a property fault reads off');
   });
 
+  // 2026-11-03: V10 reads the rebuilt v1.20.0 file (s1200); the v1.21.0 diff has its own lint
+  // in tests/test_dt10_v1210_exdiv_guard.js.
   test('V10 ES5 / ASCII lint of the diff; inventory: 17 functions and 14 vars added, 0 removed; 15 hunks whose reversal is the reviewed v1.19.0 file', () => {
-    const newSource = layerSource;   // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0: V10 reads the layer (main's v1.20.0)
-    const baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
+    const newSource = layerSource;   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: the v1.19.0 reversal reads the layer (main's v1.21.0)
+    const baseLines = {}, bl = baseSource.split('\n'), nl = s1200.split('\n');
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);
     ok(added.length >= 600 && added.length <= 760, 'added lines ' + added.length);
@@ -939,23 +949,23 @@ function battery() {
       if (!/^[\x09\x20-\x7e]*$/.test(l)) ok(baseLines[l.replace('1.20.0', '1.19.0')] === true, 'non-ASCII added line: ' + l);
     }
     function nonAscii(s) { const m = {}; for (let j = 0; j < s.length; j++) { const c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
-    deq(nonAscii(newSource), nonAscii(baseSource), 'non-ASCII code point multiset unchanged');
-    ok(newSource.indexOf('\r') < 0, 'LF only');
-    const why = newSource.slice(newSource.indexOf(' * v1.20.0 (2026-11-02)'), newSource.indexOf(' * v1.19.0 (2026-11-01) [QUALIFIED-HOLD'));
+    deq(nonAscii(s1200), nonAscii(baseSource), 'non-ASCII code point multiset unchanged');
+    ok(s1200.indexOf('\r') < 0, 'LF only');
+    const why = s1200.slice(s1200.indexOf(' * v1.20.0 (2026-11-02)'), s1200.indexOf(' * v1.19.0 (2026-11-01) [QUALIFIED-HOLD'));
     ok(why.length > 5000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block present (newest first) and ASCII');
     for (const w of [' * WHY (live review', ' * WHAT -- three Script Properties', ' * GATES: ', ' * ROLLBACK: ']) ok(why.indexOf(w) >= 0, 'WHY section ' + w);
-    ok(newSource.indexOf(baseSource.slice(baseSource.indexOf(' * v1.19.0 (2026-11-01) [QUALIFIED-HOLD'), baseSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'))) > 0, 'the v1.19.0 WHY block verbatim');
-    for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) ok(newSource.indexOf(l) > 0, 'WHY header lost: ' + l);
+    ok(s1200.indexOf(baseSource.slice(baseSource.indexOf(' * v1.19.0 (2026-11-01) [QUALIFIED-HOLD'), baseSource.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'))) > 0, 'the v1.19.0 WHY block verbatim');
+    for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) ok(s1200.indexOf(l) > 0, 'WHY header lost: ' + l);
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
-    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(newSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
+    const fb = names(baseSource, /function\s+([A-Za-z_$][\w$]*)\s*\(/g), fn = names(s1200, /function\s+([A-Za-z_$][\w$]*)\s*\(/g);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'functions removed (any level)');
-    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(newSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+    const tb = names(baseSource, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), tn = names(s1200, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     const FNS = ['dt10KpiPlanGainMode_', 'dt10KpiPlanGain_', 'dt10KpiPlanLabelMark_', 'dt10RiyadhClock_', 'dt10TicketGuardApply_', 'dt10TicketGuardConfig_',
       'dt10TicketGuardCore_', 'dt10TicketGuardExec_', 'dt10TicketGuardHeldCount_', 'dt10TicketGuardMode_', 'dt10TicketGuardToken_', 'dt10TicketGuard_',
       'dt10VenueLineOn_', 'dt10VenueLine_', 'dt10VenueOf_', 'dt10VenueSession_', 'dt10VenueSummer_'];
     deq(Object.keys(tn).filter(k => !tb[k]).sort(), FNS, 'top-level functions added');
     eq(Object.keys(tb).length, 233, 'base census'); eq(Object.keys(tn).length, 250, 'new census');
-    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
+    const vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(s1200, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DT10_GUARD_EARN_DAYS_DEF', 'DT10_GUARD_EARN_DAYS_MAX', 'DT10_GUARD_EARN_DAYS_PROP', 'DT10_GUARD_MAX_TICKETS_MAX',
       'DT10_GUARD_MAX_TICKETS_PROP', 'DT10_GUARD_OWNER_RULE_PROP', 'DT10_KPI_PLAN_GAIN_LABEL', 'DT10_KPI_PLAN_GAIN_PROP', 'DT10_KPI_PLAN_LABEL_PROP',
@@ -964,8 +974,8 @@ function battery() {
     const newSet = {}; for (const l of nl) newSet[l] = true;
     deq(bl.filter(l => !newSet[l]).map(l => l.trim()).sort(), ['* Version: 1.19.0 (see DT10_VERSION; header kept in lockstep — restored', "var DT10_VERSION = '1.19.0';"].sort(), 'only the two version lines left');
     for (const name of FNS) {
-      const start = newSource.indexOf('function ' + name + '(');
-      const body = newSource.slice(start, newSource.indexOf('\n}\n', start) + 3);
+      const start = s1200.indexOf('function ' + name + '(');
+      const body = s1200.slice(start, s1200.indexOf('\n}\n', start) + 3);
       ok(start > 0 && /^[\x00-\x7f]*$/.test(body), 'ASCII ' + name);
       new vm.Script('(function(){' + body + '})');
     }
@@ -973,9 +983,9 @@ function battery() {
     eq(edits.length, 15, 'fifteen hunks');
     eq(sha256(history.v1190Source(newSource)), history.V1190_SHA256, 'reversal = the reviewed v1.19.0 file');
     // the owner-rule filter calls the v1.19.0 predicate, it does not restate it
-    const core = newSource.slice(newSource.indexOf('function dt10TicketGuardCore_('), newSource.indexOf('\n}\n', newSource.indexOf('function dt10TicketGuardCore_(')));
+    const core = s1200.slice(s1200.indexOf('function dt10TicketGuardCore_('), s1200.indexOf('\n}\n', s1200.indexOf('function dt10TicketGuardCore_(')));
     ok(core.indexOf("dt10OwnerRuleCell_(t) !== 'rule: yes'") > 0 && core.indexOf('DT10_OWNER_RULE_ROI_MAX') < 0 && core.indexOf('HIGH') < 0, 'owner rule reused, not duplicated');
-    const apply = newSource.slice(newSource.indexOf('function dt10TicketGuardApply_('), newSource.indexOf('\n}\n', newSource.indexOf('function dt10TicketGuardApply_(')));
+    const apply = s1200.slice(s1200.indexOf('function dt10TicketGuardApply_('), s1200.indexOf('\n}\n', s1200.indexOf('function dt10TicketGuardApply_(')));
     ok(apply.indexOf('dt10FinalizeBoard_(payload);') > 0 && apply.indexOf('t._board_unfunded = true;') > 0 && apply.indexOf('suggested_sar =') < 0, 'held rows go through dt10FinalizeBoard_, no new row shape');
   });
 
@@ -986,7 +996,7 @@ function battery() {
     eq(mk({}).dt10TicketGuardMode_(), 'off', 'guard absent'); eq(mk({}, true).dt10TicketGuardMode_(), 'off', 'guard fault');
     const off = mk({}); eq(off.dt10TicketGuardConfig_(), null, 'off -> null'); deq(off.__propReads, [GUARD], 'off: one read');
     const on = mk({ [GUARD]: 'enforce' }); deq(plain(on.dt10TicketGuardConfig_()), { mode: 'enforce', earnDays: 3, ownerRule: false, maxTickets: 0 }, 'defaults');
-    deq(on.__propReads, [GUARD].concat(KNOBS), 'armed: the three knobs, once each');
+    deq(on.__propReads, [GUARD].concat(KNOBS, ['DT10_GUARD_EXDIV_DAYS']), 'armed: the three knobs, once each (+ the v1.21.0 ex-div days knob)');
     for (const [d, want] of [['0', 0], ['45', 30], ['-2', 0], ['abc', 3], [' 5 ', 5], ['2.9', 2]]) eq(mk({ [GUARD]: 'observe', DT10_GUARD_EARN_DAYS: d }).dt10TicketGuardConfig_().earnDays, want, 'earn days ' + d);
     for (const [d, want] of [['on', true], [' ON ', true], ['yes', false], ['1', false], ['', false]]) eq(mk({ [GUARD]: 'observe', DT10_GUARD_OWNER_RULE: d }).dt10TicketGuardConfig_().ownerRule, want, 'owner rule ' + d);
     for (const [d, want] of [['', 0], ['2', 2], ['99', 50], ['-1', 0], ['x', 0]]) eq(mk({ [GUARD]: 'observe', DT10_GUARD_MAX_TICKETS: d }).dt10TicketGuardConfig_().maxTickets, want, 'cap ' + d);

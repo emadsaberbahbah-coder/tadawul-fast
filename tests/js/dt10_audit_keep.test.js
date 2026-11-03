@@ -1,5 +1,8 @@
 /* tests/js/dt10_audit_keep.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.20.1 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 16_Decision_Top10.gs v1.21.1 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 2026-11-03: renumbered v1.21.1 over #906's v1.21.0; base copies are now
+ * main's v1.21.0 (git show 658a72c2:apps_script/16_Decision_Top10.gs).
+ * No case changed.
  * 2026-11-02: renumbered v1.20.1 over #895's v1.20.0 (v1.19.1 over #887's
  * v1.19.0 since 2026-11-01); base copies are now main's v1.20.0
  * (git show 3bbf3c80:apps_script/16_Decision_Top10.gs). No case changed.
@@ -306,7 +309,7 @@ if (baseSource) {
       assert.deepEqual(a.tables, b.tables);
     }
   });
-  test('D2 every changed line lies inside a designed v1.20.1 region; regions are exact text', () => {
+  test('D2 every changed line lies inside a designed v1.21.1 region; regions are exact text', () => {
     assert.equal(stripDesigned(source), baseSource);
     assert.equal((FN_REGION.match(/^function /mg) || []).length, 2, 'two top-level functions');
     assert.ok(/^[\x00-\x7f]*$/.test(HEADER_REGION + FN_REGION + CALL_REGION), 'designed regions are ASCII');

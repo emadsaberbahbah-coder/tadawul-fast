@@ -81,6 +81,8 @@ try {
 // v1.19.0 file rebuilt from it (v1.20.0 edits reversed, SHA-256 pinned) with the base.
 // merge note 2026-11-02 (#778): held seats are v1.20.1 over #895's v1.20.0, so the rebuild starts
 // from the layer (main's v1.20.0 byte for byte), never from the delivered v1.20.1 file.
+// merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0; the layer is now
+// main's v1.21.0 byte for byte and v1190Source reverses the v1.21.0 edits first.
 const s1190 = /^var DT10_VERSION = '1\.19\.0';$/m.test(layerSource) ? layerSource : history.v1190Source(layerSource);
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
@@ -576,7 +578,7 @@ function seatRow(run, sym) { for (const r of run.seats) if (r[1] === sym) return
 const stripToken = s => String(s).replace(/, qhold: (?:would hold|held) \d+(?: [A-Z0-9.]+)*/, '');
 /* The version string reaches the meta footer, the B2 status line, the Logger lines and the
  * run-marker property; comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19|20)\.\d+/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too; merge note 2026-11-02 (#778): or the bundle's v1.20.1
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19|20|21)\.\d+/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too; v1.21.0 since 2026-11-03; merge note 2026-11-03 (#778): or the bundle's v1.21.1
 
 /* ============================================================ battery */
 function battery() {
@@ -588,10 +590,10 @@ function battery() {
   test('T0 base oracle is the reviewed v1.18.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1180_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.18.0', 'base version');
-    ok(/^1\.(2\d|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.20.0: ' + N.DT10_VERSION);   // 2026-11-02: v1.20.0 pins moved; merge note 2026-11-02 (#778)
+    ok(/^1\.(2[1-9]|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.21.0: ' + N.DT10_VERSION);   // 2026-11-02: v1.20.0 pins moved; 2026-11-03: v1.21.0; merge note 2026-11-03 (#778)
     ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    ok(/^ \* Version: 1\.20\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'layer pins 1.20.0');
+    ok(/^ \* Version: 1\.21\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'layer pins 1.21.0');
     ok(/^ \* Version: 1\.19\.0 /.test(s1190.split('\n')[3]) && s1190.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'rebuilt v1.19.0 lockstep');
     eq(N.DT10_QUALIFIED_HOLD_PROP, HOLD); eq(N.DT10_SEAT_LIVE_FILL_PROP, LIVE); eq(N.DT10_OWNER_RULE_PROP, RULE);
     eq(N.DT10_OWNER_RULE_ROI_MAX, 34, 'the owner rule threshold is a display constant');
@@ -665,7 +667,7 @@ function battery() {
       deq(n.posted, baseRefresh.posted, 'POST bodies (research + replay) ' + label);
       deq(n.saved, baseRefresh.saved, 'saved state blob ' + label);
       // 2026-11-02: v1.20.0 adds four more reads (its three gates and the KPI label marker), each once
-      // merge note 2026-11-01 (#778): the bundle's v1.19.1 (v1.20.1 since 2026-11-02) adds its own memoized DT10_AUDIT_KEEP read
+      // merge note 2026-11-01 (#778): the bundle's v1.19.1 (v1.20.1 since 2026-11-02, v1.21.1 since 2026-11-03) adds its own memoized DT10_AUDIT_KEEP read
       eq(n.propReads.total - (n.propReads.byKey['DT10_AUDIT_KEEP'] || 0), baseRefresh.propReads.total + 3 + 4, 'exactly three (+ four v1.20.0) property reads added ' + label);
       ok((n.propReads.byKey['DT10_AUDIT_KEEP'] || 0) <= 1, 'the bundle reads DT10_AUDIT_KEEP at most once ' + label);
       deq([n.propReads.byKey[HOLD], n.propReads.byKey[LIVE], n.propReads.byKey[RULE]], [1, 1, 1], 'each read once ' + label);
