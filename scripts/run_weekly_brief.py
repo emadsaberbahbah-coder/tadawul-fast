@@ -73,13 +73,155 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # BLOCKED, never TRADE, with economics suppressed; eligible rows byte-same.
 # Functions added: 1 (_hard_gate_rows). Removed: 0.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.0.3"
+# v1.1.0 (2026-11-03) - BOARD PARITY: THE MEMO SHOWS THE BOARD THE
+# Shadow_Board TAB SHOWS (TFB_WEEKLY_BOARD_PARITY, default off)
+# -----------------------------------------------------------------------------
+# EVIDENCE (live, Sunday 1 Nov 2026):
+#   11:13:43Z weekly_brief  run 41300907168:
+#     "[shariah_authority v1.1.0] load failed: RuntimeError:sheet_id_missing"
+#     "[WEEKLY-BRIEF v1.0.3] cands=10 switch=NO_ACTION ... mail=SENT:1"
+#   11:47:45Z shadow_board  run 41303426265 (same Top_10, 34 min later):
+#     "[SHADOW-BOARD v1.6.0] cands=10 eligible=8 blocked={'FLOOR_LOCKED': 2}
+#      switch=SWITCH_CANDIDATES auth_rows=408"
+# The owner was mailed NO ACTION while the board proposed switches. The
+# DESIGN line above ("so the memo and the Shadow_Board tab can never
+# disagree") had stopped being true for two reasons:
+#   (1) POSITION. run_shadow_board v1.4.0 (2026-09-13) inserted "ROI Src" at
+#       index 16 and moved "Gen2 Eligible" to 17. This script still reads
+#       r[16] as Gen2 Eligible in snapshot(), _hard_gate_rows() and the memo
+#       key_cols, so EVERY row - TRADE rows included - renders "BLOCKED -
+#       <status>" with ROI / RT / Net Edge suppressed, the memo's last column
+#       is ROI Src under the header of that name, and _Brief_State saves ROI
+#       Src as "gen2". (The switch verdict itself reads the last column through
+#       shadow_board.eligible_symbols, which is correct.)
+#   (2) LANE. weekly_brief.yml runs the imported board without the
+#       shadow_board.yml lane: no TFB_COMPLIANCE_SCREEN_RETIRED (retired
+#       2026-08-13; the board hardcodes it), no TFB_BOARD_ENGINE_ROI=enforce
+#       (blank Top_10 ROI stays NO_ROI), no TFB_SHADOW_T10_READ_RETRIES, and no
+#       DEFAULT_SPREADSHEET_ID (so the authority read fails, as logged). This
+#       script also never called the board's engine-ROI fill or settled read.
+# Draft PR #795 (2026-10-18, stale, conflicted, 125 files) carries an ungated
+# fix for (1) as v1.0.4; this build credits it and takes 1.1.0.
+# WHAT (TFB_WEEKLY_BOARD_PARITY = on / 1 / true / yes; anything else = off):
+#   * off (default): every read, write, log line, _Run_Log row, state cell
+#     and mail byte is v1.0.3's (the version string aside).
+#   * on, before anything is read: _apply_board_lane_env() sets each
+#     BOARD_LANE_ENV knob that is unset or blank to the shadow_board.yml
+#     value, and DEFAULT_SPREADSHEET_ID to the sheet this run opens when it is
+#     unset (the shadow lane maps both from the same Variable). A knob already
+#     set in this lane is kept.
+#   * on, inputs: the Top_10 read goes through shadow_board.read_top10_settled
+#     when TFB_SHADOW_T10_READ_RETRIES > 0, and blank ROI is filled through
+#     fetch_engine_roi_map / apply_engine_roi when TFB_BOARD_ENGINE_ROI is not
+#     off - the calls and the order of shadow_board.main.
+#   * on, columns: snapshot_by_header(), _hard_gate_rows_by_header() and the
+#     memo columns bind by shadow_board.OUT_HEADER name; a missing name
+#     raises, so no memo is mailed on a schema it cannot read.
+#   * on, the render seam: a row that is not Gen2-eligible and still reads
+#     TRADE (the 1015.KL class, reachable only with TFB_SB_COST_LEGACY=1) is
+#     terminalized as v1.0.3 does; a row the board already BLOCKED keeps its
+#     verdict and loses ROI / RT / Net Edge; every other row (EDGE_BELOW_COST,
+#     NO_ROI, NO_COST_MODEL, TRADE + YES) reads as the tab reads. v1.0.3's
+#     rule also relabelled compliant EDGE_BELOW_COST / NO_ROI rows "BLOCKED -
+#     <status>", which under the retired screen reads "BLOCKED -
+#     SCREEN_RETIRED" on rows the board calls EDGE_BELOW_COST.
+#   * on, evidence: one "[WEEKLY-BRIEF-PARITY v1.1.0] ..." line, a BOARD LANE
+#     line under PROVENANCE (text and HTML), and "board_parity" in the
+#     _Run_Log details.
+# KNOWN: the first memo after arming reports a FLIP for every row whose
+# status moves from the model-screen codes to SCREEN_RETIRED (a one-time
+# diff against the last v1.0.3 state). shadow_board's non-trading freeze
+# (TFB_BOARD_FREEZE_NONTRADING) is not mirrored: neither lane sets it.
+# ROLLBACK: unset the TFB_WEEKLY_BOARD_PARITY Variable (= v1.0.3).
+# Functions added: 6 (_board_parity_enabled, _apply_board_lane_env,
+# _board_cols, snapshot_by_header, _hard_gate_rows_by_header,
+# _board_lane_line). Removed: 0.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.1.0"
 TAB_STATE = "_Brief_State"
+ENV_BOARD_PARITY = "TFB_WEEKLY_BOARD_PARITY"     # v1.1.0 on|off, default off
+# v1.1.0: the shadow_board.yml job-env knobs this memo must share with the
+# board (tests/test_weekly_brief_board_parity.py reads that workflow and fails
+# when a literal knob there is missing here or differs).
+BOARD_LANE_ENV: Tuple[Tuple[str, str], ...] = (
+    ("TFB_COMPLIANCE_SCREEN_RETIRED", "1"),
+    ("TFB_BOARD_ENGINE_ROI", "enforce"),
+    ("TFB_SHADOW_T10_READ_RETRIES", "6"),
+)
+# v1.1.0: the memo's board columns, by Shadow_Board header name (v1.0.3's
+# key_cols [0, 3, 4, 5, 6, 11, 12, 14, 15, 16] as authored on the 17-column
+# board).
+MEMO_COLS: Tuple[str, ...] = (
+    "Symbol", "Sector", "ROI %", "Confidence", "Shariah Status", "RT Cost %",
+    "Net Edge %", "Edge Verdict", "Debt/MCap %", "Gen2 Eligible")
 
 
 def _now_riyadh() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime(
         "%Y-%m-%d %H:%M")
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 board parity (TFB_WEEKLY_BOARD_PARITY, default off)                   #
+# --------------------------------------------------------------------------- #
+def _board_parity_enabled() -> bool:
+    """v1.1.0 gate - DEFAULT OFF. on / 1 / true / yes arms it."""
+    return (os.getenv(ENV_BOARD_PARITY) or "").strip().lower() in (
+        "on", "1", "true", "yes")
+
+
+def _apply_board_lane_env(sheet_id: Optional[str]) -> Dict[str, str]:
+    """v1.1.0: give this process the shadow_board.yml lane before anything is
+    read. Each BOARD_LANE_ENV knob that is unset or blank takes the board's
+    value (one already set here is kept); DEFAULT_SPREADSHEET_ID, which the
+    Shariah authority reader needs, takes the sheet this run opens (the same
+    resolution order as shadow_board._open_sheet) when it is unset. -> the
+    effective values for the evidence line (the sheet id itself is never
+    returned, only where it came from)."""
+    out: Dict[str, str] = {}
+    for key, value in BOARD_LANE_ENV:
+        if not (os.getenv(key) or "").strip():
+            os.environ[key] = value
+        out[key] = str(os.getenv(key) or "").strip()
+    if (os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip():
+        out["DEFAULT_SPREADSHEET_ID"] = "preset"
+    else:
+        sid = None
+        for v in (sheet_id, os.getenv("TARGET_SHEET_ID"),
+                  os.getenv("TRACK_SHEET_ID")):
+            if v and str(v).strip():
+                sid = str(v).strip()
+                break
+        if sid:
+            os.environ["DEFAULT_SPREADSHEET_ID"] = sid
+            out["DEFAULT_SPREADSHEET_ID"] = "this_sheet"
+        else:
+            out["DEFAULT_SPREADSHEET_ID"] = "missing"
+    return out
+
+
+def _board_cols(*names: str) -> List[int]:
+    """v1.1.0: column indexes by Shadow_Board header name (the producer's own
+    OUT_HEADER), never by position. A name the board does not carry raises
+    ValueError, so a memo is never mailed on a schema it cannot read."""
+    return [sb.OUT_HEADER.index(n) for n in names]
+
+
+def _board_lane_line(lane: Dict[str, Any]) -> str:
+    """v1.1.0: the BOARD LANE evidence text shared by the log line, the
+    memo and the _Run_Log details. Pure."""
+    roi = lane.get("engine_roi") or {}
+    t10 = lane.get("t10_read") or {}
+    env = lane.get("env") or {}
+    return ("lane=shadow_board"
+            f" screen_retired={env.get('TFB_COMPLIANCE_SCREEN_RETIRED', '')}"
+            f" engine_roi={roi.get('mode', 'off')}"
+            f" applied={roi.get('applied', 0)}/{roi.get('blank', 0)}"
+            f" unresolved={roi.get('unresolved', 0)}"
+            f" roi_errors={roi.get('errors', 0)}"
+            f" t10_read={t10.get('first', 'single')}->{t10.get('final', 'single')}"
+            f"/{t10.get('retries', 0)}"
+            f" authority_sheet={env.get('DEFAULT_SPREADSHEET_ID', '')}")
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +232,19 @@ def snapshot(rows: List[List[Any]], scan_verdict: str) -> Dict[str, Any]:
     return {"date": _now_riyadh(),
             "switch": scan_verdict,
             "board": {r[0]: {"status": r[6], "verdict": r[14], "gen2": r[16]}
+                      for r in rows}}
+
+
+def snapshot_by_header(rows: List[List[Any]],
+                       scan_verdict: str) -> Dict[str, Any]:
+    """v1.1.0 (parity on): snapshot() with the four fields bound by
+    Shadow_Board header name, so "gen2" is Gen2 Eligible, not ROI Src."""
+    sym, status, verdict, gen2 = _board_cols(
+        "Symbol", "Shariah Status", "Edge Verdict", "Gen2 Eligible")
+    return {"date": _now_riyadh(),
+            "switch": scan_verdict,
+            "board": {r[sym]: {"status": r[status], "verdict": r[verdict],
+                               "gen2": r[gen2]}
                       for r in rows}}
 
 
@@ -158,6 +313,38 @@ def _hard_gate_rows(rows: List[List[Any]]) -> List[List[Any]]:
     return out
 
 
+def _hard_gate_rows_by_header(rows: List[List[Any]]) -> List[List[Any]]:
+    """v1.1.0 (parity on): the render seam on the current board schema,
+    columns bound by header name. A row that is not Gen2-eligible and still
+    reads TRADE is terminalized as v1.0.3 does ('BLOCKED - <status>', edge
+    economics suppressed); a row the board already BLOCKED keeps its verdict
+    and loses ROI / RT / Net Edge; every other row reads as the Shadow_Board
+    tab reads it. Pure (copies), FAIL-OPEN per row like v1.0.3; a missing
+    header name raises (see _board_cols)."""
+    gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c = _board_cols(
+        "Gen2 Eligible", "Shariah Status", "Edge Verdict", "ROI %",
+        "RT Cost %", "Net Edge %")
+    need = max(gen2_c, status_c, verdict_c, roi_c, rt_c, ne_c)
+    out: List[List[Any]] = []
+    for r in rows or []:
+        try:
+            if (isinstance(r, list) and len(r) > need
+                    and str(r[gen2_c] or "").strip().upper() != "YES"):
+                verdict = str(r[verdict_c] or "").strip()
+                if verdict == "TRADE" or verdict.upper().startswith("BLOCKED"):
+                    c = list(r)
+                    if verdict == "TRADE":
+                        status = str(c[status_c] or "").strip() or "INELIGIBLE"
+                        c[verdict_c] = "BLOCKED \u2014 " + status
+                    c[roi_c] = c[rt_c] = c[ne_c] = "\u2014"
+                    out.append(c)
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        out.append(r)
+    return out
+
+
 def _verdict_headline(scan: Dict[str, Any]) -> Tuple[str, str]:
     if scan["verdict"] == "NO_ACTION":
         return ("لا فعل هذا الأسبوع — الإبقاء على كل المراكز هو التوصية",
@@ -172,13 +359,21 @@ def _verdict_headline(scan: Dict[str, Any]) -> Tuple[str, str]:
     return ar, "SWITCH candidates cleared the arithmetic: " + lines
 
 def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
-                diff, equity, risk=None) -> Tuple[str, str, str]:
-    """-> (subject, text, html)."""
-    rows = _hard_gate_rows(rows)  # v1.0.3: blocks terminate before display
+                diff, equity, risk=None, lane=None) -> Tuple[str, str, str]:
+    """-> (subject, text, html). v1.1.0: lane (parity on only) binds the seam
+    and the columns by header name and adds the BOARD LANE line; lane=None
+    is v1.0.3 byte for byte."""
+    if lane is None:
+        rows = _hard_gate_rows(rows)  # v1.0.3: blocks terminate before display
+    else:
+        rows = _hard_gate_rows_by_header(rows)  # v1.1.0: by header name
     ar, en = _verdict_headline(scan)
     subject = (f"TFB Weekly Decision Brief — {_now_riyadh()[:10]} — "
                f"{scan['verdict']} — SHADOW MODE")
-    key_cols = [0, 3, 4, 5, 6, 11, 12, 14, 15, 16]
+    if lane is None:
+        key_cols = [0, 3, 4, 5, 6, 11, 12, 14, 15, 16]
+    else:
+        key_cols = _board_cols(*MEMO_COLS)  # v1.1.0
     key_hdr = [sb.OUT_HEADER[i] for i in key_cols]
     # v1.0.3 D-2: retired-policy label; the field carries tradability codes.
     key_hdr = ["Status" if h == "Shariah Status" else h for h in key_hdr]
@@ -227,11 +422,16 @@ def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
              f"as_of={ameta.get('as_of')} err={sa.last_error() or '-'} | "
              f"fundamentals {fnd_n}/{cand_n} | p_hit = confidence proxy "
              f"until the calibrator graduates")
+    if lane is not None:                       # v1.1.0 board parity evidence
+        L.append("BOARD LANE | " + _board_lane_line(lane))
     text = "\n".join(L)
 
     def esc(x: Any) -> str:
         return (str(x).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;"))
+    lane_html = ""
+    if lane is not None:                       # v1.1.0 board parity evidence
+        lane_html = "board " + esc(_board_lane_line(lane)) + " &middot;\n"
     tr = "".join
     board_html = tr(
         ["<tr>" + tr(f"<th style='border:1px solid #ccc;padding:4px'>{esc(h)}</th>"
@@ -268,7 +468,7 @@ Suggested weights: {esc(json.dumps(regime.get('suggested_weights') or {}))}<br>
 <p style='color:#666;font-size:11px'>authority rows={ameta.get('rows', 0)}
 as_of={esc(ameta.get('as_of'))} err={esc(sa.last_error() or '-')} ·
 fundamentals {fnd_n}/{cand_n} · p_hit is a labeled proxy ·
-run_weekly_brief v{SCRIPT_VERSION}</p></body></html>"""
+{lane_html}run_weekly_brief v{SCRIPT_VERSION}</p></body></html>"""
     return subject, text, html
 
 
@@ -316,11 +516,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.selftest:
         return _selftest()
 
+    parity = _board_parity_enabled()                     # v1.1.0
+    lane: Optional[Dict[str, Any]] = None
+    if parity:
+        lane = {"env": _apply_board_lane_env(args.sheet_id)}
+
     os.environ.setdefault("TFB_COMPLIANCE_GATE_ENABLED", "1")
     equity = float(os.getenv("TFB_SHADOW_EQUITY_SAR") or "130000")
 
     sh = sb._open_sheet(args.sheet_id)
-    cands = sb.rows_to_records(sh.worksheet(sb.TAB_TOP10).get_all_values())
+    if parity and sb._t10_read_retries() > 0:            # v1.1.0 settled read
+        _t10_vals, cands, t10_info = sb.read_top10_settled(
+            lambda: sh.worksheet(sb.TAB_TOP10).get_all_values(),
+            sb._t10_read_retries(), sb._t10_read_wait_s())
+        lane["t10_read"] = dict(t10_info)
+    else:
+        cands = sb.rows_to_records(sh.worksheet(sb.TAB_TOP10).get_all_values())
     try:
         holds = sb.rows_to_records(sh.worksheet(sb.TAB_HOLDINGS).get_all_values())
     except Exception:  # noqa: BLE001
@@ -329,6 +540,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth = sa.get_authority_index(force=True)
     monitor = sa.get_monitor_map()
     ameta = sa.get_meta()
+    if parity:                                           # v1.1.0 engine ROI
+        roi_mode = sb._engine_roi_mode()
+        roi_counters = {"blank": 0, "applied": 0, "fraction_fixed": 0,
+                        "unresolved": 0}
+        roi_errs: List[str] = []
+        if roi_mode != "off":
+            blanks = [c["symbol"] for c in cands if c.get("roi_pct") is None]
+            roi_map, roi_errs = sb.fetch_engine_roi_map(sh, blanks) \
+                if blanks else ({}, [])
+            roi_counters = sb.apply_engine_roi(cands, roi_map, roi_mode)
+        lane["engine_roi"] = dict(roi_counters, mode=roi_mode,
+                                  errors=len(roi_errs))
     fnd, _fnd_errs = sb.fetch_board_fundamentals([c["symbol"] for c in cands])
     rows, summary = sb.evaluate_board(cands, auth, monitor, equity, fnd)
     ok = sb.eligible_symbols(rows)
@@ -337,15 +560,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     regime = sb.build_regime_block()
 
     prev = load_state(sh)
-    cur = snapshot(rows, scan["verdict"])
+    if parity:
+        cur = snapshot_by_header(rows, scan["verdict"])  # v1.1.0
+    else:
+        cur = snapshot(rows, scan["verdict"])
     diff = compute_diff(prev, cur)
     risk = sb.build_risk_block(cands, ok, fnd)
     subject, text, html = render_memo(rows, summary, scan, regime, ameta,
-                                      len(fnd), len(cands), diff, equity, risk)
+                                      len(fnd), len(cands), diff, equity, risk,
+                                      lane=lane)
 
     verdict = (f"[WEEKLY-BRIEF v{SCRIPT_VERSION}] cands={len(cands)} "
                f"switch={scan['verdict']} entered={len(diff['entered'])} "
                f"exited={len(diff['exited'])} flips={len(diff.get('flips', []))}")
+    if lane is not None:                                 # v1.1.0 evidence
+        print(f"[WEEKLY-BRIEF-PARITY v{SCRIPT_VERSION}] "
+              + _board_lane_line(lane)
+              + f" eligible={summary['compliance_eligible']}"
+              + f" switch={scan['verdict']}")
     if args.dry_run:
         print(verdict)
         print(text)
@@ -354,12 +586,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     mail_status = "SKIPPED" if args.no_mail else send_mail(subject, text, html)
     save_state(sh, cur)
     print(verdict + f" mail={mail_status}")
+    _rl_details: Dict[str, Any] = {"version": SCRIPT_VERSION}
+    if lane is not None:                                 # v1.1.0 evidence
+        _rl_details["board_parity"] = _board_lane_line(lane)
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
              "weekly_brief", "Shadow_Board", "OK",
              verdict + f" mail={mail_status}", "", "", "",
-             json.dumps({"version": SCRIPT_VERSION})],
+             json.dumps(_rl_details)],
             value_input_option="RAW")
     except Exception:  # noqa: BLE001
         pass
@@ -457,6 +692,39 @@ def _selftest() -> int:
     checks.append(("retired label renders as Status (text+html)",
                    "Shariah Status" not in t3 and "Shariah Status" not in h3
                    and "Status" in t3 and "BLOCKED — BROKER_UNTRADABLE" in h3))
+    # v1.1.0: board parity on the current 18-column board (ROI Src at 16).
+    b1 = r1[:16] + ["engine", "YES"]
+    b2 = (r2[:11] + [0.6, "", "", "EDGE_BELOW_COST", 18.2]
+          + ["", "NO"])
+    b3 = r3[:16] + ["", "NO"]
+    lane_fx = {"env": {"TFB_COMPLIANCE_SCREEN_RETIRED": "1",
+                       "DEFAULT_SPREADSHEET_ID": "this_sheet"},
+               "engine_roi": {"mode": "enforce", "applied": 1, "blank": 1,
+                              "unresolved": 0, "errors": 0}}
+    _, t4, h4 = render_memo([b1, b2, b3],
+                            {"compliance_eligible": 2,
+                             "blocked": {"BROKER_UNTRADABLE": 1}},
+                            scan_na, regime, {"rows": 0, "as_of": None},
+                            2, 3, d0, 130000, lane=lane_fx)
+    lines4 = {l.split(" | ")[0]: l for l in t4.splitlines()
+              if l.startswith(("7010.SR", "2269.T", "1015.KL"))}
+    checks.append(("v1.1.0 parity: columns bound by name (Gen2 Eligible, "
+                   "not ROI Src); TRADE + YES row untouched",
+                   "Gen2 Eligible" in t4 and "| ROI Src" not in t4
+                   and lines4["7010.SR"].endswith("| TRADE | 12.1 | YES")))
+    checks.append(("v1.1.0 parity: EDGE_BELOW_COST row reads as the board; "
+                   "TRADE + NO still terminalized",
+                   "EDGE_BELOW_COST" in lines4["2269.T"]
+                   and "BLOCKED" not in lines4["2269.T"]
+                   and "BLOCKED \u2014 BROKER_UNTRADABLE" in lines4["1015.KL"]
+                   and "BOARD LANE | lane=shadow_board" in t4
+                   and "board lane=shadow_board" in h4))
+    snap4 = snapshot_by_header([b1, b2], "NO_ACTION")
+    checks.append(("v1.1.0 parity: state gen2 is Gen2 Eligible",
+                   snap4["board"]["7010.SR"]["gen2"] == "YES"
+                   and snap4["board"]["2269.T"]["gen2"] == "NO"
+                   and dict(BOARD_LANE_ENV).get(
+                       "TFB_COMPLIANCE_SCREEN_RETIRED") == "1"))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)

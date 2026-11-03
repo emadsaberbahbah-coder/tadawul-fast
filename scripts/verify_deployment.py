@@ -283,7 +283,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
     # default strict; workflow-scoped, never on Render).
     ("await_cockpit_receipts", "1.2.0", "after-sync release dispatch (read-only wait)"),
-    ("run_weekly_brief", "1.0.3", "weekly brief"),
+    # 2026-11-03 (pin only): 1.0.3 -> 1.1.0 (the memo binds Shadow_Board columns
+    # by header name and shares the shadow_board.yml lane;
+    # vars.TFB_WEEKLY_BOARD_PARITY, default off; workflow-scoped, never on Render).
+    ("run_weekly_brief", "1.1.0", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
