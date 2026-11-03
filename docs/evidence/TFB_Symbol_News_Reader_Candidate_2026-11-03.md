@@ -6,10 +6,62 @@ times. It also repeats an article across feeds and daily captures. This candidat
 adds a separate reader and a coverage row for each universe/news symbol. The
 installed `v_symbol_news` and `v_symbol_rating` definitions remain unchanged.
 
-**Status:** isolated branch `codex/symbol-news-quality-20261103`, based on main
-`90b9384108771f9fa366492971bf0c3cc4384018`. No cloud view was created, no ingestion
-job was dispatched, and no live report binding was changed by this patch. A local
-test pass is not BigQuery syntax, cost or live-report acceptance evidence.
+**Code status:** [draft PR #903](https://github.com/emadsaberbahbah-coder/tadawul-fast/pull/903),
+branch `codex/symbol-news-quality-20261103`, based on main
+`90b9384108771f9fa366492971bf0c3cc4384018`. The PR remains unmerged. No cloud view
+was created, no ingestion job was dispatched, and no backend deployment occurred.
+The report now uses read-only custom-query sources as recorded below; that live
+report configuration is separate from installing the repository's new views.
+
+## Live report verification — 3 November 2026
+
+The root agent attached whitespace-compacted equivalents of both standalone
+SELECTs through the existing report owner's BigQuery Custom Query connector.
+The connector accepted both schemas and the sources were added to report
+`dcc2db01-69ea-4561-81e1-73622b4d0bea`, news page `p_miszsgex8d`.
+[Open the news page](https://lookerstudio.google.com/reporting/dcc2db01-69ea-4561-81e1-73622b4d0bea/page/p_miszsgex8d).
+The reader replaced only the old news table's source. This did not create SQL
+views or change the installed `v_symbol_news` / `v_symbol_rating` inputs.
+
+The reader's observed BigQuery job link is
+[job_ZIBiNLfduXFX9dvCaNNiLOTGD-6I](https://console.cloud.google.com/bigquery?project=project-2e3530e6-2311-4aa3-b36&j=bq:US:job_ZIBiNLfduXFX9dvCaNNiLOTGD-6I).
+The Cloud Console itself returned **Site Unavailable** in this environment.
+The live rows below establish that the report query executed, but a separate
+server dry-run, estimated/actual bytes, billed cost and latency audit remain
+unverified. The job link alone is not a cost or freshness receipt.
+
+Viewer checks after reload:
+
+| Selected symbol | Observed reader / coverage behavior |
+|---|---|
+| `2222.SR` | Zero archived articles, recent linked articles, undated articles and invalid-link articles. An explicit Arabic explanation says collection status is unknown; absence is not presented as proof that no news exists. |
+| `ITRN.US` | Three distinct articles: 20 October SEC 6-K and 9 / 8 October Yahoo articles. Three archived and three recent linked articles, zero undated and zero invalid-link articles. |
+
+Gate polarity was blank, while the EODHD provider polarity `1.0` appeared
+separately. This is expected: gate event direction and provider text sentiment
+remain different measures. No gate polarity is fabricated or blended into a
+provider score.
+
+The coverage source's **Date range dimension was removed** to keep its fixed
+30-day measure separate from reader-date filtering. A date-change functional
+test is still pending at this evidence checkpoint. Native field-info pop-ups
+for `news_date` and `freshness_state` showed Arabic descriptions after reload;
+descriptions for `time_basis` and `polarity` were also written. Reader data
+freshness was changed from 12 hours to 15 minutes before Done, but persisted
+15-minute configuration after reopening remains unverified.
+
+The news page height is 1500; its coverage table is at top 1200 with height 250,
+Arabic labels and wrapped text. All six symbol selectors previously used
+Show top 5000, which hid supported `ITRN.US` in viewer search. Raising the limit
+to 10000 restored that search. All six selectors now use Show top 10000 and
+have their `snapshot_date` restrictions removed, preserving page-local symbol
+selection. A 10000-item cap is still a cap, not unlimited symbol coverage.
+No five-minute cross-page symbol-reset integration has been implemented or
+verified by this work.
+
+These are browser-observed sample and configuration checks reported by the
+root agent. They do not establish comprehensive collection, complete article
+accuracy, all-symbol filtering, quote freshness or an investment outcome.
 
 ## What changes
 
@@ -113,22 +165,25 @@ That schema and quota change is outside this reader patch.
 - Independent SQL review caught collector/publisher confusion, dropped URL ports
   and permissive URL syntax. All three are corrected and covered by tests.
   Final independent review reran all 12 reader tests and found no blocking
-  static/behavioral defect. BigQuery and Looker verification remain pending.
+  static/behavioral defect. The later live samples above supplement these tests;
+  they do not replace the pending cost and remaining functional checks.
 
-Custom-query route: confirm the existing report really uses
-`project-2e3530e6-2311-4aa3-b36.tfb_archive`; dry-run both exact SELECTs in BigQuery,
-check estimated bytes and authorized existing-source access, then bind the reader
-to the symbol control. The reader scans archived history before dedup; an outer
+Custom-query route: the root agent attached both SELECTs using the existing
+owner-credential connection and observed live samples as recorded above. A
+separate dry-run and estimated/actual bytes check in
+`project-2e3530e6-2311-4aa3-b36.tfb_archive` remains pending because the console
+was unavailable. The reader scans archived history before dedup; an outer
 Looker filter may not be pushed ahead of its windows. Measure query cost and
-refresh latency instead of assuming they are free. No new grant is required by
-the candidate itself.
+refresh latency instead of assuming they are free. No new grant was added.
 
 Keep coverage fixed at 30 days and label it accordingly, **without** the report
-date filter. Put date filtering on the article table only. Keep the quality box
+date filter. Its Date range dimension was removed; date-change behavior remains
+pending. Put date filtering on the article table only. Keep the quality box
 outside publication-date filtering so missing/future dates do not disappear.
-Check a recent-news symbol, a stale-only symbol, an undated symbol and a symbol
-with zero rows. Changing the master symbol must update both article and coverage
-panels; source-field names alone do not prove cross-source filtering works.
+The live recent-news and zero-row samples above are verified. A stale-only
+symbol, an undated symbol and broader filter behavior still need live checks.
+Symbol changes must update both article and coverage panels; source-field names
+alone do not prove cross-source filtering works.
 
 Optional installed-view route: review/merge first, apply with the existing
 controlled BigQuery workflow, and read back all 43 definitions/hashes. This also
