@@ -21,21 +21,25 @@
  * WHAT (Script Property PD_PLAIN_REASONS = on, trimmed, any case; absent or
  * any other word = every cell, row, request and line byte-identical to
  * v1.5.18, apart from that one property read per refresh):
- *  (1) pdIbkrDrift_ (pure): inside pdIbkrApply_, a valid plan's page rows
- *      that link to no IBKR position and the positive IBKR positions no row
- *      represents are paired ONE TO ONE when their share counts are equal
- *      -> [{row, position, quantity}] (a likely ticker change; any doubt =
- *      no pair). Computed, never sent: the request is unchanged.
+ *  (1) pdIbkrDrift_ (pure): inside pdIbkrApply_, a valid FRESH plan's page
+ *      rows (the 14-minute send window; a stale capture may predate the
+ *      rename) that link to no IBKR position and the positive IBKR positions
+ *      no row represents are paired ONE TO ONE when their share counts are
+ *      equal -> [{row, position, quantity}] (a likely ticker change; any
+ *      doubt = no pair). Computed, never sent: the request is unchanged.
  *  (2) pdPlainCodes_ (pure): the reason codes of the payload's BLOCK rows
  *      (Advisor Note 'RECONCILIATION_REQUIRED: a, b' and
- *      detail.reconciliation_status), sorted and unique.
- *  (3) pdPlainLine_ (pure): '' without a BLOCK row; else 'WHY BLOCKED (n of
- *      m holdings): <plain clause per code (code)>. NEXT: <one step>.' The
- *      step follows a fixed priority: a ticker-change pair (rename that row
- *      in _Portfolio_CostBasis), a share-count difference, an unmatched
+ *      detail.reconciliation_status), sorted and unique; BLOCK rows from the
+ *      other gates (no code) are counted apart and keep their own notes.
+ *  (3) pdPlainLine_ (pure): '' without a coded BLOCK row; else 'WHY BLOCKED
+ *      (n of m holdings): <plain clause per code (code)>. NEXT: <one step>.'
+ *      The step follows a fixed priority: a ticker-change pair (rename that
+ *      row in _Portfolio_CostBasis), a share-count difference, an unmatched
  *      row or position, a holding without a current price (wait for the
  *      feed), a missing or stale capture (refresh within 14 minutes of the
- *      next one). The text never contains the words the readers use to
+ *      next one), a cash code (check the cash and the working BUY orders),
+ *      else each row's Advisor Note; the other BLOCK rows are counted at
+ *      the end. The text never contains the words the readers use to
  *      find the ACTIONS header ('action', 'symbol': run_daily_brief
  *      _find_header matches substrings).
  *  (4) pdRenderPayload_ writes the line, merged across the page and
@@ -3886,31 +3890,34 @@ function pdIbkrDrift_(plan, rows) {
 }
 
 /** PURE: the reconciliation codes of the BLOCK rows, sorted and unique, and
- * the counts {codes, blocked, total}. */
+ * the counts {codes, blocked, other, total}: blocked = BLOCK rows carrying a
+ * reconciliation code, other = BLOCK rows from the other gates (cost basis,
+ * thin data, identity: detail.reconciliation_status 'matched', no code --
+ * review fix, Codex P2 on #908), total = every row. */
 function pdPlainCodes_(actions) {
-  var seen = {}, codes = [], blocked = 0, list = actions || [];
+  var seen = {}, codes = [], blocked = 0, other = 0, list = actions || [];
   function add(c) {
     c = String(c || '').replace(/^\s+|\s+$/g, '').toLowerCase();
-    if (/^[a-z0-9_]{1,64}$/.test(c) && c !== 'matched' && !seen.hasOwnProperty(c)) {
-      seen[c] = true; codes.push(c);
-    }
+    if (!/^[a-z0-9_]{1,64}$/.test(c) || c === 'matched') return false;
+    if (!seen.hasOwnProperty(c)) { seen[c] = true; codes.push(c); }
+    return true;
   }
   for (var i = 0; i < list.length; i++) {
-    var a = list[i] || {};
+    var a = list[i] || {}, coded = false;
     if (String(a.action || '').toUpperCase() !== 'BLOCK') continue;
-    blocked++;
     var m = /RECONCILIATION_REQUIRED:\s*([A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*)/
         .exec(String(a.advisor_note || ''));
     if (m) {
       var parts = m[1].split(',');
-      for (var p = 0; p < parts.length; p++) add(parts[p]);
+      for (var p = 0; p < parts.length; p++) coded = add(parts[p]) || coded;
     }
     if (a.detail && typeof a.detail.reconciliation_status === 'string') {
-      add(a.detail.reconciliation_status);
+      coded = add(a.detail.reconciliation_status) || coded;
     }
+    if (coded) blocked++; else other++;
   }
   codes.sort();
-  return {codes: codes, blocked: blocked, total: list.length};
+  return {codes: codes, blocked: blocked, other: other, total: list.length};
 }
 
 /** PURE: the plain clause of one code (the code itself when unknown). */
@@ -3922,8 +3929,10 @@ function pdPlainClause_(code) {
   return code.replace(/_/g, ' ');
 }
 
-/** PURE: '' when no holding is BLOCK; else the one plain line (ASCII):
- * 'WHY BLOCKED (n of m holdings): <clause> (<code>); ... NEXT: <step>.' */
+/** PURE: '' when no BLOCK row carries a reconciliation code (the other
+ * gates explain themselves in each row's Advisor Note); else the one plain
+ * line (ASCII): 'WHY BLOCKED (n of m holdings): <clause> (<code>); ...
+ * NEXT: <step>.' + a count of the other BLOCK rows. */
 function pdPlainLine_(info, drift) {
   if (!info || !info.blocked) return '';
   var why = [], has = {}, i;
@@ -3933,6 +3942,10 @@ function pdPlainLine_(info, drift) {
   }
   function any(list) {
     for (var k = 0; k < list.length; k++) if (has[list[k]]) return true;
+    return false;
+  }
+  function anyRe(re) {
+    for (var k = 0; k < info.codes.length; k++) if (re.test(info.codes[k])) return true;
     return false;
   }
   var pairs = [];
@@ -3953,11 +3966,19 @@ function pdPlainLine_(info, drift) {
   } else if (has.holding_quote_unverified) {
     next = 'wait for a fresh price on every holding (a renamed or delisted listing keeps an ' +
         'old price until the feed switches); funding stays withheld until then';
-  } else {
+  } else if (anyRe(/^(missing_evidence|invalid_evidence|stale_|future_)/)) {
     next = 'refresh within 14 minutes of the next IBKR capture (about :05 past each hour)';
+  } else if (anyRe(/cash|reserv|fx/)) {
+    next = 'check the cash and the working BUY orders in the IBKR capture, then refresh ' +
+        'after the next capture';
+  } else {
+    next = 'read each row\'s Advisor Note for the cause';
   }
+  var other = info.other > 0 ? ' ' + info.other + ' more BLOCK row' +
+      (info.other === 1 ? ' carries' : 's carry') + ' another reason (see its Advisor Note).' : '';
   return 'WHY BLOCKED (' + info.blocked + ' of ' + info.total + ' holdings): ' +
-      (why.length ? why.join('; ') : 'no reason code on the rows') + '. NEXT: ' + next + '.';
+      (why.length ? why.join('; ') : 'no reason code on the rows') + '. NEXT: ' + next + '.' +
+      other;
 }
 
 /** v1.5.19: the plain line, merged across the page and wrapped. */
@@ -3992,7 +4013,9 @@ function pdPlainCoreOk_() {
         drift[0].position === 'SUPN' && drift[0].quantity === '95' && twin.length === 0 &&
         line.indexOf('IBKR lists SUPN where My_Portfolio has INDV.US (same 95 shares)') > 0 &&
         !/action|symbol/i.test(line) &&
-        pdPlainLine_(pdPlainCodes_([{action: 'HOLD'}]), []) === '';
+        pdPlainLine_(pdPlainCodes_([{action: 'HOLD'}]), []) === '' &&
+        pdPlainLine_(pdPlainCodes_([{action: 'BLOCK', advisor_note: 'BLOCKED; missing quantity',
+                                     detail: {reconciliation_status: 'matched'}}]), []) === '';
   } catch (ePc) {
     return false;
   }
@@ -4119,9 +4142,13 @@ function pdIbkrApply_(mode, body) {
       res.linked = plan.linked;
       res.ageMs = plan.ageMs;
       /* v1.5.19: the likely ticker changes, for the plain line only; never
-       * sent, and non-enumerable so the result's keys stay the v1.5.18 ones. */
-      Object.defineProperty(res, 'drift', {value: pdIbkrDrift_(plan, split.kept),
-                                           enumerable: false});
+       * sent, and non-enumerable so the result's keys stay the v1.5.18 ones.
+       * Review fix (Codex P2 on #908): only from a FRESH capture -- a stale
+       * one may predate the rename and would point the hint backwards. */
+      if (fresh) {
+        Object.defineProperty(res, 'drift', {value: pdIbkrDrift_(plan, split.kept),
+                                             enumerable: false});
+      }
     }
     if (mode === 'enforce') {
       var rates = pdIbkrPegRates_(body.fx_rates);

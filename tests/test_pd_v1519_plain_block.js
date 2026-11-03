@@ -310,6 +310,11 @@ const RESP_DRIFT = resp([{action: 'BLOCK', symbol: 'SYNF.US', name: 'Synthetic F
 const RESP_QUOTE = resp([{action: 'BLOCK', symbol: 'SYNF.US', name: 'Synthetic First', advisor_note: NOTE_Q},
                          {action: 'BLOCK', symbol: 'SUPN.US', name: 'Supernus (ex-Indivior)', advisor_note: NOTE_Q}]);
 const RESP_MISSING = resp([{action: 'BLOCK', symbol: 'SYNF.US', name: 'Synthetic First', advisor_note: NOTE_M}]);
+/* review fix (Codex P2 on #908): BLOCK rows of the other gates (certified inputs, detail 'matched', no code) */
+const RESP_OTHER = resp([{action: 'BLOCK', symbol: 'SYNF.US', name: 'Synthetic First', advisor_note: 'BLOCKED; missing quantity', detail: {reconciliation_status: 'matched'}},
+                         {action: 'HOLD', symbol: 'INDV.US', name: 'Indivior'}]);
+const RESP_MIXED = resp([{action: 'BLOCK', symbol: 'SYNF.US', name: 'Synthetic First', advisor_note: NOTE_M},
+                         {action: 'BLOCK', symbol: 'INDV.US', name: 'Indivior', advisor_note: 'BLOCKED; thin data', detail: {reconciliation_status: 'matched'}}]);
 const LINE_DRIFT = 'WHY BLOCKED (2 of 2 holdings): a My_Portfolio row has no matching IBKR position (ticker or currency differ) (custody_unknown); ' +
   'IBKR holds a position that is not on My_Portfolio (unrepresented_positions). NEXT: IBKR lists SUPN where My_Portfolio has INDV.US (same 95 shares) ' +
   '-- likely a ticker change (merger or rename): put the new ticker on that row in _Portfolio_CostBasis, then refresh.';
@@ -317,13 +322,19 @@ const LINE_QUOTE = 'WHY BLOCKED (2 of 2 holdings): a holding has no current pric
   'price on every holding (a renamed or delisted listing keeps an old price until the feed switches); funding stays withheld until then.';
 const LINE_MISSING = 'WHY BLOCKED (1 of 1 holdings): no fresh IBKR capture went with this request (captures are hourly; each is valid for 14 minutes) ' +
   '(missing_evidence). NEXT: refresh within 14 minutes of the next IBKR capture (about :05 past each hour).';
+const LINE_MIXED = 'WHY BLOCKED (1 of 2 holdings): no fresh IBKR capture went with this request (captures are hourly; each is valid for 14 minutes) ' +
+  '(missing_evidence). NEXT: refresh within 14 minutes of the next IBKR capture (about :05 past each hour). 1 more BLOCK row carries another reason (see its Advisor Note).';
 const SCEN = {
   drift: {props: ENFORCE, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_DRIFT},
   quote: {props: ENFORCE, rows: BOARD_RENAMED, files: [driveFile(capWith(SUPN_POS))], response: RESP_QUOTE},
   observe: {props: OBSERVE_IBKR, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_DRIFT},
   ibkrOff: {props: {}, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_MISSING},
   clean: {props: ENFORCE},
-  http500: {props: ENFORCE, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_DRIFT, code: 500}
+  http500: {props: ENFORCE, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_DRIFT, code: 500},
+  // review fixes (Codex P2 x2 on #908): another gate's BLOCK rows; a stale capture with the drift shape
+  otherGate: {props: ENFORCE, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_OTHER},
+  mixed: {props: ENFORCE, rows: BOARD_RENAMED, files: [driveFile(capWith(SUPN_POS))], response: RESP_MIXED},   // every row linked: no ticker pair
+  staleDrift: {props: ENFORCE, rows: BOARD_DRIFT, files: [driveFile(capWith(SUPN_POS))], response: RESP_MISSING, clock: START + 20 * 60000}
 };
 const scen = (k, gate) => world(Object.assign({}, SCEN[k], {props: Object.assign({}, SCEN[k].props, gate === undefined ? {} : {[GATE]: gate})}));
 const vnorm = (lines) => lines.map((l) => String(l).split('[MP-DEC v1.5.18]').join('[MP-DEC v' + NV + ']'));
@@ -410,7 +421,20 @@ function checkQuiet(src) {
   assert.deepEqual(off.writes, expectedWrites(bOff.writes, LINE_MISSING), 'IBKR off: the reason line without a ticker hint');
   const obs = run(scen('observe', 'on'), null, src), bObs = run(scen('observe'), null, baseSource);
   assert.deepEqual(obs.writes, expectedWrites(bObs.writes, LINE_DRIFT), 'observe IBKR mode: the hint comes from the same plan');
+  // review fix (Codex P2 on #908): another gate's BLOCK rows write no line (their notes explain them)
+  const og = run(scen('otherGate', 'on'), null, src), bOg = run(scen('otherGate'), null, baseSource);
+  assert.deepEqual(og.writes, bOg.writes, 'another gate only: no line');
+  const mx = run(scen('mixed', 'on'), null, src), bMx = run(scen('mixed'), null, baseSource);
+  assert.deepEqual(mx.writes, expectedWrites(bMx.writes, LINE_MIXED), 'mixed: the coded row counted, the other named at the end');
+  // review fix (Codex P2 on #908): a stale capture never gives a ticker hint (it may predate the rename)
+  const st = run(scen('staleDrift', 'on'), null, src), bSt = run(scen('staleDrift'), null, baseSource);
+  assert.deepEqual(st.writes, expectedWrites(bSt.writes, LINE_MISSING), 'stale capture: the evidence step, no ticker hint');
+  assert.ok(bSt.b2.indexOf('ibkr evidence NOT SENT') > 0, 'the fixture capture is stale: ' + bSt.b2);
+  const body = () => ({rows: [{Symbol: 'SYNF.US', Currency: 'USD', Quantity: 174}, {Symbol: 'INDV.US', Currency: 'USD', Quantity: 95}], controls: {}, fx_rates: {USD: 3.75}});
+  eq_(run(scen('staleDrift'), 'none', src).ctx.pdIbkrApply_('enforce', body()).drift, undefined, 'stale: no drift on the apply result');
+  assert.deepEqual(plain(run(scen('drift'), 'none', src).ctx.pdIbkrApply_('enforce', body()).drift), [{row: 'INDV.US', position: 'SUPN', quantity: '95'}], 'fresh: the drift');
 }
+function eq_(a, b, m) { assert.equal(a, b, m); }
 function checkPure(src) {
   const c = run(world({props: {}}), 'none', src).ctx;
   const plan = (unlinked, unrep, positions, links) => ({ok: true, unlinked, unrepresented: unrep,
@@ -431,11 +455,13 @@ function checkPure(src) {
   assert.deepEqual(d(plan(['A.US'], ['X'], null, []), [Rw('A.US', 95)]), [], 'a malformed packet never throws');
   const codes = (acts) => plain(c.pdPlainCodes_(acts));
   assert.deepEqual(codes([{action: 'BLOCK', advisor_note: NOTE_CU}, {action: 'BLOCK', advisor_note: NOTE_C}, {action: 'HOLD', advisor_note: NOTE_Q}]),
-    {codes: ['custody_unknown', 'unrepresented_positions'], blocked: 2, total: 3}, 'BLOCK rows only, sorted, unique');
+    {codes: ['custody_unknown', 'unrepresented_positions'], blocked: 2, other: 0, total: 3}, 'BLOCK rows only, sorted, unique');
   assert.deepEqual(codes([{action: 'block', advisor_note: 'x', detail: {reconciliation_status: 'quantity_mismatch'}}, {action: 'BLOCK', detail: {reconciliation_status: 'matched'}}]),
-    {codes: ['quantity_mismatch'], blocked: 2, total: 2}, 'detail status; matched is not a reason');
-  assert.deepEqual(codes([{action: 'BLOCK', advisor_note: 'BLOCKED; RECONCILIATION_REQUIRED: bad code!, stale_positions'}]), {codes: ['bad'], blocked: 1, total: 1}, 'the code list stops at the first non-code');
-  assert.deepEqual(codes(null), {codes: [], blocked: 0, total: 0}, 'no actions');
+    {codes: ['quantity_mismatch'], blocked: 1, other: 1, total: 2}, 'detail status; matched is not a reason, that row is another gate');
+  assert.deepEqual(codes([{action: 'BLOCK', advisor_note: 'BLOCKED; RECONCILIATION_REQUIRED: bad code!, stale_positions'}]), {codes: ['bad'], blocked: 1, other: 0, total: 1}, 'the code list stops at the first non-code');
+  assert.deepEqual(codes([{action: 'BLOCK', advisor_note: 'BLOCKED; missing quantity'}, {action: 'BLOCK', advisor_note: 'BLOCKED; thin data', detail: {reconciliation_status: 'matched'}}]),
+    {codes: [], blocked: 0, other: 2, total: 2}, 'the other gates only');
+  assert.deepEqual(codes(null), {codes: [], blocked: 0, other: 0, total: 0}, 'no actions');
   for (const [code, want] of [['custody_unknown', 'a My_Portfolio row has no matching IBKR position (ticker or currency differ)'], ['stale_positions', 'the IBKR capture is too old'],
     ['future_cash', 'the IBKR capture time is ahead of this clock'], ['cash_overreserved', 'cash could not be certified'], ['reservations_incomplete', 'cash could not be certified'],
     ['invalid_fx', 'cash could not be certified'], ['some_new_code', 'some new code']]) assert.equal(c.pdPlainClause_(code), want, 'clause ' + code);
@@ -446,9 +472,14 @@ function checkPure(src) {
   assert.ok(/^make the share counts/.test(next(['custody_unknown', 'quantity_mismatch', 'holding_quote_unverified'])), 'a share-count difference next');
   assert.ok(/^make every My_Portfolio row match one IBKR position/.test(next(['unrepresented_positions', 'holding_quote_unverified'])), 'an unmatched row or position next');
   assert.ok(/^wait for a fresh price/.test(next(['holding_quote_unverified', 'missing_evidence'])), 'a missing price next');
-  assert.ok(/^refresh within 14 minutes/.test(next(['missing_evidence'])), 'else the next capture');
-  assert.ok(/^refresh within 14 minutes/.test(next([])), 'no code');
-  assert.equal(c.pdPlainLine_({codes: [], blocked: 1, total: 1}, []).indexOf('no reason code on the rows'), 'WHY BLOCKED (1 of 1 holdings): '.length, 'BLOCK without a code');
+  assert.ok(/^refresh within 14 minutes/.test(next(['missing_evidence'])), 'a missing capture: the next capture');
+  assert.ok(/^refresh within 14 minutes/.test(next(['stale_positions'])) && /^refresh within 14 minutes/.test(next(['invalid_evidence'])), 'a stale or invalid capture');
+  assert.ok(/^check the cash and the working BUY orders/.test(next(['reservations_incomplete'])) && /^check the cash/.test(next(['fx_unverified'])), 'a cash code: the cash read');
+  assert.ok(/^read each row's Advisor Note for the cause\.$/.test(next(['some_new_code'])), 'an unknown code: the rows (never a capture step)');
+  assert.ok(/^read each row's Advisor Note/.test(next([])), 'no code at all');
+  assert.equal(c.pdPlainLine_(c.pdPlainCodes_([{action: 'BLOCK', advisor_note: 'BLOCKED; missing quantity', detail: {reconciliation_status: 'matched'}}]), []), '', 'another gate only: no line (review fix, Codex P2 on #908)');
+  assert.ok(/ 2 more BLOCK rows carry another reason \(see its Advisor Note\)\.$/.test(c.pdPlainLine_({codes: ['custody_unknown'], blocked: 1, other: 2, total: 3}, [])), 'the other rows counted (plural)');
+  assert.ok(/ 1 more BLOCK row carries another reason \(see its Advisor Note\)\.$/.test(c.pdPlainLine_({codes: ['custody_unknown'], blocked: 1, other: 1, total: 2}, [])), 'the other row counted (singular)');
   // every clause and every NEXT, with and without a pair: ASCII and never the ACTIONS-header words
   const all = Object.keys(c.PD_PLAIN_TEXT).concat(['stale_positions', 'future_cash', 'cash_missing', 'some_new_code']);
   for (let i = 0; i < all.length; i++) {
@@ -552,9 +583,11 @@ const MUTANTS = [
   ['a line without a BLOCK row', "  if (!info || !info.blocked) return '';", "  if (!info) return '';", checkQuiet],
   ['the drift key enumerable', "                                           enumerable: false});", "                                           enumerable: true});", checkGolden],
   ['the self-test line while off', "  if (pdPlainMode_() === 'on') {\n    report.push('plain block reasons", "  if (true) {\n    report.push('plain block reasons", checkSelfTest],
-  ['matched read as a reason', "c !== 'matched' && ", '', checkPure],
+  ['matched read as a reason', "    if (!/^[a-z0-9_]{1,64}$/.test(c) || c === 'matched') return false;", "    if (!/^[a-z0-9_]{1,64}$/.test(c)) return false;", checkPure],
   ['a header word in a clause', "holding_quote_unverified: 'a holding has no current price (no fresh market quote)'", "holding_quote_unverified: 'a holding has no current price (no symbol quote, no action)'", checkPure],
   ['the line below the header', '  if (plainLine) row = pdWritePlainLine_(sheet, row, plainLine);   /* v1.5.19 */\n  var aRows = [];', '  var aRows = [];', checkReaders],
+  ['the drift from a stale capture', '      if (fresh) {\n        Object.defineProperty(res, \'drift\'', '      if (true) {\n        Object.defineProperty(res, \'drift\'', checkQuiet],
+  ['the capture step for another gate', "  } else if (anyRe(/^(missing_evidence|invalid_evidence|stale_|future_)/)) {", "  } else if (true) {", checkPure],
   ['the price step before the unmatched rows', "  } else if (any(['custody_unknown', 'unrepresented_positions', 'position_identity_mismatch',", "  } else if (has.holding_quote_unverified) {\n    next = 'wait';\n  } else if (any(['custody_unknown', 'unrepresented_positions', 'position_identity_mismatch',", checkPure]
 ];
 

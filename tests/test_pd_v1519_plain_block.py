@@ -30,5 +30,5 @@ def test_pd_v1519_plain_block_native_harness():
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.rstrip().endswith("PASS 9/9"), result.stdout[-2000:]
-    assert "mutants killed 10/10" in result.stdout, result.stdout[-2000:]
+    assert "mutants killed 12/12" in result.stdout, result.stdout[-2000:]
     assert "x2 identical digest" in result.stdout, result.stdout[-2000:]

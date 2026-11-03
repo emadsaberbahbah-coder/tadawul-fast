@@ -225,8 +225,8 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     assert non_ascii == golden["non_ascii_lines"] == 97
     # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
     # 2026-11-02: + 708 lines for v1.5.18 (cash snapshot writer, last-known cash, follow-up retry)
-    # 2026-11-03: + 248 lines for v1.5.19 (plain block reasons, ticker-change hint)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 248
+    # 2026-11-03: + 275 lines for v1.5.19 (plain block reasons, ticker-change hint)
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275
 
 
 def test_added_lines_are_es5_and_ascii(base_source):
