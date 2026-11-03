@@ -1,11 +1,65 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.20.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.21.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.21.0 (2026-11-03) [EXDIV-GUARD] -- THE TICKET GUARD SEES EX-DIVIDEND DATES (KNOB, DEFAULT OFF)
+ * WHY (3 Nov 2026): the 2 Nov 08:49 board issued INDV.US for 12,335 SAR and
+ * the owner bought 95 shares at 17:30. Calendar_Events had read 'INDV.US |
+ * Next Ex-Div Date 2026-11-03 | Days To ExDiv 1' since 16:28 that day; the
+ * dividend was Indivior's 8.13 USD special (declared 17 Sep, paid 6 Nov),
+ * about 22 % of the 36.28 close. The shares opened ex-dividend at 28.15, the
+ * holding read -20 %, the engine plan stop (30.92) sat above the price and
+ * a 30 % US withholding takes about 2.44 USD a share from a Saudi-resident
+ * holder. The v1.20.0 guard holds a ticket for earnings, the owner rule and
+ * a cap; nothing looked at the ex-dividend date or its size.
+ * WHAT: two knobs of the EXISTING guard (DT10_TICKET_GUARD observe |
+ * enforce), read only while it is armed, both default OFF:
+ *   DT10_GUARD_EXDIV_DAYS (integer 0..30; absent, blank or junk = the
+ *   filter is off -- the v1.20.0 guard byte for byte, apart from that one
+ *   property read while the guard is armed) and
+ *   DT10_GUARD_EXDIV_PCT (percent of the ticket price, default 2, clamped
+ *   0..100).
+ * With the days knob set, the refresh-side guard reads the Dividend_Events
+ * tab once per render (scripts/run_calendar_sync.py v1.3.0, TFB_CAL_DIVIDENDS:
+ * Symbol | Ex-Div Date | ... | Amount | Currency | ...) into {SYMBOL:
+ * {days, amount, currency}} (dt10ExDivMapFromValues_, pure; a Riyadh calendar
+ * day like the earnings map; any read failure = an empty map = no ex-div
+ * hold, as for earnings). dt10TicketGuardCore_ gains one filter AFTER
+ * earnings and BEFORE the owner rule and the cap: an executable ticket whose
+ * ex-dividend date is 0..DT10_GUARD_EXDIV_DAYS days away is held when the
+ * dividend is >= DT10_GUARD_EXDIV_PCT % of its native price (same unit),
+ * reason 'ex-dividend in Nd (P.P% of price)', tag 'ex-div Nd P.P%'; when
+ * the size cannot be measured (no amount, another currency, no price) it is
+ * held too, reason 'ex-dividend in Nd (size unknown)', tag 'ex-div Nd ?' --
+ * a special dividend cannot be ruled out. A pence price (GBp / GBX, and
+ * ZAc / ILA: the DT10_FX_SUBUNIT_PARENT keys) is measured only against a
+ * subunit label of the same parent (GBX): the lane upper-cases labels, so a
+ * GBP label may be pounds or 'GBp', and that size reads unknown (the hold
+ * stays; a percentage is never guessed). observe names
+ * them in the existing token; enforce sends them through the existing
+ * research path exactly like an earnings hold. The guard's Logger line gains
+ * ', ex-div <= Nd >= P%' and the self-test a line, only while the knob is
+ * set. Nothing else changes: no other filter, seat, KPI, read or line.
+ * GATES: DT10_GUARD_EXDIV_DAYS (with DT10_TICKET_GUARD observe first, then
+ * enforce) + DT10_GUARD_EXDIV_PCT; the data lane needs the repository
+ * Variable TFB_CAL_DIVIDENDS=on (PR #905).
+ * Functions added (0 removed): dt10ExDivMapFromValues_ (pure), dt10ExDivMap_,
+ * dt10ExDivHold_ (pure). Changed: dt10TicketGuardConfig_ (two knobs while
+ * armed), dt10TicketGuardCore_ (one filter; a fifth argument), dt10TicketGuard_
+ * (the tab read and the Logger suffix while the knob is set), dt10SelfTest
+ * (one line). Vars added: DT10_GUARD_EXDIV_DAYS_PROP, DT10_GUARD_EXDIV_DAYS_MAX,
+ * DT10_GUARD_EXDIV_PCT_PROP, DT10_GUARD_EXDIV_PCT_DEF, DT10_GUARD_EXDIV_PCT_MAX,
+ * DT10_DIVIDEND_SHEET.
+ * Harness: tests/test_dt10_v1210_exdiv_guard.js (REAL file; golden negative
+ * on the v1.20.0 base rebuilt by reversing these edits, SHA-256 pinned).
+ * ROLLBACK: delete DT10_GUARD_EXDIV_DAYS (no re-paste); or re-paste v1.20.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.20.0 (2026-11-02) [TICKET-GUARD / KPI-PLAN-GAIN / VENUE-LINE] -- THREE GATES, DEFAULT OFF
  * WHY (live review, Mon 2 Nov 2026 09:50 Riyadh; the 08:49:43 render read
@@ -2332,7 +2386,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.20.0';
+var DT10_VERSION = '1.21.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3228,6 +3282,14 @@ var DT10_GUARD_EARN_DAYS_MAX = 30;
 var DT10_GUARD_OWNER_RULE_PROP = 'DT10_GUARD_OWNER_RULE';
 var DT10_GUARD_MAX_TICKETS_PROP = 'DT10_GUARD_MAX_TICKETS';
 var DT10_GUARD_MAX_TICKETS_MAX = 50;
+// v1.21.0 [EXDIV-GUARD]: the ex-dividend filter of the same guard (read
+// only while it is armed; absent days knob = the v1.20.0 guard).
+var DT10_GUARD_EXDIV_DAYS_PROP = 'DT10_GUARD_EXDIV_DAYS';
+var DT10_GUARD_EXDIV_DAYS_MAX = 30;
+var DT10_GUARD_EXDIV_PCT_PROP = 'DT10_GUARD_EXDIV_PCT';
+var DT10_GUARD_EXDIV_PCT_DEF = 2;
+var DT10_GUARD_EXDIV_PCT_MAX = 100;
+var DT10_DIVIDEND_SHEET = 'Dividend_Events';
 // The research-context tags a held note keeps: the forward / post-earnings
 // prefix (the dt10UvWithholdRow_ pattern) and the v1.19.0 live-fill suffix.
 var DT10_TGUARD_TAGS_RE = /^((?:\u26a0 earnings \u2264\d+d \u00b7 )?(?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?)/;
@@ -6522,12 +6584,22 @@ function dt10TicketGuardConfig_() {
       return '';
     }
   }
-  return { mode: mode,
+  var cfg = { mode: mode,
            earnDays: dt10StabInt_(read(DT10_GUARD_EARN_DAYS_PROP),
                                   DT10_GUARD_EARN_DAYS_DEF, 0, DT10_GUARD_EARN_DAYS_MAX),
            ownerRule: read(DT10_GUARD_OWNER_RULE_PROP).toLowerCase() === 'on',
            maxTickets: dt10StabInt_(read(DT10_GUARD_MAX_TICKETS_PROP), 0, 0,
                                     DT10_GUARD_MAX_TICKETS_MAX) };
+  // v1.21.0 [EXDIV-GUARD]: two more knobs; an absent / blank / junk days
+  // knob leaves cfg exactly the v1.20.0 object (no exdiv keys at all).
+  var exRaw = read(DT10_GUARD_EXDIV_DAYS_PROP);
+  if (/^\d{1,2}$/.test(exRaw) && Number(exRaw) <= DT10_GUARD_EXDIV_DAYS_MAX) {
+    cfg.exdivDays = Number(exRaw);
+    var pctRaw = read(DT10_GUARD_EXDIV_PCT_PROP), pct = Number(pctRaw);
+    cfg.exdivPct = (pctRaw !== '' && isFinite(pct) && pct >= 0) ?
+        Math.min(pct, DT10_GUARD_EXDIV_PCT_MAX) : DT10_GUARD_EXDIV_PCT_DEF;
+  }
+  return cfg;
 }
 /** v1.20.0 [TICKET-GUARD] PURE: is `t` an EXECUTABLE ticket of the final
  * board -- the dt10TicketClasses_ exec class (neither a grace ghost nor a
@@ -6541,13 +6613,15 @@ function dt10TicketGuardExec_(t) {
 /** v1.20.0 [TICKET-GUARD] PURE: which EXECUTABLE tickets the guard holds,
  * in board order, on an EXECUTABLE feed only (feedOk). The first failing
  * filter wins: (1) earnings -- 0 <= map[SYMBOL] <= cfg.earnDays, map being
- * the v1.6.0 tagger's Calendar_Events {SYMBOL: days to earnings}; (2) owner
+ * the v1.6.0 tagger's Calendar_Events {SYMBOL: days to earnings}; (1b)
+ * v1.21.0 ex-dividend -- only when cfg.exdivDays is a number, divMap
+ * (dt10ExDivMapFromValues_) via dt10ExDivHold_; (2) owner
  * rule -- only when cfg.ownerRule, a ticket for which dt10OwnerRuleCell_
  * (the v1.19.0 Owner Rule predicate) is not 'rule: yes'; (3) cap -- when
  * cfg.maxTickets > 0, a ticket after the first maxTickets survivors.
  * Returns {checked, kept, held: [{index, symbol, kind, reason, tag}]}.
  * Never mutates its input. */
-function dt10TicketGuardCore_(selected, feedOk, map, cfg) {
+function dt10TicketGuardCore_(selected, feedOk, map, cfg, divMap) {
   var out = { checked: 0, kept: 0, held: [] };
   if (feedOk !== true) return out;
   var sel = selected || [];
@@ -6565,6 +6639,9 @@ function dt10TicketGuardCore_(selected, feedOk, map, cfg) {
     var h = null;
     if (typeof d === 'number' && isFinite(d) && d >= 0 && d <= earnDays) {
       h = { kind: 'earn', reason: 'earnings in ' + d + 'd', tag: 'earn ' + d + 'd' };
+    } else if (typeof cfg.exdivDays === 'number' &&
+               (h = dt10ExDivHold_(t, divMap, cfg.exdivDays, cfg.exdivPct)) !== null) {
+      // v1.21.0 [EXDIV-GUARD]: h set by dt10ExDivHold_.
     } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t) !== 'rule: yes') {
       h = { kind: 'rule', reason: 'owner rule', tag: 'owner rule' };
     } else if (cap > 0 && out.kept >= cap) {
@@ -6579,6 +6656,93 @@ function dt10TicketGuardCore_(selected, feedOk, map, cfg) {
     }
   }
   return out;
+}
+/** v1.21.0 [EXDIV-GUARD] PURE: {SYMBOL: {days, amount, currency}} from the
+ * Dividend_Events grid (header row found by its Symbol and Ex-Div Date
+ * tokens; Amount and Currency optional). Days are counted from asOfDate's
+ * Riyadh calendar day like the earnings map; a past or invalid ex-date, a
+ * repeated symbol (the first row wins) or a malformed row is skipped. */
+function dt10ExDivMapFromValues_(values, asOfDate) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, iAmt = -1, iCcy = -1, r, c, cells, tok;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    var s0 = -1, d0 = -1, a0 = -1, c0 = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol') s0 = c;
+      else if (tok === 'exdivdate') d0 = c;
+      else if (tok === 'amount') a0 = c;
+      else if (tok === 'currency') c0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0) { iSym = s0; iDate = d0; iAmt = a0; iCcy = c0; }
+  }
+  if (iSym < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL' || map.hasOwnProperty(sym)) continue;
+    var day = dt10CalendarDay_(cells[iDate]);
+    if (day === null || day < today) continue;
+    var amt = iAmt >= 0 ? cells[iAmt] : null;
+    amt = (typeof amt === 'number' && isFinite(amt) && amt >= 0) ? amt :
+        ((typeof amt === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(amt)) ? Number(amt) : null);
+    var ccy = iCcy >= 0 ? String(cells[iCcy] === null || cells[iCcy] === undefined ?
+        '' : cells[iCcy]).replace(/^\s+|\s+$/g, '').toUpperCase() : '';
+    map[sym] = { days: day - today, amount: amt, currency: ccy };
+  }
+  return map;
+}
+/** v1.21.0 [EXDIV-GUARD]: live Dividend_Events read (DT10_DIVIDEND_SHEET,
+ * columns A:J, bounded like Calendar_Events). ANY failure, an absent tab or
+ * an oversized grid => {} => no ex-dividend hold. Never throws. */
+function dt10ExDivMap_(ss, asOfDate) {
+  try {
+    var sh = ss && ss.getSheetByName(DT10_DIVIDEND_SHEET);
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 10);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10ExDivMapFromValues_(sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
+  } catch (eDv) {
+    return {};
+  }
+}
+/** v1.21.0 [EXDIV-GUARD] PURE: the hold for ticket `t` when its ex-dividend
+ * date is 0..maxDays days away and the dividend is >= pct % of its native
+ * price in the same unit; the size unknown (no amount, another currency, no
+ * price) also holds. A subunit price (GBp / GBX / ZAc / ILA, the
+ * DT10_FX_SUBUNIT_PARENT keys) is compared only with a subunit label of the
+ * same parent (GBX / ZAC / ILA): a parent label (GBP) may be pounds or the
+ * calendar lane's upper-cased 'GBp', so that size reads unknown -- the hold
+ * stays and a percentage is never guessed. null = no hold. */
+function dt10ExDivHold_(t, divMap, maxDays, pct) {
+  var sym = dt10NormSym_(t && t.symbol);
+  var e = (divMap && sym && Object.prototype.hasOwnProperty.call(divMap, sym)) ? divMap[sym] : null;
+  if (!e || typeof e.days !== 'number' || !isFinite(e.days) || e.days < 0 || e.days > maxDays) {
+    return null;
+  }
+  var price = Number(t.price);
+  var raw = String(t.currency === null || t.currency === undefined ? '' : t.currency)
+      .replace(/^\s+|\s+$/g, '');
+  var ccy = raw.toUpperCase(), subs = DT10_FX_SUBUNIT_PARENT;
+  var parent = Object.prototype.hasOwnProperty.call(subs, raw) ? subs[raw] : '';
+  var sameUnit = parent ?
+      (Object.prototype.hasOwnProperty.call(subs, e.currency) && subs[e.currency] === parent) :
+      (ccy !== '' && e.currency === ccy);
+  var minPct = (typeof pct === 'number' && isFinite(pct)) ? pct : DT10_GUARD_EXDIV_PCT_DEF;
+  if (typeof e.amount === 'number' && isFinite(e.amount) && isFinite(price) && price > 0 &&
+      sameUnit) {
+    var share = Math.round(e.amount / price * 1000) / 10;
+    if (share < minPct) return null;
+    return { kind: 'exdiv', reason: 'ex-dividend in ' + e.days + 'd (' + share.toFixed(1) +
+             '% of price)', tag: 'ex-div ' + e.days + 'd ' + share.toFixed(1) + '%' };
+  }
+  return { kind: 'exdiv', reason: 'ex-dividend in ' + e.days + 'd (size unknown)',
+           tag: 'ex-div ' + e.days + 'd ?' };
 }
 /** v1.20.0 [TICKET-GUARD] PURE: the status token (ASCII). observe: 'tguard:
  * would hold SYM(tag) SYM(tag)' or 'tguard: would hold none'; enforce:
@@ -6673,7 +6837,9 @@ function dt10TicketGuard_(payload, map, ss) {
   try {
     if (!map || typeof map !== 'object') map = dt10EarningsMap_(ss);
     var feedOk = !!(payload._dt10_uv && payload._dt10_uv.state === 'EXECUTABLE');
-    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg);
+    // v1.21.0 [EXDIV-GUARD]: one Dividend_Events read, only while the knob is set.
+    var divMap = typeof tg.exdivDays === 'number' ? dt10ExDivMap_(ss) : null;
+    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg, divMap);
     var tail = '';
     if (tg.mode === 'enforce' && res.held.length) {
       var k = payload.kpis || {};
@@ -6693,7 +6859,9 @@ function dt10TicketGuard_(payload, map, ss) {
         res.checked + ' executable ticket(s)' + (parts.length ? ': ' + parts.join(' ') : '') +
         ' | earnings <= ' + dt10StabInt_(tg.earnDays, DT10_GUARD_EARN_DAYS_DEF, 0,
                                          DT10_GUARD_EARN_DAYS_MAX) + 'd, owner rule ' +
-        (tg.ownerRule === true ? 'on' : 'off') + ', cap ' + (cap > 0 ? cap : 'none') + tail);
+        (tg.ownerRule === true ? 'on' : 'off') + ', cap ' + (cap > 0 ? cap : 'none') +
+        (typeof tg.exdivDays === 'number' ? ', ex-div <= ' + tg.exdivDays + 'd >= ' +
+            tg.exdivPct + '%' : '') + tail);
     return dt10TicketGuardToken_(res, tg.mode);
   } catch (eTg) {
     try {
@@ -11292,6 +11460,45 @@ function dt10SelfTest() {
        ? 'ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; ' + tgApply + ')'
        : 'FAIL [' + tgSyms(tgE) + ' | ' + tgSyms(tgR) + ' | ' + tgSyms(tgC) + ' | ' +
          tgApply + ']'));
+  /* v1.21.0 [EXDIV-GUARD]: only while DT10_GUARD_EXDIV_DAYS is set (the
+     self-test is the v1.20.0 report otherwise): the knobs and a pure battery
+     -- INDV.US 8.13 on 36.28 (22.4 %) ex in 1d holds; FRST.US 0.10 on 15.00
+     (0.7 %) ex in 4d passes at 2 % and holds at 0.5 %; a GBP dividend on a
+     USD ticket is 'size unknown'; 5 days out passes at 3; a past date never
+     holds; on a GBp price of 152.2 a GBX 3.85 is 2.5 % (held) and a GBP
+     label reads 'size unknown'; earnings wins. */
+  if (tgCfgNow && typeof tgCfgNow.exdivDays === 'number') {
+    var exMap = dt10ExDivMapFromValues_([
+        ['Symbol', 'Ex-Div Date', 'Days To ExDiv', 'Amount', 'Currency'],
+        ['INDV.US', '2026-11-03', 1, 8.13, 'USD'], ['FRST.US', '2026-11-06', 4, 0.1, 'USD'],
+        ['GBX.US', '2026-11-03', 1, 0.5, 'GBP'], ['FAR.US', '2026-11-07', 5, 9, 'USD'],
+        ['OLD.US', '2026-11-01', -1, 9, 'USD'], ['BBX.L', '2026-11-04', 2, 3.85, 'GBX'],
+        ['BBP.L', '2026-11-04', 2, 0.0385, 'GBP']], '2026-11-02');
+    var exT = function (sym, px, ccy) {
+      return { symbol: sym, price: px, currency: ccy || 'USD', suggested_sar: 1000,
+               suggested_shares: 10, advisor_note: 'INVEST ' + sym, detail: {} };
+    };
+    var exBoard = [exT('INDV.US', 36.28), exT('FRST.US', 15), exT('GBX.US', 20),
+                   exT('FAR.US', 30), exT('OLD.US', 30), exT('BBX.L', 152.2, 'GBp'),
+                   exT('BBP.L', 152.2, 'GBp')];
+    var exA = dt10TicketGuardCore_(exBoard, true, {}, { earnDays: 3, exdivDays: 3, exdivPct: 2 }, exMap);
+    var exB = dt10TicketGuardCore_(exBoard, true, {}, { earnDays: 3, exdivDays: 4, exdivPct: 0.5 }, exMap);
+    var exE = dt10TicketGuardCore_(exBoard, true, { 'INDV.US': 0 }, { earnDays: 3, exdivDays: 3 }, exMap);
+    var exOk = tgSyms(exA) === 'INDV.US:exdiv,GBX.US:exdiv,BBX.L:exdiv,BBP.L:exdiv/7/3' &&
+        tgSyms(exB) === 'INDV.US:exdiv,FRST.US:exdiv,GBX.US:exdiv,BBX.L:exdiv,BBP.L:exdiv/7/2' &&
+        tgSyms(exE) === 'INDV.US:earn,GBX.US:exdiv,BBX.L:exdiv,BBP.L:exdiv/7/3' &&
+        exA.held[0].reason === 'ex-dividend in 1d (22.4% of price)' &&
+        exA.held[1].tag === 'ex-div 1d ?' && exA.held[2].tag === 'ex-div 2d 2.5%' &&
+        exA.held[3].tag === 'ex-div 2d ?' &&
+        dt10TicketGuardToken_(exA, 'observe') ===
+            'tguard: would hold INDV.US(ex-div 1d 22.4%) GBX.US(ex-div 1d ?) ' +
+            'BBX.L(ex-div 2d 2.5%) BBP.L(ex-div 2d ?)';
+    report.push('ticket guard ex-div (DT10_GUARD_EXDIV_DAYS): <= ' + tgCfgNow.exdivDays +
+        'd, >= ' + tgCfgNow.exdivPct + '% of price, tab ' + DT10_DIVIDEND_SHEET + ' | core: ' +
+        (exOk ? 'ok (INDV 22.4% held, FRST 0.7% passes at 2% and holds at 0.5%, GBP size unknown, ' +
+                'GBX on a GBp price measured, earnings first)' : 'FAIL [' + tgSyms(exA) + ' | ' +
+                tgSyms(exB) + ' | ' + tgSyms(exE) + ']'));
+  }
   /* v1.20.0 [KPI-PLAN-GAIN]: property line (the gate, and the label marker
      while the gate is not on) + the pure sum on the same board: 1000 x 0.20
      + 2000 x 0.10 + 3000 x 0.15 + 4000 x 0.05 = 1,050 SAR (E has no plan);
