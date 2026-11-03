@@ -101,6 +101,12 @@ def test_d1_detail_rules(cp):
     assert got["amount"] == 8.33 and got["items"] == 2 and got["period"] == "Other/Quarterly"
     mixed = f([INDV_DIV, dict(INDV_DIV, currency="GBP")], TODAY)
     assert mixed["amount"] is None and mixed["currency"] == "MIXED"
+    # review fix (Codex P2 on PR #905): a declaration without a currency next to
+    # one with a currency is not summed into a currency-qualified total
+    partial = f([dict(INDV_DIV, value=1.0), dict(INDV_DIV, value=2.0, currency=None)], TODAY)
+    assert partial["amount"] is None and partial["currency"] == "MIXED"
+    blank = f([dict(INDV_DIV, value=1.0, currency=""), dict(INDV_DIV, value=2.0, currency=None)], TODAY)
+    assert blank["amount"] == 3.0 and blank["currency"] is None, "no currency claimed at all"
     assert f([dict(INDV_DIV, value=None, unadjustedValue="8.13")], TODAY)["amount"] == 8.13
     assert f([dict(INDV_DIV, value="n/a", unadjustedValue=None)], TODAY)["amount"] is None
     assert f([dict(INDV_DIV, value=-1)], TODAY)["amount"] is None
@@ -331,6 +337,25 @@ def test_d5_on_first_run_creates_the_tab_after_the_calendar(monkeypatch, capsys)
     assert prov.detail_calls == [["INDV.US", "FRST.US", "ZTO.US"]]
     assert "dividends: with=2 fresh=2 carried=0 -> Dividend_Events" in err
     assert "dividends: wrote 2 rows -> Dividend_Events" in err
+
+
+def test_d5b_calendar_resurrection_never_reaches_the_dividend_lane(monkeypatch, capsys):
+    """Review fix (Codex P2 on PR #905): a symbol the calendar resurrects from
+    its prior tab (no longer harvested) is neither fetched nor carried."""
+    cal_prior = [list(sync.HEADERS),
+                 ["GONE.US", "2026-11-20", 18, "2026-11-10", 8, ASOF, "eodhd via calendar_provider v1.3.2"]]
+    div_prior = [list(sync.DIV_HEADERS),
+                 ["GONE.US", "2026-11-10", 8, 5.0, "USD", "", "", "Other", ASOF, "eodhd"]]
+    cal, divs = Sheet(cal_prior, cols=7), Sheet(div_prior, cols=10)
+    book = Book(cal, ["INDV.US"], dividends=divs)
+    rc, prov = _run(monkeypatch, book, gate="on")
+    capsys.readouterr()
+    assert rc == 0
+    cal_body = [r[0] for r in cal.requests[0]["values"][1:] if r[0]]
+    assert "GONE.US" in cal_body, "the calendar's own resurrection is unchanged"
+    assert prov.detail_calls == [["INDV.US"]], "only the harvest is fetched"
+    div_body = [r[0] for r in divs.requests[0]["values"][1:] if r[0]]
+    assert div_body == ["INDV.US"], "a resurrected symbol is not carried into Dividend_Events"
 
 
 def test_d6_on_existing_tab_carry_expire_and_extent(monkeypatch, capsys):

@@ -152,7 +152,8 @@ from zoneinfo import ZoneInfo
 # special from a 0.7 % quarterly payment. WHAT: TFB_CAL_DIVIDENDS = off
 # (DEFAULT: nothing below runs; this tab, its reads, writes and every log
 # line are v1.2.0 byte for byte) | on. When on, AFTER the Calendar_Events
-# publication (which is unchanged) the same decision symbols go to
+# publication (which is unchanged) the HARVESTED decision symbols (before the
+# calendar's sticky resurrection - review fix, Codex P2 on PR #905) go to
 # calendar_provider v1.4.0 fetch_next_exdiv_detail_sync() and a SEPARATE tab
 # (TFB_CAL_DIVIDENDS_SHEET, default Dividend_Events) is replaced in one
 # atomic A1:J update: Symbol | Ex-Div Date | Days To ExDiv | Amount |
@@ -854,6 +855,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if write and type(e).__name__ != "WorksheetNotFound":
             _out("ERROR: cannot establish prior event provenance — preserving tab")
             return 2
+    harvested = list(symbols)   # v1.3.0 review fix: the dividend lane's universe
     symbols, ctx, carried, n_fill, n_res = apply_sticky(symbols, ctx, prior)
     if len(symbols) > _MAX_CALENDAR_BODY_ROWS:
         _out("ERROR: merged calendar exceeds bounded full-table capacity — preserving tab")
@@ -884,7 +886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for r in rows[:15]:
             _out("  " + " | ".join(str(c) for c in r))
         if _dividends_enabled():   # v1.3.0 (default off)
-            dividend_lane(book, symbols, write=False)
+            dividend_lane(book, harvested, write=False)
         _out("dry-run — nothing written (pass --write to publish)")
         return 0
 
@@ -929,7 +931,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"ERROR: sheet publication unconfirmed: {e}; read back before retrying")
         return 3
     if _dividends_enabled():   # v1.3.0 (default off): after the calendar publication
-        return dividend_lane(book, symbols, write=True)
+        return dividend_lane(book, harvested, write=True)
     return 0
 
 

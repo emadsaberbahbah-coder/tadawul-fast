@@ -21,9 +21,11 @@ wrapper). The same per-symbol EODHD /div/ request as fetch_next_exdiv_map
 concurrency, one failed symbol drops only itself) returns, for the EARLIEST
 future ex-date: ex_date, amount (the 'value' field, else 'unadjustedValue';
 several declarations on that date in one currency are summed), currency
-(None when the payload has none; 'MIXED' with amount None when the same day
-carries two currencies), pay_date, record_date, declaration_date, period
-(the payload's label, e.g. Quarterly or Other) and items (the count summed).
+(None when no declaration names one; 'MIXED' with amount None when the same
+day carries two currencies, or a declaration with a currency next to one
+without - review fix, Codex P2 on PR #905), pay_date, record_date,
+declaration_date, period (the payload's label, e.g. Quarterly or Other) and
+items (the count summed).
 Nothing else changes: fetch_next_exdiv_map, fetch_event_context and every
 other function, request and log line are v1.3.2 byte for byte; the only
 caller is scripts/run_calendar_sync.py v1.3.0 behind TFB_CAL_DIVIDENDS
@@ -797,10 +799,13 @@ def _div_detail_of(payload: Any, today: _dt.date) -> Optional[Dict[str, Any]]:
         return None
     best = min(d for d, _it in dated)
     same = [it for d, it in dated if d == best]
-    currencies = sorted({str(it.get("currency") or "").strip().upper()
-                         for it in same if str(it.get("currency") or "").strip()})
+    labels = [str(it.get("currency") or "").strip().upper() for it in same]
+    currencies = sorted({c for c in labels if c})
     amounts = [_div_amount(it) for it in same]
-    if len(currencies) > 1:
+    if len(currencies) > 1 or (currencies and "" in labels):
+        # Review fix (Codex P2 on PR #905): two currencies, or a declaration
+        # without one next to a declaration with one, cannot be summed into a
+        # currency-qualified total -> no amount, currency MIXED.
         amount, currency = None, "MIXED"
     else:
         amount = None if any(a is None for a in amounts) else round(sum(amounts), 6)
