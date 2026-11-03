@@ -568,7 +568,7 @@ function seatRow(run, sym) { for (const r of run.seats) if (r[1] === sym) return
 const stripToken = s => String(s).replace(/, qhold: (?:would hold|held) \d+(?: [A-Z0-9.]+)*/, '');
 /* The version string reaches the meta footer, the B2 status line, the Logger lines and the
  * run-marker property; comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19|20)\.0/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19|20|21)\.0/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too
 
 /* ============================================================ battery */
 function battery() {
@@ -580,9 +580,9 @@ function battery() {
   test('T0 base oracle is the reviewed v1.18.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1180_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.18.0', 'base version');
-    eq(N.DT10_VERSION, '1.20.0', 'delivered version');   // 2026-11-02: v1.20.0 pins moved
-    ok(/^ \* Version: 1\.20\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    ok(newSource.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.21.0', 'delivered version');   // 2026-11-02: v1.20.0 pins moved
+    ok(/^ \* Version: 1\.21\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
+    ok(newSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'DT10_VERSION literal');
     ok(/^ \* Version: 1\.19\.0 /.test(s1190.split('\n')[3]) && s1190.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'rebuilt v1.19.0 lockstep');
     eq(N.DT10_QUALIFIED_HOLD_PROP, HOLD); eq(N.DT10_SEAT_LIVE_FILL_PROP, LIVE); eq(N.DT10_OWNER_RULE_PROP, RULE);
     eq(N.DT10_OWNER_RULE_ROI_MAX, 34, 'the owner rule threshold is a display constant');
@@ -862,7 +862,7 @@ function battery() {
 
   test('T6 embedded dt10SelfTest: the three new core lines ok, property lines follow the properties, every base line kept, zero FAIL; the base lacks the lines', () => {
     const rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
-    ok(rep.indexOf('[DT10 v1.20.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
+    ok(rep.indexOf('[DT10 v1.21.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
     for (const l of ['qualified hold (DT10_QUALIFIED_HOLD): off (off = v1.18.0 board; observe lists; enforce holds)', 'qualified hold core: ok',
       'seat live fill (DT10_SEAT_LIVE_FILL): off (off = v1.18.0 render)', 'seat live fill core: ok',
       'owner rule mark (DT10_OWNER_RULE_MARK): off (High + Engine ROI 12M < 34; display only)', 'owner rule core: ok']) {
