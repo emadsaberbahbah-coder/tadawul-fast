@@ -50,14 +50,38 @@ const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '10_My_Portfo
 const BASE_SHA = 'd1927aeb25306ad5e8c34621800ee08f6492a8aef35754593793e043b0ea6a57';   // v1.5.17 (origin/main 953f84e2)
 const BASE_COMMIT = '953f84e2';
 const newSource = fs.readFileSync(NEW_PATH, 'utf8');
-/* merge note 2026-11-02 (#780): panel preserve is v1.5.19 over this v1.5.18 (PD_PANEL_PRESERVE, default off;
- * tests/js/pf_panel_preserve.test.js). The delivered file may sit above v1.5.18, so the version it prints is
- * read from its own PD_VERSION (floor 1.5.18, header line in lockstep), and the inventory and the added-line
- * bounds also count #780's three panel-preserve functions and its 151 lines not in the v1.5.17 base. */
-const PDV = (newSource.match(/^var PD_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1] || '?';
-const PD780 = ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'];
-const PD780_ADDED_LINES = 151;
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+// 2026-11-03: v1.5.19 (plain block reasons, PD_PLAIN_REASONS default off) stacked on this change; pins moved.
+// Behaviour runs on the delivered file (its version token is NV; its one PD_PLAIN_REASONS read per refresh is
+// counted apart); T0 and the T9 lint / inventory check the v1.5.18 file rebuilt from it (the v1.5.19 hunks of
+// tests/js/pd_edits_v1519.json reversed, SHA-256 pinned).
+const NV = (newSource.match(/^var PD_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1] || '?';
+const V1518_SHA = '62b15eaa5eda541b867cd5fd667b71bbcd15c53732a730636ce0056d70f7f973';   // v1.5.18 (origin/main 8478029d)
+/* merge note 2026-11-03 (#780): panel preserve is v1.5.20 over #908's v1.5.19 (PD_PANEL_PRESERVE, default off;
+ * tests/js/pf_panel_preserve.test.js). A delivered file above v1.5.19 is first rebuilt into the v1.5.19 file (the
+ * v1.5.20 hunks of tests/js/pd_edits_v1520.json reversed, SHA-256 pinned), then into v1.5.18 as above, so the
+ * V1518_SHA pin, T0 and T9 are unchanged; behaviour still runs on the delivered file. */
+const V1519_SHA = '4f246be194a7ce5ade7a53e56381c19b44c20055608e33979584e47aeccfe584';   // v1.5.19 (origin/main 3e326e26)
+function v1519Of(src) {
+  if (/^var PD_VERSION = '1\.5\.19';$/m.test(src)) return src;
+  let out = src;
+  for (const [cur, prev] of JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1520.json'), 'utf8'))) {
+    if (out.split(cur).length !== 2) return null;
+    out = out.replace(cur, () => prev);
+  }
+  return sha256(out) === V1519_SHA ? out : null;
+}
+function v1518Of(src) {
+  if (/^var PD_VERSION = '1\.5\.18';$/m.test(src)) return src;
+  let out = v1519Of(src);   // merge note 2026-11-03 (#780)
+  if (out === null) return null;
+  for (const [cur, prev] of JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1519.json'), 'utf8'))) {
+    if (out.split(cur).length !== 2) return null;
+    out = out.replace(cur, () => prev);
+  }
+  return sha256(out) === V1518_SHA ? out : null;
+}
+const s1518 = v1518Of(newSource);
 
 function loadBase() {
   const candidates = [];
@@ -324,7 +348,7 @@ function battery(source, opts) {
   const EXPECTED_ROW = [
     '2026-11-01T21:00:00.000Z', '10:06:12', 'SNAPSHOT (IBKR capture)', 0, 72747, 0,
     'ibkr-capture:' + FILE_NAME + '; captured_at 2026-11-02T07:06:12.000Z; written 2026-11-02 10:11 Riyadh, age 5m; ' +
-      'settled 19399.2 USD, reserved 0 USD; FX policy://sama-usd-peg-3.75 @ 3.75; writer 10_My_Portfolio v' + PDV,
+      'settled 19399.2 USD, reserved 0 USD; FX policy://sama-usd-peg-3.75 @ 3.75; writer 10_My_Portfolio v' + NV,
     'IBKR (ibkr-primary)', 'USD', 'settled_cash', 19399.2, 3.75, '2026-11-02T10:06:12+03:00'];
   const OBSERVE_TOKEN = ' | [cash-snapshot-observe] would append (2026-11-02 10:06:12 Riyadh; IBKR (ibkr-primary); ' +
     'USD 19399.2 settled_cash; 72747.00 SAR; FX 3.75 policy://sama-usd-peg-3.75; delta 0; ibkr-capture:' + FILE_NAME + ')';
@@ -333,10 +357,11 @@ function battery(source, opts) {
 
   section('T0 compile, version lockstep, base oracle', () => {
     new vm.Script(source, {filename: 'new.gs'});
-    assert.equal((source.match(/^var PD_VERSION = '/mg) || []).length, 1);   // merge note 2026-11-02 (#780): floor 1.5.18
-    assert.equal((source.match(/^var PD_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1], PDV);
-    assert.ok(PDV.split('.').map(Number).reduce((a, x) => a * 1000 + x, 0) >= 1005018, 'PD_VERSION floor 1.5.18: ' + PDV);
-    assert.ok(new RegExp('^ \\* Version: ' + PDV.replace(/\./g, '\\.') + '$', 'm').test(source));
+    assert.equal((source.match(/^var PD_VERSION = '/mg) || []).length, 1);
+    assert.ok(s1518 !== null && sha256(s1518) === V1518_SHA, 'the rebuilt v1.5.18 file (SHA-256 pinned)');
+    assert.equal((s1518.match(/^var PD_VERSION = '1\.5\.18';$/mg) || []).length, 1);
+    assert.ok(/^ \* Version: 1\.5\.18$/m.test(s1518));
+    assert.ok(new RegExp('^ \\* Version: ' + NV.replace(/\./g, '\\.') + '$', 'm').test(source) && NV >= '1.5.18', 'delivered lockstep ' + NV);
     assert.ok(source.indexOf(' * v1.5.18 (2026-11-02)  (CASH EVIDENCE ROW') > 0);
     assert.ok(source.indexOf(' * v1.5.17 (2026-10-28)  (D1b POST-EARNINGS INPUTS') > 0, 'prior WHY kept');
     if (base) {
@@ -379,12 +404,13 @@ function battery(source, opts) {
           assert.deepEqual(r.post, b.post, label);
           assert.deepEqual(r.writes, b.writes, label);
           /* Logger lines carry the version token of the file under test */
-          assert.deepEqual(r.logs, b.logs.map((l) => l.replace(/\[MP-DEC v1\.5\.17\]/g, '[MP-DEC v' + PDV + ']')), label);
+          assert.deepEqual(r.logs, b.logs.map((l) => l.replace(/\[MP-DEC v1\.5\.17\]/g, '[MP-DEC v' + NV + ']')), label);
           assert.deepEqual(r.w.runLog, bw.runLog, label);
           assert.deepEqual(r.w.triggers, bw.triggers, label);
           const extra = r.w.propReads.filter((k) => k === 'PD_CASH_SNAPSHOT_WRITE').length;
-          const others = r.w.propReads.filter((k) => k !== 'PD_CASH_SNAPSHOT_WRITE');
+          const others = r.w.propReads.filter((k) => k !== 'PD_CASH_SNAPSHOT_WRITE' && k !== 'PD_PLAIN_REASONS');
           assert.deepEqual(others, bw.propReads, label + ': the other property reads are the base reads');
+          assert.equal(r.w.propReads.filter((k) => k === 'PD_PLAIN_REASONS').length, NV === '1.5.18' ? 0 : 1, label + ': v1.5.19 reads PD_PLAIN_REASONS once');
           assert.equal(extra, label === 'ibkr off' ? 0 : 1, label + ': exactly one PD_CASH_SNAPSHOT_WRITE read');
         }
       }
@@ -432,8 +458,8 @@ function battery(source, opts) {
     const row = w.runLog[0];
     assert.equal(row[1], 'INFO'); assert.equal(row[2], 'pdCashSnapApply_'); assert.equal(row[3], '_Cash_Snapshot');
     assert.equal(row[4], 'OK');
-    assert.equal(row[5], '[MP-DEC v' + PDV + '] cash snapshot appended for 2026-11-02 (capture 10:06 Riyadh, age 5m)');
-    assert.deepEqual(JSON.parse(row[9]), {version: PDV, mode: 'on', date: '2026-11-02', age_ms: 288000});
+    assert.equal(row[5], '[MP-DEC v' + NV + '] cash snapshot appended for 2026-11-02 (capture 10:06 Riyadh, age 5m)');
+    assert.deepEqual(JSON.parse(row[9]), {version: NV, mode: 'on', date: '2026-11-02', age_ms: 288000});
     for (const l of r.logs.concat([row[5], row[9]])) for (const s of SECRETS) assert.equal(l.indexOf(s), -1, 'log carries ' + s);
     /* a second fresh capture the same day: the property short-circuits (no sheet read), nothing appended */
     const later = CAP_MS + 3600000;
@@ -623,7 +649,7 @@ function battery(source, opts) {
       const r = run(w, call || 'pdIbkrEvidenceFollowUp', src);
       return {r: r, w: w, rendered: rendered, line: w.runLog[0] ? w.runLog[0][5] : '', row: w.runLog[0]};
     }
-    const SKIP = '[MP-DEC v' + PDV + '] evidence follow-up -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared)';
+    const SKIP = '[MP-DEC v' + NV + '] evidence follow-up -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared)';
     /* off / absent / junk: no trigger, the base line, row and details */
     for (const raw of [undefined, 'off', 'yes', '1', 'true', 'enforce']) {
       const x = fu({props: raw === undefined ? {} : {PD_IBKR_FOLLOWUP_RETRY: raw}});
@@ -631,11 +657,11 @@ function battery(source, opts) {
       assert.deepEqual(x.w.triggers, [], 'no trigger when ' + raw);
       assert.equal(x.line, SKIP);
       assert.equal(x.row[2], 'pdIbkrEvidenceFollowUp'); assert.equal(x.row[4], 'SKIPPED');
-      assert.deepEqual(JSON.parse(x.row[9]), {version: PDV, go: false});
+      assert.deepEqual(JSON.parse(x.row[9]), {version: NV, go: false});
       assert.equal(x.rendered, 0);
       if (base) {
         const b = fu({props: raw === undefined ? {} : {PD_IBKR_FOLLOWUP_RETRY: raw}}, null, base);
-        assert.equal(b.line, SKIP.replace('v' + PDV, 'v1.5.17'));
+        assert.equal(b.line, SKIP.replace('v' + NV, 'v1.5.17'));
         assert.deepEqual(b.w.triggers, [], 'GOLDEN NEGATIVE: the base never arms a retry');
         assert.deepEqual(JSON.parse(b.row[9]), {version: '1.5.17', go: false});
       }
@@ -646,7 +672,7 @@ function battery(source, opts) {
     assert.equal(on.r.ret, 'skipped: cockpit refresh in progress');
     assert.deepEqual(on.w.triggers.map((t) => [t.getHandlerFunction(), t.spec]), [['pdIbkrEvidenceFollowUpRetry', {after: 180000}]]);
     assert.equal(on.line, SKIP.replace('trigger cleared)', 'trigger cleared; retry armed (+3m) (packet 11m old at the retry))'));
-    assert.deepEqual(JSON.parse(on.row[9]), {version: PDV, go: false, retry: 'retry armed (+3m) (packet 11m old at the retry)'});
+    assert.deepEqual(JSON.parse(on.row[9]), {version: NV, go: false, retry: 'retry armed (+3m) (packet 11m old at the retry)'});
     assert.ok(on.r.logs.some((l) => l === on.line));
     /* on, but the packet would be too old at the retry: not armed, said so */
     const late = fu({props: {PD_IBKR_FOLLOWUP_RETRY: 'on'}, ageMs: 12 * 60000});
@@ -657,29 +683,29 @@ function battery(source, opts) {
     /* on, another skip reason: nothing */
     const quiet = fu({props: {PD_IBKR_FOLLOWUP_RETRY: 'on'}, world: {chain: () => ({automationAllowed: true, inflight: false, cockpitRunning: false, quiet: true})}});
     assert.deepEqual(quiet.w.triggers, []);
-    assert.equal(quiet.line, '[MP-DEC v' + PDV + '] evidence follow-up -> skipped: quiet window (quiet window; trigger cleared)');
+    assert.equal(quiet.line, '[MP-DEC v' + NV + '] evidence follow-up -> skipped: quiet window (quiet window; trigger cleared)');
     /* on and the cockpit free: rendered, no trigger */
     const free = fu({props: {PD_IBKR_FOLLOWUP_RETRY: 'on'}, busy: false});
     assert.equal(free.r.ret, 'rendered'); assert.equal(free.rendered, 1); assert.deepEqual(free.w.triggers, []);
-    assert.equal(free.line, '[MP-DEC v' + PDV + '] evidence follow-up -> rendered (packet age 8m; trigger cleared)');
+    assert.equal(free.line, '[MP-DEC v' + NV + '] evidence follow-up -> rendered (packet age 8m; trigger cleared)');
     /* the retry run: clears its trigger, marks the line and the row, renders when free */
     const retryFree = fu({props: {PD_IBKR_FOLLOWUP_RETRY: 'on'}, busy: false, ageMs: 11 * 60000}, 'pdIbkrEvidenceFollowUpRetry');
     assert.equal(retryFree.r.ret, 'rendered'); assert.equal(retryFree.rendered, 1);
     assert.deepEqual(retryFree.w.triggers, []);
-    assert.equal(retryFree.line, '[MP-DEC v' + PDV + '] evidence follow-up (retry) -> rendered (packet age 11m; trigger cleared)');
+    assert.equal(retryFree.line, '[MP-DEC v' + NV + '] evidence follow-up (retry) -> rendered (packet age 11m; trigger cleared)');
     assert.equal(retryFree.row[2], 'pdIbkrEvidenceFollowUpRetry'); assert.equal(retryFree.row[4], 'OK');
     assert.equal(retryFree.r.ctx.PD_IBKR_RETRY_RUN_, null, 'the marker is cleared');
     /* the retry run still colliding: skipped, NEVER re-armed */
     const retryBusy = fu({props: {PD_IBKR_FOLLOWUP_RETRY: 'on'}, ageMs: 11 * 60000}, 'pdIbkrEvidenceFollowUpRetry');
     assert.equal(retryBusy.r.ret, 'skipped: cockpit refresh in progress');
     assert.deepEqual(retryBusy.w.triggers, [], 'a retry never re-arms');
-    assert.equal(retryBusy.line, '[MP-DEC v' + PDV + '] evidence follow-up (retry) -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared; retry not armed: a retry never re-arms)');
+    assert.equal(retryBusy.line, '[MP-DEC v' + NV + '] evidence follow-up (retry) -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared; retry not armed: a retry never re-arms)');
     assert.equal(retryBusy.row[2], 'pdIbkrEvidenceFollowUpRetry'); assert.equal(retryBusy.row[4], 'SKIPPED');
     assert.equal(retryBusy.r.ctx.PD_IBKR_RETRY_RUN_, null);
     /* a retry with the gate meanwhile off: still marked, nothing armed */
     const retryOff = fu({props: {}, ageMs: 11 * 60000}, 'pdIbkrEvidenceFollowUpRetry');
     assert.deepEqual(retryOff.w.triggers, []);
-    assert.equal(retryOff.line, '[MP-DEC v' + PDV + '] evidence follow-up (retry) -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared)');
+    assert.equal(retryOff.line, '[MP-DEC v' + NV + '] evidence follow-up (retry) -> skipped: cockpit refresh in progress (cockpit refresh in progress; trigger cleared)');
     /* arming replaces, never stacks; the state line counts */
     const ctx = run(world({props: ENFORCE}), 'none').ctx;
     assert.equal(ctx.pdIbkrArmRetry_(), 'retry armed (+3m)');
@@ -729,6 +755,7 @@ function battery(source, opts) {
   });
 
   section('T9 ES5 / ASCII lint of the added lines, inventory (20 functions, 0 removed), the WHY block', () => {
+    const source = s1518;   // 2026-11-03: the v1.5.18 diff (the v1.5.19 one has its own lint)
     const names = (s) => (s.match(/^function\s+([A-Za-z_$][\w$]*)\s*\(/mg) || []).map((m) => m.replace(/^function\s+/, '').replace(/\s*\($/, ''));
     const ADDED = ['pdCashSnapMode_', 'pdCashSnapRiyadh_', 'pdCashSnapHeaderMap_', 'pdCashSnapCents_', 'pdCashSnapStampMs_',
       'pdCashSnapRead_', 'pdCashSnapTailScan_', 'pdCashSnapRow_', 'pdCashSnapToken_', 'pdCashSnapLastKnownNote_',
@@ -751,8 +778,8 @@ function battery(source, opts) {
     if (base) {
       const nb = names(base), set = new Set(nn);
       for (const n of nb) assert.ok(set.has(n), 'removed: ' + n);
-      assert.deepEqual(nn.filter((n) => nb.indexOf(n) < 0).sort(), ADDED.concat(PD780).sort());   // + #780
-      assert.equal(nn.length, nb.length + 20 + PD780.length);
+      assert.deepEqual(nn.filter((n) => nb.indexOf(n) < 0).sort(), ADDED.slice().sort());
+      assert.equal(nn.length, nb.length + 20);
       /* every line that is not in the base (a multiset difference) is ASCII and ES5 */
       const count = (s) => { const m = new Map(); for (const l of s.split('\n')) m.set(l, (m.get(l) || 0) + 1); return m; };
       const cb = count(base), added = [];
@@ -760,7 +787,7 @@ function battery(source, opts) {
         const n = cb.get(l) || 0;
         if (n > 0) cb.set(l, n - 1); else added.push(l);
       }
-      assert.ok(added.length >= 650 + PD780_ADDED_LINES && added.length <= 800 + PD780_ADDED_LINES, 'added lines ' + added.length);   // + #780
+      assert.ok(added.length >= 650 && added.length <= 800, 'added lines ' + added.length);
       for (const l of added) {
         assert.ok(![...l].some((ch) => ch.charCodeAt(0) > 126), 'ASCII: ' + l);
         if (!/^\s*(\*|\/\*|\/\/)/.test(l)) assert.ok(!ES6.test(l), 'ES5: ' + l);

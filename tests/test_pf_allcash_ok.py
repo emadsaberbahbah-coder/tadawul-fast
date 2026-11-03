@@ -194,16 +194,20 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-10-26: the delivered file is v1.5.16 (evidence publication stacked on this change); pin moved
     # 2026-10-28: v1.5.17 (post-earnings inputs) stacks on top; pin moved again
     # 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on top; pin moved
+    # 2026-11-03: v1.5.19 (plain block reasons, PD_PLAIN_REASONS default off) stacks on top; pin moved
     # merge note 2026-10-28 (#780): panel preserve is v1.5.18 over #869's v1.5.17;
     # it adds pdPanelPreserveMode_ / pdPanelPreserve_ / pdPanelSeedValue_ and 144
     # lines, all ASCII (tests/js/pf_panel_preserve.test.js).
     # merge note 2026-11-02 (#780): panel preserve is now v1.5.19 over #892's v1.5.18;
     # the floor moves to 1.5.18 and the header line stays in lockstep with PD_VERSION.
+    # merge note 2026-11-03 (#780): panel preserve is now v1.5.20 over #908's v1.5.19;
+    # the floor moves to 1.5.19 (main's exact pin) and the header line stays in lockstep.
     m = re.search(r"var PD_VERSION = '(\d+)\.(\d+)\.(\d+)';", text)
-    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 18), m
+    assert m and tuple(int(x) for x in m.groups()) >= (1, 5, 19), m
     assert " * Version: %s.%s.%s\n" % m.groups() in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "var PD_VERSION = '1.5.16';" not in text and "var PD_VERSION = '1.5.17';" not in text
+    assert "var PD_VERSION = '1.5.18';" not in text
     assert "\r" not in text
     now = set(_top_level_functions(text))
     base = set(golden["functions"])
@@ -212,7 +216,11 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-10-26: v1.5.16 (evidence publication) adds eight pdIbkr* functions on top of this change
     # 2026-10-28: v1.5.17 (post-earnings inputs) adds four pdPostEarn* functions
     # 2026-11-02: v1.5.18 adds thirteen pdCashSnap* and seven pdIbkrRetry* / retry follow-up functions
-    assert sorted(now - base) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
+    # 2026-11-03: v1.5.19 adds seven plain-block functions (pdPlain*, pdIbkrDrift_, pdWritePlainLine_)
+    v1519 = {"pdIbkrDrift_", "pdPlainClause_", "pdPlainCodes_", "pdPlainCoreOk_", "pdPlainLine_", "pdPlainMode_",
+             "pdWritePlainLine_"}
+    assert v1519 <= now, sorted(v1519 - now)
+    assert sorted(now - base - v1519) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
                                   "pdCashSnapCoreOk_", "pdCashSnapHeaderMap_", "pdCashSnapLastKnownNote_",
                                   "pdCashSnapMode_", "pdCashSnapRead_", "pdCashSnapRiyadh_", "pdCashSnapRow_",
                                   "pdCashSnapSheetState_", "pdCashSnapStampMs_", "pdCashSnapTailScan_",
@@ -227,9 +235,12 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     assert non_ascii == golden["non_ascii_lines"] == 97
     # 2026-10-28: + 259 lines for v1.5.17 (post-earnings inputs, report-day review fix)
     # 2026-11-02: + 708 lines for v1.5.18 (cash snapshot writer, last-known cash, follow-up retry)
+    # 2026-11-03: + 275 lines for v1.5.19 (plain block reasons, ticker-change hint)
     # merge note 2026-11-02 (#780): + 148 lines for panel preserve v1.5.19 over #892's v1.5.18 (144 as of
     # 2026-10-28, plus the extended renumber note and a two-line MERGE NOTE in its WHY block).
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 148   # + #780
+    # merge note 2026-11-03 (#780): + 153 lines for panel preserve v1.5.20 over #908's v1.5.19 (the dated
+    # renumber line and a three-line MERGE NOTE in its WHY block).
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275 + 153   # + #780
 
 
 # merge note 2026-10-25 (#780): the three seed lines buildPortfolioDecisionLayout
@@ -256,7 +267,9 @@ def test_added_lines_are_es5_and_ascii(base_source):
     # removed seed lines are matched exactly below.
     # merge note 2026-11-02 (#780): panel preserve is v1.5.19 over #892's v1.5.18; its share against this
     # base is now 151 added / 3 removed (the extended renumber note and the MERGE NOTE in its WHY block).
-    assert 95 + 151 <= len(added) <= 110 + 151 and len(removed) <= 10 + 3, (len(added), len(removed))
+    # merge note 2026-11-03 (#780): panel preserve is v1.5.20 over #908's v1.5.19; its share is now 156
+    # added / 3 removed (the dated renumber line and the second MERGE NOTE in its WHY block).
+    assert 95 + 156 <= len(added) <= 110 + 156 and len(removed) <= 10 + 3, (len(added), len(removed))
     code = [line for line in added if not re.match(r"\s*(\*|/\*|//)", line)]
     assert len(code) >= 40, len(code)
     for line in added:

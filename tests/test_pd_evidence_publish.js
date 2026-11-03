@@ -231,10 +231,15 @@ if (process.env.PD_BASE) {
     'pdCashSnapLastKnownNote_', 'pdCashSnapApply_', 'pdCashSnapSheetState_', 'pdCashSnapCoreOk_', 'pdIbkrRetryMode_',
     'pdIbkrRetryCore_', 'pdIbkrRemoveRetry_', 'pdIbkrArmRetry_', 'pdIbkrRetryAfterSkip_', 'pdIbkrEvidenceFollowUpRetry',
     'pdIbkrRetryState_'];
+  // merge note 2026-11-03 (#780): panel preserve is v1.5.20 over #908's v1.5.19, which adds seven plain-block
+  // functions (tests/test_pd_v1519_plain_block.js); they count too.
+  const PD908 = ['pdPlainMode_', 'pdIbkrDrift_', 'pdPlainCodes_', 'pdPlainClause_', 'pdPlainLine_', 'pdWritePlainLine_',
+    'pdPlainCoreOk_'];
   ok(nb.every((n) => nn.has(n)) && PD780.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
      PD869.every((n) => nn.has(n) && nb.indexOf(n) < 0) && PD892.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
-     nn.size === nb.length + 8 + PD869.length + PD892.length + PD780.length,
-     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #892\'s 20 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
+     PD908.every((n) => nn.has(n) && nb.indexOf(n) < 0) &&
+     nn.size === nb.length + 8 + PD869.length + PD892.length + PD908.length + PD780.length,
+     'P9 zero functions removed; exactly 8 added + #869\'s 4 + #892\'s 20 + #908\'s 7 + #780\'s 3 (' + nb.length + ' -> ' + nn.size + ')');
   console.log('P9 PASS golden negative on the v1.5.15 base ' + sha.slice(0, 12));
 } else {
   console.log('P9 SKIP (set PD_BASE=<v1.5.15 file> to run the golden negative)');

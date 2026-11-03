@@ -142,7 +142,37 @@ from zoneinfo import ZoneInfo
 # Functions added: _last_report_enabled, _last_report_window, _to_num,
 # _days_since, _past_report, parse_prior_last, merge_last_report,
 # last_report_cells, _stale_last_report_cols. Removed: 0.
-__version__ = "1.2.0"
+# v1.3.0 (2026-11-03): DIVIDEND DETAIL (the corporate-action guard's data
+# lane). WHY: this tab read 'INDV.US | Next Ex-Div Date 2026-11-03 | Days To
+# ExDiv 1' on 2 Nov at 16:28 Riyadh; that day's cockpit issued an INDV.US
+# ticket and the owner bought it. The dividend was an 8.13 USD special (about
+# 22 % of the price; the shares opened ex-dividend at 28.15 and a 30 % US
+# withholding applies to a Saudi-resident holder). The date was here; the
+# size was not, so neither the cockpit nor the owner could tell a 22 %
+# special from a 0.7 % quarterly payment. WHAT: TFB_CAL_DIVIDENDS = off
+# (DEFAULT: nothing below runs; this tab, its reads, writes and every log
+# line are v1.2.0 byte for byte) | on. When on, AFTER the Calendar_Events
+# publication (which is unchanged) the HARVESTED decision symbols (before the
+# calendar's sticky resurrection - review fix, Codex P2 on PR #905) go to
+# calendar_provider v1.4.0 fetch_next_exdiv_detail_sync() and a SEPARATE tab
+# (TFB_CAL_DIVIDENDS_SHEET, default Dividend_Events) is replaced in one
+# atomic A1:J update: Symbol | Ex-Div Date | Days To ExDiv | Amount |
+# Currency | Pay Date | Record Date | Period | Updated At (Riyadh) | Source.
+# A separate tab keeps every Calendar_Events reader (the GAS cockpit reads
+# A:G, the tracker and the brief read by header, the A4 lane owns H:J)
+# untouched. FILL-ONLY CARRY: a harvested symbol whose fresh fetch has no
+# dividend keeps a prior row while its ex-date is still in the future (a
+# provider 429 must not erase a known special dividend); a carried row is
+# marked '+carried' and keeps its own as-of; a symbol outside the harvest is
+# never added. FAIL-SAFE: provider disabled or the tab unreadable -> the tab
+# is left exactly as it is (nothing is blanked); a failed fetch publishes
+# the prior rows only; a publication failure returns 3 (the calendar
+# publication before it already succeeded). One summary line: dividends:
+# with=n fresh=f carried=c -> <tab>. Rollback: unset TFB_CAL_DIVIDENDS (the
+# tab stays as the last ON run left it; readers decide by its as-of).
+# Functions added: _dividends_enabled, _dividends_sheet, parse_prior_div,
+# merge_dividends, build_div_rows, dividend_lane. Removed: 0.
+__version__ = "1.3.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
 
@@ -151,6 +181,9 @@ HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
 # v1.2.0: appended after Source only when TFB_CAL_LAST_REPORT is on.
 LAST_REPORT_HEADERS = ["Last Earnings Date", "Days Since Earnings",
                        "EPS Surprise %"]
+# v1.3.0: the separate dividend-detail tab (TFB_CAL_DIVIDENDS=on only).
+DIV_HEADERS = ["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency",
+               "Pay Date", "Record Date", "Period", "Updated At (Riyadh)", "Source"]
 
 
 def _out(msg: str) -> None:
@@ -194,6 +227,17 @@ def _last_report_window() -> int:
     except ValueError:
         v = 21
     return max(1, min(120, v))
+
+
+def _dividends_enabled() -> bool:
+    """v1.3.0 gate - DEFAULT OFF. TFB_CAL_DIVIDENDS=on (or 1/true/yes)
+    publishes the dividend-detail tab; anything else runs nothing new."""
+    return _env("TFB_CAL_DIVIDENDS", "off").lower() in ("on", "1", "true", "yes")
+
+
+def _dividends_sheet() -> str:
+    """v1.3.0: the dividend-detail tab name (default Dividend_Events)."""
+    return _env("TFB_CAL_DIVIDENDS_SHEET", "Dividend_Events") or "Dividend_Events"
 
 
 def _to_num(value: Any) -> Optional[float]:
@@ -555,6 +599,168 @@ def build_rows(symbols: List[str],
 
 
 # ----------------------------------------------------------------------------- #
+# v1.3.0 dividend-detail lane (TFB_CAL_DIVIDENDS=on only)
+# ----------------------------------------------------------------------------- #
+def parse_prior_div(values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
+    """v1.3.0: {SYM: detail} from the prior Dividend_Events tab - rows whose
+    ex-date is still in the future only (the past is never carried);
+    ticker-shape guarded like parse_prior. A tab without the headers -> {}."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not values:
+        return out
+    head = [str(c or "").strip().lower() for c in values[0]]
+    if "symbol" not in head or "ex-div date" not in head:
+        return out
+    col = {h: i for i, h in enumerate(head) if h}
+
+    def cell(row: List[Any], name: str) -> Any:
+        i = col.get(name.lower())
+        return row[i] if i is not None and i < len(row) else ""
+    for row in values[1:]:
+        sym = str(cell(row, "Symbol") or "").strip().upper()
+        if not sym or sym == "SYMBOL" or sym in out:
+            continue
+        if _ticker_guard_enabled() and not _is_ticker_shaped(sym):
+            continue
+        ex = _future_date(cell(row, "Ex-Div Date"))
+        if ex is None:
+            continue
+        text = lambda name: str(cell(row, name) or "").strip() or None  # noqa: E731
+        out[sym] = {"ex_date": ex, "amount": _to_num(cell(row, "Amount")),
+                    "currency": text("Currency"), "pay_date": text("Pay Date"),
+                    "record_date": text("Record Date"), "period": text("Period"),
+                    "asof": _prior_asof(cell(row, "Updated At (Riyadh)")),
+                    "source": str(cell(row, "Source") or "").strip()}
+    return out
+
+
+def merge_dividends(symbols: List[str],
+                    fresh: Dict[str, Dict[str, Any]],
+                    prior: Dict[str, Dict[str, Any]]
+                    ) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    """v1.3.0: (merged, n_fresh, n_carried). Fresh provider data wins when it
+    carries a future ex-date; a prior row fills a harvested symbol the fresh
+    fetch left empty while its ex-date is still in the future; a symbol
+    outside `symbols` is never added."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    n_fresh = n_carried = 0
+    for s in symbols:
+        f = (fresh or {}).get(s) or {}
+        ex = _future_date(f.get("ex_date"))
+        if ex:
+            merged[s] = dict(f, ex_date=ex, carried=False)
+            n_fresh += 1
+            continue
+        p = (prior or {}).get(s) or {}
+        ex = _future_date(p.get("ex_date"))
+        if ex:
+            merged[s] = dict(p, ex_date=ex, carried=True)
+            n_carried += 1
+    return merged, n_fresh, n_carried
+
+
+def build_div_rows(symbols: List[str], merged: Dict[str, Dict[str, Any]],
+                   source: str) -> List[List[Any]]:
+    """v1.3.0: one Dividend_Events row per symbol with a known dividend, in
+    harvest order. Amount is a number (or '' when unknown)."""
+    stamp = _dt.datetime.now(_RIYADH).strftime("%Y-%m-%d %H:%M")
+    rows: List[List[Any]] = []
+    for s in symbols:
+        m = merged.get(s)
+        if not m:
+            continue
+        amount = m.get("amount")
+        amount = "" if amount is None else round(float(amount), 6)
+        if m.get("carried"):
+            prior_source = str(m.get("source") or "").strip().removesuffix(" +carried")
+            row_src = (prior_source or "prior source unknown") + " +carried"
+            row_stamp = _prior_asof(m.get("asof"))
+        else:
+            row_src, row_stamp = source, stamp
+        rows.append([s, m["ex_date"], _days_until(m["ex_date"]), amount,
+                     m.get("currency") or "", m.get("pay_date") or "",
+                     m.get("record_date") or "", m.get("period") or "",
+                     row_stamp, row_src])
+    return rows
+
+
+def dividend_lane(book: Any, symbols: List[str], write: bool) -> int:
+    """v1.3.0: fetch, merge and (write mode) publish the dividend-detail tab
+    in one atomic A1:J update. Returns 0 (published, dry run or left as is)
+    or 2/3 (prior unreadable / publication unconfirmed). Never raises."""
+    tab = _dividends_sheet()
+    width = len(DIV_HEADERS)
+    last_col = chr(ord("A") + width - 1)
+    try:
+        from core.providers.calendar_provider import (  # noqa: PLC0415
+            fetch_next_exdiv_detail_sync, is_enabled, __version__ as pv)
+    except Exception as e:
+        _out(f"dividends: provider unavailable ({e}) - {tab} left as is")
+        return 0
+    if not is_enabled():
+        _out(f"dividends: provider disabled - {tab} left as is")
+        return 0
+    prior: Dict[str, Dict[str, Any]] = {}
+    prior_extent = 0
+    ws = None
+    try:
+        ws = book.worksheet(tab)
+        rows_alloc = getattr(ws, "row_count", None)
+        cols_alloc = getattr(ws, "col_count", None)
+        if isinstance(rows_alloc, int) and rows_alloc > _MAX_CALENDAR_BODY_ROWS + 1:
+            _out(f"dividends: ERROR prior {tab} exceeds the bounded table - preserving tab")
+            return 2
+        read_rows = rows_alloc if isinstance(rows_alloc, int) and rows_alloc > 0 \
+            else _MAX_CALENDAR_BODY_ROWS + 2
+        read_cols = min(width, cols_alloc) if isinstance(cols_alloc, int) and cols_alloc > 0 else width
+        prior_values = ws.get(f"A1:{chr(ord('A') + read_cols - 1)}{read_rows}")
+        prior_extent = max(min(read_rows, _MAX_CALENDAR_BODY_ROWS + 1), len(prior_values))
+        prior = parse_prior_div(prior_values)
+    except Exception as e:
+        if type(e).__name__ != "WorksheetNotFound":
+            _out(f"dividends: ERROR prior {tab} unreadable ({e}) - preserving tab")
+            return 2
+        ws = None
+    source = f"eodhd /div via calendar_provider v{pv}"
+    try:
+        fresh = fetch_next_exdiv_detail_sync(symbols) or {}
+    except Exception as e:
+        _out(f"dividends: WARN fetch failed ({e}) - prior rows only")
+        fresh = {}
+    merged, n_fresh, n_carried = merge_dividends(symbols, fresh, prior)
+    rows = build_div_rows(symbols, merged, source)
+    _out(f"dividends: with={len(rows)} fresh={n_fresh} carried={n_carried} -> {tab}")
+    if not write:
+        for r in rows[:15]:
+            _out("  div " + " | ".join(str(c) for c in r))
+        return 0
+    try:
+        extent = max(1000, len(rows) + 1, prior_extent)
+        if ws is None:
+            ws = book.add_worksheet(title=tab, rows=extent, cols=width)
+        else:
+            rows_alloc = getattr(ws, "row_count", None)
+            cols_alloc = getattr(ws, "col_count", None)
+            if isinstance(rows_alloc, int) and rows_alloc < extent:
+                ws.resize(rows=extent)
+            if isinstance(cols_alloc, int) and cols_alloc < width:
+                ws.resize(cols=width)
+        values = [list(DIV_HEADERS)] + rows + [
+            [""] * width for _ in range(extent - len(rows) - 1)]
+        ws.update(values=values, range_name=f"A1:{last_col}{extent}",
+                  value_input_option="RAW")
+        try:
+            ws.freeze(rows=1)
+        except Exception:
+            pass
+        _out(f"dividends: wrote {len(rows)} rows -> {tab}")
+        return 0
+    except Exception as e:
+        _out(f"dividends: ERROR publication unconfirmed: {e}; read back before retrying")
+        return 3
+
+
+# ----------------------------------------------------------------------------- #
 # Main
 # ----------------------------------------------------------------------------- #
 def main(argv: Optional[List[str]] = None) -> int:
@@ -649,6 +855,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if write and type(e).__name__ != "WorksheetNotFound":
             _out("ERROR: cannot establish prior event provenance — preserving tab")
             return 2
+    harvested = list(symbols)   # v1.3.0 review fix: the dividend lane's universe
     symbols, ctx, carried, n_fill, n_res = apply_sticky(symbols, ctx, prior)
     if len(symbols) > _MAX_CALENDAR_BODY_ROWS:
         _out("ERROR: merged calendar exceeds bounded full-table capacity — preserving tab")
@@ -678,6 +885,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not write:
         for r in rows[:15]:
             _out("  " + " | ".join(str(c) for c in r))
+        if _dividends_enabled():   # v1.3.0 (default off)
+            dividend_lane(book, harvested, write=False)
         _out("dry-run — nothing written (pass --write to publish)")
         return 0
 
@@ -718,10 +927,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
         _out(f"wrote {len(rows)} rows -> {tab}")
-        return 0
     except Exception as e:
         _out(f"ERROR: sheet publication unconfirmed: {e}; read back before retrying")
         return 3
+    if _dividends_enabled():   # v1.3.0 (default off): after the calendar publication
+        return dividend_lane(book, harvested, write=True)
+    return 0
 
 
 

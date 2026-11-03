@@ -1,7 +1,22 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.31 (2026-11-02)
+ * Version: 1.2.32 (2026-11-03)
+ *   1.2.32: A PREVIEW READS AS A PREVIEW (owner, Tue 3 Nov 2026 12:14 Riyadh: 'my top 10 investment page 2 showing that
+ *           there is cash allocated to symbols but the page at top showing red no execution'). On 3 Nov the release of
+ *           run 41566014627 was withdrawn at 10:08 and the cockpit finished WITHHELD (Executable 0); Top_10_Investments_v2
+ *           then sized the active seats with the research water-fill and printed each seat's 'Alloc SAR' / 'Buy qty' in
+ *           bold green under the red NOT ACTIONABLE header. 1.2.26 greyed the Allocated tile only; the seat table, its
+ *           section line and the ALLOCATION block still read like tickets. Now, with Script Property DP2_PREVIEW_LABEL =
+ *           1 / on / true / yes (default OFF: absent, blank or any other word = the 1.2.31 page byte for byte), a page
+ *           that cannot be acted on -- no engine ticket on the board, or the release is not live (EXPIRED, SYNC RUNNING,
+ *           NOT ACTIONABLE): dp2PreviewWhy_, pure -- labels its sizing as a preview: the seat columns read 'Preview SAR' /
+ *           'Preview qty', a sized seat's cells are grey italic (not bold green) and its Flags start 'preview . not a
+ *           ticket', the SEATS line starts 'PREVIEW ONLY -- not tickets (<why>).' and the ALLOCATION block title reads
+ *           'SIZING PREVIEW (not tickets) -- ..' (research mirror) or 'ENGINE TICKETS NOT LIVE (<why>) -- ..' (an engine
+ *           board whose release is no longer live). A live EXECUTABLE release with engine tickets is unchanged; no
+ *           number, seat, class, tile, chart, gate, ticket, order or broker call changes. DP2_COHORT_LEGACY keeps the
+ *           1.2.30 page whatever this property says. Rollback: delete DP2_PREVIEW_LABEL, or Project History -> 1.2.31.
  *   1.2.31: THE MIRROR SIZES WHAT THE ENGINE SIZES (owner review, Mon 2 Nov 2026, the 09:24 build of the 08:49 cockpit:
  *           'there is no allocation but the investment page top 10 show FEED ACTIONABLE - EXECUTABLE ... 6 EXECUTABLE
  *           TICKETS + 1 RESEARCH (NO ALLOCATION) + 3 GRACE-HELD (NO PLAN TODAY)'). Top_10_Investments_v2 read EXECUTABLE 6
@@ -299,11 +314,13 @@
  *   DP2_COHORT_LEGACY 1|on|true|yes (v1.2.31 kill switch: the 1.2.30 FAST-TRACK sizing cohort, seat labels,
  *                     Portfolio_Decision_v2 action wording and IBKR coverage by the order total; default absent =
  *                     the engine-ticket mirror and coverage by the remaining quantity)
+ *   DP2_PREVIEW_LABEL 1|on|true|yes (v1.2.32, default off: on a page that cannot be acted on, the seat sizing reads as
+ *                     a preview -- 'Preview SAR' / 'Preview qty', grey cells, 'preview . not a ticket')
  *
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.31';   // lockstep with the header
+var DP2_VERSION = '1.2.32';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2181,6 +2198,17 @@ function dp2SeatClass_(seat, strict, engineBoard) {
 }
 var DP2_COHORT_LEGACY_PROP = 'DP2_COHORT_LEGACY';   // v1.2.31 kill switch: 1 / on / true / yes = the 1.2.30 cohort, wording and coverage
 function dp2CohortLegacy_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_COHORT_LEGACY_PROP)).trim()); }
+var DP2_PREVIEW_LABEL_PROP = 'DP2_PREVIEW_LABEL';   // v1.2.32 gate: 1 / on / true / yes = a page that cannot be acted on labels its sizing a preview
+function dp2PreviewLabelOn_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_PREVIEW_LABEL_PROP)).trim()); }
+/* v1.2.32 PURE: why the seat sizing of this Top-10 page is a preview, or '' when it can be acted on (an engine ticket on
+ * the board AND a live EXECUTABLE release, dp2FeedView_ live). 'nothing executable today' (+ the feed when it is not live)
+ * / 'feed EXPIRED' / 'feed SYNC RUNNING' / 'feed NOT ACTIONABLE'. */
+function dp2PreviewWhy_(executable, fv) {
+  var live = !!(fv && fv.live === true), lbl = (fv && fv.label) || 'n/a';
+  if (executable > 0 && live) return '';
+  if (executable > 0) return 'feed ' + lbl;
+  return 'nothing executable today' + (live ? '' : ' \u00b7 feed ' + lbl);
+}
 /* v1.2.31: the board's sizing cohort, worked out once per Top_10 read (kept on the reader object). basis:
  *   'engine'   the board carries at least one engine ticket - the cohort IS those tickets, mirrored as issued
  *   'research' no engine ticket - the 'active' seats, sized by the conviction water-fill (dp2Allocate_)
@@ -3150,6 +3178,7 @@ function buildTop10V2() {
   var inv = gm.counts['INVESTABLE'] || null;
   var capSector = dp2Num_(t.panel['T10: Max Per Sector']) || 2;
   var fv = dp2FeedView_(feed, new Date().getTime());   // 1.2.28: release vocabulary (EXECUTABLE / EXPIRED / SYNC RUNNING)
+  var pvWhy = (!cohort.legacy && dp2PreviewLabelOn_()) ? dp2PreviewWhy_(executable, fv) : '';   // v1.2.32: '' = the 1.2.31 page
   var state = feed.state ? fv.label : (t.output || 'n/a');
   var chipKind = feed.state ? fv.kind : 'amber';
 
@@ -3218,10 +3247,11 @@ function buildTop10V2() {
   row++;
 
   // seats table — 3-month close, research allocation (conviction mirror), initial dynamic stop
-  if (!cohort.legacy) row = dp2Section_(sh, row, 1, 16, dp2SeatsTitle_(seats.length, cohort, coN), dp2SeatsSub_(cohort, alloc, feed, fv));   // v1.2.31: engine tickets / research mirror, every class counted
+  if (!cohort.legacy) row = dp2Section_(sh, row, 1, 16, dp2SeatsTitle_(seats.length, cohort, coN), (pvWhy ? 'PREVIEW ONLY \u2014 not tickets (' + pvWhy + '). ' : '') + dp2SeatsSub_(cohort, alloc, feed, fv));   // v1.2.31: engine tickets / research mirror, every class counted; v1.2.32: the preview prefix
   else   // the 1.2.30 wording (DP2_COHORT_LEGACY)
   row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + (alloc && alloc.cfg ? alloc.cfg.maxWeightPct : DP2A.MAX_WEIGHT_PCT) + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + (alloc && alloc.cfg && alloc.cfg.envPresent ? dp2Fmt_(alloc.cfg.opFloor) + ' SAR' + (alloc.cfg.venueOn ? ' raised to the venue floor' : '') : dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR research floor (DP2_ENGINE_ENV unset)') + ', the engine\'s own cash reserve). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
   var sHdr = ['#', 'Symbol · name', '3-month close', 'Seat status', 'Price', 'Alloc SAR', 'Buy qty', 'Dyn. stop (2×ATR)', 'Risk SAR', 'Exp. gain 3M', 'ROI 3M plan', 'ROI 12M eng.', 'Rel · DQ · score', 'Flags'];
+  if (pvWhy) { sHdr[5] = 'Preview SAR'; sHdr[6] = 'Preview qty'; }   // v1.2.32
   var sSp = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2];
   var sRows = [], sRisk = [], sState = [];
   var sCl = [];   // v1.2.31: each seat's class (dp2SeatClass_)
@@ -3282,6 +3312,7 @@ function buildTop10V2() {
     if (riskSar !== null && navSar && riskSar / navSar * 100 > DP2X.RISK_WARN_PCT_NAV) flags.push('risk ' + dp2PctPlain_(riskSar / navSar * 100, 2) + ' NAV > ' + DP2X.RISK_WARN_PCT_NAV + '%');
     if (xb && xb.stale && xatr !== null) flags.push('ATR from cached bars');
     if (xb && !xb.bars.length) flags.push('no price history');
+    if (pvWhy && shares !== null) flags.unshift('preview \u00b7 not a ticket');   // v1.2.32: a sized seat on a page that cannot be acted on
     sRisk.push(riskSar); sState.push(ar ? ar.state : (isPlan ? '' : 'GRACE'));
     sRows.push([dp2Num_(s['Rank']) !== null ? dp2Num_(s['Rank']) : '—', sym + ' · ' + dp2Str_(s['Name']) + '\n' + sec + ' · ' + dp2Str_(s['Market']), dp2SparkFormula_(sym), stability, entry !== null ? dp2Fmt_(entry, 2) + ' ' + ccy : '—', allocSar !== null ? allocSar : (isPlan ? '—' : ''), shares !== null ? shares : (isPlan ? '—' : ''), stop0 !== null ? dp2Fmt_(stop0, 2) + ' (' + dp2Pct_((stop0 / entry - 1) * 100, 1) + ')\nATR ' + dp2Fmt_(xatr, 2) : 'n/a', riskSar !== null ? riskSar : '—', gain3 !== null ? gain3 : '—', roi3 !== null ? roi3 / 100 : null, roi12 !== null ? roi12 / 100 : null, dp2Fmt_(dp2Num_(s['Rel']), 1) + ' · ' + dp2Fmt_(dp2Num_(s['DQ']), 0) + ' · ' + dp2Fmt_(dp2Num_(s['Sm Score']), 1), flags.join(' · ')]);
   }
@@ -3294,15 +3325,16 @@ function buildTop10V2() {
     sh.getRange(srr, 9).setFontSize(8.5).setFontColor(DP2C.ink2);
     var rk = sRisk[i]; if (rk !== null && navSar && rk / navSar * 100 > DP2X.RISK_WARN_PCT_NAV) sh.getRange(srr, 10).setFontColor(DP2C.red).setFontWeight('bold');
     var ac = sh.getRange(srr, 7, 1, 2).setFontWeight('bold');
-    if (sState[i] === 'FUNDED') ac.setFontColor(DP2C.green); else if (sState[i] === 'NEED') ac.setFontColor(DP2C.amber);
+    if (sState[i] === 'FUNDED' && pvWhy) ac.setFontColor(DP2C.grey).setFontWeight('normal').setFontStyle('italic');   // v1.2.32: a preview, not cash
+    else if (sState[i] === 'FUNDED') ac.setFontColor(DP2C.green); else if (sState[i] === 'NEED') ac.setFontColor(DP2C.amber);
   }
   dp2Line_(sh, row, 'Price history for the stops: ' + seatFresh + ' of ' + seats.length + ' seats on fresh bars (' + (Object.keys(seatSources).join(', ') || 'none') + ') · prices = live last when available, else the cockpit price · dynamic stops for HELD names run on Portfolio_Decision_v2 with e-mail alerts.', { size: 8.5, color: DP2C.ink2, bg: DP2C.surface, height: 22 });
   row += 2;
 
   // allocation + funding plans / rotation
-  if (cohort.basis === 'engine') row = dp2Section_(sh, row, 1, 8, 'ALLOCATION \u2014 the engine\'s tickets, mirrored', 'Ticket SAR / Shares exactly as Top_10_Investments issued them (feed ' + dp2FeedTag_(feed, fv) + '): nothing is re-sized while the board carries engine tickets; the conviction water-fill applies only to a board without them.');   // v1.2.31
+  if (cohort.basis === 'engine') row = dp2Section_(sh, row, 1, 8, (pvWhy ? 'ENGINE TICKETS NOT LIVE (' + pvWhy + ')' : 'ALLOCATION') + ' \u2014 the engine\'s tickets, mirrored', 'Ticket SAR / Shares exactly as Top_10_Investments issued them (feed ' + dp2FeedTag_(feed, fv) + '): nothing is re-sized while the board carries engine tickets; the conviction water-fill applies only to a board without them.');   // v1.2.31
   else   // the research mirror (no engine ticket on the board) and DP2_COHORT_LEGACY
-  row = dp2Section_(sh, row, 1, 8, 'ALLOCATION — research mirror of the engine\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');
+  row = dp2Section_(sh, row, 1, 8, (pvWhy ? 'SIZING PREVIEW (not tickets)' : 'ALLOCATION') + ' \u2014 research mirror of the engine\'s conviction sizing', 'Same formula as opportunity_builder v1.27.0 (TFB_OPP_SIZING_MODE=conviction): weights water-filled against the deployable cash. The engine sizes only when the feed is released.');
   var rpH = (alloc && alloc.rotParams) || dp2RotParams_();   // v1.2.17: the production parameters in use
   dp2Section_(sh, row - 2, 9, 16, 'FUNDING PLANS & ROTATION — when cash does not cover the plans', 'One rotation per run: the held equity with the lowest forward ROI that trails the opportunity by ≥ ' + rpH.edge12 + ' pp (engine 12M) or ≥ ' + rpH.edge3 + ' pp (plan 3M) after ' + rpH.cost + '% cost, on the production basis (TFB_OPP_ROTATION_BASIS).');
   var aTop = row;
