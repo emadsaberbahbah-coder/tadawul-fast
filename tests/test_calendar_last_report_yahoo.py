@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""tests/test_calendar_last_report_yahoo.py - calendar_provider v1.4.0
-(TFB_CAL_LAST_REPORT_YAHOO, default off = v1.3.2 byte for byte).
+"""tests/test_calendar_last_report_yahoo.py - calendar_provider v1.5.0
+(TFB_CAL_LAST_REPORT_YAHOO, default off = v1.4.0 byte for byte).
+
+MERGE NOTE (2026-11-03): written as v1.4.0 over v1.3.2 (4c2bd640);
+renumbered to v1.5.0 after #905 shipped calendar_provider v1.4.0 (the next
+dividend's detail, fetch_next_exdiv_detail). The base of the off-identity
+(Y1), golden (G1) and diff (V1b) legs is now main 658a72c2 (v1.4.0); Y1
+also runs with #905's TFB_CAL_DIVIDENDS unset and on, and Y1d pins #905's
+dividend-detail path to the base with this gate off and on.
 
 WHY (2026-11-01): fetch_last_earnings_map skips every KSA symbol (EODHD has
 no Saudi coverage) and no Yahoo path reads PAST reports, so a Saudi name
 such as 2222.SR never gets a Last Earnings Date on Calendar_Events and the
 post-earnings quarantine (16_Decision_Top10 v1.18.0 tag, 10_My_Portfolio
 PD_POST_EARN / D1b) cannot hold a KSA Top_10 seat or a KSA holding's ADD.
-v1.4.0 fills
+v1.5.0 fills
 the KSA rows' last report from yfinance get_earnings_dates when the gate is
 on.
 
@@ -17,8 +24,10 @@ its frame with the REAL yfinance get_earnings_dates parser from a canned
 calendar page when yfinance is installed). No network.
 
 Y1   off (unset / off / 0 / blank / junk): results, EODHD requests, zero
-     yfinance calls and log lines equal the untouched v1.3.2 (4c2bd640), on a
-     mixed list and on a KSA-only list
+     yfinance calls and log lines equal the untouched v1.4.0 (658a72c2), on a
+     mixed list and on a KSA-only list, with TFB_CAL_DIVIDENDS unset and on
+Y1d  #905's fetch_next_exdiv_detail: results, /div/ requests, zero yfinance
+     calls and log lines equal the base with this gate off and on
 Y2   on, mixed list: 2222.SR gets the LATEST earnings row in the window
      (the future row, the meeting row and the older in-window row are not
      taken; the window edges are Y13's); the US rows and the EODHD requests
@@ -60,18 +69,18 @@ Y17  a frame holding a NaT date is refused and counted (errors=1): the REAL
 Y16  a row with EPS figures beats a later call or unnamed no-figure row
      (at most 21 days on); further on, or with no figured row, the latest
      row wins (a newer report not filled in yet is not lost)
-G1   golden negative: Y2, Y3 and Y11 fail on the untouched v1.3.2 with the
+G1   golden negative: Y2, Y3 and Y11 fail on the untouched v1.4.0 with the
      gate on (2222.SR stays absent)
 V1   version floor, verifier pin, calendar_sync step env maps the gate with
      default 'off' (step env only), ci.yml runs this file in the contract
-     lane, WHY block above the v1.3.2 block
+     lane, WHY block above the v1.4.0 block (which sits above v1.3.2)
 V1b  against the base: ASCII added lines; exactly the five functions added,
      none removed
 
 Base copy: TFB_TEST_CALENDAR_BASE=<path>, else `git show
-4c2bd640:core/providers/calendar_provider.py`; without either, Y1, G1 and
-V1b SKIP visibly. Golden negative of the whole file:
-TFB_TEST_CALENDAR_DELIVERED=<base copy> runs every case against v1.3.2: the
+658a72c2:core/providers/calendar_provider.py`; without either, Y1, Y1d, G1
+and V1b SKIP visibly. Golden negative of the whole file:
+TFB_TEST_CALENDAR_DELIVERED=<base copy> runs every case against v1.4.0: the
 WORKS cases fail on behaviour, the helper and version cases because the
 helpers and the version do not exist there.
 
@@ -100,7 +109,8 @@ if str(ROOT) not in sys.path:
 
 import core.providers.calendar_provider as _CP_REAL  # noqa: E402
 
-BASE_SHA = "4c2bd640"   # main 2026-10-27; calendar_provider v1.3.2 there
+# 2026-11-03 merge: was "4c2bd640" (main 2026-10-27, calendar_provider v1.3.2)
+BASE_SHA = "658a72c2"   # main 2026-11-03; calendar_provider v1.4.0 (#905) there
 GATE = "TFB_CAL_LAST_REPORT_YAHOO"
 TODAY = dt.date(2026, 11, 5)               # window [2026-10-15, 2026-11-04]
 NY = dt.timezone(dt.timedelta(hours=-5))
@@ -130,11 +140,11 @@ def _base_or_none():
                                       capture_output=True, timeout=60)
             except Exception:
                 blob = None
-            if blob is not None and blob.returncode == 0 and b'__version__ = "1.3.2"' in blob.stdout:
-                tmp = Path(tempfile.mkdtemp()) / "calendar_provider_v132_base.py"
+            if blob is not None and blob.returncode == 0 and b'__version__ = "1.4.0"' in blob.stdout:
+                tmp = Path(tempfile.mkdtemp()) / "calendar_provider_v140_base.py"
                 tmp.write_bytes(blob.stdout)
                 path = str(tmp)
-        _BASE["mod"] = _load("calendar_provider_v132_base", path) if path else None
+        _BASE["mod"] = _load("calendar_provider_v140_base", path) if path else None
     return _BASE["mod"]
 
 
@@ -590,15 +600,58 @@ def test_y16b_a_newer_report_without_figures_is_not_lost(monkeypatch, gap, want)
 
 
 # ------------------------------------------------------------- NEVER -------
+def _divs_env(monkeypatch, divs):
+    """#905's run_calendar_sync gate (the provider reads none of it)."""
+    if divs is None:
+        monkeypatch.delenv("TFB_CAL_DIVIDENDS", raising=False)
+    else:
+        monkeypatch.setenv("TFB_CAL_DIVIDENDS", divs)
+
+
 @pytest.mark.parametrize("gate", [None, "off", "0", "", "  ", "onn", "enforce", "observe"])
-def test_y1_off_is_v132(monkeypatch, caplog, gate):
+def test_y1_off_is_v140(monkeypatch, caplog, gate):
     b = base()
-    for symbols in (MIXED, KSA_ONLY, ["FRST.US"]):
-        mine = _run(CP, monkeypatch, caplog, symbols, gate)
-        theirs = _run(b, monkeypatch, caplog, symbols, gate)
-        assert mine == theirs, (gate, symbols)
-        assert mine[2] == [], "no yfinance call when off"
+    for divs in (None, "on"):           # 2026-11-03 merge: #905's dividend lane off and on
+        _divs_env(monkeypatch, divs)
+        for symbols in (MIXED, KSA_ONLY, ["FRST.US"]):
+            mine = _run(CP, monkeypatch, caplog, symbols, gate)
+            theirs = _run(b, monkeypatch, caplog, symbols, gate)
+            assert mine == theirs, (gate, divs, symbols)
+            assert mine[2] == [], "no yfinance call when off"
     assert CP._last_report_yahoo_enabled() is False
+
+
+DIV_PAYLOADS = {"/div/INDV.US": [{"date": "2026-11-06", "declarationDate": "2026-09-17",
+                                  "recordDate": "2026-11-06", "paymentDate": "2026-11-10",
+                                  "period": "Other", "value": 8.13, "currency": "USD"}]}
+
+
+@pytest.mark.parametrize("gate", [None, "on"])
+def test_y1d_dividend_detail_path_is_the_base(monkeypatch, caplog, gate):
+    """2026-11-03 merge: #905's fetch_next_exdiv_detail (v1.4.0) is untouched by
+    this gate: same rows, same /div/ requests, same log lines, no yfinance call."""
+    b = base()
+    for divs in (None, "on"):
+        got = []
+        for mod in (CP, b):
+            calls = []
+            yf = FakeYF({"2222.SR": ARAMCO})
+            _prep(mod, monkeypatch, yf, gate)
+            _divs_env(monkeypatch, divs)
+
+            async def fake_div(_client, path, params, _calls=calls):
+                _calls.append((path, dict(params)))
+                return DIV_PAYLOADS.get(path, [])
+            monkeypatch.setattr(mod, "_get_json", fake_div)
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger="core.providers.calendar_provider"):
+                out = mod.fetch_next_exdiv_detail_sync(MIXED + ["INDV.US"])
+            got.append((out, calls, yf.calls, _logs(caplog, mod)))
+        assert got[0] == got[1], (gate, divs)
+        out, calls, ycalls, _l = got[0]
+        assert sorted(out) == ["INDV.US"] and out["INDV.US"]["amount"] == 8.13, out
+        assert sorted(p for p, _q in calls) == ["/div/FRST.US", "/div/INDV.US", "/div/ZTO.US"]
+        assert ycalls == [], "the dividend path never asks Yahoo"
 
 
 @pytest.mark.parametrize("gate", ["on", "ON", " on ", "1", "true", "Yes"])
@@ -634,7 +687,7 @@ MAPPING = "${{ vars.TFB_CAL_LAST_REPORT_YAHOO || 'off' }}"
 
 
 def test_v1_version_pin_workflow_ci_why():
-    assert tuple(int(x) for x in CP.__version__.split(".")) >= (1, 4, 0)
+    assert tuple(int(x) for x in CP.__version__.split(".")) >= (1, 5, 0)
     vd = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert re.search(r'\("core\.providers\.calendar_provider", "__version__", "%s",'
                      % re.escape(CP.__version__), vd)
@@ -662,7 +715,9 @@ def test_v1_version_pin_workflow_ci_why():
     assert re.search(r"tests/test_calendar_last_report_a4\.py \\\s*\n(\s*tests/\S+ \\\s*\n)*"
                      r"\s*tests/test_calendar_last_report_yahoo\.py", ci)
     src = Path(CP.__file__).read_text(encoding="utf-8")
-    assert src.index("v1.4.0 (2026-11-01) -- the last-report lane") < src.index("v1.3.2 (2026-10-27)")
+    # 2026-11-03 merge: renumbered 1.4.0 -> 1.5.0, above #905's v1.4.0 block
+    assert src.index("v1.5.0 (2026-11-01) -- the last-report lane") < \
+        src.index("v1.4.0 (2026-11-03)") < src.index("v1.3.2 (2026-10-27)")
     assert all(ord(c) < 128 for c in Path(__file__).read_text(encoding="utf-8"))
 
 
@@ -670,8 +725,8 @@ def test_v1b_against_the_base_ascii_and_functions():
     import ast
     import difflib
     b = base()
-    if CP.__version__ != "1.4.0":
-        pytest.skip("the exact 4c2bd640 -> 1.4.0 diff checks apply to 1.4.0 only")
+    if CP.__version__ != "1.5.0":
+        pytest.skip("the exact 658a72c2 -> 1.5.0 diff checks apply to 1.5.0 only")
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
     new = Path(CP.__file__).read_text(encoding="utf-8").splitlines()
     diff = list(difflib.unified_diff(old, new, lineterm="", n=0))

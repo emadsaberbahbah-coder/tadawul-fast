@@ -173,3 +173,19 @@ Rejected:
 - `_say` honouring a deliberately silenced logger;
 - the UTC-evening and fetch-failure gaps: documented, pre-existing scope, now in S5;
 - the forward tier's `Ticker.calendar` local-zone dating, and meeting rows becoming Next: pre-existing, untouched.
+
+## S9 - Merge note (2026-11-03): renumbered 1.4.0 -> 1.5.0 onto main 658a72c2
+
+#905 shipped a different calendar_provider 1.4.0 (the next dividend's amount, currency and pay date: `fetch_next_exdiv_detail`, `TFB_CAL_DIVIDENDS`) and run_calendar_sync 1.3.0. This branch was merged onto main `658a72c2` (#898-#906) with a merge commit; the file name of this sheet is kept. Read "v1.4.0" above as "v1.5.0", and "v1.3.2 byte for byte" (the gate-off identity) as "v1.4.0 byte for byte": #905 left `fetch_last_earnings_map` and every path it calls as v1.3.2 had them.
+
+| Site | Merge resolution |
+| --- | --- |
+| `core/providers/calendar_provider.py` | title and `__version__` 1.5.0; this WHY block renumbered to v1.5.0 with a renumber line and a MERGE NOTE, above #905's v1.4.0 block (verbatim), above v1.3.2; this change's in-code tags (ENV list, docstrings, comments) read v1.5.0, #905's keep v1.4.0. Both features kept; zero removals vs main. |
+| `.github/workflows/calendar_sync.yml` | both step-env mappings kept (`TFB_CAL_DIVIDENDS` from #905, `TFB_CAL_LAST_REPORT_YAHOO` from here); header comments in the file's oldest-first order, #905's verbatim, this one after it, naming v1.5.0 with a renumber line. |
+| `scripts/verify_deployment.py` | pin 1.5.0; #905's 2026-11-03 comment kept, one line added for 1.4.0 -> 1.5.0. |
+| `tests/test_calendar_last_report_a4.py`, `test_calendar_split_404.py`, `test_calendar_venue_batches.py` | #905 had moved the exact pins to 1.4.0; they are floors now at `>= (1, 4, 0)` (was `>= (1, 3, 2)` on this branch); S2's log line carries the module's own version. #905's comments kept. |
+| `tests/test_calendar_dividends.py` (#905) | its exact pins moved 1.4.0 -> 1.5.0 (D2 `__version__`, D10 verifier pin). |
+| `tests/test_calendar_last_report_yahoo.py` | `BASE_SHA` 4c2bd640 (v1.3.2) -> 658a72c2 (v1.4.0); base check, V1 WHY order (v1.5.0 above v1.4.0 above v1.3.2), V1 floor 1.5.0, V1b exact checks for 1.5.0 (still exactly the five functions added vs the base). Y1 also runs with `TFB_CAL_DIVIDENDS` unset and on; new Y1d (2 cases) pins #905's `fetch_next_exdiv_detail` to the base (rows, `/div/` requests, log lines, no yfinance call) with this gate off and on. |
+| `.github/workflows/ci.yml` | stays 1.1.65 (main is at 1.1.61); the contract-lane golden fetch now fetches `658a72c2` instead of `4c2bd640`; MERGE NOTE in the header block. |
+
+Tests after the merge: harness PASS 84/84 (82 + Y1d x2), 84 passed under pytest; contract-lane emulation (no PyYAML / pandas / yfinance / bs4 / lxml) 80 passed, 4 skipped; golden negative against the untouched v1.4.0 (`658a72c2`): 79 failed, 4 passed (Y1c, G1, Y1d x2 compare against the base by construction), 1 skipped (V1b).

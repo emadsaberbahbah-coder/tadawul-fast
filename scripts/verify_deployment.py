@@ -231,9 +231,12 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-27 (same rule): 1.3.0 -> 1.3.1 (404 batch split, gated).
     # 2026-10-27 (same rule): 1.3.1 -> 1.3.2 (venue batches + EODHD exchange
     # codes for the calendar, both gated).
-    # 2026-11-01 (same rule): 1.3.2 -> 1.4.0 (Saudi past reports from Yahoo,
-    # TFB_CAL_LAST_REPORT_YAHOO, default off).
-    ("core.providers.calendar_provider", "__version__", "1.4.0",
+    # 2026-11-03 (same rule): 1.3.2 -> 1.4.0 (fetch_next_exdiv_detail, additive;
+    # its only caller is run_calendar_sync 1.3.0 behind TFB_CAL_DIVIDENDS).
+    # 2026-11-03 (same rule; #889 merged onto #905): 1.4.0 -> 1.5.0 (Saudi
+    # past reports from Yahoo, TFB_CAL_LAST_REPORT_YAHOO, default off; written
+    # 2026-11-01 as 1.3.2 -> 1.4.0, renumbered after #905 shipped 1.4.0).
+    ("core.providers.calendar_provider", "__version__", "1.5.0",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
@@ -267,13 +270,22 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
     # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
-    ("release_decision_feed", "1.3.0", "gated audited decision-feed release (P0-1)"),
+    # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
+    # vars.TFB_RELEASE_RENDER_HOLD default off; workflow-scoped, never on Render;
+    # 1.3.1 is claimed by open PR #831).
+    ("release_decision_feed", "1.4.0", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
     # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
     # (TFB_RELEASE_AFTER_SYNC, default off; workflow-scoped, never on Render).
-    ("await_cockpit_receipts", "1.0.0", "after-sync release dispatch (read-only wait)"),
+    # 2026-11-02 (pin only, SCRIPT_VERSION unchanged): 1.0.0 -> 1.1.0 (--wait-only,
+    # the sync-render handshake before the final and freshness audits;
+    # vars.TFB_SYNC_AWAIT_RENDER, default off; workflow-scoped, never on Render).
+    # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.1.0 -> 1.2.0 (the release's
+    # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
+    # default strict; workflow-scoped, never on Render).
+    ("await_cockpit_receipts", "1.2.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
@@ -281,7 +293,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
     # 2026-10-25: 6.50.0 [LOG-READ] Performance_Log read precision
     # (TRACK_LOG_UNFORMATTED_READ, default off; pin only).
-    ("track_performance", "6.50.0", "track performance"),
+    # 2026-11-02: 6.53.0 [ARCHIVE-BAR + DUE-ONLY] historical close from the
+    # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
+    # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
+    # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
+    ("track_performance", "6.53.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
@@ -296,7 +312,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_daily_brief", "1.20.0", "daily brief"),
     ("send_digest", "2.1.2", "digest"),
     # 2026-10-27 (A4; pin only): 1.1.4 -> 1.2.0 (TFB_CAL_LAST_REPORT, default off).
-    ("run_calendar_sync", "1.2.0", "calendar sync"),
+    # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (the
+    # Dividend_Events tab behind vars.TFB_CAL_DIVIDENDS, default off;
+    # workflow-scoped, never on Render).
+    ("run_calendar_sync", "1.3.0", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
     ("archive_to_bigquery", "1.1.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
@@ -304,7 +323,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.4.1", "bigquery looker views"),
+    ("apply_bq_views", "1.5.0", "bigquery looker views"),  # 2 Nov 2026: views 1.5.0
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -314,7 +333,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
-    ("archive_symbol_deep", "1.0.0", "bigquery symbol deep data"),
+    # 2026-11-02 (same rule): 1.0.0 -> 1.1.0 (the symbols with an active
+    # Performance_Log record join the bars load for the BigQuery outcome
+    # engine; TFB_DEEP_OUTCOME_BARS, default off).
+    ("archive_symbol_deep", "1.1.0", "bigquery symbol deep data"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),

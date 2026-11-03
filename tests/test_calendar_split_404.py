@@ -105,9 +105,11 @@ def cp():
     import core.providers.calendar_provider as mod
     # 2026-10-27: v1.3.2 (venue batches + EODHD exchange codes, both gated
     # off by default) stacked on this change; pin moved
-    # 2026-11-01: v1.4.0 (Saudi past reports from Yahoo, gated off by
-    # default) stacked as well; the pin is a floor now
-    assert tuple(int(x) for x in mod.__version__.split(".")) >= (1, 3, 2), mod.__version__
+    # 2026-11-03: v1.4.0 (fetch_next_exdiv_detail, additive) stacked; pin moved
+    # 2026-11-01: v1.5.0 (Saudi past reports from Yahoo, gated off by
+    # default; renumbered from v1.4.0 on 2026-11-03 after #905) stacked as
+    # well; the pin is a floor now
+    assert tuple(int(x) for x in mod.__version__.split(".")) >= (1, 4, 0), mod.__version__
     return mod
 
 
@@ -156,7 +158,9 @@ def test_s2_last_report_split_keeps_known_codes(cp, monkeypatch, caplog):
     msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     # 2026-10-27: the version in the line moved with v1.3.2 (pin moved; the
     # rest of the line is v1.3.1's - no translation when the suffix map is off)
-    # 2026-11-01: v1.4.0 stacked as well; the line carries the module's own version
+    # 2026-11-03: and with v1.4.0 (version tag only)
+    # 2026-11-01: v1.5.0 (renumbered from v1.4.0 after #905) stacked as well;
+    # the line carries the module's own version
     assert msgs == ["[calendar_provider v%s] last-earnings: 404 batches split 3 time(s), "
                     "7 request(s); EODHD rejected 1 code(s): BAD.L" % cp.__version__], msgs
 

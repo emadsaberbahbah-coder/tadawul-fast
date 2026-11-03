@@ -20,7 +20,8 @@
 #       secret — use the ROTATED token). TFB_CALENDAR_ENABLED=1 is scoped to
 #       this job only; the Render flag stays unset (no backend caller exists).
 # NOTE: this workflow WRITES exactly one tab (Calendar_Events) and reads two
-#       pages. It never touches universe pages, cockpits, or the sync.
+#       pages (two tabs with TFB_CAL_DIVIDENDS=on: + Dividend_Events). It never
+#       touches universe pages, cockpits, or the sync.
 # 2026-10-27: arms calendar_provider v1.3.1 TFB_CALENDAR_SPLIT_404 - EODHD
 #       answers 404 for a WHOLE /calendar/earnings batch when one code is
 #       unknown (run 40489000970 kept 3 of 327 last reports; the 31-symbol
@@ -31,7 +32,15 @@
 #       on splitting mixed-venue batches and never asked for 42 codes (27 US
 #       names TAK..ZTO). Batches are now one venue each, US first, and the
 #       calendar is asked with EODHD's codes for '.L' / '.KL' / '.IS' / '.LS'.
-# 2026-11-01: maps calendar_provider v1.4.0 TFB_CAL_LAST_REPORT_YAHOO (DEFAULT
+# 2026-11-03: maps run_calendar_sync v1.3.0 TFB_CAL_DIVIDENDS (repo Variable,
+#       default off). On: after the Calendar_Events publication, the next
+#       declared dividend's amount, currency, pay and record dates for the
+#       same decision symbols are written to a SEPARATE tab, Dividend_Events
+#       (the corporate-action guard's data: on 2 Nov Calendar_Events knew
+#       INDV.US went ex-dividend the next day but not that it was an 8.13 USD
+#       special, about 22 % of the price). Off: this job writes exactly one
+#       tab, as before.
+# 2026-11-01: maps calendar_provider v1.5.0 TFB_CAL_LAST_REPORT_YAHOO (DEFAULT
 #       OFF; NOT armed here) - the last-report lane skips every KSA symbol, so
 #       a Saudi name such as 2222.SR never gets a Last Earnings Date and the
 #       post-earnings quarantine cannot hold a KSA Top_10 seat or a KSA
@@ -40,6 +49,8 @@
 #       log shows 'last-report yahoo fill: n of m KSA (throttled=t,
 #       errors=e)'. Arm with the repo Variable TFB_CAL_LAST_REPORT_YAHOO=on
 #       (needs TFB_CAL_LAST_REPORT=on too).
+#       Renumbered from v1.4.0 on 2026-11-03 after #905 shipped calendar_provider
+#       v1.4.0 (the dividend detail, above).
 # =============================================================================
 name: 📅 Calendar Sync
 
@@ -117,6 +128,10 @@ jobs:
           # default off = the v1.1.4 seven-column table. Arm with the repo
           # Variable TFB_CAL_LAST_REPORT=on.
           TFB_CAL_LAST_REPORT: ${{ vars.TFB_CAL_LAST_REPORT || 'off' }}
+          # 2026-11-03: run_calendar_sync v1.3.0 dividend-detail tab
+          # (Dividend_Events); default off = Calendar_Events only. Arm with the
+          # repo Variable TFB_CAL_DIVIDENDS=on.
+          TFB_CAL_DIVIDENDS: ${{ vars.TFB_CAL_DIVIDENDS || 'off' }}
           # 2026-10-27: calendar_provider v1.3.1 - split a 404 earnings batch
           # (default off in the module; armed here). Kill: "off".
           TFB_CALENDAR_SPLIT_404: "on"
@@ -125,7 +140,7 @@ jobs:
           # the module; armed here). Kill: "off" (each independently).
           TFB_CALENDAR_VENUE_BATCHES: "on"
           TFB_CALENDAR_SUFFIX_MAP: "on"
-          # 2026-11-01: calendar_provider v1.4.0 - Saudi past reports from
+          # 2026-11-01: calendar_provider v1.5.0 - Saudi past reports from
           # Yahoo (fill-only). Default off; arm with the repo Variable
           # TFB_CAL_LAST_REPORT_YAHOO=on. Rollback: unset it.
           TFB_CAL_LAST_REPORT_YAHOO: ${{ vars.TFB_CAL_LAST_REPORT_YAHOO || 'off' }}

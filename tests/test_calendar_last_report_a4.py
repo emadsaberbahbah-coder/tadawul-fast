@@ -142,8 +142,10 @@ def test_l1_provider_window_env_batches_and_failures(provider, monkeypatch):
     assert provider.fetch_last_earnings_sync(["AAA.US"]) == {}
     # 2026-10-27: v1.3.1 (404 batch split, gated) stacked on this change; pin moved
     # 2026-10-27: v1.3.2 (venue batches + EODHD exchange codes, gated); pin moved
-    # 2026-11-01: v1.4.0 (Saudi past reports from Yahoo, gated); the pin is a floor now
-    assert tuple(int(x) for x in provider.__version__.split(".")) >= (1, 3, 2), provider.__version__
+    # 2026-11-03: v1.4.0 (fetch_next_exdiv_detail, additive); pin moved
+    # 2026-11-01: v1.5.0 (Saudi past reports from Yahoo, gated; renumbered from
+    # v1.4.0 on 2026-11-03 after #905); the pin is a floor now
+    assert tuple(int(x) for x in provider.__version__.split(".")) >= (1, 4, 0), provider.__version__
 
 
 def test_l2_forward_context_untouched(provider, monkeypatch):
@@ -261,7 +263,8 @@ def test_l3_off_is_v114_byte_for_byte(monkeypatch, capsys, gate):
     assert s_new.reads == s_old.reads == ["A1:G1000"]
     assert s_new.requests == s_old.requests and s_new.resizes == s_old.resizes == []
     assert s_new.requests[0]["range"] == "A1:G1000" and s_new.requests[0]["values"][0] == sync.HEADERS
-    assert err_new.replace("v1.2.0", "V") == err_old.replace("v1.1.4", "V")
+    # 2026-11-03: run_calendar_sync v1.3.0 (dividend lane, gated off) stacked; tag moved
+    assert err_new.replace("v1.3.0", "V") == err_old.replace("v1.1.4", "V")
     assert "last_report" not in err_new
 
 
@@ -348,7 +351,8 @@ def test_l7b_off_on_a_wide_tab_without_the_block_keeps_the_a_to_g_write(monkeypa
 
 
 def test_selftest_and_version():
-    assert sync.__version__ == "1.2.0"
+    # 2026-11-03: v1.3.0 (Dividend_Events lane, gated off) stacked; pin moved
+    assert sync.__version__ == "1.3.0"
     out = subprocess.run([sys.executable, str(ROOT / "scripts" / "run_calendar_sync.py"), "--selftest"],
                          capture_output=True, text=True, timeout=120, cwd=str(ROOT))
     assert out.returncode == 0 and "SELFTEST 13/13" in out.stdout, out.stdout + out.stderr

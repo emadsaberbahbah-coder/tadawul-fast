@@ -2,11 +2,18 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider -- v1.4.0 (SAUDI PAST REPORTS FROM YAHOO)
+Calendar Provider -- v1.5.0 (SAUDI PAST REPORTS FROM YAHOO)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
 
-v1.4.0 (2026-11-01) -- the last-report lane can see Saudi reports. WHY:
+v1.5.0 (2026-11-01) -- the last-report lane can see Saudi reports.
+Renumbered 1.4.0 -> 1.5.0 on 2026-11-03 after #905 shipped v1.4.0 (below).
+MERGE NOTE (2026-11-03): read 'default off = the v1.3.2 requests, results
+and log lines byte for byte' below as '... the v1.4.0 requests ...': v1.4.0
+(#905, the dividend detail) left fetch_last_earnings_map and every path it
+calls as v1.3.2 had them, so with the gate off this file runs exactly as
+v1.4.0. The v1.4.0 block follows verbatim.
+WHY:
 fetch_last_earnings_map (v1.3.0) skips every KSA symbol (EODHD has no Saudi
 coverage) and returns {} at once for a KSA-only list, and no Yahoo path
 reads PAST reports (the v1.2.0 tier keeps future dates only). So a .SR
@@ -68,6 +75,32 @@ eps_surprise_pct; it ignores the extra key). Codes EODHD rejects ('.T',
 Additions (0 removed): _last_report_yahoo_enabled, _yf_report_date,
 _yf_row_value, _yf_earnings_dates_past, _yahoo_last_report_fill.
 Rollback: unset TFB_CAL_LAST_REPORT_YAHOO (or set off).
+
+v1.4.0 (2026-11-03) — the next declared dividend's AMOUNT, not only its date.
+WHY (3 Nov 2026): Calendar_Events, written 2 Nov 16:28 Riyadh, read
+'INDV.US | Next Ex-Div Date 2026-11-03 | Days To ExDiv 1'. The cockpit issued
+an INDV.US ticket that morning and the owner bought 95 shares at 17:30. The
+dividend was Indivior's 8.13 USD special dividend (declared 17 Sep, about
+22 % of the 36.28 close, paid 6 Nov): the price opened ex-dividend at 28.15,
+the holding read -20 % and a 30 % US withholding takes about 2.44 USD a share
+from a Saudi-resident holder. The date was known; the size never was, so no
+reader could tell a 0.7 % quarterly payment from a 22 % special one.
+WHAT: new fetch_next_exdiv_detail(symbols, days_ahead) (+ the _sync
+wrapper). The same per-symbol EODHD /div/ request as fetch_next_exdiv_map
+(from today to the TFB_CALENDAR_DIV_DAYS_AHEAD horizon, KSA skipped, bounded
+concurrency, one failed symbol drops only itself) returns, for the EARLIEST
+future ex-date: ex_date, amount (the 'value' field, else 'unadjustedValue';
+several declarations on that date in one currency are summed), currency
+(None when no declaration names one; 'MIXED' with amount None when the same
+day carries two currencies, or a declaration with a currency next to one
+without - review fix, Codex P2 on PR #905), pay_date, record_date,
+declaration_date, period (the payload's label, e.g. Quarterly or Other) and
+items (the count summed).
+Nothing else changes: fetch_next_exdiv_map, fetch_event_context and every
+other function, request and log line are v1.3.2 byte for byte; the only
+caller is scripts/run_calendar_sync.py v1.3.0 behind TFB_CAL_DIVIDENDS
+(default off). Functions added: _div_amount, _div_detail_of,
+fetch_next_exdiv_detail, fetch_next_exdiv_detail_sync. Removed: 0.
 
 v1.3.2 (2026-10-27) — US codes can no longer be starved by foreign codes
 EODHD rejects. WHY: the first run with the v1.3.1 split armed (calendar_sync
@@ -272,7 +305,7 @@ ENV
     TFB_CALENDAR_CONCURRENCY          parallel dividend calls   (default 4)
     TFB_CAL_YAHOO_FALLBACK            "0" disables the v1.1.0 Yahoo
                                       earnings/ex-div fallback (default ON)
-    TFB_CAL_LAST_REPORT_YAHOO         v1.4.0 "on" fills the last report of
+    TFB_CAL_LAST_REPORT_YAHOO         v1.5.0 "on" fills the last report of
                                       KSA symbols from Yahoo (default off)
 
 VALIDATE FROM RENDER SHELL (after setting TFB_CALENDAR_ENABLED=1):
@@ -299,7 +332,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -316,6 +349,8 @@ __all__ = [
     "fetch_ipos_sync",
     "fetch_last_earnings_map",
     "fetch_last_earnings_sync",
+    "fetch_next_exdiv_detail",
+    "fetch_next_exdiv_detail_sync",
 ]
 
 # ----------------------------------------------------------------------------- #
@@ -691,13 +726,13 @@ async def fetch_last_earnings_map(symbols: List[str],
     report in [today - days_back, today - 1]. Empty when disabled, on any
     error, or for symbols with no report in the window. KSA symbols skipped
     (no EODHD coverage).
-    v1.4.0: with TFB_CAL_LAST_REPORT_YAHOO on, KSA symbols are filled from
+    v1.5.0: with TFB_CAL_LAST_REPORT_YAHOO on, KSA symbols are filled from
     Yahoo after the EODHD batches (fill-only; rows carry a 'source' key)."""
     if not is_enabled():
         return {}
     try:
         code_map, _ksa = _split_symbols(symbols)
-        _ksa_fill = bool(_ksa) and _last_report_yahoo_enabled()   # v1.4.0 (off: False)
+        _ksa_fill = bool(_ksa) and _last_report_yahoo_enabled()   # v1.5.0 (off: False)
         if not code_map and not _ksa_fill:
             return {}
         today = _today()
@@ -755,7 +790,7 @@ async def fetch_last_earnings_map(symbols: List[str],
                     }
         if split_on:
             _log_split_state("last-earnings", state)
-        if _ksa_fill:                                    # v1.4.0: Saudi past reports
+        if _ksa_fill:                                    # v1.5.0: Saudi past reports
             await _yahoo_last_report_fill(_ksa, start, end, out)
         return out
     except Exception as e:  # blanket: a calendar hiccup must never propagate
@@ -813,6 +848,101 @@ async def fetch_next_exdiv_map(symbols: List[str],
         return out
     except Exception as e:
         logger.error("[calendar_provider v%s] fetch_next_exdiv_map failed: %s",
+                     __version__, safe_error_text(e, secret_values=(_api_key(),)))
+        return {}
+
+
+# ----------------------------------------------------------------------------- #
+# v1.4.0 - the next declared dividend's detail (amount, currency, pay date)
+# ----------------------------------------------------------------------------- #
+def _div_amount(item: Dict[str, Any]) -> Optional[float]:
+    """The declared amount per share: 'value', else 'unadjustedValue'.
+    Negative or non-numeric -> None."""
+    for key in ("value", "unadjustedValue"):
+        v = _num(item.get(key))
+        if v is not None:
+            return v if v >= 0 else None
+    return None
+
+
+def _div_detail_of(payload: Any, today: _dt.date) -> Optional[Dict[str, Any]]:
+    """PURE (v1.4.0). The EARLIEST future ex-date's detail from one /div/
+    payload, or None when no item has a usable ex-date >= today."""
+    items = [it for it in (payload if isinstance(payload, list) else [])
+             if isinstance(it, dict)]
+    dated = [(d, it) for it, d in ((it, _parse_date(it.get("date"))) for it in items)
+             if d is not None and d >= today]
+    if not dated:
+        return None
+    best = min(d for d, _it in dated)
+    same = [it for d, it in dated if d == best]
+    labels = [str(it.get("currency") or "").strip().upper() for it in same]
+    currencies = sorted({c for c in labels if c})
+    amounts = [_div_amount(it) for it in same]
+    if len(currencies) > 1 or (currencies and "" in labels):
+        # Review fix (Codex P2 on PR #905): two currencies, or a declaration
+        # without one next to a declaration with one, cannot be summed into a
+        # currency-qualified total -> no amount, currency MIXED.
+        amount, currency = None, "MIXED"
+    else:
+        amount = None if any(a is None for a in amounts) else round(sum(amounts), 6)
+        currency = currencies[0] if currencies else None
+
+    def _first_date(key: str) -> Optional[str]:
+        for it in same:
+            d = _parse_date(it.get(key))
+            if d is not None:
+                return _iso(d)
+        return None
+    periods = sorted({str(it.get("period") or "").strip() for it in same
+                      if str(it.get("period") or "").strip()})
+    return {"ex_date": _iso(best), "amount": amount, "currency": currency,
+            "pay_date": _first_date("paymentDate"), "record_date": _first_date("recordDate"),
+            "declaration_date": _first_date("declarationDate"),
+            "period": "/".join(periods) or None, "items": len(same)}
+
+
+async def fetch_next_exdiv_detail(symbols: List[str],
+                                  days_ahead: Optional[int] = None
+                                  ) -> Dict[str, Dict[str, Any]]:
+    """v1.4.0: {ORIGINAL_SYMBOL: detail} for the next DECLARED dividend in the
+    window (see _div_detail_of). Same requests as fetch_next_exdiv_map; a
+    symbol with no declared dividend, or whose request failed, is absent."""
+    if not is_enabled():
+        return {}
+    try:
+        code_map, ksa = _split_symbols(symbols)
+        if ksa:
+            logger.debug("[calendar_provider v%s] KSA symbols skipped "
+                         "(EODHD has no Saudi coverage): %s",
+                         __version__, ",".join(sorted(ksa)))
+        if not code_map:
+            return {}
+        today = _today()
+        horizon = _iso(today + _dt.timedelta(
+            days=days_ahead or _env_int("TFB_CALENDAR_DIV_DAYS_AHEAD", 90, hi=365)))
+        sem = asyncio.Semaphore(_env_int("TFB_CALENDAR_CONCURRENCY", 4, lo=1, hi=16))
+        out: Dict[str, Dict[str, Any]] = {}
+
+        async def _one(client: httpx.AsyncClient, code: str, orig: str) -> None:
+            async with sem:
+                try:
+                    payload = await _get_json(client, f"/div/{code}", {
+                        "from": _iso(today), "to": horizon,
+                    })
+                except Exception as e:
+                    logger.debug("[calendar_provider] div detail %s: %s", code,
+                                 safe_error_text(e, secret_values=(_api_key(),)))
+                    return
+                detail = _div_detail_of(payload, today)
+                if detail is not None:
+                    out[orig] = detail
+
+        async with _client() as client:
+            await asyncio.gather(*[_one(client, c, o) for c, o in code_map.items()])
+        return out
+    except Exception as e:
+        logger.error("[calendar_provider v%s] fetch_next_exdiv_detail failed: %s",
                      __version__, safe_error_text(e, secret_values=(_api_key(),)))
         return {}
 
@@ -1021,15 +1151,15 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
 
 
 # ----------------------------------------------------------------------------- #
-# v1.4.0 - the last report of KSA symbols from Yahoo (EODHD has no Saudi data)
+# v1.5.0 - the last report of KSA symbols from Yahoo (EODHD has no Saudi data)
 # ----------------------------------------------------------------------------- #
 def _last_report_yahoo_enabled() -> bool:
-    """v1.4.0: TFB_CAL_LAST_REPORT_YAHOO = on|1|true|yes (any case). Default off."""
+    """v1.5.0: TFB_CAL_LAST_REPORT_YAHOO = on|1|true|yes (any case). Default off."""
     return _env_str("TFB_CAL_LAST_REPORT_YAHOO").lower() in ("on", "1", "true", "yes")
 
 
 def _yf_report_date(x: Any) -> Optional[_dt.date]:
-    """v1.4.0 PURE: the calendar date of one get_earnings_dates index entry on
+    """v1.5.0 PURE: the calendar date of one get_earnings_dates index entry on
     the basis the v1.2.0 forward tier (_yf_earnings_dates_future) dates the
     Next Earnings Date: the entry's own .date() (a tz-aware timestamp in its
     own zone - New York on yfinance 0.2.66), else the text's first 10
@@ -1044,7 +1174,7 @@ def _yf_report_date(x: Any) -> Optional[_dt.date]:
 
 
 def _yf_row_value(row: Any, key: str) -> Any:
-    """v1.4.0 PURE: row[key] for a pandas Series or a dict-like; None when absent."""
+    """v1.5.0 PURE: row[key] for a pandas Series or a dict-like; None when absent."""
     try:
         getter = getattr(row, "get", None)
         return getter(key) if callable(getter) else None
@@ -1054,7 +1184,7 @@ def _yf_row_value(row: Any, key: str) -> Any:
 
 def _yf_earnings_dates_past(ysym: str, start: _dt.date,
                             end: _dt.date) -> Optional[Dict[str, Any]]:
-    """v1.4.0 SYNC worker (runs in a thread): the last report among the rows
+    """v1.5.0 SYNC worker (runs in a thread): the last report among the rows
     of yfinance get_earnings_dates(limit=12) dated (_yf_report_date) in
     [start, end], as a fetch_last_earnings_map row, or None. A row whose
     Event Type is present and not 'Earnings' / 'Call' (or the raw codes
@@ -1132,7 +1262,7 @@ def _yf_earnings_dates_past(ysym: str, start: _dt.date,
 
 async def _yahoo_last_report_fill(ksa: List[str], start: _dt.date, end: _dt.date,
                                   out: Dict[str, Dict[str, Any]]) -> int:
-    """v1.4.0: fill-only pass of the KSA symbols' last report into `out`
+    """v1.5.0: fill-only pass of the KSA symbols' last report into `out`
     (an EODHD row is never overwritten). One summary line per call, through
     the logger when a handler takes INFO, else to stderr (run_calendar_sync
     configures no logging). Returns the number filled. Never raises."""
@@ -1259,6 +1389,13 @@ def fetch_last_earnings_sync(symbols: List[str],
                              ) -> Dict[str, Dict[str, Any]]:
     """v1.3.0: sync wrapper of fetch_last_earnings_map."""
     return _run_sync(fetch_last_earnings_map(symbols, days_back))
+
+
+def fetch_next_exdiv_detail_sync(symbols: List[str],
+                                 days_ahead: Optional[int] = None
+                                 ) -> Dict[str, Dict[str, Any]]:
+    """v1.4.0: sync wrapper of fetch_next_exdiv_detail."""
+    return _run_sync(fetch_next_exdiv_detail(symbols, days_ahead))
 
 
 # ----------------------------------------------------------------------------- #

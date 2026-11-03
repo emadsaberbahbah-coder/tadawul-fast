@@ -61,9 +61,18 @@ const VARS = ['PD_VERSION', 'PD_EVIDENCE_PROP', 'PD_EVIDENCE_MAX_CHARS', 'PD_IBK
 const FUNCS = ['pdSrcStampMs_', 'pdIbkrStampMs_', 'pdIbkrAge_', 'pdIbkrProp_', 'pdEvidencePacket_', 'pdIbkrPublishMode_',
   'pdIbkrPublish_', 'pdIbkrRemoveFollowUp_', 'pdIbkrArmFollowUp_', 'pdIbkrFollowUpCore_', 'pdIbkrRunLog_',
   'pdIbkrEvidenceFollowUp', 'pdIbkrFollowUpState_'];
+// 2026-11-02: v1.5.18 (follow-up retry, PD_IBKR_FOLLOWUP_RETRY default off) stacks on this change; the
+// follow-up now consults the retry gate after a skip, so its vars and helpers are extracted too. The
+// property stays absent here, so every P5 line, row and detail below is the v1.5.16 output.
+const VARS_V1518 = ['PD_IBKR_RETRY_PROP', 'PD_IBKR_RETRY_HANDLER', 'PD_IBKR_RETRY_DELAY_MS', 'PD_IBKR_RETRY_REASON',
+  'PD_IBKR_RETRY_RUN_'];
+const FUNCS_V1518 = ['pdIbkrRetryMode_', 'pdIbkrRetryCore_', 'pdIbkrRemoveRetry_', 'pdIbkrArmRetry_',
+  'pdIbkrRetryAfterSkip_'];
 const geval = eval;
 for (const v of VARS) geval(extractVar(src, v));
 for (const f of FUNCS) geval(extract(src, f));
+for (const v of VARS_V1518) { try { geval(extractVar(src, v)); } catch (e) { /* a pre-1.5.18 file */ } }
+for (const f of FUNCS_V1518) { try { geval(extract(src, f)); } catch (e) { /* a pre-1.5.18 file */ } }
 
 let pass = 0;
 function ok(cond, label) { if (!cond) { console.error('FAIL ' + label); process.exit(1); } pass++; }

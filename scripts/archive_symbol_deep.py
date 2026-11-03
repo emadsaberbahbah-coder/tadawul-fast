@@ -2,8 +2,46 @@
 # scripts/archive_symbol_deep.py
 """
 ================================================================================
-TFB Symbol Deep Data - v1.0.0 (program register C8, Phase 3)
+TFB Symbol Deep Data - v1.1.0 (program register C8, Phase 3)
 ================================================================================
+v1.1.0 (2026-11-02) - OUTCOME BARS: the symbols with an active forecast record
+--------------------------------------------------------------------------------
+WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow"; "improve today,
+results tomorrow"): the BigQuery outcome engine (views 1.5.0) scores every
+overdue forecast record of v_performance_log from symbol_bars_daily. Measured
+on 1 Nov: 13,856 active records across 1,376 symbols (5,759 overdue), and
+only 164 of those symbols have bars - the deep set is the holdings, the board,
+the ROI leaders and Market_Leaders, not the symbols the forecasts were made
+on - so the engine can score about 30 % of the backlog.
+WHAT: a fourth set reason, 'outcome': every DISTINCT symbol of
+v_performance_log with status = 'active' that is not already in the deep set
+(first-seen order, at most OUTCOME_CAP = 1,600; futures and FX such as ALI=F
+and AUDCHF=X are skipped, as is anything _SYMBOL_RE refuses - never a crash).
+In the bars stage the outcome set is read AFTER the deep set with the same
+collect_bars (so a Yahoo throttle late in the run hurts only the best-effort
+set), its rows carry set_reason = 'outcome', and they go into the SAME single
+WRITE_TRUNCATE load as the deep rows - never two loads of the table. The
+MIN_BARS_SHARE rule is computed over the DEEP set only, exactly as before:
+under 80 % of the deep set answered -> the outcome set is not even read,
+nothing is loaded, yesterday's table stays, exit 1. The outcome set is best
+effort: one log line (answered/total, rows, the first 15 without bars), never
+counted in the share, never a reason to fail, and it stops asking after
+OUTCOME_TIME_S (25 minutes) so the deep load always happens inside the
+workflow's 45. It never enters the CORE set, so analyst / news and the EODHD
+budget are untouched - the outcome bars never touch EODHD. build_sets() is
+unchanged and ignores the 'outcome' rows.
+GATE: TFB_DEEP_OUTCOME_BARS = on|1|true|yes (default off). Off: every code
+path, log line and table write is byte-identical to v1.0.0 (the set query
+returns the extra rows; nothing reads them). The workflow maps the dispatch
+input outcome_bars (one run) and the repository Variable
+TFB_DEEP_OUTCOME_BARS (the schedule).
+PACE: the last real run read 315 symbols in about 3 minutes; about 1,500
+symbols are 12-15 minutes on top of that.
+ROLLBACK: unset TFB_DEEP_OUTCOME_BARS (or set it off); the next run's
+WRITE_TRUNCATE replaces the table with the deep set alone.
+================================================================================
+v1.0.0 (2026-10-31)
+--------------------------------------------------------------------------------
 WHY (owner request 31 Oct 2026): "candle charts in my portfolio ... news in my
 portfolio ... investor recommendation rating to invest like what in IBKR ...
 from different institutions or make our own one ... the deep data,
@@ -55,7 +93,8 @@ run: it reads the sources and prints what it would load; BigQuery is only
 read (the dataset check and the symbol sets).
 ENV: TFB_BQ_PROJECT, TFB_BQ_DATASET (default tfb_archive), TFB_BQ_LOCATION
 (default US), GOOGLE_SHEETS_CREDENTIALS (the archive's service account),
-EODHD_API_KEY, TFB_DEEP_EODHD_MAX_SHARE, GITHUB_RUN_ID.
+EODHD_API_KEY, TFB_DEEP_EODHD_MAX_SHARE, GITHUB_RUN_ID; since v1.1.0 also
+TFB_DEEP_OUTCOME_BARS (default off, see above).
 CLI: --write | --dry-run (default) ; --extra A,B (TFB symbols, e.g. 2222.SR,
 AAPL.US) ; --only bars|analyst|news (repeatable; default all three).
 Exit: 0 loaded (or skipped by the guard / gate), 1 a load failed, under
@@ -81,7 +120,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import archive_market_series as ams  # same folder: the Yahoo reader and the BigQuery session
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
@@ -90,6 +129,9 @@ EODHD_UA = "TFB-symbol-deep/1.0"
 BARS_DAYS = 760                 # two years of sessions and a margin
 DEEP_CAP = 600
 CORE_CAP = 120
+OUTCOME_CAP = 1600              # v1.1.0: symbols with an active forecast record (bars only)
+OUTCOME_REASON = "outcome"
+OUTCOME_TIME_S = 1500.0         # v1.1.0: the outcome set stops asking Yahoo after 25 minutes
 MIN_BARS_SHARE = 0.8            # replace symbol_bars_daily only when this share answered
 MAX_EODHD_FAIL_SHARE = 0.2      # more failed EODHD calls than this share -> exit 1
 NEWS_DAYS = 30
@@ -185,6 +227,11 @@ def eodhd_enabled() -> bool:
     return _env("TFB_DEEP_EODHD", "on").lower() not in ("off", "0", "false", "no")
 
 
+def outcome_bars_enabled() -> bool:
+    """v1.1.0: TFB_DEEP_OUTCOME_BARS arms the outcome set (default off)."""
+    return _env("TFB_DEEP_OUTCOME_BARS").lower() in ("on", "1", "true", "yes")
+
+
 def max_share() -> float:
     try:
         v = float(_env("TFB_DEEP_EODHD_MAX_SHARE", str(DEFAULT_MAX_SHARE)))
@@ -255,6 +302,25 @@ def build_sets(rows: Iterable[Dict[str, Any]], extra: Sequence[str],
     return core, deep
 
 
+def build_outcome_set(rows: Iterable[Dict[str, Any]], deep: Dict[str, str],
+                      cap: int = OUTCOME_CAP) -> Dict[str, str]:
+    """v1.1.0: {symbol: 'outcome'} from the set query's 'outcome' rows (the
+    symbols with an active Performance_Log forecast record) that are market
+    symbols and not already in `deep`, in first-seen order, at most `cap`.
+    Futures and FX (ALI=F, AUDCHF=X) are not listings and are skipped."""
+    out: Dict[str, str] = {}
+    for r in rows:
+        if str(r.get("why") or "").strip() != OUTCOME_REASON:
+            continue
+        sym = str(r.get("symbol") or "").strip().upper()
+        if not sym or "=" in sym or not _SYMBOL_RE.match(sym) or sym in deep or sym in out:
+            continue
+        if len(out) >= cap:
+            break
+        out[sym] = OUTCOME_REASON
+    return out
+
+
 SET_SQL = """
 WITH hold AS (
   SELECT DISTINCT symbol FROM `{ds}.v_my_portfolio`
@@ -274,6 +340,7 @@ UNION ALL SELECT symbol, 'board' FROM board
 UNION ALL SELECT symbol, 'roi25' FROM roi WHERE rk <= 25
 UNION ALL SELECT symbol, 'roi50' FROM roi WHERE rk > 25 AND rk <= 50
 UNION ALL SELECT symbol, 'leaders' FROM `{ds}.v_universe_latest` WHERE source_page = 'Market_Leaders'
+UNION ALL SELECT DISTINCT symbol, 'outcome' FROM `{ds}.v_performance_log` WHERE status = 'active'
 """
 
 
@@ -531,6 +598,29 @@ def collect_bars(deep: Dict[str, str], now: _dt.datetime, captured_at: str, run_
     return rows, missing
 
 
+def collect_outcome_bars(outcome: Dict[str, str], now: _dt.datetime, captured_at: str, run_id: str,
+                         fetch: Callable[..., List[Dict[str, Any]]], sleep: Callable[[float], None],
+                         budget_s: float = OUTCOME_TIME_S,
+                         clock: Callable[[], float] = time.monotonic
+                         ) -> Tuple[List[Dict[str, Any]], List[str], int]:
+    """v1.1.0: the outcome set through the same collect_bars, one symbol at a
+    time, until `budget_s` seconds have passed: (rows, symbols without bars,
+    symbols asked). The symbols not reached are neither answered nor missing;
+    the caller reports them, so the deep load never waits on this set."""
+    rows: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    asked = 0
+    deadline = clock() + budget_s
+    for sym, why in outcome.items():
+        if clock() > deadline:
+            break
+        got, gone = collect_bars({sym: why}, now, captured_at, run_id, fetch, sleep)
+        rows.extend(got)
+        missing.extend(gone)
+        asked += 1
+    return rows, missing, asked
+
+
 def collect_eodhd(core: Sequence[str], token: str, day: str, captured_at: str, run_id: str,
                   stages: Sequence[str], opener: Callable[..., Any], sleep: Callable[[float], None],
                   pause: float = 0.3) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
@@ -565,7 +655,8 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
         stages: Sequence[str], now: _dt.datetime, run_id: str, write: bool, token: str,
         fetch: Callable[..., List[Dict[str, Any]]] = ams.fetch_series,
         opener: Callable[..., Any] = ams._default_opener,
-        sleep: Callable[[float], None] = time.sleep) -> int:
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic) -> int:
     try:
         if not ams.dataset_exists(session, project, dataset):
             _out(f"ERROR: dataset {project}.{dataset} not found")
@@ -575,9 +666,14 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
     core, deep = build_sets(rows, extra)
+    outcome_on = outcome_bars_enabled() and "bars" in stages   # v1.1.0, default off
+    outcome = build_outcome_set(rows, deep) if outcome_on else {}
     day = now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d")
     captured_at = now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    _out(f"sets: core {len(core)} (holdings, board, top-25 ROI, extra), deep {len(deep)}")
+    sets_msg = f"sets: core {len(core)} (holdings, board, top-25 ROI, extra), deep {len(deep)}"
+    if outcome_on:
+        sets_msg += f", outcome {len(outcome)} (active forecast records; bars only, best effort)"
+    _out(sets_msg)
     rc = 0
     if "bars" in stages:
         bars, missing = collect_bars(deep, now, captured_at, run_id, fetch, sleep)
@@ -586,6 +682,21 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
         msg = f"bars: {answered}/{len(deep)} symbols, {len(bars)} rows"
         if missing:   # a few unknown listings are normal; the share below decides
             msg += f"; no bars: {', '.join(missing[:15])}{' ...' if len(missing) > 15 else ''}"
+        tail = ""
+        if outcome_on:   # v1.1.0: after the deep set; never in the share, never a failure
+            if write and share < MIN_BARS_SHARE:
+                _out(f"outcome bars: not read, the deep set is under {MIN_BARS_SHARE:.0%} (nothing loaded)")
+            else:
+                obars, omissing, asked = collect_outcome_bars(outcome, now, captured_at, run_id, fetch, sleep,
+                                                              clock=clock)
+                omsg = f"outcome bars: {asked - len(omissing)}/{len(outcome)} symbols, {len(obars)} rows"
+                if asked < len(outcome):
+                    omsg += f"; {len(outcome) - asked} not asked (time budget {int(OUTCOME_TIME_S)}s reached)"
+                if omissing:
+                    omsg += f"; no bars: {', '.join(omissing[:15])}{' ...' if len(omissing) > 15 else ''}"
+                _out(omsg + (" | dry run" if not write else " | in the bars load"))
+                bars.extend(obars)
+                tail = " (deep + outcome rows)"
         if not write:
             _out(msg + " | dry run")
         elif share < MIN_BARS_SHARE:
@@ -594,7 +705,7 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
         else:
             try:
                 ensure_table(session, project, dataset, TABLE_BARS)
-                _out(msg + f" | loaded {load(session, project, dataset, location, TABLE_BARS, None, bars, run_id, sleep=sleep)}")
+                _out(msg + f" | loaded {load(session, project, dataset, location, TABLE_BARS, None, bars, run_id, sleep=sleep)}" + tail)
             except Exception as exc:  # noqa: BLE001
                 _out(f"ERROR bars: {str(exc)[:300]}")
                 rc = 1
@@ -638,7 +749,8 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
 def main(argv: Optional[Sequence[str]] = None, session: Any = None, now: Optional[_dt.datetime] = None,
          fetch: Optional[Callable[..., List[Dict[str, Any]]]] = None,
          opener: Optional[Callable[..., Any]] = None,
-         sleep: Callable[[float], None] = time.sleep) -> int:
+         sleep: Callable[[float], None] = time.sleep,
+         clock: Callable[[], float] = time.monotonic) -> int:
     ap = argparse.ArgumentParser(description="TFB symbol deep data -> BigQuery")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--write", action="store_true", help="load into BigQuery")
@@ -669,7 +781,8 @@ def main(argv: Optional[Sequence[str]] = None, session: Any = None, now: Optiona
     return run(session, project=project, dataset=dataset, location=location, extra=extra,
                stages=tuple(args.only or STAGES), now=now or _dt.datetime.now(_dt.timezone.utc),
                run_id=_env("GITHUB_RUN_ID"), write=bool(args.write), token=_env("EODHD_API_KEY"),
-               fetch=fetch or ams.fetch_series, opener=opener or ams._default_opener, sleep=sleep)
+               fetch=fetch or ams.fetch_series, opener=opener or ams._default_opener, sleep=sleep,
+               clock=clock)
 
 
 if __name__ == "__main__":
