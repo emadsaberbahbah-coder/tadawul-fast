@@ -6736,8 +6736,11 @@ function dt10ExDivHold_(t, divMap, maxDays, pct) {
   var minPct = (typeof pct === 'number' && isFinite(pct)) ? pct : DT10_GUARD_EXDIV_PCT_DEF;
   if (typeof e.amount === 'number' && isFinite(e.amount) && isFinite(price) && price > 0 &&
       sameUnit) {
-    var share = Math.round(e.amount / price * 1000) / 10;
-    if (share < minPct) return null;
+    // Review fix (Codex P2 on PR #906): the threshold is compared at full
+    // precision; the share is rounded for the reason and the tag only.
+    var exact = e.amount / price * 100;
+    if (exact < minPct) return null;
+    var share = Math.round(exact * 10) / 10;
     return { kind: 'exdiv', reason: 'ex-dividend in ' + e.days + 'd (' + share.toFixed(1) +
              '% of price)', tag: 'ex-div ' + e.days + 'd ' + share.toFixed(1) + '%' };
   }

@@ -773,6 +773,10 @@ function battery() {
     // the default threshold when pct is not a number
     eq(ctx.dt10ExDivHold_({ symbol: 'A', price: 100, currency: 'USD' }, { A: { days: 1, amount: 1.9, currency: 'USD' } }, 3, undefined), null, 'default 2 %: 1.9 passes');
     eq(ctx.dt10ExDivHold_({ symbol: 'A', price: 100, currency: 'USD' }, { A: { days: 1, amount: 2.0, currency: 'USD' } }, 3, NaN).tag, 'ex-div 1d 2.0%', 'default 2 %: 2.0 holds');
+    // review fix (Codex P2 on PR #906): the threshold is compared unrounded; the tag is rounded
+    eq(ctx.dt10ExDivHold_({ symbol: 'A', price: 100, currency: 'USD' }, { A: { days: 1, amount: 1.96, currency: 'USD' } }, 3, 2), null, '1.96 % at 2 %: no hold (it rounds to 2.0)');
+    eq(ctx.dt10ExDivHold_({ symbol: 'A', price: 100, currency: 'USD' }, { A: { days: 1, amount: 2.04, currency: 'USD' } }, 3, 2.03).tag, 'ex-div 1d 2.0%', '2.04 % at 2.03 %: held (it rounds to 2.0)');
+    eq(ctx.dt10ExDivHold_({ symbol: 'A', price: 100, currency: 'USD' }, { A: { days: 1, amount: 2.02, currency: 'USD' } }, 3, 2.03), null, '2.02 % at 2.03 %: no hold');
     // render level: INDV with a blank Amount is held as size unknown, through the same research path
     const rows = DIVS.map(r => r[0] === 'INDV.US' ? ['INDV.US', 1, ''] : r);
     const e = render(newSource, { tguard: XD('enforce'), divGrid: divGrid('2026-11-02', rows) });

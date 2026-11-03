@@ -5,7 +5,7 @@
 **Scope:** item A1 part B of `claude/TFB_Gap_Analysis_and_Build_Order_2026-11-03.md` (owner request 3 Nov 14:05 Riyadh: "make the required update to avoid what happen"). The EXISTING v1.20.0 ticket guard (`DT10_TICKET_GUARD` observe | enforce) gains an ex-dividend filter behind two new Script Properties, both default OFF. With the days knob absent, blank or junk, the run is the v1.20.0 run byte for byte (every cell, merge and border, the banner, B2, the KPI strip, `_Run_Log` and Logger lines, `_Selection_Log` rows, both POST bodies, the state blob); the only difference is one property read while the guard is armed. Like the v1.20.0 guard, the filter can only take tickets off today's plan, never adds one, never re-sizes one, and the cash it frees stays unallocated.
 
 **Files:**
-- `apps_script/16_Decision_Top10.gs` 1.20.0 -> 1.21.0: 600,979 -> 613,701 bytes, 11,352 -> 11,559 lines, 13 anchored hunks, 178 added lines; seven base lines replaced (the two version lines and five lines of the guard: the config object, the core's doc line and signature, the core call, the Logger line); zero removals.
+- `apps_script/16_Decision_Top10.gs` 1.20.0 -> 1.21.0: 600,979 -> 613,875 bytes, 11,352 -> 11,562 lines, 13 anchored hunks, 181 added lines; seven base lines replaced (the two version lines and five lines of the guard: the config object, the core's doc line and signature, the core call, the Logger line); zero removals.
 - `tests/test_dt10_v1210_exdiv_guard.js` (new; 12 sections x3, `PASS 12/12`) and `tests/test_dt10_v1210_exdiv_guard.py` (new pytest wrapper, the v1.20.0 pattern, skips without node).
 - `tests/js/dt10_edits_v1210.json` (new, the 13 hunks) and `tests/js/dt10_cash_utc_history.js` (`v1200Source`, the v1.20.0 base SHA-256 `dcb22bb1...` pinned; `v1190Source` now starts from it).
 - Version and census pins moved in twelve harnesses: `test_dt10_v1200_ticket_guard` (its V10 lint, inventory and hunks now run on the v1.20.0 file rebuilt from the delivered one; V11 counts the one extra read), `test_dt10_v1190_hold_live_rule`, `test_dt10_confirm_basis`, `test_dt10_pending_grace` (T6 inventory +3 functions, +6 vars; census 253), `test_dt10_funding_evidence`, `test_dt10_post_earnings`, `test_dt10_shadow_momentum`, `test_dt10_shadow_rank_log`, `decision_input_truth` (census 253 functions / 146 vars), `decision_source_readiness`, `dt10_feed_cohort_binding`, `gas_ledger_fx_failed_state`, `dt10_bulk_format`.
@@ -41,7 +41,7 @@ A ticket bought the day before a large ex-dividend opens with a price gap the bo
    - Amounts: a number >= 0 or a numeric string; anything else gives null. Currency labels are upper-cased.
 5. `dt10ExDivMap_` (new) reads the live tab A:J, bounded at 5,000 body rows like Calendar_Events. Any fault, an absent tab or an oversized grid gives `{}`. It never throws.
 6. `dt10ExDivHold_` (new, pure) holds a ticket when the ex-date is 0..`exdivDays` days away:
-   - Measured case: when the dividend is >= `exdivPct` % of the ticket's native price in the same unit, reason `ex-dividend in Nd (P.P% of price)`, tag `ex-div Nd P.P%`.
+   - Measured case: when the dividend is >= `exdivPct` % of the ticket's native price in the same unit (compared unrounded), reason `ex-dividend in Nd (P.P% of price)`, tag `ex-div Nd P.P%`.
    - Unmeasured case: with no amount, another currency, `MIXED` or no price, reason `ex-dividend in Nd (size unknown)`, tag `ex-div Nd ?`. A special dividend cannot be ruled out.
    - **Units:** a subunit price (`GBp` / `GBX`, `ZAc` / `ILA`: the existing `DT10_FX_SUBUNIT_PARENT` keys) is measured only against a subunit label of the same parent (`GBX`).
    - The calendar lane upper-cases labels, so a `GBP` label may be pounds or an upper-cased `GBp`. That size reads unknown: the hold stays, and a percentage is never guessed.
@@ -90,7 +90,8 @@ Functions added (0 removed): `dt10ExDivMapFromValues_`, `dt10ExDivMap_`, `dt10Ex
   - **E11** service reads.
 - Every node harness that loads the cockpit passes on the delivered file (24 files), including `test_dt10_v1200_ticket_guard` 12/12, `test_dt10_v1190_hold_live_rule` 9/9, `test_dt10_post_earnings` 686, `test_dt10_shadow_momentum` 365, `test_dt10_funding_evidence` 103, `test_dt10_shadow_rank_log` 86, `test_por_v100` 51/51, `test_dp2_v1231_engine_tickets` 11/11, `decision_source_readiness` 73 and `decision_board_funding` 64.
 - Python wrappers and readers (`pytest`, 18 files including the release suites): **262 passed, 11 skipped**.
-- Delivered SHA-256 `353a11fd47c9d4a20c19ea4b3b7421f213f829d86b42e7278a5be7c3e7182047` (11,559 lines, 613,701 bytes, UTF-16 length 612,763 in the editor).
+- Delivered SHA-256 `e153f4dc516f4837e3665357242d6c1ad6edff176a7abde15d4c5839feb762f9` (11,562 lines, 613,875 bytes, UTF-16 length 612,937 in the editor).
+- Review fix (Codex P2 on PR #906): the threshold is compared at full precision and the share is rounded only for the reason and the tag. E5 adds 1.96 % at 2 % (no hold), 2.04 % at 2.03 % (held) and 2.02 % at 2.03 % (no hold).
 
 ## S6 - Golden negatives
 `node tests/test_dt10_v1210_exdiv_guard.js <v1.20.0> <v1.20.0>` exits 1 with `FAIL 0/12`; every section fails:
@@ -141,7 +142,7 @@ Each mutant also fails E10, whose hunk reversal no longer reproduces the v1.20.0
 ## S10 - Operator steps (the repo file is a mirror; nothing changes until the paste)
 1. Merge PR #905 and set the repository Variable `TFB_CAL_DIVIDENDS` = `on`. Let one calendar sync write `Dividend_Events`.
 2. Merge this PR.
-3. Paste the full `apps_script/16_Decision_Top10.gs` v1.21.0 into the Apps Script editor (SHA-256 `353a11fd...`, 11,559 lines) and Save.
+3. Paste the full `apps_script/16_Decision_Top10.gs` v1.21.0 into the Apps Script editor (SHA-256 `e153f4dc...`, 11,562 lines) and Save.
 4. Script Properties: `DT10_TICKET_GUARD` = `observe` (if not already) and `DT10_GUARD_EXDIV_DAYS` = `3`. Optionally set `DT10_GUARD_EXDIV_PCT` (default 2).
 5. Run `dt10SelfTest`. Expect `[DT10 v1.21.0] self-test`, the line `ticket guard ex-div (DT10_GUARD_EXDIV_DAYS): <= 3d, >= 2% of price, tab Dividend_Events | core: ok (...)` and zero FAIL.
 6. After one observed render, set `DT10_TICKET_GUARD` = `enforce` if the named tickets match your judgement.
