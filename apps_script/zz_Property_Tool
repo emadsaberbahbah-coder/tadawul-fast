@@ -1,0 +1,92 @@
+/**
+ * zz_Property_Tool.gs -- one-off Script Property tool (3 Nov 2026).
+ * The Project Settings page turns read-only above 50 properties, so these
+ * functions do the edits from the editor. Paste as a TEMPORARY script file,
+ * run what you need from the function list, then delete this file (the repo
+ * does not carry it).
+ *
+ *  tfbDoAll            EVERYTHING IN ONE RUN: deletes the 9 stale keys, sets
+ *                      POR_MODE=observe and POR_IBKR_ALIASES=INDV.US=SUPN, and
+ *                      installs the Plan of Record trigger (porInstallTrigger).
+ *  tfbPropsPorObserve  REQUIRED for the Plan of Record: POR_MODE=observe and
+ *                      POR_IBKR_ALIASES=INDV.US=SUPN. Then run porInstallTrigger.
+ *  tfbPropsCleanStale  optional: deletes 9 stale keys (listed below) that no
+ *                      current code reads or that only record old events.
+ *  tfbPropsList        optional: logs every property (secrets hidden).
+ *  tfbPropsPorOn       later, after one market session: POR_MODE=on.
+ *  tfbPropsPorSession  only if you decide it: POR_VALIDITY=session.
+ *
+ * Never deleted here: any *_STATE key (DT10_STAB_STATE_V1 is the board's
+ * stability memory), switches (on / off / observe / enforce), counters.
+ */
+
+var TFB_PT_STALE = [
+  'DT10_RESET_PENDING',                          // half-armed stability reset of 2 Nov 13:36; it expired after 2 min
+  'PD_ACTLOG_STATE_V1',                          // July key; the code now uses PD_ACTLOG_STATE
+  'TFB_AUTOSTART_LAST_RUN::My_Portfolio',        // 15 Oct; page no longer in TFB_AUTOSTART_PAGES
+  'TFB_AUTOSTART_LAST_RUN::Portfolio_Decision',  // 15 Oct; page no longer in TFB_AUTOSTART_PAGES
+  'TFB_AUTO_LOG_LAST_My_Portfolio',              // 23 Sep timestamp for the same page
+  'TFB_SW_LOGGED_Commodities_FX',                // 17 Sep marker
+  'TFB_SW_LOGGED_Global_Markets',                // 7 Sep marker
+  'TFB_SYNC_DISPATCH_LAST_EVENT',                // 30 Sep failed-dispatch record (diagnostic only)
+  'TFB_GH_DISPATCH_TOKEN'                        // empty value; deleted only while empty
+];
+
+function tfbDoAll() {
+  tfbPropsCleanStale();
+  tfbPropsPorObserve();
+  var t = typeof porInstallTrigger === 'function' ? porInstallTrigger() :
+      'porInstallTrigger not found: paste 28_Plan_Of_Record first, then run tfbDoAll again';
+  Logger.log(t);
+  if (typeof porSelfTest === 'function') porSelfTest();
+}
+
+function tfbPropsPorObserve() {
+  var p = PropertiesService.getScriptProperties();
+  p.setProperty('POR_MODE', 'observe');
+  p.setProperty('POR_IBKR_ALIASES', 'INDV.US=SUPN');
+  Logger.log('POR_MODE=' + p.getProperty('POR_MODE') + ' | POR_IBKR_ALIASES=' + p.getProperty('POR_IBKR_ALIASES') +
+      ' | now run porInstallTrigger');
+}
+
+function tfbPropsPorOn() {
+  PropertiesService.getScriptProperties().setProperty('POR_MODE', 'on');
+  Logger.log('POR_MODE=on');
+}
+
+function tfbPropsPorSession() {
+  PropertiesService.getScriptProperties().setProperty('POR_VALIDITY', 'session');
+  Logger.log('POR_VALIDITY=session');
+}
+
+function tfbPropsCleanStale() {
+  var p = PropertiesService.getScriptProperties(), out = [];
+  for (var i = 0; i < TFB_PT_STALE.length; i++) {
+    var k = TFB_PT_STALE[i], v = p.getProperty(k);
+    if (v === null) { out.push('absent   ' + k); continue; }
+    if (k === 'TFB_GH_DISPATCH_TOKEN' && String(v).replace(/^\s+|\s+$/g, '') !== '') {
+      out.push('KEPT     ' + k + ' (it has a value)');
+      continue;
+    }
+    if (k === 'DT10_RESET_PENDING' && Date.now() - Number(v) < 10 * 60000) {
+      out.push('KEPT     ' + k + ' (armed in the last 10 minutes)');
+      continue;
+    }
+    p.deleteProperty(k);
+    out.push('deleted  ' + k);
+  }
+  out.push('properties now: ' + Object.keys(p.getProperties()).length);
+  Logger.log(out.join('\n'));
+}
+
+function tfbPropsList() {
+  var all = PropertiesService.getScriptProperties().getProperties();
+  var keys = Object.keys(all).sort(), out = ['Script Properties: ' + keys.length];
+  for (var i = 0; i < keys.length; i++) {
+    var v = String(all[keys[i]]);
+    var shown = /TOKEN|SECRET|PASSWORD|API_?KEY/i.test(keys[i]) ? '(' + v.length + ' chars, hidden)' :
+        (v.length > 70 ? v.slice(0, 70) + '... (' + v.length + ' chars)' : v);
+    out.push(keys[i] + ' = ' + shown);
+  }
+  Logger.log(out.join('\n'));
+}
