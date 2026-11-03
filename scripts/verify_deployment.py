@@ -274,7 +274,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-02 (pin only, SCRIPT_VERSION unchanged): 1.0.0 -> 1.1.0 (--wait-only,
     # the sync-render handshake before the final and freshness audits;
     # vars.TFB_SYNC_AWAIT_RENDER, default off; workflow-scoped, never on Render).
-    ("await_cockpit_receipts", "1.1.0", "after-sync release dispatch (read-only wait)"),
+    # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.1.0 -> 1.2.0 (the release's
+    # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
+    # default strict; workflow-scoped, never on Render).
+    ("await_cockpit_receipts", "1.2.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the

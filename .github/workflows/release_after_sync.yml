@@ -1,6 +1,15 @@
 # =============================================================================
 # Release After Sync (P0-1 timing) - .github/workflows/release_after_sync.yml
 # =============================================================================
+# VERSION 1.1.0 (2026-11-03) -- vars.TFB_RELEASE_AFTER_SYNC_PRIOR (strict,
+# default | release) reaches scripts/await_cockpit_receipts.py v1.2.0. With
+# 'release' an OLDER run's value in the decision feed is weighed with the
+# release script's own classify_prior (older_run_veto, superseded_older_run)
+# instead of stopping the attempt: on 3 Nov sync 41566014627 passed its final
+# job (no new veto is written then), the feed still named the previous run's
+# 23:32 withdrawal, and the attempt stopped with decision_feed_not_this_run
+# although both cockpits had consumed the run. Unset = v1.0.0 behaviour.
+#
 # VERSION 1.0.0 (2026-10-29) -- NEW WORKFLOW: release as soon as the cockpits
 # consumed a completed production sync, instead of at the next late slot.
 #
@@ -46,7 +55,8 @@
 # nor tfb-decision-release (the wait must never delay a kill, a sweep or a
 # scheduled release).
 # ROLLBACK: unset vars.TFB_RELEASE_AFTER_SYNC (the job is skipped), or delete
-# this file and scripts/await_cockpit_receipts.py.
+# this file and scripts/await_cockpit_receipts.py. v1.1.0 alone: unset
+# vars.TFB_RELEASE_AFTER_SYNC_PRIOR.
 # =============================================================================
 name: Release After Sync (P0-1)
 
@@ -90,6 +100,7 @@ jobs:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_RELEASE_AFTER_SYNC: ${{ vars.TFB_RELEASE_AFTER_SYNC || '0' }}
       TFB_RELEASE_AFTER_SYNC_WAIT_MIN: ${{ vars.TFB_RELEASE_AFTER_SYNC_WAIT_MIN || '45' }}
+      TFB_RELEASE_AFTER_SYNC_PRIOR: ${{ vars.TFB_RELEASE_AFTER_SYNC_PRIOR || 'strict' }}
     steps:
       - name: Checkout this workflow's ref
         uses: actions/checkout@v6
