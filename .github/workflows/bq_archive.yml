@@ -20,6 +20,11 @@
 name: 🗄️ BigQuery Archive
 
 on:
+  # Opt-in only. The capture script independently proves full-source readiness;
+  # success/failure of this triggering workflow is never an acceptance receipt.
+  workflow_run:
+    workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
+    types: [completed]
   schedule:
     # 23:05 UTC == 02:05 Asia/Riyadh (next calendar day), daily.
     - cron: "5 23 * * *"
@@ -35,13 +40,25 @@ on:
         required: false
         default: ""
         type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+      staging_dataset:
+        description: "Optional isolated tfb_archive_staging_* dataset; enables coherent mode only for this dispatch"
+        required: false
+        default: ""
+        type: string
+      source_run_id:
+        description: "Completed production source run for a real coherent capture (blank = current source)"
+        required: false
+        default: ""
+        type: string
+      staging_checks:
+        description: "Run synthetic atomic/replay/rollback/diagnostic checks in the isolated dataset (requires staging_dataset)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+  actions: read
 
 defaults:
   run:
@@ -55,11 +72,27 @@ env:
 jobs:
   archive:
     name: 🗄️ Archive the workbook to BigQuery
+    if: >-
+      ${{ github.event_name != 'workflow_run' || (
+        contains(fromJSON('["1", "true", "yes", "on"]'), vars.TFB_BQ_AFTER_SYNC) &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+        contains(fromJSON('["success", "failure"]'), github.event.workflow_run.conclusion)
+      ) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 75
+    # Job-level: skipped PR/push completions never enter this queue. This group
+    # is private to archive writers and never joins the production sync lease.
+    concurrency:
+      group: tfb-bigquery-archive-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: 🐍 Set up Python
         uses: actions/setup-python@v6
@@ -70,6 +103,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: Install strict audit dependencies for coherent capture
+        if: contains(fromJSON('["1", "true", "yes", "on"]'), vars.TFB_BQ_AFTER_SYNC) || github.event.inputs.staging_dataset != ''
+        run: python -m pip install -r requirements.render.txt
 
       - name: 🔎 Resolve spreadsheet id
         id: sheet
@@ -92,8 +129,25 @@ jobs:
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: "US"
+          TFB_BQ_AFTER_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.staging_dataset != '' && 'on' || vars.TFB_BQ_AFTER_SYNC || 'off' }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.inputs.source_run_id || github.event.workflow_run.id || 'auto' }}
+          STAGING_DATASET: ${{ github.event.inputs.staging_dataset }}
+          STAGING_CHECKS: ${{ github.event.inputs.staging_checks }}
           INPUT_TABS: ${{ github.event.inputs.tabs }}
         run: |
+          set -euo pipefail
+          if [[ -n "${STAGING_DATASET:-}" ]]; then
+            if [[ ! "$STAGING_DATASET" =~ ^tfb_archive_staging_[A-Za-z0-9_]{1,128}$ ]]; then
+              echo "::error::Staging requires a separate tfb_archive_staging_* dataset."
+              exit 2
+            fi
+            export TFB_BQ_DATASET="$STAGING_DATASET"
+          elif [[ "${STAGING_CHECKS:-false}" == "true" ]]; then
+            echo "::error::Synthetic staging checks cannot target the production dataset."
+            exit 2
+          fi
           # Schedule always writes; a manual dispatch writes ONLY when
           # write=true was explicitly ticked (dry run otherwise).
           MODE="--write"
@@ -101,4 +155,32 @@ jobs:
             MODE="--dry-run"
             echo "Dry-run mode — reading the tabs, loading nothing (tick write=true to load)."
           fi
-          python scripts/archive_to_bigquery.py $MODE --tabs "${INPUT_TABS:-}"
+          if [[ "${STAGING_CHECKS:-false}" == "true" ]]; then
+            CHECK_MODE=""
+            [[ "$MODE" == "--write" ]] && CHECK_MODE="--write"
+            python scripts/validate_coherent_archive_staging.py $CHECK_MODE
+            exit "$?"
+          fi
+          case "${TFB_BQ_AFTER_SYNC}" in
+            1|true|yes|on)
+              # While armed, nightly and manual writes use the SAME coherent
+              # publisher; no legacy writer can overwrite its generation.
+              # All-tabs only: partial manual scopes are refused by the script.
+              COHERENT_MODE=""
+              [[ "$MODE" == "--write" ]] && COHERENT_MODE="--write"
+              python scripts/archive_coherent_snapshot.py $COHERENT_MODE \
+                --source-run "$SOURCE_RUN" --tabs "${INPUT_TABS:-}"
+              ;;
+            *) python scripts/archive_to_bigquery.py $MODE --tabs "${INPUT_TABS:-}" ;;
+          esac
+
+      - name: Upload coherent capture receipt (no raw grids)
+        if: always() && (contains(fromJSON('["1", "true", "yes", "on"]'), vars.TFB_BQ_AFTER_SYNC) || github.event.inputs.staging_dataset != '')
+        uses: actions/upload-artifact@v7
+        with:
+          name: coherent-archive-${{ github.run_id }}
+          path: |
+            coherent_archive.json
+            coherent_staging_validation.json
+          if-no-files-found: warn
+          retention-days: 14
