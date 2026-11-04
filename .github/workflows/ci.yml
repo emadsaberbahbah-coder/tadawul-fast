@@ -10,10 +10,11 @@
 # [OUTCOME-CAL-EXT], TRACK_OUTCOME_CAL_EXT default off = v6.53.0: a forecast on
 # a venue the outcome map lacks uses the opportunity builder's reviewed venue
 # calendar) in its own heavy-job step after the outcome-evidence step; it needs
-# the pinned exchange_calendars, which only this job installs. Offline fixtures
-# only; its golden legs read main c54eba40 with `git show` and SKIP on a
-# shallow checkout when the fetch fails. Nothing is removed and no existing
-# entry moves.
+# the pinned exchange_calendars, and this is the only blocking job that
+# installs it. Offline fixtures only; its golden legs read main c54eba40 with
+# `git show`, and the step sets TFB_TEST_REQUIRE_BASE=1 so a missing base copy
+# FAILS those legs instead of skipping them. Nothing is removed and no
+# existing entry moves.
 #
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
@@ -1373,11 +1374,13 @@ jobs:
         run: python -m pytest -q tests/test_outcome_price_evidence.py
 
       - name: Outcome calendars for more venues (track_performance 6.56.0)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
         run: |
           # v1.1.68: the golden legs read track_performance v6.53.0 at main
-          # c54eba40 (a failed fetch only SKIPs those legs).
+          # c54eba40; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them.
           git fetch --no-tags --depth=1 origin c54eba40fb82e0a8a0cf8c69b69f7f59ffc3f272 \
-            || echo "::notice::tracker v6.53.0 base not fetched - its golden legs will SKIP"
+            || echo "::warning::tracker v6.53.0 base not fetched - its golden legs will FAIL"
           python -m pytest -q tests/test_track_outcome_cal_ext.py
 
       # v1.1.21: opportunity_builder v1.26.2 venue-calendar coverage. Needs the

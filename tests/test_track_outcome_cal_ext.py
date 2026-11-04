@@ -6,53 +6,67 @@ apart from the version string).
 WHY (2026-11-04): _outcome_sessions is the tracker's only exchange-calendar
 lookup (live-quote session check, target session, v6.47.0 historical close).
 It knows 32 suffixes; any other one raises outcome_calendar_unknown and the
-record stays ACTIVE / PENDING for ever. MEGACPO.MX is on the 4 Nov board
-(Performance Clock run 41795448626); .MX .KL .JO .MC .SA .TW .IR .AT .F .BO
-.SS and others have no calendar, although core/analysis/opportunity_builder
+record stays ACTIVE / PENDING for ever. .KL .JO .MC .TW .IR .AT .BO .SS .BK
+.JK and others have no calendar, although core/analysis/opportunity_builder
 already ships reviewed calendars for them (_VENUE_CAL_MAP /
-_VENUE_CAL_EXT_MAP). With the gate on the tracker consults those 30 extra
-entries when its own map misses.
+_VENUE_CAL_EXT_MAP). With the gate on the tracker consults 22 of the 30
+missing entries when its own map misses; 8 are DENIED (.MX .SA .LM .BA .F:
+the calendar close is not the venue's real close all year; .PH .CR .PK: not
+Yahoo's code for the builder's venue).
 
 REAL modules (scripts/track_performance.py, core/analysis/opportunity_builder,
 core.symbols.normalize) and the REAL pinned exchange_calendars. The audit
 cases run the real PerformanceTrackerApp.audit_active_records loop; the only
 stubs are the backend quote call (an AsyncMock returning one witnessed row),
-the clock, and the price fallback / CA guard / feed switches. No network.
+the clock, the historical-bar source (C5b), and the price fallback / CA guard
+/ feed switches. No network.
 
 C1  parity: _OUTCOME_CALENDARS_EXT == (builder _VENUE_CAL_MAP | _VENUE_CAL_EXT_MAP)
-    minus the tracker's base keys; no key overlaps the base map; the excluded
-    venues are in neither map; every MIC instantiates
+    minus the tracker's base keys minus _OUTCOME_CAL_EXT_DENIED; no key overlaps
+    the base map; DENIED and EXCLUDED are pinned both ways; every MIC
+    instantiates
 C2  off (unset / blank / off / 0 / false / no / enforce / observe / onn / y):
     _outcome_sessions returns or raises exactly as the untouched v6.53.0 over
-    a symbol matrix (base suffixes, every extension suffix, excluded venues,
-    indices / futures / crypto / bare digits, US share classes, suffix-less)
+    a symbol matrix (base suffixes, every extension and denied suffix,
+    excluded venues, indices / futures / crypto / bare digits, US share
+    classes, suffix-less)
 C2b the on-spellings; junk stays off
-C3  on: every extension suffix maps to its MIC; every base-map symbol keeps
-    the base calendar (base wins); every refusal still raises; .NS .SZ .CA
-    .QA .AE .AD .KW .BH stay unknown; BRK.B stays US; SAP.F is XFRA
-C4  on, the REAL audit loop: a due record on MX KL JO MC SA TW IR AT F BO SS
-    BK JK with a quote at its target-session close MATURES (WIN), its receipt
+C3  on: every extension suffix maps to the MIC of a literal table; every
+    base-map symbol keeps the base calendar (base wins); every refusal still
+    raises; the DENIED and EXCLUDED venues stay unknown; BRK.B stays US
+C4  on, the REAL audit loop: a due record on KL JO MC TW IR AT BO SS BK JK CN
+    SN PR with a quote at its target-session close MATURES (WIN), its receipt
     naming the MIC; off, the same record stays ACTIVE with
-    outcome_calendar_unknown, byte-identical to v6.53.0 (receipt version aside)
+    outcome_calendar_unknown
+C4g off, that record is byte-identical to v6.53.0's (receipt version aside)
 C4b on and off, AAPL.US / 2222.SR / VOD.L / 7203.T records give identical
-    records and receipts (the gate never touches a base venue)
+    records and receipts (the gate never touches a base venue); C4bg: and
+    equal v6.53.0's
 C5  on, a quote one hour before the calendar close is refused as
-    quote_before_target_close (the record stays ACTIVE): an earlier real close
-    than the calendar's loses maturations, it never makes a wrong one
-C6  on, .BO / .SS targets whose session window passes exchange_calendars'
-    2026-12-31 bound stay outcome_calendar_unknown (fail closed); a November
-    target works
+    quote_before_target_close (the record stays ACTIVE)
+C5b on with TRACK_HIST_TARGET_CLOSE=enforce: an extension record whose target
+    session closed before the audit matures on THAT session's bar (receipt:
+    calendar, hist_bar_date, quote_asof = the calendar close); a DENIED record
+    (.MX .SA .F, target 30 minutes before the calendar close) stays
+    outcome_calendar_unknown and no bar is ever read
+C6  on, .BO / .SS: a lookup on 2026-12-17 works, from 2026-12-18 (the
+    +/-14-day window passes exchange_calendars' 2026-12-31 bound) it raises
+    and a target there stays outcome_calendar_unknown (fail closed)
 C7  ENV lane: both tracker steps map TRACK_OUTCOME_CAL_EXT with || 'off'
     exactly once and identically; the reader's fallback literal is "off";
-    ci.yml's heavy job runs this file
-G1  golden negative: the untouched v6.53.0 with the gate set leaves the .MX
-    record ACTIVE with outcome_calendar_unknown (C4's on-check fails on it)
+    ci.yml's heavy job runs this file with the base required
+C8  tripwire for #857: when _outcome_tally_calendar exists it must name the
+    calendar _outcome_sessions uses, gate on and off
+G1  golden negative: C4's on-leg and C5b's matured leg FAIL on the untouched
+    v6.53.0 with the gate set
 V1  version floor, verify_deployment pin, title line, WHY order, ASCII file
 V1b against the base: ASCII added lines (the title line aside), exactly the
     title and SCRIPT_VERSION lines removed, one function added, none removed
+    (this PR's diff alone: SKIPs once #845 / #857 are merged in)
 
-Base copy: TFB_TEST_TRACK_BASE=<path>, else `git show c54eba40:scripts/
-track_performance.py`; without either C2, C4's base leg, G1 and V1b SKIP.
+Base copy: TFB_TEST_TRACK_BASE=<path> (must be v6.53.0), else `git show
+c54eba40:scripts/track_performance.py`; without either, C2, C4g, C4bg, G1 and
+V1b SKIP, or FAIL when TFB_TEST_REQUIRE_BASE=1 (ci.yml sets it).
 Golden negative of the whole file: TFB_TEST_TRACK_DELIVERED=<base copy>.
 
 Run: python3 tests/test_track_outcome_cal_ext.py   (prints PASS k/k)
@@ -116,12 +130,18 @@ def _base_or_none():
                 tmp = Path(tempfile.mkdtemp()) / "track_performance_v6530_base.py"
                 tmp.write_bytes(blob.stdout)
                 path = str(tmp)
-        _MODS["base"] = _load("track_performance_v6530_base", path) if path else None
+        mod = _load("track_performance_v6530_base", path) if path else None
+        if mod is not None:   # whichever path supplied it, it must be the untouched v6.53.0
+            assert getattr(mod, "SCRIPT_VERSION", "") == "6.53.0", (path, getattr(mod, "SCRIPT_VERSION", ""))
+            assert not hasattr(mod, "_OUTCOME_CALENDARS_EXT") and not hasattr(mod, "_outcome_cal_ext_enabled"), path
+        _MODS["base"] = mod
     return _MODS["base"]
 
 
 def base():
     if _base_or_none() is None:
+        if (os.getenv("TFB_TEST_REQUIRE_BASE") or "").strip() == "1":
+            pytest.fail("TFB_TEST_REQUIRE_BASE=1 but the v6.53.0 base copy is unavailable")
         pytest.skip("base copy unavailable (set TFB_TEST_TRACK_BASE)")
     return _MODS["base"]
 
@@ -141,12 +161,20 @@ def _sessions(tp, sym, around=NOW):
         return "RAISES", "%s:%s" % (type(exc).__name__, exc)
 
 
-EXT_SAMPLE = {"MX": "WALMEX.MX", "KL": "1155.KL", "JO": "NPN.JO", "MC": "SAN.MC", "SA": "PETR4.SA",
-              "TW": "2330.TW", "IR": "RYA.IR", "AT": "ETE.AT", "F": "SAP.F", "BO": "500325.BO",
-              "SS": "600519.SS", "BK": "PTT.BK", "JK": "BBCA.JK", "KQ": "035720.KQ", "TWO": "6488.TWO",
-              "BA": "GGAL.BA", "SN": "SQM-B.SN", "IC": "MAREL.IC", "PR": "CEZ.PR", "BD": "OTP.BD",
-              "LM": "BAP.LM", "PH": "SM.PH", "TL": "LHV1T.TL", "RG": "GRD1R.RG", "VS": "TEL1L.VS",
-              "CR": "HT.CR", "RO": "TLV.RO", "PK": "OGDC.PK", "CN": "WEED.CN", "NE": "AW-UN.NE"}
+EXT_SAMPLE = {"MC": "SAN.MC", "JK": "BBCA.JK", "KQ": "035720.KQ", "TW": "2330.TW", "TWO": "6488.TWO",
+              "KL": "1155.KL", "BO": "500325.BO", "SN": "SQM-B.SN", "BK": "PTT.BK", "JO": "NPN.JO",
+              "IR": "RYA.IR", "CN": "WEED.CN", "NE": "AW-UN.NE", "SS": "600519.SS", "IC": "MAREL.IC",
+              "PR": "CEZ.PR", "BD": "OTP.BD", "TL": "LHV1T.TL", "RG": "GRD1R.RG", "VS": "TEL1L.VS",
+              "RO": "TLV.RO", "AT": "ETE.AT"}
+# The independent anchor C3 checks the lookup against (not the module constant).
+EXPECTED_MIC = {"MC": "XMAD", "JK": "XIDX", "KQ": "XKRX", "TW": "XTAI", "TWO": "XTAI", "KL": "XKLS",
+                "BO": "XBOM", "SN": "XSGO", "BK": "XBKK", "JO": "XJSE", "IR": "XDUB", "CN": "XTSE",
+                "NE": "XTSE", "SS": "XSHG", "IC": "XICE", "PR": "XPRA", "BD": "XBUD", "TL": "XTAL",
+                "RG": "XRIS", "VS": "XLIT", "RO": "XBSE", "AT": "ASEX"}
+DENIED = {"MX", "SA", "LM", "BA", "F", "PH", "CR", "PK"}
+EXCLUDED = {"NS", "SZ", "CA", "QA", "AE", "AD", "KW", "BH"}
+DENIED_SAMPLE = {"MX": "WALMEX.MX", "SA": "PETR4.SA", "LM": "BAP.LM", "BA": "GGAL.BA", "F": "SAP.F",
+                 "PH": "SM.PH", "CR": "HT.CR", "PK": "OGDC.PK"}
 BASE_SAMPLE = ["AAPL.US", "AAPL", "BRK.B", "BRK-B.US", "2222.SR", "VOD.L", "BARC.LSE", "RY.TO", "XYZ.V",
                "BHP.AX", "7203.T", "0700.HK", "SAP.DE", "SAP.XETRA", "MC.PA", "ASML.AS", "UCB.BR",
                "ENI.MI", "NESN.SW", "NOVO-B.CO", "VOLV-B.ST", "EQNR.OL", "NOKIA.HE", "PKO.WA",
@@ -154,7 +182,7 @@ BASE_SAMPLE = ["AAPL.US", "AAPL", "BRK.B", "BRK-B.US", "2222.SR", "VOD.L", "BARC
                "005930.KO", "FPH.NZ"]
 REFUSE_SAMPLE = ["", "^N225", "GC=F", "SAR=X", "BTC-USD", "1234", "7203", "RELIANCE.NS", "000001.SZ",
                  "ABC.CA", "QNBK.QA", "EMAAR.AE", "ADNOC.AD", "ZAIN.KW", "BATELCO.BH", "FOO.ZZ"]
-MATRIX = BASE_SAMPLE + list(EXT_SAMPLE.values()) + REFUSE_SAMPLE
+MATRIX = BASE_SAMPLE + list(EXT_SAMPLE.values()) + list(DENIED_SAMPLE.values()) + REFUSE_SAMPLE
 
 
 def _set_gate(monkeypatch, word):
@@ -164,13 +192,18 @@ def _set_gate(monkeypatch, word):
         monkeypatch.setenv(GATE, word)
 
 
-def _last_close(mic, before=NOW):
+def _closed_sessions(mic, before=NOW):
+    """[(session label, close)] of the sessions that closed by before - 30 min."""
     cal = xc.get_calendar(mic)
-    sess = cal.sessions_in_range((before - timedelta(days=12)).date().isoformat(), before.date().isoformat())
-    closes = [cal.session_close(s).to_pydatetime() for s in sess]
-    closes = [c for c in closes if c <= before - timedelta(minutes=30)]
-    assert closes, mic
-    return closes[-1]
+    sess = cal.sessions_in_range((before - timedelta(days=14)).date().isoformat(), before.date().isoformat())
+    out = [(str(x.date()), cal.session_close(x).to_pydatetime()) for x in sess]
+    out = [(d, c) for d, c in out if c <= before - timedelta(minutes=30)]
+    assert len(out) >= 4, mic
+    return out
+
+
+def _last_close(mic, before=NOW):
+    return _closed_sessions(mic, before)[-1][1]
 
 
 def _boundaries(tp, monkeypatch):
@@ -237,16 +270,21 @@ def test_c1_parity_with_the_builder_maps():
     from core.analysis import opportunity_builder as ob
     union = dict(ob._VENUE_CAL_MAP)
     union.update(ob._VENUE_CAL_EXT_MAP)
-    want = {k: v for k, v in union.items() if k not in tp._OUTCOME_CALENDARS}
+    missing = {k: v for k, v in union.items() if k not in tp._OUTCOME_CALENDARS}
+    want = {k: v for k, v in missing.items() if k not in tp._OUTCOME_CAL_EXT_DENIED}
     assert tp._OUTCOME_CALENDARS_EXT == want, (set(tp._OUTCOME_CALENDARS_EXT) ^ set(want))
-    assert len(tp._OUTCOME_CALENDARS_EXT) >= 30
+    assert len(tp._OUTCOME_CALENDARS_EXT) >= 22
     assert not set(tp._OUTCOME_CALENDARS_EXT) & set(tp._OUTCOME_CALENDARS)
-    for key in tp._OUTCOME_CAL_EXT_EXCLUDED:
+    assert set(tp._OUTCOME_CAL_EXT_DENIED) == DENIED                 # pinned both ways
+    assert set(tp._OUTCOME_CAL_EXT_EXCLUDED) == EXCLUDED
+    assert DENIED <= set(missing), DENIED - set(missing)             # each is a builder key the tracker lacks
+    for key in EXCLUDED:
         assert key not in tp._OUTCOME_CALENDARS_EXT and key not in tp._OUTCOME_CALENDARS, key
-        assert key not in union, key   # the builder rejects them too
+        assert key not in union, key                                 # the builder rejects them too
     for mic in sorted(set(tp._OUTCOME_CALENDARS_EXT.values())):
-        xc.get_calendar(mic)            # raises if the pinned library lacks it
-    assert set(EXT_SAMPLE) == set(tp._OUTCOME_CALENDARS_EXT)
+        xc.get_calendar(mic)                                         # raises if the pinned library lacks it
+    assert set(EXT_SAMPLE) == set(tp._OUTCOME_CALENDARS_EXT) == set(EXPECTED_MIC)
+    assert set(DENIED_SAMPLE) == DENIED
 
 
 # ------------------------------------------------------------------- C2 ----
@@ -283,63 +321,78 @@ def test_c3_on_maps_the_extension_and_keeps_everything_else(monkeypatch):
     _set_gate(monkeypatch, "on")
     on = {sym: _sessions(tp, sym) for sym in MATRIX}
     for suffix, sym in EXT_SAMPLE.items():
-        assert on[sym][0] == tp._OUTCOME_CALENDARS_EXT[suffix], (sym, on[sym][0])
+        assert on[sym][0] == EXPECTED_MIC[suffix], (sym, on[sym][0])
         assert on[sym][1], sym                                    # real sessions came back
         assert off[sym][0] == "RAISES" and "outcome_calendar_unknown" in off[sym][1]
-    for sym in BASE_SAMPLE + REFUSE_SAMPLE:
+    for sym in BASE_SAMPLE + REFUSE_SAMPLE + list(DENIED_SAMPLE.values()):
         assert on[sym] == off[sym], sym                           # base wins; refusals unchanged
-    for sym in REFUSE_SAMPLE:
-        assert on[sym][0] == "RAISES", sym
-    assert on["BRK.B"][0] == "XNYS" and on["NPN.JSE"][0] == "XJSE" and on["SAP.F"][0] == "XFRA"
+    for sym in REFUSE_SAMPLE + list(DENIED_SAMPLE.values()):
+        assert on[sym][0] == "RAISES" and "outcome_calendar_unknown" in on[sym][1], sym
+    assert on["BRK.B"][0] == "XNYS" and on["NPN.JSE"][0] == "XJSE" and on["SAP.DE"][0] == "XETR"
 
 
 # ------------------------------------------------------------------- C4 ----
-AUDIT_CASES = [("WALMEX.MX", "XMEX"), ("1155.KL", "XKLS"), ("NPN.JO", "XJSE"), ("SAN.MC", "XMAD"),
-               ("PETR4.SA", "BVMF"), ("2330.TW", "XTAI"), ("RYA.IR", "XDUB"), ("ETE.AT", "ASEX"),
-               ("SAP.F", "XFRA"), ("500325.BO", "XBOM"), ("600519.SS", "XSHG"), ("PTT.BK", "XBKK"),
-               ("BBCA.JK", "XIDX")]
+AUDIT_CASES = [("1155.KL", "XKLS"), ("NPN.JO", "XJSE"), ("SAN.MC", "XMAD"), ("2330.TW", "XTAI"),
+               ("RYA.IR", "XDUB"), ("ETE.AT", "ASEX"), ("500325.BO", "XBOM"), ("600519.SS", "XSHG"),
+               ("PTT.BK", "XBKK"), ("BBCA.JK", "XIDX"), ("WEED.CN", "XTSE"), ("SQM-B.SN", "XSGO"),
+               ("CEZ.PR", "XPRA")]
+
+
+def _c4_on_leg(tp, monkeypatch, sym, mic):
+    _set_gate(monkeypatch, "on")
+    rec, receipt = audit_one(tp, monkeypatch, sym, mic)
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.outcome == "WIN", (sym, rec.status, receipt)
+    assert receipt.get("calendar") == mic, receipt
 
 
 @pytest.mark.parametrize("sym,mic", AUDIT_CASES)
 def test_c4_due_record_matures_only_with_the_gate(monkeypatch, sym, mic):
     tp = delivered()
-    _set_gate(monkeypatch, "on")
-    rec, receipt = audit_one(tp, monkeypatch, sym, mic)
-    assert rec.status == tp.PerformanceStatus.MATURED and rec.outcome == "WIN", (sym, rec.status, receipt)
-    assert receipt["state"] == "matured" or receipt.get("calendar") == mic, receipt
-    assert receipt.get("calendar") == mic, receipt
+    _c4_on_leg(tp, monkeypatch, sym, mic)
     _set_gate(monkeypatch, None)
     rec_off, receipt_off = audit_one(tp, monkeypatch, sym, mic)
     assert rec_off.status == tp.PerformanceStatus.ACTIVE and receipt_off["reason"] == "outcome_calendar_unknown"
-    b = _base_or_none()
-    if b is not None:
-        _set_gate(monkeypatch, "on")    # the base ignores the gate
-        rec_b, _rb = audit_one(b, monkeypatch, sym, mic)
-        _set_gate(monkeypatch, None)
-        assert _record_state(tp, rec_off) == _record_state(b, rec_b)
+
+
+@pytest.mark.parametrize("sym,mic", AUDIT_CASES[:4])
+def test_c4g_off_record_equals_the_base(monkeypatch, sym, mic):
+    b, tp = base(), delivered()
+    _set_gate(monkeypatch, None)
+    rec_off, _r = audit_one(tp, monkeypatch, sym, mic)
+    _set_gate(monkeypatch, "on")                          # the base ignores the gate
+    rec_b, _rb = audit_one(b, monkeypatch, sym, mic)
+    assert _record_state(tp, rec_off) == _record_state(b, rec_b)
 
 
 BASE_AUDIT = [("AAPL.US", "XNYS"), ("2222.SR", "XSAU"), ("VOD.L", "XLON"), ("7203.T", "XTKS")]
 
 
-@pytest.mark.parametrize("sym,mic", BASE_AUDIT)
-def test_c4b_base_venues_identical_on_and_off(monkeypatch, sym, mic):
-    tp = delivered()
+def _base_states(tp, monkeypatch, sym, mic):
     states = []
     for word in (None, "on"):
         _set_gate(monkeypatch, word)
         rec, _r = audit_one(tp, monkeypatch, sym, mic)
         states.append(_record_state(tp, rec))
+    return states
+
+
+@pytest.mark.parametrize("sym,mic", BASE_AUDIT)
+def test_c4b_base_venues_identical_on_and_off(monkeypatch, sym, mic):
+    states = _base_states(delivered(), monkeypatch, sym, mic)
     assert states[0] == states[1]
     assert states[0]["status"].upper().startswith("MATURED"), states[0]
-    b = _base_or_none()
-    if b is not None:
-        rec_b, _rb = audit_one(b, monkeypatch, sym, mic)
-        assert _record_state(b, rec_b) == states[0]
+
+
+@pytest.mark.parametrize("sym,mic", BASE_AUDIT)
+def test_c4bg_base_venues_equal_the_base(monkeypatch, sym, mic):
+    b, tp = base(), delivered()
+    states = _base_states(tp, monkeypatch, sym, mic)
+    rec_b, _rb = audit_one(b, monkeypatch, sym, mic)
+    assert _record_state(b, rec_b) == states[0] == states[1]
 
 
 # ------------------------------------------------------------------- C5 ----
-@pytest.mark.parametrize("sym,mic", [("WALMEX.MX", "XMEX"), ("PETR4.SA", "BVMF")])
+@pytest.mark.parametrize("sym,mic", [("1155.KL", "XKLS"), ("RYA.IR", "XDUB")])
 def test_c5_quote_before_the_calendar_close_is_refused(monkeypatch, sym, mic):
     tp = delivered()
     _set_gate(monkeypatch, "on")
@@ -348,20 +401,72 @@ def test_c5_quote_before_the_calendar_close_is_refused(monkeypatch, sym, mic):
     assert receipt["reason"] == "quote_before_target_close", receipt
 
 
+def audit_hist(tp, monkeypatch, sym, mic, before_close=timedelta(hours=3)):
+    """The REAL audit loop under TRACK_HIST_TARGET_CLOSE=enforce on a record
+    whose target session closed days before the audit; the bar source is a
+    stub that records every call -> (rec, receipt, calls, label, close)."""
+    _boundaries(tp, monkeypatch)
+    monkeypatch.setenv("TRACK_HIST_TARGET_CLOSE", "enforce")
+    sessions = _closed_sessions(mic)
+    label, close = sessions[-4]
+    last_label, last_close = sessions[-1]
+    calls = []
+
+    def fake_bars(symbol, session):
+        calls.append((symbol, session))
+        return ([{"date": label, "close": 105.0, "split": 0.0},
+                 {"date": last_label, "close": 110.0, "split": 0.0}], "", "stub-history")
+    monkeypatch.setattr(tp, "_hist_close_bars_for", fake_bars)
+    monkeypatch.setattr(tp, "_hist_close_bars", lambda *a, **k: pytest.fail("network"))
+    monkeypatch.setattr(tp, "_ca_ledger_factor", lambda *a, **k: None)
+    rec = _record(tp, sym, close - before_close)
+    asyncio.run(_app(tp, [_row(sym, last_close)]).audit_active_records([rec]))
+    receipt = json.loads(rec.notes.rsplit(tp._OUTCOME_RECEIPT, 1)[1])
+    return rec, receipt, calls, label, close
+
+
+def _c5b_matured_leg(tp, monkeypatch, sym, mic):
+    _set_gate(monkeypatch, "on")
+    rec, receipt, calls, label, close = audit_hist(tp, monkeypatch, sym, mic)
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.outcome == "WIN", (sym, rec.status, receipt)
+    assert abs(rec.realized_roi - 5.0) < 1e-9, rec.realized_roi
+    assert receipt.get("calendar") == mic and receipt.get("hist_bar_date") == label, receipt
+    assert receipt.get("quote_asof") == close.isoformat(), (receipt.get("quote_asof"), close)
+    assert calls and all(c[1] == label for c in calls), calls
+
+
+@pytest.mark.parametrize("sym,mic", [("1155.KL", "XKLS"), ("NPN.JO", "XJSE"), ("WEED.CN", "XTSE"),
+                                     ("500325.BO", "XBOM")])
+def test_c5b_hist_enforce_matures_an_extension_record_on_its_bar(monkeypatch, sym, mic):
+    _c5b_matured_leg(delivered(), monkeypatch, sym, mic)
+
+
+@pytest.mark.parametrize("sym,mic", [("WALMEX.MX", "XMEX"), ("PETR4.SA", "BVMF"), ("SAP.F", "XFRA")])
+def test_c5b_hist_enforce_never_scores_a_denied_venue(monkeypatch, sym, mic):
+    tp = delivered()
+    _set_gate(monkeypatch, "on")
+    rec, receipt, calls, _label, _close = audit_hist(tp, monkeypatch, sym, mic,
+                                                     before_close=timedelta(minutes=30))
+    assert rec.status == tp.PerformanceStatus.ACTIVE, (sym, rec.status, receipt)
+    assert receipt["reason"] == "outcome_calendar_unknown" and calls == [], (receipt, calls)
+
+
 # ------------------------------------------------------------------- C6 ----
-@pytest.mark.parametrize("sym", ["500325.BO", "600519.SS"])
-def test_c6_calendar_bound_fails_closed(monkeypatch, sym):
+@pytest.mark.parametrize("sym,mic", [("500325.BO", "XBOM"), ("600519.SS", "XSHG")])
+def test_c6_calendar_bound_fails_closed(monkeypatch, sym, mic):
     tp = delivered()
     _set_gate(monkeypatch, "on")
     tp._outcome_calendar_schedule.cache_clear()
+    assert str(xc.get_calendar(mic).last_session.date()) == "2026-12-31"   # the pinned bound
+    name, sess = tp._outcome_sessions(sym, datetime(2026, 12, 17, 12, 0, tzinfo=UTC))
+    assert name == mic and sess
+    for day in (18, 24, 31):
+        assert _sessions(tp, sym, datetime(2026, 12, day, 12, 0, tzinfo=UTC))[0] == "RAISES", day
     late = tp.OutcomePrice(sym, 110.0, "yahoo_chart", datetime(2026, 12, 29, 12, 0, tzinfo=UTC),
                            datetime(2026, 12, 29, 10, 0, tzinfo=UTC))
     rec = _record(tp, sym, datetime(2026, 12, 28, 6, 0, tzinfo=UTC))
     _ctx, reason = tp._outcome_target_session(rec, late, datetime(2026, 12, 29, 12, 0, tzinfo=UTC))
     assert reason == "outcome_calendar_unknown", reason
-    early_target = datetime(2026, 11, 10, 6, 0, tzinfo=UTC)
-    name, sess = tp._outcome_sessions(sym, early_target)
-    assert name in ("XBOM", "XSHG") and sess
 
 
 # ------------------------------------------------------------------- C7 ----
@@ -392,19 +497,34 @@ def test_c7_env_lane_parity_reader_and_ci():
     assert m and re.search(r'os\.getenv\("%s"\)\s*or\s*"off"' % GATE, m.group(1))
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     heavy = ci.split("\n  heavy:\n", 1)[1].split("\n  summary:\n", 1)[0]
-    assert re.search(r"python -m pytest -q tests/test_track_outcome_cal_ext\.py", heavy)
-    assert "git fetch --no-tags --depth=1 origin %s" % BASE_FULL in heavy
+    step = heavy.split("- name: Outcome calendars for more venues", 1)[1].split("\n      - name: ", 1)[0]
+    assert re.search(r"python -m pytest -q tests/test_track_outcome_cal_ext\.py", step)
+    assert "git fetch --no-tags --depth=1 origin %s" % BASE_FULL in step
+    assert re.search(r'^\s+TFB_TEST_REQUIRE_BASE: "1"$', step, re.M), step
     assert BASE_FULL.startswith(BASE_SHA)
 
 
+# ------------------------------------------------------------------- C8 ----
+def test_c8_tally_tripwire_for_857(monkeypatch):
+    tp = delivered()
+    tally = getattr(tp, "_outcome_tally_calendar", None)
+    if tally is None:
+        pytest.skip("no _outcome_tally_calendar in this build (#857 not merged in)")
+    for word in (None, "on"):
+        _set_gate(monkeypatch, word)
+        for sym in list(EXT_SAMPLE.values()) + list(DENIED_SAMPLE.values()) + BASE_SAMPLE:
+            name = _sessions(tp, sym)[0]
+            assert tally(sym) == ("UNKNOWN" if name == "RAISES" else name), (word, sym, tally(sym), name)
+
+
 # ---------------------------------------------------------------- GOLD -----
-def test_g1_golden_negative_base_never_matures_mx(monkeypatch):
+@pytest.mark.parametrize("sym,mic", AUDIT_CASES[:3])
+def test_g1_golden_negative_c4_fails_on_the_base(monkeypatch, sym, mic):
     b = base()
-    _set_gate(monkeypatch, "on")
-    rec, receipt = audit_one(b, monkeypatch, "WALMEX.MX", "XMEX")
-    assert rec.status == b.PerformanceStatus.ACTIVE and receipt["reason"] == "outcome_calendar_unknown"
     with pytest.raises(AssertionError):
-        assert rec.status == b.PerformanceStatus.MATURED
+        _c4_on_leg(b, monkeypatch, sym, mic)
+    with pytest.raises(AssertionError):
+        _c5b_matured_leg(b, monkeypatch, sym, mic)
 
 
 # ------------------------------------------------------------------- V -----
@@ -425,10 +545,11 @@ def test_v1b_against_the_base_ascii_and_functions():
     import difflib
     b = base()
     tp = delivered()
-    if tp.SCRIPT_VERSION != "6.56.0":
-        pytest.skip("the exact c54eba40 -> 6.56.0 diff checks apply to 6.56.0 only")
+    src = Path(tp.__file__).read_text(encoding="utf-8")
+    if tp.SCRIPT_VERSION != "6.56.0" or re.search(r"^# v6\.5[45]\.0 \(", src, re.M):
+        pytest.skip("the exact c54eba40 -> 6.56.0 diff checks apply to this PR's diff alone")
     old = Path(b.__file__).read_text(encoding="utf-8").splitlines()
-    new = Path(tp.__file__).read_text(encoding="utf-8").splitlines()
+    new = src.splitlines()
     diff = list(difflib.unified_diff(old, new, lineterm="", n=0))
     added = [ln[1:] for ln in diff if ln.startswith("+") and not ln.startswith("+++")]
     removed = [ln[1:] for ln in diff if ln.startswith("-") and not ln.startswith("---")]
