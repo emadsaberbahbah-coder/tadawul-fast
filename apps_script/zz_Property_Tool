@@ -15,6 +15,8 @@
  *  tfbPropsList        optional: logs every property (secrets hidden).
  *  tfbPropsPorOn       later, after one market session: POR_MODE=on.
  *  tfbPropsPorSession  only if you decide it: POR_VALIDITY=session.
+ *  tfbPropsExitSanityOn  (4 Nov) DP2_EXIT_SANITY=on for 27_Decision_Pages_v2
+ *                      1.2.33 (the Settings page cannot add a 51st property).
  *
  * Never deleted here: any *_STATE key (DT10_STAB_STATE_V1 is the board's
  * stability memory), switches (on / off / observe / enforce), counters.
@@ -57,6 +59,12 @@ function tfbPropsPorOn() {
 function tfbPropsPorSession() {
   PropertiesService.getScriptProperties().setProperty('POR_VALIDITY', 'session');
   Logger.log('POR_VALIDITY=session');
+}
+
+function tfbPropsExitSanityOn() {
+  PropertiesService.getScriptProperties().setProperty('DP2_EXIT_SANITY', 'on');
+  Logger.log('DP2_EXIT_SANITY=' + PropertiesService.getScriptProperties().getProperty('DP2_EXIT_SANITY') +
+      ' | now run dp2SelfTest (expect: exit sanity (DP2_EXIT_SANITY): on . core ok)');
 }
 
 function tfbPropsCleanStale() {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* tests/test_gas_sync_dispatch_p170.js
- * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 surface, re-pinned on v1.1.0 [P-170 DISPATCH-FROM-GAS].
+ * Harness for apps_script/24_Sync_Dispatch.gs v1.0.0 surface, re-pinned on v1.1.0 and v1.1.1 [P-170 DISPATCH-FROM-GAS].
  * Loads the REAL .gs source into a vm context whose only additions are stubs of
  * the Apps Script services it touches (PropertiesService, UrlFetchApp,
  * SpreadsheetApp, ScriptApp, Logger). Every test calls the real functions.
@@ -87,7 +87,7 @@ function run() {
     const w = makeWorld({});
     const v = w.ctx.tfbSyncDispatchSelfTest();
     T('T1 selftest', v.indexOf('sync dispatch core: ok') === 0, v);
-    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.1.0');
+    T('T1 version', w.ctx.TFB_SYNC_DISPATCH_VERSION === '1.1.1');
   }
   // T2 happy path: token, stale GM (3 h), expired hold -> dispatch 204
   {
@@ -101,6 +101,7 @@ function run() {
     const f = w.fetches[0];
     T('T2 url', f.url === 'https://api.github.com/repos/emadsaberbahbah-coder/tadawul-fast/actions/workflows/daily_sync.yml/dispatches', f.url);
     T('T2 payload', JSON.parse(f.options.payload).inputs.run_mode === 'full_sync' && JSON.parse(f.options.payload).ref === 'main');
+    T('T2 payload carries My_Portfolio (v1.1.1)', JSON.parse(f.options.payload).inputs.include_portfolio === 'true');
     T('T2 bearer', f.options.headers.Authorization === 'Bearer ' + TOKEN);
     T('T2 log row', w.logRows.length === 1 && w.logRows[0][2] === 'tfbDispatchDailySync' && w.logRows[0][4] === 'OK' && w.logRows[0][7] === 204 && w.logRows[0][3] === 'daily_sync.yml', JSON.stringify(w.logRows[0] && w.logRows[0].slice(1, 8)));
     T('T2 details reason ok', /"reason":"ok"/.test(String(w.logRows[0][9])) && /"gm_stamp_age_min":18[0-9]/.test(String(w.logRows[0][9])), String(w.logRows[0][9]).slice(0, 120));
