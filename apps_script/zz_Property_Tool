@@ -13,6 +13,8 @@
  *  tfbPropsCleanStale  optional: deletes 9 stale keys (listed below) that no
  *                      current code reads or that only record old events.
  *  tfbPropsList        optional: logs every property (secrets hidden).
+ *  tfbPropsEarlyT10On  (4 Nov) TFB_DECISION_CHAIN_EARLY_T10=on for 26_Decision_Chain
+ *                      1.0.4 (Top_10 renders once the sync proved its run ready).
  *  tfbPropsPorOn       later, after one market session: POR_MODE=on.
  *  tfbPropsPorSession  only if you decide it: POR_VALIDITY=session.
  *  tfbPropsExitSanityOn  (4 Nov) DP2_EXIT_SANITY=on for 27_Decision_Pages_v2
@@ -97,4 +99,11 @@ function tfbPropsList() {
     out.push(keys[i] + ' = ' + shown);
   }
   Logger.log(out.join('\n'));
+}
+
+function tfbPropsEarlyT10On() {
+  PropertiesService.getScriptProperties().setProperty('TFB_DECISION_CHAIN_EARLY_T10', 'on');
+  Logger.log('TFB_DECISION_CHAIN_EARLY_T10=' +
+      PropertiesService.getScriptProperties().getProperty('TFB_DECISION_CHAIN_EARLY_T10') +
+      ' | now run tfbDecisionChainStatus (expect: early_t10=on)');
 }

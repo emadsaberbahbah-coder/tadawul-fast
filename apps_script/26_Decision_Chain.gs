@@ -1,8 +1,36 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.3 (2026-10-28)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.4 (2026-11-04)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.4 (2026-11-04) -- EARLY TOP_10 RENDER (TFB_DECISION_CHAIN_EARLY_T10,
+ * default off). WHY: both overnight syncs of 4 Nov ended red at "Verify
+ * final decision publication" (blockers: decision_failed; runs 41748516298
+ * and 41766747380). The final audit (audit_decision_surface_freshness.py
+ * 1.2.3) needs Top_10 to carry 'source readiness VERIFIED (run N)' BEFORE
+ * it runs, and daily_sync.yml 1.0.9 waits up to 15 min for that receipt.
+ * This chain rendered Top_10 for run N only once 'TFB Decision Feed'
+ * carried run N, i.e. AFTER that audit, so the wait timed out ("receipts
+ * for run 41748516298: Portfolio_Decision at 1 s, Top_10_Investments
+ * none") and each red finalizer published NOT_ACTIONABLE(final_publication)
+ * until a later release.
+ * WHAT (gate on only): Top_10 may render for run N once 'TFB Upstream Feed
+ * Diagnostic' reads exactly 'UPSTREAM_READY | run=N ...' and the four page
+ * feeds 'TFB Feed Market_Leaders / Global_Markets / Commodities_FX /
+ * Mutual_Funds' each read 'OK | ... | run=N' (PURE tfbDcUpstreamReadyRun_).
+ * It is its own step (action t10e, state.t10e, attempts t10e:N) with the
+ * same skips (claim, manual priority, sync in flight, cockpit running,
+ * quiet window), receipt check, hold and attempt budget. The post-audit
+ * render and the release re-render are unchanged, so the board still shows
+ * the final verdict after the audit. Off (absent, blank, any other word, or
+ * a fault): one property read per tick and nothing else; the same plans,
+ * state and _Run_Log rows as v1.0.3. Functions added: 2 (tfbDcEarlyOn_,
+ * tfbDcUpstreamReadyRun_, PURE). Changed: tfbDcStateOf_ (t10e, kept only
+ * when set), tfbDcReadInputs_ (early fields while on), tfbDcPlanCore_
+ * (early branch before 'final audit not finished'), tfbDecisionChainTick
+ * (observe view, prune), tfbDecisionChainStatus (early_t10= field).
+ * Removed: 0. Rollback: delete TFB_DECISION_CHAIN_EARLY_T10, or v1.0.3.
  *
  * v1.0.3 -- wait for _Status to change before re-rendering a board whose
  * receipt did not verify. _Run_Log since 27 Oct: all 10 ERROR rows are this
@@ -111,7 +139,7 @@
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.3';
+var TFB_DC_VERSION = '1.0.4';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -128,6 +156,10 @@ var TFB_DC_INFLIGHT_MAX_MIN = 90;
 var TFB_DC_STATUS_FP_MAX_ROWS = 400;                  // v1.0.3: bounded _Status read
 var TFB_DC_FP_ENDPOINT_PREFIX = 'backend:';           // v1.0.3: the sync's own A:J stamp
 var TFB_DC_FP_FEED_PREFIX = 'TFB Feed ';              // v1.0.3: sync-written per-page keys
+var TFB_DC_EARLY_PROP = 'TFB_DECISION_CHAIN_EARLY_T10'; // v1.0.4: off (default) | on
+var TFB_DC_UPSTREAM_KEY = 'TFB Upstream Feed Diagnostic'; // v1.0.4: 'UPSTREAM_READY | run=N ...'
+var TFB_DC_EARLY_FEED_KEYS = ['TFB Feed Market_Leaders', 'TFB Feed Global_Markets',
+                              'TFB Feed Commodities_FX', 'TFB Feed Mutual_Funds'];   // v1.0.4
 
 /* ------------------------------------------------------------------ PURE --- */
 
@@ -194,6 +226,28 @@ function tfbDcReleaseOf_(raw) {
 }
 
 /** Parse the chain's own state JSON; anything malformed -> empty state. */
+/** v1.0.4 PURE: the early-render gate; on / 1 / true / yes (trimmed, any
+ * case) reads on, anything else (absent, blank, junk) reads off. */
+function tfbDcEarlyOn_(raw) {
+  return /^\s*(on|1|true|yes)\s*$/i.test(String(raw === null || raw === undefined ? '' : raw));
+}
+
+/** v1.0.4 PURE: the run the sync proved ready, or ''. The diagnostic must
+ * read 'UPSTREAM_READY | run=N ...' (one run= token) and every page feed
+ * 'OK | ... | run=N ...' for that same N: one finished job can write
+ * UPSTREAM_READY while another job of the run still writes its pages. */
+function tfbDcUpstreamReadyRun_(diagRaw, feedRaws) {
+  var d = String(diagRaw === null || diagRaw === undefined ? '' : diagRaw);
+  if (!/^\s*UPSTREAM_READY\s*\|/.test(d)) return '';
+  var run = tfbDcRunOf_(d);
+  if (!run || !feedRaws || !feedRaws.length) return '';
+  for (var i = 0; i < feedRaws.length; i++) {
+    var f = String(feedRaws[i] === null || feedRaws[i] === undefined ? '' : feedRaws[i]);
+    if (!/^\s*OK\s*\|/.test(f) || tfbDcRunOf_(f) !== run) return '';
+  }
+  return run;
+}
+
 function tfbDcStateOf_(raw) {
   var st = {pd: '', t10: '', t10rel: '', claim: null, attempts: {}, observed: {}, hold: {}};
   try {
@@ -206,6 +260,7 @@ function tfbDcStateOf_(raw) {
       st.attempts = (o.attempts && typeof o.attempts === 'object') ? o.attempts : {};
       st.observed = (o.observed && typeof o.observed === 'object') ? o.observed : {};
       st.hold = (o.hold && typeof o.hold === 'object') ? o.hold : {};   /* v1.0.3 */
+      if (o.t10e) st.t10e = String(o.t10e);   /* v1.0.4: early render, kept only when set */
     }
   } catch (e) {}
   return st;
@@ -349,6 +404,19 @@ function tfbDcPlanCore_(s) {
             reason: 'release issued ' + issued + ' for run ' + run};
   }
   if (String(t.decisionRun || '') !== run) {
+    /* v1.0.4: gate on - render once as soon as the sync proved run N ready;
+     * the final audit of run N needs this board's receipt for run N. */
+    if (t.early && String(t.upstreamRun || '') === run && String(st.t10e || '') !== run) {
+      if ((att['t10e:' + run] || 0) >= TFB_DC_MAX_ATTEMPTS) {
+        return none('Top_10 early render for run ' + run + ' gave up after ' + TFB_DC_MAX_ATTEMPTS + ' attempts');
+      }
+      if (held('t10e:' + run)) {
+        return none('Top_10 early render for run ' + run + ' did not verify; waiting for _Status to change');
+      }
+      if (s.cockpitRunning) return none('cockpit refresh in progress');
+      if (s.quiet) return none('quiet window (S-1 board slot)');
+      return {action: 't10e', run: run, release: '', reason: 'run ' + run + ' upstream ready'};
+    }
     return none('run ' + run + ' final audit not finished');
   }
   if ((att['t10:' + run] || 0) >= TFB_DC_MAX_ATTEMPTS) {
@@ -473,6 +541,19 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
       s.inflight = !!dt10SyncInflightCore_(ml, gm, nowMs, TFB_DC_INFLIGHT_MAX_MIN).active;
     }
   } catch (eSt) {}
+  try {   /* v1.0.4: early Top_10 inputs, read only while the gate is on */
+    if (tfbDcEarlyOn_(tfbDcProps_().getProperty(TFB_DC_EARLY_PROP))) {
+      var feeds = [];
+      for (var fi = 0; fi < TFB_DC_EARLY_FEED_KEYS.length; fi++) {
+        var fk = TFB_DC_EARLY_FEED_KEYS[fi];
+        feeds.push(fk === TFB_DC_GM_FEED_KEY ? gm : fk === TFB_DC_ML_FEED_KEY ? ml :
+                   tfbDcStatusValue_(ss, fk));
+      }
+      var upRun = tfbDcUpstreamReadyRun_(tfbDcStatusValue_(ss, TFB_DC_UPSTREAM_KEY), feeds);
+      s.t10.early = true;
+      s.t10.upstreamRun = upRun;
+    }
+  } catch (eUp) { delete s.t10.early; delete s.t10.upstreamRun; }
   try {
     var marker = tfbDcProps_().getProperty(TFB_DC_COCKPIT_MARKER_PROP) || '';
     if (marker && typeof dt10RunMarkerCore_ === 'function') {
@@ -531,6 +612,7 @@ function tfbDecisionChainTick() {
     var view = mode === 'observe'
         ? {pd: state.observed.pd || state.pd, t10: state.observed.t10 || state.t10,
            t10rel: state.observed.t10rel || state.t10rel,
+           t10e: state.observed.t10e || state.t10e,   /* v1.0.4 */
            claim: null, attempts: {}, observed: state.observed}
         : state;
     var inputs = tfbDcReadInputs_(ss, mode, view, nowMs);
@@ -606,6 +688,7 @@ function tfbDecisionChainTick() {
       if (tail === p.plan.run || (p.plan.release && tail === p.plan.release)) keep[k] = state.attempts[k];
       else if (head === 'pd' && cur.pd && tail === cur.pd) keep[k] = state.attempts[k];
       else if (head === 't10' && cur.t10 && tail === cur.t10) keep[k] = state.attempts[k];
+      else if (head === 't10e' && cur.t10 && tail === cur.t10) keep[k] = state.attempts[k];   /* v1.0.4 */
       else if (head === 't10rel' && cur.rel && tail === cur.rel) keep[k] = state.attempts[k];
     }
     state.attempts = keep;
@@ -674,6 +757,8 @@ function tfbDecisionChainStatus() {
   var msg = '[DECISION-CHAIN v' + TFB_DC_VERSION + '] mode=' + mode +
       ' last_pd=' + (state.pd || '-') + ' last_t10=' + (state.t10 || '-') +
       ' last_release_render=' + (state.t10rel || '-') +
+      ' early_t10=' + (tfbDcEarlyOn_(tfbDcProps_().getProperty(TFB_DC_EARLY_PROP)) ? 'on' : 'off') +
+      ' last_t10_early=' + (state.t10e || '-') +   /* v1.0.4 */
       ' next=' + plan.action + (plan.run ? ' run ' + plan.run : '') + ' (' + plan.reason + ')';
   Logger.log(msg);
   return msg;
