@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.56.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,63 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# v6.56.0 (2026-11-04) [OUTCOME-CAL-EXT]: a forecast on a venue the outcome
+# map does not know (.MX .KL .JO .MC .SA .TW .IR .AT .F .BO .SS ...) can
+# mature, using the venue calendars the opportunity builder already ships.
+# ONE ENV gate, DEFAULT OFF (TRACK_OUTCOME_CAL_EXT) = v6.53.0 byte-identical
+# apart from the version string. 6.54.0 and 6.55.0 are claimed by the open PRs
+# #845 and #857, so this build takes 6.56.0; whichever lands later re-numbers.
+# EVIDENCE: _outcome_sessions (the one calendar lookup behind the live-quote
+#   session check, the target session and the v6.47.0 historical close)
+#   knows 32 suffixes. Any other suffix raises outcome_calendar_unknown, and a
+#   record with that reason stays ACTIVE and PENDING for ever: it never
+#   matures, never expires and never reaches Realized ROI, WIN/LOSS or the
+#   Directional Win Rate. The 31 Oct audit receipts counted about 100 such
+#   records (v6.53.0 WHY above: 'MX and suffix-less names'); the 4 Nov
+#   07:53Z Performance Clock run (41795448626) records MEGACPO.MX again
+#   (ACTION-TREND 'ACCUMULATE, 106 obs'; DEDUP-SIGNAL sample
+#   MEGACPO.MX|20261104), a forecast that can never be scored. Of the 45
+#   venue suffixes v_outcome_engine knows, 21 have no calendar here (.MX .KL
+#   .JO .MC .SA .TW .IR .AT .BO .SS .KQ .JK .BK .NS .SZ .CA and the Gulf
+#   ones). core/analysis/opportunity_builder ships _VENUE_CAL_MAP and
+#   _VENUE_CAL_EXT_MAP (v1.26.2 / v1.27.2, every MIC instantiated in the
+#   pinned exchange_calendars 4.13.2, '.NS' deliberately absent because XBOM
+#   does not model NSE's special sessions). 30 of their suffixes are missing
+#   here; none of them disagrees with a key this map already has.
+# WHAT: _OUTCOME_CALENDARS_EXT = exactly those 30 entries (the builder's two
+#   maps minus the keys _OUTCOME_CALENDARS already has; the harness pins the
+#   parity). _outcome_sessions consults it only when the base map misses AND
+#   TRACK_OUTCOME_CAL_EXT is on / 1 / true / yes, so every suffix the base
+#   map knows keeps its calendar (base always wins) and with the gate off the
+#   extension is never read. Every refusal before and after the lookup is
+#   unchanged: '^' indices, '=' futures/FX, '-USD' crypto, a bare name that
+#   does not start with a letter, and the US share-class dot rule (BRK.B is
+#   US). Still unknown with the gate on: .NS, .SZ (no XSHE in 4.13.2), .CA,
+#   .QA, .AE, .AD, .KW, .BH, and suffix-less non-US names.
+# ENV LANE: track_performance.yml 'Run performance clock' (1.0.10) and
+#   daily_sync.yml's tracker step map TRACK_OUTCOME_CAL_EXT (|| 'off') - ENV
+#   PARITY, so a manual run_tracker=true audit in the sync lane matures the
+#   same records.
+# ARMING (owner): repository Variable TRACK_OUTCOME_CAL_EXT=on. The next
+#   audit's receipts on those records read 'calendar': '<MIC>' and either
+#   mature or carry the ordinary session reasons (quote_outside_target_session,
+#   target_session_not_complete ...) instead of outcome_calendar_unknown.
+# KNOWN LIMITS: (1) exchange_calendars ends XBOM (.BO) and XSHG (.SS) on
+#   2026-12-31 (the others one year ahead); a target whose +/-14-day session
+#   window passes that bound stays outcome_calendar_unknown (fail closed). (2)
+#   XMEX keeps 08:30-15:00 Mexico City and BVMF 10:00-18:00 Sao Paulo all
+#   year; if a venue's real close is ever earlier than its calendar's (for
+#   example one that follows New York's daylight-saving hours), a quote at
+#   the real close is refused as quote_before_target_close: fewer
+#   maturations, never a wrong one. (3) A special session the calendar does
+#   not model (a Muhurat hour on .BO) refuses the quote the same way. (4) #857's outcome tally (_outcome_tally_calendar)
+#   repeats the base lookup; whichever of the two lands second must consult
+#   the extension there too.
+# ZERO functions removed. Additions: _outcome_cal_ext_enabled,
+#   _OUTCOME_CALENDARS_EXT, _OUTCOME_CAL_EXT_EXCLUDED.
+# ROLLBACK: unset TRACK_OUTCOME_CAL_EXT (or set off). Records that matured
+#   meanwhile keep their receipts ('calendar' names the MIC used).
+SCRIPT_VERSION = "6.56.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3379,6 +3435,29 @@ _OUTCOME_CALENDARS = {
     "IS": "XIST", "JSE": "XJSE", "TA": "XTAE", "SG": "XSES",
     "SI": "XSES", "KS": "XKRX", "KO": "XKRX", "NZ": "XNZE",
 }
+# v6.56.0 [OUTCOME-CAL-EXT] (TRACK_OUTCOME_CAL_EXT, default off): the venue
+# calendars core/analysis/opportunity_builder already ships (_VENUE_CAL_MAP +
+# _VENUE_CAL_EXT_MAP, v1.26.2 / v1.27.2) that the map above lacks. Consulted
+# only when the map above misses; the harness pins the parity with the builder.
+_OUTCOME_CALENDARS_EXT = {
+    "F": "XFRA", "MC": "XMAD",
+    "MX": "XMEX", "JK": "XIDX", "KQ": "XKRX", "TW": "XTAI", "TWO": "XTAI",
+    "KL": "XKLS", "BO": "XBOM", "BA": "XBUE", "SN": "XSGO", "BK": "XBKK",
+    "JO": "XJSE", "SA": "BVMF", "IR": "XDUB", "CN": "XTSE", "NE": "XTSE",
+    "SS": "XSHG", "IC": "XICE", "PR": "XPRA", "BD": "XBUD", "LM": "XLIM",
+    "PH": "XPHS", "TL": "XTAL", "RG": "XRIS", "VS": "XLIT", "CR": "XZAG",
+    "RO": "XBSE", "PK": "XKAR", "AT": "ASEX",
+}
+# Venues that stay outcome_calendar_unknown with the gate on (no calendar in
+# exchange_calendars 4.13.2, or one the builder review rejected: XBOM does not
+# model NSE's special sessions).
+_OUTCOME_CAL_EXT_EXCLUDED = ("NS", "SZ", "CA", "QA", "AE", "AD", "KW", "BH")
+
+
+def _outcome_cal_ext_enabled() -> bool:
+    """v6.56.0: TRACK_OUTCOME_CAL_EXT=1/on/true/yes lets an outcome use the
+    builder's venue calendars for a suffix the base map lacks. DEFAULT OFF."""
+    return (os.getenv("TRACK_OUTCOME_CAL_EXT") or "off").strip().lower() in {"1", "on", "true", "yes"}
 
 
 @dataclass(frozen=True)
@@ -3458,6 +3537,8 @@ def _outcome_sessions(symbol: str, around: datetime) -> Tuple[str, Tuple[Tuple[s
     if "." in raw and US_SHARE_CLASS_DOT_RE.fullmatch(raw) and split_symbol_exchange(raw)[1] is None:
         suffix = "US"
     name = _OUTCOME_CALENDARS.get(suffix)
+    if name is None and _outcome_cal_ext_enabled():   # v6.56.0 (base map wins)
+        name = _OUTCOME_CALENDARS_EXT.get(suffix)
     if name is None or ("." not in raw and not raw[0].isalpha()):
         raise ValueError("outcome_calendar_unknown")
     return name, _outcome_calendar_schedule(name, around.astimezone(timezone.utc).date().isoformat())

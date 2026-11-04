@@ -2,6 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.68 (2026-11-04) -- OUTCOME CALENDARS FOR MORE VENUES (track_performance 6.56.0)
+# (1.1.62 and 1.1.63 are claimed by open #778, 1.1.64 by open #882, 1.1.65 by
+# open #889, 1.1.66 by open #897, 1.1.67 by open #909.)
+#
+# v1.1.68: run tests/test_track_outcome_cal_ext.py (track_performance v6.56.0
+# [OUTCOME-CAL-EXT], TRACK_OUTCOME_CAL_EXT default off = v6.53.0: a forecast on
+# a venue the outcome map lacks uses the opportunity builder's reviewed venue
+# calendar) in its own heavy-job step after the outcome-evidence step; it needs
+# the pinned exchange_calendars, which only this job installs. Offline fixtures
+# only; its golden legs read main c54eba40 with `git show` and SKIP on a
+# shallow checkout when the fetch fails. Nothing is removed and no existing
+# entry moves.
+#
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
@@ -1358,6 +1371,14 @@ jobs:
 
       - name: ⚙️ Run outcome evidence with production calendars
         run: python -m pytest -q tests/test_outcome_price_evidence.py
+
+      - name: Outcome calendars for more venues (track_performance 6.56.0)
+        run: |
+          # v1.1.68: the golden legs read track_performance v6.53.0 at main
+          # c54eba40 (a failed fetch only SKIPs those legs).
+          git fetch --no-tags --depth=1 origin c54eba40fb82e0a8a0cf8c69b69f7f59ffc3f272 \
+            || echo "::notice::tracker v6.53.0 base not fetched - its golden legs will SKIP"
+          python -m pytest -q tests/test_track_outcome_cal_ext.py
 
       # v1.1.21: opportunity_builder v1.26.2 venue-calendar coverage. Needs the
       # pinned exchange_calendars + pandas, which only this job installs (the
