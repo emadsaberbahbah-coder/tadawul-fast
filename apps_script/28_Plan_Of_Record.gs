@@ -1,6 +1,21 @@
 /**
- * 28_Plan_Of_Record.gs -- TFB Plan of Record v1.0.0 (2026-11-03)
+ * 28_Plan_Of_Record.gs -- TFB Plan of Record v1.0.1 (2026-11-05)
  * ============================================================================
+ * v1.0.1 (2026-11-05) -- YIELD TO THE DECISION RENDERS (TFB_RENDER_PRIORITY,
+ * default off). WHY (Apps Script executions, Thu 5 Nov 2026, Riyadh): this
+ * refresh runs every 15 minutes for 125-321 s; at 01:13:51 it ran beside the
+ * decision chain's Top_10 render of 01:14:49, which was stopped at the Apps
+ * Script 6-minute limit, and sync 41901407829 missed its final check.
+ * WHAT (gate on only): porRefresh skips its refresh while the Top_10
+ * cockpit's run marker (DT10_RUN_MARKER) is younger than 7 minutes or the
+ * decision chain holds a claim younger than 7 minutes (PURE
+ * porRenderBusyCore_): {skipped: 'a Top_10 / Portfolio_Decision render is
+ * running'}; the next 15-minute tick refreshes. The run claim lives 360 s
+ * instead of 240 s, because runs reach 321 s and the chain reads it
+ * (26_Decision_Chain 1.0.5). Off: one property read per refresh; v1.0.0
+ * otherwise. Functions added: 3 (porPriorityOn_, porRenderBusyCore_,
+ * porRenderBusy_). Changed: porRefresh (the skip), porClaim_ (the TTL).
+ *
  * One stable decision page: the plan you can act on for each market session,
  * locked from the cockpit's EXECUTABLE render, tracked to execution against
  * your IBKR holdings and working orders, and never silently replaced.
@@ -129,10 +144,11 @@
  *
  * Not a licensed financial adviser; the owner decides and executes every
  * trade. ES5, ASCII. Functions: 62, all new (prefix por). Removed: 0.
+ * (v1.0.1: 65 functions, 3 added, all prefixed por.)
  * ============================================================================
  */
 
-var POR_VERSION = '1.0.0';
+var POR_VERSION = '1.0.1';
 var POR_MODE_PROP = 'POR_MODE';           // off (default) | observe | on
 var POR_VALIDITY_PROP = 'POR_VALIDITY';   // feed (default) | session
 var POR_ALIAS_PROP = 'POR_IBKR_ALIASES';  // 'INDV.US=SUPN, ...' (TFB symbol = IBKR symbol); empty default
@@ -158,6 +174,9 @@ var POR_FEED_SKEW_MIN = 15;               // = DT10_UV_FUTURE_SKEW_MIN (16_Decis
 var POR_STOP_TOL = 0.01;                  // 1%: IBKR stop vs plan stop
 var POR_RUN_KEY = 'POR_RUNNING';
 var POR_RUN_TTL_S = 240;
+var POR_PRIORITY_PROP = 'TFB_RENDER_PRIORITY';      // v1.0.1: off (default) | on
+var POR_PRIORITY_TTL_S = 360;                       // v1.0.1: the run claim's life while on
+var POR_RENDER_BUSY_MIN = 7;                        // v1.0.1: the cockpit marker / chain claim window
 var POR_SHEET_TZ = POR_TZ;                // the workbook's time zone, set at the start of each run
 
 var POR_VENUES = {
@@ -1074,14 +1093,55 @@ function porRenderPage_(ss, built, ctx) {
 
 /* ------------------------------------------------------------ entry points */
 
-function porClaim_() {
+function porClaim_(ttlS) {
   try {
     var cache = CacheService.getScriptCache();
     if (cache.get(POR_RUN_KEY)) return false;
-    cache.put(POR_RUN_KEY, String(porNow_()), POR_RUN_TTL_S);
+    cache.put(POR_RUN_KEY, String(porNow_()), ttlS || POR_RUN_TTL_S);
     return true;
   } catch (e) {
     return true;
+  }
+}
+
+/** v1.0.1 PURE: the render-priority gate (on / 1 / true / yes, any case). */
+function porPriorityOn_(raw) {
+  return /^\s*(on|1|true|yes)\s*$/i.test(String(raw === null || raw === undefined ? '' : raw));
+}
+
+/** v1.0.1 PURE: is a decision render running? markerRaw is the cockpit's
+ * DT10_RUN_MARKER ({started: ISO} or a bare ISO stamp), stateRaw the decision
+ * chain's TFB_DECISION_CHAIN_STATE ({claim: {at_ms}}). Busy when either is
+ * younger than POR_RENDER_BUSY_MIN minutes; unreadable input is not busy. */
+function porRenderBusyCore_(markerRaw, stateRaw, nowMs) {
+  var limit = POR_RENDER_BUSY_MIN * 60000;
+  try {
+    var m = String(markerRaw || '').replace(/^\s+|\s+$/g, '');
+    if (m) {
+      var started = m;
+      try {
+        var o = JSON.parse(m);
+        if (o && o.started) started = String(o.started);
+      } catch (eJ) {}
+      var ms = Date.parse(started);
+      if (isFinite(ms) && nowMs - ms >= 0 && nowMs - ms < limit) return true;
+    }
+  } catch (eM) {}
+  try {
+    var st = JSON.parse(String(stateRaw || ''));
+    var c = st && st.claim;
+    if (c && typeof c.at_ms === 'number' && nowMs - c.at_ms >= 0 && nowMs - c.at_ms < limit) return true;
+  } catch (eS) {}
+  return false;
+}
+
+/** v1.0.1 I/O: the cockpit marker and the chain claim, read once. */
+function porRenderBusy_(nowMs) {
+  try {
+    var p = PropertiesService.getScriptProperties();
+    return porRenderBusyCore_(p.getProperty('DT10_RUN_MARKER'), p.getProperty('TFB_DECISION_CHAIN_STATE'), nowMs);
+  } catch (e) {
+    return false;
   }
 }
 
@@ -1110,7 +1170,13 @@ function porRenders_(ss, log) {
 function porRefresh() {
   var mode = porModeOf_(porProp_(POR_MODE_PROP));
   if (mode === 'off') return {mode: 'off', version: POR_VERSION};
-  if (!porClaim_()) return {mode: mode, version: POR_VERSION, skipped: 'another refresh is running'};
+  var prio = porPriorityOn_(porProp_(POR_PRIORITY_PROP));   // v1.0.1
+  if (prio && porRenderBusy_(porNow_())) {
+    return {mode: mode, version: POR_VERSION, skipped: 'a Top_10 / Portfolio_Decision render is running'};
+  }
+  if (!porClaim_(prio ? POR_PRIORITY_TTL_S : POR_RUN_TTL_S)) {
+    return {mode: mode, version: POR_VERSION, skipped: 'another refresh is running'};
+  }
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var nowMs = porNow_();

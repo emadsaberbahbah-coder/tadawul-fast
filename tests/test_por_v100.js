@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* tests/test_por_v100.js
- * Harness for apps_script/28_Plan_Of_Record.gs v1.0.0 [PLAN OF RECORD] (owner review of Tue 3 Nov 2026 01:08
+ * Harness for apps_script/28_Plan_Of_Record.gs v1.0.1 (v1.0.0 [PLAN OF RECORD], owner review of Tue 3 Nov 2026 01:08
  * Riyadh: 'today morning there was 6 symboles as quailifed for investing, but after that now no one is
  * qualified ... the program should show in consistance beahviour and more stable recommdadtions').
  *
@@ -12,7 +12,9 @@
  * with the cockpit's own DT10_SELECTED_HEADERS read out of apps_script/16_Decision_Top10.gs, and the feed clock
  * is compared with the cockpit's own dt10UvParse_ run from that file.
  * Sections:
- *   T0  the file compiles, version, ES5 / ASCII lint, function inventory (62, prefix por)
+ *   T0  the file compiles, version, ES5 / ASCII lint, function inventory (65 since v1.0.1, prefix por)
+ *   T13 v1.0.1 render priority (TFB_RENDER_PRIORITY): off = the v1.0.0 refresh; on = no refresh while the
+ *       cockpit marker or a decision-chain claim is younger than 7 minutes; the run claim lives 360 s
  *   T1  gates: POR_MODE off (default, junk, property fault) -> nothing read or written; observe -> ledger and
  *       snapshot only; on -> ledger + page; POR_VALIDITY feed default, session only for 'session'
  *   T2  sessions: US DST / standard time, weekend roll, Tadawul Sun-Thu, LSE BST / GMT, HKEX; venue codes
@@ -344,15 +346,66 @@ function battery(src, label) {
   const SES = {POR_MODE: 'on', POR_VALIDITY: 'session'};
   const AFTER_CLOSE = T('2026-11-03 1:40');
 
-  test(label + 'T0 compiles, version, ES5 / ASCII, 62 functions prefixed por', () => {
+  test(label + 'T13 v1.0.1 render priority: off = v1.0.0; on = no refresh beside a decision render; claim TTL 360 s', () => {
+    const ON2 = {POR_MODE: 'on'};
+    const iso = ms => new Date(ms).toISOString();
+    const marker = ageMin => JSON.stringify({started: iso(AFTER_CLOSE - ageMin * 60000), v: '1.21.0', entry: 'x'});
+    const claim = ageMin => JSON.stringify({claim: {act: 't10e', run: '41901407829', at_ms: AFTER_CLOSE - ageMin * 60000}});
+    // off (absent, blank, junk): a fresh marker and claim change nothing - the refresh runs as v1.0.0
+    for (const g of [undefined, '', 'off', 'enable']) {
+      const props = Object.assign({}, ON2, {DT10_RUN_MARKER: marker(2), TFB_DECISION_CHAIN_STATE: claim(2)});
+      if (g !== undefined) props.TFB_RENDER_PRIORITY = g;
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props});
+      ok(!res.skipped && world.writes.length > 0, 'off ' + String(g) + ': the refresh ran');
+      eq(world.cache.POR_RUNNING, undefined, 'the claim is released');
+    }
+    // on: a fresh cockpit marker or a fresh chain claim skips the refresh before anything is read or written
+    for (const [name, extra] of [['marker', {DT10_RUN_MARKER: marker(2)}], ['bare ISO marker', {DT10_RUN_MARKER: iso(AFTER_CLOSE - 60000)}],
+                                 ['claim', {TFB_DECISION_CHAIN_STATE: claim(3)}]]) {
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: Object.assign({}, ON2, {TFB_RENDER_PRIORITY: 'on'}, extra)});
+      eq(res.skipped, 'a Top_10 / Portfolio_Decision render is running', name);
+      eq(world.writes.length, 0, name + ': no cell written'); eq(world.propWrites.length, 0, name + ': no property written');
+      eq(Object.keys(world.cache).length, 0, name + ': no run claim taken');
+    }
+    // on: an old marker (a stopped render), an old claim, a future stamp or junk does not block
+    for (const [name, extra] of [['stale', {DT10_RUN_MARKER: marker(8), TFB_DECISION_CHAIN_STATE: claim(9)}],
+                                 ['future', {DT10_RUN_MARKER: marker(-3)}], ['junk', {DT10_RUN_MARKER: 'x', TFB_DECISION_CHAIN_STATE: '{'}],
+                                 ['none', {}]]) {
+      let ttl = null;
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: Object.assign({}, ON2, {TFB_RENDER_PRIORITY: 'on'}, extra),
+        beforeRun: (w) => { const put = w.cacheTtl = []; }});
+      ok(!res.skipped && world.writes.length > 0, name + ': the refresh ran');
+    }
+    // the claim TTL: 360 s while on, 240 s while off
+    const ttls = [];
+    const probe = (props) => {
+      const world = makeWorld({props});
+      const ctx = load(src, world, AFTER_CLOSE);
+      ctx.CacheService = {getScriptCache: () => ({get: () => null, put: (k, v, t) => { ttls.push(t); }, remove: () => {}})};
+      ctx.porRefresh();
+    };
+    probe(Object.assign({}, ON2, {TFB_RENDER_PRIORITY: 'on'})); probe(ON2);
+    eq(ttls.join(','), '360,240', 'claim TTL');
+    // the pure core
     const ctx = load(src, makeWorld({}), AFTER_CLOSE);
-    eq(ctx.POR_VERSION, '1.0.0', 'version');
+    for (const v of ['on', 'ON', ' on ', '1', 'true', 'Yes']) eq(ctx.porPriorityOn_(v), true, v);
+    for (const v of [null, undefined, '', 'off', '0', 'enable']) eq(ctx.porPriorityOn_(v), false, String(v));
+    const core = (m, st) => ctx.porRenderBusyCore_(m, st, AFTER_CLOSE);
+    eq(core(marker(6.9), ''), true, '6.9 min marker'); eq(core(marker(7), ''), false, '7 min marker');
+    eq(core('', claim(6.9)), true, '6.9 min claim'); eq(core('', claim(7)), false, '7 min claim');
+    eq(core('', JSON.stringify({claim: null})), false, 'no claim'); eq(core(null, null), false, 'nothing');
+  });
+
+
+  test(label + 'T0 compiles, version, ES5 / ASCII, 65 functions prefixed por', () => {
+    const ctx = load(src, makeWorld({}), AFTER_CLOSE);
+    eq(ctx.POR_VERSION, '1.0.1', 'version');
     ok(!/[^\x00-\x7e]/.test(src.replace(/\r/g, '')), 'ASCII only');
     ok(!/=>|\blet\s|\bconst\s|`|\.startsWith\(|\.includes\(|Object\.assign|\.padStart\(/.test(src), 'ES5 only');
     const fns = src.match(/^function [A-Za-z0-9_]+/mg) || [];
-    eq(fns.length, 62, 'function count');
+    eq(fns.length, 65, 'function count (62 + 3 in v1.0.1)');
     ok(fns.every(f => /^function por/.test(f)), 'prefix por');
-    ok(/Functions: 62, all new \(prefix por\)/.test(src), 'header inventory');
+    ok(/Functions: 62, all new \(prefix por\)/.test(src) && /v1\.0\.1: 65 functions, 3 added, all prefixed por/.test(src), 'header inventory');
   });
 
   test(label + 'T1 gates: off by default, junk and faults are off; observe = ledger + snapshot; on = page', () => {
@@ -576,7 +629,7 @@ function battery(src, label) {
     const w0 = world.writes.length, p0 = world.propWrites.length;
     const st = ctx.porSelfTest();
     eq(world.writes.length, w0, 'self test writes no cell'); eq(world.propWrites.length, p0, 'self test writes no property');
-    ok(st[0] === 'Plan of Record 1.0.0', 'self test title');
+    ok(st[0] === 'Plan of Record 1.0.1', 'self test title');
     ok(st.some(l => /^plan US\|2026-11-02 locked 2026-11-02 08:49 pre-open run 41363258387 tickets 6 \(log\)$/.test(l)), 'self test plan line');
     ok(st.some(l => /^snapshot: 2026-11-03 01:40$/.test(l)) && st.some(l => /^board: board 11-02 23:42 is in the log$/.test(l)), 'self test notes ' + st.join(' / '));
     eq(ctx.porInstallTrigger(), 'installed porRefreshTrigger every 15 min');
@@ -756,7 +809,12 @@ const MUTANTS = [
     "var plans = porMergePlans_(porDerivePlans_(src.renders), []);\n    var built"],
   ['alias ignored', "if (m) out[m[1]] = porIbkrBase_(m[2]);", "if (false) out[m[1]] = porIbkrBase_(m[2]);"],
   ['workbook time zone ignored', "if (POR_SHEET_TZ === POR_TZ) return t;", "return t;"],
-  ['writes _Status', "var POR_LEDGER_SHEET = '_Plan_Of_Record';", "var POR_LEDGER_SHEET = '_Status';"]
+  ['writes _Status', "var POR_LEDGER_SHEET = '_Plan_Of_Record';", "var POR_LEDGER_SHEET = '_Status';"],
+  ['v1.0.1 priority skip removed', "  if (prio && porRenderBusy_(porNow_())) {", "  if (false) {"],
+  ['v1.0.1 gate always on', "function porPriorityOn_(raw) {\n  return /^\\s*(on|1|true|yes)\\s*$/i.test(String(raw === null || raw === undefined ? '' : raw));", "function porPriorityOn_(raw) {\n  return true;"],
+  ['v1.0.1 marker window ignored', "if (isFinite(ms) && nowMs - ms >= 0 && nowMs - ms < limit) return true;", "if (isFinite(ms)) return true;"],
+  ['v1.0.1 claim ignored', "if (c && typeof c.at_ms === 'number' && nowMs - c.at_ms >= 0 && nowMs - c.at_ms < limit) return true;", "if (false) return true;"],
+  ['v1.0.1 TTL unchanged', "if (!porClaim_(prio ? POR_PRIORITY_TTL_S : POR_RUN_TTL_S)) {", "if (!porClaim_(POR_RUN_TTL_S)) {"]
 ];
 for (const [name, from, to] of MUTANTS) {
   test('mutant killed: ' + name, () => {
