@@ -28,6 +28,10 @@
 2. **`28_Plan_Of_Record.gs` 1.0.0 -> 1.0.1:**
    - **The yield:** `porRefresh` skips while the cockpit's `DT10_RUN_MARKER` or the decision chain's claim is younger than 7 minutes. It returns `{skipped: 'a Top_10 / Portfolio_Decision render is running'}` and nothing is read or written; the next 15-minute tick refreshes.
    - **The claim:** the run claim lives 360 s instead of 240 s, because runs reach 321 s and the chain now reads the claim.
+   - **The lock** (Codex P2 on this PR): the render check and the claim run under the same script lock `tfbDecisionChainTick` plans under (`porPriorityGate_`, tryLock 5 s).
+     - Without it, a chain tick could read an empty `POR_RUNNING` while the refresh sat between its check and its claim, and both would start.
+     - The lock is released before the refresh itself.
+     - A busy lock skips with `the decision chain holds the script lock`; a lock fault skips with `the script lock is unavailable`.
    - **Unblocked:** a stale marker (a stopped render), a stale claim, a future stamp or junk does not block.
 
 ## S2 - Tests (node v22)
@@ -39,16 +43,17 @@
   - C47: the gate spellings, the status line and observe mode.
   - The v1.0.4 file fails C42 (`priority=` field).
   - Mutants 9/9 killed: gate always/never on, the POR wait removed, a cache fault blocking, no row, the claim not cleared, fresh claims reported, the status field missing, the cache read while off.
-- **`node tests/test_por_v100.js`: `PASS 58/58`**, run twice, SHA-256 prefix `576e5a9d973f654b`.
-  - T0 and T9 are re-pinned to 1.0.1 and 65 functions.
+- **`node tests/test_por_v100.js`: `PASS 62/62`**, run twice, SHA-256 prefix `1b2e77a94248322f`.
+  - T0 and T9 are re-pinned to 1.0.1 and 66 functions.
   - T13 is new: off = the v1.0.0 refresh. On covers a fresh marker, a bare ISO marker and a fresh claim (each skips with no read, write or claim) and a stale, future, junk or absent marker (runs). It also checks the claim TTL 360/240 and the pure core at 6.9/7 minutes.
+  - T13, the lock: one `tryLock(5000)` and a release, with the lock already released when the refresh reads its first sheet. A busy lock, a lock fault, a running render and a held claim each skip and take no claim. While off, the lock is never touched.
   - Every v1.0.0 section T1-T12 passes with the gate off.
   - v1.0.0 run as the delivered file fails T0, T9 and T13.
-  - Mutants: 23 killed (18 from v1.0.0, 5 new).
-- **`pytest tests/test_decision_chain_js.py tests/test_por_v100.py`:** 3 passed.
+  - Mutants: 27 killed (18 from v1.0.0, 9 new: lock not taken, never released, fault runs, gate-off path takes the lock).
+- **`pytest tests/test_decision_chain_js.py tests/test_por_v100.py tests/test_repository_workflow_audit.py`:** 14 passed, 10 subtests passed.
 - **Delivered files:**
   - `26_Decision_Chain.gs`: SHA-256 `86192cf44b236c6c5ce066bd0fa8e83d3f75436e59b9a95f88bdfca4a24492e9` (835 lines).
-  - `28_Plan_Of_Record.gs`: SHA-256 `0d0110e66aa06311b6f51f784afe71fc8f94c197ceaa9a370d7ce862dd0af882` (1,271 lines).
+  - `28_Plan_Of_Record.gs`: SHA-256 `7dff8187f041e1ab3d0222ef20122dae49cc5bfc8e566fdb318befe17efd6eeb` (1,295 lines).
   - Every added line is ASCII and ES5.
 
 ## S3 - Operator steps (the repo files are mirrors; nothing changes until the paste)

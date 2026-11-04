@@ -198,7 +198,7 @@ class Sheet {
 }
 function makeWorld(opts) {
   const world = {writes: [], propWrites: [], sheets: {}, props: Object.assign({}, opts.props || {}), cache: {}, triggers: [], logs: [],
-    failReads: opts.failReads || []};
+    failReads: opts.failReads || [], lockCalls: [], lockHeld: false, lockBusy: !!opts.lockBusy};
   const add = (name, rows) => { world.sheets[name] = new Sheet(name, rows, world); };
   if (opts.log !== null) add('_Selection_Log', opts.log || buildLog(FIX.renders));
   if (opts.portfolio !== null) add('My_Portfolio', [FIX.portfolio_header].concat(opts.portfolio || FIX.portfolio_after));
@@ -242,7 +242,9 @@ function load(src, world, nowMs, capture) {
       deleteTrigger: t => { world.triggers = world.triggers.filter(x => x !== t); },
       newTrigger: h => ({timeBased: () => ({everyMinutes: n => ({create: () => { const t = {h, n, getHandlerFunction: () => h}; world.triggers.push(t); return t; }})})})
     },
-    SpreadsheetApp: {getActiveSpreadsheet: () => world.ss}
+    SpreadsheetApp: {getActiveSpreadsheet: () => world.ss},
+    LockService: {getScriptLock: () => ({tryLock: ms => { world.lockCalls.push('try:' + ms); if (world.lockBusy) return false; world.lockHeld = true; return true; },
+                                           releaseLock: () => { world.lockCalls.push('release'); world.lockHeld = false; }})}
   };
   if (capture !== null) {
     ctx.pdIbkrLatestCapture_ = () => (capture === undefined ? {ok: true, name: 'TFB_IBKR_Capture_20261103-013507.json', json: JSON.parse(JSON.stringify(FIX.capture))} : capture);
@@ -346,7 +348,7 @@ function battery(src, label) {
   const SES = {POR_MODE: 'on', POR_VALIDITY: 'session'};
   const AFTER_CLOSE = T('2026-11-03 1:40');
 
-  test(label + 'T13 v1.0.1 render priority: off = v1.0.0; on = no refresh beside a decision render; claim TTL 360 s', () => {
+  test(label + 'T13 v1.0.1 render priority: off = v1.0.0; on = no refresh beside a decision render; claim TTL 360 s; check and claim under the script lock', () => {
     const ON2 = {POR_MODE: 'on'};
     const iso = ms => new Date(ms).toISOString();
     const marker = ageMin => JSON.stringify({started: iso(AFTER_CLOSE - ageMin * 60000), v: '1.21.0', entry: 'x'});
@@ -386,6 +388,45 @@ function battery(src, label) {
     };
     probe(Object.assign({}, ON2, {TFB_RENDER_PRIORITY: 'on'})); probe(ON2);
     eq(ttls.join(','), '360,240', 'claim TTL');
+    // the script lock (Codex P2 on #918): the check and the claim run under it; the refresh itself never holds it
+    const ONP = Object.assign({}, ON2, {TFB_RENDER_PRIORITY: 'on'});
+    {
+      const world = makeWorld({props: ONP});
+      const c = load(src, world, AFTER_CLOSE);
+      const orig = c.porReadLog_; let heldAtRead = null;
+      c.porReadLog_ = function () { heldAtRead = world.lockHeld; return orig.apply(this, arguments); };
+      const res = c.porRefresh();
+      ok(!res.skipped && world.writes.length > 0, 'lock free: the refresh ran');
+      eq(world.lockCalls.join(','), 'try:5000,release', 'lock free: one tryLock(5000), released');
+      eq(heldAtRead, false, 'the lock is released before the refresh reads a sheet');
+    }
+    {
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: ONP, lockBusy: true});
+      eq(res.skipped, 'the decision chain holds the script lock', 'lock busy: skipped');
+      eq(world.lockCalls.join(','), 'try:5000', 'lock busy: nothing to release');
+      eq(world.writes.length, 0, 'lock busy: no cell written'); eq(Object.keys(world.cache).length, 0, 'lock busy: no run claim taken');
+    }
+    {
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: ONP, beforeRun: (w, c) => { c.LockService = {getScriptLock: () => { throw new Error('no lock service'); }}; }});
+      eq(res.skipped, 'the script lock is unavailable', 'lock fault: skipped');
+      eq(world.writes.length, 0, 'lock fault: no cell written'); eq(Object.keys(world.cache).length, 0, 'lock fault: no run claim taken');
+    }
+    {
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: Object.assign({}, ONP, {DT10_RUN_MARKER: marker(2)})});
+      eq(res.skipped, 'a Top_10 / Portfolio_Decision render is running', 'render running under the lock');
+      eq(world.lockCalls.join(','), 'try:5000,release', 'render running: the lock released');
+      eq(Object.keys(world.cache).length, 0, 'render running: no run claim taken');
+    }
+    {
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props: ONP, beforeRun: w => { w.cache.POR_RUNNING = String(AFTER_CLOSE - 60000); }});
+      eq(res.skipped, 'another refresh is running', 'a held claim under the lock');
+      eq(world.lockCalls.join(','), 'try:5000,release', 'a held claim: the lock released');
+    }
+    for (const g of [undefined, 'off']) {
+      const props = Object.assign({}, ON2); if (g !== undefined) props.TFB_RENDER_PRIORITY = g;
+      const {world, res} = refresh({src, now: AFTER_CLOSE, props});
+      ok(!res.skipped, 'off ' + String(g) + ': the refresh ran'); eq(world.lockCalls.length, 0, 'off ' + String(g) + ': the script lock is never touched');
+    }
     // the pure core
     const ctx = load(src, makeWorld({}), AFTER_CLOSE);
     for (const v of ['on', 'ON', ' on ', '1', 'true', 'Yes']) eq(ctx.porPriorityOn_(v), true, v);
@@ -397,15 +438,15 @@ function battery(src, label) {
   });
 
 
-  test(label + 'T0 compiles, version, ES5 / ASCII, 65 functions prefixed por', () => {
+  test(label + 'T0 compiles, version, ES5 / ASCII, 66 functions prefixed por', () => {
     const ctx = load(src, makeWorld({}), AFTER_CLOSE);
     eq(ctx.POR_VERSION, '1.0.1', 'version');
     ok(!/[^\x00-\x7e]/.test(src.replace(/\r/g, '')), 'ASCII only');
     ok(!/=>|\blet\s|\bconst\s|`|\.startsWith\(|\.includes\(|Object\.assign|\.padStart\(/.test(src), 'ES5 only');
     const fns = src.match(/^function [A-Za-z0-9_]+/mg) || [];
-    eq(fns.length, 65, 'function count (62 + 3 in v1.0.1)');
+    eq(fns.length, 66, 'function count (62 + 4 in v1.0.1)');
     ok(fns.every(f => /^function por/.test(f)), 'prefix por');
-    ok(/Functions: 62, all new \(prefix por\)/.test(src) && /v1\.0\.1: 65 functions, 3 added, all prefixed por/.test(src), 'header inventory');
+    ok(/Functions: 62, all new \(prefix por\)/.test(src) && /v1\.0\.1: 66 functions, 4 added, all prefixed por/.test(src), 'header inventory');
   });
 
   test(label + 'T1 gates: off by default, junk and faults are off; observe = ledger + snapshot; on = page', () => {
@@ -810,11 +851,15 @@ const MUTANTS = [
   ['alias ignored', "if (m) out[m[1]] = porIbkrBase_(m[2]);", "if (false) out[m[1]] = porIbkrBase_(m[2]);"],
   ['workbook time zone ignored', "if (POR_SHEET_TZ === POR_TZ) return t;", "return t;"],
   ['writes _Status', "var POR_LEDGER_SHEET = '_Plan_Of_Record';", "var POR_LEDGER_SHEET = '_Status';"],
-  ['v1.0.1 priority skip removed', "  if (prio && porRenderBusy_(porNow_())) {", "  if (false) {"],
+  ['v1.0.1 priority skip removed', "    if (porRenderBusy_(nowMs)) return 'a Top_10 / Portfolio_Decision render is running';", "    if (false) return 'a Top_10 / Portfolio_Decision render is running';"],
   ['v1.0.1 gate always on', "function porPriorityOn_(raw) {\n  return /^\\s*(on|1|true|yes)\\s*$/i.test(String(raw === null || raw === undefined ? '' : raw));", "function porPriorityOn_(raw) {\n  return true;"],
   ['v1.0.1 marker window ignored', "if (isFinite(ms) && nowMs - ms >= 0 && nowMs - ms < limit) return true;", "if (isFinite(ms)) return true;"],
   ['v1.0.1 claim ignored', "if (c && typeof c.at_ms === 'number' && nowMs - c.at_ms >= 0 && nowMs - c.at_ms < limit) return true;", "if (false) return true;"],
-  ['v1.0.1 TTL unchanged', "if (!porClaim_(prio ? POR_PRIORITY_TTL_S : POR_RUN_TTL_S)) {", "if (!porClaim_(POR_RUN_TTL_S)) {"]
+  ['v1.0.1 TTL unchanged', "    if (!porClaim_(POR_PRIORITY_TTL_S)) return 'another refresh is running';", "    if (!porClaim_(POR_RUN_TTL_S)) return 'another refresh is running';"],
+  ['v1.0.1 lock not taken', "    if (!lock.tryLock(POR_LOCK_WAIT_MS)) return 'the decision chain holds the script lock';", "    if (false) return 'the decision chain holds the script lock';"],
+  ['v1.0.1 lock never released', "    try { lock.releaseLock(); } catch (eR) {}\n  }\n}", "  }\n}"],
+  ['v1.0.1 lock fault runs the refresh', "    return 'the script lock is unavailable';", "    lock = {releaseLock: function () {}};"],
+  ['v1.0.1 gate-off path takes the lock', "  var skip = prio ? porPriorityGate_(porNow_()) : (porClaim_(POR_RUN_TTL_S) ? '' : 'another refresh is running');", "  var skip = porPriorityGate_(porNow_());"]
 ];
 for (const [name, from, to] of MUTANTS) {
   test('mutant killed: ' + name, () => {

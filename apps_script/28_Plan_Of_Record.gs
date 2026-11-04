@@ -12,9 +12,15 @@
  * porRenderBusyCore_): {skipped: 'a Top_10 / Portfolio_Decision render is
  * running'}; the next 15-minute tick refreshes. The run claim lives 360 s
  * instead of 240 s, because runs reach 321 s and the chain reads it
- * (26_Decision_Chain 1.0.5). Off: one property read per refresh; v1.0.0
- * otherwise. Functions added: 3 (porPriorityOn_, porRenderBusyCore_,
- * porRenderBusy_). Changed: porRefresh (the skip), porClaim_ (the TTL).
+ * (26_Decision_Chain 1.0.5). The render check and the claim run under the
+ * script lock tfbDecisionChainTick plans under (porPriorityGate_, tryLock
+ * 5 s; Codex P2 on PR #918), so a chain tick never reads an empty
+ * POR_RUNNING while this refresh sits between its check and its claim; the
+ * lock is released before the refresh itself, and a busy lock skips with
+ * 'the decision chain holds the script lock'. Off: one property read per
+ * refresh; v1.0.0 otherwise. Functions added: 4 (porPriorityOn_,
+ * porRenderBusyCore_, porRenderBusy_, porPriorityGate_). Changed: porRefresh
+ * (the skip), porClaim_ (the TTL).
  *
  * One stable decision page: the plan you can act on for each market session,
  * locked from the cockpit's EXECUTABLE render, tracked to execution against
@@ -144,7 +150,7 @@
  *
  * Not a licensed financial adviser; the owner decides and executes every
  * trade. ES5, ASCII. Functions: 62, all new (prefix por). Removed: 0.
- * (v1.0.1: 65 functions, 3 added, all prefixed por.)
+ * (v1.0.1: 66 functions, 4 added, all prefixed por.)
  * ============================================================================
  */
 
@@ -177,6 +183,7 @@ var POR_RUN_TTL_S = 240;
 var POR_PRIORITY_PROP = 'TFB_RENDER_PRIORITY';      // v1.0.1: off (default) | on
 var POR_PRIORITY_TTL_S = 360;                       // v1.0.1: the run claim's life while on
 var POR_RENDER_BUSY_MIN = 7;                        // v1.0.1: the cockpit marker / chain claim window
+var POR_LOCK_WAIT_MS = 5000;                        // v1.0.1: the decision chain's own tryLock wait
 var POR_SHEET_TZ = POR_TZ;                // the workbook's time zone, set at the start of each run
 
 var POR_VENUES = {
@@ -1135,6 +1142,27 @@ function porRenderBusyCore_(markerRaw, stateRaw, nowMs) {
   return false;
 }
 
+/** v1.0.1 I/O (gate on): the render check and the run claim, under the script lock tfbDecisionChainTick plans under
+ * (Codex P2 on PR #918). Without it a chain tick could read an empty POR_RUNNING while this refresh sat between its
+ * check and its claim, and both would start. Returns '' when this refresh holds the claim and runs, else the skip
+ * reason. The lock is released before the refresh itself: porRefresh never holds it while it reads or writes sheets. */
+function porPriorityGate_(nowMs) {
+  var lock = null;
+  try {
+    lock = LockService.getScriptLock();
+    if (!lock.tryLock(POR_LOCK_WAIT_MS)) return 'the decision chain holds the script lock';
+  } catch (eL) {
+    return 'the script lock is unavailable';
+  }
+  try {
+    if (porRenderBusy_(nowMs)) return 'a Top_10 / Portfolio_Decision render is running';
+    if (!porClaim_(POR_PRIORITY_TTL_S)) return 'another refresh is running';
+    return '';
+  } finally {
+    try { lock.releaseLock(); } catch (eR) {}
+  }
+}
+
 /** v1.0.1 I/O: the cockpit marker and the chain claim, read once. */
 function porRenderBusy_(nowMs) {
   try {
@@ -1171,12 +1199,8 @@ function porRefresh() {
   var mode = porModeOf_(porProp_(POR_MODE_PROP));
   if (mode === 'off') return {mode: 'off', version: POR_VERSION};
   var prio = porPriorityOn_(porProp_(POR_PRIORITY_PROP));   // v1.0.1
-  if (prio && porRenderBusy_(porNow_())) {
-    return {mode: mode, version: POR_VERSION, skipped: 'a Top_10 / Portfolio_Decision render is running'};
-  }
-  if (!porClaim_(prio ? POR_PRIORITY_TTL_S : POR_RUN_TTL_S)) {
-    return {mode: mode, version: POR_VERSION, skipped: 'another refresh is running'};
-  }
+  var skip = prio ? porPriorityGate_(porNow_()) : (porClaim_(POR_RUN_TTL_S) ? '' : 'another refresh is running');
+  if (skip) return {mode: mode, version: POR_VERSION, skipped: skip};
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var nowMs = porNow_();
