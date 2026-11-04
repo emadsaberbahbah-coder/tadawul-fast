@@ -13,9 +13,10 @@
  *                     dp2SelfTest and tfbDecisionChainStatus. Safe to repeat.
  *  tfbSetupRenderPriority  ONE RUN for 5 Nov (v2.1). Sets TFB_RENDER_PRIORITY=on
  *                     (26_Decision_Chain 1.0.5 waits for the Plan of Record and
- *                     reports stopped renders; 28_Plan_Of_Record 1.0.1 yields to
- *                     a decision render), reads it back, shows both versions
- *                     and runs tfbDecisionChainStatus. Safe to repeat.
+ *                     reports stopped renders; 28_Plan_Of_Record 1.0.1 and
+ *                     27_Decision_Pages_v2 1.2.34 yield to a decision render),
+ *                     reads it back, shows the three versions and runs
+ *                     tfbDecisionChainStatus. Safe to repeat.
  *  tfbSetAnyProperty  any other key: type it in TFB_PT_SET_KEY and the value
  *                     in TFB_PT_SET_VALUE below, Save, Run. Refuses secrets
  *                     (TOKEN / SECRET / PASSWORD / API KEY names).
@@ -90,6 +91,9 @@ function tfbSetupRenderPriority() {
   var por = typeof POR_VERSION !== 'undefined' ? String(POR_VERSION) : 'not found';
   out.push('28_Plan_Of_Record live: ' + por + (por === '1.0.1' ? ' (ok)' :
       ' -> PASTE 28_Plan_Of_Record 1.0.1 FROM GITHUB MAIN, Save, then run this again'));
+  var dp2 = typeof DP2_VERSION !== 'undefined' ? String(DP2_VERSION) : 'not found';
+  out.push('27_Decision_Pages_v2 live: ' + dp2 + (dp2 === '1.2.34' ? ' (ok)' :
+      ' -> PASTE 27_Decision_Pages_v2 1.2.34 FROM GITHUB MAIN, Save, then run this again'));
   if (typeof tfbDecisionChainStatus === 'function') {
     try {
       out.push('decision chain: ' + tfbDecisionChainStatus());
