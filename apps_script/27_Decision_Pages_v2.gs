@@ -16,7 +16,10 @@
  *           (b) it builds the page built longest ago first (Script Property DP2_LAST_BUILT {pd, t10}, epoch ms; a page
  *               never stamped counts as oldest; no stamps keep the v1.2.33 order) and the other only inside
  *               RUN_SOFT_LIMIT_MS; a page that throws is stamped too, the other page is still built and the first
- *               error is rethrown, so one failing page cannot starve the other;
+ *               error is rethrown, so one failing page cannot starve the other; a short (six-month) fetch for a
+ *               seat keeps the older cached bars of the same symbol (dp2RpKeepOlder_), so building Top_10 first never
+ *               truncates the history a holding's exit replay needs, and a cached entry is no longer cut to
+ *               KEEP_BARS at every cache write (dp2RpKeepLengths_; Codex P2 on PR #920);
  *           (c) Top_10_Investments_v2 prints its own build time and, when the cockpit status it copies reads
  *               'running', says whether that render is in progress (started under 7 minutes ago) or did not finish.
  *           Gate off: one property read per execution and nothing else - every page, cell, call, toast and return
@@ -570,6 +573,32 @@ function dp2RpBuildBoth_(ss, t0) {
   try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, skipped || firstErr ? 20 : 8); } catch (e) {}
   if (firstErr) throw firstErr;
   return { ok: true, pd: res.pd, t10: res.t10, ms: Date.now() - t0, order: order.join(',') };
+}
+/* PURE (v1.2.34, gate on): a fresh series that starts after the cached one keeps the cached bars before its first
+ * date, capped at the longer of the two, so a six-month fetch for a Top_10 seat that is also a holding (Top_10 may now
+ * be built first) never truncates the longer history the holding's exit replay needs; the fresh bars win from their
+ * first date on. Codex P2 on PR #920. Returns fresh itself when there is nothing older to keep. Never throws. */
+function dp2RpKeepOlder_(cached, fresh) {
+  try {
+    if (!cached || !cached.bars || !cached.bars.length || !fresh || !fresh.bars || !fresh.bars.length) return fresh;
+    var first = fresh.bars[0].date, older = [];
+    for (var i = 0; i < cached.bars.length; i++) if (cached.bars[i].date < first) older.push(cached.bars[i]);
+    if (!older.length) return fresh;
+    var o = {};
+    for (var k in fresh) if (fresh.hasOwnProperty(k)) o[k] = fresh[k];
+    var cap = Math.max(cached.bars.length, fresh.bars.length);
+    o.bars = older.concat(fresh.bars);
+    if (o.bars.length > cap) o.bars = o.bars.slice(o.bars.length - cap);
+    o.keep = Math.max(fresh.keep || 0, o.bars.length);   // the cache writer keeps max(KEEP_BARS, keep) bars
+    return o;
+  } catch (e) { return fresh; }
+}
+/* (v1.2.34, gate on): the cache writer keeps max(KEEP_BARS, keep) bars per entry, and an entry read back from the sheet
+ * carries no keep, so every write cut it to KEEP_BARS (130) - the history a holding fetched with a wider range was lost
+ * at the next write. Each cached entry keeps the bars it holds (the writer still caps at KEEP_BARS_MAX). */
+function dp2RpKeepLengths_(cache) {
+  try { for (var k in cache) if (cache.hasOwnProperty(k) && cache[k] && cache[k].bars) cache[k].keep = Math.max(cache[k].keep || 0, cache[k].bars.length); } catch (e) {}
+  return cache;
 }
 /* v1.2.34: the dp2SelfTest line while the gate is on - the three PURE rules on fixed inputs. */
 function dp2RpCoreOk_() {
@@ -1733,7 +1762,8 @@ function dp2LoadBars_(symbols, sinceDate) {
   }
   if (changed) {
     if (cache === null) cache = dp2BarsCacheRead_();
-    for (var s in out) if (out.hasOwnProperty(s) && !out[s].stale) cache[s] = out[s];
+    if (dp2RpOn_()) dp2RpKeepLengths_(cache);   // v1.2.34 (gate on only): no cached entry is cut below the bars it holds
+    for (var s in out) if (out.hasOwnProperty(s) && !out[s].stale) cache[s] = dp2RpOn_() ? dp2RpKeepOlder_(cache[s], out[s]) : out[s];   // v1.2.34 (gate on only)
     try { dp2BarsCacheWrite_(cache); } catch (e3) {}
   }
   return out;

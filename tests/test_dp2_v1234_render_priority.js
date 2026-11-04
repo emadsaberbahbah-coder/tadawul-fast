@@ -24,15 +24,17 @@
  *   P3  order, gate on: no stamps -> Portfolio_Decision_v2 first; the older page first; an unstamped page first; the
  *       soft limit skips the second page and stamps only the first; a failing page is stamped, the other page is still
  *       built, the toast names the failure and the error is rethrown
+ *   P3b the bars cache, gate on: a six-month fetch for a held seat keeps the older cached bars (capped at the longer
+ *       series), so the holding replay still reaches its entry when the budget is spent; the base truncates
  *   P4  Top_10_Investments_v2, gate on: the header names the build time; a cockpit render in progress (4 min) and one
  *       that did not finish (19 min) are named on the Status line (amber); a finished status is unchanged; every
  *       other cell of both pages equals the gate-off build
  *   P5  the pure helpers: dp2RpOnCore_, dp2RpBusyCore_, dp2RpOrderCore_, dp2RpRunningNoteCore_, dp2RpCoreOk_
  *   P6  the gate: spellings, a fault reads off, one property read per execution
  *   P7  dp2SelfTest: the v1.2.33 report while off; one 'render priority .. core ok' line while on
- *   P8  ES5 / ASCII lint of the v1.2.34 diff; inventory (9 functions + 4 vars added, 0 removed); the 3 replaced base
- *       lines pinned; 6 hunks whose reversal is the v1.2.33 file; WHY block; every prior WHY kept
- *   P9  mutants: each mutation of the delivered file fails at least one section check
+ *   P8  ES5 / ASCII lint of the v1.2.34 diff; inventory (11 functions + 4 vars added, 0 removed); the 4 replaced base
+ *       lines pinned; 7 hunks whose reversal is the v1.2.33 file; WHY block; every prior WHY kept
+ *   P9  mutants: each mutation of the delivered file fails at least one section check (23 mutants)
  * The battery runs twice and the two digests must match; the last line is 'PASS k/k' (exit 1 on any failure).
  * Usage: node tests/test_dp2_v1234_render_priority.js [new.gs] [v1.2.33.gs]
  */
@@ -575,6 +577,64 @@ function checkSelfTest(src) {
   eq(line[0].ok, true, 'core ok');
 }
 
+/* the bars cache (Codex P2 on #920): Top_10 first fetches a held seat with the six-month range */
+function wkBars(from, n, f) {
+  const out = []; let d = Date.parse(from + 'T00:00:00Z'), i = 0;
+  while (out.length < n) {
+    const wd = new Date(d).getUTCDay();
+    if (wd !== 0 && wd !== 6) { const c = Math.round(f(i) * 100) / 100; out.push({ date: new Date(d).toISOString().slice(0, 10), o: c, h: Math.round((c + 0.5) * 100) / 100, l: Math.round((c - 0.5) * 100) / 100, c }); i++; }
+    d += 86400000;
+  }
+  return out;
+}
+const LONG = wkBars('2025-09-01', 300, i => 20 + 0.01 * i + 0.4 * Math.sin(i / 4));   // the holding's persisted history
+const SHORT = LONG.slice(-130).map(b => Object.assign({}, b, { c: b.c + 0.05, h: b.h + 0.05, l: b.l + 0.05 }));   // a six-month fetch
+const cacheGrid = series => [['Symbol', 'Key', 'Date', 'Open', 'High', 'Low', 'Close', 'Source', 'Fetched (Riyadh)']].concat(...Object.keys(series).map(sym => series[sym].map(b => [sym, sym.replace(/\.US$/, ''), b.date, b.o, b.h, b.l, b.c, 'yahoo', '2026-11-01 18:00'])));
+function chartOf(seriesByKey) {
+  return { fetch(url) {
+    const m = /\/v8\/finance\/chart\/([^?]+)\?/.exec(String(url)); const s = m ? seriesByKey[decodeURIComponent(m[1])] : null;
+    if (!s) return { getResponseCode: () => 404, getContentText: () => '{}' };
+    const res = { meta: { regularMarketPrice: s[s.length - 1].c, currency: 'USD', exchangeTimezoneName: 'America/New_York', marketState: 'REGULAR' },
+                  timestamp: s.map(b => Date.parse(b.date + 'T13:30:00Z') / 1000),
+                  indicators: { quote: [{ open: s.map(b => b.o), high: s.map(b => b.h), low: s.map(b => b.l), close: s.map(b => b.c) }] } };
+    return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ chart: { result: [res], error: null } }) };
+  } };
+}
+function checkCache(src) {
+  const SYM = 'HLD.US';
+  const run = props => {
+    const env = makeEnv(src, { props, fetch: chartOf({ HLD: SHORT }) });
+    env.book.load('_DP2_Exit_Engine', cacheGrid({ [SYM]: LONG, 'OTH.US': LONG }));
+    const seat = plain(env.ctx.dp2LoadBars_([SYM]));                        // Top_10_Investments_v2 first: the default range
+    const read = plain(env.ctx.dp2BarsCacheRead_()), after = read[SYM].bars, other = read['OTH.US'].bars;
+    env.ctx.dp2RunElapsed_ = () => 10 * 60000;                              // the download budget is spent
+    const hold = plain(env.ctx.dp2LoadBars_([SYM], LONG[5].date));          // the holding's replay asks for its entry
+    return { seat: seat[SYM].bars.length, after, other, hold: hold[SYM], x: env.ctx.dp2ExitCompute_(hold[SYM].bars, LONG[5].c, LONG[5].date, null) };
+  };
+  const on = run(ON), off = run({});
+  eq(on.seat, 130, 'the seat gets its six-month bars'); eq(off.seat, 130, 'base: the same');
+  eq(off.after.length, 130, 'base: the six-month fetch truncates the cached history');
+  eq(off.x, null, 'base: the holding replay has no history at its entry');
+  eq(off.other.length, 130, 'base: the write cuts another holding to KEEP_BARS');
+  eq(on.other.length, 300, 'gate on: another holding keeps the bars it holds');
+  eq(on.after.length, 300, 'gate on: the older cached bars are kept');
+  eq(on.after[0].date, LONG[0].date, 'the oldest cached bar kept');
+  deq(on.after.slice(-130), SHORT, 'the fresh bars win from their first date on');
+  ok(on.hold.stale === true && on.hold.bars.length === 300, 'the holding falls back to the kept history');
+  ok(on.x !== null, 'gate on: the holding replay reaches its entry');
+  const c = makeEnv(src, {}).ctx, K = (a, b) => plain(c.dp2RpKeepOlder_(a, b));
+  const SHORT2 = LONG.slice(200).concat(wkBars('2026-10-27', 30, i => 23 + 0.01 * i)).slice(-130);   // 100 overlapping + 30 newer bars
+  const k2 = K({ bars: LONG }, { bars: SHORT2, key: 'HLD', source: 'yahoo' });
+  eq(k2.bars.length, 300, 'capped at the longer series');
+  deq(k2.bars.slice(-130), SHORT2, 'the fresh bars kept whole');
+  eq(k2.bars[0].date, LONG[30].date, 'the oldest bars beyond the cap dropped');
+  eq(k2.key + '/' + k2.source, 'HLD/yahoo', 'the fresh fields kept');
+  const fr = { bars: SHORT };
+  ok(c.dp2RpKeepOlder_(null, fr) === fr && c.dp2RpKeepOlder_({ bars: [] }, fr) === fr && c.dp2RpKeepOlder_({ bars: SHORT }, fr) === fr, 'nothing older: the fresh series itself');
+  eq(c.dp2RpKeepOlder_({ bars: LONG }, { bars: [] }).bars.length, 0, 'an empty fresh series stays empty');
+  return on.after.length + '/' + off.after.length;
+}
+
 function battery() {
   const digest = [];
   test('P0 oracle: v1.2.33 rebuilt from the delivered file (SHA-256 pinned); version lockstep 1.2.34; both files compile; the base lacks the new names', () => {
@@ -598,6 +658,9 @@ function battery() {
   test('P3 order, gate on: no stamps -> Portfolio_Decision_v2 first; the older or unstamped page first; the soft limit skips the second page; a failing page is isolated, stamped and rethrown', () => {
     digest.push(checkOrder(NEW));
   });
+  test('P3b the bars cache, gate on: a six-month fetch for a held seat keeps the older cached bars (capped), so the holding replay still reaches its entry; the base truncates', () => {
+    digest.push(checkCache(NEW));
+  });
   test('P4 Top_10_Investments_v2, gate on: the build time in the header; a render in progress / not finished named on the Status line (amber); everything else = the gate-off build', () => {
     digest.push(checkPage(NEW));
   });
@@ -610,11 +673,11 @@ function battery() {
   test('P7 dp2SelfTest: the v1.2.33 report while off; one render priority line (core ok) while on', () => {
     checkSelfTest(NEW);
   });
-  test('P8 ES5 / ASCII lint of the v1.2.34 diff; inventory (9 functions + 4 vars added, 0 removed); the 3 replaced base lines pinned; 6 hunks whose reversal is the v1.2.33 file; WHY block', () => {
+  test('P8 ES5 / ASCII lint of the v1.2.34 diff; inventory (11 functions + 4 vars added, 0 removed); the 4 replaced base lines pinned; 7 hunks whose reversal is the v1.2.33 file; WHY block', () => {
     const bl = OLD.split('\n'), nl = NEW.split('\n');
     const baseSet = new Set(bl), newSet = new Set(nl);
     const added = nl.filter(l => !baseSet.has(l));
-    ok(added.length >= 110 && added.length <= 180, 'added lines ' + added.length);
+    ok(added.length >= 120 && added.length <= 210, 'added lines ' + added.length);
     for (const l of added) {
       const code = l.replace(/\/\/.*$/, '');
       ok(!/\b(let|const|class)\s|=>|`|\.\.\.|\.includes\(|\.startsWith\(|\.endsWith\(|\.padStart\(|\.find\(/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l.slice(0, 120));
@@ -622,7 +685,7 @@ function battery() {
       ok(!/^\s{2,}function\s/.test(l), 'no block-level function declaration: ' + l.slice(0, 80));
     }
     ok(NEW.indexOf('\r') < 0, 'LF only');
-    const NEWF = ['dp2RpBuildBoth_', 'dp2RpBusyCore_', 'dp2RpBusy_', 'dp2RpCoreOk_', 'dp2RpOnCore_', 'dp2RpOn_', 'dp2RpOrderCore_', 'dp2RpRunningNoteCore_', 'dp2RpStamp_'].sort();
+    const NEWF = ['dp2RpBuildBoth_', 'dp2RpBusyCore_', 'dp2RpBusy_', 'dp2RpCoreOk_', 'dp2RpKeepLengths_', 'dp2RpKeepOlder_', 'dp2RpOnCore_', 'dp2RpOn_', 'dp2RpOrderCore_', 'dp2RpRunningNoteCore_', 'dp2RpStamp_'].sort();
     for (const name of NEWF) {
       const start = NEW.indexOf('function ' + name + '(');
       ok(start > 0, 'defined ' + name);
@@ -637,17 +700,17 @@ function battery() {
     const vb = names(OLD, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(NEW, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DP2_RP_BUILT_PROP_', 'DP2_RP_BUSY_MIN_', 'DP2_RP_MEMO_', 'DP2_RP_PROP_'], 'vars added');
-    const REMOVED = ['* Version: 1.2.33 (2026-11-03)', "var DP2_VERSION = '1.2.33';", "dp2Line_(sh, row, 'Status: ' + t.status, { size: 8, bg: DP2C.surface, height: 20 }); row++;"];
+    const REMOVED = ['* Version: 1.2.33 (2026-11-03)', "var DP2_VERSION = '1.2.33';", 'for (var s in out) if (out.hasOwnProperty(s) && !out[s].stale) cache[s] = out[s];', "dp2Line_(sh, row, 'Status: ' + t.status, { size: 8, bg: DP2C.surface, height: 20 }); row++;"];
     const removed = bl.filter(l => !newSet.has(l)).map(l => l.trim());
     eq(removed.length, REMOVED.length, 'base lines replaced: ' + JSON.stringify(removed.map(x => x.slice(0, 60))));
     for (let i = 0; i < removed.length; i++) ok(removed[i].indexOf(REMOVED[i]) === 0, 'replaced base line ' + i + ': ' + removed[i].slice(0, 120));
     let pos = 0; for (const l of bl) { if (!newSet.has(l)) continue; const at = nl.indexOf(l, pos); ok(at >= pos, 'base line out of order: ' + l.slice(0, 80)); pos = at + 1; }
     const why = NEW.slice(NEW.indexOf(' *   1.2.34: '), NEW.indexOf(' *   1.2.33: '));
     ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block (1.2.34) present, newest first, ASCII');
-    for (const w of ['TFB_RENDER_PRIORITY', 'default OFF', 'DP2_LAST_BUILT', 'DT10_RUN_MARKER', 'RUN_SOFT_LIMIT_MS', '41901407829', 'Gate off', 'Rollback:']) ok(why.indexOf(w) >= 0, 'WHY names ' + w);
+    for (const w of ['TFB_RENDER_PRIORITY', 'default OFF', 'DP2_LAST_BUILT', 'DT10_RUN_MARKER', 'RUN_SOFT_LIMIT_MS', '41901407829', 'Gate off', 'Rollback:', 'dp2RpKeepOlder_', 'dp2RpKeepLengths_']) ok(why.indexOf(w) >= 0, 'WHY names ' + w);
     for (const l of bl.filter(x => /^ \*   1\.\d+\.\d+[: ]/.test(x))) ok(NEW.indexOf(l) > 0, 'prior WHY entry kept: ' + l.slice(0, 60));
     eq(reverseEdits(NEW), OLD, 'hunk reversal = the v1.2.33 file');
-    eq(EDITS.length, 6, 'six hunks');
+    eq(EDITS.length, 7, 'seven hunks');
     digest.push(String(EDITS.length));
   });
   test('P9 mutants: each mutation of the delivered file fails at least one section check', () => {
@@ -670,6 +733,11 @@ function battery() {
       ['no build time', '  if (dp2RpOn_()) { var rpHr = sh.getRange(row, 13);', '  if (false) { var rpHr = sh.getRange(row, 13);', [checkPage]],
       ['no running note', "  var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';", "  var rpNote = '';", [checkPage]],
       ['the note window 70 min', 'if (age !== null && age < DP2_RP_BUSY_MIN_) return', 'if (age !== null && age < 70) return', [checkPure, checkPage]],
+      ['no older bars kept', 'cache[s] = dp2RpOn_() ? dp2RpKeepOlder_(cache[s], out[s]) : out[s];', 'cache[s] = out[s];', [checkCache]],
+      ['the kept series uncapped', '    if (o.bars.length > cap) o.bars = o.bars.slice(o.bars.length - cap);\n', '', [checkCache]],
+      ['overlapping cached bars kept', '    for (var i = 0; i < cached.bars.length; i++) if (cached.bars[i].date < first) older.push(cached.bars[i]);', '    for (var i = 0; i < cached.bars.length; i++) older.push(cached.bars[i]);', [checkCache]],
+      ['cached lengths not kept', '    if (dp2RpOn_()) dp2RpKeepLengths_(cache);   // v1.2.34 (gate on only): no cached entry is cut below the bars it holds\n', '', [checkCache]],
+      ['the kept series loses its length', '    o.keep = Math.max(fresh.keep || 0, o.bars.length);   // the cache writer keeps max(KEEP_BARS, keep) bars\n', '', [checkCache]],
       ['the self-test line always', '  if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_();', '  if (true) { var rpOk = dp2RpCoreOk_();', [checkSelfTest]]
     ];
     let killed = 0;

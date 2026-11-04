@@ -13,6 +13,10 @@
     - A page with no timestamp counts as oldest. With no timestamps at all, the v1.2.33 order applies.
     - The other page is built only inside `RUN_SOFT_LIMIT_MS`.
     - A page that throws still gets a timestamp, and the other page is still built. The toast names the failure and the first error is rethrown.
+    - **Bars cache** (Codex P2 on this PR). Building Top_10 first must not starve a holding's exit replay:
+      - a six-month fetch for a seat that is also a holding keeps the older cached bars of that symbol (`dp2RpKeepOlder_`, capped at the longer series; the fresh bars win from their first date);
+      - a cached entry is no longer cut to `KEEP_BARS` (130) at every cache write (`dp2RpKeepLengths_`). v1.2.33 cut every entry read back from the sheet;
+      - so, when the second page finds the download budget spent, its fallback still reaches the oldest entry.
   - **(c) Top_10_Investments_v2 shows its own state:**
     - The header adds `page built yyyy-MM-dd HH:mm`.
     - When the copied cockpit status reads `running`, the Status line turns amber and says one of two things:
@@ -23,15 +27,15 @@
   - **Unchanged:** no gate, verdict, ticket, sizing, alert, order or broker call.
 
 **Files:**
-- `apps_script/27_Decision_Pages_v2.gs` 1.2.33 -> 1.2.34: 3,713 -> 3,855 lines, SHA-256 `53552d07fd3a52a876d320628af5ae83629afc4b19e00d8ebc346073f168d8f1`. Every added line is ASCII and ES5.
-  - Added: 9 functions (`dp2RpOnCore_`, `dp2RpOn_`, `dp2RpBusyCore_`, `dp2RpBusy_`, `dp2RpOrderCore_`, `dp2RpStamp_`, `dp2RpRunningNoteCore_`, `dp2RpBuildBoth_`, `dp2RpCoreOk_`) and 4 vars.
-  - 3 base lines replaced (the Version line, `DP2_VERSION`, the Status line). 0 removed.
-- `tests/js/dp2_edits_v1234.json`: the 6 hunks. Reversing them gives the v1.2.33 file (SHA-256 pinned `dd5ee204`).
-- `tests/test_dp2_v1234_render_priority.js` (new, 703 lines) and `tests/test_dp2_v1234_render_priority.py`.
+- `apps_script/27_Decision_Pages_v2.gs` 1.2.33 -> 1.2.34: 3,713 -> 3,885 lines, SHA-256 `992fb7f77e0d4c4c59f1eb6fb42b7b45be41e1ffaa47957797222662246811c0`. Every added line is ASCII and ES5.
+  - Added: 11 functions (`dp2RpOnCore_`, `dp2RpOn_`, `dp2RpBusyCore_`, `dp2RpBusy_`, `dp2RpOrderCore_`, `dp2RpStamp_`, `dp2RpRunningNoteCore_`, `dp2RpBuildBoth_`, `dp2RpKeepOlder_`, `dp2RpKeepLengths_`, `dp2RpCoreOk_`) and 4 vars.
+  - 4 base lines replaced (the Version line, `DP2_VERSION`, the cache-write line of `dp2LoadBars_`, the Status line). 0 removed.
+- `tests/js/dp2_edits_v1234.json`: the 7 hunks. Reversing them gives the v1.2.33 file (SHA-256 pinned `dd5ee204`).
+- `tests/test_dp2_v1234_render_priority.js` (new, 771 lines) and `tests/test_dp2_v1234_render_priority.py`.
 - The 1.2.31, 1.2.32 and 1.2.33 harnesses now undo v1.2.34 first. Their behaviour still runs on the delivered file, and their golden negatives still compare it with their own base.
 
 ## Tests (node v22)
-- **`node tests/test_dp2_v1234_render_priority.js`:** `PASS 10/10`. The battery runs twice with the identical digest `1f516bde88cda956` (18 s).
+- **`node tests/test_dp2_v1234_render_priority.js`:** `PASS 11/11`. The battery runs twice with the identical digest `8cf0d1028697f3df` (19 s).
   - **P1 golden negative:**
     - Setup: the switch absent, blank, `off`, `0`, `enable`, `no`, or a property fault; five boards, two of them a cockpit `running` status; a live marker, a live claim and old timestamps.
     - Result: both pages and each page alone match v1.2.33 cell for cell, including formats, merges, charts, the call log, toasts, logs and return values. No timestamp is written.
@@ -42,15 +46,19 @@
     - No timestamps: Portfolio_Decision_v2 first. Otherwise the older page first, and a page with no timestamp first.
     - Past the soft limit, only the first page is built and timestamped, and the toast names the skipped page.
     - A synthetic Top_10 fault: Portfolio_Decision_v2 is still built, both pages get timestamps, the toast says `FAILED`, and the error is rethrown.
+  - **P3b bars cache:**
+    - Switch on: a 130-bar seat fetch over a 300-bar cached holding keeps 300 bars (oldest kept, fresh tail exact), and another cached holding keeps its 300. With the budget spent, the holding's fallback reaches its entry and the exit replay is non-null.
+    - Base: both are cut to 130 and the replay is null.
+    - Pure cases: the cap, overlap and empty-series rules.
   - **P4 the page:**
     - The header shows the build time, and nothing else changes on a finished board.
     - Statuses started 4 min and 19 min earlier get the in-progress and did-not-finish notes (amber, height 30).
     - Every other cell of both pages matches the switch-off build.
   - **P5 pure helpers** (including the 7-minute boundaries and clock skew). **P6** the switch spellings, one read per execution. **P7** `dp2SelfTest` is the v1.2.33 report while off, plus one line while on.
-  - **P8 lint and inventory:** ES5 and ASCII; 9 functions and 4 vars added; 3 replaced lines pinned; reversing the 6 hunks gives v1.2.33; WHY block present; every prior WHY kept.
-  - **P9:** 18 of 18 mutants killed.
+  - **P8 lint and inventory:** ES5 and ASCII; 11 functions and 4 vars added; 4 replaced lines pinned; reversing the 7 hunks gives v1.2.33; WHY block present; every prior WHY kept.
+  - **P9:** 23 of 23 mutants killed.
 - **Earlier harnesses on the delivered file:** 1.2.31 `PASS 11/11`, 1.2.32 `PASS 10/10`, 1.2.33 `PASS 10/10`.
-- **`pytest`:** the four dp2 wrappers plus `tests/test_universe_maintenance.py`: 67 passed. The workflow audit: 11 passed.
+- **`pytest`:** the four dp2 wrappers, `tests/test_universe_maintenance.py` and the workflow audit: 78 passed, 10 subtests passed.
 
 ## Operator steps (the repo file is a mirror; nothing changes until the paste)
 1. Merge.
@@ -63,6 +71,7 @@
 6. **Rollback:** set `TFB_RENDER_PRIORITY` to `off`, which turns it off in all three files. To roll back this file only, use Project History -> 1.2.33. `DP2_LAST_BUILT` is harmless when off.
 
 ## Known limits
+- With the switch on, the bars cache holds up to `KEEP_BARS_MAX` bars per symbol instead of 130, so the hidden `_DP2_Exit_Engine` tab is larger. A split between two fetches can join cached bars from before the split to adjusted fresh bars. The v1.2.33 exit-sanity anchor check then gives no signal.
 - A yield skips that hourly run. With renders of about 4–6 minutes, a collision with the hourly trigger is uncommon, and the next hour builds both pages.
 - The page is still a derived view. The authoritative decision surface is `Top_10_Investments`: it owns the receipts, the release and the tickets.
 
