@@ -2,9 +2,29 @@
 # scripts/intraday_quote_refresh.py
 """
 ================================================================================
-Intraday Quote Refresh — v1.0.3 (2026-10-10)
+Intraday Quote Refresh — v1.0.4 (2026-11-04)
 ================================================================================
 NEW script. Closes the largest recoverable loss in the system.
+
+v1.0.4 (2026-11-04) — THE BACKEND TOKEN, A VISIBLE FETCH FAILURE, QUOTE AGES
+    Evidence: the 17:46 Riyadh dry run of 4 Nov (run 41851262140) printed
+    "[FETCH-FAIL] Market_Leaders: HTTPError" for both target pages, and the
+    Render log shows both GET /v1/analysis/sheet-rows requests answered 401.
+    The backend auth wall (main.py 8.13.0) refuses anonymous reads and this
+    script sent no token, so it has never fetched a quote, while every run
+    still ended green. Now:
+      * the request carries X-APP-TOKEN and Bearer from the same variables
+        run_dashboard_sync reads (TFB_TOKEN, X_APP_TOKEN, APP_TOKEN,
+        BACKEND_TOKEN); no token -> anonymous, as before; never printed;
+      * a fetch failure prints its HTTP status, and a run whose every target
+        page failed to fetch exits 3 (red) instead of 0;
+      * every page prints one [AGE] line per region (US / other): how old the
+        returned quotes are and the provider delay (acquired - quote_asof),
+        fresh or not, so the in-session freshness question is measured;
+      * the harvest keeps only exchange-suffixed tickers: block labels such as
+        TYPE, MISSING_FX, CASH_FLOOR or RISK/REWARD were sent as symbols.
+    The write rules (symbol-keyed cells, strictly newer, fingerprints) are
+    unchanged.
 
 THE PROBLEM, PROVEN ARITHMETICALLY
     TFB_TICKET_MAX_QUOTE_AGE_MIN = 15   (in-session limit)
@@ -77,7 +97,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.4"
 # v1.0.3: share supplier quote-time parsing with acquisition validity so an
 # EODHD integer epoch serialized as a string retains its actual quote receipt.
 
@@ -123,6 +143,34 @@ def _env_int(name: str, default: int) -> int:
         return int(_s(os.getenv(name)) or default)
     except Exception:
         return default
+
+
+def _backend_token() -> str:
+    """v1.0.4: the backend app token, looked up exactly as
+    run_dashboard_sync._env_token does. Never printed."""
+    for name in ("TFB_TOKEN", "X_APP_TOKEN", "APP_TOKEN", "BACKEND_TOKEN"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _backend_request(url: str) -> Any:
+    """v1.0.4: the sheet-rows GET with X-APP-TOKEN + Bearer when a token is
+    set; the backend auth wall answers 401 to anonymous reads."""
+    import urllib.request
+    headers = {"Accept": "application/json"}
+    token = _backend_token()
+    if token:
+        headers["X-APP-TOKEN"] = token
+        headers["Authorization"] = "Bearer " + token
+    return urllib.request.Request(url, headers=headers)
+
+
+# v1.0.4: a decision symbol carries an exchange suffix (CRC.US, 1030.SR,
+# LIVEPOLC-1.MX, GRT-UN.TO, 010130.KS). Block labels harvested from the
+# decision pages (TYPE, MISSING_FX, CASH_FLOOR, RISK/REWARD) are not symbols.
+TICKER_SHAPE = re.compile(r"[A-Z0-9][A-Z0-9&\-]{0,14}\.[A-Z]{1,3}")
 
 
 def _col_letter(idx0: int) -> str:
@@ -336,6 +384,8 @@ def harvest_symbols(pages: Dict[str, Sequence[Sequence[Any]]],
                 # cheap shape filter: a ticker has no spaces and is short
                 if " " in sym or len(sym) > 15:
                     continue
+                if not TICKER_SHAPE.fullmatch(sym):   # v1.0.4: labels are not tickers
+                    continue
                 seen.add(sym)
                 out.append(sym)
                 if len(out) >= limit:
@@ -477,32 +527,79 @@ def _open_sheet(cli_id: Optional[str]):
     return gspread.authorize(creds).open_by_key(sid)
 
 
-def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
-                 timeout: int = 45) -> Dict[str, QuoteEvidence]:
-    """GET /v1/analysis/sheet-rows?page=..&symbols=..
+def quote_age_report(rows: Sequence[Dict[str, Any]], requested: Sequence[str],
+                     now: datetime) -> Dict[str, Dict[str, Any]]:
+    """v1.0.4 PURE: {'US'|'other': {n, age_median, age_max, within, delay_median}}
+    over every returned row of a requested symbol whose acquisition proof
+    carries quote_asof, fresh or not; minutes. within = ages <= the in-session
+    limit TFB_TICKET_MAX_QUOTE_AGE_MIN (default 15)."""
+    from core.analysis import opportunity_builder as ob
+    from core.data_validity import row_acquisition
+    limit = float(_env_int("TFB_TICKET_MAX_QUOTE_AGE_MIN", 15))
+    want = {_s(symbol).upper() for symbol in requested}
+    ages: Dict[str, List[float]] = {}
+    delays: Dict[str, List[float]] = {}
+    seen = set()
+    for row in rows:
+        try:
+            declared = {_s(value).upper() for name, value in row.items()
+                        if _key(name) in {"symbol", "ticker"} and _s(value)}
+            hits = sorted(declared & want)
+            if len(hits) != 1 or hits[0] in seen:
+                continue
+            proof = row_acquisition(row, now, ob._env_freshness_fallback_h() * 3600)
+            asof = getattr(proof, "quote_asof", None)
+            if not isinstance(asof, datetime) or asof.tzinfo is None:
+                continue
+            seen.add(hits[0])
+            region = "US" if hits[0].endswith(".US") else "other"
+            ages.setdefault(region, []).append((now - asof).total_seconds() / 60.0)
+            acquired = getattr(proof, "acquired_at", None)
+            if isinstance(acquired, datetime) and acquired.tzinfo is not None:
+                delays.setdefault(region, []).append((acquired - asof).total_seconds() / 60.0)
+        except Exception:                                 # noqa: BLE001
+            continue
 
-    The route resolves 'requested symbols by each row's OWN declared symbol —
-    NEVER by position', so the response is safe to index by symbol.
-    """
+    def median(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for region, values in ages.items():
+        out[region] = {"n": len(values), "age_median": median(values), "age_max": max(values),
+                       "within": sum(1 for value in values if value <= limit), "limit": limit,
+                       "delay_median": median(delays.get(region, []))}
+    return out
+
+
+def fetch_quotes_ex(base_url: str, page: str, symbols: Sequence[str],
+                    timeout: int = 45) -> Tuple[Dict[str, QuoteEvidence], Optional[str], Dict[str, Dict[str, Any]]]:
+    """v1.0.4: (quotes, failure, ages). failure names the exception and HTTP
+    status when the request failed ('HTTPError 401'), else None."""
     import urllib.parse
     import urllib.request
 
     if not base_url or not symbols:
-        return {}
+        return {}, None, {}
     qs = urllib.parse.urlencode({"page": page,
                                  "symbols": ",".join(symbols),
                                  "limit": str(len(symbols))})
     url = "%s/v1/analysis/sheet-rows?%s" % (base_url.rstrip("/"), qs)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(_backend_request(url), timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:                              # noqa: BLE001
-        print("  [FETCH-FAIL] %s: %s" % (page, type(exc).__name__))
-        return {}
+        code = getattr(exc, "code", None)
+        failure = type(exc).__name__ + (" %s" % code if isinstance(code, int) else "")
+        print("  [FETCH-FAIL] %s: %s" % (page, failure))
+        return {}, failure, {}
 
     retrieved = _clock()
     if not isinstance(payload, dict):
-        return {}
+        return {}, None, {}
     # The real sheet-rows route has matrix rows and dictionary data/row_objects.
     # Collect only dictionary aliases; contradictory source duplicates fail
     # closed even when returned in different aliases in the same envelope.
@@ -516,8 +613,19 @@ def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
         declared = {_s(value).upper() for name, value in row.items() if _key(name) in {"symbol", "ticker"} and _s(value)}
         for sym in declared & requested:
             grouped.setdefault(sym, []).append(_source_quote(row, sym, retrieved))
-    return {symbol: evidence[0] for symbol, evidence in grouped.items()
-            if evidence[0] is not None and len(set(evidence)) == 1}
+    quotes = {symbol: evidence[0] for symbol, evidence in grouped.items()
+              if evidence[0] is not None and len(set(evidence)) == 1}
+    return quotes, None, quote_age_report(rows, sorted(requested), retrieved)
+
+
+def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
+                 timeout: int = 45) -> Dict[str, QuoteEvidence]:
+    """GET /v1/analysis/sheet-rows?page=..&symbols=..
+
+    The route resolves 'requested symbols by each row's OWN declared symbol —
+    NEVER by position', so the response is safe to index by symbol.
+    """
+    return fetch_quotes_ex(base_url, page, symbols, timeout=timeout)[0]
 
 
 def apply_page_plan(ws: Any, page: str, plan: Sequence[Dict[str, Any]]) -> Tuple[int, int, bool]:
@@ -622,6 +730,8 @@ def main() -> int:
 
     total_written = 0
     write_failed = False
+    fetch_failures: List[str] = []   # v1.0.4
+    fetched_pages = 0
     for page in tgt_pages:
         try:
             ws = sh.worksheet(page)
@@ -630,7 +740,15 @@ def main() -> int:
             print("  [PAGE-MISS] %s: %s" % (page, exc))
             continue
 
-        quotes = fetch_quotes(base, page, symbols, timeout=timeout)
+        quotes, failure, ages = fetch_quotes_ex(base, page, symbols, timeout=timeout)
+        fetched_pages += 1
+        if failure:
+            fetch_failures.append(page + " " + failure)
+        for region in sorted(ages):   # v1.0.4: the measured in-session freshness
+            a = ages[region]
+            print("  [AGE] %-16s %-5s n=%-4d age_min median=%.1f max=%.1f within_%dmin=%d delay_min median=%s"
+                  % (page, region, a["n"], a["age_median"], a["age_max"], int(a["limit"]), a["within"],
+                     "n/a" if a["delay_median"] is None else "%.1f" % a["delay_median"]))
         plan, stats = plan_page_updates(page, values, quotes)
         print("  %-16s rows=%-6d quotes=%-4d matched=%-4d planned=%-4d "
               "not_newer=%-4d no_price=%d"
@@ -657,11 +775,16 @@ def main() -> int:
         total_written += written
         print("     wrote %d cell(s)" % written)
 
+    all_failed = bool(fetched_pages) and len(fetch_failures) == fetched_pages   # v1.0.4
+    if all_failed:
+        print("[IQR v%s] FETCH FAILED on every target page (%s) - no quote was read; a 401 means the"
+              " backend token (BACKEND_TOKEN) is missing or wrong" % (SCRIPT_VERSION, "; ".join(fetch_failures)))
     if args.apply:
         try:
             sh.worksheet(RUN_LOG_TAB).append_row(
-                [_now_utc(), "INFO", "intraday_quote_refresh", ",".join(tgt_pages),
-                 "PARTIAL" if write_failed else "OK", "[IQR v%s] symbols=%d cells=%d"
+                [_now_utc(), "ERROR" if all_failed else "INFO", "intraday_quote_refresh", ",".join(tgt_pages),
+                 "FETCH_FAILED" if all_failed else "PARTIAL" if write_failed else "OK",
+                 "[IQR v%s] symbols=%d cells=%d"
                  % (SCRIPT_VERSION, len(symbols), total_written),
                  "", "", "", json.dumps({"version": SCRIPT_VERSION})],
                 value_input_option="RAW")
@@ -670,6 +793,8 @@ def main() -> int:
         print("[IQR v%s] APPLIED cells=%d" % (SCRIPT_VERSION, total_written))
     else:
         print("  (dry-run: nothing written; re-run with --apply)")
+    if all_failed:
+        return 3
     return 2 if write_failed else 0
 
 
@@ -680,16 +805,16 @@ def _selftest() -> int:
     checks: List[Tuple[str, bool]] = []
 
     src = {
-        "Top_10_Investments": [["Symbol", "Name"], ["AAPL", "Apple"],
-                               ["1150.SR", "Alinma"]],
-        "My_Portfolio": [["Symbol", "Name"], ["AAPL", "Apple"],
-                         ["NTES", "NetEase"]],
+        "Top_10_Investments": [["Symbol", "Name"], ["AAPL.US", "Apple"],
+                               ["1150.SR", "Alinma"], ["MISSING_FX", "label"]],
+        "My_Portfolio": [["Symbol", "Name"], ["AAPL.US", "Apple"],
+                         ["NTES.US", "NetEase"], ["TYPE", "label"]],
     }
     syms = harvest_symbols(src)
-    checks.append(("harvest unions and de-duplicates, order-stable",
-                   syms == ["AAPL", "1150.SR", "NTES"]))
+    checks.append(("harvest unions and de-duplicates, order-stable, labels dropped (v1.0.4)",
+                   syms == ["AAPL.US", "1150.SR", "NTES.US"]))
     checks.append(("harvest honours the ceiling",
-                   harvest_symbols(src, limit=2) == ["AAPL", "1150.SR"]))
+                   harvest_symbols(src, limit=2) == ["AAPL.US", "1150.SR"]))
 
     # v1.0.1: a page whose real header is NOT row 1 (the Top_10 layout)
     multi = {"Top_10_Investments": [

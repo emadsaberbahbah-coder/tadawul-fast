@@ -201,6 +201,11 @@ jobs:
           # own lines 655 and 1273). Same idiom here; H0 item: create the
           # Variable so the fallback stops carrying production.
           TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          # (2026-11-04) The backend auth wall answers 401 to anonymous reads
+          # (dry run 41851262140: both sheet-rows GETs 401 in the Render log).
+          # The same secret daily_sync maps; intraday_quote_refresh 1.0.4 sends
+          # it as X-APP-TOKEN + Bearer and never prints it. Step-scoped.
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
           TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
           TFB_IQR_MAX_SYMBOLS: "400"
