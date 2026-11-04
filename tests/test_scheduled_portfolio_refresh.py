@@ -80,16 +80,34 @@ def test_real_scheduled_override_includes_portfolio(tmp_path, keys):
     assert values["SYNC_KEYS"].split() == LEGACY_KEYS.split() + ["MY_PORTFOLIO"]
 
 
-def test_portfolio_full_sync_opt_in_is_a_scoped_boolean_with_false_default():
+def test_portfolio_full_sync_opt_in_is_a_scoped_boolean_with_true_default():
+    # (2026-11-04) default true: an API dispatch that omits the input (the
+    # Apps Script dispatcher 1.1.0) must carry the scheduled run's page set.
     workflow = yaml.load(DAILY.read_text(), Loader=yaml.BaseLoader)
     control = workflow["on"]["workflow_dispatch"]["inputs"]["include_portfolio"]
-    assert control["type"] == "boolean" and control["default"] == "false"
+    assert control["type"] == "boolean" and control["default"] == "true"
     assert control["required"] == "false"
     step = next(item for item in workflow["jobs"]["sync-dashboard"]["steps"]
                 if item.get("id") == "smart_config")
     assert step["env"]["INPUT_INCLUDE_PORTFOLIO"] == "${{ github.event.inputs.include_portfolio }}"
     assert "INPUT_INCLUDE_PORTFOLIO" not in workflow.get("env", {})
     assert "INPUT_INCLUDE_PORTFOLIO" not in workflow["jobs"]["sync-dashboard"].get("env", {})
+
+
+def test_api_dispatch_omitting_the_input_gets_the_scheduled_page_set(tmp_path):
+    # GitHub renders an omitted workflow_dispatch input as its default
+    # (run 41766747380: Apps Script sent run_mode only; the step env read
+    # INPUT_INCLUDE_PORTFOLIO: false under the old default).
+    workflow = yaml.load(DAILY.read_text(), Loader=yaml.BaseLoader)
+    rendered = workflow["on"]["workflow_dispatch"]["inputs"]["include_portfolio"]["default"]
+    proc, values = resolve(tmp_path, event="workflow_dispatch", mode="full_sync",
+                           include_portfolio=rendered)
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"].split() == LEGACY_KEYS.split() + ["MY_PORTFOLIO"]
+    proc, values = resolve(tmp_path, event="workflow_dispatch", mode="full_sync",
+                           include_portfolio="false")
+    assert proc.returncode == 0, proc.stderr
+    assert values["SYNC_KEYS"] == LEGACY_KEYS
 
 
 @pytest.mark.parametrize("keys", [LEGACY_KEYS, LEGACY_KEYS.lower().replace(" ", ","),
