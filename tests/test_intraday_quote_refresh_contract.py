@@ -455,12 +455,18 @@ def test_v104_one_page_failing_is_not_a_run_failure(monkeypatch):
     assert iqr.main() == 0
 
 
-def test_v104_harvest_keeps_exchange_tickers_and_drops_block_labels():
-    page = [["Symbol", "Name"], ["CRC.US", "x"], ["TYPE", "label"], ["MISSING_FX", "label"], ["CASH_FLOOR", "label"],
-            ["PRICE_XCHECK", "label"], ["INVESTABILITY", "label"], ["RISK/REWARD", "label"], ["1030.SR", "x"],
-            ["LIVEPOLC-1.MX", "x"], ["GRT-UN.TO", "x"], ["010130.KS", "x"], ["BRK-B.US", "x"], ["0883.HK", "x"]]
+def test_v104_harvest_drops_block_labels_and_keeps_every_supported_identifier():
+    # Codex review on #916: bare symbols (core/symbols/normalize.py) and long
+    # EODHD suffixes (SAP.XETRA) are supported identifiers and must be kept.
+    page = [["Symbol", "Name"], ["CRC.US", "x"], ["MISSING_FX", "label"], ["CASH_FLOOR", "label"],
+            ["PRICE_XCHECK", "label"], ["RISK/REWARD", "label"], ["1030.SR", "x"], ["AAPL", "x"], ["QQQ", "x"],
+            ["SAP.XETRA", "x"], ["LIVEPOLC-1.MX", "x"], ["GRT-UN.TO", "x"], ["010130.KS", "x"], ["BRK-B.US", "x"],
+            ["0883.HK", "x"]]
     assert iqr.harvest_symbols({"Top_10_Investments": page}) == [
-        "CRC.US", "1030.SR", "LIVEPOLC-1.MX", "GRT-UN.TO", "010130.KS", "BRK-B.US", "0883.HK"]
+        "CRC.US", "1030.SR", "AAPL", "QQQ", "SAP.XETRA", "LIVEPOLC-1.MX", "GRT-UN.TO", "010130.KS", "BRK-B.US",
+        "0883.HK"]
+    # a one-word label cannot be told from a ticker; it is sent and never matches
+    assert iqr.harvest_symbols({"Top_10_Investments": [["Symbol", "Name"], ["TYPE", "label"]]}) == ["TYPE"]
 
 
 def test_v104_age_report_measures_every_returned_quote_fresh_or_not(monkeypatch):

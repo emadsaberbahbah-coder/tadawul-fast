@@ -21,8 +21,10 @@ v1.0.4 (2026-11-04) — THE BACKEND TOKEN, A VISIBLE FETCH FAILURE, QUOTE AGES
       * every page prints one [AGE] line per region (US / other): how old the
         returned quotes are and the provider delay (acquired - quote_asof),
         fresh or not, so the in-session freshness question is measured;
-      * the harvest keeps only exchange-suffixed tickers: block labels such as
-        TYPE, MISSING_FX, CASH_FLOOR or RISK/REWARD were sent as symbols.
+      * the harvest drops block labels that carry '_' or '/' (MISSING_FX,
+        CASH_FLOOR, PRICE_XCHECK, RISK/REWARD were sent as symbols); every
+        supported identifier (bare AAPL, SAP.XETRA, LIVEPOLC-1.MX) is kept, so
+        a one-word label such as TYPE still goes out and simply never matches.
     The write rules (symbol-keyed cells, strictly newer, fingerprints) are
     unchanged.
 
@@ -167,10 +169,12 @@ def _backend_request(url: str) -> Any:
     return urllib.request.Request(url, headers=headers)
 
 
-# v1.0.4: a decision symbol carries an exchange suffix (CRC.US, 1030.SR,
-# LIVEPOLC-1.MX, GRT-UN.TO, 010130.KS). Block labels harvested from the
-# decision pages (TYPE, MISSING_FX, CASH_FLOOR, RISK/REWARD) are not symbols.
-TICKER_SHAPE = re.compile(r"[A-Z0-9][A-Z0-9&\-]{0,14}\.[A-Z]{1,3}")
+# v1.0.4: block labels harvested from the decision pages (MISSING_FX,
+# CASH_FLOOR, PRICE_XCHECK, RISK/REWARD) carry '_' or '/', which no supported
+# identifier does (bare AAPL, CRC.US, SAP.XETRA, LIVEPOLC-1.MX, BRK-B.US).
+# A one-word label (TYPE) is indistinguishable from a ticker and is kept; it
+# never matches a target row.
+LABEL_CHARS = re.compile(r"[_/]")
 
 
 def _col_letter(idx0: int) -> str:
@@ -384,7 +388,7 @@ def harvest_symbols(pages: Dict[str, Sequence[Sequence[Any]]],
                 # cheap shape filter: a ticker has no spaces and is short
                 if " " in sym or len(sym) > 15:
                     continue
-                if not TICKER_SHAPE.fullmatch(sym):   # v1.0.4: labels are not tickers
+                if LABEL_CHARS.search(sym):   # v1.0.4: block labels are not symbols
                     continue
                 seen.add(sym)
                 out.append(sym)
@@ -805,16 +809,16 @@ def _selftest() -> int:
     checks: List[Tuple[str, bool]] = []
 
     src = {
-        "Top_10_Investments": [["Symbol", "Name"], ["AAPL.US", "Apple"],
+        "Top_10_Investments": [["Symbol", "Name"], ["AAPL", "Apple"],
                                ["1150.SR", "Alinma"], ["MISSING_FX", "label"]],
-        "My_Portfolio": [["Symbol", "Name"], ["AAPL.US", "Apple"],
-                         ["NTES.US", "NetEase"], ["TYPE", "label"]],
+        "My_Portfolio": [["Symbol", "Name"], ["AAPL", "Apple"],
+                         ["NTES", "NetEase"], ["RISK/REWARD", "label"]],
     }
     syms = harvest_symbols(src)
     checks.append(("harvest unions and de-duplicates, order-stable, labels dropped (v1.0.4)",
-                   syms == ["AAPL.US", "1150.SR", "NTES.US"]))
+                   syms == ["AAPL", "1150.SR", "NTES"]))
     checks.append(("harvest honours the ceiling",
-                   harvest_symbols(src, limit=2) == ["AAPL.US", "1150.SR"]))
+                   harvest_symbols(src, limit=2) == ["AAPL", "1150.SR"]))
 
     # v1.0.1: a page whose real header is NOT row 1 (the Top_10 layout)
     multi = {"Top_10_Investments": [
