@@ -1,5 +1,5 @@
 /**
- * zz_Property_Tool.gs -- Script Property tool, v2.0 (4 Nov 2026).
+ * zz_Property_Tool.gs -- Script Property tool, v2.1 (5 Nov 2026).
  * WHY: Project Settings -> Script Properties turns read-only above 50
  * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
  * property is set from code instead: pick a function in the toolbar list,
@@ -11,6 +11,11 @@
  *                     (Top_10 renders before the final audit), reads both
  *                     back, shows which file versions are live, and runs
  *                     dp2SelfTest and tfbDecisionChainStatus. Safe to repeat.
+ *  tfbSetupRenderPriority  ONE RUN for 5 Nov (v2.1). Sets TFB_RENDER_PRIORITY=on
+ *                     (26_Decision_Chain 1.0.5 waits for the Plan of Record and
+ *                     reports stopped renders; 28_Plan_Of_Record 1.0.1 yields to
+ *                     a decision render), reads it back, shows both versions
+ *                     and runs tfbDecisionChainStatus. Safe to repeat.
  *  tfbSetAnyProperty  any other key: type it in TFB_PT_SET_KEY and the value
  *                     in TFB_PT_SET_VALUE below, Save, Run. Refuses secrets
  *                     (TOKEN / SECRET / PASSWORD / API KEY names).
@@ -70,6 +75,29 @@ function tfbSetupTonight() {
   out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
   out.push('NEXT: menu Decision Pages v2 -> Refresh Portfolio_Decision_v2 (or run buildPortfolioDecisionV2).' +
       ' SUPN.US should then read HOLD with "dividend-adjusted (8.13 ex 2026-11-03)", not SELL NOW.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function tfbSetupRenderPriority() {
+  var p = PropertiesService.getScriptProperties();
+  var out = ['TFB render priority (zz_Property_Tool 2.1)'];
+  p.setProperty('TFB_RENDER_PRIORITY', 'on');
+  out.push('SET TFB_RENDER_PRIORITY = ' + p.getProperty('TFB_RENDER_PRIORITY'));
+  var dc = typeof TFB_DC_VERSION !== 'undefined' ? String(TFB_DC_VERSION) : 'not found';
+  out.push('26_Decision_Chain live: ' + dc + (dc === '1.0.5' ? ' (ok)' :
+      ' -> PASTE 26_Decision_Chain 1.0.5 FROM GITHUB MAIN, Save, then run this again'));
+  var por = typeof POR_VERSION !== 'undefined' ? String(POR_VERSION) : 'not found';
+  out.push('28_Plan_Of_Record live: ' + por + (por === '1.0.1' ? ' (ok)' :
+      ' -> PASTE 28_Plan_Of_Record 1.0.1 FROM GITHUB MAIN, Save, then run this again'));
+  if (typeof tfbDecisionChainStatus === 'function') {
+    try {
+      out.push('decision chain: ' + tfbDecisionChainStatus());
+    } catch (e1) {
+      out.push('tfbDecisionChainStatus error: ' + String(e1 && e1.message ? e1.message : e1).slice(0, 200));
+    }
+  }
+  out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
   Logger.log(out.join('\n'));
   return out.join('\n');
 }
