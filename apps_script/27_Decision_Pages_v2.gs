@@ -1,7 +1,27 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.33 (2026-11-03)
+ * Version: 1.2.34 (2026-11-05)
+ *   1.2.34: THE SECOND PAGE IS NEVER STARVED AND A STOPPED RENDER IS NAMED (owner review, Thu 5 Nov 2026 01:48 Riyadh):
+ *           Top_10_Investments_v2 still read 'Status: Last run 2026-11-05 00:03:55 | status: running...' at 01:48. The
+ *           hourly buildDecisionPagesV2 always built Portfolio_Decision_v2 first and skipped this page whenever that
+ *           one alone used DP2X.RUN_SOFT_LIMIT_MS (about 329 s on 4 Nov), so the page kept the snapshot it took while a
+ *           cockpit render was running - a render Apps Script then stopped at its 6-minute limit. The same hourly
+ *           build ran beside the decision chain's renders and the Plan of Record refresh, the contention that stopped
+ *           the Top_10 renders of sync run 41901407829. Script Property TFB_RENDER_PRIORITY (default OFF; 1 / on /
+ *           true / yes; shared with 26_Decision_Chain 1.0.5 and 28_Plan_Of_Record 1.0.1), gate on:
+ *           (a) buildDecisionPagesV2 yields - writes no page, returns {yielded: true} - while a Top_10 /
+ *               Portfolio_Decision render runs (the cockpit marker DT10_RUN_MARKER or the decision chain claim is
+ *               younger than 7 minutes);
+ *           (b) it builds the page built longest ago first (Script Property DP2_LAST_BUILT {pd, t10}, epoch ms; a page
+ *               never stamped counts as oldest; no stamps keep the v1.2.33 order) and the other only inside
+ *               RUN_SOFT_LIMIT_MS; a page that throws is stamped too, the other page is still built and the first
+ *               error is rethrown, so one failing page cannot starve the other;
+ *           (c) Top_10_Investments_v2 prints its own build time and, when the cockpit status it copies reads
+ *               'running', says whether that render is in progress (started under 7 minutes ago) or did not finish.
+ *           Gate off: one property read per execution and nothing else - every page, cell, call, toast and return
+ *           value of v1.2.33. No gate, verdict, ticket, sizing, alert, order or broker call changes. Rollback:
+ *           TFB_RENDER_PRIORITY off (all three files) or Project History -> 1.2.33 (this file only).
  *   1.2.33: AN EXIT SIGNAL NEEDS THE LOT'S OWN PRICES (owner portfolio, Tue 3 Nov 2026 16:15 Riyadh, dp2ExitStatus:
  *           'SUPN.US . SELL NOW -- stop 38.32 hit . last 36.28 . dyn stop 38.32 . high 41.92'). IBKR moved the 95 INDV
  *           shares (bought 2 Nov at 35.45) to the new contract SUPN (Supernus Inc) and the ledger row was renamed
@@ -343,7 +363,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.33';   // lockstep with the header
+var DP2_VERSION = '1.2.34';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -448,6 +468,124 @@ var DP2X_MEMO_ = {};
 var DP2_RUN_T0_ = 0;
 function dp2RunStart_() { if (!DP2_RUN_T0_) DP2_RUN_T0_ = new Date().getTime(); return DP2_RUN_T0_; }
 function dp2RunElapsed_() { return DP2_RUN_T0_ ? new Date().getTime() - DP2_RUN_T0_ : 0; }
+/* v1.2.34 [RENDER-PRIORITY]: Script Property TFB_RENDER_PRIORITY (default OFF; 1 / on / true / yes, any case), read once
+ * per execution; shared with 26_Decision_Chain 1.0.5 and 28_Plan_Of_Record 1.0.1. */
+var DP2_RP_PROP_ = 'TFB_RENDER_PRIORITY';
+var DP2_RP_BUILT_PROP_ = 'DP2_LAST_BUILT';
+var DP2_RP_BUSY_MIN_ = 7;   // a render older than this was stopped (the 6-minute limit + skew); the window of 26_ / 28_
+var DP2_RP_MEMO_ = null;
+function dp2RpOnCore_(raw) {
+  var v = String(raw === null || raw === undefined ? '' : raw).replace(/^\s+|\s+$/g, '').toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+}
+function dp2RpOn_() {
+  if (DP2_RP_MEMO_ === null) {
+    var raw = '';
+    try { raw = PropertiesService.getScriptProperties().getProperty(DP2_RP_PROP_); } catch (e) { raw = ''; }
+    DP2_RP_MEMO_ = dp2RpOnCore_(raw);
+  }
+  return DP2_RP_MEMO_;
+}
+/* PURE: a Top_10 / Portfolio_Decision render is running - the cockpit marker {started} (or a bare timestamp) or the
+ * decision chain claim {claim: {at_ms}} is younger than DP2_RP_BUSY_MIN_ minutes. Never throws. */
+function dp2RpBusyCore_(markerRaw, stateRaw, nowMs) {
+  var lim = DP2_RP_BUSY_MIN_ * 60000;
+  try {
+    var m = String(markerRaw || '').replace(/^\s+|\s+$/g, '');
+    if (m) {
+      var started = m;
+      try { var o = JSON.parse(m); if (o && o.started) started = String(o.started); } catch (eJ) {}
+      var ms = Date.parse(started);
+      if (isFinite(ms) && nowMs - ms >= 0 && nowMs - ms < lim) return true;
+    }
+  } catch (eM) {}
+  try {
+    var st = JSON.parse(String(stateRaw || ''));
+    var c = st && st.claim;
+    if (c && typeof c.at_ms === 'number' && nowMs - c.at_ms >= 0 && nowMs - c.at_ms < lim) return true;
+  } catch (eS) {}
+  return false;
+}
+function dp2RpBusy_(nowMs) {
+  try {
+    var p = PropertiesService.getScriptProperties();
+    return dp2RpBusyCore_(p.getProperty('DT10_RUN_MARKER'), p.getProperty('TFB_DECISION_CHAIN_STATE'), nowMs);
+  } catch (e) { return false; }
+}
+/* PURE: the page built longest ago goes first ('pd' | 't10'); a page never stamped counts as oldest; no stamps (or a
+ * tie) keep the v1.2.33 order, Portfolio_Decision_v2 first. */
+function dp2RpOrderCore_(builtRaw) {
+  var b = null;
+  try { b = JSON.parse(String(builtRaw || '')); } catch (e) { b = null; }
+  if (!b || typeof b !== 'object') return ['pd', 't10'];
+  var pd = typeof b.pd === 'number' ? b.pd : 0, t10 = typeof b.t10 === 'number' ? b.t10 : 0;
+  return t10 < pd ? ['t10', 'pd'] : ['pd', 't10'];
+}
+function dp2RpStamp_(page, nowMs) {
+  try {
+    var p = PropertiesService.getScriptProperties(), b = null;
+    try { b = JSON.parse(String(p.getProperty(DP2_RP_BUILT_PROP_) || '')); } catch (eJ) { b = null; }
+    if (!b || typeof b !== 'object') b = {};
+    b[page] = nowMs;
+    p.setProperty(DP2_RP_BUILT_PROP_, JSON.stringify(b));
+  } catch (e) {}
+}
+/* PURE: the note for a copied cockpit status whose state reads 'running' ('' otherwise). lastRun is that line's
+ * 'Last run yyyy-MM-dd HH:mm:ss' (Riyadh), which a running render stamps with its start. */
+function dp2RpRunningNoteCore_(status, lastRun, nowMs) {
+  var s = /\|\s*status:\s*([A-Za-z_]+)/.exec(String(status || ''));
+  if (!s || s[1].toLowerCase() !== 'running') return '';
+  var m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(lastRun || ''));
+  var age = m ? (nowMs - Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5], +(m[6] || 0))) / 60000 : null;
+  var at = m ? ' started ' + m[4] + ':' + m[5] : '';
+  if (age !== null && age < DP2_RP_BUSY_MIN_) return 'a cockpit render' + at + ' is in progress; until it finishes, read the seats below as the previous render\'s';
+  return 'the cockpit render' + at + ' did not finish (Apps Script stops an execution at 6 minutes; it wrote no receipt); read the seats below as the previous render\'s until the cockpit shows a finished run';
+}
+/* v1.2.34 [RENDER-PRIORITY] (gate on): yield while a decision render runs; otherwise the page built longest ago first. */
+function dp2RpBuildBoth_(ss, t0) {
+  if (dp2RpBusy_(new Date().getTime())) {
+    var ym = 'Decision Pages v2 yielded: a Top_10 / Portfolio_Decision render is running (TFB_RENDER_PRIORITY); both pages are rebuilt at the next hourly run';
+    try { Logger.log(ym); } catch (eL) {}
+    try { ss.toast(ym, 'Decision Pages v2 ' + DP2_VERSION, 8); } catch (eT) {}
+    return { ok: true, yielded: true, ms: Date.now() - t0 };
+  }
+  var order = dp2RpOrderCore_(dp2Prop_(DP2_RP_BUILT_PROP_));
+  var res = { pd: null, t10: null }, skipped = '', firstErr = null;
+  for (var i = 0; i < order.length; i++) {
+    var page = order[i];
+    if (i > 0 && dp2RunElapsed_() > DP2X.RUN_SOFT_LIMIT_MS) { res[page] = { rows: 0, skipped: true }; skipped = page; continue; }
+    try { res[page] = page === 'pd' ? buildPortfolioDecisionV2() : buildTop10V2(); }
+    catch (eB) { res[page] = { rows: 0, error: String(eB && eB.message || eB) }; if (!firstErr) firstErr = eB; }
+    dp2RpStamp_(page, new Date().getTime());
+  }
+  var name = function (p) { return p === 'pd' ? DP2.SHEET_PD : DP2.SHEET_T10; };
+  var part = function (p) {
+    var r = res[p];
+    if (r.skipped) return name(p) + ' NOT rebuilt (the first page used ' + Math.round(dp2RunElapsed_() / 1000) + ' s of the 6-minute limit; it goes first at the next hourly run)';
+    if (r.error) return name(p) + ' FAILED (' + r.error + ')';
+    return name(p) + ' (' + r.rows + ' rows)';
+  };
+  var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's - ' + part(order[0]) + ' \u00b7 ' + part(order[1]);
+  try { dp2EnsureStaleFlags_(); } catch (eF) { Logger.log('stale-row flags skipped: ' + eF); }
+  try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, skipped || firstErr ? 20 : 8); } catch (e) {}
+  if (firstErr) throw firstErr;
+  return { ok: true, pd: res.pd, t10: res.t10, ms: Date.now() - t0, order: order.join(',') };
+}
+/* v1.2.34: the dp2SelfTest line while the gate is on - the three PURE rules on fixed inputs. */
+function dp2RpCoreOk_() {
+  try {
+    var now = Date.UTC(2026, 10, 5, 0, 0, 0);   // 03:00 Riyadh
+    var iso = function (minAgo) { return new Date(now - minAgo * 60000).toISOString(); };
+    var busy = dp2RpBusyCore_(JSON.stringify({ started: iso(2) }), '', now) && dp2RpBusyCore_('', JSON.stringify({ claim: { at_ms: now - 60000 } }), now) &&
+               !dp2RpBusyCore_(JSON.stringify({ started: iso(9) }), JSON.stringify({ claim: { at_ms: now - 8 * 60000 } }), now) && !dp2RpBusyCore_('junk', 'junk', now);
+    var ord = dp2RpOrderCore_('').join(',') === 'pd,t10' && dp2RpOrderCore_(JSON.stringify({ pd: 5, t10: 3 })).join(',') === 't10,pd' &&
+              dp2RpOrderCore_(JSON.stringify({ pd: 5 })).join(',') === 't10,pd' && dp2RpOrderCore_(JSON.stringify({ pd: 3, t10: 5 })).join(',') === 'pd,t10';
+    var run = function (hm) { return dp2RpRunningNoteCore_('Last run 2026-11-05 ' + hm + ' | status: running\u2026', '2026-11-05 ' + hm, now); };
+    var note = /did not finish/.test(run('02:40:00')) && /in progress/.test(run('02:58:00')) &&
+               dp2RpRunningNoteCore_('Last run 2026-11-05 02:40:00 | status: OK | output: WITHHELD', '2026-11-05 02:40:00', now) === '';
+    return busy && ord && note;
+  } catch (e) { return false; }
+}
 /* v1.2.23: NON-BLOCKING notices. Ui.alert waits for OK — run from the script editor, the box opens in the spreadsheet
  * tab and the execution sits there until the 6-minute limit. A modeless dialog returns at once; without a UI (time
  * trigger) the notice goes to a toast, and always to the execution log. */
@@ -480,6 +618,7 @@ function buildDecisionPagesV2() {
   var t0 = dp2RunStart_();
   var ss = SpreadsheetApp.getActive();
   DP2X_MEMO_ = {};
+  if (dp2RpOn_()) return dp2RpBuildBoth_(ss, t0);   // v1.2.34 [RENDER-PRIORITY] (gate on only)
   // v1.2.1: a refresh never seeds the _IBKR_* tabs — missing broker inputs are reported as unknown (menu: Seed IBKR Tabs)
   var pd = buildPortfolioDecisionV2();
   // v1.2.23: never start the second page this close to the 6-minute limit — it is refreshed on its own instead
@@ -3373,9 +3512,11 @@ function buildTop10V2() {
   dp2ChartsBegin_(DP2.SHEET_CHARTS_T10);
   var row = 1;
   dp2Header_(sh, row, 'TOP 10 INVESTMENTS — DECISION v2', state, chipKind, 'run ' + (feed.run || 'n/a') + ' · epoch ' + (t.epoch || 'n/a') + ' · cockpit ' + (t.lastRun || 'n/a'));
+  if (dp2RpOn_()) { var rpHr = sh.getRange(row, 13); rpHr.setValue(dp2Str_(rpHr.getValues()[0][0]) + ' \u00b7 page built ' + dp2Today_()); }   // v1.2.34 [RENDER-PRIORITY]
   row++;
   dp2Line_(sh, row, (fv.label === 'SYNC RUNNING' || fv.label === 'EXPIRED' || fv.label === 'EXECUTABLE') ? 'Feed: ' + fv.note : 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
-  dp2Line_(sh, row, 'Status: ' + t.status, { size: 8, bg: DP2C.surface, height: 20 }); row++;
+  var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';   // v1.2.34 [RENDER-PRIORITY] (gate on only)
+  dp2Line_(sh, row, 'Status: ' + t.status + (rpNote ? ' \u2014 ' + rpNote : ''), { size: 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
 
@@ -3698,6 +3839,7 @@ function dp2SelfTest() {
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
+  if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var probe = null;
   var probeSym = 'SPY';
   for (var li = 0; li < led.lots.length; li++) { if (/\.US$/i.test(led.lots[li].symbol)) { probeSym = led.lots[li].symbol; break; } }
