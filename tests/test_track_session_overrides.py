@@ -23,13 +23,14 @@ historical-bar source and the price fallback / CA guard / feed switches. No
 network.
 
 T1  the table, pinned literally: every entry names a session the pinned
-    calendar has; a re-time changes it (open < close, same UTC day, a shorter
-    day); XKRX re-times are exactly the library's own +1h exam-day rule; XJSE
-    half days close 12:00 SAST, XTAE Fridays 13:50 IDT, XSES half days 12:00
-    SGT; the "closed" days are exactly the seven phantom sessions
+    calendar has; a re-time changes it (open < close, same UTC day); XKRX
+    re-times are exactly the library's own +1h exam-day rule, every other
+    re-time is a shorter day; XJSE half days close 12:00 SAST, XTAE Fridays
+    13:50 IDT, XSES half days 12:00 SGT; the "closed" days are exactly the
+    seven phantom sessions
 T2  off (unset / blank / off / 0 / false / no / enforce / observe / onn / y):
-    _outcome_sessions equals the untouched v6.53.0 over a symbol x day matrix
-    that includes every override day
+    _outcome_sessions equals the untouched v6.53.0 over 21 distinct symbols x
+    22 days whose +/-14-day windows reach every override day (T3 asserts it)
 T2b the on-spellings; junk stays off
 T3  on: only the named sessions change (re-timed, or gone when "closed"), only
     on their MIC; every other session, MIC and refusal is unchanged; nothing
@@ -48,7 +49,13 @@ T4  the REAL audit loop:
        dated that day matures the record; on, 5 Nov's own close matures it
     g  .TA on the 3 Apr 2026 Passover Friday, a 14:00 IDT target: off, the
        Friday bar (struck at 13:50) matures it; on, Monday 6 Apr does
+    h  .JSE half day, hist enforce, a 10:00 SAST target audited on 28 Dec:
+       on and off both mature on the 24 Dec bar; on stamps it (quote_asof,
+       target_session_close) at the real 12:00 SAST close, off at 17:00
 T5  golden negative: T4a-on and T4c-on FAIL on the untouched v6.53.0
+T7  a malformed table entry: _outcome_session_override returns the
+    calendar's own schedule (the same object) and never raises, directly and
+    through _outcome_sessions with the gate on
 T6  ENV lane: both tracker steps map TRACK_SESSION_OVERRIDES with || 'off'
     exactly once and identically; the reader's fallback literal is "off";
     ci.yml's heavy job runs this file with the base required
@@ -197,13 +204,15 @@ def _sessions(tp, sym, around):
 
 
 SYMBOLS = ["005930.KS", "035720.KO", "NPN.JSE", "TEVA.TA", "D05.SI", "D05.SG", "AAPL.US", "2222.SR", "VOD.L", "7203.T", "0700.HK", "SAP.DE",
-           "BHP.AX", "D05.SI", "TEVA.TA", "FPH.NZ", "^N225", "GC=F", "BTC-USD", "1234", "FOO.ZZ"]
-DAYS = [_at(2024, 11, 14, 3, 0), _at(2025, 11, 13, 3, 0), _at(2025, 12, 24, 9, 0), _at(2025, 12, 31, 9, 0),
+           "BHP.AX", "Z74.SI", "LUMI.TA", "FPH.NZ", "^N225", "GC=F", "BTC-USD", "1234", "FOO.ZZ"]
+DAYS = [_at(2024, 11, 14, 3, 0), _at(2024, 12, 24, 9, 0), _at(2025, 11, 13, 3, 0), _at(2025, 12, 24, 9, 0),
+        _at(2025, 12, 31, 9, 0),
         _at(2026, 1, 4, 9, 0), _at(2026, 2, 16, 3, 0), _at(2026, 4, 3, 9, 0), _at(2026, 6, 3, 3, 0),
         _at(2026, 7, 17, 3, 0), _at(2026, 10, 27, 9, 0), _at(2026, 11, 4, 9, 0), _at(2026, 11, 5, 12, 0),
         _at(2026, 11, 19, 3, 0), _at(2026, 11, 20, 3, 0), _at(2026, 12, 10, 9, 0), _at(2026, 12, 24, 9, 0),
         _at(2026, 12, 31, 9, 0), _at(2027, 1, 15, 12, 0), _at(2027, 4, 23, 9, 0), _at(2027, 5, 3, 3, 0),
         _at(2027, 7, 19, 3, 0)]
+assert len(set(SYMBOLS)) == len(SYMBOLS) == 21 and len(set(DAYS)) == len(DAYS) == 22
 
 
 # --------------------------------------------------------------- the loop ---
@@ -265,7 +274,7 @@ def audit(tp, monkeypatch, sym, target, quote_at, now, bars=None, price=110.0):
 def _state(tp, rec):
     notes = rec.notes.rsplit(tp._OUTCOME_RECEIPT, 1)
     receipt = notes[1] if len(notes) == 2 else ""
-    receipt = re.sub(r'"tracker_version": "[0-9.]+"', '"tracker_version": "X"', receipt)
+    receipt = re.sub(r'"tracker_version":"[0-9.]+"', '"tracker_version":"X"', receipt)   # compact JSON
     return (str(getattr(rec.status, "value", rec.status)), rec.outcome, rec.realized_roi, notes[0], receipt)
 
 
@@ -369,8 +378,7 @@ def test_t3_on_changes_only_the_named_sessions(monkeypatch):
                 changed.add((a[0], la))
         assert set(kept) <= {x[0] for x in a[1]}, key                 # nothing added
     want = {(m, d) for m, t in EXPECTED.items() for d in t}
-    reachable = want - {("XJSE", "2024-12-24"), ("XJSE", "2024-12-31")}   # outside the DAYS windows
-    assert reachable <= changed, sorted(reachable - changed)
+    assert changed == want, (sorted(want - changed), sorted(changed - want))   # every row, nothing else
     assert {m for m, _ in changed} == {"XKRX", "XJSE", "XTAE", "XSES"}
 
 
@@ -470,6 +478,29 @@ def test_t4g_passover_friday_target_after_the_real_end(monkeypatch):
     assert receipt.get("target_session") == "2026-04-06" and calls == [], (receipt, calls)
 
 
+JSE_HIST_EARLY = ("NPN.JSE", _at(2026, 12, 24, 8, 0), _at(2026, 12, 28, 15, 0), _at(2026, 12, 28, 16, 0),
+                  [("2026-12-24", 105.0), ("2026-12-28", 110.0)])
+
+
+def _t4h(tp, monkeypatch, word, stamp):
+    _set_gate(monkeypatch, word)
+    rec, receipt, calls = audit(tp, monkeypatch, *JSE_HIST_EARLY)
+    assert rec.status == tp.PerformanceStatus.MATURED and abs(rec.realized_roi - 5.0) < 1e-9, (rec.status, receipt)
+    assert receipt.get("target_session") == "2026-12-24" and receipt.get("hist_bar_date") == "2026-12-24", receipt
+    assert receipt.get("quote_asof") == stamp and receipt.get("target_session_close") == stamp, receipt
+    assert calls == [("NPN.JSE", "2026-12-24")], calls
+
+
+def test_t4h_hist_close_is_stamped_with_the_corrected_close(monkeypatch):
+    """XJSE 2026-12-24, a 10:00 SAST target (before the 12:00 half-day close),
+    audited on 28 Dec under hist enforce: the 24 Dec bar matures it either way;
+    the gate decides only the stamp (the real 12:00 SAST close, 10:00Z, on;
+    the calendar's 17:00 SAST, 15:00Z, off)."""
+    tp = delivered()
+    _t4h(tp, monkeypatch, "on", "2026-12-24T10:00:00+00:00")
+    _t4h(tp, monkeypatch, None, "2026-12-24T15:00:00+00:00")
+
+
 ORDINARY = [("035720.KO", _at(2026, 11, 12, 5, 0), _at(2026, 11, 12, 6, 31), _at(2026, 11, 12, 7, 5)),
             ("AAPL.US", _at(2026, 11, 12, 18, 0), _at(2026, 11, 12, 21, 0), _at(2026, 11, 12, 22, 0)),
             ("2222.SR", _at(2026, 11, 12, 9, 0), _at(2026, 11, 12, 12, 0), _at(2026, 11, 12, 13, 0)),
@@ -487,6 +518,21 @@ def test_t4e_ordinary_days_identical_on_and_off(monkeypatch, sym, target, quote,
         states.append(_state(tp, rec))
     assert states[0] == states[1]
     assert states[0][0].upper().startswith("MATURED"), states[0]
+
+
+# ------------------------------------------------------------------- T7 ----
+@pytest.mark.parametrize("bad", [("bad", None), (None, "2026-11-19T25:00:00+00:00"), "Closed", ("x",), 7,
+                                 ("2026-11-19T01:00:00+00:00",)])
+def test_t7_malformed_entry_returns_the_calendar_schedule(monkeypatch, bad):
+    tp = delivered()
+    tp._outcome_calendar_schedule.cache_clear()
+    sched = tp._outcome_calendar_schedule("XKRX", "2026-11-19")
+    assert "2026-11-19" in {s[0] for s in sched}
+    monkeypatch.setattr(tp, "_OUTCOME_SESSION_OVERRIDES", {"XKRX": {"2026-11-19": bad}})
+    assert tp._outcome_session_override("XKRX", sched) is sched
+    _set_gate(monkeypatch, "on")
+    name, sessions = tp._outcome_sessions("005930.KS", _at(2026, 11, 19, 3, 0))
+    assert name == "XKRX" and sessions == sched
 
 
 # ---------------------------------------------------------------- GOLD -----

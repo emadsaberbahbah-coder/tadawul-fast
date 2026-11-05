@@ -3554,6 +3554,9 @@ _OUTCOME_SESSION_OVERRIDES = {
     },
     # SGX: eve-of-holiday half days, continuous trading ends 12:00 SGT (the
     # library's docstring lists them as a TODO; its data ends at 2026-12-31).
+    # 12:00 follows the calendar's own SGX convention: its 17:00 on ordinary
+    # days is also the end of continuous trading, before the closing routine
+    # and trade-at-close; both are left to the 15-minute regular-market slack.
     "XSES": {
         "2025-12-24": (None, "2025-12-24T04:00:00+00:00"),
         "2025-12-31": (None, "2025-12-31T04:00:00+00:00"),

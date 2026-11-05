@@ -91,19 +91,19 @@ The mappings and the CI step sit away from #915's edits. Trial merges with #915,
 
 ## S3 - Off identity
 
-`_outcome_sessions` was run over 21 symbols x 21 days, every override day included, under ten off words (unset, blank, off, 0, false, no, enforce, observe, onn, y). It returns or raises exactly as the untouched v6.53.0 (`git show a85edfc6`), sessions included (T2).
+`_outcome_sessions` was run over 21 distinct symbols x 22 days, whose +/-14-day windows reach every override day (T3 asserts that every row is exercised), under ten off words (unset, blank, off, 0, false, no, enforce, observe, onn, y). It returns or raises exactly as the untouched v6.53.0 (`git show a85edfc6`), sessions included (T2).
 
 The real audit loop on ordinary days (.KO, AAPL.US, 2222.SR, VOD.L, .JSE) gives the same record state and receipt with the gate off and on (T4e).
 
 ## S4 - Measured
 
-`tests/test_track_session_overrides.py` passes **PASS 33/33** as a script and under pytest.
+`tests/test_track_session_overrides.py` passes **PASS 40/40** as a script and under pytest (33 at the first head; the review round added T4h and T7, S7).
 
 | Case | What it checks |
 | --- | --- |
 | T1 | the table, pinned literally. Every entry names a session the pinned calendar has. A re-time changes it (open < close, same UTC day). XKRX re-times are exactly the library's +1h exam-day rule. XJSE half days close 12:00 SAST, XTAE Fridays 13:50 IDT (the calendar says 14:15), XSES half days 12:00 SGT, and every non-XKRX re-time shortens the day. The "closed" days are exactly the seven phantom sessions |
 | T2 / T2b / T2c | off = v6.53.0 over the matrix and ten off words; the six on-spellings; junk stays off |
-| T3 | on: only the named sessions change (re-timed, or gone when "closed"), only on their MIC; every other session, MIC and refusal is unchanged; nothing is added; every reachable entry is exercised |
+| T3 | on: only the named sessions change (re-timed, or gone when "closed"), only on their MIC; every other session, MIC and refusal is unchanged; nothing is added; the changed set equals the table, every row exercised |
 | T4a | .KS exam day, a 15:40 KST quote at 07:05Z: off MATURES (the defect; receipt `target_session_close` 06:30Z); on stays ACTIVE `target_session_not_complete` (close 07:30Z) |
 | T4b | .KS exam day, the 16:30 KST close quote at 08:00Z: on MATURES (WIN, close 07:30Z); off stays ACTIVE |
 | T4c | .JSE 24 Dec half day, hist enforce, a 14:00 SAST target: off MATURES on the 24 Dec bar (ROI 5.0, the defect); on, the target session is 28 Dec and its own close matures it (ROI 10.0, no bar read) |
@@ -111,29 +111,33 @@ The real audit loop on ordinary days (.KO, AAPL.US, 2222.SR, VOD.L, .JSE) gives 
 | T4e | ordinary days: identical on and off |
 | T4f | .JSE 4 Nov 2026 election day (closed), hist enforce: off, the phantom session is the target and a bar dated 4 Nov matures it; on, 5 Nov's own close does |
 | T4g | .TA 3 Apr 2026 Passover Friday, a 14:00 IDT target: off, hist enforce matures it on the Friday bar struck at 13:50; on, Monday 6 Apr's close does |
+| T4h | .JSE 24 Dec half day, hist enforce, a 10:00 SAST target audited on 28 Dec: both modes mature on the 24 Dec bar (ROI 5.0, one bar read); on stamps `quote_asof` and `target_session_close` at the real 12:00 SAST close (10:00Z), off at the calendar's 17:00 (15:00Z) |
+| T7 | six malformed entries (an unparseable open, an hour 25 close, "Closed", a 1-tuple, an int, a 1-tuple with a valid open): `_outcome_session_override` returns the calendar's own schedule (the same object) and does not raise, directly and through `_outcome_sessions` with the gate on |
 | T5 | golden negative: T4a-on and T4c-on FAIL on the untouched v6.53.0 |
 | T6 | both tracker steps map the gate exactly once with `\|\| 'off'`, identically; the reader's fallback literal is "off"; ci.yml's step runs the file, fetches the full base SHA and sets `TFB_TEST_REQUIRE_BASE: "1"` |
 | V1 / V1b | version floor, verifier pin, title line, WHY order, ASCII test file. Against the base: only the title and `SCRIPT_VERSION` lines removed, the added lines ASCII apart from the title, exactly two functions added (skips once #845 / #857 / #915 blocks are merged in) |
 
-Golden negative of the whole file against the untouched v6.53.0 (`TFB_TEST_TRACK_DELIVERED=` that copy): **25 failed, 7 passed, 1 skipped**.
+Golden negative of the whole file against the untouched v6.53.0 (`TFB_TEST_TRACK_DELIVERED=` that copy): **32 failed, 7 passed, 1 skipped** (25 / 7 / 1 at the first head).
 - The 7 that pass compare with the base by construction (T2, T4e x5) or assert the base's own defect (T5).
 - The skip is V1b.
 
-Mutants, each run against the harness: **14 / 14 killed**:
-1. the reader defaulting on (10 failed);
-2. the gate check dropped (8);
+Mutants, each run against the harness (rebuilt on the review-round file): **16 / 16 killed**:
+1. the reader defaulting on (11 failed);
+2. the gate check dropped (9);
 3. the exam-day close kept at 15:30 (4);
 4. the 2026 exam-day row dropped (4);
-5. a JSE half-day close at 11:00Z (3);
-6. the open never re-timed (1);
-7. the close never re-timed (6);
+5. a JSE half-day close at 11:00Z (4);
+6. the open never re-timed (2);
+7. the close never re-timed (9);
 8. any word turning it on (8);
 9. a row for a day the calendar does not open (1);
 10. the XSES rows filed under another MIC (2);
 11. "closed" days not dropped (2);
 12. the TASE Friday row dropped (3);
 13. an SGX half day at 12:30 (2);
-14. the JSE election-day row dropped (3).
+14. the JSE election-day row dropped (3);
+15. the fallback narrowed to `except ZeroDivisionError`, so a malformed entry raises (6; review round);
+16. a malformed entry silently dropping its session instead of returning the calendar's schedule (5; review round).
 
 Other checks: see the PR body (the tracker, workflow and flag suites; compileall; ruff; the ci.yml lean list and the contract-lane emulation on an export of this tree).
 
@@ -155,3 +159,25 @@ Rollback: unset the Variable. Records that matured meanwhile keep their receipts
 - **Not fixed here (base map, pre-existing, time-bound):** XSES data ends 2026-12-31 in 4.13.2 (`holidays are only recorded to the year 2026`). From 2026-12-18 every .SI / .SG lookup raises `outcome_calendar_unknown` until the pinned package is bumped; no exchange_calendars release after 4.13.2 was found. Proposed as the next item.
 - Once this and #915 both land, #915's .KQ and .JO denials can be lifted for these days.
 - No change to the base map, the maturation rule, the receipt schema, the cron or the concurrency. No live workbook read or write and no provider call: everything is offline with stubs.
+
+## S7 - Review round (2026-11-05)
+
+**Codex (P2, SGX half days should close after the closing auction, 12:06 or 12:16 SGT): kept at 12:00, answered on the thread and resolved.**
+- The pinned XSES calendar closes every ordinary SGX session at 17:00 SGT, the end of continuous trading, before the closing routine (17:00-17:06) and trade-at-close (to 17:16). The half-day rows use the same point. On both kinds of day the closing print falls to the 15-minute regular-market slack.
+- No record can reach the three rows. They are 2025-12-24, 2025-12-31 and 2026-02-16, and the first target date in the log is 2026-07-28.
+- Replayed with the real audit loop with the gate off on an ordinary day (2026-11-04): a 17:03 SGT target maps to the next session, and a 17:16 regular-market print is refused as `quote_session_unknown`. So the case the reviewer describes is a base-map property of every SGX session (and of other venues whose calendar close excludes the auction), not of this override. It is reported to the owner as a separate item.
+- A comment on the XSES rows now states the convention. It is three comment lines in the table and changes no value.
+
+**Independent four-lens review (maturation, off identity, workflows / CI, tests and claims):**
+- No finding on maturation or on the workflows / CI lens.
+- Fixed in this round:
+  - **(minor) The matrix was smaller than claimed.** SYMBOLS listed D05.SI and TEVA.TA twice, so it held 19 distinct symbols, not 21. No DAYS window reached the 2024 JSE half days, and T3 carved them out by hand. Now: Z74.SI and LUMI.TA replace the duplicates, 2024-12-24 09:00Z is added (22 days), a module-level assert pins 21 distinct symbols and 22 distinct days, and T3 asserts that the changed set equals the table.
+  - **(nit) The malformed-entry contract was untested.** Mutants 15 and 16 survived the first head. T7 now covers it.
+  - **(nit) No case ran the hist path with the gate on.** T4h now covers it.
+  - **(nit) T1's docstring** said every re-time is a shorter day. XKRX shifts by +1h; the docstring now says so.
+  - **(nit) `_state`'s receipt normaliser** expected a space after each colon, but the receipt is compact JSON, so it never matched. It now matches. T4e is unaffected: it compares the delivered module with itself.
+
+**CI:**
+- The advisory "Whole suite (pinned Python 3.11)" job (`timeout-minutes: 15`, `continue-on-error: true`) was cancelled at its timeout in push run 42042240471 at 97%.
+- It passed on the same commit in the pull_request run 42042353188, in 13m43s.
+- It is cancelled the same way on main `a85edfc6` (push run 42017020363). Not this PR's; noted on the PR. Raising the cap or sharding the suite is an owner choice.
