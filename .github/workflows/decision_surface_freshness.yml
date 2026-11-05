@@ -1,6 +1,10 @@
 name: 🛡️ Decision Surface Freshness
 
 # =============================================================================
+# VERSION 1.1.1 (2026-11-05) -- THE HANDSHAKE COVERS ONE RENDER RETRY
+# (await_cockpit_receipts 1.3.0: default 30, hard cap 35 minutes; step backstop
+# 40, job timeout 60). WHY: daily_sync.yml 1.0.11 (run 41901407829, 5 Nov).
+#
 # VERSION 1.1.0 (2026-11-02) -- SYNC-RENDER HANDSHAKE (await_cockpit_receipts 1.1.0)
 # (first dated entry; the earlier file carried no version header)
 # WHY (runs of 1-2 Nov 2026): on workflow_run of the Advanced Sync this
@@ -113,9 +117,10 @@ jobs:
         )
       }}
     runs-on: ubuntu-24.04
+    # v1.1.1: 45 -> 60 (the handshake backstop grew from 25 to 40 minutes).
     # v1.1.0: 20 -> 45, room for the gated handshake wait (cap 20 min) and
     # its 25-minute step backstop before the unchanged audit.
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: production
     env:
       PYTHONUNBUFFERED: '1'
@@ -206,10 +211,10 @@ jobs:
       # runs exactly as before. The audit below keeps every finding as is.
       - name: Await the native cockpit render (handshake)
         if: ${{ github.event_name == 'workflow_run' && contains(fromJSON('["1","true","yes","on"]'), vars.TFB_SYNC_AWAIT_RENDER) }}
-        timeout-minutes: 25
+        timeout-minutes: 40
         env:
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
-          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}
+          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}
         run: |
           set -euo pipefail
           rm -f await_render.json
