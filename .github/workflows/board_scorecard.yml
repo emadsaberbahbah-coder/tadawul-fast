@@ -105,6 +105,11 @@ jobs:
       # rule (reads _Shadow_Rank_Log). "off" restores the v1.1.0 outputs
       # byte for byte.
       TFB_BOARD_SCORECARD_CHALLENGER: "on"
+      # v1.2.2 [RAW OUTCOMES] (2026-11-05): DETAIL outcome cells at full
+      # precision, so the Looker win rate (10_v_board_episodes.sql, '> 0' on
+      # the cell) counts the same wins as the SUMMARY row (243 vs 246 of 468
+      # on 5 Nov). "off" restores the v1.2.1 rows byte for byte.
+      TFB_BOARD_SCORECARD_RAW: "on"
     steps:
       # Pinned to main; the job token is not persisted into .git.
       - uses: actions/checkout@v6

@@ -1,4 +1,4 @@
-/* 26_Decision_Chain v1.0.4: refresh Portfolio_Decision and Top_10 when the
+/* 26_Decision_Chain v1.0.5: refresh Portfolio_Decision and Top_10 when the
  * sync's data lands. Runs the REAL 10_My_Portfolio, 11_Manual_Refresh_
  * Coordinator, 16_Decision_Top10 and 26_Decision_Chain sources in one vm (the
  * shared Apps Script namespace) with service stubs; only the two refresh
@@ -113,6 +113,11 @@ function world(o) {
                 newTrigger(h) { return {timeBased() { return {everyMinutes(n) { return {create() {
                   const t = {getHandlerFunction() { return h; }, every: n}; triggers.push(t); return t; }}; }}; }}; }},
     Utilities: {getUuid() { return 'uuid-synthetic'; }, formatDate: gasFormatDate},
+    CacheService: {getScriptCache() {   // v1.0.5: the Plan of Record's run claim
+      if (o.cacheThrows) throw new Error('synthetic cache fault');
+      const cache = o.cache || {};
+      return {get(k) { calls.cacheReads = (calls.cacheReads || 0) + 1; return Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : null; }};
+    }},
     Session: {getScriptTimeZone() { return o.scriptTimeZone || 'Asia/Riyadh'; }},
   };
   vm.createContext(ctx);
@@ -808,7 +813,7 @@ check('C38 v1.0.4 gate on: Top_10 renders as soon as the sync proved run N ready
   assert.deepEqual([w.calls.t10, w2.calls.t10], [1, 1]);
   assert.deepEqual(w.runLog.map(r => [r[1], r[3], r[4]]),
     [['INFO', 'Portfolio_Decision', 'OK'], ['INFO', 'Top_10_Investments', 'OK']]);
-  assert.match(w.runLog[1][5], new RegExp('\\[DECISION-CHAIN v1\\.0\\.4\\] t10e run ' + RUN +
+  assert.match(w.runLog[1][5], new RegExp('\\[DECISION-CHAIN v' + w.ctx.TFB_DC_VERSION.replace(/\./g, '\\.') + '\\] t10e run ' + RUN +
     ' -> rendered \\(run ' + RUN + ' upstream ready\\)$'));
   // the next run renders early again
   const w3 = world({now: T0 + 6 * 3600000, status: readyStatus(NEXT), kv: earlyKv(NEXT, RUN),
@@ -908,13 +913,102 @@ check('C42 v1.0.4 pure helpers and the status line', () => {
   assert.equal(c.tfbDcUpstreamReadyRun_(UP_DIAG(RUN), feeds({ML: null})), '');
   const off = world({now: T0, status: readyStatus(RUN), kv: earlyKv(RUN, OLD),
                      props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_STATE: pdDone(RUN)}});
-  assert.match(off.ctx.tfbDecisionChainStatus(), / early_t10=off last_t10_early=- next=none \(run 7777777771 final audit not finished\)$/);
+  assert.match(off.ctx.tfbDecisionChainStatus(), / early_t10=off priority=off last_t10_early=- next=none \(run 7777777771 final audit not finished\)$/);
   const on = world({now: T0, status: readyStatus(RUN), kv: earlyKv(RUN, OLD),
                     props: {TFB_DECISION_CHAIN: 'on', TFB_DECISION_CHAIN_EARLY_T10: 'on',
                             TFB_DECISION_CHAIN_STATE: pdDone(RUN)}});
-  assert.match(on.ctx.tfbDecisionChainStatus(), / early_t10=on last_t10_early=- next=t10e run 7777777771 \(run 7777777771 upstream ready\)$/);
+  assert.match(on.ctx.tfbDecisionChainStatus(), / early_t10=on priority=off last_t10_early=- next=t10e run 7777777771 \(run 7777777771 upstream ready\)$/);
   assert.equal(on.calls.t10, 0);
 });
 
-console.log('RESULT ' + passed + '/42 PASS');
-assert.equal(passed, 42);
+// ------------------------------------------------------------ v1.0.5 -------
+// 5 Nov 2026: three of the night's Top_10 renders were stopped at the Apps
+// Script 6-minute limit; one started beside the Plan of Record refresh.
+const POR = {POR_RUNNING: String(T0 - 60000)};
+const prio = (extra) => Object.assign({TFB_DECISION_CHAIN: 'on', TFB_RENDER_PRIORITY: 'on'}, extra || {});
+
+check('C43 v1.0.5 gate off (absent, blank, off, junk, a fault): the Plan of Record claim and an expired claim change nothing', () => {
+  for (const g of [undefined, '', 'off', 'enable', 'FAULT']) {
+    const props = {TFB_DECISION_CHAIN: 'on'};
+    if (g !== undefined && g !== 'FAULT') props.TFB_RENDER_PRIORITY = g;
+    const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props, cache: POR,
+                     propThrows: g === 'FAULT' ? 'TFB_RENDER_PRIORITY' : undefined});
+    assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN, String(g));
+    assert.equal(w.calls.cacheReads || 0, 0, String(g));
+    const stale = JSON.stringify({pd: RUN, claim: {act: 't10', run: RUN, at_ms: T0 - 9 * 60000}});
+    const w2 = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), cache: POR,
+                      props: Object.assign({}, props, {TFB_DECISION_CHAIN_STATE: stale}),
+                      propThrows: g === 'FAULT' ? 'TFB_RENDER_PRIORITY' : undefined});
+    assert.equal(w2.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN, String(g));
+    assert.deepEqual(w2.runLog.map(r => r[4]), ['OK'], String(g));
+  }
+});
+
+check('C44 v1.0.5 gate on: no render while the Plan of Record holds its claim; the next tick renders', () => {
+  const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props: prio(), cache: POR});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'Plan of Record refresh running; the render waits for the next tick');
+  assert.deepEqual([w.calls.pd, w.calls.t10, w.runLog.length], [0, 0, 0]);
+  assert.equal(w.props.TFB_DECISION_CHAIN_STATE, undefined);
+  const w2 = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props: prio(), cache: {}});
+  assert.equal(w2.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
+  assert.equal(w2.ctx.tfbDecisionChainTick(), 'refreshed t10 run ' + RUN);
+  // the early render and the release re-render wait the same way
+  const e = world({now: T0, status: readyStatus(RUN), kv: earlyKv(RUN, OLD), cache: POR,
+                   props: prio({TFB_DECISION_CHAIN_EARLY_T10: 'on', TFB_DECISION_CHAIN_STATE: pdDone(RUN)})});
+  assert.equal(e.ctx.tfbDecisionChainTick(), 'Plan of Record refresh running; the render waits for the next tick');
+  assert.equal(e.calls.t10, 0);
+  // the skips that come first keep their own words
+  const kv = readyKv(RUN, RUN, NEXT); kv['TFB Feed Market_Leaders'] = feed('OK', NEXT, T0 - 2 * 60000);
+  const f = world({now: T0, status: readyStatus(RUN), kv, props: prio(), cache: POR});
+  assert.equal(f.ctx.tfbDecisionChainTick(), 'sync in flight');
+  // an unreadable cache never blocks
+  const c = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props: prio(), cacheThrows: true});
+  assert.equal(c.ctx.tfbDecisionChainTick(), 'refreshed pd run ' + RUN);
+});
+
+check('C45 v1.0.5 gate on: an expired claim is reported once as a render that did not finish, then retried', () => {
+  const stale = JSON.stringify({pd: RUN, claim: {act: 't10e', run: RUN, at_ms: T0 - 9 * 60000},
+                                attempts: {['t10e:' + RUN]: 1}});
+  const w = world({now: T0, status: readyStatus(RUN), kv: earlyKv(RUN, OLD), cache: {},
+                   props: prio({TFB_DECISION_CHAIN_EARLY_T10: 'on', TFB_DECISION_CHAIN_STATE: stale})});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'refreshed t10e run ' + RUN);
+  assert.deepEqual(w.runLog.map(r => [r[1], r[3], r[4]]),
+    [['WARN', 'Top_10_Investments', 'NOT_FINISHED'], ['INFO', 'Top_10_Investments', 'OK']]);
+  assert.match(w.runLog[0][5], new RegExp('^\\[DECISION-CHAIN v1\\.0\\.5\\] t10e run ' + RUN +
+    ' -> did not finish \\(claimed 9 min ago; an Apps Script execution is stopped at 6 minutes without a trace;'));
+  const st = JSON.parse(w.props.TFB_DECISION_CHAIN_STATE);
+  assert.deepEqual([st.t10e, st.claim], [RUN, null]);
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'run ' + RUN + ' final audit not finished');
+  assert.equal(w.runLog.length, 2);                                   // reported once
+  // a Portfolio_Decision claim names its own page; the WARN row is written even when the tick then waits
+  const pdStale = JSON.stringify({claim: {act: 'pd', run: RUN, at_ms: T0 - 8 * 60000}});
+  const p = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), cache: POR,
+                   props: prio({TFB_DECISION_CHAIN_STATE: pdStale})});
+  assert.equal(p.ctx.tfbDecisionChainTick(), 'Plan of Record refresh running; the render waits for the next tick');
+  assert.deepEqual(p.runLog.map(r => [r[1], r[3], r[4]]), [['WARN', 'Portfolio_Decision', 'NOT_FINISHED']]);
+  assert.equal(JSON.parse(p.props.TFB_DECISION_CHAIN_STATE).claim, null);
+});
+
+check('C46 v1.0.5 gate on: a fresh claim is not a stopped render (no row, the claim blocks as before)', () => {
+  const fresh = JSON.stringify({claim: {act: 'pd', run: RUN, at_ms: T0 - 2 * 60000}});
+  const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), cache: {},
+                   props: prio({TFB_DECISION_CHAIN_STATE: fresh})});
+  assert.equal(w.ctx.tfbDecisionChainTick(), 'claimed pd run ' + RUN);
+  assert.equal(w.runLog.length, 0);
+  assert.equal(JSON.parse(w.props.TFB_DECISION_CHAIN_STATE).claim.run, RUN);
+});
+
+check('C47 v1.0.5 pure gate, the status line and observe mode', () => {
+  const c = world({now: T0}).ctx;
+  for (const v of ['on', 'ON', ' on ', '1', 'true', 'Yes']) assert.equal(c.tfbDcPriorityOn_(v), true, v);
+  for (const v of [null, undefined, '', 'off', '0', 'enable', 'onn']) assert.equal(c.tfbDcPriorityOn_(v), false, String(v));
+  const w = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), props: prio(), cache: POR});
+  assert.match(w.ctx.tfbDecisionChainStatus(), / priority=on .*next=none \(Plan of Record refresh running; the render waits for the next tick\)$/);
+  const o = world({now: T0, status: readyStatus(RUN), kv: readyKv(RUN, RUN), cache: POR,
+                   props: {TFB_DECISION_CHAIN: 'observe', TFB_RENDER_PRIORITY: 'on'}});
+  assert.equal(o.ctx.tfbDecisionChainTick(), 'Plan of Record refresh running; the render waits for the next tick');
+  assert.equal(o.runLog.length, 0);
+});
+
+console.log('RESULT ' + passed + '/47 PASS');
+assert.equal(passed, 47);
