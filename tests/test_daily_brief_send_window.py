@@ -57,4 +57,5 @@ def test_surfaces_carry_the_label_not_the_constant():
 
 
 def test_version():
-    assert brief.__version__ == "1.20.0"
+    # 2026-10-31: v1.21.0 [UNSIZED-ADD] builds on this send window; a floor.
+    assert tuple(int(x) for x in brief.__version__.split(".")) >= (1, 20, 0)

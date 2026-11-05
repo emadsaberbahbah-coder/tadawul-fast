@@ -113,6 +113,9 @@ jobs:
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON or base64(JSON); prefer the JSON secret.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_BRIEF_OWNER_NAME: "Emad Bahbah"
+          # 2026-10-31 run_daily_brief v1.21.0 [UNSIZED-ADD]: off (default) | observe |
+          # enforce. Off = v1.20.0; see the script's WHY. Rollback: unset the Variable.
+          TFB_BRIEF_UNSIZED_ADD: ${{ vars.TFB_BRIEF_UNSIZED_ADD || 'off' }}
           TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
           TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
           TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
