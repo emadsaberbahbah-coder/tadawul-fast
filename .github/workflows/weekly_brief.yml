@@ -32,6 +32,13 @@ jobs:
       TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
       TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
       TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
+      # run_weekly_brief v1.1.0 (2026-11-03) BOARD PARITY - default off = the
+      # v1.0.3 memo. on (or 1/true/yes): the memo binds Shadow_Board columns by
+      # header name and computes the board under the shadow_board.yml lane
+      # (retired screen, engine ROI enforce, settled Top_10 read, authority
+      # from this workbook), so memo and tab agree. Not armed here.
+      # Rollback: unset the Variable.
+      TFB_WEEKLY_BOARD_PARITY: ${{ vars.TFB_WEEKLY_BOARD_PARITY || 'off' }}
     steps:
       - uses: actions/checkout@v6
 

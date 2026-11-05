@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.67 (2026-11-03) -- WEEKLY BRIEF BOARD PARITY (run_weekly_brief 1.1.0)
+# (1.1.62 and 1.1.63 are claimed by open #778, 1.1.64 by open #882, 1.1.65 by
+# open #889, 1.1.66 by open #897.)
+#
+# v1.1.67: run tests/test_weekly_brief_board_parity.py (run_weekly_brief
+# v1.1.0 [BOARD-PARITY], TFB_WEEKLY_BOARD_PARITY default off = v1.0.3: the
+# weekly memo binds Shadow_Board columns by header name and computes the
+# board under the shadow_board.yml lane) in its own heavy-job step after the
+# supplier margin step. Offline fixtures only; its golden legs read main
+# 3e326e26 with `git show` and SKIP on a shallow checkout when the fetch
+# fails. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
@@ -1371,6 +1383,14 @@ jobs:
             tests/test_margin_scoring_unit_contract.py \
             tests/test_margin_producer_unit_receipts.py \
             tests/test_eps_basis_contract.py
+
+      - name: Weekly brief memo matches the Shadow_Board tab (run_weekly_brief 1.1.0)
+        run: |
+          # v1.1.67: the off-identity and golden legs read run_weekly_brief
+          # v1.0.3 at main 3e326e26 (a failed fetch only SKIPs those legs).
+          git fetch --no-tags --depth=1 origin 3e326e26a66393bcf26d725184507f8c1772b290 \
+            || echo "::notice::weekly brief v1.0.3 base not fetched - its golden legs will SKIP"
+          python -m pytest -q tests/test_weekly_brief_board_parity.py
 
       - name: 🧪 Work-brief publication, policy and workbook regressions
         # Full production dependencies exercise the real engine/provider
