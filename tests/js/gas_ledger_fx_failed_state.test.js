@@ -51,7 +51,7 @@ function ledgerMap(rows) {
     getSheetByName(name) { return name === '_Portfolio_CostBasis' ? sheet : null; }}; }}};
   vm.createContext(ctx);
   vm.runInContext(PF, ctx, {filename: '10_My_Portfolio.gs'});
-  assert.equal(ctx.PD_VERSION, '1.5.18');   // 2026-10-26: evidence publication stacked; 2026-10-28: post-earnings inputs stacked; 2026-11-02: cash snapshot writer stacked
+  assert.equal(ctx.PD_VERSION, '1.5.19');   // 2026-10-26: evidence publication stacked; 2026-10-28: post-earnings inputs stacked; 2026-11-02: cash snapshot writer stacked; 2026-11-03: plain block reasons stacked
   return copy(ctx._myPortfolioLedgerMap_());
 }
 

@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
+// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.1  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
 //
 // Purpose
 // -------
@@ -7,6 +7,25 @@
 // THE MINUTE instead of whenever GitHub gets round to a schedule event.
 //
 // -----------------------------------------------------------------------------
+// v1.1.1 (2026-11-04) - THE DISPATCHED SYNC CARRIES MY_PORTFOLIO
+// WHY (owner installed the dispatch triggers on 4 Nov 01:05 Riyadh; Actions
+//   run 41766747380 + _Status + _Run_Log, read-only): the first dispatched
+//   daily_sync (06:22 Riyadh, on the minute) ran WITHOUT My_Portfolio.
+//   daily_sync.yml (since 12 Oct) adds MY_PORTFOLIO to a full_sync only for a
+//   schedule event or a workflow_dispatch with include_portfolio=true; this
+//   dispatcher (written in Sept) sent only run_mode. With no My_Portfolio
+//   publication for the run, 26_Decision_Chain never refreshed
+//   Portfolio_Decision for it, the finalizer published decision_failed at
+//   07:42 (feed NOT_ACTIONABLE, superseding the 05:08 EXECUTABLE release of
+//   the 03:40 scheduled sync) and Release After Sync timed out on the missing
+//   Portfolio_Decision receipt ('pf': null): no release for the session.
+// WHAT: the daily_sync dispatch payload is now
+//   { ref, inputs: { run_mode: 'full_sync', include_portfolio: 'true' } }, the
+//   same page set as a scheduled run. Nothing else changes: the S-1 lanes,
+//   the guards, the probe, the log rows and the status line are unchanged.
+//   tfbSyncDispatchSelfTest checks the new field.
+// ROLLBACK: Project History -> 1.1.0, or tfbRemoveSyncDispatchTriggers.
+//
 // v1.1.0 (2026-09-30, One-Pass Script - P-170b S-1 LANE DISPATCH)
 // WHY (measured 2026-09-30 from _Run_Log, the Actions run pages and the
 //   scorer source): the S-1 evidence lane runs on the SAME GitHub schedule
@@ -109,7 +128,7 @@
 //   and drop the schedule block entirely.
 // ES5 only (file is loaded by the classic runtime path); no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_SYNC_DISPATCH_VERSION = '1.1.0';
+var TFB_SYNC_DISPATCH_VERSION = '1.1.1';
 
 var TFB_SYNC_DISPATCH_ = Object.freeze({
   PROP_TOKEN: 'TFB_GH_DISPATCH_TOKEN',
@@ -245,7 +264,7 @@ function tfbSdDecide_(inp) {
 function tfbSdBuildDispatchRequest_(repo, workflow, ref, token) {
   var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
     '/actions/workflows/' + encodeURIComponent(workflow) + '/dispatches';
-  var payload = { ref: ref, inputs: { run_mode: TFB_SYNC_DISPATCH_.RUN_MODE } };
+  var payload = { ref: ref, inputs: { run_mode: TFB_SYNC_DISPATCH_.RUN_MODE, include_portfolio: 'true' } };   // v1.1.1: the scheduled run's page set
   var options = {
     method: 'post',
     contentType: 'application/json',
@@ -629,6 +648,7 @@ function tfbSyncDispatchSelfTest() {
   ok(rq.options.method === 'post' && rq.options.muteHttpExceptions === true, 'dispatch method');
   var pl = JSON.parse(rq.options.payload);
   ok(pl.ref === 'main' && pl.inputs && pl.inputs.run_mode === 'full_sync', 'dispatch payload');
+  ok(pl.inputs.include_portfolio === 'true', 'dispatch payload carries My_Portfolio (v1.1.1)');
   ok(rq.options.headers.Authorization === 'Bearer tok_ABCDEFG' && rq.options.headers['X-GitHub-Api-Version'] === '2022-11-28', 'dispatch headers');
   var pr = tfbSdBuildProbeRequest_('o/r', 'daily_sync.yml', 'tok_ABCDEFG');
   ok(pr.url === 'https://api.github.com/repos/o/r/actions/workflows/daily_sync.yml' && pr.options.method === 'get', 'probe request');

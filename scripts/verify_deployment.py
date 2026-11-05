@@ -276,7 +276,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (#831 merge of main #898-#906; pin only): renumbered 1.3.1 -> 1.4.1
     # over main's 1.4.0 (#904, render hold, TFB_RELEASE_RENDER_HOLD default off).
     ("release_decision_feed", "1.4.1", "gated audited decision-feed release (P0-1)"),
-    ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
+    ("intraday_quote_refresh", "1.0.4", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
     # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
@@ -287,7 +287,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.1.0 -> 1.2.0 (the release's
     # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
     # default strict; workflow-scoped, never on Render).
-    ("await_cockpit_receipts", "1.2.0", "after-sync release dispatch (read-only wait)"),
+    ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.3", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
