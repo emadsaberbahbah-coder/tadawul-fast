@@ -1,24 +1,146 @@
 /**
- * zz_Property_Tool.gs -- one-off Script Property tool (3 Nov 2026).
- * The Project Settings page turns read-only above 50 properties, so these
- * functions do the edits from the editor. Paste as a TEMPORARY script file,
- * run what you need from the function list, then delete this file (the repo
- * does not carry it).
+ * zz_Property_Tool.gs -- Script Property tool, v2.1 (5 Nov 2026).
+ * WHY: Project Settings -> Script Properties turns read-only above 50
+ * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
+ * property is set from code instead: pick a function in the toolbar list,
+ * press Run, then read View -> Execution log. Nothing here places, changes
+ * or cancels an order.
  *
- *  tfbDoAll            EVERYTHING IN ONE RUN: deletes the 9 stale keys, sets
- *                      POR_MODE=observe and POR_IBKR_ALIASES=INDV.US=SUPN, and
- *                      installs the Plan of Record trigger (porInstallTrigger).
- *  tfbPropsPorObserve  REQUIRED for the Plan of Record: POR_MODE=observe and
- *                      POR_IBKR_ALIASES=INDV.US=SUPN. Then run porInstallTrigger.
- *  tfbPropsCleanStale  optional: deletes 9 stale keys (listed below) that no
- *                      current code reads or that only record old events.
- *  tfbPropsList        optional: logs every property (secrets hidden).
- *  tfbPropsPorOn       later, after one market session: POR_MODE=on.
- *  tfbPropsPorSession  only if you decide it: POR_VALIDITY=session.
+ *  tfbSetupTonight    ONE RUN for 4 Nov. Sets DP2_EXIT_SANITY=on (the false
+ *                     SUPN SELL NOW) and TFB_DECISION_CHAIN_EARLY_T10=on
+ *                     (Top_10 renders before the final audit), reads both
+ *                     back, shows which file versions are live, and runs
+ *                     dp2SelfTest and tfbDecisionChainStatus. Safe to repeat.
+ *  tfbSetupRenderPriority  ONE RUN for 5 Nov (v2.1). Sets TFB_RENDER_PRIORITY=on
+ *                     (26_Decision_Chain 1.0.5 waits for the Plan of Record and
+ *                     reports stopped renders; 28_Plan_Of_Record 1.0.1 and
+ *                     27_Decision_Pages_v2 1.2.34 yield to a decision render),
+ *                     reads it back, shows the three versions and runs
+ *                     tfbDecisionChainStatus. Safe to repeat.
+ *  tfbSetAnyProperty  any other key: type it in TFB_PT_SET_KEY and the value
+ *                     in TFB_PT_SET_VALUE below, Save, Run. Refuses secrets
+ *                     (TOKEN / SECRET / PASSWORD / API KEY names).
+ *  tfbGetAnyProperty  logs the current value of TFB_PT_SET_KEY.
+ *  tfbPropsList       logs every property (secrets hidden) and the count.
+ *  tfbPropsExitSanityOn / tfbPropsEarlyT10On   the two switches one by one.
+ *  tfbPropsPorObserve / tfbPropsPorOn / tfbPropsPorSession   Plan of Record.
+ *  tfbPropsCleanStale optional: deletes 9 stale keys (listed below).
+ * Removed in 2.0: tfbDoAll (it re-set POR_MODE=observe and re-installed a
+ * trigger on every run).
  *
  * Never deleted here: any *_STATE key (DT10_STAB_STATE_V1 is the board's
  * stability memory), switches (on / off / observe / enforce), counters.
  */
+
+var TFB_PT_SET_KEY = '';     // for tfbSetAnyProperty, e.g. 'POR_MODE'
+var TFB_PT_SET_VALUE = '';   // for tfbSetAnyProperty, e.g. 'on'
+
+function tfbSetupTonight() {
+  var p = PropertiesService.getScriptProperties();
+  var out = ['TFB setup (zz_Property_Tool 2.0)'];
+  p.setProperty('DP2_EXIT_SANITY', 'on');
+  p.setProperty('TFB_DECISION_CHAIN_EARLY_T10', 'on');
+  out.push('SET DP2_EXIT_SANITY = ' + p.getProperty('DP2_EXIT_SANITY'));
+  out.push('SET TFB_DECISION_CHAIN_EARLY_T10 = ' + p.getProperty('TFB_DECISION_CHAIN_EARLY_T10'));
+  var dp2 = typeof DP2_VERSION !== 'undefined' ? String(DP2_VERSION) : 'not found';
+  out.push('27_Decision_Pages_v2 live: ' + dp2 + ' (needs 1.2.33 or later)');
+  var dc = typeof TFB_DC_VERSION !== 'undefined' ? String(TFB_DC_VERSION) : 'not found';
+  out.push('26_Decision_Chain live: ' + dc + (dc === '1.0.4' ? ' (ok)' :
+      ' -> PASTE 26_Decision_Chain 1.0.4 FROM GITHUB MAIN, Save, then run tfbSetupTonight again'));
+  out.push('24_Sync_Dispatch live: ' + (typeof TFB_SYNC_DISPATCH_VERSION !== 'undefined' ?
+      String(TFB_SYNC_DISPATCH_VERSION) : 'not found') + ' (1.1.1 is optional since daily_sync 1.0.10)');
+  if (typeof dp2SelfTest === 'function') {
+    try {
+      var r = dp2SelfTest(), hit = false;
+      for (var i = 0; r && r.checks && i < r.checks.length; i++) {
+        if (/exit sanity/i.test(String(r.checks[i].name))) {
+          out.push('dp2SelfTest: ' + (r.checks[i].ok ? 'PASS' : 'FAIL') + ' - ' + r.checks[i].name);
+          hit = true;
+        }
+      }
+      if (!hit) out.push('dp2SelfTest: no exit-sanity line (27_Decision_Pages_v2 is older than 1.2.33)');
+      out.push('dp2SelfTest overall: ' + (r && r.ok ? 'PASS' : 'FAIL (the full list is earlier in this log)'));
+    } catch (e1) {
+      out.push('dp2SelfTest error: ' + String(e1 && e1.message ? e1.message : e1).slice(0, 200));
+    }
+  } else {
+    out.push('dp2SelfTest not found (27_Decision_Pages_v2 missing)');
+  }
+  if (typeof tfbDecisionChainStatus === 'function') {
+    try {
+      out.push('decision chain: ' + tfbDecisionChainStatus());
+    } catch (e2) {
+      out.push('tfbDecisionChainStatus error: ' + String(e2 && e2.message ? e2.message : e2).slice(0, 200));
+    }
+  }
+  out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
+  out.push('NEXT: menu Decision Pages v2 -> Refresh Portfolio_Decision_v2 (or run buildPortfolioDecisionV2).' +
+      ' SUPN.US should then read HOLD with "dividend-adjusted (8.13 ex 2026-11-03)", not SELL NOW.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function tfbSetupRenderPriority() {
+  var p = PropertiesService.getScriptProperties();
+  var out = ['TFB render priority (zz_Property_Tool 2.1)'];
+  p.setProperty('TFB_RENDER_PRIORITY', 'on');
+  out.push('SET TFB_RENDER_PRIORITY = ' + p.getProperty('TFB_RENDER_PRIORITY'));
+  var dc = typeof TFB_DC_VERSION !== 'undefined' ? String(TFB_DC_VERSION) : 'not found';
+  out.push('26_Decision_Chain live: ' + dc + (dc === '1.0.5' ? ' (ok)' :
+      ' -> PASTE 26_Decision_Chain 1.0.5 FROM GITHUB MAIN, Save, then run this again'));
+  var por = typeof POR_VERSION !== 'undefined' ? String(POR_VERSION) : 'not found';
+  out.push('28_Plan_Of_Record live: ' + por + (por === '1.0.1' ? ' (ok)' :
+      ' -> PASTE 28_Plan_Of_Record 1.0.1 FROM GITHUB MAIN, Save, then run this again'));
+  var dp2 = typeof DP2_VERSION !== 'undefined' ? String(DP2_VERSION) : 'not found';
+  out.push('27_Decision_Pages_v2 live: ' + dp2 + (dp2 === '1.2.34' ? ' (ok)' :
+      ' -> PASTE 27_Decision_Pages_v2 1.2.34 FROM GITHUB MAIN, Save, then run this again'));
+  if (typeof tfbDecisionChainStatus === 'function') {
+    try {
+      out.push('decision chain: ' + tfbDecisionChainStatus());
+    } catch (e1) {
+      out.push('tfbDecisionChainStatus error: ' + String(e1 && e1.message ? e1.message : e1).slice(0, 200));
+    }
+  }
+  out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function tfbPtSecretKey_(k) {
+  return /TOKEN|SECRET|PASSWORD|API_?KEY/i.test(String(k || ''));
+}
+
+function tfbSetAnyProperty() {
+  var k = String(TFB_PT_SET_KEY || '').replace(/^\s+|\s+$/g, '');
+  var v = String(TFB_PT_SET_VALUE === null || TFB_PT_SET_VALUE === undefined ? '' : TFB_PT_SET_VALUE);
+  if (!k) { Logger.log('Type the key in TFB_PT_SET_KEY (top of this file), Save, then Run again.'); return 'no key'; }
+  if (tfbPtSecretKey_(k)) {
+    Logger.log('Refused: ' + k + ' looks like a secret. Do not put secrets in code.');
+    return 'refused';
+  }
+  var p = PropertiesService.getScriptProperties();
+  var before = p.getProperty(k);
+  p.setProperty(k, v);
+  var msg = 'SET ' + k + ' = ' + p.getProperty(k) + ' (was ' + (before === null ? 'absent' : before) + ')';
+  Logger.log(msg);
+  return msg;
+}
+
+function tfbGetAnyProperty() {
+  var k = String(TFB_PT_SET_KEY || '').replace(/^\s+|\s+$/g, '');
+  if (!k) { Logger.log('Type the key in TFB_PT_SET_KEY (top of this file), Save, then Run again.'); return 'no key'; }
+  var v = PropertiesService.getScriptProperties().getProperty(k);
+  var msg = k + ' = ' + (v === null ? '(absent)' : tfbPtSecretKey_(k) ? '(' + String(v).length + ' chars, hidden)' : v);
+  Logger.log(msg);
+  return msg;
+}
+
+function tfbPropsEarlyT10On() {
+  PropertiesService.getScriptProperties().setProperty('TFB_DECISION_CHAIN_EARLY_T10', 'on');
+  Logger.log('TFB_DECISION_CHAIN_EARLY_T10=' +
+      PropertiesService.getScriptProperties().getProperty('TFB_DECISION_CHAIN_EARLY_T10') +
+      ' | now run tfbDecisionChainStatus (expect: early_t10=on)');
+}
 
 var TFB_PT_STALE = [
   'DT10_RESET_PENDING',                          // half-armed stability reset of 2 Nov 13:36; it expired after 2 min
@@ -31,15 +153,6 @@ var TFB_PT_STALE = [
   'TFB_SYNC_DISPATCH_LAST_EVENT',                // 30 Sep failed-dispatch record (diagnostic only)
   'TFB_GH_DISPATCH_TOKEN'                        // empty value; deleted only while empty
 ];
-
-function tfbDoAll() {
-  tfbPropsCleanStale();
-  tfbPropsPorObserve();
-  var t = typeof porInstallTrigger === 'function' ? porInstallTrigger() :
-      'porInstallTrigger not found: paste 28_Plan_Of_Record first, then run tfbDoAll again';
-  Logger.log(t);
-  if (typeof porSelfTest === 'function') porSelfTest();
-}
 
 function tfbPropsPorObserve() {
   var p = PropertiesService.getScriptProperties();
@@ -57,6 +170,12 @@ function tfbPropsPorOn() {
 function tfbPropsPorSession() {
   PropertiesService.getScriptProperties().setProperty('POR_VALIDITY', 'session');
   Logger.log('POR_VALIDITY=session');
+}
+
+function tfbPropsExitSanityOn() {
+  PropertiesService.getScriptProperties().setProperty('DP2_EXIT_SANITY', 'on');
+  Logger.log('DP2_EXIT_SANITY=' + PropertiesService.getScriptProperties().getProperty('DP2_EXIT_SANITY') +
+      ' | now run dp2SelfTest (expect: exit sanity (DP2_EXIT_SANITY): on . core ok)');
 }
 
 function tfbPropsCleanStale() {

@@ -1,7 +1,53 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.32 (2026-11-03)
+ * Version: 1.2.34 (2026-11-05)
+ *   1.2.34: THE SECOND PAGE IS NEVER STARVED AND A STOPPED RENDER IS NAMED (owner review, Thu 5 Nov 2026 01:48 Riyadh):
+ *           Top_10_Investments_v2 still read 'Status: Last run 2026-11-05 00:03:55 | status: running...' at 01:48. The
+ *           hourly buildDecisionPagesV2 always built Portfolio_Decision_v2 first and skipped this page whenever that
+ *           one alone used DP2X.RUN_SOFT_LIMIT_MS (about 329 s on 4 Nov), so the page kept the snapshot it took while a
+ *           cockpit render was running - a render Apps Script then stopped at its 6-minute limit. The same hourly
+ *           build ran beside the decision chain's renders and the Plan of Record refresh, the contention that stopped
+ *           the Top_10 renders of sync run 41901407829. Script Property TFB_RENDER_PRIORITY (default OFF; 1 / on /
+ *           true / yes; shared with 26_Decision_Chain 1.0.5 and 28_Plan_Of_Record 1.0.1), gate on:
+ *           (a) buildDecisionPagesV2 yields - writes no page, returns {yielded: true} - while a Top_10 /
+ *               Portfolio_Decision render runs (the cockpit marker DT10_RUN_MARKER or the decision chain claim is
+ *               younger than 7 minutes);
+ *           (b) it builds the page built longest ago first (Script Property DP2_LAST_BUILT {pd, t10}, epoch ms; a page
+ *               never stamped counts as oldest; no stamps keep the v1.2.33 order) and the other only inside
+ *               RUN_SOFT_LIMIT_MS; a page that throws is stamped too, the other page is still built and the first
+ *               error is rethrown, so one failing page cannot starve the other; a short (six-month) fetch for a
+ *               seat keeps the older cached bars of the same symbol (dp2RpKeepOlder_), so building Top_10 first never
+ *               truncates the history a holding's exit replay needs, and a cached entry is no longer cut to
+ *               KEEP_BARS at every cache write (dp2RpKeepLengths_; Codex P2 on PR #920);
+ *           (c) Top_10_Investments_v2 prints its own build time and, when the cockpit status it copies reads
+ *               'running', says whether that render is in progress (started under 7 minutes ago) or did not finish.
+ *           Gate off: one property read per execution and nothing else - every page, cell, call, toast and return
+ *           value of v1.2.33. No gate, verdict, ticket, sizing, alert, order or broker call changes. Rollback:
+ *           TFB_RENDER_PRIORITY off (all three files) or Project History -> 1.2.33 (this file only).
+ *   1.2.33: AN EXIT SIGNAL NEEDS THE LOT'S OWN PRICES (owner portfolio, Tue 3 Nov 2026 16:15 Riyadh, dp2ExitStatus:
+ *           'SUPN.US . SELL NOW -- stop 38.32 hit . last 36.28 . dyn stop 38.32 . high 41.92'). IBKR moved the 95 INDV
+ *           shares (bought 2 Nov at 35.45) to the new contract SUPN (Supernus Inc) and the ledger row was renamed
+ *           SUPN.US, but the chart key SUPN and the feed's SUPN.US still carried the OLD Supernus Pharmaceuticals line
+ *           (41.92 on 2 Nov). The replay took that line's 2 Nov close as the highest close since the entry, its 2 x ATR
+ *           trail (38.32) as the stop and the price of the shares actually held (36.28) as the last: STOP_HIT, an
+ *           immediate SELL NOW e-mail once the alerts are on. The same day the shares went ex-dividend 8.13 USD (a
+ *           special, about 22 % of the price): even a correct history would have read the ex-dividend price (30.00
+ *           pre-market) as a stop hit. Now, with Script Property DP2_EXIT_SANITY = 1 / on / true / yes (default OFF:
+ *           absent, blank or any other word = the 1.2.32 engine byte for byte), on Portfolio_Decision_v2:
+ *           (a) dp2ExitAnchorMiss_ (pure): the first bar on or after the lot's entry date (within 5 days) must hold the
+ *           entry price inside its low-high range widened by 8 %. A history of another listing (a ticker change),
+ *           another unit (GBp vs GBP) or a split the ledger does not carry fails: the lot gets no exit signal and no
+ *           alert ('HOLD -- exit engine n/a'), its engine cell says why and a CHECK action names the bar and the entry.
+ *           (b) dp2ExitDivAdjust_ (pure): cash dividends inside the history are back-adjusted (every bar before an
+ *           ex-date x (1 - amount / the cum-dividend close), the entry too when the lot was bought before the
+ *           ex-date), so an ex-dividend gap is not a fall and the stop stays in today's price terms. The amounts come
+ *           from the chart's own dividend events (the Yahoo request adds events=div) and, for an ex-date the chart
+ *           does not list yet, from the Dividend_Events row of the same symbol in the quote's own currency
+ *           (calendar_sync TFB_CAL_DIVIDENDS). The engine cell names each adjustment ('dividend-adjusted (8.13 ex
+ *           2026-11-03)'). dp2SelfTest adds one line while the gate is on. Nothing else changes: no number on the
+ *           board, no gate, ticket, order or broker call. Rollback: delete DP2_EXIT_SANITY, or Project History ->
+ *           1.2.32.
  *   1.2.32: A PREVIEW READS AS A PREVIEW (owner, Tue 3 Nov 2026 12:14 Riyadh: 'my top 10 investment page 2 showing that
  *           there is cash allocated to symbols but the page at top showing red no execution'). On 3 Nov the release of
  *           run 41566014627 was withdrawn at 10:08 and the cockpit finished WITHHELD (Executable 0); Top_10_Investments_v2
@@ -320,7 +366,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.32';   // lockstep with the header
+var DP2_VERSION = '1.2.34';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -425,6 +471,150 @@ var DP2X_MEMO_ = {};
 var DP2_RUN_T0_ = 0;
 function dp2RunStart_() { if (!DP2_RUN_T0_) DP2_RUN_T0_ = new Date().getTime(); return DP2_RUN_T0_; }
 function dp2RunElapsed_() { return DP2_RUN_T0_ ? new Date().getTime() - DP2_RUN_T0_ : 0; }
+/* v1.2.34 [RENDER-PRIORITY]: Script Property TFB_RENDER_PRIORITY (default OFF; 1 / on / true / yes, any case), read once
+ * per execution; shared with 26_Decision_Chain 1.0.5 and 28_Plan_Of_Record 1.0.1. */
+var DP2_RP_PROP_ = 'TFB_RENDER_PRIORITY';
+var DP2_RP_BUILT_PROP_ = 'DP2_LAST_BUILT';
+var DP2_RP_BUSY_MIN_ = 7;   // a render older than this was stopped (the 6-minute limit + skew); the window of 26_ / 28_
+var DP2_RP_MEMO_ = null;
+function dp2RpOnCore_(raw) {
+  var v = String(raw === null || raw === undefined ? '' : raw).replace(/^\s+|\s+$/g, '').toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+}
+function dp2RpOn_() {
+  if (DP2_RP_MEMO_ === null) {
+    var raw = '';
+    try { raw = PropertiesService.getScriptProperties().getProperty(DP2_RP_PROP_); } catch (e) { raw = ''; }
+    DP2_RP_MEMO_ = dp2RpOnCore_(raw);
+  }
+  return DP2_RP_MEMO_;
+}
+/* PURE: a Top_10 / Portfolio_Decision render is running - the cockpit marker {started} (or a bare timestamp) or the
+ * decision chain claim {claim: {at_ms}} is younger than DP2_RP_BUSY_MIN_ minutes. Never throws. */
+function dp2RpBusyCore_(markerRaw, stateRaw, nowMs) {
+  var lim = DP2_RP_BUSY_MIN_ * 60000;
+  try {
+    var m = String(markerRaw || '').replace(/^\s+|\s+$/g, '');
+    if (m) {
+      var started = m;
+      try { var o = JSON.parse(m); if (o && o.started) started = String(o.started); } catch (eJ) {}
+      var ms = Date.parse(started);
+      if (isFinite(ms) && nowMs - ms >= 0 && nowMs - ms < lim) return true;
+    }
+  } catch (eM) {}
+  try {
+    var st = JSON.parse(String(stateRaw || ''));
+    var c = st && st.claim;
+    if (c && typeof c.at_ms === 'number' && nowMs - c.at_ms >= 0 && nowMs - c.at_ms < lim) return true;
+  } catch (eS) {}
+  return false;
+}
+function dp2RpBusy_(nowMs) {
+  try {
+    var p = PropertiesService.getScriptProperties();
+    return dp2RpBusyCore_(p.getProperty('DT10_RUN_MARKER'), p.getProperty('TFB_DECISION_CHAIN_STATE'), nowMs);
+  } catch (e) { return false; }
+}
+/* PURE: the page built longest ago goes first ('pd' | 't10'); a page never stamped counts as oldest; no stamps (or a
+ * tie) keep the v1.2.33 order, Portfolio_Decision_v2 first. */
+function dp2RpOrderCore_(builtRaw) {
+  var b = null;
+  try { b = JSON.parse(String(builtRaw || '')); } catch (e) { b = null; }
+  if (!b || typeof b !== 'object') return ['pd', 't10'];
+  var pd = typeof b.pd === 'number' ? b.pd : 0, t10 = typeof b.t10 === 'number' ? b.t10 : 0;
+  return t10 < pd ? ['t10', 'pd'] : ['pd', 't10'];
+}
+function dp2RpStamp_(page, nowMs) {
+  try {
+    var p = PropertiesService.getScriptProperties(), b = null;
+    try { b = JSON.parse(String(p.getProperty(DP2_RP_BUILT_PROP_) || '')); } catch (eJ) { b = null; }
+    if (!b || typeof b !== 'object') b = {};
+    b[page] = nowMs;
+    p.setProperty(DP2_RP_BUILT_PROP_, JSON.stringify(b));
+  } catch (e) {}
+}
+/* PURE: the note for a copied cockpit status whose state reads 'running' ('' otherwise). lastRun is that line's
+ * 'Last run yyyy-MM-dd HH:mm:ss' (Riyadh), which a running render stamps with its start. */
+function dp2RpRunningNoteCore_(status, lastRun, nowMs) {
+  var s = /\|\s*status:\s*([A-Za-z_]+)/.exec(String(status || ''));
+  if (!s || s[1].toLowerCase() !== 'running') return '';
+  var m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(lastRun || ''));
+  var age = m ? (nowMs - Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5], +(m[6] || 0))) / 60000 : null;
+  var at = m ? ' started ' + m[4] + ':' + m[5] : '';
+  if (age !== null && age < DP2_RP_BUSY_MIN_) return 'a cockpit render' + at + ' is in progress; until it finishes, read the seats below as the previous render\'s';
+  return 'the cockpit render' + at + ' did not finish (Apps Script stops an execution at 6 minutes; it wrote no receipt); read the seats below as the previous render\'s until the cockpit shows a finished run';
+}
+/* v1.2.34 [RENDER-PRIORITY] (gate on): yield while a decision render runs; otherwise the page built longest ago first. */
+function dp2RpBuildBoth_(ss, t0) {
+  if (dp2RpBusy_(new Date().getTime())) {
+    var ym = 'Decision Pages v2 yielded: a Top_10 / Portfolio_Decision render is running (TFB_RENDER_PRIORITY); both pages are rebuilt at the next hourly run';
+    try { Logger.log(ym); } catch (eL) {}
+    try { ss.toast(ym, 'Decision Pages v2 ' + DP2_VERSION, 8); } catch (eT) {}
+    return { ok: true, yielded: true, ms: Date.now() - t0 };
+  }
+  var order = dp2RpOrderCore_(dp2Prop_(DP2_RP_BUILT_PROP_));
+  var res = { pd: null, t10: null }, skipped = '', firstErr = null;
+  for (var i = 0; i < order.length; i++) {
+    var page = order[i];
+    if (i > 0 && dp2RunElapsed_() > DP2X.RUN_SOFT_LIMIT_MS) { res[page] = { rows: 0, skipped: true }; skipped = page; continue; }
+    try { res[page] = page === 'pd' ? buildPortfolioDecisionV2() : buildTop10V2(); }
+    catch (eB) { res[page] = { rows: 0, error: String(eB && eB.message || eB) }; if (!firstErr) firstErr = eB; }
+    dp2RpStamp_(page, new Date().getTime());
+  }
+  var name = function (p) { return p === 'pd' ? DP2.SHEET_PD : DP2.SHEET_T10; };
+  var part = function (p) {
+    var r = res[p];
+    if (r.skipped) return name(p) + ' NOT rebuilt (the first page used ' + Math.round(dp2RunElapsed_() / 1000) + ' s of the 6-minute limit; it goes first at the next hourly run)';
+    if (r.error) return name(p) + ' FAILED (' + r.error + ')';
+    return name(p) + ' (' + r.rows + ' rows)';
+  };
+  var msg = 'Decision Pages v2 built in ' + Math.round((Date.now() - t0) / 1000) + 's - ' + part(order[0]) + ' \u00b7 ' + part(order[1]);
+  try { dp2EnsureStaleFlags_(); } catch (eF) { Logger.log('stale-row flags skipped: ' + eF); }
+  try { ss.toast(msg, 'Decision Pages v2 ' + DP2_VERSION, skipped || firstErr ? 20 : 8); } catch (e) {}
+  if (firstErr) throw firstErr;
+  return { ok: true, pd: res.pd, t10: res.t10, ms: Date.now() - t0, order: order.join(',') };
+}
+/* PURE (v1.2.34, gate on): a fresh series that starts after the cached one keeps the cached bars before its first
+ * date, capped at the longer of the two, so a six-month fetch for a Top_10 seat that is also a holding (Top_10 may now
+ * be built first) never truncates the longer history the holding's exit replay needs; the fresh bars win from their
+ * first date on. Codex P2 on PR #920. Returns fresh itself when there is nothing older to keep. Never throws. */
+function dp2RpKeepOlder_(cached, fresh) {
+  try {
+    if (!cached || !cached.bars || !cached.bars.length || !fresh || !fresh.bars || !fresh.bars.length) return fresh;
+    var first = fresh.bars[0].date, older = [];
+    for (var i = 0; i < cached.bars.length; i++) if (cached.bars[i].date < first) older.push(cached.bars[i]);
+    if (!older.length) return fresh;
+    var o = {};
+    for (var k in fresh) if (fresh.hasOwnProperty(k)) o[k] = fresh[k];
+    var cap = Math.max(cached.bars.length, fresh.bars.length);
+    o.bars = older.concat(fresh.bars);
+    if (o.bars.length > cap) o.bars = o.bars.slice(o.bars.length - cap);
+    o.keep = Math.max(fresh.keep || 0, o.bars.length);   // the cache writer keeps max(KEEP_BARS, keep) bars
+    return o;
+  } catch (e) { return fresh; }
+}
+/* (v1.2.34, gate on): the cache writer keeps max(KEEP_BARS, keep) bars per entry, and an entry read back from the sheet
+ * carries no keep, so every write cut it to KEEP_BARS (130) - the history a holding fetched with a wider range was lost
+ * at the next write. Each cached entry keeps the bars it holds (the writer still caps at KEEP_BARS_MAX). */
+function dp2RpKeepLengths_(cache) {
+  try { for (var k in cache) if (cache.hasOwnProperty(k) && cache[k] && cache[k].bars) cache[k].keep = Math.max(cache[k].keep || 0, cache[k].bars.length); } catch (e) {}
+  return cache;
+}
+/* v1.2.34: the dp2SelfTest line while the gate is on - the three PURE rules on fixed inputs. */
+function dp2RpCoreOk_() {
+  try {
+    var now = Date.UTC(2026, 10, 5, 0, 0, 0);   // 03:00 Riyadh
+    var iso = function (minAgo) { return new Date(now - minAgo * 60000).toISOString(); };
+    var busy = dp2RpBusyCore_(JSON.stringify({ started: iso(2) }), '', now) && dp2RpBusyCore_('', JSON.stringify({ claim: { at_ms: now - 60000 } }), now) &&
+               !dp2RpBusyCore_(JSON.stringify({ started: iso(9) }), JSON.stringify({ claim: { at_ms: now - 8 * 60000 } }), now) && !dp2RpBusyCore_('junk', 'junk', now);
+    var ord = dp2RpOrderCore_('').join(',') === 'pd,t10' && dp2RpOrderCore_(JSON.stringify({ pd: 5, t10: 3 })).join(',') === 't10,pd' &&
+              dp2RpOrderCore_(JSON.stringify({ pd: 5 })).join(',') === 't10,pd' && dp2RpOrderCore_(JSON.stringify({ pd: 3, t10: 5 })).join(',') === 'pd,t10';
+    var run = function (hm) { return dp2RpRunningNoteCore_('Last run 2026-11-05 ' + hm + ' | status: running\u2026', '2026-11-05 ' + hm, now); };
+    var note = /did not finish/.test(run('02:40:00')) && /in progress/.test(run('02:58:00')) &&
+               dp2RpRunningNoteCore_('Last run 2026-11-05 02:40:00 | status: OK | output: WITHHELD', '2026-11-05 02:40:00', now) === '';
+    return busy && ord && note;
+  } catch (e) { return false; }
+}
 /* v1.2.23: NON-BLOCKING notices. Ui.alert waits for OK — run from the script editor, the box opens in the spreadsheet
  * tab and the execution sits there until the 6-minute limit. A modeless dialog returns at once; without a UI (time
  * trigger) the notice goes to a toast, and always to the execution log. */
@@ -457,6 +647,7 @@ function buildDecisionPagesV2() {
   var t0 = dp2RunStart_();
   var ss = SpreadsheetApp.getActive();
   DP2X_MEMO_ = {};
+  if (dp2RpOn_()) return dp2RpBuildBoth_(ss, t0);   // v1.2.34 [RENDER-PRIORITY] (gate on only)
   // v1.2.1: a refresh never seeds the _IBKR_* tabs — missing broker inputs are reported as unknown (menu: Seed IBKR Tabs)
   var pd = buildPortfolioDecisionV2();
   // v1.2.23: never start the second page this close to the 6-minute limit — it is refreshed on its own instead
@@ -1457,6 +1648,7 @@ function dp2RangeFor_(sinceDate) {
 }
 function dp2FetchYahoo_(key, range) {
   var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(key) + '?interval=1d&range=' + (range || DP2X.RANGE) + '&includePrePost=false';
+  if (dp2ExitSanityOn_()) url += '&events=div';   // v1.2.33 [EXIT-SANITY]: the chart's own dividend events (gate on only)
   var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TFB-DecisionPages/' + DP2_VERSION + ')', 'Accept': 'application/json' } });
   var code = resp.getResponseCode();
   if (code !== 200) throw new Error('yahoo HTTP ' + code);
@@ -1472,7 +1664,9 @@ function dp2FetchYahoo_(key, range) {
     bars.push({ date: Utilities.formatDate(new Date(r.timestamp[i] * 1000), tz, 'yyyy-MM-dd'), o: (o === null || o === undefined) ? c : o, h: h, l: l, c: c });
   }
   if (!bars.length) throw new Error('yahoo: empty series');
-  return { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };
+  var outY = { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };
+  if (dp2ExitSanityOn_()) outY.divs = dp2YahooDivs_(r, tz);   // v1.2.33 [EXIT-SANITY] (gate on only)
+  return outY;
 }
 function dp2FetchStooq_(key, keep) {
   var url = 'https://stooq.com/q/d/l/?s=' + encodeURIComponent(key.toLowerCase() + '.us') + '&i=d';
@@ -1568,7 +1762,8 @@ function dp2LoadBars_(symbols, sinceDate) {
   }
   if (changed) {
     if (cache === null) cache = dp2BarsCacheRead_();
-    for (var s in out) if (out.hasOwnProperty(s) && !out[s].stale) cache[s] = out[s];
+    if (dp2RpOn_()) dp2RpKeepLengths_(cache);   // v1.2.34 (gate on only): no cached entry is cut below the bars it holds
+    for (var s in out) if (out.hasOwnProperty(s) && !out[s].stale) cache[s] = dp2RpOn_() ? dp2RpKeepOlder_(cache[s], out[s]) : out[s];   // v1.2.34 (gate on only)
     try { dp2BarsCacheWrite_(cache); } catch (e3) {}
   }
   return out;
@@ -1690,6 +1885,151 @@ function dp2EngineNaWhy_(xb, entryDate) {
   if (entryDate && xb.bars[0].date > entryDate) return 'exit engine n/a — history starts ' + xb.bars[0].date + ', after the entry ' + entryDate + ' (fetched ' + (xb.range || DP2X.RANGE) + '); widen the range or check the entry date';
   if (xb.bars.length < DP2X.ATR_N + 1) return 'exit engine n/a — only ' + xb.bars.length + ' bars';
   return 'exit engine n/a';
+}
+/* ========================================================= v1.2.33 [EXIT-SANITY]: the lot's own prices, dividends */
+var DP2_EXIT_SANITY_PROP = 'DP2_EXIT_SANITY';   // 1 / on / true / yes = on; default OFF (the 1.2.32 engine)
+var DP2_EXIT_ANCHOR_PCT = 8;                    // the entry may sit at most 8 % outside the entry day's low-high range
+var DP2_EXIT_ANCHOR_GAP_D = 5;                  // a first bar more than 5 days after the entry cannot judge the fill
+var DP2_EXIT_DIV_MAX = 0.6;                     // a distribution above 60 % of the close before it is not adjusted
+var DP2_EXIT_DIV_NEAR_D = 3;                    // a tab ex-date within 3 days of a chart dividend is that dividend
+var DP2_DIVIDEND_SHEET = 'Dividend_Events';     // calendar_sync TFB_CAL_DIVIDENDS (the 16_Decision_Top10 guard's tab)
+var DP2_EXIT_SUBUNIT_ = { GBp: true, GBX: true, ZAc: true, ZAC: true, ILA: true, ILa: true };   // quote units the upper-cased tab cannot match
+var DP2X_SAN_ = null;                           // the gate, read once per execution
+function dp2ExitSanityOn_() {
+  if (DP2X_SAN_ === null) DP2X_SAN_ = /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_EXIT_SANITY_PROP)).trim());
+  return DP2X_SAN_;
+}
+function dp2DayMs_(d) { return new Date(String(d) + 'T00:00:00Z').getTime(); }
+/* PURE: does this history belong to the lot? The first bar on or after the entry date (within DP2_EXIT_ANCHOR_GAP_D
+ * days) must hold the entry price inside its low-high range widened by DP2_EXIT_ANCHOR_PCT %. A history of another
+ * listing (3 Nov: SUPN charted the old Supernus line at 41.92 for a lot bought at 35.45), another unit or a split the
+ * ledger does not carry fails. -> null (it matches, or it cannot be judged) | { date, low, high, close, entry, pct } */
+function dp2ExitAnchorMiss_(bars, entry, entryDate) {
+  if (!bars || !bars.length || !(entry > 0) || !entryDate) return null;
+  var b = null;
+  for (var i = 0; i < bars.length; i++) { if (bars[i].date >= entryDate) { b = bars[i]; break; } }
+  if (!b) return null;
+  var gap = (dp2DayMs_(b.date) - dp2DayMs_(entryDate)) / 86400000;
+  if (!(gap >= 0) || gap > DP2_EXIT_ANCHOR_GAP_D) return null;
+  var lo = Math.min(b.l, b.o, b.c), hi = Math.max(b.h, b.o, b.c);
+  if (!(lo > 0) || !(hi >= lo)) return null;
+  var tol = DP2_EXIT_ANCHOR_PCT / 100;
+  if (entry >= lo * (1 - tol) && entry <= hi * (1 + tol)) return null;
+  return { date: b.date, low: lo, high: hi, close: b.c, entry: entry, pct: (b.c / entry - 1) * 100 };
+}
+function dp2ExitAnchorWhy_(m) {
+  return 'exit engine n/a \u2014 the price history does not match this lot: the ' + m.date + ' bar (low ' + dp2Fmt_(m.low, 2) + ', high ' + dp2Fmt_(m.high, 2) + ', close ' + dp2Fmt_(m.close, 2) + ') is ' + dp2Pct_(m.pct, 1) + ' from the entry ' + dp2Fmt_(m.entry, 2) + ' (a ticker change, another listing, another unit or a split); check the symbol';
+}
+/* Yahoo chart events.dividends -> [{ date 'yyyy-MM-dd' (exchange zone), amount, source }] sorted by date. */
+function dp2YahooDivs_(r, tz) {
+  var out = [], ev = r && r.events && r.events.dividends;
+  if (!ev || typeof ev !== 'object') return out;
+  for (var k in ev) {
+    if (!Object.prototype.hasOwnProperty.call(ev, k)) continue;
+    var d = ev[k] || {}, amt = dp2Num_(d.amount), ts = dp2Num_(d.date !== undefined ? d.date : k);
+    if (amt === null || !(amt > 0) || ts === null || !(ts > 0)) continue;
+    out.push({ date: Utilities.formatDate(new Date(ts * 1000), tz, 'yyyy-MM-dd'), amount: amt, source: 'chart' });
+  }
+  out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  return out;
+}
+/* PURE: Dividend_Events values -> { SYMBOL: { date 'yyyy-MM-dd', amount, currency } }: the header row is found by
+ * name (Symbol, Ex-Div Date, Amount, Currency), the first row per symbol counts. */
+function dp2DivTabFromValues_(vals) {
+  var out = {}, hdr = -1, iS = -1, iD = -1, iA = -1, iC = -1, r, c, h;
+  vals = vals || [];
+  for (r = 0; r < vals.length && hdr < 0; r++) {
+    var s0 = -1, d0 = -1, a0 = -1, c0 = -1;
+    for (c = 0; c < (vals[r] || []).length; c++) {
+      h = dp2Str_(vals[r][c]).toLowerCase().replace(/[^a-z]/g, '');
+      if (h === 'symbol') s0 = c; else if (h === 'exdivdate') d0 = c; else if (h === 'amount') a0 = c; else if (h === 'currency') c0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0 && a0 >= 0) { hdr = r; iS = s0; iD = d0; iA = a0; iC = c0; }
+  }
+  if (hdr < 0) return out;
+  for (r = hdr + 1; r < vals.length; r++) {
+    var row = vals[r] || [], sym = dp2Str_(row[iS]).trim().toUpperCase();
+    if (!sym || Object.prototype.hasOwnProperty.call(out, sym)) continue;
+    var date = dp2DateStr_(row[iD]), amt = dp2Num_(row[iA]);
+    if (!date || amt === null || !(amt > 0)) continue;
+    out[sym] = { date: date, amount: amt, currency: iC >= 0 ? dp2Str_(row[iC]).trim().toUpperCase() : '' };
+  }
+  return out;
+}
+/* Dividend_Events read once per Portfolio_Decision_v2 build; any failure or an absent tab -> {} (no fallback). */
+function dp2DivTab_() {
+  try {
+    var sh = dp2Sheet_(DP2_DIVIDEND_SHEET, false);
+    if (!sh || sh.getLastRow() < 2) return {};
+    return dp2DivTabFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), 2000), Math.min(Math.max(sh.getLastColumn(), 1), 12)).getValues());
+  } catch (e) { return {}; }
+}
+/* PURE: the dividends to adjust one lot's history by: the chart's own (xb.divs) first; the Dividend_Events row of the
+ * same symbol fills an ex-date the chart does not list yet (none within DP2_EXIT_DIV_NEAR_D days of it), once it has
+ * arrived (<= today) and only in the quote's own currency (a subunit quote never matches the upper-cased tab). */
+function dp2ExitDivsFor_(xb, sym, tab, today) {
+  var out = (xb && xb.divs) ? xb.divs.slice() : [];
+  var t = tab ? tab[dp2Str_(sym).trim().toUpperCase()] : null;
+  var ccy = xb ? dp2Str_(xb.ccy) : '';
+  if (t && t.date && today && t.date <= today && ccy && !DP2_EXIT_SUBUNIT_.hasOwnProperty(ccy) && t.currency === ccy.toUpperCase()) {
+    var near = false;
+    for (var i = 0; i < out.length; i++) { if (Math.abs(dp2DayMs_(out[i].date) - dp2DayMs_(t.date)) <= DP2_EXIT_DIV_NEAR_D * 86400000) near = true; }
+    if (!near) out.push({ date: t.date, amount: t.amount, source: 'Dividend_Events' });
+  }
+  out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+  return out;
+}
+/* PURE: back-adjusts a daily history for cash dividends (total-return view). Every bar BEFORE an ex-date is scaled by
+ * f = 1 - amount / the cum-dividend close (the bar before the ex-date; the last bar when the ex-date has arrived but
+ * its bar has not), and the entry by the same f when the lot was bought before the ex-date, so an ex-dividend gap is
+ * not a fall and the stop stays in today's price terms. A dividend with no bar before it, or above DP2_EXIT_DIV_MAX
+ * of that close, is skipped. -> { bars, entry, applied: [{ date, amount, factor, source }] }; none applied = the input. */
+function dp2ExitDivAdjust_(bars, entry, entryDate, divs, today) {
+  var n = bars ? bars.length : 0, applied = [], f = [], entryF = 1, i, j;
+  if (!n || !divs || !divs.length) return { bars: bars, entry: entry, applied: applied };
+  for (i = 0; i < n; i++) f.push(1);
+  for (j = 0; j < divs.length; j++) {
+    var d = divs[j], k = -1;
+    if (!d || !d.date || !(d.amount > 0)) continue;
+    for (i = 0; i < n; i++) { if (bars[i].date >= d.date) { k = i; break; } }
+    if (k < 0) { if (today && d.date <= today) k = n; else continue; }
+    if (k === 0) continue;
+    var prev = bars[k - 1].c;
+    if (!(prev > 0) || d.amount / prev > DP2_EXIT_DIV_MAX) continue;
+    var fac = 1 - d.amount / prev;
+    for (i = 0; i < k; i++) f[i] *= fac;
+    if (entryDate ? d.date > entryDate : k === n) entryF *= fac;
+    applied.push({ date: d.date, amount: d.amount, factor: fac, source: d.source || '' });
+  }
+  if (!applied.length) return { bars: bars, entry: entry, applied: applied };
+  var out = [];
+  for (i = 0; i < n; i++) { var b = bars[i], m = f[i]; out.push(m === 1 ? b : { date: b.date, o: b.o * m, h: b.h * m, l: b.l * m, c: b.c * m }); }
+  return { bars: out, entry: entry * entryF, applied: applied };
+}
+/* The dp2SelfTest core (pure): the 3 Nov shape (a history of another listing), a GBp history for a GBP entry, and the
+ * 8.13 USD ex-dividend gap (the raw replay reads it as a stop hit, the adjusted one does not; also before its bar). */
+function dp2ExitSanityCoreOk_() {
+  try {
+    var mk = function (from, n, base, step) {
+      var out = [], t0 = dp2DayMs_(from);
+      for (var q = 0; q < n; q++) { var c = Math.round((base + (q % 3) * step) * 100) / 100; out.push({ date: new Date(t0 + q * 86400000).toISOString().slice(0, 10), o: c, h: c + 0.5, l: c - 0.5, c: c }); }
+      return out;
+    };
+    var old = mk('2026-10-14', 20, 41.5, 0.2);   // the old listing: 41.5-41.9 through 2 Nov
+    var own = mk('2026-10-14', 20, 35.5, 0.39);  // the shares held: 35.5-36.28 through 2 Nov
+    var okA = dp2ExitAnchorMiss_(old, 35.45, '2026-11-02') !== null && dp2ExitAnchorMiss_(own, 35.45, '2026-11-02') === null &&
+              dp2ExitAnchorMiss_(mk('2026-10-14', 20, 510, 2), 5.10, '2026-11-02') !== null && dp2ExitAnchorMiss_(own, 35.45, '') === null;
+    var ex = own.concat([{ date: '2026-11-03', o: 29.6, h: 30.4, l: 29.4, c: 30.0 }]);
+    var divs = [{ date: '2026-11-03', amount: 8.13, source: 'chart' }];
+    var raw = dp2ExitCompute_(ex, 35.45, '2026-11-02', 30.0);
+    var adj = dp2ExitDivAdjust_(ex, 35.45, '2026-11-02', divs, '2026-11-03');
+    var xa = dp2ExitCompute_(adj.bars, adj.entry, '2026-11-02', 30.0);
+    var pre = dp2ExitDivAdjust_(own, 35.45, '2026-11-02', divs, '2026-11-03');   // the ex-day before its bar
+    var xp = dp2ExitCompute_(pre.bars, pre.entry, '2026-11-02', 30.0);
+    var fut = dp2ExitDivAdjust_(own, 35.45, '2026-11-02', [{ date: '2026-11-06', amount: 0.1 }], '2026-11-03');
+    var okD = !!(raw && raw.last <= raw.stop && adj.applied.length === 1 && xa && xa.last > xa.stop && xp && xp.last > xp.stop && fut.applied.length === 0);
+    return okA && okD;
+  } catch (e) { return false; }
 }
 function dp2RFmt_(r) { return (r === null || r === undefined || isNaN(r)) ? '—' : ((r >= 0 ? '+' : '−') + Math.abs(r).toFixed(1) + 'R'); }
 
@@ -2779,6 +3119,8 @@ function buildPortfolioDecisionV2() {
   var oldestEntry = '';
   for (var oe = 0; oe < eq.length; oe++) { var od = dp2DateStr_(eq[oe].buyDate); if (od && (!oldestEntry || od < oldestEntry)) oldestEntry = od; }
   try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; }), oldestEntry); } catch (eX) { xbars = {}; }   // v1.2.11: history back to the oldest entry
+  // v1.2.33 [EXIT-SANITY]: the gate (read once per execution); the dividend tab and today's date only while it is on
+  var xSan = dp2ExitSanityOn_(), divTab = xSan ? dp2DivTab_() : null, xToday = xSan ? dp2Today_().slice(0, 10) : '';
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
   var alloc = null;
   try {
@@ -2934,6 +3276,16 @@ function buildPortfolioDecisionV2() {
     // actionable alert is issued — the signal is shown and flagged, mailed at most as an advisory.
     var lastOv = (xb && xb.last !== null && !xb.stale) ? xb.last : ((xb && xb.stale && l.price) ? l.price : null);
     var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, lastOv) : null;
+    // v1.2.33 [EXIT-SANITY] (gate on only): a history that is not this lot's gives no signal; a dividend is not a fall
+    var xMiss = null, xDiv = null;
+    if (xSan && xb && xb.bars && xb.bars.length) {
+      xMiss = dp2ExitAnchorMiss_(xb.bars, cost, entryDate);
+      if (xMiss) x = null;
+      else {
+        xDiv = dp2ExitDivAdjust_(xb.bars, cost, entryDate, dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), xToday);
+        if (xDiv.applied.length) x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv); else xDiv = null;
+      }
+    }
     xTotal++;
     if (xb && !xb.stale && x) xFresh++;
     if (xb && xb.source) xSources[xb.source] = true;
@@ -2959,6 +3311,8 @@ function buildPortfolioDecisionV2() {
     var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
                    : (dp2EngineNaWhy_(xb, entryDate) + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
     if (x && x.atrApprox) engTxt += ' · entry ATR approximated (' + x.barsBeforeEntry + ' bars before the entry)';
+    if (xMiss) engTxt = dp2ExitAnchorWhy_(xMiss);   // v1.2.33 [EXIT-SANITY]
+    else if (xDiv && x) engTxt += ' \u00b7 dividend-adjusted (' + xDiv.applied.map(function (a) { return dp2Fmt_(a.amount, 2) + ' ex ' + a.date; }).join(', ') + ')';
     var ostat;
     if (!ib.ordersKnown && br.n > 0) { ostat = 'UNVERIFIED — ' + ib.unknownWhy + ' · last listed: ' + br.statuses.join(', ') + ' → paste a fresh connector read'; }
     else if (br.state === 'working' && posShares && br.stopQty > 0 && br.stopQty < posShares - 1e-9) { ostat = 'working since ' + br.placed + ' — stop covers ' + dp2Fmt_(br.stopQty) + ' of the position\'s ' + dp2Fmt_(posShares) + ' sh (partial' + (lotOfMany ? '; this lot ' + dp2Fmt_(l.shares) + ' sh, covered ' + dp2Fmt_(lotCov || 0) : '') + ')'; }   // v1.2.11/12/13
@@ -2987,6 +3341,7 @@ function buildPortfolioDecisionV2() {
       actions.push({ p: 2, t: l.symbol + ' is ' + dp2Pct_(tpPct, 1) + ' from the broker take-profit ' + dp2Fmt_(br.tp, 2) + '; a fill returns ≈ ' + dp2Fmt_(l.shares * br.tp * lfx) + ' SAR to cash. Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.' });
     }
     if (xb && xb.stale && x) actions.push({ p: 3, t: l.symbol + ' exit engine is running on cached bars (' + dp2Str_(xb.fetched) + '): ' + dp2Str_(xb.error || 'fetch failed').slice(0, 120) + '.' });
+    if (xMiss) actions.push({ p: 1, t: 'CHECK ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitAnchorWhy_(xMiss).replace(/^exit engine n\/a \u2014 /, '') + '. No exit signal or alert is given for this lot until its symbol prices the shares the broker holds.' });   // v1.2.33
     // rotation (switch) advisory — research mirror of the engine's funding plans
     // v1.2.14 (review finding): only the PRODUCTION basis (dp2RotationBasis_) raises a SWITCH action / advisory; the
     // other basis is a research note on the row, never an instruction
@@ -3187,9 +3542,11 @@ function buildTop10V2() {
   dp2ChartsBegin_(DP2.SHEET_CHARTS_T10);
   var row = 1;
   dp2Header_(sh, row, 'TOP 10 INVESTMENTS — DECISION v2', state, chipKind, 'run ' + (feed.run || 'n/a') + ' · epoch ' + (t.epoch || 'n/a') + ' · cockpit ' + (t.lastRun || 'n/a'));
+  if (dp2RpOn_()) { var rpHr = sh.getRange(row, 13); rpHr.setValue(dp2Str_(rpHr.getValues()[0][0]) + ' \u00b7 page built ' + dp2Today_()); }   // v1.2.34 [RENDER-PRIORITY]
   row++;
   dp2Line_(sh, row, (fv.label === 'SYNC RUNNING' || fv.label === 'EXPIRED' || fv.label === 'EXECUTABLE') ? 'Feed: ' + fv.note : 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
-  dp2Line_(sh, row, 'Status: ' + t.status, { size: 8, bg: DP2C.surface, height: 20 }); row++;
+  var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';   // v1.2.34 [RENDER-PRIORITY] (gate on only)
+  dp2Line_(sh, row, 'Status: ' + t.status + (rpNote ? ' \u2014 ' + rpNote : ''), { size: 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
 
@@ -3511,6 +3868,8 @@ function dp2SelfTest() {
   checks.push({ name: 'production configuration: ' + cfgS.summary, ok: true });
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
+  if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
+  if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var probe = null;
   var probeSym = 'SPY';
   for (var li = 0; li < led.lots.length; li++) { if (/\.US$/i.test(led.lots[li].symbol)) { probeSym = led.lots[li].symbol; break; } }

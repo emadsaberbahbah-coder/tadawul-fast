@@ -1,4 +1,5 @@
-"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.2.1
+"""tests/test_board_scorecard_p182.py - scripts/score_selection_log.py v1.2.2
+(P16 v1.2.2 [RAW OUTCOMES]: DETAIL outcome cells at full precision behind TFB_BOARD_SCORECARD_RAW)
 [P-182 BOARD SCORECARD] + [RANKING HEALTH] + [CHALLENGER] + [CHALLENGER INPUTS].
 
 REAL module. The only stub is an in-memory workbook (worksheet /
@@ -1617,6 +1618,60 @@ def main():
     else:
         out.append("SKIP P15 golden negative (git show %s unavailable; set SSL_BASE_V12=<v1.2.0 file>)"
                    % BASE_V12_REV)
+
+    # ------------------------------------------------------------------- P16
+    # v1.2.2 [RAW OUTCOMES] (5 Nov 2026): Looker read 243 / 468 wins at +5 on
+    # the 2-decimal DETAIL cells, the SUMMARY row 246 / 468 on the raw returns.
+    import datetime as _dt
+    def _sc(r5, x5, xr5=None):
+        ep = {"seat_at": _dt.datetime(2026, 10, 20, 9, 30), "seq": 1, "symbol": "SYN.US", "name": "Synthetic",
+              "sector": "Tech", "seat_px": 10.0, "ccy": "USD", "output": "EXECUTABLE", "stability": "OK",
+              "exit_at": None, "exit_kind": "", "days": ["2026-10-20"], "hours": 6.0, "rank_at_seat": 3,
+              "eng_roi_at_seat": 21.4567, "rel_at_seat": 80.123, "conf_at_seat": "High", "ref": "SPUS"}
+        return {"seat_date": "2026-10-20", "ep": ep, "r": {1: 0.12345, 5: r5, 10: None, 20: None},
+                "r_exit": None, "r_now": r5, "x": {5: x5}, "x_now": x5, "status": "OPEN",
+                "xr": {5: xr5}, "xr_now": xr5}
+    near = [0.004, -0.004, 0.0, 0.0049, -0.0049, 1e-9, 2.5, -0.0001, 0.0044]
+    saved_raw = os.environ.pop(m.RAW_ENV, None)
+    try:
+        rows_off = [m.detail_rows([_sc(v, v, v)], ranking=True)[0] for v in near]
+        rows_dflt = [m.detail_rows([_sc(v, v, v)], ranking=True, raw=False)[0] for v in near]
+        T("P16 gate off (unset): DETAIL rows == the 2-decimal v1.2.1 rows", rows_off == rows_dflt
+          and rows_off[0][14] == 0.0 and rows_off[6][14] == 2.5, rows_off[0][13:22])
+        for word in ("on", "ON", " 1 ", "true", "Yes"):
+            os.environ[m.RAW_ENV] = word
+            T("P16 gate spelling %r arms raw outcome cells" % word, m._raw_enabled(), word)
+        for word in ("off", "0", "enable", ""):
+            os.environ[m.RAW_ENV] = word
+            T("P16 gate spelling %r keeps the v1.2.1 rows" % word,
+              not m._raw_enabled() and m.detail_rows([_sc(0.004, 0.004)])[0] == m.detail_rows([_sc(0.004, 0.004)], raw=False)[0], word)
+        os.environ[m.RAW_ENV] = "on"
+        rows_on = [m.detail_rows([_sc(v, v, v)], ranking=True)[0] for v in near]
+        hdr = m.DETAIL_HEADER_RANKING
+        i5, ix5, ixr5 = hdr.index("+5 %"), hdr.index("vs SPUS +5 pp"), hdr.index("vs Ref +5 pp")
+        T("P16 gate on: +5 %, vs SPUS +5 pp and vs Ref +5 pp carry the raw value",
+          [r[i5] for r in rows_on] == [v + 0.0 for v in near] and [r[ix5] for r in rows_on] == [v + 0.0 for v in near]
+          and [r[ixr5] for r in rows_on] == [v + 0.0 for v in near], [r[i5] for r in rows_on])
+        T("P16 gate on: inputs (Engine ROI %, Rel, +1 % rounding of inputs untouched) keep their v1.2.1 form",
+          rows_on[0][hdr.index("Engine ROI %")] == rows_off[0][hdr.index("Engine ROI %")]
+          and rows_on[0][hdr.index("Rel")] == rows_off[0][hdr.index("Rel")]
+          and rows_on[0][hdr.index("Seat Price")] == rows_off[0][hdr.index("Seat Price")], rows_on[0][:13])
+        summary_wins = sum(1 for v in near if v > 0)                          # the SUMMARY rule (raw)
+        view_wins_old = sum(1 for r in rows_off if r[i5] != "" and r[i5] > 0)  # 10_v_board_episodes on 2-decimal cells
+        view_wins_new = sum(1 for r in rows_on if r[i5] != "" and r[i5] > 0)   # the same view on raw cells
+        T("P16 the view's '> 0' on raw cells counts the SUMMARY's wins (old cells disagree on near-zero returns)",
+          view_wins_new == summary_wins == 5 and view_wins_old == 1, (summary_wins, view_wins_old, view_wins_new))
+        T("P16 no -0.0 and absent stays blank", m._rraw(-0.0) == 0.0 and str(m._rraw(-0.0)) == "0.0" and m._rraw(None) == "",
+          (m._rraw(-0.0), m._rraw(None)))
+    finally:
+        if saved_raw is None:
+            os.environ.pop(m.RAW_ENV, None)
+        else:
+            os.environ[m.RAW_ENV] = saved_raw
+    wf = open(os.path.join(os.path.dirname(SSL_FILE), "..", ".github", "workflows", "board_scorecard.yml"),
+              encoding="utf-8").read()
+    T("P16 board_scorecard.yml arms TFB_BOARD_SCORECARD_RAW in the job env", '      TFB_BOARD_SCORECARD_RAW: "on"\n' in wf, "")
+    T("P16 SCRIPT_VERSION 1.2.2", m.SCRIPT_VERSION == "1.2.2", m.SCRIPT_VERSION)
 
     shutil.rmtree(TMP, ignore_errors=True)
     digest = hashlib.sha256(("\n".join(out) + json.dumps(digests)).encode()).hexdigest()[:16]

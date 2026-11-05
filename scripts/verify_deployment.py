@@ -271,7 +271,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # vars.TFB_RELEASE_RENDER_HOLD default off; workflow-scoped, never on Render;
     # 1.3.1 is claimed by open PR #831).
     ("release_decision_feed", "1.4.0", "gated audited decision-feed release (P0-1)"),
-    ("intraday_quote_refresh", "1.0.3", "witnessed partial quote refresh"),
+    ("intraday_quote_refresh", "1.0.4", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
     # 1.0.0 - release_after_sync.yml's read-only wait + one release dispatch
@@ -282,7 +282,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.1.0 -> 1.2.0 (the release's
     # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
     # default strict; workflow-scoped, never on Render).
-    ("await_cockpit_receipts", "1.2.0", "after-sync release dispatch (read-only wait)"),
+    ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
     # 2026-11-03 (pin only): 1.0.3 -> 1.1.0 (the memo binds Shadow_Board columns
     # by header name and shares the shadow_board.yml lane;
     # vars.TFB_WEEKLY_BOARD_PARITY, default off; workflow-scoped, never on Render).
