@@ -57,9 +57,24 @@ const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 // tests/js/pd_edits_v1519.json reversed, SHA-256 pinned).
 const NV = (newSource.match(/^var PD_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1] || '?';
 const V1518_SHA = '62b15eaa5eda541b867cd5fd667b71bbcd15c53732a730636ce0056d70f7f973';   // v1.5.18 (origin/main 8478029d)
+/* merge note 2026-11-03 (#780): panel preserve is v1.5.20 over #908's v1.5.19 (PD_PANEL_PRESERVE, default off;
+ * tests/js/pf_panel_preserve.test.js). A delivered file above v1.5.19 is first rebuilt into the v1.5.19 file (the
+ * v1.5.20 hunks of tests/js/pd_edits_v1520.json reversed, SHA-256 pinned), then into v1.5.18 as above, so the
+ * V1518_SHA pin, T0 and T9 are unchanged; behaviour still runs on the delivered file. */
+const V1519_SHA = '4f246be194a7ce5ade7a53e56381c19b44c20055608e33979584e47aeccfe584';   // v1.5.19 (origin/main 3e326e26)
+function v1519Of(src) {
+  if (/^var PD_VERSION = '1\.5\.19';$/m.test(src)) return src;
+  let out = src;
+  for (const [cur, prev] of JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1520.json'), 'utf8'))) {
+    if (out.split(cur).length !== 2) return null;
+    out = out.replace(cur, () => prev);
+  }
+  return sha256(out) === V1519_SHA ? out : null;
+}
 function v1518Of(src) {
   if (/^var PD_VERSION = '1\.5\.18';$/m.test(src)) return src;
-  let out = src;
+  let out = v1519Of(src);   // merge note 2026-11-03 (#780)
+  if (out === null) return null;
   for (const [cur, prev] of JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1519.json'), 'utf8'))) {
     if (out.split(cur).length !== 2) return null;
     out = out.replace(cur, () => prev);
