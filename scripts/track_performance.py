@@ -1967,10 +1967,11 @@ from urllib.error import HTTPError, URLError
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
 # v6.57.0 (2026-11-05) [SESSION-OVERRIDES]: a forecast on a day the pinned
-# exchange calendar mis-times (the Korean exam day, the JSE half days) is
-# judged on that day's real hours, not on a close that is wrong by an hour or
-# five. ONE ENV gate, DEFAULT OFF (TRACK_SESSION_OVERRIDES) = v6.53.0
-# byte-identical apart from the version string. 6.54.0, 6.55.0 and 6.56.0 are
+# exchange calendar gets wrong (the Korean exam day, half days, election and
+# new public holidays) is judged on that day's real hours, or on the next real
+# session when the venue was closed. ONE ENV gate, DEFAULT OFF
+# (TRACK_SESSION_OVERRIDES) = v6.53.0 byte-identical apart from the version
+# string. 6.54.0, 6.55.0 and 6.56.0 are
 # claimed by the open PRs #845, #857 and #915, so this build takes 6.57.0;
 # whichever lands later re-numbers.
 # EVIDENCE (pinned exchange_calendars 4.13.2; the base map, no gate needed):
@@ -1990,13 +1991,29 @@ from urllib.error import HTTPError, URLError
 #   expected for 2026). Under TRACK_HIST_TARGET_CLOSE=enforce an NPN.JSE
 #   record targeting 2026-12-24 12:00Z (14:00 SAST) matures on the 24 Dec bar,
 #   struck at 12:00 SAST before its target (one session early).
-# WHAT: _OUTCOME_SESSION_OVERRIDES = {MIC: {session label: (open, close)}} in
-#   UTC ISO stamps (None keeps the calendar's value). _outcome_sessions applies
-#   it through _outcome_session_override only when TRACK_SESSION_OVERRIDES is
-#   on / 1 / true / yes; every other session, every other MIC and every
-#   refusal are unchanged. The table only re-times sessions the calendar
-#   already has (the harness pins that each entry names a calendar session and
-#   changes it), so it never adds or removes a trading day. Both the live-quote
+#   A base-map audit (every base MIC, 2025-11..2027-11, each finding re-checked
+#   by a refuter) added: XSES (.SI .SG) eve half days 2025-12-24, 2025-12-31,
+#   2026-02-16 end continuous trading at 12:00 SGT (the library's docstring
+#   lists them as a TODO); XTAE (.TA) Passover-interim Fridays 2026-04-03 and
+#   2027-04-23 end at 13:50 IDT like every Friday (the calendar says 14:15); and
+#   phantom sessions, days the calendar opens while the venue is closed: XTAE
+#   2026-01-04 (no Sunday after the Monday-Friday switch) and 2026-10-27
+#   (Knesset election), XJSE 2026-11-04 (local elections), XKRX 2026-06-03
+#   (local elections), 2026-07-17 (Constitution Day, a holiday again from
+#   2026) and the 2027 substitute days 2027-05-03 and 2027-07-19. A record
+#   whose target falls on a phantom session never finds a quote in it: it
+#   stays ACTIVE for ever, or matures on a provider bar for a closed day.
+#   Refuted and left alone: XETR / XSWX extended-hours claims, TASE ordinary
+#   Fridays (trade-at-last runs at the closing price until the calendar's
+#   13:50), and the 2026 SGX half days (XSES data ends 2026-12-31, so no
+#   lookup reaches them).
+# WHAT: _OUTCOME_SESSION_OVERRIDES = {MIC: {session label: (open, close) in
+#   UTC ISO stamps (None keeps the calendar's value) | "closed"}}.
+#   _outcome_sessions applies it through _outcome_session_override only when
+#   TRACK_SESSION_OVERRIDES is on / 1 / true / yes; every other session, every
+#   other MIC and every refusal are unchanged. Every entry names a session the
+#   calendar already has and changes it (the harness pins that), so no trading
+#   day is ever added; a "closed" entry removes one. Both the live-quote
 #   check and the target session read _outcome_sessions, so the v6.47.0
 #   historical close is stamped with the corrected close too.
 # ENV LANE: track_performance.yml 'Run performance clock' (1.0.11) and
@@ -2007,10 +2024,13 @@ from urllib.error import HTTPError, URLError
 #   corrected target_session_close; nothing else changes.
 # KNOWN LIMITS: (1) the table is maintained by hand; a new special session
 #   needs a new row (the harness checks each row against the pinned calendar,
-#   not against the venue). (2) The 2026 JSE half days and the 2026 exam-day
-#   hours follow the venues' recurring rules; their 2026 notices were not yet
-#   published on 2026-11-05. (3) #915's .KQ and .JO denials stay as they are;
-#   once both land they can be lifted for these days.
+#   not against the venue). (2) The 2026 JSE half days, the 2026 exam-day hours
+#   and the 2027 KRX substitute holidays follow the venues' recurring rules or
+#   the 2026 holiday law; their notices were not all published on 2026-11-05.
+#   (3) #915's .KQ and .JO denials stay as they are; once both land they can be
+#   lifted for these days. (4) Not fixed here: XSES data ends 2026-12-31, so
+#   from 2026-12-18 every .SI / .SG lookup raises (outcome_calendar_unknown)
+#   until the pinned package is bumped.
 # ZERO functions removed. Additions: _session_overrides_enabled,
 #   _outcome_session_override, _OUTCOME_SESSION_OVERRIDES.
 # ROLLBACK: unset TRACK_SESSION_OVERRIDES (or set off). Records matured
@@ -3494,25 +3514,50 @@ def _outcome_calendar_schedule(name: str, utc_day: str) -> Tuple[Tuple[str, date
 
 
 # v6.57.0 [SESSION-OVERRIDES] (TRACK_SESSION_OVERRIDES, default off): sessions
-# the pinned exchange_calendars 4.13.2 mis-times, as (open, close) in UTC ISO
-# stamps; None keeps the calendar's value. Only sessions the calendar already
-# has are re-timed (the harness pins it). Sources: the v6.57.0 WHY above.
+# the pinned exchange_calendars 4.13.2 gets wrong. An entry is either (open,
+# close) in UTC ISO stamps (None keeps the calendar's value) or "closed" (the
+# venue did not / will not trade that day). Only sessions the calendar already
+# has are named (the harness pins it), so no trading day is ever added.
+# Sources: the v6.57.0 WHY above.
 _OUTCOME_SESSION_OVERRIDES = {
-    # KRX college-exam (CSAT) days: 10:00-16:30 KST (the library's own +1h
-    # rule; its date list ends at 2020-12-03).
+    # KRX: college-exam (CSAT) days 10:00-16:30 KST (the library's own +1h
+    # rule; its date list ends at 2020-12-03); closed on the 2026 local
+    # election day and on the Constitution Day / Labor Day holidays of the
+    # 2026 Public Holidays Act amendment (substitute days in 2027).
     "XKRX": {
         "2024-11-14": ("2024-11-14T01:00:00+00:00", "2024-11-14T07:30:00+00:00"),
         "2025-11-13": ("2025-11-13T01:00:00+00:00", "2025-11-13T07:30:00+00:00"),
+        "2026-06-03": "closed",
+        "2026-07-17": "closed",
         "2026-11-19": ("2026-11-19T01:00:00+00:00", "2026-11-19T07:30:00+00:00"),
+        "2027-05-03": "closed",
+        "2027-07-19": "closed",
     },
-    # JSE half days: close 12:00 SAST.
+    # JSE: half days close 12:00 SAST; closed for the 2026 local elections.
     "XJSE": {
         "2024-12-24": (None, "2024-12-24T10:00:00+00:00"),
         "2024-12-31": (None, "2024-12-31T10:00:00+00:00"),
         "2025-12-24": (None, "2025-12-24T10:00:00+00:00"),
         "2025-12-31": (None, "2025-12-31T10:00:00+00:00"),
+        "2026-11-04": "closed",
         "2026-12-24": (None, "2026-12-24T10:00:00+00:00"),
         "2026-12-31": (None, "2026-12-31T10:00:00+00:00"),
+    },
+    # TASE: no Sunday session after the Monday-Friday switch; closed on the
+    # 2026 Knesset election day; a Friday in the Passover interim days keeps
+    # the ordinary Friday end of trading, 13:50 IDT (the calendar says 14:15).
+    "XTAE": {
+        "2026-01-04": "closed",
+        "2026-04-03": (None, "2026-04-03T10:50:00+00:00"),
+        "2026-10-27": "closed",
+        "2027-04-23": (None, "2027-04-23T10:50:00+00:00"),
+    },
+    # SGX: eve-of-holiday half days, continuous trading ends 12:00 SGT (the
+    # library's docstring lists them as a TODO; its data ends at 2026-12-31).
+    "XSES": {
+        "2025-12-24": (None, "2025-12-24T04:00:00+00:00"),
+        "2025-12-31": (None, "2025-12-31T04:00:00+00:00"),
+        "2026-02-16": (None, "2026-02-16T04:00:00+00:00"),
     },
 }
 
@@ -3526,9 +3571,9 @@ def _session_overrides_enabled() -> bool:
 def _outcome_session_override(name: str, sessions: Tuple[Tuple[str, datetime, datetime], ...]
                               ) -> Tuple[Tuple[str, datetime, datetime], ...]:
     """v6.57.0 PURE: `sessions` with every override for calendar `name` applied
-    (open and/or close replaced); sessions the table does not name, and any
-    other calendar, come back unchanged. On a malformed entry the calendar's
-    own schedule is returned. Never raises."""
+    (open and/or close replaced, a "closed" day dropped); sessions the table
+    does not name, and any other calendar, come back unchanged. On a malformed
+    entry the calendar's own schedule is returned. Never raises."""
     table = _OUTCOME_SESSION_OVERRIDES.get(name)
     if not table:
         return sessions
@@ -3536,6 +3581,8 @@ def _outcome_session_override(name: str, sessions: Tuple[Tuple[str, datetime, da
         out = []
         for label, opened, closed in sessions:
             spec = table.get(label)
+            if spec == "closed":
+                continue
             if spec is not None:
                 if spec[0]:
                     opened = datetime.fromisoformat(spec[0]).astimezone(timezone.utc)

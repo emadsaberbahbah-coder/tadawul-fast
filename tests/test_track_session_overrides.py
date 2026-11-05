@@ -3,15 +3,17 @@
 [SESSION-OVERRIDES] (TRACK_SESSION_OVERRIDES, default off = v6.53.0 byte for
 byte apart from the version string).
 
-WHY (2026-11-05): the pinned exchange_calendars 4.13.2 mis-times sessions the
-tracker's base map relies on. XKRX (.KS .KO) has no exam-day (CSAT) session
+WHY (2026-11-05): the pinned exchange_calendars 4.13.2 gets sessions wrong
+that the tracker's base map relies on. XKRX (.KS .KO) has no exam-day (CSAT) session
 after 2020, so 19 Nov 2026 reads 09:00-15:30 KST while KRX trades 10:00-16:30;
 a regular-market quote stamped inside the 15-minute close slack after 15:30
 is an intraday price and matures the record. XJSE (.JSE) keeps 17:00 on the
 24 and 31 Dec half days, which close at 12:00 SAST; under
 TRACK_HIST_TARGET_CLOSE=enforce a record targeting the afternoon matures on a
-close struck before its target. With the gate on those sessions take their
-real hours from _OUTCOME_SESSION_OVERRIDES.
+close struck before its target. A base-map audit added SGX half days, TASE
+Passover Fridays and seven phantom sessions (KRX, TASE and JSE days the
+calendar opens while the venue is closed). With the gate on those sessions
+take their real hours, or disappear, from _OUTCOME_SESSION_OVERRIDES.
 
 REAL modules (scripts/track_performance.py, core.symbols.normalize) and the
 REAL pinned exchange_calendars. The audit cases run the real
@@ -20,16 +22,18 @@ backend quote call (an AsyncMock returning one witnessed row), the clock, the
 historical-bar source and the price fallback / CA guard / feed switches. No
 network.
 
-T1  the table: every MIC instantiates; every entry names a session the pinned
-    calendar has and changes it; open < close; XKRX entries are exactly the
-    library's own +1h exam-day rule; XJSE entries close at 12:00 SAST; the
-    table is pinned literally
+T1  the table, pinned literally: every entry names a session the pinned
+    calendar has; a re-time changes it (open < close, same UTC day, a shorter
+    day); XKRX re-times are exactly the library's own +1h exam-day rule; XJSE
+    half days close 12:00 SAST, XTAE Fridays 13:50 IDT, XSES half days 12:00
+    SGT; the "closed" days are exactly the seven phantom sessions
 T2  off (unset / blank / off / 0 / false / no / enforce / observe / onn / y):
     _outcome_sessions equals the untouched v6.53.0 over a symbol x day matrix
     that includes every override day
 T2b the on-spellings; junk stays off
-T3  on: only the named sessions change, only on their MIC; every other
-    session, MIC and refusal is unchanged
+T3  on: only the named sessions change (re-timed, or gone when "closed"), only
+    on their MIC; every other session, MIC and refusal is unchanged; nothing
+    is added
 T4  the REAL audit loop:
     a  .KS exam day, a 15:40 KST quote at 07:05Z: off MATURES (the defect);
        on stays ACTIVE (target_session_not_complete)
@@ -40,6 +44,10 @@ T4  the REAL audit loop:
     d  .JSE half day, a 12:05 SAST quote: on MATURES on the real close; off
        stays ACTIVE
     e  .KO and AAPL.US / 2222.SR / VOD.L on ordinary days: identical on and off
+    f  .JSE on the 4 Nov 2026 election day (venue closed): off, a provider bar
+       dated that day matures the record; on, 5 Nov's own close matures it
+    g  .TA on the 3 Apr 2026 Passover Friday, a 14:00 IDT target: off, the
+       Friday bar (struck at 13:50) matures it; on, Monday 6 Apr does
 T5  golden negative: T4a-on and T4c-on FAIL on the untouched v6.53.0
 T6  ENV lane: both tracker steps map TRACK_SESSION_OVERRIDES with || 'off'
     exactly once and identically; the reader's fallback literal is "off";
@@ -90,15 +98,31 @@ EXPECTED = {
     "XKRX": {
         "2024-11-14": ("2024-11-14T01:00:00+00:00", "2024-11-14T07:30:00+00:00"),
         "2025-11-13": ("2025-11-13T01:00:00+00:00", "2025-11-13T07:30:00+00:00"),
+        "2026-06-03": "closed",
+        "2026-07-17": "closed",
         "2026-11-19": ("2026-11-19T01:00:00+00:00", "2026-11-19T07:30:00+00:00"),
+        "2027-05-03": "closed",
+        "2027-07-19": "closed",
     },
     "XJSE": {
         "2024-12-24": (None, "2024-12-24T10:00:00+00:00"),
         "2024-12-31": (None, "2024-12-31T10:00:00+00:00"),
         "2025-12-24": (None, "2025-12-24T10:00:00+00:00"),
         "2025-12-31": (None, "2025-12-31T10:00:00+00:00"),
+        "2026-11-04": "closed",
         "2026-12-24": (None, "2026-12-24T10:00:00+00:00"),
         "2026-12-31": (None, "2026-12-31T10:00:00+00:00"),
+    },
+    "XTAE": {
+        "2026-01-04": "closed",
+        "2026-04-03": (None, "2026-04-03T10:50:00+00:00"),
+        "2026-10-27": "closed",
+        "2027-04-23": (None, "2027-04-23T10:50:00+00:00"),
+    },
+    "XSES": {
+        "2025-12-24": (None, "2025-12-24T04:00:00+00:00"),
+        "2025-12-31": (None, "2025-12-31T04:00:00+00:00"),
+        "2026-02-16": (None, "2026-02-16T04:00:00+00:00"),
     },
 }
 
@@ -172,11 +196,14 @@ def _sessions(tp, sym, around):
         return "RAISES", "%s:%s" % (type(exc).__name__, exc)
 
 
-SYMBOLS = ["005930.KS", "035720.KO", "NPN.JSE", "AAPL.US", "2222.SR", "VOD.L", "7203.T", "0700.HK", "SAP.DE",
+SYMBOLS = ["005930.KS", "035720.KO", "NPN.JSE", "TEVA.TA", "D05.SI", "D05.SG", "AAPL.US", "2222.SR", "VOD.L", "7203.T", "0700.HK", "SAP.DE",
            "BHP.AX", "D05.SI", "TEVA.TA", "FPH.NZ", "^N225", "GC=F", "BTC-USD", "1234", "FOO.ZZ"]
 DAYS = [_at(2024, 11, 14, 3, 0), _at(2025, 11, 13, 3, 0), _at(2025, 12, 24, 9, 0), _at(2025, 12, 31, 9, 0),
-        _at(2026, 11, 5, 12, 0), _at(2026, 11, 19, 3, 0), _at(2026, 11, 20, 3, 0), _at(2026, 12, 24, 9, 0),
-        _at(2026, 12, 31, 9, 0), _at(2027, 1, 15, 12, 0)]
+        _at(2026, 1, 4, 9, 0), _at(2026, 2, 16, 3, 0), _at(2026, 4, 3, 9, 0), _at(2026, 6, 3, 3, 0),
+        _at(2026, 7, 17, 3, 0), _at(2026, 10, 27, 9, 0), _at(2026, 11, 4, 9, 0), _at(2026, 11, 5, 12, 0),
+        _at(2026, 11, 19, 3, 0), _at(2026, 11, 20, 3, 0), _at(2026, 12, 10, 9, 0), _at(2026, 12, 24, 9, 0),
+        _at(2026, 12, 31, 9, 0), _at(2027, 1, 15, 12, 0), _at(2027, 4, 23, 9, 0), _at(2027, 5, 3, 3, 0),
+        _at(2027, 7, 19, 3, 0)]
 
 
 # --------------------------------------------------------------- the loop ---
@@ -251,27 +278,39 @@ JSE_LIVE = ("NPN.JSE", _at(2026, 12, 24, 8, 0), _at(2026, 12, 24, 10, 5), _at(20
 
 
 # ------------------------------------------------------------------- T1 ----
-def test_t1_table_is_pinned_and_re_times_real_sessions_only():
+def test_t1_table_is_pinned_and_names_real_sessions_only():
     tp = delivered()
     assert tp._OUTCOME_SESSION_OVERRIDES == EXPECTED
     for mic, table in tp._OUTCOME_SESSION_OVERRIDES.items():
         cal = xc.get_calendar(mic)
-        for label, (o, c) in table.items():
+        for label, spec in table.items():
             assert cal.is_session(label), (mic, label)                 # never adds a trading day
-            day = xc.get_calendar(mic).sessions_in_range(label, label)[0]
+            if spec == "closed":                                       # a phantom session goes
+                continue
+            o, c = spec
+            day = cal.sessions_in_range(label, label)[0]
             cal_o, cal_c = cal.session_open(day).to_pydatetime(), cal.session_close(day).to_pydatetime()
             new_o = datetime.fromisoformat(o) if o else cal_o
             new_c = datetime.fromisoformat(c) if c else cal_c
             assert new_o.tzinfo is not None and new_c.tzinfo is not None
             assert new_o < new_c and (new_o, new_c) != (cal_o, cal_c), (mic, label)
             assert new_o.astimezone(UTC).date().isoformat() == label == new_c.astimezone(UTC).date().isoformat()
+            hhmm = new_c.astimezone(UTC).strftime("%H:%M")
             if mic == "XKRX":                                          # the library's own +1h exam-day rule
                 assert new_o - cal_o == timedelta(hours=1) and new_c - cal_c == timedelta(hours=1), label
-                assert new_c.astimezone(UTC).strftime("%H:%M") == "07:30"   # 16:30 KST
+                assert hhmm == "07:30"                                 # 16:30 KST
             if mic == "XJSE":                                          # half day: close 12:00 SAST
-                assert o is None and label[5:] in ("12-24", "12-31"), label
-                assert new_c.astimezone(UTC).strftime("%H:%M") == "10:00"
-                assert cal_c.astimezone(UTC).strftime("%H:%M") == "15:00"   # what the calendar says
+                assert o is None and label[5:] in ("12-24", "12-31") and hhmm == "10:00", label
+            if mic == "XTAE":                                          # Friday end of trading 13:50 IDT
+                assert o is None and day.dayofweek == 4 and hhmm == "10:50", label
+                assert cal_c.astimezone(UTC).strftime("%H:%M") == "11:15", label   # what the calendar says
+            if mic == "XSES":                                          # eve half day: 12:00 SGT
+                assert o is None and hhmm == "04:00", label
+            if mic != "XKRX":                                          # a half day / Friday ends earlier
+                assert new_c < cal_c and new_o == cal_o, (mic, label)
+    closed = sorted((m, d) for m, t in tp._OUTCOME_SESSION_OVERRIDES.items() for d, v in t.items() if v == "closed")
+    assert closed == [("XJSE", "2026-11-04"), ("XKRX", "2026-06-03"), ("XKRX", "2026-07-17"), ("XKRX", "2027-05-03"),
+                      ("XKRX", "2027-07-19"), ("XTAE", "2026-01-04"), ("XTAE", "2026-10-27")]
 
 
 # ------------------------------------------------------------------- T2 ----
@@ -313,18 +352,26 @@ def test_t3_on_changes_only_the_named_sessions(monkeypatch):
         if a[0] == "RAISES":
             assert a == b, key
             continue
-        assert [x[0] for x in a[1]] == [x[0] for x in b[1]], key      # same trading days
-        for (la, oa, ca), (lb, ob, cb) in zip(a[1], b[1]):
-            if (oa, ca) != (ob, cb):
-                spec = EXPECTED.get(a[0], {}).get(la)
-                assert spec is not None, (key, la)                    # only a listed session moves
-                assert (ob if spec[0] else oa) == ob and cb == (spec[1] or ca), (key, la)
-                if spec[0]:
-                    assert ob == spec[0]
+        table = EXPECTED.get(a[0], {})
+        kept = {x[0]: x for x in b[1]}
+        for la, oa, ca in a[1]:
+            spec = table.get(la)
+            if spec == "closed":
+                assert la not in kept, (key, la)                      # the phantom session is gone
                 changed.add((a[0], la))
-    assert ("XKRX", "2026-11-19") in changed and ("XJSE", "2026-12-24") in changed and ("XJSE", "2026-12-31") in changed
-    assert ("XKRX", "2025-11-13") in changed and ("XKRX", "2024-11-14") in changed
-    assert {m for m, _ in changed} == {"XKRX", "XJSE"}
+                continue
+            assert la in kept, (key, la)                              # every other trading day stays
+            _lb, ob, cb = kept[la]
+            if spec is None:
+                assert (oa, ca) == (ob, cb), (key, la)                # untouched session
+            else:
+                assert ob == (spec[0] or oa) and cb == (spec[1] or ca), (key, la)
+                changed.add((a[0], la))
+        assert set(kept) <= {x[0] for x in a[1]}, key                 # nothing added
+    want = {(m, d) for m, t in EXPECTED.items() for d in t}
+    reachable = want - {("XJSE", "2024-12-24"), ("XJSE", "2024-12-31")}   # outside the DAYS windows
+    assert reachable <= changed, sorted(reachable - changed)
+    assert {m for m, _ in changed} == {"XKRX", "XJSE", "XTAE", "XSES"}
 
 
 # ------------------------------------------------------------------- T4 ----
@@ -384,6 +431,43 @@ def test_t4d_half_day_real_close_quote(monkeypatch):
     _set_gate(monkeypatch, None)
     rec_off, receipt_off, _c = audit(tp, monkeypatch, *JSE_LIVE)
     assert rec_off.status == tp.PerformanceStatus.ACTIVE and receipt_off.get("reason") == "target_session_not_complete"
+
+
+JSE_CLOSED = ("NPN.JSE", _at(2026, 11, 4, 10, 0), _at(2026, 11, 5, 15, 0), _at(2026, 11, 5, 16, 0),
+              [("2026-11-04", 104.0), ("2026-11-05", 110.0)])
+TASE_FRIDAY = ("TEVA.TA", _at(2026, 4, 3, 11, 0), _at(2026, 4, 6, 11, 15), _at(2026, 4, 6, 12, 0),
+               [("2026-04-03", 105.0), ("2026-04-06", 110.0)])
+
+
+def test_t4f_phantom_session_election_day(monkeypatch):
+    """XJSE 2026-11-04: the JSE was closed (local elections). Off, the target
+    session is the phantom day: the 5 Nov quote is outside it and, under hist
+    enforce, a provider bar dated 4 Nov matures the record (or it waits for
+    ever). On, the target session is 5 Nov and its own close matures it."""
+    tp = delivered()
+    _set_gate(monkeypatch, None)
+    rec, receipt, calls = audit(tp, monkeypatch, *JSE_CLOSED)
+    assert receipt.get("target_session") == "2026-11-04", receipt
+    assert rec.status == tp.PerformanceStatus.MATURED and receipt.get("hist_bar_date") == "2026-11-04", receipt
+    _set_gate(monkeypatch, "on")
+    rec, receipt, calls = audit(tp, monkeypatch, *JSE_CLOSED)
+    assert rec.status == tp.PerformanceStatus.MATURED and abs(rec.realized_roi - 10.0) < 1e-9, (rec.status, receipt)
+    assert receipt.get("target_session") == "2026-11-05" and calls == [], (receipt, calls)
+
+
+def test_t4g_passover_friday_target_after_the_real_end(monkeypatch):
+    """XTAE 2026-04-03: the Friday ended at 13:50 IDT (10:50Z); the calendar says
+    14:15. A 14:00 IDT target (11:00Z): off, hist enforce matures it on the
+    Friday bar, struck before the target; on, the target session is Monday 6
+    April and its own close matures it."""
+    tp = delivered()
+    _set_gate(monkeypatch, None)
+    rec, receipt, _c = audit(tp, monkeypatch, *TASE_FRIDAY)
+    assert rec.status == tp.PerformanceStatus.MATURED and receipt.get("hist_bar_date") == "2026-04-03", receipt
+    _set_gate(monkeypatch, "on")
+    rec, receipt, calls = audit(tp, monkeypatch, *TASE_FRIDAY)
+    assert rec.status == tp.PerformanceStatus.MATURED and abs(rec.realized_roi - 10.0) < 1e-9, (rec.status, receipt)
+    assert receipt.get("target_session") == "2026-04-06" and calls == [], (receipt, calls)
 
 
 ORDINARY = [("035720.KO", _at(2026, 11, 12, 5, 0), _at(2026, 11, 12, 6, 31), _at(2026, 11, 12, 7, 5)),
