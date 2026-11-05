@@ -1,5 +1,13 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.11 (2026-11-05) -- THE RENDER HANDSHAKE COVERS ONE RETRY
+# WHY (5 Nov 2026): run 41901407829 failed its final check because both early
+# Top_10 renders were stopped at the Apps Script 6-minute limit (01:04 and
+# 01:14 Riyadh) and the 15-minute handshake ended at 01:15; the third render
+# verified at 01:27:55 and Release After Sync released at 01:30. The
+# handshake default is now 30 minutes (await_cockpit_receipts 1.3.0, hard cap
+# 35); the step backstop is 40 minutes and the job timeout 70.
+#
 # VERSION 1.0.10 (2026-11-04) -- A DISPATCHED FULL SYNC CARRIES MY_PORTFOLIO
 # WHY (4 Nov 2026): the 06:22 Riyadh run 41766747380 was dispatched by Apps
 # Script 24_Sync_Dispatch 1.1.0 with run_mode only. GitHub filled the omitted
@@ -22,7 +30,8 @@ name: 🏦 Tadawul Dashboard Advanced Sync
 # immediately BEFORE the final audit: scripts/await_cockpit_receipts.py
 # --wait-only, the same read-only poll release_after_sync.yml uses, until
 # both cockpits carry the receipt for THIS run or the bound ends
-# (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It only
+# (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes; 30 and 35
+# since 1.0.11). It only
 # DELAYS the audit: '|| true', never fails the job, never writes, never
 # dispatches; its JSON joins the final publication artifact and one line
 # goes to the step summary. The audit, every veto and --publish-blockers are
@@ -2169,9 +2178,10 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     environment: production
+    # v1.0.11: 55 -> 70 (the handshake backstop grew from 25 to 40 minutes).
     # v1.0.9: 30 -> 55, room for the gated handshake wait (cap 20 min) and
     # its 25-minute step backstop before the unchanged final audit.
-    timeout-minutes: 55
+    timeout-minutes: 70
     env:
       PYTHONPATH: ${{ github.workspace }}
       TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
@@ -2256,7 +2266,8 @@ jobs:
       # (one batchGet of _Status L1:M60 and the two cockpit B2 cells per poll,
       # the strict audit's own receipt parser), until both cockpits carry
       # 'source readiness VERIFIED (run <this run>)' or the bound ends
-      # (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 15, hard cap 20 minutes). It
+      # (vars.TFB_SYNC_AWAIT_RENDER_MIN, default 30, hard cap 35 minutes since
+      # 1.0.11; was 15 / 20). It
       # never fails this job ('|| true'; the script exits 2 only on a
       # configuration error and never raises), never writes the workbook,
       # never dispatches anything, and uses the credentials configured above.
@@ -2267,9 +2278,9 @@ jobs:
       # veto, threshold and --publish-blockers exactly as before.
       - name: Await the native cockpit render (handshake)
         if: ${{ contains(fromJSON('["1","true","yes","on"]'), vars.TFB_SYNC_AWAIT_RENDER) }}
-        timeout-minutes: 25
+        timeout-minutes: 40
         env:
-          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}
+          TFB_SYNC_AWAIT_RENDER_MIN: ${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}
         run: |
           set -euo pipefail
           rm -f await_render.json

@@ -950,7 +950,7 @@ def case_w18_wait_only_consumed_on_the_second_poll(mp, tmp_path):
     assert result["consumed_at_utc"] == {"pf": NOW.isoformat(timespec="seconds"),
                                          "t10": NOW.isoformat(timespec="seconds")}
     assert result["mode"] == "wait_only" and result["run_id"] == SOURCE
-    assert result["max_min"] == 15 and result["poll_s"] == 60 and result["max_min_clamped"] is False
+    assert result["max_min"] == 30 and result["poll_s"] == 60 and result["max_min_clamped"] is False
     assert result["dispatched"] is False and result["dispatch_attempts"] == 0
     assert result["faults"] == 0 and result["gate_variable"] == "TFB_SYNC_AWAIT_RENDER"
     # the SAME bounded ranges, reader and render option as the dispatch mode
@@ -970,22 +970,22 @@ def case_w18_wait_only_consumed_on_the_second_poll(mp, tmp_path):
     result = h.wait()
     assert result["outcome"] == "consumed" and result["polls"] == 1 and h.clock.sleeps == []
     assert result["consumed_at_s"] == {"pf": 0, "t10": 0}
-    assert W.WAIT_ONLY_DEFAULT_MIN == 15 and W.WAIT_ONLY_MAX_MIN == 20
+    assert W.WAIT_ONLY_DEFAULT_MIN == 30 and W.WAIT_ONLY_MAX_MIN == 35   # v1.3.0 (was 15 / 20)
     assert W.WAIT_ONLY_DEFAULT_POLL_S == 60 and (W.WAIT_ONLY_MIN_POLL_S, W.WAIT_ONLY_MAX_POLL_S) == (30, 90)
 
 
 def case_w19_wait_only_is_bounded_and_ends_early_on_evidence(mp, tmp_path):
     _clean(mp)
     _seal_github(mp)
-    # never consumed: 15 minutes at 60 s = 16 polls, exit 0 with a notice
+    # never consumed: 30 minutes at 60 s = 31 polls, exit 0 with a notice (v1.3.0; was 15 / 16)
     h = WaitHarness([state(t10_grid=t10(""))])
     result = h.wait()
     assert result["exit_code"] == 0 and result["outcome"] == "timeout", result
     assert result["reasons"] == ["receipts_timeout"]
-    assert result["polls"] == 16 and h.clock.sleeps == [60] * 15 and result["waited_s"] == 900
+    assert result["polls"] == 31 and h.clock.sleeps == [60] * 30 and result["waited_s"] == 1800
     assert result["consumed"] == {"pf": True, "t10": False}
     assert result["consumed_at_s"] == {"pf": 0, "t10": None}
-    assert result["notice"].startswith("no receipt for run " + SOURCE + " from Top_10_Investments after 900 s")
+    assert result["notice"].startswith("no receipt for run " + SOURCE + " from Top_10_Investments after 1800 s")
     assert result["notice"].endswith("the audit that follows decides.")
     assert result["dispatched"] is False and result["last"]["state"] == "wait"
     # every receipt the strict audit would reject keeps waiting (never consumed)
@@ -995,14 +995,14 @@ def case_w19_wait_only_is_bounded_and_ends_early_on_evidence(mp, tmp_path):
         result = h.wait(max_min="2")
         assert result["outcome"] == "timeout" and result["polls"] == 3, receipt
         assert result["consumed"] == {"pf": False, "t10": True}, receipt
-    # the bound: default 15, cap 20, larger values clamped and recorded
-    for raw, minutes, polls, clamped in (("1", 1, 2, False), ("20", 20, 21, False), ("21", 20, 21, True),
-                                         ("600", 20, 21, True), (None, 15, 16, False)):
+    # the bound: default 30, cap 35 (v1.3.0; was 15 / 20), larger values clamped and recorded
+    for raw, minutes, polls, clamped in (("1", 1, 2, False), ("15", 15, 16, False), ("35", 35, 36, False),
+                                         ("36", 35, 36, True), ("600", 35, 36, True), (None, 30, 31, False)):
         h = WaitHarness([state(t10_grid=t10(""))])
         result = h.wait(max_min=raw)
         assert (result["max_min"], result["polls"], result["max_min_clamped"]) == (minutes, polls, clamped), raw
         assert ("max_minutes_clamped" in result["reasons"]) is clamped, raw
-    for poll, polls in (("30", 31), ("90", 11)):
+    for poll, polls in (("30", 61), ("90", 21)):   # v1.3.0: over the 30-minute default
         h = WaitHarness([state(t10_grid=t10(""))])
         result = h.wait(poll_s=poll)
         assert result["polls"] == polls and result["poll_s"] == int(poll), poll
@@ -1240,7 +1240,7 @@ def case_w23_handshake_step_contract(mp, tmp_path):
         assert names[-1].startswith("Secure") and "shred -u -z" in steps[-1]["run"]
         step = steps[index]
         assert set(step) == {"name", "if", "timeout-minutes", "env", "run"}, (path.name, set(step))
-        assert step["timeout-minutes"] == 25 and "continue-on-error" not in json.dumps(steps)
+        assert step["timeout-minutes"] == 40 and "continue-on-error" not in json.dumps(steps)   # v1.3.0: was 25
         assert "${{" not in step["run"] and step["run"].startswith("set -euo pipefail\n")
         # the exact command: wait-only, this run (or the triggering sync), env-mapped bound, || true
         run_env = "$GITHUB_RUN_ID" if path == DAILY_YML else "$SOURCE_RUN_ID"
@@ -1256,7 +1256,7 @@ def case_w23_handshake_step_contract(mp, tmp_path):
         for forbidden in ("--source-run-id", "release_decision_feed", "finalize_decision_publication",
                           "audit_decision_surface_freshness", "--publish", "dispatch"):
             assert forbidden not in step["run"], (path.name, forbidden)
-        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}"}
+        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}"}
         if path == FRESH_YML:
             expected_env["SOURCE_RUN_ID"] = "${{ github.event.workflow_run.id }}"
         assert step["env"] == expected_env, path.name

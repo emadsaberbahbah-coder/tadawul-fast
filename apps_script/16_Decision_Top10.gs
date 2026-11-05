@@ -1,11 +1,37 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.21.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.21.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.21.1 (2026-11-05) [MF-SCOPE-2422] -- THE APPROVED FUND TAB DROPS 52 DEAD ROWS (POLICY DATA ONLY)
+ * WHY (owner, Thu 5 Nov 2026 12:51 Riyadh: "Approved to be removed"): sync run
+ * 41944918372 was withheld for Mutual_Funds name coverage 97.90% below the
+ * unchanged 99% gate. The 52 unnamed rows were all acquisition_status:
+ * unavailable: 45 tickers the chart API no longer carries (404), 6 with no
+ * bar in two years (IBMN, IBDQ, IBTF, SPVU, HYXU; SPLG renamed SPYM) and
+ * the bare duplicate SPLG - matured iBonds, liquidated or renamed ETFs. None
+ * is held in My_Portfolio.
+ * WHAT: DT10_SOURCE_APPROVED_SCOPE carries the repository policy revision
+ * 2026-11-05.mf-retire-52.v2 (config/approved_universe_scope_v1.json):
+ * Mutual_Funds approved_count 2422 (was 2474) and its new symbol_set_sha256;
+ * DT10_SOURCE_MIN_ROWS.Mutual_Funds follows it (a scoped page's floor is its
+ * approved count, as Market_Leaders 255 already is). Market_Leaders, the
+ * other floors, every gate, verdict and ticket rule are unchanged; no
+ * function or var is added or removed.
+ * GATES: none (policy data). The rows leave the page through the sync's
+ * retirement seam (_Retired_Symbols, Page = Mutual_Funds, under
+ * TFB_SYNC_RETIRE_TAB = enforce). Paste this file and that list before the
+ * same sync: the native source check enforces the exact membership, so until
+ * the page, the repository policy and this file agree it withholds the board
+ * (fail closed); today the final audit withholds it for the 52 rows.
+ * ROLLBACK: Project History -> v1.21.0, the 2026-10-12 policy restored in the
+ * repository, the 52 rows removed from _Retired_Symbols and pasted back into
+ * Mutual_Funds (the sheet is the symbol source; the sync does not re-add them).
+ * Harness: tests/test_dt10_v1211_mf_scope.js
  *
  * v1.21.0 (2026-11-03) [EXDIV-GUARD] -- THE TICKET GUARD SEES EX-DIVIDEND DATES (KNOB, DEFAULT OFF)
  * WHY (3 Nov 2026): the 2 Nov 08:49 board issued INDV.US for 12,335 SAR and
@@ -2386,7 +2412,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.21.0';
+var DT10_VERSION = '1.21.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2497,14 +2523,14 @@ function dt10FeedCohortCheck_(raw, cohort) {
 // Legacy staged-expansion properties do not override this explicit approval.
 // Unscoped Global/commodities properties may still tighten their floors.
 var DT10_SOURCE_MIN_ROWS = {Market_Leaders: 255, Global_Markets: 6512,
-                          Commodities_FX: 453, Mutual_Funds: 2474};
+                          Commodities_FX: 453, Mutual_Funds: 2422};
 var DT10_SOURCE_APPROVED_SCOPE = {
-  policy_revision: '2026-10-12.current-workbook.v1', approved_on: '2026-10-12',
+  policy_revision: '2026-11-05.mf-retire-52.v2', approved_on: '2026-11-05',
   pages: {
     Market_Leaders: {approved_count: 255, supersedes_min_rows: 1025,
       symbol_set_sha256: '9c9949e0952b3b6c7ac4de2cdefd7fdc084e0649ecffef48e3e27cdaab703c66'},
-    Mutual_Funds: {approved_count: 2474, supersedes_min_rows: 4496,
-      symbol_set_sha256: 'd9a3fcb8aefc9de60de28c1e4d2c89464be2dbaf0907e11edd904bd48214bc02'}
+    Mutual_Funds: {approved_count: 2422, supersedes_min_rows: 4496,
+      symbol_set_sha256: '1bb8747656e2a4c635863c933c41f51cae530892dd5c08c3d0a132a3bf6926ff'}
   }
 };
 var DT10_SOURCE_STATUS_MAX_ROWS = 1000;

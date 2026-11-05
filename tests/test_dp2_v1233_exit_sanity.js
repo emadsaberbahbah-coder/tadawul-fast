@@ -80,9 +80,25 @@ function reverseEdits(src) {
   eq(sha256(s), V1232_SHA256, 'v1.2.33 changes only its enumerated hunks (their reversal = the v1.2.32 file)');
   return s;
 }
-let OLD = null, oldErr = '';
+// 2026-11-05: v1.2.34 (render priority, TFB_RENDER_PRIORITY default off) stacked on this change; pins moved. Behaviour runs on
+// the delivered file; P0 / P8 (lockstep, lint, inventory, replaced lines, hunks, WHY) read the v1.2.33 file rebuilt from it
+// (the v1.2.34 hunks of tests/js/dp2_edits_v1234.json reversed, SHA-256 pinned).
+const EDITS1234 = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1234.json'), 'utf8'));
+const V1233_SHA256 = 'dd5ee2041b065b5e12aed7c41ea505fd3b75b3219e29807d060ff4d95a394756';   // v1.2.33 (origin/main c54eba40)
+function v1233Of(src) {
+  if (src.indexOf("var DP2_VERSION = '1.2.34';") < 0) return src;
+  let s = src;
+  for (const [cur, prev] of EDITS1234) {
+    if (s.split(cur).length - 1 !== 1) throw new Error('exactly one approved v1.2.34 hunk: ' + cur.split('\n')[0].slice(0, 90));
+    s = s.replace(cur, () => prev);
+  }
+  if (crypto.createHash('sha256').update(s).digest('hex') !== V1233_SHA256) throw new Error('v1.2.34 changes only its enumerated hunks (their reversal = the v1.2.33 file)');
+  return s;
+}
+let OLD = null, oldErr = '', S1233 = null;
 try {
-  OLD = OLD_PATH ? fs.readFileSync(OLD_PATH, 'utf8') : reverseEdits(NEW);
+  S1233 = v1233Of(NEW);
+  OLD = OLD_PATH ? fs.readFileSync(OLD_PATH, 'utf8') : reverseEdits(S1233);
   eq(sha256(OLD), V1232_SHA256, 'v1.2.32 SHA-256');
 } catch (e) { oldErr = String(e && e.message || e); OLD = null; }
 if (!OLD) { console.log('FAIL P0 oracle: ' + oldErr); console.log('FAIL 0/1'); process.exit(1); }
@@ -362,7 +378,7 @@ function build(source, which, opts) {
 }
 function norm(b) {   // the only bytes v1.2.31 under its kill switch may differ in: the version printed on both footers / the toast title
   const strip = o => { const x = Object.assign({}, o); delete x.env; return x; };
-  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.33').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.33').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.32').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
+  return JSON.parse(JSON.stringify(strip(b)).split('Decision Pages v2 1.2.34').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.33').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.33').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.32').join('Decision Pages v2 1.2.30').split('Decision Pages v2 1.2.31').join('Decision Pages v2 1.2.30'));
 }
 function sheet(b, name) { return b.env.book.getSheetByName(name); }
 function val(sh, r, c) { const x = sh._cells.get(r + ':' + c); return x && x.v !== undefined && x.v !== null ? x.v : ''; }
@@ -633,10 +649,10 @@ function battery() {
   const digest = [];
   test('P0 oracle: v1.2.32 rebuilt from the delivered file (SHA-256 pinned); version lockstep 1.2.33; both files compile; the base lacks the new names', () => {
     eq(sha256(OLD), V1232_SHA256, 'v1.2.32');
-    ok(/^ \* Version: 1\.2\.33 \(2026-11-03\)$/m.test(NEW), 'header Version line 1.2.33');
-    ok(NEW.indexOf("var DP2_VERSION = '1.2.33';   // lockstep with the header") > 0, 'DP2_VERSION 1.2.33');
+    ok(/^ \* Version: 1\.2\.33 \(2026-11-03\)$/m.test(S1233), 'header Version line 1.2.33');
+    ok(S1233.indexOf("var DP2_VERSION = '1.2.33';   // lockstep with the header") > 0, 'DP2_VERSION 1.2.33');
     ok(/^ \* Version: 1\.2\.32 \(2026-11-03\)$/m.test(OLD) && OLD.indexOf("var DP2_VERSION = '1.2.32';") > 0, 'base is 1.2.32');
-    for (const s of [NEW, OLD]) new vm.Script(s, { filename: '27_Decision_Pages_v2.gs' });
+    for (const s of [NEW, S1233, OLD]) new vm.Script(s, { filename: '27_Decision_Pages_v2.gs' });
     const e = makeEnv(OLD, {});
     for (const k of ['dp2ExitAnchorMiss_', 'dp2ExitDivAdjust_', 'dp2ExitSanityOn_', 'DP2_EXIT_SANITY_PROP']) eq(typeof e.ctx[k], 'undefined', 'the base lacks ' + k);
     eq(makeEnv(NEW, {}).ctx.DP2_EXIT_SANITY_PROP, GATE, 'the gate name');
@@ -667,7 +683,7 @@ function battery() {
     checkSelfTest(NEW);
   });
   test('P8 ES5 / ASCII lint of the v1.2.33 diff; inventory (10 functions + 8 vars added, 0 removed); the 3 replaced base lines pinned; 10 hunks whose reversal is the v1.2.32 file; WHY block', () => {
-    const bl = OLD.split('\n'), nl = NEW.split('\n');
+    const bl = OLD.split('\n'), nl = S1233.split('\n');
     const baseSet = new Set(bl), newSet = new Set(nl);
     const added = nl.filter(l => !baseSet.has(l));
     ok(added.length >= 150 && added.length <= 230, 'added lines ' + added.length);
@@ -677,20 +693,20 @@ function battery() {
       ok(/^[\x09\x20-\x7e]*$/.test(l), 'non-ASCII added line: ' + l.slice(0, 120));
       ok(!/^\s{2,}function\s/.test(l), 'no block-level function declaration: ' + l.slice(0, 80));
     }
-    ok(NEW.indexOf('\r') < 0, 'LF only');
+    ok(S1233.indexOf('\r') < 0, 'LF only');
     const NEWF = ['dp2DayMs_', 'dp2DivTabFromValues_', 'dp2DivTab_', 'dp2ExitAnchorMiss_', 'dp2ExitAnchorWhy_', 'dp2ExitDivAdjust_', 'dp2ExitDivsFor_', 'dp2ExitSanityCoreOk_', 'dp2ExitSanityOn_', 'dp2YahooDivs_'];
     for (const name of NEWF) {
-      const start = NEW.indexOf('function ' + name + '(');
+      const start = S1233.indexOf('function ' + name + '(');
       ok(start > 0, 'defined ' + name);
-      const body = NEW.slice(start, NEW.indexOf('\n}\n', start) + 3);
+      const body = S1233.slice(start, S1233.indexOf('\n}\n', start) + 3);
       ok(/^[\x00-\x7f]*$/.test(body), 'ASCII ' + name);
       new vm.Script('(function(){' + body + '})');
     }
     const names = (src, re) => { const out = {}; let m; while ((m = re.exec(src))) out[m[1]] = true; return out; };
-    const fb = names(OLD, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(NEW, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
+    const fb = names(OLD, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(S1233, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
     deq(Object.keys(fb).filter(k => !fn[k]), [], 'top-level functions removed');
     deq(Object.keys(fn).filter(k => !fb[k]).sort(), NEWF, 'top-level functions added');
-    const vb = names(OLD, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(NEW, /^var\s+([A-Za-z_$][\w$]*)/mg);
+    const vb = names(OLD, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(S1233, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DP2X_SAN_', 'DP2_DIVIDEND_SHEET', 'DP2_EXIT_ANCHOR_GAP_D', 'DP2_EXIT_ANCHOR_PCT', 'DP2_EXIT_DIV_MAX', 'DP2_EXIT_DIV_NEAR_D', 'DP2_EXIT_SANITY_PROP', 'DP2_EXIT_SUBUNIT_'], 'vars added');
     const REMOVED = ['* Version: 1.2.32 (2026-11-03)', "var DP2_VERSION = '1.2.32';", 'return { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy:'];
@@ -699,11 +715,11 @@ function battery() {
     for (let i = 0; i < removed.length; i++) ok(removed[i].indexOf(REMOVED[i]) === 0, 'replaced base line ' + i + ': ' + removed[i].slice(0, 120));
     let pos = 0; for (const l of bl) { if (!newSet.has(l)) continue; const at = nl.indexOf(l, pos); ok(at >= pos, 'base line out of order: ' + l.slice(0, 80)); pos = at + 1; }
     ok(NEW.indexOf("  var outY = { bars: bars, last: r.meta ? dp2Num_(r.meta.regularMarketPrice) : null, ccy: (r.meta && r.meta.currency) || '', marketState: (r.meta && r.meta.marketState) || '', source: 'yahoo' };") > 0, 'the return object kept field for field');
-    const why = NEW.slice(NEW.indexOf(' *   1.2.33: '), NEW.indexOf(' *   1.2.32: '));
+    const why = S1233.slice(S1233.indexOf(' *   1.2.33: '), S1233.indexOf(' *   1.2.32: '));
     ok(why.length > 1500 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'WHY block (1.2.33) present, newest first, ASCII');
     for (const w of ['DP2_EXIT_SANITY', 'default OFF', 'Rollback: delete DP2_EXIT_SANITY', 'dp2ExitAnchorMiss_', 'dp2ExitDivAdjust_', 'Dividend_Events', 'events=div']) ok(why.indexOf(w) >= 0, 'WHY names ' + w);
-    for (const l of bl.filter(x => /^ \*   1\.\d+\.\d+[: ]/.test(x))) ok(NEW.indexOf(l) > 0, 'prior WHY entry kept: ' + l.slice(0, 60));
-    eq(reverseEdits(NEW), OLD, 'hunk reversal = the v1.2.32 file');
+    for (const l of bl.filter(x => /^ \*   1\.\d+\.\d+[: ]/.test(x))) ok(S1233.indexOf(l) > 0, 'prior WHY entry kept: ' + l.slice(0, 60));
+    eq(reverseEdits(S1233), OLD, 'hunk reversal = the v1.2.32 file');
     eq(EDITS.length, 10, 'ten hunks');
     digest.push(String(EDITS.length));
   });

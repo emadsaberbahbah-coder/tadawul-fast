@@ -29,7 +29,7 @@ def test_por_v100_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("PASS 51/51"), result.stdout[-2000:]
+    assert result.stdout.rstrip().endswith("PASS 62/62"), result.stdout[-2000:]
 
 
 def test_por_v100_source_is_ascii_es5():
@@ -37,4 +37,4 @@ def test_por_v100_source_is_ascii_es5():
     assert all(ord(ch) < 127 for ch in src.replace("\r", "")), "28_Plan_Of_Record.gs must be ASCII"
     for token in ("=>", "`", ".startsWith(", ".includes(", "Object.assign", ".padStart("):
         assert token not in src, token
-    assert "var POR_VERSION = '1.0.0';" in src
+    assert "var POR_VERSION = '1.0.1';" in src   # v1.0.1 (render priority)

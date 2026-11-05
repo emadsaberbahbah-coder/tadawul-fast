@@ -382,3 +382,125 @@ def test_coherent_existing_return_is_preserved_without_recalculation():
     plan, _ = iqr.plan_page_updates("Market_Leaders", [HEADER, row], quotes())
     assert 8 not in plan[0]["changes"]
     assert plan[0]["changes"][2] == 110
+
+
+# ------------------------------------------------------------ v1.0.4 -------
+# 4 Nov 2026: the backend answered 401 to the token-less sheet-rows GETs
+# (dry run 41851262140), so no quote was ever read while runs ended green.
+import io
+import urllib.error
+
+import yaml
+
+TOKEN_NAMES = ("TFB_TOKEN", "X_APP_TOKEN", "APP_TOKEN", "BACKEND_TOKEN")
+
+
+def _clear_tokens(monkeypatch):
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_v104_request_carries_the_backend_token_like_the_sync(monkeypatch):
+    _clear_tokens(monkeypatch)
+    anonymous = iqr._backend_request("https://synthetic.invalid/v1/analysis/sheet-rows?page=x")
+    assert anonymous.get_header("X-app-token") is None and anonymous.get_header("Authorization") is None
+    monkeypatch.setenv("BACKEND_TOKEN", "synthetic-backend")
+    req = iqr._backend_request("https://synthetic.invalid/v1/analysis/sheet-rows?page=x")
+    assert req.get_header("X-app-token") == "synthetic-backend"
+    assert req.get_header("Authorization") == "Bearer synthetic-backend"
+    monkeypatch.setenv("TFB_TOKEN", "synthetic-first")        # run_dashboard_sync order: TFB_TOKEN first
+    assert iqr._backend_request("https://x.invalid").get_header("X-app-token") == "synthetic-first"
+
+
+def test_v104_fetch_sends_the_token_and_reads_quotes(monkeypatch):
+    _clear_tokens(monkeypatch)
+    monkeypatch.setenv("BACKEND_TOKEN", "synthetic-backend")
+    calls = serve(monkeypatch, [source()])
+    got = iqr.fetch_quotes("https://synthetic.invalid", "Market_Leaders", ["SYNTH.SR"])
+    assert set(got) == {"SYNTH.SR"}
+    assert calls[0].get_header("X-app-token") == "synthetic-backend"
+    assert "/v1/analysis/sheet-rows?" in calls[0].full_url
+
+
+def test_v104_http_401_is_named_and_a_run_without_any_quote_exits_3(monkeypatch, capsys):
+    _clear_tokens(monkeypatch)
+    monkeypatch.setenv("BACKEND_TOKEN", "synthetic-secret-value")
+    def refuse(req, **kwargs):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    quotes, failure, ages = iqr.fetch_quotes_ex("https://synthetic.invalid", "Market_Leaders", ["SYNTH.SR"])
+    assert (quotes, failure, ages) == ({}, "HTTPError 401", {})
+    book = Book()
+    monkeypatch.setattr(iqr, "_open_sheet", lambda *args: book)
+    for mode in ("--scan", "--apply"):
+        monkeypatch.setattr(sys, "argv", ["intraday_quote_refresh", mode, "--backend", "https://synthetic.invalid"])
+        assert iqr.main() == 3, mode
+    out = capsys.readouterr().out
+    assert "[FETCH-FAIL] Market_Leaders: HTTPError 401" in out and "FETCH FAILED on every target page" in out
+    assert "synthetic-secret-value" not in out
+    assert book.pages["_Run_Log"].appends[-1][1] == "ERROR" and book.pages["_Run_Log"].appends[-1][4] == "FETCH_FAILED"
+    assert not book.pages["Market_Leaders"].writes and not book.pages["Global_Markets"].writes
+
+
+def test_v104_one_page_failing_is_not_a_run_failure(monkeypatch):
+    _clear_tokens(monkeypatch)
+    payload = {"row_objects": [source()]}
+    def half(req, **kwargs):
+        if "page=Global_Markets" in req.full_url:
+            raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b""))
+        return Response(payload)
+    monkeypatch.setattr(urllib.request, "urlopen", half)
+    monkeypatch.setattr(iqr, "_open_sheet", lambda *args: Book())
+    monkeypatch.setattr(sys, "argv", ["intraday_quote_refresh", "--scan", "--backend", "https://synthetic.invalid"])
+    assert iqr.main() == 0
+
+
+def test_v104_harvest_drops_block_labels_and_keeps_every_supported_identifier():
+    # Codex review on #916: bare symbols (core/symbols/normalize.py) and long
+    # EODHD suffixes (SAP.XETRA) are supported identifiers and must be kept.
+    page = [["Symbol", "Name"], ["CRC.US", "x"], ["MISSING_FX", "label"], ["CASH_FLOOR", "label"],
+            ["PRICE_XCHECK", "label"], ["RISK/REWARD", "label"], ["1030.SR", "x"], ["AAPL", "x"], ["QQQ", "x"],
+            ["SAP.XETRA", "x"], ["LIVEPOLC-1.MX", "x"], ["GRT-UN.TO", "x"], ["010130.KS", "x"], ["BRK-B.US", "x"],
+            ["0883.HK", "x"]]
+    assert iqr.harvest_symbols({"Top_10_Investments": page}) == [
+        "CRC.US", "1030.SR", "AAPL", "QQQ", "SAP.XETRA", "LIVEPOLC-1.MX", "GRT-UN.TO", "010130.KS", "BRK-B.US",
+        "0883.HK"]
+    # a one-word label cannot be told from a ticker; it is sent and never matches
+    assert iqr.harvest_symbols({"Top_10_Investments": [["Symbol", "Name"], ["TYPE", "label"]]}) == ["TYPE"]
+
+
+def test_v104_age_report_measures_every_returned_quote_fresh_or_not(monkeypatch):
+    rows = [source("AAA.US", acquisition_quote_asof=(NOW - timedelta(minutes=17)).isoformat(),
+                   acquisition_acquired_at=(NOW - timedelta(minutes=1)).isoformat(), currency="USD"),
+            source("BBB.US", acquisition_quote_asof=(NOW - timedelta(minutes=19)).isoformat(),
+                   acquisition_acquired_at=(NOW - timedelta(minutes=1)).isoformat(), currency="USD"),
+            source("CCC.US", acquisition_quote_asof=(NOW - timedelta(minutes=4)).isoformat(),
+                   acquisition_acquired_at=(NOW - timedelta(minutes=1)).isoformat(), currency="USD"),
+            source("SYNTH.SR"),
+            source("NOTASKED.US"),
+            {"symbol": "DDD.US", "current_price": 5}]                     # no proof: not measured
+    rep = iqr.quote_age_report(rows, ["AAA.US", "BBB.US", "CCC.US", "SYNTH.SR", "DDD.US"], NOW)
+    assert set(rep) == {"US", "other"}
+    us = rep["US"]
+    assert us["n"] == 3 and us["within"] == 1 and us["limit"] == 15.0
+    assert abs(us["age_median"] - 17.0) < 1e-6 and abs(us["age_max"] - 19.0) < 1e-6
+    assert abs(us["delay_median"] - 16.0) < 1e-6                         # acquired 1 min ago, quote 17 min old
+    assert rep["other"]["n"] == 1 and rep["other"]["within"] == 1
+
+
+def test_v104_scan_prints_age_lines(monkeypatch, capsys):
+    code, book, calls = main_wire(monkeypatch, apply=False)
+    out = capsys.readouterr().out
+    assert code == 0 and "[AGE] Market_Leaders   other n=1" in out and "within_15min=1" in out
+
+
+def test_v104_workflow_maps_the_backend_token_into_the_refresh_step_only():
+    w = yaml.load(open(iqr.Path(__file__).resolve().parents[1] / ".github/workflows/intraday_refresh.yml").read(),
+                  Loader=yaml.BaseLoader)
+    steps = [st for job in w["jobs"].values() for st in job.get("steps", [])]
+    holders = [st.get("name") for st in steps if "BACKEND_TOKEN" in (st.get("env") or {})]
+    assert holders == ["Refresh decision-symbol quotes"]
+    refresh = next(st for st in steps if st.get("name") == "Refresh decision-symbol quotes")
+    assert refresh["env"]["BACKEND_TOKEN"] == "${{ secrets.BACKEND_TOKEN }}"
+    assert "BACKEND_TOKEN" not in (w.get("env") or {})
+    assert all("BACKEND_TOKEN" not in (job.get("env") or {}) for job in w["jobs"].values())
