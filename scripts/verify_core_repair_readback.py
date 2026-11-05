@@ -16,7 +16,17 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 BACKEND = "https://tadawul-fast-bridge.onrender.com"
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.2.2"
+# v1.2.2 (2026-10-15) - [P0-6 DEFAULT ENFORCE LOCKSTEP]
+# WHY: portfolio_actions 1.17.0 makes TFB_PF_RESEARCH_VIEW default to
+# enforce (owner decision 2026-10-15). A readback that still declared off
+# by default would fail a correctly deployed page with "uncertified
+# portfolio amount was published".
+# WHAT: --expect-pf-research-view defaults to enforce. Every enforce check
+# of v1.2.1 is unchanged (amounts only on BLOCK rows tagged
+# [custody-unverified] that end "; not executable"; every money,
+# execution, weight, cash and alert assertion kept). --expect-pf-research-
+# view off still runs the v1.1.1 probe exactly.
 # v1.2.1 (2026-10-13) - [P0-6 ENFORCE MUST PUBLISH ITS LEVELS]
 # WHY: review of v1.2.0 (PR #764): a declared enforce accepted a blank
 # (None) research amount, so a deployed regression that blanked every
@@ -616,8 +626,8 @@ def main():
                         help="Capture actual three-symbol crypto forecast/ROI precision evidence; no Sheet writes")
     parser.add_argument("--output", default="artifacts/core-repair-readback.json")
     # v1.2.0: the portfolio research view mode this run expects (see header).
-    parser.add_argument("--expect-pf-research-view", default="off",
-                        help="Declared TFB_PF_RESEARCH_VIEW mode: off (default), observe or enforce")
+    parser.add_argument("--expect-pf-research-view", default="enforce",
+                        help="Declared TFB_PF_RESEARCH_VIEW mode: enforce (default since 1.2.2), observe or off")
     args = parser.parse_args()
     research_view = str(args.expect_pf_research_view or "").strip().lower()
     token = os.getenv("BACKEND_TOKEN", "").strip()

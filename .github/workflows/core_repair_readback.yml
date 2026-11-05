@@ -68,13 +68,16 @@ jobs:
       # mode armed on Render (TFB_PF_RESEARCH_VIEW). Unset Variable = off =
       # the previous probe exactly. Set the Variable only after arming the
       # same mode on Render; enforce needs this declaration or it fails.
+      # 2026-10-15 (portfolio_actions 1.17.0): the research view defaults to
+      # enforce, so the unset Variable declares enforce in lockstep. A
+      # Variable set to off must match TFB_PF_RESEARCH_VIEW=off on Render.
       - name: Verify deployed SHA, authenticated signing and empty allocation
         env:
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           EXPECTED_COMMIT: ${{ github.sha }}
           WORKFLOW_SOURCE_SHA: ${{ github.sha }}
           TINY_QUOTE_READBACK: ${{ inputs.tiny_quote_readback }}
-          TFB_PF_RESEARCH_VIEW_EXPECT: ${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'off' }}
+          TFB_PF_RESEARCH_VIEW_EXPECT: ${{ vars.TFB_PF_RESEARCH_VIEW_EXPECT || 'enforce' }}
         run: |
           set -euo pipefail
           args=(--expected-commit "$EXPECTED_COMMIT" --workflow-source-sha "$WORKFLOW_SOURCE_SHA"

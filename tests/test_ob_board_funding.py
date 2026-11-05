@@ -153,7 +153,9 @@ def test_ordinary_requests_keep_existing_allocation_behavior():
     assert "board_funding" not in ordinary["meta"]
 
 
-def test_research_retains_all_qualified_names_without_cash_or_sector_reservations():
+def test_research_retains_all_qualified_names_without_cash_or_sector_reservations(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     rows = [_row("HIGH.SR"), _row("LATER.SR", 20.0), _row("THIRD.SR", 18.0)]
     payload = _research(rows)
     assert [t["symbol"] for t in payload["selected"]] == [
@@ -165,7 +167,9 @@ def test_research_retains_all_qualified_names_without_cash_or_sector_reservation
     assert not any(row.get("failed_gate") == "Funding" for row in payload["near_miss"])
 
 
-def test_research_zero_cash_produces_no_capital_solicitation():
+def test_research_zero_cash_produces_no_capital_solicitation(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     payload = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)], portfolio={
         "cash_available_sar": 0.0
     })
@@ -174,7 +178,9 @@ def test_research_zero_cash_produces_no_capital_solicitation():
     _assert_no_execution(payload)
 
 
-def test_research_snapshot_preserves_exact_qualified_input_and_signed_basis():
+def test_research_snapshot_preserves_exact_qualified_input_and_signed_basis(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     rows = [_row("HIGH.SR"), _row("LATER.SR", 20.0), _row("BLOCKED.SR", 30.0,
         investability_status="BLOCKED", block_reason="synthetic identity mismatch")]
     payload = _research(rows)
@@ -191,7 +197,9 @@ def test_research_snapshot_preserves_exact_qualified_input_and_signed_basis():
     assert isinstance(frozen["xchecks"], dict)
 
 
-def test_snapshot_overflow_keeps_research_display_and_disables_allocation():
+def test_snapshot_overflow_keeps_research_display_and_disables_allocation(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     rows = [_row("S%03d.SR" % i) for i in range(501)]
     payload = _research(rows)
     funding = payload["meta"]["board_funding"]
@@ -202,7 +210,9 @@ def test_snapshot_overflow_keeps_research_display_and_disables_allocation():
     _assert_no_execution(payload)
 
 
-def test_later_confirmed_name_receives_cash_and_sector_capacity_before_research_names():
+def test_later_confirmed_name_receives_cash_and_sector_capacity_before_research_names(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)])
     allocated = _allocate(research, ["LATER.SR"])
     assert allocated["status"] == "ok", allocated.get("message")
@@ -229,7 +239,9 @@ def test_empty_final_eligibility_reserves_nothing_and_requests_no_money():
     _assert_no_execution(allocated)
 
 
-def test_funding_shortfall_and_capital_call_cover_only_final_eligible_names():
+def test_funding_shortfall_and_capital_call_cover_only_final_eligible_names(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     portfolio = {"cash_available_sar": 4_000.0}
     research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)], portfolio=portfolio)
     allocated = _allocate(research, ["LATER.SR"], portfolio=portfolio)
@@ -271,7 +283,9 @@ def test_eligibility_cannot_add_a_candidate_absent_from_qualified_snapshot():
     _assert_no_execution(allocated)
 
 
-def test_allocation_reuses_existing_weight_lot_and_funding_policy():
+def test_allocation_reuses_existing_weight_lot_and_funding_policy(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     criteria = {"max_weight_pct": 25.0, "min_ticket_sar": 0.0, "lot_size": 3}
     research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)], criteria=criteria)
     allocated = _allocate(research, ["LATER.SR"], criteria=criteria)
@@ -282,12 +296,16 @@ def test_allocation_reuses_existing_weight_lot_and_funding_policy():
         assert allocated["kpis"][key] == ordinary["kpis"][key]
 
 
-def test_same_frozen_allocation_is_idempotent():
+def test_same_frozen_allocation_is_idempotent(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)])
     first = _allocate(research, ["LATER.SR"])
     second = _allocate(research, ["LATER.SR"])
     first["meta"].pop("generated_at_utc", None)
     second["meta"].pop("generated_at_utc", None)
+    # the replay must be a funded allocation, not two empty payloads
+    assert first["selected"], first["selected"]
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
@@ -467,6 +485,8 @@ def test_snapshot_transport_is_byte_bounded_and_does_not_disclose_signing_key():
 
 
 def test_allocation_replays_signed_price_verification_without_network_fetch(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     monkeypatch.setenv("TFB_T10_PRICE_XCHECK", "enforce")
     monkeypatch.setenv("TFB_T10_PRICE_XCHECK_STRICT", "1")
     calls = []
@@ -493,6 +513,8 @@ def test_allocation_replays_signed_price_verification_without_network_fetch(monk
 
 
 def test_scan_uncapped_normalizes_same_effective_policy_in_both_passes(monkeypatch):
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     monkeypatch.setenv("TFB_OPP_SCAN_UNCAPPED", "1")
     criteria = {"max_candidates": 1}
     research = _research([_row("HIGH.SR"), _row("LATER.SR", 20.0)], criteria=criteria)

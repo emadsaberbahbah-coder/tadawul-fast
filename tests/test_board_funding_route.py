@@ -170,6 +170,8 @@ def test_current_shared_auth_configurations_round_trip_at_real_mounted_route(
     real_authenticated_board_route, monkeypatch, config_name,
 ):
     client, _calls = real_authenticated_board_route
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     token = "accepted-route-token"
     configured = (token + ",accepted-route-backup"
                   if config_name.endswith("TOKENS") else token)
@@ -341,8 +343,12 @@ def test_normalized_criteria_preserve_snapshot_dict_and_symbol_list():
     assert criteria["board_funding_snapshot"] == frozen
 
 
-def test_mounted_route_round_trip_replays_snapshot_without_provider_refresh(mounted_board_route):
+def test_mounted_route_round_trip_replays_snapshot_without_provider_refresh(
+    mounted_board_route, monkeypatch,
+):
     client, calls = mounted_board_route
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     body = _research_body()
     first = client.post("/sheet-rows/opportunity-candidates", json=body)
     assert first.status_code == 200
@@ -441,9 +447,11 @@ def test_deployment_readback_probe_runs_real_mounted_blocked_snapshot_protocol(
 
 
 def test_real_node_json_round_trip_preserves_signed_snapshot_and_rejects_tampering(
-    mounted_board_route,
+    mounted_board_route, monkeypatch,
 ):
     client, calls = mounted_board_route
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     body = _research_body()
     body["rows"][0]["synthetic_numeric_metadata"] = {
         "values": [100.0, -0.0, 1e-7, 1.0000000000000002],
@@ -476,6 +484,8 @@ def test_backend_selector_research_uses_frozen_rows_without_second_collection(
     mounted_board_route, monkeypatch,
 ):
     client, calls = mounted_board_route
+    # 2026-10-15: default armed in code; this case tests the legacy/off path
+    monkeypatch.setenv("TFB_OPP_RESEARCH_DIVERSIFY", "0")
     body = _research_body()
     rows = body.pop("rows")
     async def collect(**_kwargs):

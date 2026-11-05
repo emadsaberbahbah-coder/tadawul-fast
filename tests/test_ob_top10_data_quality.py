@@ -60,7 +60,8 @@ def _clock(now):
 def _setup(mp, module=ob, now=NOW, arm=()):
     mp.setattr(module, "datetime", _clock(now))
     for name in GATES:
-        mp.delenv(name, raising=False)
+        # 2026-10-15: default armed in code; this case tests the legacy/off path
+        mp.setenv(name, "0")
     mp.setenv("TFB_OPP_ENABLED", "1")
     mp.setenv("TFB_TICKET_FRESHNESS_GATE", "1")
     mp.setenv("TFB_T10_PRICE_XCHECK", "off")
@@ -127,7 +128,9 @@ def canon(payload):
     text = json.dumps(p, sort_keys=True, default=str)
     # 2026-10-27 merge of #778: the stamps now read 1.28.0 (main, the golden
     # base) and 1.28.1 (this build).
-    return re.sub(r"1\.2[678]\.[0-3]", "<ver>", text)
+    # 2026-10-27 merge into #779: the defaults build is 1.28.2 (authored as
+    # 1.28.0); the same pattern covers it.
+    return re.sub(r"1\.2[678]\.[0-3]", "<ver>", text)   # 2026-10-15: + v1.28.0; 2026-10-22: + 1.27.2/1.27.3
 
 
 def by_symbol(payload):
@@ -352,9 +355,12 @@ def case_w13_route_passes_the_key_through(mp, _tmp):
 def case_w14_verifier_registers_flags_and_pin(mp, _tmp):
     text = (ROOT / "scripts" / "verify_deployment.py").read_text()
     for name in GATES:
-        assert "('" + name + "', '0'," in text, name
+        # 2026-10-15: v1.28.0 arms VENUE_CAL_EXT and FRESHNESS_ALERT by default
+        # (merge note 2026-10-27 (#779): the defaults build is 1.28.2 over #778's 1.28.1)
+        default = "0" if name == "TFB_OPP_AUDIT_KEEP" else "1"
+        assert "('" + name + "', '" + default + "'," in text, name
     assert '"%s", "opportunity builder"' % ob.OPPORTUNITY_BUILDER_VERSION in text
-    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")[:3]) >= (1, 27, 1)
+    assert tuple(int(x) for x in ob.OPPORTUNITY_BUILDER_VERSION.split(".")[:3]) >= (1, 28, 2)   # merge note 2026-10-27 (#779): the defaults build is 1.28.2 over #778's 1.28.1
 
 
 # --------------------------------------------------------------- negative ---
@@ -366,6 +372,9 @@ def case_n1_off_spellings_are_off(mp, _tmp):
         for name in GATES:
             mp.setenv(name, value)
         assert canon(build()) == ref, value
+    for name in GATES:   # 2026-10-15: unset now arms the two v1.28.0 defaults (v1.28.2 since 2026-10-27)
+        mp.delenv(name)
+    assert canon(build()) != ref
 
 
 def case_n2_never_raises(mp, _tmp):
