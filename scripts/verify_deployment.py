@@ -233,7 +233,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # codes for the calendar, both gated).
     # 2026-11-03 (same rule): 1.3.2 -> 1.4.0 (fetch_next_exdiv_detail, additive;
     # its only caller is run_calendar_sync 1.3.0 behind TFB_CAL_DIVIDENDS).
-    ("core.providers.calendar_provider", "__version__", "1.4.0",
+    # 2026-11-03 (same rule; #889 merged onto #905): 1.4.0 -> 1.5.0 (Saudi
+    # past reports from Yahoo, TFB_CAL_LAST_REPORT_YAHOO, default off; written
+    # 2026-11-01 as 1.3.2 -> 1.4.0, renumbered after #905 shipped 1.4.0).
+    ("core.providers.calendar_provider", "__version__", "1.5.0",
      "calendar provider"),
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read

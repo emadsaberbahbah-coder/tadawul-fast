@@ -143,7 +143,8 @@ def test_d2_fetch_requests_failures_and_live_shape(cp, monkeypatch):
     assert calls[0][1]["to"] == "2026-12-02"
     monkeypatch.setattr(cp, "is_enabled", lambda: False)
     assert cp.fetch_next_exdiv_detail_sync(["INDV.US"]) == {}
-    assert cp.__version__ == "1.4.0"
+    # 2026-11-03: v1.5.0 (#889, Saudi past reports from Yahoo, gated off) stacked; pin moved
+    assert cp.__version__ == "1.5.0"
     assert {"fetch_next_exdiv_detail", "fetch_next_exdiv_detail_sync"} <= set(cp.__all__)
 
 
@@ -473,7 +474,8 @@ def test_d10_workflow_mapping_and_pins():
     assert env["TFB_CAL_DIVIDENDS"] == "${{ vars.TFB_CAL_DIVIDENDS || 'off' }}"
     assert env["TFB_CAL_LAST_REPORT"] == "${{ vars.TFB_CAL_LAST_REPORT || 'off' }}"
     verifier = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.providers.calendar_provider", "__version__", "1.4.0",' in verifier
+    # 2026-11-03: calendar_provider v1.5.0 (#889) stacked; pin moved
+    assert '("core.providers.calendar_provider", "__version__", "1.5.0",' in verifier
     assert '("run_calendar_sync", "1.3.0", "calendar sync"),' in verifier
     for path in (ROOT / "scripts" / "run_calendar_sync.py", ROOT / "core" / "providers" / "calendar_provider.py"):
         added = path.read_text(encoding="utf-8")
