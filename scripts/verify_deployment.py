@@ -245,7 +245,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
 SCRIPTS: List[Tuple[str, str, str]] = [
     ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
-    ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
+    ("approved_universe_scope", "1.0.1", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
     # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
     # (the FEED banner detail keeps up to 1,000 characters).
@@ -264,7 +264,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
 
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
-    ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
+    ("finalize_decision_publication", "1.1.3", "final decision-publication acceptance"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
     # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,

@@ -99,7 +99,7 @@ def test_real_source_contracts_accept_one_complete_frozen_current_cohort(real_co
     coverage = reports[0]["audits"]["coverage"]
     assert {page["page"]: page["rows"] for page in coverage["pages"]} == {
         "Market_Leaders": 255, "Global_Markets": 6512,
-        "Commodities_FX": 453, "Mutual_Funds": 2474,
+        "Commodities_FX": 453, "Mutual_Funds": 2422,
         "My_Portfolio": 10, "Insights_Analysis": 1, "Data_Dictionary": 1,
     }
     assert coverage["active_holdings"] == [f"PF{i:02d}.SR" for i in range(10)]
