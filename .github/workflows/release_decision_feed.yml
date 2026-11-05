@@ -1,6 +1,46 @@
 # =============================================================================
 # Release Decision Feed (P0-1) - .github/workflows/release_decision_feed.yml
 # =============================================================================
+# VERSION 1.4.1 (2026-10-24, renumbered 2026-10-31, 2026-11-02 and 2026-11-03;
+# authored as 1.1.1, which main reserved for this PR) -- SCHEDULED SLOT
+# DEFERRAL (release_decision_feed.py v1.4.1, authored as v1.2.1). Merged
+# over main's 1.2.0 (render settle); both
+# gates sit in the release STEP env, and either one off leaves the other as is.
+# The release step maps TFB_RELEASE_INFLIGHT_DEFER from the repository
+# variable (default '0' = v1.3.0 behaviour; v1.2.0 when authored). Armed, a
+# scheduled source=auto attempt
+# that lands inside the daily_sync which superseded or produced its cohort exits 1
+# (deferred, green with a warning below) instead of 3, and the one key-block read
+# retries transport faults. Mapped in the STEP env so the job env stays the final
+# job's env plus the two release gates. ROLLBACK: delete the variable.
+# Renumbered 1.2.1 -> 1.3.1 on 2026-11-02 after #893 shipped workflow 1.3.0
+# (step 'Defer while a production sync is running'). MERGE NOTE: read
+# 'v1.3.0 behaviour' above as the SCRIPT's v1.3.0 (main's script is still
+# v1.3.0); with this gate off the workflow behaves as 1.3.0.
+# COEXISTENCE with 1.3.0's defer step (TFB_RELEASE_DEFER_DURING_SYNC): at
+# most one deferral per slot. When that step records deferred=true the
+# release step, and so this gate, does not run. When it does not defer (gate
+# off, a dispatched run, no daily_sync busy at its one listing, or an ARMED
+# sticky kill) the script runs and this gate may defer once, only for the
+# exact run its own probe lists as busy (daily_sync.yml,
+# page_refresh_recovery.yml, grid_capacity_repair.yml). The sticky kill
+# always wins: that step never defers an armed kill, and the script's kill
+# branch (step 2) returns before this gate's steps 4 and 5; this gate's only
+# earlier change is the read retry at step 1 (a read, never a write). Both
+# gates off: as 1.3.0 with its step skipped (the result JSON differs only
+# in script_version).
+# Renumbered 1.3.1 -> 1.4.1 on 2026-11-03 after #904 shipped workflow 1.4.0
+# (render hold mapping) and release_decision_feed.py v1.4.0
+# (TFB_RELEASE_RENDER_HOLD, default off). MERGE NOTE: read 'v1.3.0
+# behaviour', 'behaves as 1.3.0' and 'as 1.3.0 with its step skipped'
+# above as the script's v1.4.0 and workflow 1.4.0 (main's script is v1.4.0
+# now). The release step env now carries three script gates (render
+# settle, render hold, this one); each off leaves the others as they are.
+# This gate's deferrals (script steps 4 and 5) return before the strict
+# audits, the render hold acts only after them (step 7a), so a run ends in
+# at most one deferral; a deferral by the defer step still skips the
+# script, and the sticky kill still answers first.
+#
 # VERSION 1.4.0 (2026-11-03) -- RENDER HOLD MAPPING (release_decision_feed 1.4.0)
 #
 # WHY (3 Nov 2026): a re-verification of the live release of run
@@ -394,6 +434,9 @@ jobs:
           TFB_RELEASE_RENDER_SETTLE: ${{ vars.TFB_RELEASE_RENDER_SETTLE || '0' }}
           # v1.4.0: release_decision_feed 1.4.0 render hold (default OFF).
           TFB_RELEASE_RENDER_HOLD: ${{ vars.TFB_RELEASE_RENDER_HOLD || '0' }}
+          # v1.4.1 (authored as v1.1.1; 1.2.1 until 2026-11-02, 1.3.1 until 2026-11-03):
+          # scheduled-slot deferral (release_decision_feed.py v1.4.1).
+          TFB_RELEASE_INFLIGHT_DEFER: ${{ vars.TFB_RELEASE_INFLIGHT_DEFER || '0' }}
         run: |
           set -euo pipefail
           code=0

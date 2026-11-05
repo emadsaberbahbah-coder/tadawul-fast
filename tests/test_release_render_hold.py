@@ -439,7 +439,9 @@ def case_h10_gate_vocabulary_and_constants(mp, tmp_path):
     assert R._RENDER_HOLD_REASONS <= vocabulary
     assert vocabulary - R._RENDER_HOLD_REASONS == {
         "run_id_not_source", "not_strict", "coverage_summary_not_zero", "cockpit_run_stamps_missing"}
-    assert R.SCRIPT_VERSION == "1.4.0"
+    # 2026-11-03 (#831 merge of main #898-#906): a floor; #831's 1.4.1 carries
+    # this hold unchanged (H12 still pins the verifier to R.SCRIPT_VERSION).
+    assert tuple(int(part) for part in R.SCRIPT_VERSION.split(".")) >= (1, 4, 0)
 
 
 def _base_module(tmp_path):
@@ -555,7 +557,10 @@ def case_h12_workflow_mapping_and_summary(mp, tmp_path):
         if name not in (RELEASE_STEP, "Publish release summary"):
             assert steps[name] == step, name
     base_run = dict(base_steps[RELEASE_STEP], env=dict(base_steps[RELEASE_STEP]["env"]))
-    mine = dict(run, env={key: value for key, value in run["env"].items() if key != HOLD_ENV})
+    # 2026-11-03 (#831 merge): #831's TFB_RELEASE_INFLIGHT_DEFER line (workflow
+    # 1.4.1) sits next to this one in the same step env.
+    mine = dict(run, env={key: value for key, value in run["env"].items()
+                          if key not in (HOLD_ENV, "TFB_RELEASE_INFLIGHT_DEFER")})
     assert mine == base_run
     assert yaml.safe_load(base_text)["jobs"]["release-decision-feed"]["env"] == job["env"]
 

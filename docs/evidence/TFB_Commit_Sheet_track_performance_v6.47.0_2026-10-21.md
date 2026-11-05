@@ -265,3 +265,16 @@ The first review's four refuted claims:
 - **`maturity_date`** is the audit time, as for every maturity. This only affects plot ordering.
 - **Provider:** the close comes from Yahoo through yfinance. It is a different provider from the current-quote witness but is the exact session's close. Observe is the step that shows whether the runner can reach it.
 - **CI coverage:** the harness is not enrolled in the blocking lean list. `ci.yml` is edited by open #778, so enrolling here would collide with its version lines; enrolling is proposed once #778 lands. The advisory whole-suite job collects it. N1, N2 and N4 need the base copy (`git show df99bcf3` since the merge, `55b47f24` before it, or `TFB_TEST_TP_BASE`) and skip in a shallow checkout. They were run locally, as recorded above.
+
+## Erratum (2026-10-24)
+
+The **Coverage** bullet above says "those past the 5-day grace EXPIRE as UNPRICED under the existing behaviour". That is not what happens in production.
+
+- **Why the expiry never fires:**
+  - With the default `TFB_TRACK_PRICE_FALLBACK` on, the Yahoo fallback joins its own reason onto every symbol it leaves unpriced (`scripts/track_performance.py` around L9917-9919). `_yahoo_chart_fallback_prices` sets a reason on every exit.
+  - The grace expiry fires only on the exact reason `price_unavailable` (around L10025).
+  - The only expiry test forces the fallback off (`tests/test_outcome_price_evidence.py` autouse fixture).
+- **Production logs:** every audited Performance Clock run since #742 (merged 2026-10-08 22:26Z) logs `expired-unpriced=0`.
+  - The unpriced population: on 23 Oct the backend left 359 symbols unpriced, and the fallback priced 0 of them (16 HTTP 429, then 343 skipped by the breaker; job 120614987176, run 40012156458).
+  - Their overdue records stay ACTIVE. They are part of the run's `pending-price=3956`, which counts every pending record. Most of those are wrong-session quotes, the HIST-CLOSE class.
+- **Status:** this is the behaviour main has today, not something v6.47.0 changed. `docs/reviews/witnessed-outcomes-20261009.md` (L62-65) lets only an actually absent price expire. Whether a rate-limited or breaker-skipped fallback miss counts as absent is an owner policy decision. No code change is proposed until it is made (daily review of 2026-10-24).
