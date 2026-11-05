@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.57.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,56 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# v6.57.0 (2026-11-05) [SESSION-OVERRIDES]: a forecast on a day the pinned
+# exchange calendar mis-times (the Korean exam day, the JSE half days) is
+# judged on that day's real hours, not on a close that is wrong by an hour or
+# five. ONE ENV gate, DEFAULT OFF (TRACK_SESSION_OVERRIDES) = v6.53.0
+# byte-identical apart from the version string. 6.54.0, 6.55.0 and 6.56.0 are
+# claimed by the open PRs #845, #857 and #915, so this build takes 6.57.0;
+# whichever lands later re-numbers.
+# EVIDENCE (pinned exchange_calendars 4.13.2; the base map, no gate needed):
+#   XKRX (.KS .KO): the library shifts every Korean college-exam (CSAT) day by
+#   +1h (special_offsets_adhoc), but its date list precomputed_csat_days ends
+#   at 2020-12-03, so 2024-11-14, 2025-11-13 and 2026-11-19 read 09:00-15:30
+#   KST while KRX trades 10:00-16:30 (continuous to 16:20, closing call to
+#   16:30; the 2025 hours were announced 30 Oct 2025, the 2027 exam is Thu 19
+#   Nov 2026). Replayed offline on main a85edfc6 with the REAL audit loop: a
+#   005930.KS record targeting 2026-11-19 05:00Z, audited at 07:05Z with a
+#   regular-market quote stamped 06:40Z (15:40 KST, continuous trading),
+#   MATURES (WIN) on that intraday price - it falls inside the 15-minute close
+#   slack of the calendar's 15:30 close. The record is then scored about 50
+#   minutes before the real close.
+#   XJSE (.JSE): the calendar keeps 17:00 SAST on 24 and 31 Dec; the JSE
+#   closes at 12:00 on both half days (2024 and 2025 notices; the same rule is
+#   expected for 2026). Under TRACK_HIST_TARGET_CLOSE=enforce an NPN.JSE
+#   record targeting 2026-12-24 12:00Z (14:00 SAST) matures on the 24 Dec bar,
+#   struck at 12:00 SAST before its target (one session early).
+# WHAT: _OUTCOME_SESSION_OVERRIDES = {MIC: {session label: (open, close)}} in
+#   UTC ISO stamps (None keeps the calendar's value). _outcome_sessions applies
+#   it through _outcome_session_override only when TRACK_SESSION_OVERRIDES is
+#   on / 1 / true / yes; every other session, every other MIC and every
+#   refusal are unchanged. The table only re-times sessions the calendar
+#   already has (the harness pins that each entry names a calendar session and
+#   changes it), so it never adds or removes a trading day. Both the live-quote
+#   check and the target session read _outcome_sessions, so the v6.47.0
+#   historical close is stamped with the corrected close too.
+# ENV LANE: track_performance.yml 'Run performance clock' (1.0.11) and
+#   daily_sync.yml's tracker step map TRACK_SESSION_OVERRIDES (|| 'off') - ENV
+#   PARITY.
+# ARMING (owner): repository Variable TRACK_SESSION_OVERRIDES=on BEFORE Thu
+#   19 Nov 2026 (the next exam day). Receipts on those days then carry the
+#   corrected target_session_close; nothing else changes.
+# KNOWN LIMITS: (1) the table is maintained by hand; a new special session
+#   needs a new row (the harness checks each row against the pinned calendar,
+#   not against the venue). (2) The 2026 JSE half days and the 2026 exam-day
+#   hours follow the venues' recurring rules; their 2026 notices were not yet
+#   published on 2026-11-05. (3) #915's .KQ and .JO denials stay as they are;
+#   once both land they can be lifted for these days.
+# ZERO functions removed. Additions: _session_overrides_enabled,
+#   _outcome_session_override, _OUTCOME_SESSION_OVERRIDES.
+# ROLLBACK: unset TRACK_SESSION_OVERRIDES (or set off). Records matured
+#   meanwhile keep their receipts (target_session_close shows the hours used).
+SCRIPT_VERSION = "6.57.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3444,6 +3493,60 @@ def _outcome_calendar_schedule(name: str, utc_day: str) -> Tuple[Tuple[str, date
                   cal.session_close(s).to_pydatetime()) for s in sessions)
 
 
+# v6.57.0 [SESSION-OVERRIDES] (TRACK_SESSION_OVERRIDES, default off): sessions
+# the pinned exchange_calendars 4.13.2 mis-times, as (open, close) in UTC ISO
+# stamps; None keeps the calendar's value. Only sessions the calendar already
+# has are re-timed (the harness pins it). Sources: the v6.57.0 WHY above.
+_OUTCOME_SESSION_OVERRIDES = {
+    # KRX college-exam (CSAT) days: 10:00-16:30 KST (the library's own +1h
+    # rule; its date list ends at 2020-12-03).
+    "XKRX": {
+        "2024-11-14": ("2024-11-14T01:00:00+00:00", "2024-11-14T07:30:00+00:00"),
+        "2025-11-13": ("2025-11-13T01:00:00+00:00", "2025-11-13T07:30:00+00:00"),
+        "2026-11-19": ("2026-11-19T01:00:00+00:00", "2026-11-19T07:30:00+00:00"),
+    },
+    # JSE half days: close 12:00 SAST.
+    "XJSE": {
+        "2024-12-24": (None, "2024-12-24T10:00:00+00:00"),
+        "2024-12-31": (None, "2024-12-31T10:00:00+00:00"),
+        "2025-12-24": (None, "2025-12-24T10:00:00+00:00"),
+        "2025-12-31": (None, "2025-12-31T10:00:00+00:00"),
+        "2026-12-24": (None, "2026-12-24T10:00:00+00:00"),
+        "2026-12-31": (None, "2026-12-31T10:00:00+00:00"),
+    },
+}
+
+
+def _session_overrides_enabled() -> bool:
+    """v6.57.0: TRACK_SESSION_OVERRIDES=1/on/true/yes re-times the sessions in
+    _OUTCOME_SESSION_OVERRIDES. DEFAULT OFF."""
+    return (os.getenv("TRACK_SESSION_OVERRIDES") or "off").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _outcome_session_override(name: str, sessions: Tuple[Tuple[str, datetime, datetime], ...]
+                              ) -> Tuple[Tuple[str, datetime, datetime], ...]:
+    """v6.57.0 PURE: `sessions` with every override for calendar `name` applied
+    (open and/or close replaced); sessions the table does not name, and any
+    other calendar, come back unchanged. On a malformed entry the calendar's
+    own schedule is returned. Never raises."""
+    table = _OUTCOME_SESSION_OVERRIDES.get(name)
+    if not table:
+        return sessions
+    try:
+        out = []
+        for label, opened, closed in sessions:
+            spec = table.get(label)
+            if spec is not None:
+                if spec[0]:
+                    opened = datetime.fromisoformat(spec[0]).astimezone(timezone.utc)
+                if spec[1]:
+                    closed = datetime.fromisoformat(spec[1]).astimezone(timezone.utc)
+            out.append((label, opened, closed))
+        return tuple(out)
+    except Exception:
+        return sessions
+
+
 def _outcome_sessions(symbol: str, around: datetime) -> Tuple[str, Tuple[Tuple[str, datetime, datetime], ...]]:
     """Bounded offline exchange-calendar evidence; unavailable means unknown.
 
@@ -3460,6 +3563,9 @@ def _outcome_sessions(symbol: str, around: datetime) -> Tuple[str, Tuple[Tuple[s
     name = _OUTCOME_CALENDARS.get(suffix)
     if name is None or ("." not in raw and not raw[0].isalpha()):
         raise ValueError("outcome_calendar_unknown")
+    if _session_overrides_enabled():   # v6.57.0 [SESSION-OVERRIDES] (default off)
+        return name, _outcome_session_override(
+            name, _outcome_calendar_schedule(name, around.astimezone(timezone.utc).date().isoformat()))
     return name, _outcome_calendar_schedule(name, around.astimezone(timezone.utc).date().isoformat())
 
 
