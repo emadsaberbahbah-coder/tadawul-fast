@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, '../../apps_script/16_Decisi
 const plain = value => JSON.parse(JSON.stringify(value));
 const NOW = Date.parse('2026-10-12T09:30:00Z');
 const STAMP = '2026-10-12 12:00:00+03:00';
-const FLOORS = {Market_Leaders:255, Global_Markets:6512, Commodities_FX:453, Mutual_Funds:2474};
+const FLOORS = {Market_Leaders:255, Global_Markets:6512, Commodities_FX:453, Mutual_Funds:2422};   // 2026-11-05: v1.21.1 approved fund scope 2422 (52 dead rows retired)
 const SCOPE_PAGES = ['Market_Leaders','Mutual_Funds'];
 const FULL_PAGES = ['Market_Leaders','Global_Markets','Commodities_FX','Mutual_Funds'];
 const SYMBOLS = Object.fromEntries(FULL_PAGES.map(page => [page, Array.from({length:FLOORS[page]},(_,i) => 'SYNTH_' + page.toUpperCase() + '_' + String(i).padStart(4,'0'))]));
@@ -129,7 +129,7 @@ test('source acquisition exactly 95 percent passes and lower percentage fails',(
 test('current scoped counts and Global/commodities floors match the approved contract',()=>assert.deepEqual(plain(load().DT10_SOURCE_MIN_ROWS),FLOORS));
 test('dated scoped approval supersedes old properties; unscoped properties may only tighten floors',()=> {
   const ctx=load({TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS:'1025',TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS:'4496',TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS:'6500',TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX:'454'});
-  const policy=ctx.dt10SourcePolicy_();assert.equal(policy.floors.Market_Leaders,255);assert.equal(policy.floors.Mutual_Funds,2474);
+  const policy=ctx.dt10SourcePolicy_();assert.equal(policy.floors.Market_Leaders,255);assert.equal(policy.floors.Mutual_Funds,2422);
   assert.equal(policy.floors.Global_Markets,6512);assert.equal(policy.floors.Commodities_FX,454);
   assert.deepEqual(plain(policy.superseded_properties),{Market_Leaders:1025,Mutual_Funds:4496});
   assert.equal(core(ctx,goodGrid(),null,policy).ready,false);
@@ -137,7 +137,7 @@ test('dated scoped approval supersedes old properties; unscoped properties may o
 test('embedded dated scope counts/hashes exactly match the approved manifest without an embedded raw roster',()=> {
   const ctx=load({}, {nativeHashes:true});
   const manifest=JSON.parse(fs.readFileSync(path.join(__dirname,'../../config/approved_universe_scope_v1.json'),'utf8'));
-  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 21, 0][k] ? 1 : x < [1, 21, 0][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.21.0 (merge note 2026-11-03, #778: held seats are v1.21.1 over #906): ' + ctx.DT10_VERSION);   /* 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved */assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
+  assert.ok(String(ctx.DT10_VERSION).split('.').map(Number).reduce((a, x, k) => a !== 0 ? a : (x > [1, 21, 1][k] ? 1 : x < [1, 21, 1][k] ? -1 : 0), 0) >= 0, 'DT10_VERSION floor 1.21.1 (merge note 2026-11-05, #778: held seats are v1.21.2 over #921): ' + ctx.DT10_VERSION);   /* 2026-11-05: v1.21.1 approved fund scope, pin moved */   /* 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved */assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.policy_revision,manifest.policy_revision);
   assert.equal(ctx.DT10_SOURCE_APPROVED_SCOPE.approved_on,manifest.approved_on);
   for(const page of SCOPE_PAGES) {
     const declared=ctx.DT10_SOURCE_APPROVED_SCOPE.pages[page],approved=manifest.pages[page];
@@ -150,14 +150,14 @@ test('actual full physical scope reads consume one digest per page and produce o
   const result=ctx.dt10SourceReadiness_(ss);
   assert.equal(result.ready,true);assert.equal(ctx._digestCalls.length,2);
   assert.deepEqual(ss.scopeCalls.map(r=>r.slice(0,3)),[['Market_Leaders',1,1],['Market_Leaders',2,2],['Mutual_Funds',1,1],['Mutual_Funds',2,2]]);
-  assert.deepEqual(ss.scopeCalls.filter(r=>r[2]===2).map(r=>r.slice(3)),[[255,1],[2474,1]]);
-  assert.equal(result.scope_policy_revision,'2026-10-12.current-workbook.v1');
+  assert.deepEqual(ss.scopeCalls.filter(r=>r[2]===2).map(r=>r.slice(3)),[[255,1],[2422,1]]);
+  assert.equal(result.scope_policy_revision,'2026-11-05.mf-retire-52.v2');
   assert.deepEqual(plain(result.superseded_scope_properties),{Market_Leaders:1025,Mutual_Funds:4496});
   for(const page of SCOPE_PAGES) {
     const receipt=result.approved_scope[page];
     assert.equal(receipt.ready,true);assert.equal(receipt.actual_count,FLOORS[page]);
     assert.equal(receipt.observed_symbol_set_sha256,symbolDigest(SYMBOLS[page]));
-    assert.equal(receipt.policy_revision,'2026-10-12.current-workbook.v1');
+    assert.equal(receipt.policy_revision,'2026-11-05.mf-retire-52.v2');
   }
   assert(!JSON.stringify(result.approved_scope).includes(SYMBOLS.Market_Leaders[0]),'receipt contains no raw symbols');
 });
@@ -244,7 +244,7 @@ function overlappedPool(cap=50000, symbolFirst=false) {
 }
 test('five individual earlier-owner duplicates reconcile approved physical funds with the smaller complete unique pool',()=> {
   const {ctx,ss,before,collected}=overlappedPool();
-  assert.equal(collected.available.Mutual_Funds,2469);assert.equal(collected.approved_scope.Mutual_Funds.actual_count,2474);
+  assert.equal(collected.available.Mutual_Funds,2417);assert.equal(collected.approved_scope.Mutual_Funds.actual_count,2422);
   assert.equal(collected.pool_reconciliation.run,'90001');assert.equal(collected.pool_reconciliation.excluded.length,5);
   assert.deepEqual(plain(collected.pool_reconciliation.excluded),[
     {symbol:'COPX.US',page:'Mutual_Funds',owner:'Commodities_FX'},
@@ -256,7 +256,7 @@ test('five individual earlier-owner duplicates reconcile approved physical funds
   const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,true,result.reason);
   assert.equal(result.pool_reconciliation.ready,true);
   const text=ctx.dt10PoolNote_(collected,result);
-  assert(text.includes('Mutual_Funds 2469/2474'));assert(text.includes('pool_reconciliation_v1='));
+  assert(text.includes('Mutual_Funds 2417/2422'));assert(text.includes('pool_reconciliation_v1='));
   assert(text.includes('source readiness VERIFIED (run 90001)'));
   const unsigned=plain(collected.pool_reconciliation);delete unsigned.sha256;
   assert.equal(collected.pool_reconciliation.sha256,crypto.createHash('sha256').update(JSON.stringify(unsigned)).digest('hex'));
@@ -288,8 +288,8 @@ test('missing receipt, changed earlier-owner grid, bad checksum and explicit cap
     const result=ctx.dt10SourceReadiness_(ss,before);assert.equal(result.ready,false,mode);
     assert.equal(ctx.dt10BoardVerdict_(ss,before).state,'NOT_ACTIONABLE');
     if(mode==='cap') {
-      assert.equal(collected.pool_reconciliation.pages.Mutual_Funds.physical,2474);
-      assert(collected.pool_reconciliation.pages.Mutual_Funds.included<2469);
+      assert.equal(collected.pool_reconciliation.pages.Mutual_Funds.physical,2422);
+      assert(collected.pool_reconciliation.pages.Mutual_Funds.included<2417);
       assert(ctx.dt10PoolNote_(collected,result).includes('TRUNCATED'));
     }
   }

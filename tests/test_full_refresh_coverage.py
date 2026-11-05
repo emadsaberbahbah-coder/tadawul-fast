@@ -24,7 +24,7 @@ HEADERS = ["Symbol", "Name", "Current Price", "Last Updated (UTC)", "Position Qt
 def scoped_symbols():
     """Synthetic current memberships retain the policy's full cardinalities."""
     return {"Market_Leaders": [f"{900001+i}.SR" for i in range(255)],
-            "Mutual_Funds": [f"SYNTHFUND{i:04d}.US" for i in range(2474)]}
+            "Mutual_Funds": [f"SYNTHFUND{i:04d}.US" for i in range(2422)]}
 
 
 def synthetic_approved_scope(tmp_path):
@@ -101,7 +101,7 @@ def test_default_live_audit_loads_current_policy_and_records_membership_receipts
     monkeypatch.setenv("TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX", "1")
     rules = {rule.page: rule for rule in coverage.rules()}
     assert {page: rule.min_rows for page, rule in rules.items() if page in scope.pages} == {
-        "Market_Leaders": 255, "Mutual_Funds": 2474}
+        "Market_Leaders": 255, "Mutual_Funds": 2422}
     assert rules["Global_Markets"].min_rows == 6512 and rules["Commodities_FX"].min_rows == 453
     assert {page: (rules[page].min_name, rules[page].min_price) for page in
             ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")} == {

@@ -4,6 +4,13 @@ The default policy is a versioned repository file, never an environment or CLI
 selection. Approval establishes membership only; it does not certify instrument
 identity, acquisition, prices, freshness, names or custody. Importing this module
 performs no policy read or provider/Sheet operation.
+
+v1.0.1 (2026-11-05): the Mutual_Funds contract count is 2,422 (was 2,474). The owner approved
+(Thu 5 Nov 2026 12:51 Riyadh) retiring 52 dead fund rows - tickers the chart API no longer
+carries, matured iBonds, liquidated or renamed ETFs and one bare duplicate - whose blank names
+held Mutual_Funds name coverage at 97.90% below the unchanged 99% gate (sync run 41944918372).
+The policy file carries revision 2026-11-05.mf-retire-52.v2; the rows leave the page through the
+sync's own retirement seam (`_Retired_Symbols`, Page = Mutual_Funds). Nothing else changes.
 """
 from __future__ import annotations
 
@@ -16,13 +23,13 @@ import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 SCHEMA = "tfb.approved-universe-scope/v1"
 DEFAULT_SCOPE_PATH = Path(__file__).resolve().parents[1] / "config/approved_universe_scope_v1.json"
 SYMBOL_HASH_DOMAIN = b"tfb.approved-symbol/v1\0"
 _PAGE_CONTRACT = {
     "Market_Leaders": ("saudi_only", 255, 1025),
-    "Mutual_Funds": ("current_fund_tab", 2474, 4496),
+    "Mutual_Funds": ("current_fund_tab", 2422, 4496),   # v1.0.1: 52 dead fund rows retired (owner, 5 Nov 2026)
 }
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")

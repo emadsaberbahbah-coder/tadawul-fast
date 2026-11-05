@@ -2,6 +2,21 @@
 """
 scripts/score_selection_log.py — Selection_Log ticket-vs-reality scorer
 =======================================================================
+VERSION 1.2.2 (2026-11-05) - [RAW OUTCOMES] (additive; gate TFB_BOARD_SCORECARD_RAW)
+    WHY (5 Nov 2026 review of the Looker report): the board log page showed a
+    +5-session win rate of 51.92 % (243 / 468) while this script's SUMMARY row
+    said 52.56 % (246 / 468). The SUMMARY counts wins on the raw returns; the
+    DETAIL rows wrote every return and excess rounded to 2 decimals (_r2), and
+    sql/bigquery/10_v_board_episodes.sql classifies `ret_plus5_pct > 0` on
+    those rounded cells, so three returns between 0 and +0.005 % read as
+    losses in Looker and as wins here.
+    WHAT (gate on): the DETAIL outcome cells (+1/+5/+10/+20 %, To Exit %, To
+    Now %, vs SPUS +5 pp, vs SPUS Now pp and, with the ranking gate, vs Ref +5
+    pp / vs Ref Now pp) carry the raw value; rounding stays a display choice
+    of the sheet and the report. The SUMMARY, CHURN, RANKING and every input
+    column (prices, Engine ROI, Rel) are unchanged. Gate off (unset, 'off',
+    junk): the v1.2.1 rows byte for byte.
+
 VERSION 1.2.1 (2026-10-27) - [CHALLENGER INPUTS] (inside the challenger gate)
 
 WHY: the first _Shadow_Rank_Log day (27 Oct 2026, 10:48 Riyadh) was logged
@@ -262,7 +277,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.2.2"
 EODHD_URL = "https://eodhd.com/api/eod/{sym}?from={frm}&api_token={tok}&fmt=json&period=d"
 SKIP_SUFFIX = ("=F",)          # futures: no reliable EOD mapping
 SKIP_CONTAINS = ("-USD",)      # crypto pairs: out of scope v0.1.0
@@ -570,6 +585,20 @@ def _ranking_enabled() -> bool:
     true / yes arm it; anything else (unset, 'off', junk) keeps the v1.0.0
     outputs byte-identical."""
     return os.getenv(RANKING_ENV, "").strip().lower() in ("on", "1", "true", "yes")
+
+
+RAW_ENV = "TFB_BOARD_SCORECARD_RAW"   # v1.2.2 [RAW OUTCOMES]
+
+
+def _raw_enabled() -> bool:
+    """v1.2.2: TFB_BOARD_SCORECARD_RAW = off (default) | on (on / 1 / true /
+    yes, any case). Off keeps the v1.2.1 DETAIL rows byte for byte."""
+    return os.getenv(RAW_ENV, "").strip().lower() in ("on", "1", "true", "yes")
+
+
+def _rraw(v: Optional[float]) -> Any:
+    """v1.2.2: an outcome cell at full precision ('' when absent, no -0.0)."""
+    return "" if v is None else float(v) + 0.0
 
 
 def _challenger_enabled() -> bool:
@@ -1244,10 +1273,12 @@ def summarize(scored: List[Dict[str, Any]],
 
 
 def detail_rows(scored: List[Dict[str, Any]],
-                ranking: bool = False) -> List[List[Any]]:
+                ranking: bool = False, raw: Optional[bool] = None) -> List[List[Any]]:
     """v1.1.0: `ranking=True` appends the seven DETAIL_HEADER_RANKING columns
     at the END of every row (Rank, Engine ROI %, Rel, Conf, Ref, vs Ref +5
-    pp, vs Ref Now pp); False -> the v1.0.0 rows."""
+    pp, vs Ref Now pp); False -> the v1.0.0 rows. v1.2.2: `raw` (default: the
+    TFB_BOARD_SCORECARD_RAW gate) writes the outcome cells unrounded."""
+    oc = _rraw if (_raw_enabled() if raw is None else raw) else _r2
     rows: List[List[Any]] = []
     for s in sorted(scored, key=lambda s: (s["ep"]["seat_at"], -s["ep"]["seq"]),
                     reverse=True):
@@ -1259,15 +1290,15 @@ def detail_rows(scored: List[Dict[str, Any]],
             ep["output"], ep["stability"],
             ep["exit_at"].strftime("%Y-%m-%d") if ep["exit_at"] else "",
             ep["exit_kind"], len(ep["days"]), round(ep["hours"], 1),
-            _r2(s["r"][1]), _r2(s["r"][5]), _r2(s["r"][10]), _r2(s["r"][20]),
-            _r2(s["r_exit"]), _r2(s["r_now"]), _r2(s["x"][5]),
-            _r2(s["x_now"]), s["status"]]
+            oc(s["r"][1]), oc(s["r"][5]), oc(s["r"][10]), oc(s["r"][20]),
+            oc(s["r_exit"]), oc(s["r_now"]), oc(s["x"][5]),
+            oc(s["x_now"]), s["status"]]
         if ranking:
             rank = ep.get("rank_at_seat")
             row += ["" if rank is None else rank, _r2(ep.get("eng_roi_at_seat")),
                     _r2(ep.get("rel_at_seat")), ep.get("conf_at_seat", ""),
-                    ep.get("ref", ""), _r2(s.get("xr", {}).get(5)),
-                    _r2(s.get("xr_now"))]
+                    ep.get("ref", ""), oc(s.get("xr", {}).get(5)),
+                    oc(s.get("xr_now"))]
         rows.append(row)
     return rows
 

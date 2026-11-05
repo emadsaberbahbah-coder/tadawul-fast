@@ -2,6 +2,28 @@
 """Dispatch the audited decision-feed release as soon as both cockpits consumed
 a completed production sync (bounded, read-only wait).
 
+VERSION 1.3.0 (2026-11-05) -- THE HANDSHAKE COVERS ONE RENDER RETRY
+(--wait-only bound: default 15 -> 30 minutes, hard cap 20 -> 35).
+
+WHY (GitHub Actions + Apps Script executions + _Run_Log, Thu 5 Nov 2026)
+- Sync 41901407829 (the 23:17 slot) wrote UPSTREAM_READY at 01:01:14 Riyadh;
+  the handshake started at 01:01:25. 26_Decision_Chain 1.0.4 rendered Top_10
+  early at 01:04:49 and again at 01:14:49; both Apps Script executions were
+  stopped at the 6-minute limit ("Timed Out", 361 s), overlapping the hourly
+  Decision Pages v2 build (329 s) and the 15-minute Plan of Record refresh
+  (220 s). The handshake ended at 01:15:30 (15 min), the audit failed
+  (decision_failed) and the veto was published at 01:17:57. The third render
+  (01:24:49, 216 s) wrote VERIFIED (run 41901407829) at 01:27:55, and Release
+  After Sync released the run at 01:30:43: 26.5 minutes after the handshake
+  began. The chain retries a stopped render about every 10 minutes (claim
+  TTL 7 min + 5-minute tick), so a 15-minute bound fails on any single stop.
+- WHAT: the --wait-only default is 30 minutes and the hard cap 35 (one stop
+  plus one retry fit). Evidence first: the wait still ends at the first poll
+  that reads both receipts, and every veto, receipt rule and audit is
+  unchanged. The daily_sync and decision_surface_freshness steps carry the
+  new default and a 40-minute step backstop. A Variable
+  TFB_SYNC_AWAIT_RENDER_MIN still wins (clamped to 35).
+
 VERSION 1.2.0 (2026-11-03) -- THE RELEASE'S OWN PRIOR RULE FOR AN OLDER RUN'S
 VETO (vars.TFB_RELEASE_AFTER_SYNC_PRIOR = strict, default | release).
 
@@ -191,7 +213,7 @@ from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 from scripts import release_decision_feed as release  # noqa: E402
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 GATE_ENV = "TFB_RELEASE_AFTER_SYNC"
 PRIOR_ENV = "TFB_RELEASE_AFTER_SYNC_PRIOR"   # v1.2.0: strict (default) | release
 WAIT_ENV = "TFB_RELEASE_AFTER_SYNC_WAIT_MIN"
@@ -209,8 +231,8 @@ MAX_DISPATCH_FAILURES = 2
 WAIT_ONLY_MODE = "wait_only"
 WAIT_ONLY_GATE_VAR = "TFB_SYNC_AWAIT_RENDER"
 WAIT_ONLY_BOUND_VAR = "TFB_SYNC_AWAIT_RENDER_MIN"
-WAIT_ONLY_DEFAULT_MIN = 15
-WAIT_ONLY_MAX_MIN = 20
+WAIT_ONLY_DEFAULT_MIN = 30   # v1.3.0: was 15
+WAIT_ONLY_MAX_MIN = 35       # v1.3.0: was 20
 WAIT_ONLY_DEFAULT_POLL_S = 60
 WAIT_ONLY_MIN_POLL_S = 30
 WAIT_ONLY_MAX_POLL_S = 90

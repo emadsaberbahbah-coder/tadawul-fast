@@ -157,7 +157,7 @@ def approved_fixture(tmp_path):
     )
     symbols = {
         "Market_Leaders": [f"SYNTH_ML_{i:04d}.SR" for i in range(255)],
-        "Mutual_Funds": [f"SYNTH_MF_{i:04d}" for i in range(2474)],
+        "Mutual_Funds": [f"SYNTH_MF_{i:04d}" for i in range(2422)],
     }
     pages = {}
     for page, identities in symbols.items():
@@ -193,7 +193,7 @@ def approved_grids(symbols):
     top10[1][1] = (
         "Last run 2026-07-31 20:10:00 | status: ok | sheets pool "
         "[Market_Leaders 255/255, Global_Markets 6512/6512, "
-        "Commodities_FX 453/453, Mutual_Funds 2474/2474] (full universe) "
+        "Commodities_FX 453/453, Mutual_Funds 2422/2422] (full universe) "
         "| source readiness VERIFIED (run 90001)"
     )
     source_grids = {page: [["Symbol", "Name"]] + [[identity, "Synthetic"]
@@ -220,7 +220,7 @@ def source_columns_for(source_grids):
 
 
 def _native_pool_case(approved_fixture):
-    """Synthetic physical 2474 -> unique 2469 with five exact earlier owners."""
+    """Synthetic physical 2422 -> unique 2417 with five exact earlier owners."""
     from scripts.approved_universe_scope import symbol_set_sha256
     scope, symbols = approved_fixture
     grids, source_grids = approved_grids(symbols)
@@ -229,7 +229,7 @@ def _native_pool_case(approved_fixture):
     for row, identity in enumerate(identities[1:], 1):
         source_grids["Commodities_FX"][row][0] = identity
     physical = {"Market_Leaders": 255, "Global_Markets": 6512,
-                "Commodities_FX": 453, "Mutual_Funds": 2474}
+                "Commodities_FX": 453, "Mutual_Funds": 2422}
     receipt = {"version": 1, "run": "90001", "pages": {
         page: {"physical": count, "unique": count - (5 if page == "Mutual_Funds" else 0),
                "included": count - (5 if page == "Mutual_Funds" else 0)}
@@ -242,8 +242,8 @@ def _native_pool_case(approved_fixture):
     # Native protocol fixes page order independently of Python fixture order.
     receipt["physical_symbol_sha256"] = {
         page: receipt["physical_symbol_sha256"][page] for page in freshness.POOL_PAGES}
-    grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2474/2474", "Mutual_Funds 2469/2474").replace(
-        "sheets pool [", "sheets pool 9689 rows [")
+    grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2422/2422", "Mutual_Funds 2417/2422").replace(
+        "sheets pool [", "sheets pool 9637 rows [")
     return scope, grids, source_grids, receipt
 
 
@@ -270,15 +270,15 @@ def test_five_individually_proven_cross_page_exclusions_preserve_approved_physic
     proof = report.payload()["top10_pool_reconciliation"]
     assert proof["valid"] is True and proof["run"] == "90001"
     assert proof["excluded"] == receipt["excluded"]
-    assert proof["physical_counts"]["Mutual_Funds"] == 2474
-    assert proof["unique_counts"]["Mutual_Funds"] == 2469
-    assert report.top10_pool_counts["Mutual_Funds"] == {"used": 2469, "total": 2474}
-    assert report.source_status["Mutual_Funds"]["approved_scope"]["actual_count"] == 2474
+    assert proof["physical_counts"]["Mutual_Funds"] == 2422
+    assert proof["unique_counts"]["Mutual_Funds"] == 2417
+    assert report.top10_pool_counts["Mutual_Funds"] == {"used": 2417, "total": 2422}
+    assert report.source_status["Mutual_Funds"]["approved_scope"]["actual_count"] == 2422
 
 
 @pytest.mark.parametrize("claim", ["(full universe)", "(all available sheet rows)",
                                  "(TRUNCATED to cap 1)", ""])
-@pytest.mark.parametrize("page,physical", [("Market_Leaders", 255), ("Mutual_Funds", 2474)])
+@pytest.mark.parametrize("page,physical", [("Market_Leaders", 255), ("Mutual_Funds", 2422)])
 def test_a_capped_approved_pool_cannot_certify_publication_without_an_exclusion_receipt(
         approved_fixture, claim, page, physical):
     scope, symbols = approved_fixture
@@ -343,19 +343,19 @@ def test_pool_exclusions_fail_closed_without_exact_current_individual_evidence(a
         receipt["pages"]["Mutual_Funds"]["included"] += 1
     elif fault == "truncated":
         receipt["pages"]["Mutual_Funds"]["included"] -= 1
-        grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2469/2474", "Mutual_Funds 2468/2474")
+        grids[2][1][1] = grids[2][1][1].replace("Mutual_Funds 2417/2422", "Mutual_Funds 2416/2422")
     elif fault == "non_integer":
         receipt["pages"]["Mutual_Funds"]["included"] = True
     elif fault == "wrong_count_label":
-        grids[2][1][1] = grids[2][1][1].replace("2469/2474", "2469/2469")
+        grids[2][1][1] = grids[2][1][1].replace("2417/2422", "2417/2417")
     elif fault == "count_duplicate":
-        grids[2][1][1] += " | Mutual_Funds 2469/2474"
+        grids[2][1][1] += " | Mutual_Funds 2417/2422"
     elif fault == "sent_total":
-        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9689 rows", "sheets pool 9690 rows")
+        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9637 rows", "sheets pool 9638 rows")
     elif fault == "missing_sent_total":
-        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9689 rows", "sheets pool")
+        grids[2][1][1] = grids[2][1][1].replace("sheets pool 9637 rows", "sheets pool")
     elif fault == "duplicate_sent_total":
-        grids[2][1][1] += " | sheets pool 9689 rows"
+        grids[2][1][1] += " | sheets pool 9637 rows"
     elif fault == "missing_owner_grid":
         source_grids.pop("Commodities_FX")
     elif fault == "missing_owner_column":
@@ -402,7 +402,7 @@ def test_approved_physical_membership_supersedes_only_two_legacy_floors(approved
     assert report.approved_scope["policy_revision"] == "synthetic-test-v1"
     from scripts.approved_universe_scope import receipt_matches_policy
     for page, approved_count, configured in (("Market_Leaders", 255, "5000"),
-                                             ("Mutual_Funds", 2474, "9999")):
+                                             ("Mutual_Funds", 2422, "9999")):
         receipt = report.source_status[page]["approved_scope"]
         assert receipt_matches_policy(receipt, policy=approved_fixture[0])
         assert receipt["actual_count"] == receipt["approved_count"] == approved_count
