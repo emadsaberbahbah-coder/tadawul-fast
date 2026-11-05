@@ -1661,7 +1661,90 @@ from typing import Optional
 #   inside _rank_challenger. Removed: 0.
 #   Rollback: unset TFB_OPP_RANK_MODE (or set legacy), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.28.0"
+# v1.28.1 (2026-10-13, renumbered 2026-10-19, 2026-10-22 and 2026-10-27) [TOP10 DATA-QUALITY]
+#   - three gates, all DEFAULT OFF; ALL v1.28.0 logic carried verbatim.
+#   Authored as v1.27.0 in PR #770/#778; main shipped a different v1.27.0
+#   (conviction sizing, #797) first, so this build was 1.27.1; on 2026-10-22
+#   main shipped v1.27.2 (#813, Athens calendar) and 1.27.1 stays claimed by
+#   open #803, so this build was 1.27.3; on 2026-10-27 main shipped v1.28.0
+#   (#848, ranking challenger in shadow) above it, so this build is 1.28.1.
+# EVIDENCE (Top_10_Investments export 2026-10-13 20:37 Riyadh = 17:37 UTC,
+#   pool 9,786, written audit 500): 481 of 500 written rows (96.2%) stop at
+#   Quote Freshness and only 2 pass every gate. By venue: 385 .US + 11 .TO
+#   "STALE_PRICE intraday" (the 12:17 UTC daily_sync ran pre-market, so the
+#   sheet holds the 12 Oct close while NYSE trades); 41 European rows
+#   "STALE_PRICE pre-close" (quoted ~12:20 UTC, venue closed 15:30 UTC);
+#   41 rows "venue calendar unavailable" (.NS 11, .AX 5, .JK 5, .BK 4,
+#   .OL 3, .MX 3, .AT 2, .TW 2, .KL/.CO/.HE/.VI/.VN 1). The gate is right;
+#   the page gave the operator no way to see that the cause is run timing,
+#   and 41 rows were deferred only because no calendar was mapped. The six
+#   stability grace-held seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US,
+#   JMSB.US) rendered blank Rel/DQ/Conf/Engine ROI because none of them was
+#   in the capped written audit: the cockpit never tells the builder which
+#   incumbents it is holding.
+# WHAT:
+#   (1) TFB_OPP_VENUE_CAL_EXT=1 - _venue_state also resolves the suffixes in
+#       _VENUE_CAL_MAP_EXT (exchange_calendars 4.13.2 codes, each checked to
+#       exist; suffix->venue matched to the pool's own Market labels). The
+#       rule is unchanged: live <= TFB_TICKET_MAX_QUOTE_AGE_MIN in session,
+#       else the witnessed latest close. It makes the existing rule decidable
+#       on more venues; it never widens the 15-minute or close test.
+#   (2) TFB_OPP_FRESHNESS_ALERT=1 - one countable "stale_quotes" alert that
+#       splits Quote Freshness deferrals into prior-session-while-trading /
+#       older-than-latest-close / no-calendar / no-acquisition-proof, names
+#       the top venues and the next close (UTC and Riyadh), and the near-miss
+#       "How To Qualify" text for a Quote Freshness row says when it
+#       re-qualifies. Display only: no gate, verdict, score or ticket moves.
+#   (3) TFB_OPP_AUDIT_KEEP=1 - criteria.audit_keep_symbols (list or comma
+#       string, max 60) take the room the TFB_OPP_AUDIT_ROWS_MAX cap leaves
+#       after the always-written rows, ahead of the depth-ordered filler; the
+#       cap never grows, and meta.audit_keep reports requested / written /
+#       missing. Read
+#       from the RAW criteria (make_criteria drops unknown keys), so
+#       criteria_snapshot is unchanged. The cockpit half (sending the held
+#       symbols) is a separate Apps Script paste.
+# OFF (all three unset/0): byte-identical v1.26.1 except the version stamp.
+#   _venue_state's suffix resolution moved into _venue_suffix/_venue_code
+#   (same logic, same order). Functions added: 11 (_env_venue_cal_ext,
+#   _env_freshness_alert, _env_audit_keep, _venue_suffix, _venue_code,
+#   _venue_next_close, _utc_riyadh_hm, _freshness_class,
+#   _freshness_improve_note, _freshness_alert, _audit_keep_symbols).
+#   Removed: 0.
+# Rollback: unset the three env names; or revert.
+# MERGE NOTE (2026-10-19, main 6ebe737d): v1.26.2 (#796) shipped its own
+#   venue-calendar extension, _VENUE_CAL_EXT_MAP (39 suffixes, DEFAULT ON, kill
+#   switch TFB_TICKET_VENUE_CAL_EXT=0). 27 of the 30 suffixes in (1) above are
+#   in that map with the SAME exchange_calendars codes, so _VENUE_CAL_MAP_EXT
+#   now holds only the three v1.26.2 leaves out, read after _venue_cal_code()
+#   and only when TFB_OPP_VENUE_CAL_EXT=1: .AT -> ASEX (Athens; the code exists
+#   in exchange_calendars 4.13.2 - verified 2026-10-19 by get_calendar_names,
+#   so the v1.26.2 note that .AT has no calendar does not hold), .NS -> XBOM
+#   (NSE shares the BSE session and holiday calendar), .SZ -> XSHG (Shenzhen
+#   shares the Shanghai calendar). _venue_state resolves the suffix through
+#   _venue_suffix (v1.27.0's inline logic, moved verbatim) and the code
+#   through _venue_code = base map, then v1.26.2's extension, then these three.
+#   OFF (all three unset/0): byte-identical to v1.27.0 (#797) except the
+#   version stamp. The 'TFB_OPP_VENUE_CAL_EXT=1 certifies their latest close'
+#   hint therefore names only .AT/.NS/.SZ rows.
+# MERGE NOTE 2 (2026-10-22, main df99bcf3): v1.27.2 (#813) put .AT -> ASEX in
+#   the default-on _VENUE_CAL_EXT_MAP and, on review, deliberately left .NS
+#   out: XBOM 4.13.2 does not model NSE's special sessions (Diwali Muhurat,
+#   the rare weekend sessions), so an XBOM alias would certify a stale quote
+#   while NSE trades. This build's _VENUE_CAL_MAP_EXT therefore drops .NS
+#   (the safety call is main's) and .AT (now always resolved by v1.27.2's
+#   map first, so the entry could never be read). It keeps .SZ -> XSHG
+#   (Shenzhen trades the Shanghai session and holiday calendar). The hint
+#   above that names .AT/.NS/.SZ rows now names .SZ rows only. OFF (all three
+#   unset/0): byte-identical to v1.27.2 except the version stamp.
+# MERGE NOTE 3 (2026-10-27, main e8337a16): v1.28.0 (#848) added
+#   TFB_OPP_RANK_MODE (default legacy) and the shadow challenger order. It
+#   and this build's three gates read disjoint env names and add disjoint
+#   payload keys (shadow_rank / meta.rank_challenger vs the stale_quotes
+#   alert, the near-miss improve_note text and meta.audit_keep); no line of
+#   either is changed by the other. OFF (all three unset/0, rank mode
+#   legacy): byte-identical to v1.28.0 except the version stamp.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.28.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3256,6 +3339,21 @@ def _env_fx_usx_subunit():
     return _env_flag01("TFB_OPP_FX_USX_SUBUNIT", "0")
 
 
+def _env_venue_cal_ext():
+    """v1.27.0: resolve _VENUE_CAL_MAP_EXT venues in the freshness gate; DEFAULT OFF."""
+    return _env_flag01("TFB_OPP_VENUE_CAL_EXT", "0")
+
+
+def _env_freshness_alert():
+    """v1.27.0: stale_quotes alert + run-window near-miss text; DEFAULT OFF."""
+    return _env_flag01("TFB_OPP_FRESHNESS_ALERT", "0")
+
+
+def _env_audit_keep():
+    """v1.27.0: keep criteria.audit_keep_symbols in the capped audit; DEFAULT OFF."""
+    return _env_flag01("TFB_OPP_AUDIT_KEEP", "0")
+
+
 def _env_held_target_no_new_money():
     """v1.19.3: DEFAULT OFF. When on, a candidate carrying an analyst_lkg:
     warning (R-6 held target) is never funded for a NEW ticket."""
@@ -4727,6 +4825,17 @@ _VENUE_CAL_EXT_MAP = {
     "VS": "XLIT", "CR": "XZAG", "RO": "XBSE", "PK": "XKAR",
     "AT": "ASEX",   # v1.27.2 ('.NS' deliberately absent: no NSE special sessions)
 }
+# v1.28.1 [VENUE-CAL-EXT] (merged with v1.26.2 and v1.27.2): read only when
+# TFB_OPP_VENUE_CAL_EXT is armed, AFTER v1.26.2's map. Only the suffixes
+# v1.26.2/v1.27.2 leave out; every code exists in exchange_calendars 4.13.2
+# (verified by get_calendar_names, 2026-10-19). .SZ shares XSHG. 2026-10-22:
+# .AT is in v1.27.2's map (always read first) and .NS is deliberately absent
+# (XBOM does not model NSE's special sessions; review on #813), so both are
+# dropped here. The other 27 suffixes of the v1.27.0-as-authored map are in
+# _VENUE_CAL_EXT_MAP above with the same codes.
+_VENUE_CAL_MAP_EXT = {
+    "SZ": "XSHG",
+}
 _VENUE_CAL_CACHE = {}
 
 
@@ -4749,20 +4858,39 @@ _VENUE_LAST_ERROR = {"msg": ""}
 _FRESHNESS_FALLBACK_LOGGED = set()
 
 
+def _venue_suffix(symbol):
+    """v1.27.0: the venue suffix _venue_state resolves (moved verbatim): the
+    text after the last dot, "US" when there is none, and "US" for a US
+    share class such as BRK.B. May raise; callers guard."""
+    s = (str(symbol or "").strip().upper())
+    suffix = s.rsplit(".", 1)[1] if "." in s else "US"
+    if suffix not in _VENUE_CAL_MAP and "." in s:
+        from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
+        if (s.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(s)
+                and split_symbol_exchange(s)[1] is None):
+            suffix = "US"
+    return suffix
+
+
+def _venue_code(symbol):
+    """v1.27.0: exchange_calendars code for the symbol's venue or None.
+    v1.28.1: the base map, then v1.26.2's extension (_venue_cal_code, kill
+    switch TFB_TICKET_VENUE_CAL_EXT), then _VENUE_CAL_MAP_EXT only when
+    TFB_OPP_VENUE_CAL_EXT=1."""
+    suffix = _venue_suffix(symbol)
+    code = _venue_cal_code(suffix)
+    if not code and _env_venue_cal_ext():
+        code = _VENUE_CAL_MAP_EXT.get(suffix)
+    return code
+
+
 def _venue_state(symbol, now_utc):
     """(is_open, prev_close_utc_datetime) for the symbol's venue at now_utc,
     or None when the calendar layer cannot answer (unknown suffix, import
     failure, any exception) — an old quote then remains uncertified.
     Lazy exchange_calendars + pandas; NEVER raises."""
     try:
-        s = (str(symbol or "").strip().upper())
-        suffix = s.rsplit(".", 1)[1] if "." in s else "US"
-        if suffix not in _VENUE_CAL_MAP and "." in s:
-            from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
-            if (s.isascii() and US_SHARE_CLASS_DOT_RE.fullmatch(s)
-                    and split_symbol_exchange(s)[1] is None):
-                suffix = "US"
-        code = _venue_cal_code(suffix)        # v1.26.2: base, then extension
+        code = _venue_code(symbol)      # v1.28.1: base, v1.26.2 ext, then v1.28.1 ext
         if not code:
             return None
         cal = _VENUE_CAL_CACHE.get(code)
@@ -4857,6 +4985,197 @@ def _quote_freshness_assessment(cand):
         pass
     return False, ("UNVERIFIED_PRICE: %.1fh old and venue calendar unavailable"
                    % (age_min / 60.0)), detail
+
+
+def _venue_next_close(symbol, now_utc):
+    """v1.27.0: next scheduled close (aware UTC datetime) of the symbol's
+    venue at now_utc, or None. Display only; NEVER raises."""
+    try:
+        code = _venue_code(symbol)
+        if not code:
+            return None
+        cal = _VENUE_CAL_CACHE.get(code)
+        if cal is None:
+            import exchange_calendars as _xc  # lazy; present on Render
+            cal = _xc.get_calendar(code)
+            _VENUE_CAL_CACHE[code] = cal
+        import pandas as _pd  # lazy
+        ts = _pd.Timestamp(now_utc)
+        try:
+            nc = cal.next_close(ts)
+        except Exception:
+            ts_n = ts.tz_convert("UTC").tz_localize(None) \
+                if ts.tzinfo is not None else ts
+            nc = cal.next_close(ts_n)
+        nc = nc.to_pydatetime()
+        if nc.tzinfo is None:
+            nc = nc.replace(tzinfo=timezone.utc)
+        return nc
+    except Exception:
+        return None
+
+
+def _utc_riyadh_hm(dt):
+    """v1.27.0: 'HH:MM UTC / HH:MM Riyadh' (Riyadh is UTC+3, no DST)."""
+    if dt is None:
+        return ""
+    try:
+        u = dt.astimezone(timezone.utc)
+        return "%s UTC / %s Riyadh" % (u.strftime("%H:%M"),
+                                       (u + timedelta(hours=3)).strftime("%H:%M"))
+    except Exception:
+        return ""
+
+
+_FRESHNESS_CLASSES = ("session_open", "pre_close", "no_calendar",
+                      "unverified")
+
+
+def _freshness_class(ff):
+    """v1.27.0: bucket a Quote Freshness first-fail by its recorded mode."""
+    mode = ((ff or {}).get("freshness_detail") or {}).get("mode")
+    if mode == "session_open":
+        return "session_open"
+    if mode == "session_closed":
+        return "pre_close"
+    if mode == "calendar_unavailable":
+        return "no_calendar"
+    return "unverified"
+
+
+def _freshness_improve_note(symbol, ff, now_utc=None):
+    """v1.27.0 [FRESHNESS-ALERT]: near-miss 'How To Qualify' for a Quote
+    Freshness row - says WHEN it re-qualifies. Text only; never raises."""
+    try:
+        now = now_utc or datetime.now(timezone.utc)
+        cls = _freshness_class(ff)
+        max_min = _env_quote_max_age_min()
+        if cls == "session_open":
+            when = _utc_riyadh_hm(_venue_next_close(symbol, now))
+            return ("Re-qualifies on a fresh quote: the sheet holds the prior "
+                    "session's price while the venue trades. Re-run after the "
+                    "venue closes" + (" (" + when + ")" if when else "") +
+                    " and the next market sync lands, or run Intraday Quote "
+                    "Refresh first. No operator gate change.")
+        if cls == "pre_close":
+            det = (ff or {}).get("freshness_detail") or {}
+            pc = None
+            try:
+                pc = datetime.fromisoformat(str(det.get("prev_close")))
+            except Exception:
+                pc = None
+            when = _utc_riyadh_hm(pc)
+            return ("Re-qualifies on a fresh quote: the sheet price predates "
+                    "the venue's latest close" + (" (" + when + ")" if when
+                                                  else "") +
+                    ". Re-run after the next market sync lands. No operator "
+                    "gate change.")
+        if cls == "no_calendar":
+            try:
+                sfx = _venue_suffix(symbol)
+            except Exception:
+                sfx = ""
+            if sfx in _VENUE_CAL_MAP_EXT and not _env_venue_cal_ext():
+                return ("No trading calendar is mapped for ." + sfx + ", so "
+                        "an old close cannot be certified. Arming "
+                        "TFB_OPP_VENUE_CAL_EXT=1 lets the latest close pass; "
+                        "otherwise only a quote <= %.0fm old passes." % max_min)
+            return ("No trading calendar exists for this venue, so only a "
+                    "quote <= %.0fm old passes. Refresh this row's quote, "
+                    "then re-run." % max_min)
+        return ("The price has no successful acquisition proof. Re-sync this "
+                "row; no control-panel setting can qualify it.")
+    except Exception:
+        return _improve_note(ff)
+
+
+def _freshness_alert(audit, now_utc=None):
+    """v1.27.0 [FRESHNESS-ALERT]: one countable alert splitting every Quote
+    Freshness first-fail in the FULL audit by cause and venue. None when no
+    row failed there. Display only; never raises."""
+    try:
+        now = now_utc or datetime.now(timezone.utc)
+        groups = dict((c, {}) for c in _FRESHNESS_CLASSES)
+        reps = {}
+        total = 0
+        for a in audit or []:
+            ff = a.get("first_fail")
+            if not ff or ff.get("gate") != "Quote Freshness":
+                continue
+            total += 1
+            cls = _freshness_class(ff)
+            try:
+                sfx = _venue_suffix(a.get("symbol"))
+            except Exception:
+                sfx = "?"
+            groups[cls][sfx] = groups[cls].get(sfx, 0) + 1
+            reps.setdefault((cls, sfx), a.get("symbol"))
+        if not total:
+            return None
+        parts = []
+        for cls in _FRESHNESS_CLASSES:
+            g = groups[cls]
+            n = sum(g.values())
+            if not n:
+                continue
+            top = sorted(g.items(), key=lambda kv: (-kv[1], kv[0]))
+            venues = ", ".join(".%s %d" % kv for kv in top[:4])
+            if len(top) > 4:
+                venues += ", +%d more" % (len(top) - 4)
+            if cls == "session_open":
+                sfx0 = top[0][0]
+                when = _utc_riyadh_hm(_venue_next_close(reps[(cls, sfx0)], now))
+                parts.append("%d prior-session price(s) while the venue trades "
+                             "(%s)%s" % (n, venues, (" - ." + sfx0 + " closes "
+                                                     + when) if when else ""))
+            elif cls == "pre_close":
+                parts.append("%d price(s) older than the venue's latest close "
+                             "(%s) - no post-close sync yet" % (n, venues))
+            elif cls == "no_calendar":
+                hint = ""
+                if (not _env_venue_cal_ext()
+                        and any(s in _VENUE_CAL_MAP_EXT for s in g)):
+                    hint = " - TFB_OPP_VENUE_CAL_EXT=1 certifies their latest close"
+                parts.append("%d on venues without a trading calendar (%s)%s"
+                             % (n, venues, hint))
+            else:
+                parts.append("%d without acquisition proof (%s)" % (n, venues))
+        return {"type": "stale_quotes", "count": total,
+                "required_action": (
+                    "Quote Freshness deferred %d candidate(s): " % total +
+                    "; ".join(parts) + ". Re-run Top_10 after the venues "
+                    "close and the next market sync lands, or run Intraday "
+                    "Quote Refresh first. No gate or ticket changed.")}
+    except Exception:
+        return None
+
+
+_AUDIT_KEEP_MAX = 60
+
+
+def _audit_keep_symbols(criteria):
+    """v1.27.0 [AUDIT-KEEP]: the caller's keep list from the RAW criteria
+    (list, or a comma/space separated string), upper-cased, de-duplicated,
+    at most _AUDIT_KEEP_MAX entries; [] when absent or malformed."""
+    if not isinstance(criteria, dict):
+        return []
+    raw = criteria.get("audit_keep_symbols")
+    if isinstance(raw, str):
+        items = re.split(r"[,\s]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, (str, int, float)) or isinstance(it, bool):
+            continue
+        s = str(it).strip().upper()
+        if s and len(s) <= 32 and s not in out:
+            out.append(s)
+        if len(out) >= _AUDIT_KEEP_MAX:
+            break
+    return out
 
 
 def _data_trust_assessment(cand, criteria):
@@ -7063,6 +7382,10 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
             cur = ff["current"] if ff else None
             req = ff["required"] if ff else None
             note = _improve_note(ff)
+            # v1.27.0 [FRESHNESS-ALERT]: say when a stale row re-qualifies.
+            if (ff and ff.get("gate") == "Quote Freshness"
+                    and _env_freshness_alert()):
+                note = _freshness_improve_note(a.get("symbol"), ff)
         rows.append({"symbol": a["symbol"], "failed_gate": gate,
                      "current": cur, "required": req,
                      "verdict": a["verdict"], "improve_note": note})
@@ -7746,6 +8069,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "type": "price_xcheck", "count": int(_XCHECK_STATE["fetched"]),
             "required_action": _xcheck_summary_text(),
         })
+    # v1.27.0 [FRESHNESS-ALERT]: one stale_quotes alert from the FULL audit.
+    if _env_freshness_alert():
+        _fresh_alert = _freshness_alert(audit)
+        if _fresh_alert:
+            alerts.append(_fresh_alert)
     # 4) audit grid sorted by score; strip internals
     # v1.19.1 [AUDIT-DEPTH-ORDER]: depth order by default (display-only).
     if _env_audit_order() == "depth":
@@ -7764,6 +8092,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # the only rows dropped are the low-score DO_NOT_INVEST / WATCH tail.
     # 0 => unlimited (byte-identical v1.0.9 — full audit returned).
     _audit_cap = crit.get("audit_rows_max") or 0
+    # v1.27.0 [AUDIT-KEEP]: the cockpit's held incumbents (raw criteria key).
+    _keep_req = _audit_keep_symbols(criteria) if _env_audit_keep() else None
     if _audit_cap > 0 and len(audit) > _audit_cap:
         _nm_syms = {r.get("symbol") for r in near_miss if isinstance(r, dict)}
         _keep_syms = set(selected_syms) | set(unfunded_syms) | _nm_syms
@@ -7773,6 +8103,17 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                 _must.append(a)
             else:
                 _rest.append(a)
+        if _keep_req:
+            # v1.27.0 [AUDIT-KEEP] (review, Codex P2): held seats take only the
+            # room the cap leaves after the always-written rows, in audit
+            # order; any that do not fit stay out and meta.audit_keep lists
+            # them as missing. The cap never grows.
+            _held_set = set(_keep_req)
+            _held = [a for a in _rest if a.get("symbol") in _held_set]
+            _held = _held[:max(0, _audit_cap - len(_must))]
+            _held_ids = {id(a) for a in _held}
+            _rest = [a for a in _rest if id(a) not in _held_ids]
+            _must = _must + _held
         _room = _audit_cap - len(_must)
         # v1.19.1 [AUDIT-DEPTH-ORDER]: the free slots go to the rows that got
         # furthest through the gate chain, so a Risk/Reward failure is written
@@ -7828,6 +8169,13 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         },
     }
 
+    if _keep_req is not None:
+        _written = {a.get("symbol") for a in audit}
+        meta["audit_keep"] = {
+            "requested": len(_keep_req),
+            "written": sum(1 for s in _keep_req if s in _written),
+            "missing": [s for s in _keep_req if s not in _written][:20],
+        }
     if _board_stage:
         board = {"contract_version": _BOARD_FUNDING_VERSION,
                  "stage": _board_stage, "snapshot_available": False}

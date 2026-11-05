@@ -3,9 +3,81 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.71.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.72.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.72.0 - FW-2 SCOPE: drift rows keep identity, gross rows stay quarantined (2026-10-14)
+================================================================================
+MERGE NOTE (2026-10-19): authored as v6.70.0 in #773/#778; main shipped a
+different v6.70.0 (#799 HK-FX, below) first, so this build is v6.71.0 and
+its default-off identity is now to v6.70.0. The HK-FX exemption still runs
+first: a .HK row inside the reporting-currency band is never tiered. Only
+the rows FW-2 would strip reach the census; a fielded drift row is not
+stripped, so it is not in the HK-FX 'FW-2 detail' strip list.
+MERGE NOTE 2 (2026-10-21): main shipped v6.70.1 (KLG-READ) and v6.70.2
+(STAMP-RETRY) in #810; this build stays v6.71.0 and its default-off
+identity is now to v6.70.2. Neither touches the FW-2 tier code.
+MERGE NOTE 3 (2026-10-31): main shipped a different v6.71.0 (#875
+FW2-STALE-PE, below), so this build is v6.72.0 (the Warnings tag reads
+fw2_pe_eps_drift:v6.72.0) and its default-off identity is now to v6.71.0.
+The two gates compose without new code: FW2-STALE-PE plans its keeps with
+a probe FW-2 pass, which treats a row FW-2 SCOPE fields (a new list) like a
+strip, and under enforce it blanks P/E and EPS of each witnessed row
+[0.80, 1.25] BEFORE the real FW-2 runs, so the real pass finds that row
+untestable: it is kept with only P/E and EPS cleared and is not BLOCKED.
+Every other tripped row meets FW-2 SCOPE as before (drift fielded and
+BLOCKED under enforce, gross stripped). Either gate off leaves the other
+exactly as authored; both off is v6.70.2's FW-2 call. One addition (review of
+this merge): under FW-2 SCOPE enforce the probe's changed rows include fielded
+ones, so FW2-STALE-PE's report gains scope_fielded and its log line says 'FW-2
+trip(s) (N fielded and BLOCKED by FW-2 SCOPE, M stripped)' and 'not kept' instead
+of 'strip(s)' and 'still stripped'. Without that key (SCOPE off or observe) the
+report and the line are main's.
+WHY. The 2026-10-14 export (run 38486122061) shows the FW-2 outgoing row
+firewall stripping 114 Global_Markets rows in one leg (60 and 102 in the two
+legs before it, Q3 earnings season). 38 came back from last-good; 76 stayed
+symbol-only stubs because their previous sheet row was already a stub. The
+stubs include JNJ, AMAT, CDW, FLEX, INFY, Samsung Electronics (005930.KS),
+Tokyo Electron (8035.T) and Givaudan (GIVN.SW). Replaying the real
+final-publication audit offline on that export: 75 stubs are among the 198
+nameless GM rows (name coverage 97.00% < 99%; the 76th stub kept its name),
+and the 76 stubs are all of its blank timestamps (a coverage warning, so
+exit 1, which a release refuses). The
+trigger is |Price/EPS - P/E| / P/E >= 5% outside the 50-200x unit band. P/E
+and EPS arrive from different providers and vintages, so a fresh earnings
+print on one side trips it on healthy rows (the v6.25.1 note already records
+this). A transposed enrichment block (the GOOG/Gulfport class FW-2 exists
+for) moves the ratio by the price ratio of two unrelated issuers, usually
+far from 1.
+WHAT. One gate, TFB_SYNC_FW2_SCOPE = off | observe | enforce (explicit words;
+anything else = off; enforce degrades to observe if the pure self-test
+fails). DEFAULT OFF = byte-identical to v6.70.2: no census, no new log text.
+Every tripped row is classed by implied/stated P/E ratio: drift when
+0.5 <= ratio <= 2.0, otherwise gross.
+  observe: strips exactly as v6.69.0 and appends
+    ' | fw2=observe drift=D gross=G fielded=0' to the [ID-FIREWALL] _Run_Log
+    line, plus a Details JSON 'fw2' block (symbol, currency, price, EPS, P/E,
+    ratio and tier for up to 60 rows). This is the evidence the enforce call
+    needs.
+  enforce: a drift row is NOT stripped. P/E (TTM), EPS (TTM) and PEG are
+    cleared, Investability Status = BLOCKED, Final Action = DO_NOT_INVEST, a
+    Block Reason note is prepended and 'fw2_pe_eps_drift:v6.72.0' is appended
+    to Warnings. Name, quote, timestamps and every other cell stay. The tag is
+    substring-safe for the engine investability gate and is not an
+    invalid-acquisition token in core.data_validity, so a freshly acquired
+    price keeps counting as acquired. Gross rows are stripped and FW-KEEP
+    restores last-good exactly as before.
+SAFETY. Drift rows never become investable: they are BLOCKED on write, and
+FW-4 name-dedup plus the v6.30.0 exact critical identity registry still run
+after FW-2. L3b page-level transposition detection is untouched.
+ENV LANE: GitHub Actions (daily_sync.yml), both writer jobs (sync-dashboard
+and recover-missing-market-pages), mapped from the repository Variable
+TFB_SYNC_FW2_SCOPE with default 'off'. Rollback: unset the Variable.
+ZERO functions removed. Additions: _fw2_scope_mode_raw, _fw2_scope_mode,
+_fw2_tier, _fw2_field_scope_row, _fw2_selftest. _row_identity_firewall takes
+an optional _mode argument and _append_runlog_idfirewall an optional
+fw2_census argument; their two-argument and default calls are unchanged.
 
 v6.71.0 - FW-2 keeps a witnessed row whose P/E is only stale (2026-10-29)
 ================================================================================
@@ -2172,7 +2244,10 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.71.0"
+SCRIPT_VERSION = "6.72.0"
+# v6.72.0 (2026-10-14, renumbered 2026-10-19 and 2026-10-31) - FW-2 SCOPE:
+#   gate TFB_SYNC_FW2_SCOPE off|observe|enforce (default off = v6.71.0
+#   byte-identical). Full WHY and the merge note in the module header.
 # v6.71.0 (2026-10-29) - FW2-STALE-PE [FW-2, stale EODHD P/E]:
 #   WHY: FW-2 strips rows whose P/E is a few percent stale against the live
 #   quote (the Yahoo fundamentals 429 breaker hands P/E to EODHD, priced at
@@ -6064,6 +6139,107 @@ def _row_firewall_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# v6.72.0 FW-2 SCOPE (WHY: see the v6.72.0 module header; v6.71.0 until 2026-10-31)
+# ---------------------------------------------------------------------------
+_FW2_SCOPE_MODES = ("off", "observe", "enforce")
+# implied/stated P/E ratio band treated as provider/vintage drift (inclusive)
+_FW2_DRIFT_LO = 0.5
+_FW2_DRIFT_HI = 2.0
+_FW2_FIELD_TAG = "fw2_pe_eps_drift:v6.72.0"
+_FW2_BLOCK_NOTE = "FW-2 P/E vs Price/EPS drift: P/E, EPS and PEG cleared"
+_FW2_PEG_ALIASES = frozenset({"peg", "pegratio", "pegttm"})
+_FW2_INVEST_ALIASES = frozenset({"investabilitystatus", "investability"})
+_FW2_ACTION_ALIASES = frozenset({"finalaction"})
+_FW2_BLOCK_ALIASES = frozenset({"blockreason"})
+_FW2_CCY_ALIASES = frozenset({"currency"})
+_FW2_CENSUS_MAX = 60
+_LAST_FW2_CENSUS: Dict[str, Any] = {}
+_FW2_SELFTEST_OK: Optional[bool] = None
+
+
+def _fw2_scope_mode_raw() -> str:
+    """PURE parse of TFB_SYNC_FW2_SCOPE: off (default) | observe | enforce."""
+    raw = (os.getenv("TFB_SYNC_FW2_SCOPE") or "off").strip().lower()
+    return raw if raw in _FW2_SCOPE_MODES else "off"
+
+
+def _fw2_scope_mode() -> str:
+    """Effective mode. enforce degrades to observe when the pure self-test
+    fails, so a broken build can never alter rows."""
+    mode = _fw2_scope_mode_raw()
+    if mode == "enforce" and not _fw2_selftest():
+        return "observe"
+    return mode
+
+
+def _fw2_tier(ratio: float) -> str:
+    """drift: implied/stated P/E inside [0.5, 2.0]; gross: anything else."""
+    return "drift" if _FW2_DRIFT_LO <= ratio <= _FW2_DRIFT_HI else "gross"
+
+
+def _fw2_field_scope_row(row: list, pe_i: int, eps_i: int, peg_i: int,
+                         inv_i: int, act_i: int, blk_i: int, warn_i: int) -> list:
+    """Copy of one drift row with the distrusted fundamentals cleared and the
+    row fenced off from investment. Never touches Symbol, Name or quote cells."""
+    out = list(row)
+    for i in (pe_i, eps_i, peg_i):
+        if 0 <= i < len(out):
+            out[i] = ""
+    if 0 <= inv_i < len(out):
+        out[inv_i] = "BLOCKED"
+    if 0 <= act_i < len(out):
+        out[act_i] = "DO_NOT_INVEST"
+    if 0 <= blk_i < len(out):
+        prev = "" if out[blk_i] is None else str(out[blk_i]).strip()
+        out[blk_i] = _FW2_BLOCK_NOTE if not prev else _FW2_BLOCK_NOTE + "; " + prev
+    if 0 <= warn_i < len(out):
+        prev = "" if out[warn_i] is None else str(out[warn_i]).strip()
+        out[warn_i] = _FW2_FIELD_TAG if not prev else prev + "; " + _FW2_FIELD_TAG
+    return out
+
+
+def _fw2_selftest() -> bool:
+    """Pure fixtures, cached. healthy and GBX pass; a vintage drift row is
+    fielded under enforce; a transposed (GOOG/Gulfport) row is stripped in
+    every mode; observe strips both like v6.69.0. Never raises."""
+    global _FW2_SELFTEST_OK
+    if _FW2_SELFTEST_OK is not None:
+        return _FW2_SELFTEST_OK
+    ok = False
+    try:
+        h = ["Symbol", "Name", "Currency", "Price", "EPS (TTM)", "P/E (TTM)", "PEG",
+             "Investability Status", "Final Action", "Block Reason", "Warnings"]
+        healthy = ["MSFT", "Microsoft Corporation", "USD", 500.0, 12.5, 40.0, 2.1,
+                   "INVESTABLE", "INVEST", "", ""]
+        gbx = ["NG.L", "National Grid plc", "GBX", 1050.0, 0.60, 17.5, 1.2,
+               "WATCHLIST", "WATCH", "", ""]
+        drift = ["JNJ", "Johnson & Johnson", "USD", 190.0, 7.0, 25.0, 3.0,
+                 "INVESTABLE", "INVEST", "", "a"]
+        gross = ["GOOG", "Gulfport Energy Corporation", "USD", 213.5, 9.18, 3.6, 0.4,
+                 "INVESTABLE", "INVEST", "", ""]
+        m_enf, s_enf = _row_identity_firewall(
+            h, [list(healthy), list(gbx), list(drift), list(gross)], _mode="enforce")
+        m_obs, s_obs = _row_identity_firewall(
+            h, [list(healthy), list(gbx), list(drift), list(gross)], _mode="observe")
+        m_off, s_off = _row_identity_firewall(
+            h, [list(healthy), list(gbx), list(drift), list(gross)], _mode="off")
+        fielded = m_enf[2]
+        ok = (s_enf == ["GOOG"] and s_obs == ["JNJ", "GOOG"] and s_off == ["JNJ", "GOOG"]
+              and m_enf[0] == healthy and m_enf[1] == gbx
+              and fielded[1] == "Johnson & Johnson" and fielded[3] == 190.0
+              and fielded[4] == "" and fielded[5] == "" and fielded[6] == ""
+              and fielded[7] == "BLOCKED" and fielded[8] == "DO_NOT_INVEST"
+              and fielded[9] == _FW2_BLOCK_NOTE
+              and fielded[10] == "a; " + _FW2_FIELD_TAG
+              and m_enf[3][0] == "GOOG" and m_enf[3][1] == ""
+              and m_obs == m_off)
+    except Exception:
+        ok = False
+    _FW2_SELFTEST_OK = bool(ok)
+    return _FW2_SELFTEST_OK
+
+
+# ---------------------------------------------------------------------------
 # v6.31.0 FW-5: FABRICATED-PLACEHOLDER TRIPWIRE (WHY: see v6.31.0 header)
 # ---------------------------------------------------------------------------
 _FABRICATED_NAME_PAGES = (
@@ -6154,14 +6330,26 @@ def _fabrication_tripwire(
 def _row_identity_firewall(
     headers: list,
     rows_matrix: list,
+    _mode: Optional[str] = None,
 ) -> tuple:
     """v6.24.0 FW-2: blank every cell except Symbol on each OUTGOING row
     that is testable and identity-broken (same per-row rules as
     _coherence_scan); the Warnings column (when locatable) is set to
     'identity_quarantined:v6.24.0'. Mutates rows in place. Returns
     (rows_matrix, stripped_symbols). FAIL-SAFE: any missing column of the
-    triple -> nothing is ever stripped."""
+    triple -> nothing is ever stripped.
+    v6.71.0 FW-2 SCOPE: _mode None reads TFB_SYNC_FW2_SCOPE. off is
+    v6.70.0 byte-identical; observe adds a census; enforce keeps drift
+    rows with P/E, EPS and PEG cleared and the row BLOCKED."""
+    global _LAST_FW2_CENSUS
     stripped: list = []
+    _fw2_mode = (_fw2_scope_mode() if _mode is None else
+                 (_mode if _mode in _FW2_SCOPE_MODES else "off"))
+    _fw2_rows: list = []
+    _fw2_counts = {"drift": 0, "gross": 0, "fielded": 0}
+    if _fw2_mode != "off":
+        _LAST_FW2_CENSUS = {"mode": _fw2_mode, "drift": 0, "gross": 0,
+                            "fielded": 0, "rows": [], "version": SCRIPT_VERSION}
     _diag_stripped: list = []
     _diag_exempt: list = []
     _LAST_FW2_DIAG["stripped"] = _diag_stripped
@@ -6209,6 +6397,31 @@ def _row_identity_firewall(
             _diag_exempt.append(str(row[sym_i]).strip().upper())
             continue
         sym = str(row[sym_i]).strip().upper()
+        if _fw2_mode != "off":
+            _tier = _fw2_tier(ratio)
+            _fw2_counts[_tier] += 1
+            _ccy_i = _guard_find_col(hdr, _FW2_CCY_ALIASES)
+            _act = ("fielded" if (_fw2_mode == "enforce" and _tier == "drift")
+                    else "stripped")
+            if len(_fw2_rows) < _FW2_CENSUS_MAX:
+                _fw2_rows.append({
+                    "symbol": sym,
+                    "currency": (str(row[_ccy_i]).strip()[:8]
+                                 if 0 <= _ccy_i < len(row) and row[_ccy_i] is not None else ""),
+                    "price": px, "eps": eps, "pe": pe,
+                    "ratio": round(ratio, 4), "tier": _tier, "action": _act,
+                })
+            if _act == "fielded":
+                rows_matrix[r_i] = _fw2_field_scope_row(
+                    row, pe_i, eps_i,
+                    _guard_find_col(hdr, _FW2_PEG_ALIASES),
+                    _guard_find_col(hdr, _FW2_INVEST_ALIASES),
+                    _guard_find_col(hdr, _FW2_ACTION_ALIASES),
+                    _guard_find_col(hdr, _FW2_BLOCK_ALIASES),
+                    warn_i,
+                )
+                _fw2_counts["fielded"] += 1
+                continue
         _diag_stripped.append((sym, round(ratio, 4),
                                str(row[ccy_i]).strip() if 0 <= ccy_i < len(row) else ""))
         blanked = ["" for _ in row]
@@ -6217,6 +6430,11 @@ def _row_identity_firewall(
             blanked[warn_i] = "identity_quarantined:v6.24.0"
         rows_matrix[r_i] = blanked
         stripped.append(sym)
+    if _fw2_mode != "off":
+        _LAST_FW2_CENSUS = {"mode": _fw2_mode, "drift": _fw2_counts["drift"],
+                            "gross": _fw2_counts["gross"],
+                            "fielded": _fw2_counts["fielded"],
+                            "rows": _fw2_rows, "version": SCRIPT_VERSION}
     return rows_matrix, stripped
 
 
@@ -6411,16 +6629,20 @@ def _fw2_stale_pe_plan(headers: list, rows_matrix: list, report: Dict[str, Any],
     replaces a stripped row with a new list and never mutates the row it
     read, so 'probe[i] is not rows_matrix[i]' is exactly its decision."""
     probe = list(rows_matrix)
-    _row_identity_firewall(headers, probe)
+    _probe_out, _probe_stripped = _row_identity_firewall(headers, probe)
     cols = _fw2_row_cols(headers)
     if min(cols["sym"], cols["px"], cols["eps"], cols["pe"]) < 0:
         return []
     lo, hi = _FW2_STALE_PE_BAND
     band: List[Tuple[int, str, float]] = []
+    _scope_fielded: set = set()   # v6.72.0 (#778): rows FW-2 SCOPE enforce fielded, not stripped
+    _stripped_set = set(_probe_stripped)
     for r_i, row in enumerate(rows_matrix):
         if probe[r_i] is row:
             continue
         report["fw2_strips"] += 1
+        if str(row[cols["sym"]]).strip().upper() not in _stripped_set:
+            _scope_fielded.add(str(row[cols["sym"]]).strip().upper())
         px = _coh_float(row[cols["px"]])
         eps = _coh_float(row[cols["eps"]])
         pe = _coh_float(row[cols["pe"]])
@@ -6429,6 +6651,11 @@ def _fw2_stale_pe_plan(headers: list, rows_matrix: list, report: Dict[str, Any],
         ratio = (px / eps) / pe          # the same two divisions as FW-2
         if lo <= ratio <= hi:
             band.append((r_i, str(row[cols["sym"]]).strip().upper(), ratio))
+    if _scope_fielded:
+        # v6.72.0 (#778 merge 2026-10-31): only under TFB_SYNC_FW2_SCOPE=enforce,
+        # whose FW-2 keeps drift rows BLOCKED instead of stripping them; the
+        # log line then names them as fielded (absent key = main's report).
+        report["scope_fielded"] = sorted(_scope_fielded)
     report["band"] = len(band)
     if not band:
         return []
@@ -6506,7 +6733,19 @@ def _fw2_stale_pe_line(page: str, report: Dict[str, Any]) -> str:
         rows += f" (+{len(kept) - 20} more)"
     tail = (f" | band {report.get('band', 0)} of {report.get('fw2_strips', 0)} "
             f"FW-2 strip(s)")
-    if rej:
+    _sf = set(report.get("scope_fielded") or [])
+    if _sf:
+        # v6.72.0 (#778 merge 2026-10-31): under FW-2 SCOPE enforce a drift row is
+        # fielded and BLOCKED, not stripped; say so instead of "strip(s)".
+        tail = (f" | band {report.get('band', 0)} of {report.get('fw2_strips', 0)} "
+                f"FW-2 trip(s) ({len(_sf)} fielded and BLOCKED by FW-2 SCOPE, "
+                f"{report.get('fw2_strips', 0) - len(_sf)} stripped)")
+    if rej and _sf:
+        tail += (f"; not kept {len(rej)}: "
+                 + ", ".join(f"{s}({w}, {'fielded' if s in _sf else 'stripped'})"
+                             for s, w in rej[:15])
+                 + (" ..." if len(rej) > 15 else ""))
+    elif rej:
         tail += (f"; still stripped {len(rej)}: "
                  + ", ".join(f"{s}({w})" for s, w in rej[:15])
                  + (" ..." if len(rej) > 15 else ""))
@@ -7411,6 +7650,7 @@ def _append_runlog_idfirewall(
     out_stripped: list,
     name_dup_groups: dict = None,
     name_dup_quarantined: list = None,
+    fw2_census: dict = None,
     stale_pe_kept: list = None,
 ) -> None:
     """v6.24.0 FW-3: best-effort, fail-open verdict append (columns match
@@ -7428,8 +7668,9 @@ def _append_runlog_idfirewall(
         name_dup_groups = dict(list((name_dup_groups or {}).items())[:12])
         name_dup_quarantined = list(name_dup_quarantined or [])
         _dup_n = len(name_dup_groups)
-        level = "WARNING" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "INFO"
-        status = "SUSPECT" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "OK"
+        _fw2_hit = bool(fw2_census and (fw2_census.get("fielded") or fw2_census.get("gross")))
+        level = "WARNING" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined or _fw2_hit) else "INFO"
+        status = "SUSPECT" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined or _fw2_hit) else "OK"
         msg = (
             f"{_IDFW_TAG} {page} | klg_kept={klg_kept} | "
             f"klg_suspect_dropped={len(klg_suspects)}"
@@ -7442,8 +7683,11 @@ def _append_runlog_idfirewall(
             f"{' | quarantined=' + str(len(name_dup_quarantined)) if name_dup_quarantined else ''}"
             f"{' | stale_pe_kept ' + str(len(stale_pe_kept)) if stale_pe_kept is not None else ''}"
             f" | selftest={_IDFW_SELFTEST_MSG}"
+            + (f" | fw2={fw2_census.get('mode')} drift={fw2_census.get('drift', 0)}"
+               f" gross={fw2_census.get('gross', 0)} fielded={fw2_census.get('fielded', 0)}"
+               if fw2_census else "")
         )
-        details = json.dumps({
+        _details_obj = {
             "klg_kept": int(klg_kept),
             "klg_suspect_dropped": klg_suspects[:50],
             "out_stripped": out_stripped[:50],
@@ -7454,7 +7698,16 @@ def _append_runlog_idfirewall(
             "version": SCRIPT_VERSION,
             **({"stale_pe_kept": list(stale_pe_kept)[:50]}
                if stale_pe_kept is not None else {}),
-        })
+        }
+        if fw2_census:
+            _details_obj["fw2"] = {
+                "mode": fw2_census.get("mode"),
+                "drift": fw2_census.get("drift", 0),
+                "gross": fw2_census.get("gross", 0),
+                "fielded": fw2_census.get("fielded", 0),
+                "rows": list(fw2_census.get("rows") or [])[:_FW2_CENSUS_MAX],
+            }
+        details = json.dumps(_details_obj)
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status, msg, "", "", "", details]]}
         _last_err = None
@@ -14504,6 +14757,7 @@ async def _run_one_task(
         # 24% poisoned sails under L3b's 25% page trip; FW-2 stops each row
         # individually. Expected strips on a healthy backend: 0.
         _idfw_stripped: list = []
+        _fw2_census = None
         _fw2_stale_kept = None   # v6.71.0: a list only under enforce (FW-3 field)
         if (_row_firewall_enabled() and task.expects_rows
                 and rows_matrix and headers
@@ -14532,6 +14786,20 @@ async def _run_one_task(
                             logger.info(_spe_line)
                     except Exception:
                         pass
+                # v6.72.0 FW-2 SCOPE: read this page's census at once (no await
+                # between the firewall and this read). After FW2-STALE-PE (main
+                # v6.71.0) the census is the real FW-2 pass's, set last.
+                if _fw2_scope_mode() != "off" and _LAST_FW2_CENSUS:
+                    _fw2_census = dict(_LAST_FW2_CENSUS)
+                    if _fw2_census.get("fielded"):
+                        _f2 = (
+                            f"[FW-2 SCOPE v{SCRIPT_VERSION}] '{task.sheet_name}': kept "
+                            f"{_fw2_census['fielded']} drift row(s) with P/E, EPS and PEG "
+                            f"cleared and the row BLOCKED; "
+                            f"{_fw2_census.get('gross', 0)} gross row(s) quarantined as before."
+                        )
+                        res.warnings.append(_f2)
+                        logger.warning(_f2)
                 try:
                     _hk_ex = list(_LAST_FW2_DIAG.get("hk_fx_exempt") or [])
                     if _hk_ex:
@@ -14773,6 +15041,7 @@ async def _run_one_task(
                     sheets, spreadsheet_id, task.sheet_name,
                     len(_klg_syms or []), _idfw_klg_suspects, _idfw_stripped,
                     _idfw_dup_groups, _idfw_dup_quar,
+                    fw2_census=_fw2_census,
                     stale_pe_kept=_fw2_stale_kept,
                 )
             except Exception:

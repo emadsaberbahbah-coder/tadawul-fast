@@ -70,10 +70,18 @@ const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
 const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+/* merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0. The structural checks
+ * (E0 pins, E10 diff inventory and reversal) and the v1.20.0 base rebuild read the layer: the
+ * delivered file with the bundle's designed regions stripped (tests/js/dt10_audit_keep_regions.js),
+ * which is main's v1.21.0 byte for byte; the behavioural checks run the delivered file.
+ * merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1; the layer is now main's
+ * v1.21.1 byte for byte (v1200Source reverses the v1.21.1 edits first). */
+const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
+const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 let baseSource;
 try {
-  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1200Source(newSource);
+  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1200Source(layerSource);
 } catch (eBase) {
   console.log('FAIL E0 base oracle: ' + String(eBase && eBase.message || eBase).split('\n')[0]);
   console.log('FAIL 0/1');
@@ -82,8 +90,11 @@ try {
 /* 2026-11-05: v1.21.1 (approved Mutual_Funds scope 2422, policy data only) is stacked on this change.
  * The rebuilt v1.21.0 file (the v1.21.1 edits reversed, SHA-256 pinned) feeds E1's refresh-level
  * golden negative and E10's lint; tests/test_dt10_v1211_mf_scope.js proves v1.21.1 = v1.21.0 apart
- * from that data. Every other check runs on the delivered file. */
-const S1210 = history.v1210Source(newSource);
+ * from that data. Every other check runs on the delivered file.
+ * merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the v1.21.1 edits are
+ * reversed on the layer (main's v1.21.1 byte for byte), never on the delivered v1.21.2 file, so S1210
+ * is main's v1.21.0 (without the bundle's regions) and reads no DT10_AUDIT_KEEP property. */
+const S1210 = history.v1210Source(layerSource);
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const GUARD = 'DT10_TICKET_GUARD', KNOB = 'DT10_GUARD_EXDIV_DAYS', PCTK = 'DT10_GUARD_EXDIV_PCT';
@@ -116,7 +127,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and B2; comparisons against
  * the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.21\.[01]/g, 'v1.20.0'));   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.21\.\d+/g, 'v1.20.0'));   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0; merge note 2026-11-05 (#778): or the bundle's v1.21.2
 
 /* The Dividend_Events grid (scripts/run_calendar_sync.py v1.3.0 DIV_HEADERS),
  * ex-dates relative to the Riyadh day `d0`. */
@@ -594,9 +605,13 @@ function battery() {
   test('E0 base oracle is the reviewed v1.20.0 file (SHA-256 pinned); versions in lockstep; both files compile; the new constants (the base lacks them)', () => {
     eq(sha256(baseSource), history.V1200_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.20.0', 'base version');
-    eq(N.DT10_VERSION, '1.21.1', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
-    ok(/^ \* Version: 1\.21\.1 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    ok(newSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'DT10_VERSION literal');
+    // merge note 2026-11-03 (#778): the delivered file sits above v1.21.0; the exact v1.21.0 pins hold on the layer
+    // 2026-11-05: v1.21.1 pins moved; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the delivered file sits above v1.21.1;
+    // the exact v1.21.1 pins hold on the layer
+    ok(/^1\.(21\.[1-9]\d*|(2[2-9]|[3-9]\d)\.\d+)$/.test(N.DT10_VERSION), 'delivered version floor 1.21.1: ' + N.DT10_VERSION);
+    ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
+    ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
+    ok(/^ \* Version: 1\.21\.1 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'layer pins 1.21.1');
     deq([N.DT10_GUARD_EXDIV_DAYS_PROP, N.DT10_GUARD_EXDIV_PCT_PROP, N.DT10_DIVIDEND_SHEET], [KNOB, PCTK, 'Dividend_Events'], 'names');
     deq([N.DT10_GUARD_EXDIV_DAYS_MAX, N.DT10_GUARD_EXDIV_PCT_DEF, N.DT10_GUARD_EXDIV_PCT_MAX], [30, 2, 100], 'bounds');
     for (const k of ['DT10_GUARD_EXDIV_DAYS_PROP', 'DT10_DIVIDEND_SHEET', 'dt10ExDivHold_', 'dt10ExDivMap_', 'dt10ExDivMapFromValues_']) eq(typeof B[k], 'undefined', 'the base lacks ' + k);
@@ -640,7 +655,10 @@ function battery() {
         deq(nv(n.logs), b.logs, 'Logger lines ' + label);
         deq(n.posted, b.posted, 'POST bodies ' + label); deq(n.saved, b.saved, 'state blob ' + label);
         const extra = mode === 'off' ? 0 : 1;   // the days knob, read once while the guard is armed; the pct knob never
-        eq(n.propReads.total, b.propReads.total + extra, 'property reads ' + label);
+        // merge note 2026-11-03 (#778): the bundle adds its own memoized DT10_AUDIT_KEEP read
+        // (2026-11-05: S1210 is rebuilt from the layer, so it reads none; the checks still hold)
+        eq(n.propReads.total - (n.propReads.byKey['DT10_AUDIT_KEEP'] || 0), b.propReads.total + extra, 'property reads ' + label);
+        ok((n.propReads.byKey['DT10_AUDIT_KEEP'] || 0) <= 1, 'the bundle reads DT10_AUDIT_KEEP at most once ' + label);
         eq(n.propReads.byKey[KNOB] || 0, extra, 'days knob reads ' + label); eq(n.propReads.byKey[PCTK] || 0, 0, 'pct knob reads ' + label);
         for (const k of Object.keys(b.propReads.byKey)) eq(n.propReads.byKey[k], b.propReads.byKey[k], 'reads of ' + k + ' ' + label);
         eq(divReadsOf(n), 0, 'no Dividend_Events read ' + label);
@@ -659,7 +677,7 @@ function battery() {
     deq(o.payload.selected, getOff().payload.selected, 'observe changes no ticket');
     deq(o.payload.kpis, getOff().payload.kpis, 'observe changes no KPI');
     eq(o.token, 'tguard: would hold CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%)', 'token');
-    deq(o.logs.filter(l => /ticket guard/.test(l)), ['[DT10 v1.21.1] ticket guard (observe): would hold 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2%'], 'one Logger line');
+    deq(o.logs.filter(l => /ticket guard/.test(l)), ['[DT10 v' + N.DT10_VERSION + '] ticket guard (observe): would hold 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2%'], 'one Logger line');
     deq(o.logs.filter(l => !/ticket guard/.test(l)), getOff().logs, 'every other Logger line identical');
     eq(o.divReads.length, 1, 'one Dividend_Events read per render');
     eq(o.calReads.length, getOff().calReads.length, 'Calendar_Events reads unchanged');
@@ -715,7 +733,7 @@ function battery() {
     }
     eq(e.ctx.dt10TicketGuardHeldCount_(e.payload.selected), 3, 'three _tguard_held markers');
     const un = Math.round(e.payload.kpis.capital_unallocated_sar - getOff().payload.kpis.capital_unallocated_sar);
-    ok(e.logs.some(l => l === '[DT10 v1.21.1] ticket guard (enforce): held 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2% | executable 6 -> 3, unallocated +' + un + ' SAR'), 'Logger line');
+    ok(e.logs.some(l => l === '[DT10 v' + N.DT10_VERSION + '] ticket guard (enforce): held 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2% | executable 6 -> 3, unallocated +' + un + ' SAR'), 'Logger line');
     // the REAL refresh
     const r = refresh(newSource, { [GUARD]: 'enforce', [KNOB]: '3' });
     ok(/\| output: EXECUTABLE \|/.test(r.status) && /funding=final\/3exec/.test(r.status), 'B2 output / funding: ' + r.status);
@@ -875,7 +893,7 @@ function battery() {
     deq(noB2(r.calls), noB2(refresh(newSource, { [GUARD]: 'enforce' }).calls), 'REAL refresh without the tab: every write = the v1.20.0 enforce');
   });
 
-  const vAll = s => String(s).replace(/1\.21\.[01]/g, '1.20.0');   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0
+  const vAll = s => String(s).replace(/1\.21\.\d+/g, '1.20.0');   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0; merge note 2026-11-05 (#778): or the bundle's 1.21.2
   test('E9 embedded dt10SelfTest: the v1.20.0 report while the knob is unset (or the guard off); one core-ok line while it is set and the guard is armed; a fault reads off', () => {
     const mini = (src, props, throwIt) => {
       const statusRows = []; for (let r = 0; r < 60; r++) statusRows.push(['', '']);
@@ -890,7 +908,7 @@ function battery() {
       eq(vAll(mini(newSource, props)), mini(baseSource, props), 'the v1.20.0 report ' + JSON.stringify(props));
     }
     const rep = mini(newSource, { [GUARD]: 'observe', [KNOB]: '3' });
-    ok(rep.indexOf('[DT10 v1.21.1] self-test') === 0, 'version line');
+    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-03 (#778)
     const lines = rep.split('\n'), baseLines = mini(baseSource, { [GUARD]: 'observe', [KNOB]: '3' }).split('\n');
     eq(lines.length, baseLines.length + 1, 'exactly one line added');
     const want = 'ticket guard ex-div (DT10_GUARD_EXDIV_DAYS): <= 3d, >= 2% of price, tab Dividend_Events | core: ok (INDV 22.4% held, FRST 0.7% passes at 2% and holds at 0.5%, GBP size unknown, GBX on a GBp price measured, earnings first)';
@@ -905,7 +923,7 @@ function battery() {
   });
 
   test('E10 ES5 / ASCII lint of the v1.21.0 diff; inventory: 3 functions and 6 vars added, 0 removed; 13 hunks whose reversal is the reviewed v1.20.0 file; WHY block; every prior WHY verbatim', () => {
-    const newSource = S1210;   // 2026-11-05: the rebuilt v1.21.0 file (see S1210); the v1.21.1 diff has its own harness
+    const newSource = S1210;   // 2026-11-05: the rebuilt v1.21.0 file (see S1210); the v1.21.1 diff has its own harness; merge note 2026-11-03 (#778): E10 reads the layer (main's v1.21.0); merge note 2026-11-05 (#778): S1210 is rebuilt from the layer (main's v1.21.1)
     const baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);

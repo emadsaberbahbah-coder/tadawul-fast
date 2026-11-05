@@ -43,10 +43,21 @@ const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
 const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+/* merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1. The structural checks
+ * (K0 reversal, K1 inventory, K2's exact pins, K6 mutants) and the v1.21.0 base rebuild read the
+ * layer: the delivered file with the bundle's designed regions stripped
+ * (tests/js/dt10_audit_keep_regions.js), which is main's v1.21.1 byte for byte. K2's manifest binding
+ * also runs on the delivered file with a 1.21.1 version floor in place of the exact pins, and the
+ * behavioural checks (K4, K5) run the delivered file. history.v1210Source is applied to the layer,
+ * never to the delivered file. */
+const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
+const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
+const deliveredVersion = (newSource.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
+const dt10AtLeast = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
 const sha256 = s => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 let baseSource;
 try {
-  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1210Source(newSource);
+  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1210Source(layerSource);
 } catch (eBase) {
   console.log('FAIL K0 base oracle: ' + String(eBase && eBase.message || eBase).split('\n')[0]);
   console.log('FAIL 0/1');
@@ -92,7 +103,10 @@ function deq(a, b, m) {
   }
 }
 const plain = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
-const vNorm = x => JSON.parse(JSON.stringify(x).replace(/1\.21\.1/g, '1.21.0'));
+const vNorm = x => JSON.parse(JSON.stringify(x).replace(/1\.21\.[12]/g, '1.21.0'));   // merge note 2026-11-05 (#778): or the bundle's delivered 1.21.2
+/* merge note 2026-11-05 (#778): the delivered version read as the layer's, so the run digest is
+ * comparable with main's (a no-op on main). */
+const asLayer = x => JSON.parse(JSON.stringify(x).split('v' + deliveredVersion + ']').join('v1.21.1]'));
 
 /* ------------------------------------------------------------ GAS sandbox (the E9 mini of the v1.21.0 harness) */
 function load(src, props, opts) {
@@ -167,7 +181,7 @@ function inventory(src) {
   for (const l of bl.filter(x => /^ \* v\d+\.\d+\.\d+ \(/.test(x))) if (src.indexOf(l) < 0) errs.push('WHY header lost ' + l);
   return errs;
 }
-function binding(src) {
+function binding(src, delivered) {
   const errs = [];
   let c; try { c = load(src); } catch (e) { return ['load: ' + e.message]; }
   const S = plain(c.DT10_SOURCE_APPROVED_SCOPE), F = plain(c.DT10_SOURCE_MIN_ROWS);
@@ -182,6 +196,12 @@ function binding(src) {
   }
   if (JSON.stringify(Object.keys(F).sort()) !== '["Commodities_FX","Global_Markets","Market_Leaders","Mutual_Funds"]') errs.push('floor pages');
   if (F.Global_Markets !== 6512 || F.Commodities_FX !== 453) errs.push('unscoped floors ' + JSON.stringify(F));
+  if (delivered) {   // merge note 2026-11-05 (#778): the delivered file sits above v1.21.1 (floor + lockstep)
+    if (!dt10AtLeast(c.DT10_VERSION, [1, 21, 1])) errs.push('DT10_VERSION floor ' + c.DT10_VERSION);
+    if (src.split('\n')[3].indexOf(' * Version: ' + c.DT10_VERSION + ' (see DT10_VERSION;') !== 0) errs.push('header line 4');
+    if ((src.match(/^var DT10_VERSION = '/mg) || []).length !== 1 || src.indexOf("var DT10_VERSION = '" + c.DT10_VERSION + "';") < 0) errs.push('DT10_VERSION literal');
+    return errs;
+  }
   if (c.DT10_VERSION !== '1.21.1') errs.push('DT10_VERSION ' + c.DT10_VERSION);
   if (!/^ \* Version: 1\.21\.1 \(see DT10_VERSION;/.test(src.split('\n')[3])) errs.push('header line 4');
   if ((src.match(/^var DT10_VERSION = '1\.21\.1';$/mg) || []).length !== 1) errs.push('DT10_VERSION literal');
@@ -243,22 +263,25 @@ function behaviour(mk) {
 function battery() {
   test('K0 base oracle: the four hunks of dt10_edits_v1211.json reverse to the reviewed v1.21.0 file; both files compile', () => {
     eq(EDITS.length, 4, 'four hunks');
-    for (const [cur] of EDITS) eq(newSource.split(cur).length - 1, 1, 'each current is unique: ' + cur.split('\n')[0]);
+    // merge note 2026-11-05 (#778): uniqueness and the reversal read the layer (main's v1.21.1)
+    for (const [cur] of EDITS) eq(layerSource.split(cur).length - 1, 1, 'each current is unique: ' + cur.split('\n')[0]);
     eq(sha256(baseSource), history.V1210_SHA256, 'base SHA-256 (origin/main 7fb3f77f)');
-    eq(sha256(history.v1210Source(newSource)), history.V1210_SHA256, 'reversal of the delivered file');
+    eq(sha256(history.v1210Source(layerSource)), history.V1210_SHA256, 'reversal of the layer');
     new vm.Script(newSource, { filename: 'new.gs' }); new vm.Script(baseSource, { filename: 'base.gs' });
+    new vm.Script(layerSource, { filename: 'layer.gs' });
     ok(/^var DT10_VERSION = '1\.21\.0';$/m.test(baseSource), 'the base is v1.21.0');
   });
 
   test('K1 inventory: six base lines replaced, the WHY block added, nothing else; ASCII; no function / var added or removed; prior WHY headers kept; LF only', () => {
-    deq(inventory(newSource), [], 'inventory');
-    const why = newSource.slice(newSource.indexOf(WHY_HEAD), newSource.indexOf(WHY_NEXT));
+    deq(inventory(layerSource), [], 'inventory');   // merge note 2026-11-05 (#778): the layer
+    const why = layerSource.slice(layerSource.indexOf(WHY_HEAD), layerSource.indexOf(WHY_NEXT));
     ok(why.length > 1500 && why.length < 4000, 'WHY block size ' + why.length);
     ok(why.indexOf('2026-11-05.mf-retire-52.v2') > 0 && why.indexOf('41944918372') > 0 && why.indexOf('_Retired_Symbols') > 0, 'WHY names the revision, the run and the seam');
   });
 
   test('K2 manifest binding: native scope = config/approved_universe_scope_v1.json (revision, date, counts, digests); a scoped page floor = its approved count; the other floors unchanged', () => {
-    deq(binding(newSource), [], 'binding');
+    deq(binding(layerSource), [], 'binding');   // merge note 2026-11-05 (#778): exact pins on the layer
+    deq(binding(newSource, true), [], 'binding (delivered, version floor 1.21.1)');
     eq(MANIFEST.policy_revision, NEW.revision, 'manifest revision'); eq(MANIFEST.approved_on, NEW.approved_on, 'manifest date');
     eq(MANIFEST.pages.Mutual_Funds.approved_count, NEW.count); eq(MANIFEST.pages.Mutual_Funds.symbol_set_sha256, NEW.symbolSet);
     ok(MANIFEST.approval_basis.indexOf('Approved to be removed') > 0 && MANIFEST.approval_basis.indexOf('TFB_Commit_Sheet_approved_scope_v1.0.1_mf_retire_52_2026-11-05.md') > 0,
@@ -326,7 +349,8 @@ function battery() {
     for (const k of Object.keys(base)) deq(vNorm(injected[k]), base[k], 'identical ' + k);
     const own = behaviour(p => load(newSource, p));
     eq(vNorm(own.selfTest), base.selfTest, 'dt10SelfTest: the v1.21.0 report (version normalized)');
-    ok(own.selfTest.indexOf('[DT10 v1.21.1] self-test') === 0 && own.selfTest.indexOf('FAIL') < 0, 'self-test version line, no FAIL');
+    ok(own.selfTest.indexOf('[DT10 v' + deliveredVersion + '] self-test') === 0 && dt10AtLeast(deliveredVersion, [1, 21, 1]) &&
+       own.selfTest.indexOf('FAIL') < 0, 'self-test version line, no FAIL');   // merge note 2026-11-05 (#778): the delivered version (floor 1.21.1)
     const swap = x => JSON.parse(JSON.stringify(x).split(NEW.revision).join(OLD.revision).split(NEW.approved_on).join(OLD.approved_on)
       .split(NEW.symbolSet).join(OLD.symbolSet).replace(/approved 2422\b/g, 'approved 2474').replace(/scope 2422\b/g, 'scope 2474')
       .replace(/floor 2422\b/g, 'floor 2474').replace(/"approved_count":2422/g, '"approved_count":2474').replace(/"Mutual_Funds":2422/g, '"Mutual_Funds":2474'));
@@ -343,6 +367,7 @@ function battery() {
   });
 
   test('K6 mutants: each one-line mutation of the delivered file is caught by the inventory or the binding', () => {
+    // merge note 2026-11-05 (#778): the mutants are applied to the layer (main's v1.21.1)
     const MUT = [
       ['fund count 2421', 'Mutual_Funds: {approved_count: 2422,', 'Mutual_Funds: {approved_count: 2421,'],
       ['fund digest', "'" + NEW.symbolSet + "'", "'" + NEW.symbolSet.slice(0, -1) + "0'"],
@@ -355,18 +380,18 @@ function battery() {
       ['header version left behind', ' * Version: 1.21.1 (see', ' * Version: 1.21.0 (see'],
       ['DT10_VERSION left behind', "var DT10_VERSION = '1.21.1';", "var DT10_VERSION = '1.21.0';"],
       ['an unrelated code edit', 'var policy = {floors: {}, freshMin: 95,', 'var policy = {floors: {}, freshMin: 94,'],
-      ['the WHY block dropped', newSource.slice(newSource.indexOf(WHY_HEAD), newSource.indexOf(WHY_NEXT)), '']
+      ['the WHY block dropped', layerSource.slice(layerSource.indexOf(WHY_HEAD), layerSource.indexOf(WHY_NEXT)), '']
     ];
     for (const [label, from, to] of MUT) {
-      eq(newSource.split(from).length - 1, 1, 'mutant anchor unique: ' + label);
-      const m = newSource.replace(from, () => to), errs = inventory(m).concat(binding(m));
+      eq(layerSource.split(from).length - 1, 1, 'mutant anchor unique: ' + label);
+      const m = layerSource.replace(from, () => to), errs = inventory(m).concat(binding(m));
       ok(errs.length > 0, 'mutant survived: ' + label);
     }
     console.log('  mutants killed: ' + MUT.length + '/' + MUT.length);
   });
 
-  return sha256(JSON.stringify([inventory(newSource), binding(newSource), behaviour(p => load(newSource, p)),
-    behaviour(p => inject(load(newSource, p)))])).slice(0, 16);
+  return sha256(JSON.stringify([inventory(layerSource), binding(layerSource), asLayer(behaviour(p => load(newSource, p))),
+    asLayer(behaviour(p => inject(load(newSource, p))))])).slice(0, 16);   // merge note 2026-11-05 (#778): the layer's structure, the delivered behaviour
 }
 
 const digests = [];

@@ -427,13 +427,15 @@ def test_e8_l2_round_trip_carries_the_block_only_while_armed(monkeypatch):
 def test_e9_versions_pins_flag_registration_and_ci_lane():
     assert ep.PROVIDER_VERSION == "4.19.0"
     # 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
-    assert de.__version__ == "5.159.2"
+    # merge note 2026-10-28 (#778): the suffix locale fallback is 5.159.3 over
+    # this 5.159.2, so the engine pin is a floor.
+    assert tuple(int(x) for x in de.__version__.split(".")[:3]) >= (5, 159, 2), de.__version__
     assert de._EODHD_ANALYST_TAG == TAG
     for bad in ("cap", "forecast", "target", "roi", "drop", "reject"):
         assert bad not in TAG
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert "(\"core.providers.eodhd_provider\", \"PROVIDER_VERSION\", '4.19.0'," in vd
-    assert "(\"core.data_engine_v2\", \"__version__\", \"5.159.2\"," in vd
+    assert ("(\"core.data_engine_v2\", \"__version__\", \"%s\"," % de.__version__) in vd
     assert "('TFB_EODHD_ANALYST_TARGET', '0'," in vd
     contract = (_REPO / "docs" / "render_env_contract.md").read_text(encoding="utf-8")
     assert "TFB_EODHD_ANALYST_TARGET" in contract

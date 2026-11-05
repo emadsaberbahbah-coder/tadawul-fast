@@ -296,8 +296,13 @@ def test_s9_env_reads_are_in_the_fingerprinted_family():
                 names.add(str(node.args[0].value))
     assert {"TFB_OPP_SIZING_MODE", "TFB_OPP_SIZING_TILT"} <= names
     assert all(n.startswith(ob._BOARD_FUNDING_POLICY_PREFIXES) for n in ("TFB_OPP_SIZING_MODE", "TFB_OPP_SIZING_TILT"))
+    # 2026-10-19 merge of #778: version floor instead of an exact pin.
+    # 2026-10-22 merge of #778: the floor follows main's v1.27.2 (#813 venue
+    # calendars; sizing unchanged); this branch carries 1.27.3.
     # v1.28.0 (A2): exact pin -> version-tuple floor (house rule); sizing unchanged.
-    assert tuple(map(int, ob.OPPORTUNITY_BUILDER_VERSION.split("."))) >= (1, 27, 2)
+    # 2026-10-27 merge of #778: the floor follows main's v1.28.0 (#848 rank
+    # challenger; sizing unchanged); this branch carries 1.28.1.
+    assert tuple(map(int, ob.OPPORTUNITY_BUILDER_VERSION.split("."))) >= (1, 28, 0)
 
 
 if __name__ == "__main__":   # pragma: no cover

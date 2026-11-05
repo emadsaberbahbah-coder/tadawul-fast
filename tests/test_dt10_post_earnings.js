@@ -41,7 +41,26 @@ const history = require('./js/dt10_cash_utc_history');
 
 const SRC = process.argv[2] || path.join(__dirname, '..', 'apps_script', '16_Decision_Top10.gs');
 const src = fs.readFileSync(SRC, 'utf8');
-const base = history.v1171Source(src);
+// merge note 2026-10-28 (#778): the delivered file is main's v1.18.0 plus #778's
+// held-seat regions (v1.18.1; tests/js/dt10_audit_keep_regions.js). Behaviour
+// runs on the delivered file; the v1.17.1 rebuild, the lint and the inventory
+// start from main's v1.18.0 layer: the delivered file with exactly those regions
+// removed (stripDesigned throws on any other shape).
+// merge note 2026-11-01 (#778): now main's v1.19.0 plus the v1.19.1 regions; the v1.18.0
+// rebuild (history.v1180Source) and everything older start from the v1.19.0 layer.
+// merge note 2026-11-02 (#778): now main's v1.20.0 plus the v1.20.1 regions; the v1.18.0
+// rebuild (history.v1180Source, which reverses the v1.20.0 edits first) and everything
+// older start from the v1.20.0 layer.
+// merge note 2026-11-03 (#778): now main's v1.21.0 plus the v1.21.1 regions; the v1.18.0
+// rebuild (history.v1180Source, which reverses the v1.21.0 and v1.20.0 edits first) and
+// everything older start from the v1.21.0 layer.
+// merge note 2026-11-05 (#778): now main's v1.21.1 plus the v1.21.2 regions; the v1.18.0
+// rebuild (history.v1180Source, which reverses the v1.21.1, v1.21.0 and v1.20.0 edits first)
+// and everything older start from the v1.21.1 layer.
+const layerSrc = require('./js/dt10_audit_keep_regions.js').stripDesigned(src);
+const dt10Floor = (v, f) => { const x = String(v).split('.').map(Number); for (let k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; };
+const deliveredVersion = (src.match(/^var DT10_VERSION = '(\d+\.\d+\.\d+)';$/m) || [])[1];
+const base = history.v1171Source(layerSrc);
 const NOW = Date.UTC(2026, 9, 27, 7, 0, 0);   // Tue 27 Oct 2026 10:00 Riyadh
 
 let pass = 0;
@@ -326,7 +345,7 @@ for (const mode of ['observe', 'on', ' On ', 'OBSERVE']) {
        'P2 one extra Calendar_Events read (A1, all 10 columns) ' + label + ': ' + n.calReads.join(' '));
     // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked on this change; pin moved
     // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pin moved
-    ok(n.ctx.__logs.some(l => l === '[DT10 v1.21.1] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),
+    ok(n.ctx.__logs.some(l => l === '[DT10 v' + deliveredVersion + '] post-earnings tags: 5/9 tickets (recent reports 8; quarantine 5/10 sessions)'),   // merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the delivered version
        'P2 Logger line ' + label);
   }
 }
@@ -529,14 +548,20 @@ console.log('P6 PASS self-test');
 
 // ------------------------------------------------------------ P7 static
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked on this change; pins moved.
-// The delivered file is v1.19.0; the added-lines lint and the census compare the v1.18.0 file
-// rebuilt from it (v1.19.0 edits reversed, SHA-256 pinned) with v1.17.1.
+// The delivered file is v1.21.2 (merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1); the layer (this bundle's regions
+// stripped) is main's v1.21.1, and the added-lines lint and the census compare the v1.18.0 file rebuilt
+// from the layer (v1.21.1, v1.21.0, v1.20.0 then v1.19.0 edits reversed, SHA-256 pinned) with v1.17.1.
 // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; the delivered
 // pin moved to 1.20.0 (v1180Source now reverses the v1.20.0 edits first).
-const s1180 = history.v1180Source(src);
-ok((src.match(/^var DT10_VERSION = '1\.21\.1';$/m) || []).length === 1 && /^ \* Version: 1\.21\.1 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&
+// 2026-11-03: v1.21.0 (ex-dividend guard) stacked as well; pins moved to 1.21.0.
+// 2026-11-05: v1.21.1 (approved fund scope) stacked as well; pins moved to 1.21.1.
+const s1180 = history.v1180Source(layerSrc);
+ok((layerSrc.match(/^var DT10_VERSION = '1\.21\.1';$/m) || []).length === 1 && /^ \* Version: 1\.21\.1 \(see DT10_VERSION;/.test(layerSrc.split('\n')[3]) &&
    (s1180.match(/^var DT10_VERSION = '1\.18\.0';$/m) || []).length === 1 && /^ \* Version: 1\.18\.0 \(see DT10_VERSION;/.test(s1180.split('\n')[3]),
-   'P7 version lockstep 1.21.1 (delivered) and 1.18.0 (rebuilt)');
+   'P7 version lockstep 1.21.1 (layer) and 1.18.0 (rebuilt)');
+ok(dt10Floor(deliveredVersion, [1, 21, 1]) && (src.match(/^var DT10_VERSION = '/mg) || []).length === 1 &&
+   src.split('\n')[3].indexOf(' * Version: ' + deliveredVersion + ' (see DT10_VERSION;') === 0,
+   'P7 delivered version floor 1.21.1 in lockstep: ' + deliveredVersion);
 const why = src.slice(src.indexOf(' * v1.18.0 (2026-10-27) [POST-EARNINGS]'), src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'));
 ok(why.length > 2000 && /^[\x09\x0a\x20-\x7e]*$/.test(why), 'P7 WHY block present (newest first) and ASCII');
 ok(src.indexOf(base.slice(base.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), base.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'))) > 0,
