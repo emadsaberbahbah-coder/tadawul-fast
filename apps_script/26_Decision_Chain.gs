@@ -1,8 +1,34 @@
 /**
- * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.4 (2026-11-04)
+ * 26_Decision_Chain.gs -- TFB Decision Chain v1.0.5 (2026-11-05)
  * ============================================================================
  * Refresh Portfolio_Decision and Top_10_Investments when the sync's data
  * LANDS, instead of on fixed clocks.
+ *
+ * v1.0.5 (2026-11-05) -- RENDER PRIORITY (TFB_RENDER_PRIORITY, default off).
+ * WHY (Apps Script executions + _Run_Log, Thu 5 Nov 2026, Riyadh): for sync
+ * 41901407829 this chain's Top_10 renders at 01:04:49, 01:14:49 and 01:34:49
+ * were stopped at the Apps Script 6-minute limit ("Timed Out", 361 s each).
+ * The 01:14:49 render started while porRefreshTrigger (28_Plan_Of_Record,
+ * every 15 minutes, 174-321 s) was running; the 01:04:49 one shared its
+ * minutes with the hourly Decision Pages v2 build. A stopped execution writes
+ * nothing: no _Run_Log row, no receipt, and the claim simply expires, so
+ * three of the night's four failed renders were invisible.
+ * WHAT (gate on only):
+ *   - no render is planned while the Plan of Record holds its run claim
+ *     (CacheService 'POR_RUNNING'): 'Plan of Record refresh running; the
+ *     render waits for the next tick'. 28_Plan_Of_Record 1.0.1 yields the
+ *     other way (no refresh while a cockpit render or a chain claim is
+ *     fresh). An unreadable cache never blocks.
+ *   - a claim found expired (older than TFB_DC_CLAIM_TTL_MIN) is a render
+ *     whose execution never reached its outcome: one WARN row
+ *     '<act> run N -> did not finish (...)', and the claim is cleared so the
+ *     row is written once.
+ * Off (absent, blank, any other word, a fault): one property read per tick
+ * and nothing else; plans, state and rows are those of v1.0.4. Functions
+ * added: 2 (tfbDcPriorityOn_ PURE, tfbDcPorRunning_ I/O). Changed:
+ * tfbDcReadInputs_ (priority fields while on), tfbDcPlanCore_ (the POR
+ * wait), tfbDecisionChainTick (the stopped-render row), tfbDecisionChainStatus
+ * (priority= field). Rollback: delete TFB_RENDER_PRIORITY, or v1.0.4.
  *
  * v1.0.4 (2026-11-04) -- EARLY TOP_10 RENDER (TFB_DECISION_CHAIN_EARLY_T10,
  * default off). WHY: both overnight syncs of 4 Nov ended red at "Verify
@@ -139,7 +165,7 @@
  * ============================================================================
  */
 
-var TFB_DC_VERSION = '1.0.4';
+var TFB_DC_VERSION = '1.0.5';
 var TFB_DC_MODE_PROP = 'TFB_DECISION_CHAIN';          // off (default) | observe | on
 var TFB_DC_QUIET_PROP = 'TFB_DECISION_CHAIN_QUIET';   // Riyadh windows, 'none' = no quiet
 var TFB_DC_STATE_PROP = 'TFB_DECISION_CHAIN_STATE';   // JSON, owned by this file
@@ -160,6 +186,8 @@ var TFB_DC_EARLY_PROP = 'TFB_DECISION_CHAIN_EARLY_T10'; // v1.0.4: off (default)
 var TFB_DC_UPSTREAM_KEY = 'TFB Upstream Feed Diagnostic'; // v1.0.4: 'UPSTREAM_READY | run=N ...'
 var TFB_DC_EARLY_FEED_KEYS = ['TFB Feed Market_Leaders', 'TFB Feed Global_Markets',
                               'TFB Feed Commodities_FX', 'TFB Feed Mutual_Funds'];   // v1.0.4
+var TFB_DC_PRIORITY_PROP = 'TFB_RENDER_PRIORITY';   // v1.0.5: off (default) | on
+var TFB_DC_POR_RUN_KEY = 'POR_RUNNING';             // v1.0.5: 28_Plan_Of_Record's run claim (CacheService)
 
 /* ------------------------------------------------------------------ PURE --- */
 
@@ -226,6 +254,22 @@ function tfbDcReleaseOf_(raw) {
 }
 
 /** Parse the chain's own state JSON; anything malformed -> empty state. */
+/** v1.0.5 PURE: the render-priority gate; on / 1 / true / yes (trimmed, any
+ * case) reads on, anything else reads off. */
+function tfbDcPriorityOn_(raw) {
+  return /^\s*(on|1|true|yes)\s*$/i.test(String(raw === null || raw === undefined ? '' : raw));
+}
+
+/** v1.0.5 I/O: is the Plan of Record refresh holding its run claim? An
+ * unreadable cache never blocks (false). */
+function tfbDcPorRunning_() {
+  try {
+    return !!CacheService.getScriptCache().get(TFB_DC_POR_RUN_KEY);
+  } catch (e) {
+    return false;
+  }
+}
+
 /** v1.0.4 PURE: the early-render gate; on / 1 / true / yes (trimmed, any
  * case) reads on, anything else (absent, blank, junk) reads off. */
 function tfbDcEarlyOn_(raw) {
@@ -371,6 +415,8 @@ function tfbDcPlanCore_(s) {
   }
   if (s.automationAllowed === false) return none('automation paused (manual priority or backend hold)');
   if (s.inflight) return none('sync in flight');
+  /* v1.0.5: TFB_RENDER_PRIORITY on - never render beside the Plan of Record */
+  if (s.priority && s.porRunning) return none('Plan of Record refresh running; the render waits for the next tick');
   var att = st.attempts || {};
   var pd = s.pd || {};
   if (pd.available && pd.ready && /^[1-9]\d*$/.test(String(pd.cohort || '')) &&
@@ -541,6 +587,12 @@ function tfbDcReadInputs_(ss, mode, state, nowMs) {
       s.inflight = !!dt10SyncInflightCore_(ml, gm, nowMs, TFB_DC_INFLIGHT_MAX_MIN).active;
     }
   } catch (eSt) {}
+  try {   /* v1.0.5: render priority, read only while the gate is on */
+    if (tfbDcPriorityOn_(tfbDcProps_().getProperty(TFB_DC_PRIORITY_PROP))) {
+      s.priority = true;
+      s.porRunning = tfbDcPorRunning_();
+    }
+  } catch (ePr) { delete s.priority; delete s.porRunning; }
   try {   /* v1.0.4: early Top_10 inputs, read only while the gate is on */
     if (tfbDcEarlyOn_(tfbDcProps_().getProperty(TFB_DC_EARLY_PROP))) {
       var feeds = [];
@@ -608,6 +660,23 @@ function tfbDecisionChainTick() {
     var props = tfbDcProps_();
     var state = tfbDcStateOf_(props.getProperty(TFB_DC_STATE_PROP));
     var nowMs = Date.now();
+    /* v1.0.5: an expired claim is a render whose execution never reached its
+     * outcome (the 6-minute limit stops it without a trace); say so once. */
+    var oc = state.claim;
+    if (oc && typeof oc.at_ms === 'number' && nowMs - oc.at_ms >= TFB_DC_CLAIM_TTL_MIN * 60000) {
+      var prOn = false;
+      try { prOn = tfbDcPriorityOn_(props.getProperty(TFB_DC_PRIORITY_PROP)); } catch (ePo) { prOn = false; }
+      if (prOn) {
+        tfbDcLog_('WARN', oc.act === 'pd' ? 'Portfolio_Decision' : 'Top_10_Investments', 'NOT_FINISHED',
+                  '[DECISION-CHAIN v' + TFB_DC_VERSION + '] ' + oc.act + ' run ' + oc.run +
+                  ' -> did not finish (claimed ' + Math.round((nowMs - oc.at_ms) / 60000) +
+                  ' min ago; an Apps Script execution is stopped at 6 minutes without a trace;' +
+                  ' no receipt was written; the attempt counts and the next tick retries)', null,
+                  {version: TFB_DC_VERSION, act: oc.act, run: oc.run, stopped: true});
+        state.claim = null;
+        props.setProperty(TFB_DC_STATE_PROP, JSON.stringify(state));
+      }
+    }
     /* observe walks both steps: what it already reported counts as done */
     var view = mode === 'observe'
         ? {pd: state.observed.pd || state.pd, t10: state.observed.t10 || state.t10,
@@ -758,6 +827,7 @@ function tfbDecisionChainStatus() {
       ' last_pd=' + (state.pd || '-') + ' last_t10=' + (state.t10 || '-') +
       ' last_release_render=' + (state.t10rel || '-') +
       ' early_t10=' + (tfbDcEarlyOn_(tfbDcProps_().getProperty(TFB_DC_EARLY_PROP)) ? 'on' : 'off') +
+      ' priority=' + (tfbDcPriorityOn_(tfbDcProps_().getProperty(TFB_DC_PRIORITY_PROP)) ? 'on' : 'off') +   /* v1.0.5 */
       ' last_t10_early=' + (state.t10e || '-') +   /* v1.0.4 */
       ' next=' + plan.action + (plan.run ? ' run ' + plan.run : '') + ' (' + plan.reason + ')';
   Logger.log(msg);
