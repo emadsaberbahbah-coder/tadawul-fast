@@ -193,7 +193,10 @@ The sync reads but does not apply the Replacement column (v6.64.0 scope cut). `S
 ## Operator steps
 1. **Merge** the PR.
 2. **Paste** the full `apps_script/16_Decision_Top10.gs` v1.21.1 into Apps Script and Save. `dt10SelfTest` starts with `[DT10 v1.21.1] self-test`.
-3. **`_Retired_Symbols`:** the 52 rows above, Page = Mutual_Funds. Do not delete Mutual_Funds rows by hand: the sync removes them on its next write, and the tab keeps them out.
+3. **`_Retired_Symbols`:** done by Claude on Thu 5 Nov 2026 13:43 Riyadh, under the owner's approval: the 52 rows above, in rows 6-57, Page = Mutual_Funds.
+   - A read-back (gviz) shows the header, the 4 Global_Markets rows and the 52 in page order.
+   - The sync's own parser (`_retired_index_from_matrix` / `_retired_for_page` / `_retire_decide`) on that matrix gives Mutual_Funds 52 (both SPLG rows), Global_Markets 4, junk 0, verdict `retired`.
+   - Do not delete Mutual_Funds rows by hand: the sync removes them on its next write, and the tab keeps them out.
 4. **The next sync** (scheduled 15:17 or 23:17 Riyadh, or a fresh `daily_sync` dispatch after 15:00 Riyadh) removes the 52 rows: the log shows `[UNIVERSE-RETIRE v6.64.0] ... Mutual_Funds ... verdict=retired` and `_Status` adds ` retired=52`.
 5. **Check:**
    - Mutual_Funds has 2422 rows and 100 % names;
