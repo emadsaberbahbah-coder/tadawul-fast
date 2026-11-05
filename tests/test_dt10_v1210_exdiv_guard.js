@@ -73,7 +73,9 @@ const newSource = fs.readFileSync(NEW_PATH, 'utf8');
 /* merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0. The structural checks
  * (E0 pins, E10 diff inventory and reversal) and the v1.20.0 base rebuild read the layer: the
  * delivered file with the bundle's designed regions stripped (tests/js/dt10_audit_keep_regions.js),
- * which is main's v1.21.0 byte for byte; the behavioural checks run the delivered file. */
+ * which is main's v1.21.0 byte for byte; the behavioural checks run the delivered file.
+ * merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1; the layer is now main's
+ * v1.21.1 byte for byte (v1200Source reverses the v1.21.1 edits first). */
 const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
 const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
@@ -85,6 +87,14 @@ try {
   console.log('FAIL 0/1');
   process.exit(1);
 }
+/* 2026-11-05: v1.21.1 (approved Mutual_Funds scope 2422, policy data only) is stacked on this change.
+ * The rebuilt v1.21.0 file (the v1.21.1 edits reversed, SHA-256 pinned) feeds E1's refresh-level
+ * golden negative and E10's lint; tests/test_dt10_v1211_mf_scope.js proves v1.21.1 = v1.21.0 apart
+ * from that data. Every other check runs on the delivered file.
+ * merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the v1.21.1 edits are
+ * reversed on the layer (main's v1.21.1 byte for byte), never on the delivered v1.21.2 file, so S1210
+ * is main's v1.21.0 (without the bundle's regions) and reads no DT10_AUDIT_KEEP property. */
+const S1210 = history.v1210Source(layerSource);
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const GUARD = 'DT10_TICKET_GUARD', KNOB = 'DT10_GUARD_EXDIV_DAYS', PCTK = 'DT10_GUARD_EXDIV_PCT';
@@ -117,7 +127,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and B2; comparisons against
  * the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.21\.\d+/g, 'v1.20.0'));   // merge note 2026-11-03 (#778): v1.21.0 or the bundle's v1.21.1
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.21\.\d+/g, 'v1.20.0'));   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0; merge note 2026-11-05 (#778): or the bundle's v1.21.2
 
 /* The Dividend_Events grid (scripts/run_calendar_sync.py v1.3.0 DIV_HEADERS),
  * ex-dates relative to the Riyadh day `d0`. */
@@ -596,10 +606,12 @@ function battery() {
     eq(sha256(baseSource), history.V1200_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.20.0', 'base version');
     // merge note 2026-11-03 (#778): the delivered file sits above v1.21.0; the exact v1.21.0 pins hold on the layer
-    ok(/^1\.(2[1-9]|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.21.0: ' + N.DT10_VERSION);
+    // 2026-11-05: v1.21.1 pins moved; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the delivered file sits above v1.21.1;
+    // the exact v1.21.1 pins hold on the layer
+    ok(/^1\.(21\.[1-9]\d*|(2[2-9]|[3-9]\d)\.\d+)$/.test(N.DT10_VERSION), 'delivered version floor 1.21.1: ' + N.DT10_VERSION);
     ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    ok(/^ \* Version: 1\.21\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'layer pins 1.21.0');
+    ok(/^ \* Version: 1\.21\.1 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'layer pins 1.21.1');
     deq([N.DT10_GUARD_EXDIV_DAYS_PROP, N.DT10_GUARD_EXDIV_PCT_PROP, N.DT10_DIVIDEND_SHEET], [KNOB, PCTK, 'Dividend_Events'], 'names');
     deq([N.DT10_GUARD_EXDIV_DAYS_MAX, N.DT10_GUARD_EXDIV_PCT_DEF, N.DT10_GUARD_EXDIV_PCT_MAX], [30, 2, 100], 'bounds');
     for (const k of ['DT10_GUARD_EXDIV_DAYS_PROP', 'DT10_DIVIDEND_SHEET', 'dt10ExDivHold_', 'dt10ExDivMap_', 'dt10ExDivMapFromValues_']) eq(typeof B[k], 'undefined', 'the base lacks ' + k);
@@ -627,14 +639,15 @@ function battery() {
     for (const st of ['EXECUTABLE', 'NOT_ACTIONABLE']) {
       deq(render(newSource, { state: st, tguard: guardCfg('enforce') }).snap, render(baseSource, { state: st, tguard: guardCfg('enforce') }).snap, 'feed ' + st);
     }
-    // refresh level: Script Properties as the owner would type them
+    // refresh level: Script Properties as the owner would type them. 2026-11-05: on the rebuilt v1.21.0
+    // file (S1210): v1.21.1's approved fund count reaches the readiness reason in the Logger lines
     const JUNK = [null, '', ' ', 'abc', '-1', '31', '1.5', '3d', '+3'];
     for (const mode of ['off', 'observe', 'enforce']) {
       const bp = mode === 'off' ? {} : { [GUARD]: mode };
       const b = refresh(baseSource, bp);
       for (const kv of mode === 'off' ? [null, '3', '0', '30', 'abc'] : JUNK) {
         const props = Object.assign({}, bp); if (kv !== null) { props[KNOB] = kv; props[PCTK] = '0.5'; }
-        const n = refresh(newSource, props), label = mode + ' knob ' + JSON.stringify(kv);
+        const n = refresh(S1210, props), label = mode + ' knob ' + JSON.stringify(kv);
         eq(nv(n.status), b.status, 'B2 status line ' + label);
         deq(nv(n.calls), b.calls, 'every sheet write ' + label);
         deq(nv(n.runLog), b.runLog, '_Run_Log rows ' + label);
@@ -643,6 +656,7 @@ function battery() {
         deq(n.posted, b.posted, 'POST bodies ' + label); deq(n.saved, b.saved, 'state blob ' + label);
         const extra = mode === 'off' ? 0 : 1;   // the days knob, read once while the guard is armed; the pct knob never
         // merge note 2026-11-03 (#778): the bundle adds its own memoized DT10_AUDIT_KEEP read
+        // (2026-11-05: S1210 is rebuilt from the layer, so it reads none; the checks still hold)
         eq(n.propReads.total - (n.propReads.byKey['DT10_AUDIT_KEEP'] || 0), b.propReads.total + extra, 'property reads ' + label);
         ok((n.propReads.byKey['DT10_AUDIT_KEEP'] || 0) <= 1, 'the bundle reads DT10_AUDIT_KEEP at most once ' + label);
         eq(n.propReads.byKey[KNOB] || 0, extra, 'days knob reads ' + label); eq(n.propReads.byKey[PCTK] || 0, 0, 'pct knob reads ' + label);
@@ -879,7 +893,7 @@ function battery() {
     deq(noB2(r.calls), noB2(refresh(newSource, { [GUARD]: 'enforce' }).calls), 'REAL refresh without the tab: every write = the v1.20.0 enforce');
   });
 
-  const vAll = s => String(s).replace(/1\.21\.\d+/g, '1.20.0');   // merge note 2026-11-03 (#778): or the bundle's 1.21.1
+  const vAll = s => String(s).replace(/1\.21\.\d+/g, '1.20.0');   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0; merge note 2026-11-05 (#778): or the bundle's 1.21.2
   test('E9 embedded dt10SelfTest: the v1.20.0 report while the knob is unset (or the guard off); one core-ok line while it is set and the guard is armed; a fault reads off', () => {
     const mini = (src, props, throwIt) => {
       const statusRows = []; for (let r = 0; r < 60; r++) statusRows.push(['', '']);
@@ -909,7 +923,7 @@ function battery() {
   });
 
   test('E10 ES5 / ASCII lint of the v1.21.0 diff; inventory: 3 functions and 6 vars added, 0 removed; 13 hunks whose reversal is the reviewed v1.20.0 file; WHY block; every prior WHY verbatim', () => {
-    const newSource = layerSource;   // merge note 2026-11-03 (#778): E10 reads the layer (main's v1.21.0)
+    const newSource = S1210;   // 2026-11-05: the rebuilt v1.21.0 file (see S1210); the v1.21.1 diff has its own harness; merge note 2026-11-03 (#778): E10 reads the layer (main's v1.21.0); merge note 2026-11-05 (#778): S1210 is rebuilt from the layer (main's v1.21.1)
     const baseLines = {}, bl = baseSource.split('\n'), nl = newSource.split('\n');
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);

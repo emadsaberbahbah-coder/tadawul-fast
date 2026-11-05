@@ -1,5 +1,10 @@
 /* tests/js/dt10_audit_keep.test.js -- full-source node vm harness for
- * 16_Decision_Top10.gs v1.21.1 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 16_Decision_Top10.gs v1.21.2 HELD SEATS KEPT IN THE WRITTEN AUDIT.
+ * 2026-11-05: renumbered v1.21.2 over #921's v1.21.1; base copies are now
+ * main's v1.21.1 (git show a85edfc6:apps_script/16_Decision_Top10.gs).
+ * The fixture fund floor follows #921's approved scope (2422, as in
+ * dt10_feed_cohort_binding.test.js), so the refresh source stays ready.
+ * No case changed.
  * 2026-11-03: renumbered v1.21.1 over #906's v1.21.0; base copies are now
  * main's v1.21.0 (git show 658a72c2:apps_script/16_Decision_Top10.gs).
  * No case changed.
@@ -65,7 +70,7 @@ const plain = value => (value === undefined ? undefined : JSON.parse(JSON.string
 const NOW = Date.parse('2026-10-12T09:30:00Z');
 const STAMP = '2026-10-12 12:00:00+03:00';            // 30 minutes before NOW
 const COHORT = '90001';
-const FLOORS = {Market_Leaders: 255, Global_Markets: 6512, Commodities_FX: 453, Mutual_Funds: 2474};
+const FLOORS = {Market_Leaders: 255, Global_Markets: 6512, Commodities_FX: 453, Mutual_Funds: 2422};   // merge note 2026-11-05 (#778): #921's approved fund scope
 const SCOPE_PAGES = ['Market_Leaders', 'Mutual_Funds'];
 const FULL_PAGES = ['Market_Leaders', 'Global_Markets', 'Commodities_FX', 'Mutual_Funds'];
 const SYMBOLS = Object.fromEntries(FULL_PAGES.map(page => [page,
@@ -309,7 +314,7 @@ if (baseSource) {
       assert.deepEqual(a.tables, b.tables);
     }
   });
-  test('D2 every changed line lies inside a designed v1.21.1 region; regions are exact text', () => {
+  test('D2 every changed line lies inside a designed v1.21.2 region; regions are exact text', () => {
     assert.equal(stripDesigned(source), baseSource);
     assert.equal((FN_REGION.match(/^function /mg) || []).length, 2, 'two top-level functions');
     assert.ok(/^[\x00-\x7f]*$/.test(HEADER_REGION + FN_REGION + CALL_REGION), 'designed regions are ASCII');

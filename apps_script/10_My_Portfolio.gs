@@ -1,7 +1,63 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.18
+ * Version: 1.5.19
+ *
+ * v1.5.19 (2026-11-03)  (PLAIN BLOCK REASONS + TICKER-CHANGE HINT: ONE LINE
+ *                        ABOVE THE ACTIONS TABLE SAYS WHY EVERY HOLDING IS
+ *                        BLOCKED AND THE ONE STEP THAT CLEARS IT --
+ *                        PD_PLAIN_REASONS, default off; ALL v1.5.18 logic
+ *                        carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (owner, 3 Nov 2026 12:14 Riyadh: 'still my portfolio showing Block'):
+ * IBKR moved the INDV shares to the new contract SUPN after the Indivior -
+ * Supernus merger while the ledger still said INDV.US. pdIbkrPlan_ linked
+ * 4 of 5 rows; B2 read '... linked 4/5; IBKR not on page: SUPN ...' and
+ * every row read 'BLOCKED; RECONCILIATION_REQUIRED: custody_unknown,
+ * unrepresented_positions'. After the ledger rename the rows read
+ * 'RECONCILIATION_REQUIRED: holding_quote_unverified' (the feed still priced
+ * the old SUPN.US listing). The page never said, in words, that a ticker
+ * had changed or what to do; the owner had to ask.
+ * WHAT (Script Property PD_PLAIN_REASONS = on, trimmed, any case; absent or
+ * any other word = every cell, row, request and line byte-identical to
+ * v1.5.18, apart from that one property read per refresh):
+ *  (1) pdIbkrDrift_ (pure): inside pdIbkrApply_, a valid FRESH plan's page
+ *      rows (the 14-minute send window; a stale capture may predate the
+ *      rename) that link to no IBKR position and the positive IBKR positions
+ *      no row represents are paired ONE TO ONE when their share counts are
+ *      equal -> [{row, position, quantity}] (a likely ticker change; any
+ *      doubt = no pair). Computed, never sent: the request is unchanged.
+ *  (2) pdPlainCodes_ (pure): the reason codes of the payload's BLOCK rows
+ *      (Advisor Note 'RECONCILIATION_REQUIRED: a, b' and
+ *      detail.reconciliation_status), sorted and unique; BLOCK rows from the
+ *      other gates (no code) are counted apart and keep their own notes.
+ *  (3) pdPlainLine_ (pure): '' without a coded BLOCK row; else 'WHY BLOCKED
+ *      (n of m holdings): <plain clause per code (code)>. NEXT: <one step>.'
+ *      The step follows a fixed priority: a ticker-change pair (rename that
+ *      row in _Portfolio_CostBasis), a share-count difference, an unmatched
+ *      row or position, a holding without a current price (wait for the
+ *      feed), a missing or stale capture (refresh within 14 minutes of the
+ *      next one), a cash code (check the cash and the working BUY orders),
+ *      else each row's Advisor Note; the other BLOCK rows are counted at
+ *      the end. The text never contains the words the readers use to
+ *      find the ACTIONS header ('action', 'symbol': run_daily_brief
+ *      _find_header matches substrings).
+ *  (4) pdRenderPayload_ writes the line, merged across the page and
+ *      wrapped, between the ACTIONS section title and its header row; the
+ *      readers find that header by its cells, so they are unaffected.
+ * GATES: PD_PLAIN_REASONS (display only; nothing is sent, weighted,
+ *   funded or actioned differently).
+ * Functions added (0 removed): pdPlainMode_, pdIbkrDrift_, pdPlainCodes_,
+ *   pdPlainClause_, pdPlainLine_, pdWritePlainLine_, pdPlainCoreOk_. Changed:
+ *   pdIbkrApply_ (res.drift), pdRenderPayload_ (a fifth argument),
+ *   refreshPortfolioDecision (the gate, the line), pdSelfTest (one line,
+ *   only while the gate is on).
+ *   Vars added: PD_PLAIN_PROP, PD_PLAIN_TEXT.
+ * Harness: tests/test_pd_v1519_plain_block.js (REAL file; golden negative on
+ *   the v1.5.18 base rebuilt by reversing these edits, SHA-256 pinned).
+ * ROLLBACK: delete PD_PLAIN_REASONS (no re-paste); or re-paste v1.5.18.
+ * ES5; ASCII; every prior WHY verbatim; PD_VERSION and the header bumped in
+ * lockstep.
  *
  * v1.5.18 (2026-11-02)  (CASH EVIDENCE ROW + LAST-KNOWN CASH + FOLLOW-UP
  *                        RETRY: _Cash_Snapshot GETS ONE CERTIFIABLE IBKR
@@ -2816,7 +2872,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.18';
+var PD_VERSION = '1.5.19';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3764,6 +3820,207 @@ function pdIbkrPlan_(cap, rows, nowMs, createdMs, sourceRef) {
   return out;
 }
 
+/* ----- v1.5.19 [PLAIN-BLOCK] ---------------------------------------------- */
+var PD_PLAIN_PROP = 'PD_PLAIN_REASONS';
+/* Plain clauses for the reconciliation codes (core/portfolio_reconciliation
+ * statuses and reasons, portfolio_actions certification reasons). Never the
+ * words 'action' or 'symbol' (the ACTIONS header is found by substring). */
+var PD_PLAIN_TEXT = {
+  custody_unknown: 'a My_Portfolio row has no matching IBKR position (ticker or currency differ)',
+  unrepresented_positions: 'IBKR holds a position that is not on My_Portfolio',
+  position_missing: 'a linked IBKR position is missing from the capture',
+  position_identity_mismatch: 'a row and its IBKR position carry different tickers or currencies',
+  quantity_mismatch: 'a row\'s share count differs from IBKR',
+  position_closed: 'IBKR shows a held row as closed (0 shares)',
+  inactive_zero: 'a row carries 0 shares',
+  holding_quote_unverified: 'a holding has no current price (no fresh market quote)',
+  holding_fx_mismatch: 'a holding\'s FX rate disagrees with the proof',
+  missing_evidence: 'no fresh IBKR capture went with this request (captures are hourly; each is valid for 14 minutes)',
+  invalid_evidence: 'the IBKR capture could not be verified',
+  fx_unverified: 'a currency has no FX proof',
+  portfolio_inputs_unverified: 'the portfolio inputs are not verified'
+};
+
+/** 'on' only when PD_PLAIN_REASONS is exactly 'on' (trimmed, any case);
+ * anything else, or a property fault, is 'off'. */
+function pdPlainMode_() {
+  return pdIbkrProp_(PD_PLAIN_PROP).toLowerCase() === 'on' ? 'on' : 'off';
+}
+
+/** PURE: likely ticker changes in a VALID plan -- a page row that links to
+ * no IBKR position and a positive position no row represents, paired one to
+ * one by an equal share count (any second candidate on either side = no
+ * pair). -> [{row, position, quantity}]. Never throws. */
+function pdIbkrDrift_(plan, rows) {
+  var out = [];
+  try {
+    if (!plan || plan.ok !== true || !plan.packet || !plan.unlinked.length ||
+        !plan.unrepresented.length) return out;
+    var acct = (plan.packet.accounts || [])[0] || {};
+    var pos = acct.positions || [], linked = {}, l, i, j;
+    for (l = 0; l < (plan.packet.holding_links || []).length; l++) {
+      linked[plan.packet.holding_links[l].row_index] = true;
+    }
+    var free = [];   /* unrepresented positive positions with their counts */
+    for (i = 0; i < pos.length; i++) {
+      if (plan.unrepresented.indexOf(pos[i].symbol) < 0) continue;
+      var pq = Number(pos[i].quantity);
+      if (isFinite(pq) && pq > 0) free.push({symbol: pos[i].symbol, qty: pq});
+    }
+    var lone = [];   /* unlinked page rows with their counts */
+    for (j = 0; j < (rows || []).length; j++) {
+      if (linked[j]) continue;
+      var rq = Number(rows[j] ? rows[j]['Quantity'] : NaN);
+      var rs = pdIbkrSym_(rows[j] ? rows[j]['Symbol'] : '');
+      if (rs && isFinite(rq) && rq > 0) lone.push({symbol: rs, qty: rq});
+    }
+    for (i = 0; i < lone.length; i++) {
+      var hit = -1, nHit = 0, nTwin = 0;
+      for (j = 0; j < free.length; j++) if (free[j].qty === lone[i].qty) { hit = j; nHit++; }
+      for (j = 0; j < lone.length; j++) if (lone[j].qty === lone[i].qty) nTwin++;
+      if (nHit === 1 && nTwin === 1) {
+        out.push({row: lone[i].symbol, position: free[hit].symbol,
+                  quantity: String(lone[i].qty)});
+      }
+    }
+  } catch (eDr) {
+    return [];
+  }
+  return out;
+}
+
+/** PURE: the reconciliation codes of the BLOCK rows, sorted and unique, and
+ * the counts {codes, blocked, other, total}: blocked = BLOCK rows carrying a
+ * reconciliation code, other = BLOCK rows from the other gates (cost basis,
+ * thin data, identity: detail.reconciliation_status 'matched', no code --
+ * review fix, Codex P2 on #908), total = every row. */
+function pdPlainCodes_(actions) {
+  var seen = {}, codes = [], blocked = 0, other = 0, list = actions || [];
+  function add(c) {
+    c = String(c || '').replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (!/^[a-z0-9_]{1,64}$/.test(c) || c === 'matched') return false;
+    if (!seen.hasOwnProperty(c)) { seen[c] = true; codes.push(c); }
+    return true;
+  }
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i] || {}, coded = false;
+    if (String(a.action || '').toUpperCase() !== 'BLOCK') continue;
+    var m = /RECONCILIATION_REQUIRED:\s*([A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*)/
+        .exec(String(a.advisor_note || ''));
+    if (m) {
+      var parts = m[1].split(',');
+      for (var p = 0; p < parts.length; p++) coded = add(parts[p]) || coded;
+    }
+    if (a.detail && typeof a.detail.reconciliation_status === 'string') {
+      coded = add(a.detail.reconciliation_status) || coded;
+    }
+    if (coded) blocked++; else other++;
+  }
+  codes.sort();
+  return {codes: codes, blocked: blocked, other: other, total: list.length};
+}
+
+/** PURE: the plain clause of one code (the code itself when unknown). */
+function pdPlainClause_(code) {
+  if (PD_PLAIN_TEXT.hasOwnProperty(code)) return PD_PLAIN_TEXT[code];
+  if (/^stale_/.test(code)) return 'the IBKR capture is too old';
+  if (/^future_/.test(code)) return 'the IBKR capture time is ahead of this clock';
+  if (/cash|reserv|fx/.test(code)) return 'cash could not be certified';
+  return code.replace(/_/g, ' ');
+}
+
+/** PURE: '' when no BLOCK row carries a reconciliation code (the other
+ * gates explain themselves in each row's Advisor Note); else the one plain
+ * line (ASCII): 'WHY BLOCKED (n of m holdings): <clause> (<code>); ...
+ * NEXT: <step>.' + a count of the other BLOCK rows. */
+function pdPlainLine_(info, drift) {
+  if (!info || !info.blocked) return '';
+  var why = [], has = {}, i;
+  for (i = 0; i < info.codes.length; i++) {
+    has[info.codes[i]] = true;
+    why.push(pdPlainClause_(info.codes[i]) + ' (' + info.codes[i] + ')');
+  }
+  function any(list) {
+    for (var k = 0; k < list.length; k++) if (has[list[k]]) return true;
+    return false;
+  }
+  function anyRe(re) {
+    for (var k = 0; k < info.codes.length; k++) if (re.test(info.codes[k])) return true;
+    return false;
+  }
+  var pairs = [];
+  for (i = 0; i < (drift || []).length; i++) {
+    pairs.push('IBKR lists ' + drift[i].position + ' where My_Portfolio has ' +
+               drift[i].row + ' (same ' + drift[i].quantity + ' shares)');
+  }
+  var next;
+  if (pairs.length) {
+    next = pairs.join('; ') + ' -- likely a ticker change (merger or rename): put the new ' +
+        'ticker on that row in _Portfolio_CostBasis, then refresh';
+  } else if (any(['quantity_mismatch', 'position_closed', 'inactive_zero'])) {
+    next = 'make the share counts in _Portfolio_CostBasis match IBKR, then refresh';
+  } else if (any(['custody_unknown', 'unrepresented_positions', 'position_identity_mismatch',
+                  'position_missing'])) {
+    next = 'make every My_Portfolio row match one IBKR position (same ticker, currency and ' +
+        'shares) in _Portfolio_CostBasis, then refresh';
+  } else if (has.holding_quote_unverified) {
+    next = 'wait for a fresh price on every holding (a renamed or delisted listing keeps an ' +
+        'old price until the feed switches); funding stays withheld until then';
+  } else if (anyRe(/^(missing_evidence|invalid_evidence|stale_|future_)/)) {
+    next = 'refresh within 14 minutes of the next IBKR capture (about :05 past each hour)';
+  } else if (anyRe(/cash|reserv|fx/)) {
+    next = 'check the cash and the working BUY orders in the IBKR capture, then refresh ' +
+        'after the next capture';
+  } else {
+    next = 'read each row\'s Advisor Note for the cause';
+  }
+  var other = info.other > 0 ? ' ' + info.other + ' more BLOCK row' +
+      (info.other === 1 ? ' carries' : 's carry') + ' another reason (see its Advisor Note).' : '';
+  return 'WHY BLOCKED (' + info.blocked + ' of ' + info.total + ' holdings): ' +
+      (why.length ? why.join('; ') : 'no reason code on the rows') + '. NEXT: ' + next + '.' +
+      other;
+}
+
+/** v1.5.19: the plain line, merged across the page and wrapped. */
+function pdWritePlainLine_(sheet, row, text) {
+  sheet.getRange(row, 1, 1, PD_LAST_COL).merge().setValue(text)
+      .setWrap(true).setFontSize(9).setFontWeight('bold')
+      .setFontColor(PD_GOLD_TEXT).setBackground(PD_GOLD_FILL);
+  return row + 1;
+}
+
+/** v1.5.19 PURE battery for pdSelfTest (the 3 Nov shapes): the codes of a
+ * BLOCK note, the INDV.US -> SUPN pair (95 shares, one to one), a twin count
+ * gives no pair, a clean board gives no line, and the line never carries the
+ * ACTIONS-header words. */
+function pdPlainCoreOk_() {
+  try {
+    var acts = [{action: 'BLOCK', advisor_note: 'BLOCKED; RECONCILIATION_REQUIRED: ' +
+                 'custody_unknown, unrepresented_positions | [custody-unverified]'},
+                {action: 'BLOCK', advisor_note: 'BLOCKED; RECONCILIATION_REQUIRED: custody_unknown',
+                 detail: {reconciliation_status: 'custody_unknown'}}];
+    var info = pdPlainCodes_(acts);
+    var plan = {ok: true, unlinked: ['INDV.US'], unrepresented: ['SUPN'],
+                packet: {holding_links: [{row_index: 0}],
+                         accounts: [{positions: [{symbol: 'FRST', quantity: '174'},
+                                                 {symbol: 'SUPN', quantity: '95'}]}]}};
+    var rows = [{Symbol: 'FRST.US', Quantity: 174}, {Symbol: 'INDV.US', Quantity: 95}];
+    var drift = pdIbkrDrift_(plan, rows);
+    var line = pdPlainLine_(info, drift);
+    var twin = pdIbkrDrift_(plan, rows.concat([{Symbol: 'X.US', Quantity: 95}]));
+    return info.codes.join(',') === 'custody_unknown,unrepresented_positions' &&
+        info.blocked === 2 && drift.length === 1 && drift[0].row === 'INDV.US' &&
+        drift[0].position === 'SUPN' && drift[0].quantity === '95' && twin.length === 0 &&
+        line.indexOf('IBKR lists SUPN where My_Portfolio has INDV.US (same 95 shares)') > 0 &&
+        !/action|symbol/i.test(line) &&
+        pdPlainLine_(pdPlainCodes_([{action: 'HOLD'}]), []) === '' &&
+        pdPlainLine_(pdPlainCodes_([{action: 'BLOCK', advisor_note: 'BLOCKED; missing quantity',
+                                     detail: {reconciliation_status: 'matched'}}]), []) === '';
+  } catch (ePc) {
+    return false;
+  }
+}
+
 /** PURE: the status-line fragment (never the receipt phrase, never the
  * packet; the certified cash is shown because it replaces the panel's). */
 function pdIbkrNote_(mode, plan, fresh, excluded) {
@@ -3884,6 +4141,14 @@ function pdIbkrApply_(mode, body) {
       res.positions = plan.positions;
       res.linked = plan.linked;
       res.ageMs = plan.ageMs;
+      /* v1.5.19: the likely ticker changes, for the plain line only; never
+       * sent, and non-enumerable so the result's keys stay the v1.5.18 ones.
+       * Review fix (Codex P2 on #908): only from a FRESH capture -- a stale
+       * one may predate the rename and would point the hint backwards. */
+      if (fresh) {
+        Object.defineProperty(res, 'drift', {value: pdIbkrDrift_(plan, split.kept),
+                                             enumerable: false});
+      }
     }
     if (mode === 'enforce') {
       var rates = pdIbkrPegRates_(body.fx_rates);
@@ -5344,7 +5609,11 @@ function refreshPortfolioDecision() {
     return 'HTTP ' + resp.code;
   }
   var payload = resp.json;
-  pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null);
+  /* v1.5.19 [PLAIN-BLOCK]: PD_PLAIN_REASONS = on -> one plain line above the
+   * ACTIONS table when a holding is BLOCK; off -> '' = the v1.5.18 render. */
+  var plainLine = pdPlainMode_() === 'on' ?
+      pdPlainLine_(pdPlainCodes_(payload.actions), ibkr ? ibkr.drift : null) : '';
+  pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null, plainLine);
 
   /* v1.5.9: append the just-rendered board to _Portfolio_Action_Log from
    * memory (16 v1.3.1 pattern). Never throws — failures become the note. */
@@ -5377,7 +5646,7 @@ function refreshPortfolioDecision() {
   return String(payload.status || '?');
 }
 
-function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
+function pdRenderPayload_(sheet, payload, tokens, outOfScope, plainLine) {
   var lastRow = sheet.getMaxRows();
   if (lastRow >= PD_ZONES_START) {
     var zone = sheet.getRange(PD_ZONES_START, 1,
@@ -5402,6 +5671,7 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope) {
 
   row = pdWriteSection_(sheet, row,
       'ACTIONS \u2014 one per holding (' + actions.length + ')', tokens);
+  if (plainLine) row = pdWritePlainLine_(sheet, row, plainLine);   /* v1.5.19 */
   var aRows = [];
   for (var a = 0; a < actions.length; a++) {
     aRows.push(pdActionToRow_(actions[a]));
@@ -5796,6 +6066,11 @@ function pdSelfTest() {
       '; last written here: ' + (pdIbkrProp_(PD_CASH_SNAP_LAST_PROP) || 'none') +
       '; ' + pdCashSnapSheetState_());
   report.push('cash snapshot core: ' + (pdCashSnapCoreOk_() ? 'ok' : 'FAIL'));
+  /* v1.5.19 [PLAIN-BLOCK]: only while the gate is on (else the v1.5.18 report). */
+  if (pdPlainMode_() === 'on') {
+    report.push('plain block reasons (PD_PLAIN_REASONS): on | core: ' +
+                (pdPlainCoreOk_() ? 'ok' : 'FAIL'));
+  }
   var rtOk = pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, false).arm === true &&
       pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660000, false).arm === true &&
       pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660001, false).arm === false &&

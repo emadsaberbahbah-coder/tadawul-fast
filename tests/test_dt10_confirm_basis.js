@@ -64,6 +64,8 @@ var newSource = fs.readFileSync(NEW_PATH, 'utf8');
 // v1.20.1 held-seat regions, so the layer is main's v1.20.0 byte for byte.
 // merge note 2026-11-03 (#778): the delivered file is now main's v1.21.0 plus the
 // v1.21.1 held-seat regions, so the layer is main's v1.21.0 byte for byte.
+// merge note 2026-11-05 (#778): the delivered file is now main's v1.21.1 plus the
+// v1.21.2 held-seat regions, so the layer is main's v1.21.1 byte for byte.
 var layerSource = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js')).stripDesigned(newSource);
 function dt10AtLeast(v, f) { var x = String(v).split('.').map(Number); for (var k = 0; k < f.length; k++) { if (x[k] !== f[k]) return x[k] > f[k]; } return true; }
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
@@ -256,11 +258,14 @@ function battery() {
     // 2026-11-03: v1.21.0 (ex-dividend guard) stacked as well; pins moved
     // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: the delivered file sits above v1.21.0;
     // the exact v1.21.0 pins hold on the layer (the delivered file with this bundle's regions stripped).
-    assert(dt10AtLeast(N.DT10_VERSION, [1, 21, 0]), 'delivered version ' + N.DT10_VERSION);
+    // 2026-11-05: v1.21.1 (approved fund scope) stacked as well; pins moved
+    // merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: the delivered file sits above v1.21.1;
+    // the exact v1.21.1 pins hold on the layer (the delivered file with this bundle's regions stripped).
+    assert(dt10AtLeast(N.DT10_VERSION, [1, 21, 1]), 'delivered version ' + N.DT10_VERSION);
     assert(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     assert(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    assert(/^ \* Version: 1\.21\.0 /.test(layerSource.split('\n')[3]), 'layer header line 4');
-    assert(layerSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'layer DT10_VERSION literal');
+    assert(/^ \* Version: 1\.21\.1 /.test(layerSource.split('\n')[3]), 'layer header line 4');
+    assert(layerSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'layer DT10_VERSION literal');
   });
 
   test('T1 GOLDEN NEGATIVE (v1.13.11): displaced challenger resets to 0 on day 3; pending 1/3, unseated on day 4; displaced FAST-TRACK seat restarts', function () {
@@ -371,7 +376,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('confirm basis core: ok') > 0, 'battery line');
     assert(rep.indexOf('confirm basis (TFB_T10_CONFIRM_BASIS): qualified') > 0, 'basis line default');
-    assert(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved; merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
+    assert(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
     // property memo, so the memo line reports one more key (keys=3); pin moved
@@ -397,7 +402,7 @@ function battery() {
       assert(!/\b(let|const|class)\s|=>|`/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l);
       if (!/^[\x09\x20-\x7e]*$/.test(l)) {
         // the only non-ASCII added line is the version header rewrite (pre-existing em dash)
-        assert(baseLines[l.replace('1.21.0', '1.13.11')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
+        assert(baseLines[l.replace('1.21.1', '1.13.11')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
       }
     });
     function nonAscii(s) { var m = {}; for (var j = 0; j < s.length; j++) { var c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }

@@ -75,7 +75,9 @@ const newSource = fs.readFileSync(NEW_PATH, 'utf8');
  * designed regions stripped (tests/js/dt10_audit_keep_regions.js), which is main's v1.20.0 byte for
  * byte; the behavioural checks run the delivered file.
  * merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0; the layer is now main's
- * v1.21.0 byte for byte, and s1200 (the v1.20.0 rebuild V0 / V10 read) starts from the layer. */
+ * v1.21.0 byte for byte, and s1200 (the v1.20.0 rebuild V0 / V10 read) starts from the layer.
+ * merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1; the layer is now main's
+ * v1.21.1 byte for byte; s1200 and S1210 (the v1.21.0 rebuild B2 reads) start from the layer. */
 const keepRegions = require(path.join(ROOT, 'tests', 'js', 'dt10_audit_keep_regions.js'));
 const layerSource = newSource.indexOf(keepRegions.CALL_REGION) >= 0 ? keepRegions.stripDesigned(newSource) : newSource;
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
@@ -91,6 +93,14 @@ try {
 // the delivered file; the v1.20.0 lint / inventory / hunks (V10) compare the v1.20.0 file rebuilt
 // from it (v1.21.0 edits reversed, SHA-256 pinned) with the base.
 const s1200 = /^var DT10_VERSION = '1\.20\.0';$/m.test(layerSource) ? layerSource : history.v1200Source(layerSource);   // merge note 2026-11-03 (#778): from the layer
+// 2026-11-05: v1.21.1 (approved Mutual_Funds scope 2422, policy data only) stacked on top. Its fund
+// count reaches the readiness reason in the REAL refresh's Logger lines, so the refresh-level golden
+// negative reads the v1.21.0 file rebuilt from the delivered one (v1.21.1 edits reversed, SHA-256
+// pinned); tests/test_dt10_v1211_mf_scope.js proves v1.21.1 = v1.21.0 apart from that data.
+// merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1; the layer is now
+// main's v1.21.1 byte for byte, v1200Source reverses the v1.21.1 edits first, and the v1.21.0
+// rebuild (S1210) starts from the layer, never from the delivered v1.21.2 file.
+const S1210 = /^var DT10_VERSION = '1\.21\.1';$/m.test(layerSource) ? history.v1210Source(layerSource) : layerSource;
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const GUARD = 'DT10_TICKET_GUARD', KPI = 'DT10_KPI_PLAN_GAIN', VENUE = 'DT10_VENUE_LINE', MARK = 'DT10_KPI_PLAN_LABEL_STATE';
@@ -123,7 +133,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and the run-marker property;
  * comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.2[01]\.\d+/g, 'v1.19.0'));   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: v1.20.0, v1.21.0 or the bundle's v1.21.1
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.2[01]\.\d+/g, 'v1.19.0'));   // 2026-11-05: v1.21.1 too; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1: v1.20.0, v1.21.0, v1.21.1 or the bundle's v1.21.2
 
 /* ============================================================ the live board of 2 Nov 2026 */
 const LIVE = [
@@ -575,10 +585,10 @@ function battery() {
   test('V0 base oracle is the reviewed v1.19.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1190_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.19.0', 'base version');
-    ok(/^1\.(2[1-9]|[3-9]\d)\.\d+$/.test(N.DT10_VERSION), 'delivered version floor 1.21.0: ' + N.DT10_VERSION);   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
+    ok(/^1\.(21\.[1-9]\d*|(2[2-9]|[3-9]\d)\.\d+)$/.test(N.DT10_VERSION), 'delivered version floor 1.21.1: ' + N.DT10_VERSION);   // 2026-11-05: v1.21.1 pins moved; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1
     ok(newSource.split('\n')[3].indexOf(' * Version: ' + N.DT10_VERSION + ' ') === 0, 'header line 4 lockstep');
     ok(newSource.indexOf("var DT10_VERSION = '" + N.DT10_VERSION + "';") > 0, 'DT10_VERSION literal');
-    ok(/^ \* Version: 1\.21\.0 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.0';") > 0, 'layer pins 1.21.0');
+    ok(/^ \* Version: 1\.21\.1 /.test(layerSource.split('\n')[3]) && layerSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'layer pins 1.21.1');
     eq(sha256(s1200), history.V1200_SHA256, 'rebuilt v1.20.0 SHA-256');
     ok(/^ \* Version: 1\.20\.0 /.test(s1200.split('\n')[3]) && s1200.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'rebuilt v1.20.0 lockstep');
     eq(N.DT10_TICKET_GUARD_PROP, GUARD); eq(N.DT10_KPI_PLAN_GAIN_PROP, KPI); eq(N.DT10_VENUE_LINE_PROP, VENUE); eq(N.DT10_KPI_PLAN_LABEL_PROP, MARK);
@@ -630,7 +640,7 @@ function battery() {
     baseRefresh = refresh(baseSource, {});
     offRefresh = refresh(newSource, {});
     for (const props of OFF_PROPS) {
-      const n = refresh(newSource, props);
+      const n = refresh(S1210, props);   // 2026-11-05: the rebuilt v1.21.0 file (see S1210)
       const label = JSON.stringify(props);
       eq(nv(n.status), baseRefresh.status, 'B2 status line ' + label);
       deq(nv(n.calls), baseRefresh.calls, 'every sheet write ' + label);
@@ -916,7 +926,7 @@ function battery() {
       return String(ctx.dt10SelfTest());
     };
     const rep = mini(newSource, {}), repB = mini(baseSource, {});
-    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0
+    ok(rep.indexOf('[DT10 v' + N.DT10_VERSION + '] self-test') === 0, 'version line');   // merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1
     const lines = ['ticket guard (DT10_TICKET_GUARD): off (off = v1.19.0 board; observe names; enforce holds) | core: ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; apply ok)',
       'kpi plan gain (DT10_KPI_PLAN_GAIN): off (Exp. Gain TP1 (SAR) = sum Ticket SAR x (TP1 SAR / Price SAR - 1); off = v1.19.0 KPI) | core: ok (four tickets 1050 SAR; no ticket = em dash)',
       'venue line (DT10_VENUE_LINE): off (approximate regular sessions in Riyadh time, no holidays; display only) | core: ok (US 17:30 winter / 16:30 summer, London 11:00, Tadawul Sun 10:00, Friday night -> Mon; open now / withheld / unsized = none)'];
@@ -938,7 +948,7 @@ function battery() {
   // 2026-11-03: V10 reads the rebuilt v1.20.0 file (s1200); the v1.21.0 diff has its own lint
   // in tests/test_dt10_v1210_exdiv_guard.js.
   test('V10 ES5 / ASCII lint of the diff; inventory: 17 functions and 14 vars added, 0 removed; 15 hunks whose reversal is the reviewed v1.19.0 file', () => {
-    const newSource = layerSource;   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: the v1.19.0 reversal reads the layer (main's v1.21.0)
+    const newSource = layerSource;   // merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0: the v1.19.0 reversal reads the layer (main's v1.21.0; main's v1.21.1 since the 2026-11-05 merge note)
     const baseLines = {}, bl = baseSource.split('\n'), nl = s1200.split('\n');
     for (const l of bl) baseLines[l] = true;
     const added = nl.filter(l => !baseLines[l]);

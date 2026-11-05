@@ -378,7 +378,7 @@ test('B7 dt10BulkPaint_: token rows get bg/fg/bold, undefined fields reset, null
 
 /* ================================================================== B8 */
 test('B8 version lockstep, WHY block, oracle integrity, ES5 shape and ASCII of the change', () => {
-  assert(/^1\.((2[1-9]|[3-9]\d)\.\d+)$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved; merge note 2026-11-03 (#778): held seats are v1.21.1 over #906's v1.21.0 (floor 1.21.0)
+  assert(/^1\.(21\.[1-9]\d*|(2[2-9]|[3-9]\d)\.\d+)$/.test(NEW.DT10_VERSION), NEW.DT10_VERSION);   // 2026-11-05: v1.21.1 approved fund scope, pin moved   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved; merge note 2026-11-05 (#778): held seats are v1.21.2 over #921's v1.21.1 (floor 1.21.1)
   assert.equal(OLD.DT10_VERSION, '1.13.10');
   assert(source.split('\n')[3].startsWith(' * Version: ' + NEW.DT10_VERSION + ' '));   // 2026-10-27: v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0, pin moved; 2026-11-02: v1.20.0, pin moved
   assert(source.includes(' * v1.13.11 (2026-10-22) -- BULK RENDER FORMATTING (6-MINUTE LIMIT)\n'));

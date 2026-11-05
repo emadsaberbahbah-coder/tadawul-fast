@@ -1,13 +1,13 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.21.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.21.2 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
  *
- * v1.21.1 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
+ * v1.21.2 (2026-10-14) -- HELD SEATS KEPT IN THE WRITTEN AUDIT
  * (Built 2026-10-13 as an unreleased v1.13.9 draft in PR #770; renumbered
  * after #774 shipped v1.13.9, again on 2026-10-21 after #810 shipped a
  * different v1.13.10, on 2026-10-22 after #815 shipped a different
@@ -18,10 +18,11 @@
  * on 2026-10-28 after #855 shipped v1.18.0 (post-earnings), on
  * 2026-11-01 after #887 shipped v1.19.0 (qualified hold, seat live fill,
  * owner rule), on 2026-11-02 after #895 shipped v1.20.0 (ticket guard,
- * plan-payoff KPI, venue line), and on 2026-11-03 after #906 shipped
- * v1.21.0 (ticket guard holds a new ticket before a large ex-dividend).
- * ALL v1.21.0 logic carried verbatim. No behaviour changed in the
- * renumbering; the base named below is now v1.21.0, the one it sits on.)
+ * plan-payoff KPI, venue line), on 2026-11-03 after #906 shipped
+ * v1.21.0 (ticket guard holds a new ticket before a large ex-dividend),
+ * and on 2026-11-05 after #921 shipped v1.21.1 (approved fund scope).
+ * ALL v1.21.1 logic carried verbatim. No behaviour changed in the
+ * renumbering; the base named below is now v1.21.1, the one it sits on.)
  * WHY (Top_10 export 2026-10-13 20:37 Riyadh): six stability grace-held
  * seats (AED.BR, BBOX.L, INDV.US, CRC.US, MGY.US, JMSB.US) rendered blank
  * Rel / DQ / Conf / Engine ROI. None was in the backend's written audit
@@ -30,7 +31,7 @@
  * backend never learns which incumbents this cockpit holds.
  * WHAT: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any case)
  * arms it; absent or any other word is off. OFF IS BYTE-IDENTICAL to
- * v1.21.0 in every request and render (one memoized property read is
+ * v1.21.1 in every request and render (one memoized property read is
  * added). Armed, body.criteria gains audit_keep_symbols = the sorted
  * stability members (seated and grace-held, fast-track included; at most
  * 60) read from DT10_STAB_STATE_V1, the blob dt10StabCore_ already uses.
@@ -39,13 +40,39 @@
  * when its own TFB_OPP_AUDIT_KEEP=1 is set: both switches are needed and
  * either alone is inert. The list is display context, never a decision
  * input: it moves no gate, score, seat or ticket. A property or state read
- * failure sends nothing (the v1.21.0 body).
+ * failure sends nothing (the v1.21.1 body).
  * Functions added (0 removed): dt10AuditKeepOn_, dt10AuditKeepSymbols_;
  * vars added: DT10_AUDIT_KEEP_PROP, DT10_AUDIT_KEEP_MAX. refreshDecisionTop10
  * makes one guarded call before the POST. Harness:
  * tests/js/dt10_audit_keep.test.js.
- * Rollback: delete the property (the next run is v1.21.0 behaviour) or
- * re-paste v1.21.0.
+ * Rollback: delete the property (the next run is v1.21.1 behaviour) or
+ * re-paste v1.21.1.
+ *
+ * v1.21.1 (2026-11-05) [MF-SCOPE-2422] -- THE APPROVED FUND TAB DROPS 52 DEAD ROWS (POLICY DATA ONLY)
+ * WHY (owner, Thu 5 Nov 2026 12:51 Riyadh: "Approved to be removed"): sync run
+ * 41944918372 was withheld for Mutual_Funds name coverage 97.90% below the
+ * unchanged 99% gate. The 52 unnamed rows were all acquisition_status:
+ * unavailable: 45 tickers the chart API no longer carries (404), 6 with no
+ * bar in two years (IBMN, IBDQ, IBTF, SPVU, HYXU; SPLG renamed SPYM) and
+ * the bare duplicate SPLG - matured iBonds, liquidated or renamed ETFs. None
+ * is held in My_Portfolio.
+ * WHAT: DT10_SOURCE_APPROVED_SCOPE carries the repository policy revision
+ * 2026-11-05.mf-retire-52.v2 (config/approved_universe_scope_v1.json):
+ * Mutual_Funds approved_count 2422 (was 2474) and its new symbol_set_sha256;
+ * DT10_SOURCE_MIN_ROWS.Mutual_Funds follows it (a scoped page's floor is its
+ * approved count, as Market_Leaders 255 already is). Market_Leaders, the
+ * other floors, every gate, verdict and ticket rule are unchanged; no
+ * function or var is added or removed.
+ * GATES: none (policy data). The rows leave the page through the sync's
+ * retirement seam (_Retired_Symbols, Page = Mutual_Funds, under
+ * TFB_SYNC_RETIRE_TAB = enforce). Paste this file and that list before the
+ * same sync: the native source check enforces the exact membership, so until
+ * the page, the repository policy and this file agree it withholds the board
+ * (fail closed); today the final audit withholds it for the 52 rows.
+ * ROLLBACK: Project History -> v1.21.0, the 2026-10-12 policy restored in the
+ * repository, the 52 rows removed from _Retired_Symbols and pasted back into
+ * Mutual_Funds (the sheet is the symbol source; the sync does not re-add them).
+ * Harness: tests/test_dt10_v1211_mf_scope.js
  *
  * v1.21.0 (2026-11-03) [EXDIV-GUARD] -- THE TICKET GUARD SEES EX-DIVIDEND DATES (KNOB, DEFAULT OFF)
  * WHY (3 Nov 2026): the 2 Nov 08:49 board issued INDV.US for 12,335 SAR and
@@ -2426,7 +2453,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.21.1';
+var DT10_VERSION = '1.21.2';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -2537,14 +2564,14 @@ function dt10FeedCohortCheck_(raw, cohort) {
 // Legacy staged-expansion properties do not override this explicit approval.
 // Unscoped Global/commodities properties may still tighten their floors.
 var DT10_SOURCE_MIN_ROWS = {Market_Leaders: 255, Global_Markets: 6512,
-                          Commodities_FX: 453, Mutual_Funds: 2474};
+                          Commodities_FX: 453, Mutual_Funds: 2422};
 var DT10_SOURCE_APPROVED_SCOPE = {
-  policy_revision: '2026-10-12.current-workbook.v1', approved_on: '2026-10-12',
+  policy_revision: '2026-11-05.mf-retire-52.v2', approved_on: '2026-11-05',
   pages: {
     Market_Leaders: {approved_count: 255, supersedes_min_rows: 1025,
       symbol_set_sha256: '9c9949e0952b3b6c7ac4de2cdefd7fdc084e0649ecffef48e3e27cdaab703c66'},
-    Mutual_Funds: {approved_count: 2474, supersedes_min_rows: 4496,
-      symbol_set_sha256: 'd9a3fcb8aefc9de60de28c1e4d2c89464be2dbaf0907e11edd904bd48214bc02'}
+    Mutual_Funds: {approved_count: 2422, supersedes_min_rows: 4496,
+      symbol_set_sha256: '1bb8747656e2a4c635863c933c41f51cae530892dd5c08c3d0a132a3bf6926ff'}
   }
 };
 var DT10_SOURCE_STATUS_MAX_ROWS = 1000;
@@ -7369,7 +7396,7 @@ function dt10SendHoldingsEnabled_() {
     return true;
   }
 }
-/** v1.21.1: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
+/** v1.21.2: Script Property DT10_AUDIT_KEEP. Exactly 'on' (trimmed, any
  * case) arms the held-seat hand-off; absent or any other word is off. A
  * property-service failure reads as OFF: the list is display context only,
  * so failing open keeps the unarmed request. Memoized (P-202). */
@@ -7384,7 +7411,7 @@ function dt10AuditKeepOn_() {
     } catch (eProp) { return false; }
   });
 }
-/** v1.21.1 PURE: the stability members (member === true: seated, grace-held
+/** v1.21.2 PURE: the stability members (member === true: seated, grace-held
  * and fast-track seats) of a parsed DT10_STAB_STATE_V1 state, sorted, at
  * most DT10_AUDIT_KEEP_MAX. [] for a missing or malformed state. */
 function dt10AuditKeepSymbols_(state) {
@@ -9573,7 +9600,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
              poolNote);
   body.criteria.board_funding_stage = 'research';
-  // v1.21.1: held seats kept in the backend's written audit (display only).
+  // v1.21.2: held seats kept in the backend's written audit (display only).
   if (dt10AuditKeepOn_()) {
     try {
       var akSyms = dt10AuditKeepSymbols_(dt10StabLoad_());
