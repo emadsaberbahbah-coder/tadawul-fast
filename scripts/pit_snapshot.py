@@ -2,7 +2,7 @@
 # scripts/pit_snapshot.py
 """
 ================================================================================
-PIT Snapshot — v1.1.1 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
+PIT Snapshot — v1.1.3 (W-6, Execution Plan v2.1; the evidence-preservation stopgap)
 ================================================================================
 NEW script (window whitelist W-6, scheduled Jul 22–24; adopted 2026-07-20).
 
@@ -43,6 +43,7 @@ ENV
     TFB_PIT_SHEET            default "_PIT_Fundamentals"
     TFB_PIT_SYMBOL_PAGES     default "Top_10_Investments,My_Portfolio,Shadow_Board"
     TFB_PIT_SOURCE_PAGES     default "Market_Leaders,Global_Markets,Mutual_Funds"
+    TFB_PIT_DAY_KEY          v1.1.3: wallclock (default) | observe | slot
 
 USAGE
     python scripts/pit_snapshot.py --dry-run     # print rows, write nothing
@@ -113,7 +114,10 @@ from zoneinfo import ZoneInfo
 #   repair_pit_legacy_rows planner moves only the two original timestamps to
 #   their 24-column destinations. Uncaptured diagnostic values remain blank;
 #   this writer's append and duplicate-guard behavior is unchanged.
-__version__ = "1.1.1"
+# v1.1.3 WHY (2026-10-22): PIT DAY KEY, TFB_PIT_DAY_KEY default off. The
+#   full block sits above _pit_day_key_mode(). (1.1.2 is claimed by open
+#   PRs #785/#795, which do not touch the day key.)
+__version__ = "1.1.3"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Snapshot Date", "Symbol", "Source Page", "Price", "Market Cap",
@@ -189,6 +193,126 @@ def _today_riyadh() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# v1.1.3 PIT DAY KEY (2026-10-22) -- TFB_PIT_DAY_KEY, default off             #
+# --------------------------------------------------------------------------- #
+# WHY
+#   The Snapshot Date label is the Riyadh wall-clock date at RUN time
+#   (_today_riyadh) and the duplicate guard is keyed (label, symbol). The
+#   20:10 UTC slot is 23:10 Riyadh, so a run that starts on time (20:10-20:59
+#   UTC) is labelled D while a late run (21:00 UTC or later) of the PREVIOUS
+#   slot is ALSO labelled D. When a late run is followed by an on-time run,
+#   the second run's symbols are skipped as duplicates and the run still ends
+#   OK: that session's capture is lost for good.
+# EVIDENCE (Actions job logs)
+#   - run 31136275420 (the 6 Aug slot, fired 2026-08-07 00:54 UTC):
+#     "date=2026-08-07 symbols=53 to_write=53 skipped_dup=0".
+#   - run 31217800255 (the 7 Aug slot, fired on time, 2026-08-07 20:53 UTC):
+#     "date=2026-08-07 symbols=129 to_write=93 skipped_dup=36". The 7 Aug
+#     (Fri) captures of 36 symbols were never archived (for the non-Tadawul
+#     listings among them that includes their 7 Aug close); _Run_Log said OK.
+#   - the 26 Aug slot fired at 23:25 UTC and was labelled 2026-08-27, so
+#     2026-08-26 has no rows. 74 of the 93 runs from 21 Jul to 21 Oct fired
+#     after 21:00 UTC and carry the D+1 label (all of the last 57); only the
+#     7-25 Aug runs carry D. Current exposure is nil while GitHub keeps
+#     firing the slot late; the loss recurs on the next late-to-on-time pair.
+#   - Precedent: run_shadow_scorer v1.9.0 P-176 (resolve_evidence_day) fixed
+#     the same class for S-1.
+# WHAT CHANGED
+#   - _pit_day_key_mode(): TFB_PIT_DAY_KEY = wallclock (default; unset, empty
+#     and unknown words read as wallclock) | observe | slot.
+#   - slot_day_key(now_utc): one label per scheduled slot. The slot that
+#     starts at 20:10 UTC on day D and runs to 20:10 UTC on D+1 is labelled
+#     D+1, the date on which it ends. That equals the wall-clock label for
+#     every fire from 21:00 UTC to 20:09 UTC next day and differs only for
+#     on-time fires in [20:10, 21:00) UTC, which are exactly the runs that
+#     can collide. The label is never earlier than the capture's Riyadh date
+#     (no look-ahead), it continues the archive's majority D+1 convention,
+#     and arming needs no migration: a slot label can never meet an older
+#     wall-clock label from a different slot.
+#   - cross_slot_dups(): symbols of this run that the guard would skip
+#     because the existing row under the same label was captured in a
+#     DIFFERENT slot (read from Captured At (UTC)). That is the loss count.
+#   - main(): wallclock keeps calling _today_riyadh() and writes, prints and
+#     logs exactly what v1.1.1 did. observe keeps the wall-clock label and
+#     rows and adds one "[PIT-DAYKEY v1.1.3] ..." line plus a day_key entry
+#     in the OK _Run_Log details. slot uses slot_day_key() as the label and
+#     the duplicate key and logs the same line and entry. Both take ONE
+#     clock read after the page and ledger reads and use it for the slot and
+#     for this run's Captured At (build_rows' new optional captured_at;
+#     wallclock passes None and keeps v1.1.1's own clock read), so a run
+#     that starts just before 20:10 UTC is classified by its capture, and a
+#     label and its stamp can never fall in different slots.
+# ROLLBACK
+#   Unset TFB_PIT_DAY_KEY (or set wallclock). observe is also a disarm (it
+#   keeps the wall-clock label). After a disarm the first wall-clock run is
+#   exposed once: if it is the next slot's run and fires on time (20:10-20:59
+#   UTC), its label equals the last slot run's label, whenever that run
+#   fired, and its captures are skipped. A late first run is unaffected.
+_DAY_KEY_MODES = ("observe", "slot")
+_SLOT_UTC_HM = (20, 10)   # .github/workflows/pit_snapshot.yml cron "10 20 * * *"
+
+
+def _pit_day_key_mode() -> str:
+    raw = _env("TFB_PIT_DAY_KEY").lower()
+    return raw if raw in _DAY_KEY_MODES else "wallclock"
+
+
+def slot_day_key(now_utc: "_dt.datetime") -> str:
+    """Label of the scheduled slot that `now_utc` (tz-aware) falls in: the
+    UTC date on which that slot ends (slot start 20:10 UTC on D -> D+1)."""
+    h, m = _SLOT_UTC_HM
+    start = now_utc.astimezone(_dt.timezone.utc) - _dt.timedelta(hours=h,
+                                                                 minutes=m)
+    return (start.date() + _dt.timedelta(days=1)).isoformat()
+
+
+def _captured_at(row: List[Any]) -> Optional["_dt.datetime"]:
+    """Captured At (UTC) of a ledger row: last of the 24 columns, or the
+    16th of a legacy 16-column row. None when absent or unparseable."""
+    if len(row) >= len(HEADERS):
+        raw = row[len(HEADERS) - 1]
+    elif len(row) == len(LEGACY_HEADERS_16):
+        raw = row[len(LEGACY_HEADERS_16) - 1]
+    else:
+        return None
+    txt = str(raw or "").strip().replace("T", " ")[:19]
+    try:
+        return _dt.datetime.strptime(txt, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def cross_slot_dups(values: List[List[Any]], date_str: str, slot: str,
+                    symbols: List[str]) -> int:
+    """How many of `symbols` already hold a row labelled date_str whose
+    capture belongs to a slot other than `slot` (captures the duplicate
+    guard would drop). Rows without a parseable capture, or with one too
+    near the calendar ends to place in a slot, are not counted: this
+    diagnostic never fails a run."""
+    want = {str(s).strip().upper() for s in symbols}
+    hit: set = set()
+    for row in values or []:
+        if not row or len(row) < 2:
+            continue
+        if str(row[0]).strip()[:10] != date_str:
+            continue
+        sym = str(row[1]).strip().upper()
+        if sym not in want:
+            continue
+        cap = _captured_at(row)
+        if cap is None:
+            continue
+        try:
+            cap_slot = slot_day_key(cap)
+        except (OverflowError, ValueError):
+            continue
+        if cap_slot != slot:
+            hit.add(sym)
+    return len(hit)
+
+
+# --------------------------------------------------------------------------- #
 # Pure helpers (offline selftest)                                             #
 # --------------------------------------------------------------------------- #
 def harvest_symbols(values: List[List[Any]],
@@ -260,11 +384,15 @@ def index_page(values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
 
 def build_rows(date_str: str, symbols: List[str],
                pages: List[Tuple[str, Dict[str, Dict[str, Any]]]],
-               existing_keys: set) -> Tuple[List[List[Any]], int, int]:
+               existing_keys: set,
+               captured_at: Optional[str] = None
+               ) -> Tuple[List[List[Any]], int, int]:
     """(rows_to_append, skipped_dup, missing). First page holding the symbol
     wins (page order = precedence). A symbol on no page still gets a row —
     the ABSENCE at t is itself point-in-time evidence — with Source '-'."""
     captured = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if captured_at is not None:   # v1.1.3: the armed day key's one clock read
+        captured = captured_at
     rows: List[List[Any]] = []
     skipped = missing = 0
     for s in symbols:
@@ -369,6 +497,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "Market_Leaders,Global_Markets,Mutual_Funds").split(",") if p.strip()]
     tab = _env("TFB_PIT_SHEET", "_PIT_Fundamentals")
     today = _today_riyadh()
+    # v1.1.3: TFB_PIT_DAY_KEY. wallclock (default) leaves `today` untouched;
+    # observe/slot read the slot after the ledger read, below.
+    day_mode = _pit_day_key_mode()
+    wallclock = today
+    day_slot = ""
 
     try:
         book = _open_book()
@@ -416,9 +549,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:
         ws = None
         existing = []
+    if day_mode != "wallclock":
+        # v1.1.3: ONE clock read, after every page and ledger read, gives
+        # both the slot and this run's Captured At (passed to build_rows), so
+        # the label and the stamp can never fall in different slots and
+        # cross_slot_dups classifies this run and the ledger on one clock.
+        day_now = _dt.datetime.now(_dt.timezone.utc)
+        day_slot = slot_day_key(day_now)
+        if day_mode == "slot":
+            today = day_slot
     keys = existing_keys_for(existing[1:] if existing else [], today)
+    day_info: Dict[str, Any] = {}
+    if day_mode != "wallclock":
+        day_info = {"mode": day_mode, "key": today, "wallclock": wallclock,
+                    "slot": day_slot,
+                    "cross_slot_dups": cross_slot_dups(
+                        existing[1:] if existing else [], today, day_slot,
+                        symbols)}
+        _out(f"[PIT-DAYKEY v{__version__}] mode={day_mode} key={today} "
+             f"wallclock={wallclock} slot={day_slot} "
+             f"cross_slot_dups={day_info['cross_slot_dups']}")
 
-    rows, skipped, missing = build_rows(today, symbols, indexed, keys)
+    rows, skipped, missing = build_rows(
+        today, symbols, indexed, keys,
+        captured_at=(None if day_mode == "wallclock"
+                     else day_now.strftime("%Y-%m-%d %H:%M:%S")))
     _out(f"date={today} symbols={len(symbols)} to_write={len(rows)} "
          f"skipped_dup={skipped} missing_on_pages={missing}")
 
@@ -458,9 +613,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"written={len(rows)} skipped_dup={skipped} "
                f"missing={missing} symbols={len(symbols)}")
         _out(msg)
-        append_run_log(book, "OK", msg,
-                       {"written": len(rows), "skipped": skipped,
-                        "missing": missing})
+        ok_details: Dict[str, Any] = {"written": len(rows),
+                                      "skipped": skipped, "missing": missing}
+        if day_info:
+            ok_details["day_key"] = day_info
+        append_run_log(book, "OK", msg, ok_details)
         return 0
     except Exception as e:  # noqa: BLE001
         msg = f"[PIT-SNAPSHOT v{__version__}] FAIL append: {e}"

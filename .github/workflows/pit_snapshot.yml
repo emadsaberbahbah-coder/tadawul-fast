@@ -32,6 +32,14 @@ name: "🗄️ TFB PIT Snapshot"
 # ROLLBACK: each item is independently removable.
 # v1.1.1 (2026-10-13) -- RUNNER IMAGE PIN. WHY: runs-on pinned to ubuntu-24.04 before
 # ubuntu-latest moves to a newer image on 19 Oct 2026; labels only (ci.yml v1.1.13).
+# v1.1.2 (2026-10-22) -- PIT DAY KEY. The run step maps TFB_PIT_DAY_KEY from the
+# repo variable (default 'wallclock' = pit_snapshot v1.1.1 behaviour, byte-identical).
+# observe logs the slot label and the cross-slot duplicate count; slot labels each
+# run by its scheduled slot so a late run and the next on-time run can no longer
+# share a Snapshot Date (2026-08-07 lost 36 captures). See pit_snapshot.py v1.1.3.
+# ROLLBACK: delete the variable or set it to wallclock (observe is also a disarm).
+# After a disarm, if the next slot's run fires on time (20:10-20:59 UTC) it gets the
+# last slot run's label and its captures are skipped once; a late fire is unaffected.
 # ============================================================================
 
 on:
@@ -111,6 +119,8 @@ jobs:
           # v1.1.0: input read through the environment, not interpolated into
           # the shell line.
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          # v1.1.2: wallclock | observe | slot (pit_snapshot v1.1.3).
+          TFB_PIT_DAY_KEY: ${{ vars.TFB_PIT_DAY_KEY || 'wallclock' }}
         run: |
           set -euo pipefail
           # WHY THE DEFAULT IS --write, NOT --dry-run — READ BEFORE EDITING:
