@@ -28,6 +28,7 @@ The v2 fingerprint set is exactly v1 minus the 52 below. `tests/test_dt10_v1211_
 - `config/approved_universe_scope_v1.json`: revision, `approved_on`, `approval_basis`, the Mutual_Funds count, fingerprints and both digests.
 - `scripts/approved_universe_scope.py` 1.0.0 -> 1.0.1: `_PAGE_CONTRACT` Mutual_Funds `("current_fund_tab", 2422, 4496)`.
 - `scripts/finalize_decision_publication.py` 1.1.2 -> 1.1.3: `MARKET_FLOORS["Mutual_Funds"] = 2422`.
+- `scripts/verify_deployment.py`: the SCRIPTS manifest pins `approved_universe_scope` 1.0.1 and `finalize_decision_publication` 1.1.3 (`tests/test_verify_manifest_pins.py`).
 - `apps_script/16_Decision_Top10.gs` 1.21.0 -> 1.21.1: six base lines replaced (the version line, `DT10_VERSION`, the fund floor, the revision line and the fund scope's two lines) plus the WHY block. No function or var is added or removed. Every added line is ASCII; the version line keeps its existing em dash.
 - `tests/js/dt10_edits_v1211.json`: the four hunks. Reversing them gives the v1.21.0 file (SHA-256 `e153f4dc`, origin/main 7fb3f77f).
 - `tests/test_dt10_v1211_mf_scope.js` (new) and `tests/test_dt10_v1211_mf_scope.py` (new).
