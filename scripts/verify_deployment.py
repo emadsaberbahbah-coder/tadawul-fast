@@ -294,7 +294,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
-    ("track_performance", "6.53.0", "track performance"),
+    # 2026-10-27: 6.52.0 [OUTCOME-TALLY] (TRACK_OUTCOME_TALLY, default off;
+    # pin only; merged onto #841's 6.50.0 on 2026-11-01; open #845 claims 6.51.0).
+    # 2026-11-02: renumbered 6.52.0 -> 6.55.0 over #894's 6.53.0 (open #845
+    # claims 6.54.0).
+    ("track_performance", "6.55.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
