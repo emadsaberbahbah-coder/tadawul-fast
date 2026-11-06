@@ -8,7 +8,7 @@ pages; 2d: candles, analysts, news and the TFB rating per symbol; 2e: the
 learning loop from the archive). Offline: the BigQuery session is a fake, no
 google library is imported.
 
-  V1  the 41 objects load in apply order (6 functions, then the views and
+  V1  the 43 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
@@ -231,6 +231,9 @@ PENDING = {
     "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
     "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
     "v_outcome_coverage": "341bd1f3a44d5d35e88c309a3f3a6ac6dd6e4678d640843c373fddad87447f31",
+    # Reader-only research candidate, not installed. Existing news/rating pins unchanged.
+    "v_symbol_news_research": "d81c8c6bb264bb17e5b2725626e24e298bc1e6f5dcf68ba68a92d7dae84718d4",
+    "v_symbol_news_coverage": "2850b2c3d13b4f64bf879dfa60c735d23d0f030d16469a2eae455d0e892c8e85",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -244,9 +247,10 @@ EXPECTED_ORDER = [
     "v_dive_signals", "v_dive_board", "v_dive_events",
     "v_top10_insight", "v_portfolio_insight",
     "v_outcome_engine", "v_outcome_calibration", "v_board_archive", "v_outcome_coverage",
+    "v_symbol_news_research", "v_symbol_news_coverage",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 13)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 15)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -801,10 +805,11 @@ def case_v18():
     assert {c.strip() for c in bars_cte.split(",")} <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bt\.([a-z_]+)", code["v_symbol_analyst"])) <= cols["symbol_analyst_daily"]
     assert set(re.findall(r"\be\.([a-z_]+)", code["v_symbol_news"])) <= cols["symbol_news"]
+    assert set(re.findall(r"\bn\.([a-z_]+)", code["v_symbol_news_research"])) <= cols["symbol_news"]
     used = {n: set(bv._REF.findall(c)) & bv.DEEP_TABLES for n, c in code.items()}
     assert {n: t for n, t in used.items() if t} == {
         "v_symbol_candles": {"symbol_bars_daily"}, "v_symbol_analyst": {"symbol_analyst_daily"},
-        "v_symbol_news": {"symbol_news"},
+        "v_symbol_news": {"symbol_news"}, "v_symbol_news_research": {"symbol_news"},
         "v_outcome_engine": {"symbol_bars_daily"}}, used          # v1.5.0: the engine reads the bars too
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     # every picker view carries symbol_label
@@ -1524,9 +1529,24 @@ def case_v27():
     assert _coverage_engine(rows, cohort=False)["1W"][:3] == (3, 2, 66.7)     # every copy counted: wrong
 
 
+def case_v28():
+    # Keep reader behavior in the existing blocking SQL CI lane. Stdlib only;
+    # the module executes the real SELECTs with offline compatibility shims.
+    import importlib.util
+    import unittest
+    spec = importlib.util.spec_from_file_location("symbol_news_research_sql", ROOT / "tests" / "test_symbol_news_research.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(mod.NewsSql)
+    result = unittest.TestResult()
+    suite.run(result)
+    assert result.wasSuccessful(), (result.errors, result.failures)
+    assert result.testsRun >= 12
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
-         case_v22, case_v23, case_v24, case_v25, case_v26, case_v27]
+         case_v22, case_v23, case_v24, case_v25, case_v26, case_v27, case_v28]
 
 
 def test_v1(): case_v1()
@@ -1556,6 +1576,7 @@ def test_v24(): case_v24()
 def test_v25(): case_v25()
 def test_v26(): case_v26()
 def test_v27(): case_v27()
+def test_v28(): case_v28()
 
 
 if __name__ == "__main__":
