@@ -1977,16 +1977,20 @@ from urllib.error import HTTPError, URLError
 #   record reads outcome_calendar_unknown (the live check and the target
 #   session both); from 2027-01-01 no Singapore record can mature. Replayed
 #   offline on main a85edfc6 with the REAL audit loop: a D05.SI record
-#   targeting 2026-12-24 05:00Z, audited at 09:30Z with the 17:00 SGT close
+#   targeting 2026-12-23 05:00Z, audited at 09:30Z with the 17:00 SGT close
 #   quote, stays ACTIVE (outcome_calendar_unknown).
 # WHAT: _outcome_calendar_schedule asks _outcome_calendar_ext(name) first.
 #   That is core.exchange_calendar_ext.extended_calendar (v1.0.0): only with
 #   TFB_XCAL_DATA_EXT on / 1 / true / yes, only for XSES, it returns the
 #   pinned calendar plus the eight 2027 SGX closures (the 2027 Singapore
 #   public holidays on weekdays: MOM data via the holidays package 0.108,
-#   whose SGX calendar equals the pinned XSES in 19 of 20 years 2007-2026).
-#   Every pinned session keeps its open and close. Otherwise (and on any
-#   error) None, and the pinned calendar is used exactly as before.
+#   whose SGX calendar equals the pinned XSES in 19 of 20 years 2007-2026)
+#   and the five half days it makes reachable (24 / 31 Dec 2026, 5 Feb and
+#   24 / 31 Dec 2027) closing at 12:00 SGT, the end of continuous trading
+#   as in _OUTCOME_SESSION_OVERRIDES. Every other pinned session keeps its
+#   open and close; the two 2026 half days are reached only by windows that
+#   pass 2026-12-31, which raise on the pinned calendar. Otherwise (and on
+#   any error) None, and the pinned calendar is used exactly as before.
 # GATE: TFB_XCAL_DATA_EXT, DEFAULT OFF = v6.53.0 byte for byte apart from the
 #   version string. The same Variable is read by opportunity_builder 1.28.3
 #   on Render (the .SI quote-freshness venue state).
@@ -1995,11 +1999,14 @@ from urllib.error import HTTPError, URLError
 #   PARITY.
 # ARMING (owner): repository Variable TFB_XCAL_DATA_EXT=on before Fri 18 Dec
 #   2026 (and the Render env for the builder before Thu 31 Dec 2026).
-# KNOWN LIMITS: (1) no SGX half day is modelled (#922 re-times the 2025 and
-#   early-2026 ones; the pinned calendar models none). (2) A closure SGX adds
-#   later in 2027 needs a new row in core/exchange_calendar_ext.py. (3) XSHG
-#   and XBOM end at 2026-12-31 too; neither is in this file's base map (#915
-#   adds .SS / .BO) and their 2027 calendars were not official on 2026-11-06.
+# KNOWN LIMITS: (1) the half days before 2026-12-24 stay at the calendar's
+#   17:00 (#922 re-times 2025-12-24, 2025-12-31 and 2026-02-16). (2) A
+#   closure SGX adds later in 2027 needs a new row in
+#   core/exchange_calendar_ext.py. (3) XSHG and XBOM end at 2026-12-31 too;
+#   neither is in this file's base map (#915 adds .SS / .BO) and their 2027
+#   calendars were not official on 2026-11-06. (4) The new bound is
+#   2027-12-31: the window reaches it from 2027-12-18, so the 2028 rows are
+#   needed before then.
 # ZERO functions removed. Additions: _outcome_calendar_ext.
 # ROLLBACK: unset TFB_XCAL_DATA_EXT (or set off). Records matured meanwhile
 #   keep their receipts (calendar 'XSES' and the session used).

@@ -10,7 +10,8 @@ outcome window raises for every .SI / .SG lookup from 2026-12-18
 (outcome_calendar_unknown); the builder's venue state raises from 2026-12-31
 09:00Z, so an old .SI quote reads "UNVERIFIED_PRICE: ... venue calendar
 unavailable". With the gate on, both read the pinned XSES calendar plus the
-eight 2027 SGX closures.
+eight 2027 SGX closures and the five SGX half days from 2026-12-24 on
+(closing 12:00 SGT).
 
 REAL modules (core/exchange_calendar_ext.py, scripts/track_performance.py,
 core/analysis/opportunity_builder.py) and the REAL pinned exchange_calendars.
@@ -19,36 +20,47 @@ loop; the only stubs are the backend quote call (an AsyncMock returning one
 witnessed row), the clock and the price fallback / CA guard / feed switches.
 No network.
 
-X1  the table, pinned literally: only XSES; every added day is a 2027
-    weekday after the pinned bound (2026-12-31); the base-class map names
-    the same MICs
+X1  the tables, pinned literally: only XSES; every added day is a 2027
+    weekday after the pinned bound (2026-12-31); the half days are weekday
+    eves of Christmas, New Year or Chinese New Year from 2026-12-24 on; the
+    base-class map names the same MICs
 X2  the gate: unset and ten off words read off (extended_calendar is None
     for every MIC); the six on-spellings read on
 X3  on: the extended XSES equals the pinned XSES on every pinned session
-    (open and close); 2027 = its weekdays minus the eight closures; bound
-    2027-12-31; one instance per process; every other MIC, an unknown name
-    and a failing import read None; a table the package already covers
-    retires itself
+    (open and close) but the two 2026 half days, which close 04:00Z; 2027 =
+    its weekdays minus the eight closures, closing 09:00Z but the three half
+    days (04:00Z); bound 2027-12-31; one instance per process; every other
+    MIC, an unknown name and a failing import read None; a table the
+    package already covers retires itself
 X4  tracker, _outcome_sessions over a symbol x day matrix: off equals the
     untouched v6.53.0 (raising cases included) under the off words; on
-    equals it everywhere except .SI / .SG windows past 2026-12-31, where
-    the base raises and the delivered file returns the extended sessions
+    equals it everywhere except .SI / .SG windows: past 2026-12-31 the base
+    raises and the delivered file returns the extended sessions; a window
+    that ends earlier but holds 24 / 31 Dec 2026 differs only in those two
+    half days' close (04:00Z), entries no lookup that early ever selects
 X5  the REAL audit loop:
-    a  D05.SI due 2026-12-24 05:00Z, the 17:00 SGT close quote at 09:30Z:
+    a  D05.SI due 2026-12-23 05:00Z, the 17:00 SGT close quote at 09:30Z:
        off stays ACTIVE (outcome_calendar_unknown, the defect); on MATURES
-       (target_session_close 2026-12-24T09:00:00+00:00)
+       (target_session_close 2026-12-23T09:00:00+00:00)
     b  D05.SI due 2027-01-08: off unknown; on MATURES
     c  D05.SI due 2027-02-08 03:00Z (Chinese New Year, closed): on, the
        target session is 2027-02-09 and its close matures the record
     d  AAPL.US, 2222.SR, VOD.L: identical on and off
+    e  the 24 Dec 2026 half day: an 11:00 SGT target matures on the 12:06
+       SGT print (target_session_close 04:00Z); a 13:00 SGT target belongs
+       to Mon 28 Dec; off both read outcome_calendar_unknown
 X6  the builder's .SI freshness:
     a  _venue_state('D05.SI', 2027-01-04 03:00Z): off None; on (open, the
        2026-12-31 09:00Z close)
-    b  a .SI quote stamped at the 2026-12-31 close, judged on Fri 1 Jan
-       2027 (a holiday): off "UNVERIFIED_PRICE ... venue calendar
-       unavailable"; on certified "last close"
+    b  a .SI quote stamped at the 2026-12-31 half-day close (12:06 SGT),
+       judged on Fri 1 Jan 2027 (a holiday): off "UNVERIFIED_PRICE ... venue
+       calendar unavailable"; on certified "last close" (04:00Z)
     c  AAPL.US and 2222.SR venue states identical on and off
-X7  golden negative: X5a-on and X6b-on FAIL on the untouched main copies
+    d  the 24 Dec 2026 half day at 14:00 SGT: off the pinned calendar says
+       the venue trades ("STALE_PRICE intraday"); on it is closed and the
+       12:06 SGT print is certified
+X7  golden negative: X5a-on, X5e-on and X6b-on FAIL on the untouched main
+    copies
 X8  ENV lane: both tracker steps map TFB_XCAL_DATA_EXT with || 'off'
     exactly once and identically; the reader's fallback literal is "off";
     ci.yml's heavy job runs this file with the base required
@@ -102,6 +114,9 @@ _MODS = {}
 EXPECTED = {
     "XSES": ("2027-01-01", "2027-02-08", "2027-03-10", "2027-03-26",
              "2027-05-17", "2027-05-20", "2027-08-09", "2027-10-28"),
+}
+EXPECTED_HALF = {
+    "XSES": ("12:00", ("2026-12-24", "2026-12-31", "2027-02-05", "2027-12-24", "2027-12-31")),
 }
 
 
@@ -196,8 +211,13 @@ def _at(y, mo, d, h, mi):
 # ------------------------------------------------------------------- X1 ----
 def test_x1_table_is_pinned_and_extends_only_past_the_pinned_bound():
     e = ext()
-    assert e.XCAL_EXTRA_HOLIDAYS == EXPECTED
-    assert set(e._XCAL_BASE_CLASSES) == set(EXPECTED)
+    assert e.XCAL_EXTRA_HOLIDAYS == EXPECTED and e.XCAL_HALF_DAYS == EXPECTED_HALF
+    assert set(e._XCAL_BASE_CLASSES) == set(EXPECTED) == set(EXPECTED_HALF)
+    eves = {"2026-12-24", "2026-12-31", "2027-12-24", "2027-12-31",
+            "2027-02-05"}                                                   # Christmas / New Year eves; CNY 2027 is Sat 6 Feb
+    for mic, (hhmm, days) in EXPECTED_HALF.items():
+        assert hhmm == "12:00" and list(days) == sorted(set(days)) and set(days) <= eves, mic
+        assert all(d >= "2026-12-24" and pd.Timestamp(d).weekday() < 5 for d in days), mic
     for mic, days in EXPECTED.items():
         cal = xc.get_calendar(mic)
         assert str(cal.last_session.date()) == "2026-12-31", mic          # the pinned bound this build answers
@@ -231,12 +251,20 @@ def test_x3_extended_xses_keeps_every_pinned_session_and_adds_2027(monkeypatch):
     pinned = xc.get_calendar("XSES")
     assert cal is not None and cal.name == "XSES" and str(cal.last_session.date()) == "2027-12-31"
     n = len(pinned.sessions)
-    assert (cal.sessions[:n] == pinned.sessions).all()
-    assert (cal.opens[:n] == pinned.opens).all() and (cal.closes[:n] == pinned.closes).all()
+    half = set(EXPECTED_HALF["XSES"][1])
+    assert (cal.sessions[:n] == pinned.sessions).all() and (cal.opens[:n] == pinned.opens).all()
+    moved = {str(d.date()): (str(pinned.closes.iloc[i]), str(cal.closes.iloc[i]))
+             for i, d in enumerate(pinned.sessions) if cal.closes.iloc[i] != pinned.closes.iloc[i]}
+    assert moved == {"2026-12-24": ("2026-12-24 09:00:00+00:00", "2026-12-24 04:00:00+00:00"),
+                     "2026-12-31": ("2026-12-31 09:00:00+00:00", "2026-12-31 04:00:00+00:00")}, moved
     s27 = {d.date().isoformat() for d in cal.sessions if d.year == 2027}
     weekdays = {d.date().isoformat() for d in pd.bdate_range("2027-01-01", "2027-12-31")}
     assert s27 == weekdays - set(EXPECTED["XSES"]) and len(s27) == 253
-    assert cal.previous_close(pd.Timestamp("2027-01-04 03:00", tz="UTC")) == pd.Timestamp("2026-12-31 09:00", tz="UTC")
+    for d in cal.sessions[n:]:
+        o, c = cal.session_open(d), cal.session_close(d)
+        assert (o.hour, o.minute) == (1, 0), d
+        assert (c.hour, c.minute) == ((4, 0) if str(d.date()) in half else (9, 0)), d
+    assert cal.previous_close(pd.Timestamp("2027-01-04 03:00", tz="UTC")) == pd.Timestamp("2026-12-31 04:00", tz="UTC")
     assert e.extended_calendar("XSES") is cal and e.extended_calendar(" xses ") is cal      # one instance
     for mic in ("XNYS", "XSAU", "XSHG", "XBOM", "XKRX", "NOPE", ""):
         assert e.extended_calendar(mic) is None, mic
@@ -291,7 +319,8 @@ def test_x4b_tracker_on_changes_only_singapore_windows_past_2026(monkeypatch):
     tp, b = tracker(), tracker_base()
     _set_gate(monkeypatch, "on")
     cal = ext().extended_calendar("XSES")
-    changed = 0
+    half = {"2026-12-24": "2026-12-24T04:00:00+00:00", "2026-12-31": "2026-12-31T04:00:00+00:00"}
+    changed = retimed = 0
     for s in SYMBOLS:
         for t in DAYS:
             got, base = _sessions(tp, s, t), _sessions(b, s, t)
@@ -303,9 +332,12 @@ def test_x4b_tracker_on_changes_only_singapore_windows_past_2026(monkeypatch):
                 assert got == ("XSES", tuple((str(x.date()), cal.session_open(x).isoformat(),
                                               cal.session_close(x).isoformat()) for x in rng)), (s, t)
                 changed += 1
+            elif s in SG and base[0] == "XSES" and any(d in half for d, _o, _c in base[1]):
+                assert got == ("XSES", tuple((d, o, half.get(d, c)) for d, o, c in base[1])), (s, t)
+                retimed += 1
             else:
                 assert got == base, (s, t)
-    assert changed == 3 * 7
+    assert changed == 3 * 7 and retimed == 3 * 1
 
 
 # ------------------------------------------------------------------- X5 ----
@@ -359,7 +391,7 @@ def _state(tp, rec):
     return (str(getattr(rec.status, "value", rec.status)), rec.outcome, rec.realized_roi, notes[0], receipt)
 
 
-SG_DEC = ("D05.SI", _at(2026, 12, 24, 5, 0), _at(2026, 12, 24, 9, 0), _at(2026, 12, 24, 9, 30))
+SG_DEC = ("D05.SI", _at(2026, 12, 23, 5, 0), _at(2026, 12, 23, 9, 0), _at(2026, 12, 23, 9, 30))
 SG_JAN = ("D05.SI", _at(2027, 1, 8, 5, 0), _at(2027, 1, 8, 9, 0), _at(2027, 1, 8, 9, 30))
 SG_CNY = ("D05.SI", _at(2027, 2, 8, 3, 0), _at(2027, 2, 9, 9, 0), _at(2027, 2, 9, 9, 30))
 
@@ -368,11 +400,11 @@ def _x5a_on(tp, monkeypatch):
     _set_gate(monkeypatch, "on")
     rec, receipt = audit(tp, monkeypatch, *SG_DEC)
     assert rec.status == tp.PerformanceStatus.MATURED and rec.outcome == "WIN", (rec.status, receipt)
-    assert receipt.get("calendar") == "XSES" and receipt.get("target_session") == "2026-12-24", receipt
-    assert receipt.get("target_session_close") == "2026-12-24T09:00:00+00:00", receipt
+    assert receipt.get("calendar") == "XSES" and receipt.get("target_session") == "2026-12-23", receipt
+    assert receipt.get("target_session_close") == "2026-12-23T09:00:00+00:00", receipt
 
 
-def test_x5a_singapore_record_due_on_24_dec_2026(monkeypatch):
+def test_x5a_singapore_record_due_on_23_dec_2026(monkeypatch):
     tp = tracker()
     _set_gate(monkeypatch, None)
     rec, receipt = audit(tp, monkeypatch, *SG_DEC)
@@ -399,6 +431,31 @@ def test_x5c_singapore_holiday_target_moves_to_the_next_session(monkeypatch):
     assert rec.status == tp.PerformanceStatus.MATURED, (rec.status, receipt)
     assert receipt.get("target_session") == "2027-02-09", receipt                        # 8 Feb 2027 is closed
     assert receipt.get("target_session_close") == "2027-02-09T09:00:00+00:00", receipt
+
+
+SG_HALF_AM = ("D05.SI", _at(2026, 12, 24, 3, 0), _at(2026, 12, 24, 4, 6), _at(2026, 12, 24, 5, 0))
+SG_HALF_PM = ("D05.SI", _at(2026, 12, 24, 5, 0), _at(2026, 12, 28, 9, 0), _at(2026, 12, 28, 9, 30))
+
+
+def _x5e_on(tp, monkeypatch):
+    _set_gate(monkeypatch, "on")
+    rec, receipt = audit(tp, monkeypatch, *SG_HALF_AM)
+    assert rec.status == tp.PerformanceStatus.MATURED, (rec.status, receipt)
+    assert receipt.get("target_session") == "2026-12-24", receipt
+    assert receipt.get("target_session_close") == "2026-12-24T04:00:00+00:00", receipt   # the 12:00 SGT half day
+    rec, receipt = audit(tp, monkeypatch, *SG_HALF_PM)
+    assert rec.status == tp.PerformanceStatus.MATURED, (rec.status, receipt)
+    assert receipt.get("target_session") == "2026-12-28", receipt                          # after the half-day close
+
+
+def test_x5e_singapore_half_day_closes_at_noon(monkeypatch):
+    tp = tracker()
+    _set_gate(monkeypatch, None)
+    for case in (SG_HALF_AM, SG_HALF_PM):
+        rec, receipt = audit(tp, monkeypatch, *case)
+        assert rec.status == tp.PerformanceStatus.ACTIVE, (rec.status, receipt)
+        assert receipt.get("reason") == "outcome_calendar_unknown", receipt
+    _x5e_on(tp, monkeypatch)
 
 
 ORDINARY = [("AAPL.US", _at(2026, 12, 23, 18, 0), _at(2026, 12, 23, 21, 0), _at(2026, 12, 23, 22, 0)),
@@ -438,14 +495,14 @@ def _fresh(ob, monkeypatch, symbol, quote_at, now):
     return ob._quote_freshness_assessment(cand)
 
 
-SG_HOLIDAY = ("D05.SI", _at(2026, 12, 31, 9, 0), _at(2027, 1, 1, 6, 0))
+SG_HOLIDAY = ("D05.SI", _at(2026, 12, 31, 4, 6), _at(2027, 1, 1, 6, 0))
 
 
 def _x6b_on(ob, monkeypatch):
     _set_gate(monkeypatch, "on")
     ok, text, detail = _fresh(ob, monkeypatch, *SG_HOLIDAY)
     assert ok is True and text.startswith("last close"), (ok, text, detail)
-    assert detail.get("mode") == "session_closed" and detail.get("prev_close") == "2026-12-31T09:00:00+00:00", detail
+    assert detail.get("mode") == "session_closed" and detail.get("prev_close") == "2026-12-31T04:00:00+00:00", detail
 
 
 def test_x6a_builder_venue_state_after_2026(monkeypatch):
@@ -456,7 +513,7 @@ def test_x6a_builder_venue_state_after_2026(monkeypatch):
     assert ob._venue_state("D05.SI", _at(2026, 12, 30, 3, 0)) is not None
     _set_gate(monkeypatch, "on")
     is_open, prev_close = ob._venue_state("D05.SI", _at(2027, 1, 4, 3, 0))
-    assert is_open is True and prev_close == _at(2026, 12, 31, 9, 0)
+    assert is_open is True and prev_close == _at(2026, 12, 31, 4, 0)
 
 
 def test_x6b_builder_certifies_the_last_close_on_a_2027_holiday(monkeypatch):
@@ -466,6 +523,18 @@ def test_x6b_builder_certifies_the_last_close_on_a_2027_holiday(monkeypatch):
     assert ok is False and "venue calendar unavailable" in text, (ok, text)             # the defect, gate off
     assert detail.get("mode") == "calendar_unavailable", detail
     _x6b_on(ob, monkeypatch)
+
+
+def test_x6d_builder_half_day_reads_closed_after_noon(monkeypatch):
+    ob = builder()
+    case = ("D05.SI", _at(2026, 12, 24, 4, 6), _at(2026, 12, 24, 6, 0))
+    _set_gate(monkeypatch, None)
+    ok, text, detail = _fresh(ob, monkeypatch, *case)
+    assert ok is False and text.startswith("STALE_PRICE intraday"), (ok, text)          # the pinned 17:00 close
+    _set_gate(monkeypatch, "on")
+    ok, text, detail = _fresh(ob, monkeypatch, *case)
+    assert ok is True and text.startswith("last close"), (ok, text)
+    assert detail.get("prev_close") == "2026-12-24T04:00:00+00:00", detail
 
 
 @pytest.mark.parametrize("symbol,now", [("AAPL.US", _at(2027, 1, 4, 3, 0)), ("2222.SR", _at(2027, 1, 4, 3, 0)),
@@ -485,6 +554,8 @@ def test_x7_golden_negative_on_legs_fail_on_the_base(monkeypatch):
     tpb, obb = tracker_base(), builder_base()
     with pytest.raises(AssertionError):
         _x5a_on(tpb, monkeypatch)
+    with pytest.raises(AssertionError):
+        _x5e_on(tpb, monkeypatch)
     with pytest.raises(AssertionError):
         _x6b_on(obb, monkeypatch)
 

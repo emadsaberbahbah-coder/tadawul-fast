@@ -1674,9 +1674,13 @@ from typing import Optional
 # WHAT: _venue_state asks _venue_cal_data_ext(code) after the cache lookup.
 #   That is core.exchange_calendar_ext.extended_calendar (v1.0.0): only with
 #   TFB_XCAL_DATA_EXT on / 1 / true / yes, only for XSES, it returns the
-#   pinned calendar plus the eight 2027 SGX closures (every pinned session
-#   keeps its open and close). The freshness rule is unchanged: it becomes
-#   decidable after 2026 again; it never widens the live-age or close test.
+#   pinned calendar plus the eight 2027 SGX closures and the five SGX half
+#   days from 2026-12-24 on (24 / 31 Dec 2026, 5 Feb and 24 / 31 Dec 2027)
+#   closing at 12:00 SGT; every other pinned session keeps its open and
+#   close. The freshness rule is unchanged: it becomes decidable after 2026
+#   again, and on those half days the venue reads closed after 12:00 SGT (a
+#   witnessed close is certified instead of "STALE_PRICE intraday"); it
+#   never widens the live-age or close test.
 # OFF (unset): byte-identical v1.28.0 except the version stamp (the extension
 #   is None and the cached pinned calendar answers, as before).
 # GATE: TFB_XCAL_DATA_EXT (Render env), DEFAULT OFF. The same name is read by
@@ -1685,7 +1689,10 @@ from typing import Optional
 # KNOWN LIMITS: XSHG (.SS) and XBOM (.BO) end at 2026-12-31 in 4.13.2 too;
 #   their 2027 calendars were not official on 2026-11-06, so those rows still
 #   read "venue calendar unavailable" from 2026-12-31 until the package or
-#   this table carries 2027.
+#   this table carries 2027. The new XSES bound is the 2027-12-31 close
+#   (04:00Z): the 2028 rows are needed before then. MERGE NOTE: #778 adds
+#   _venue_next_close, which reads the pinned calendar directly; whichever PR
+#   lands second sends it through _venue_cal_data_ext too.
 #   Functions added: 1 (_venue_cal_data_ext). Removed: 0.
 #   Rollback: unset TFB_XCAL_DATA_EXT, or git revert.
 # -----------------------------------------------------------------------------
