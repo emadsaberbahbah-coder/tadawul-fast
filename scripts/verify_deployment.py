@@ -206,8 +206,14 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
+    # 2026-11-06 (manifest pin only): 1.28.0 -> 1.28.3 [XCAL-DATA-EXT] (.SI venue
+    # state after 2026, TFB_XCAL_DATA_EXT default off; 1.28.1 / 1.28.2 are
+    # claimed by open #778 / #779).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.28.0", "opportunity builder"),
+     "1.28.3", "opportunity builder"),
+    # 2026-11-06: the shared exchange calendar data extension (XSES 2027).
+    ("core.exchange_calendar_ext", "CALENDAR_EXT_VERSION", "1.0.0",
+     "exchange calendar data extension"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
@@ -294,7 +300,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
-    ("track_performance", "6.53.0", "track performance"),
+    # 2026-11-06: 6.58.0 [XCAL-DATA-EXT] Singapore outcomes keep a calendar
+    # after 2026 (TFB_XCAL_DATA_EXT, default off); 6.54.0-6.57.0 are claimed by
+    # open PRs #845 / #857 / #915 / #922 (pin only).
+    ("track_performance", "6.58.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
