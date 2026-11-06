@@ -68,6 +68,8 @@ _MODULE_FILES = {
     "integrations.google_sheets_service": "integrations/google_sheets_service.py",
     "core.enriched_quote": "core/enriched_quote.py",
     "core.analysis.opportunity_builder": "core/analysis/opportunity_builder.py",
+    # 2026-11-06: the exchange calendar data extension (XSES 2027) is pinned too.
+    "core.exchange_calendar_ext": "core/exchange_calendar_ext.py",
     "core.analysis.portfolio_actions": "core/analysis/portfolio_actions.py",
     "routes.advanced_analysis": "routes/advanced_analysis.py",
     "routes.analysis_sheet_rows": "routes/analysis_sheet_rows.py",

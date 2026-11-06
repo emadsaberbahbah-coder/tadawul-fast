@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.58.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,51 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# -----------------------------------------------------------------------------
+# v6.58.0 (2026-11-06) [XCAL-DATA-EXT]: Singapore outcomes keep a calendar
+# after 2026. 6.54.0-6.57.0 are claimed by the open PRs #845, #857, #915 and
+# #922; whichever lands later re-numbers.
+# EVIDENCE: the pinned exchange_calendars==4.13.2 (still the newest release on
+#   PyPI on 2026-11-06) records SGX holidays only to 2026, so XSES ends at the
+#   2026-12-31 close. _outcome_calendar_schedule reads a +/-14-day window, so
+#   from 2026-12-18 every .SI / .SG lookup raises DateOutOfBounds and the
+#   record reads outcome_calendar_unknown (the live check and the target
+#   session both); from 2027-01-01 no Singapore record can mature. Replayed
+#   offline on main a85edfc6 with the REAL audit loop: a D05.SI record
+#   targeting 2026-12-23 05:00Z, audited at 09:30Z with the 17:00 SGT close
+#   quote, stays ACTIVE (outcome_calendar_unknown).
+# WHAT: _outcome_calendar_schedule asks _outcome_calendar_ext(name) first.
+#   That is core.exchange_calendar_ext.extended_calendar (v1.0.0): only with
+#   TFB_XCAL_DATA_EXT on / 1 / true / yes, only for XSES, it returns the
+#   pinned calendar plus the eight 2027 SGX closures (the 2027 Singapore
+#   public holidays on weekdays: MOM data via the holidays package 0.108,
+#   whose SGX calendar equals the pinned XSES in 19 of 20 years 2007-2026)
+#   and the five half days it makes reachable (24 / 31 Dec 2026, 5 Feb and
+#   24 / 31 Dec 2027) closing at 12:00 SGT, the end of continuous trading
+#   as in _OUTCOME_SESSION_OVERRIDES. Every other pinned session keeps its
+#   open and close; the two 2026 half days are reached only by windows that
+#   pass 2026-12-31, which raise on the pinned calendar. Otherwise (and on
+#   any error) None, and the pinned calendar is used exactly as before.
+# GATE: TFB_XCAL_DATA_EXT, DEFAULT OFF = v6.53.0 byte for byte apart from the
+#   version string. The same Variable is read by opportunity_builder 1.28.3
+#   on Render (the .SI quote-freshness venue state).
+# ENV LANE: track_performance.yml 'Run performance clock' (1.0.12) and
+#   daily_sync.yml's tracker step map TFB_XCAL_DATA_EXT (|| 'off') - ENV
+#   PARITY.
+# ARMING (owner): repository Variable TFB_XCAL_DATA_EXT=on before Fri 18 Dec
+#   2026 (and the Render env for the builder before Thu 31 Dec 2026).
+# KNOWN LIMITS: (1) the half days before 2026-12-24 stay at the calendar's
+#   17:00 (#922 re-times 2025-12-24, 2025-12-31 and 2026-02-16). (2) A
+#   closure SGX adds later in 2027 needs a new row in
+#   core/exchange_calendar_ext.py. (3) XSHG and XBOM end at 2026-12-31 too;
+#   neither is in this file's base map (#915 adds .SS / .BO) and their 2027
+#   calendars were not official on 2026-11-06. (4) The new bound is
+#   2027-12-31: the window reaches it from 2027-12-18, so the 2028 rows are
+#   needed before then.
+# ZERO functions removed. Additions: _outcome_calendar_ext.
+# ROLLBACK: unset TFB_XCAL_DATA_EXT (or set off). Records matured meanwhile
+#   keep their receipts (calendar 'XSES' and the session used).
+SCRIPT_VERSION = "6.58.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -3433,10 +3477,25 @@ def _outcome_timestamp(value: Any) -> Optional[datetime]:
         return None
 
 
+def _outcome_calendar_ext(name: str) -> Any:
+    """v6.58.0 [XCAL-DATA-EXT]: core.exchange_calendar_ext.extended_calendar(name),
+    the pinned calendar plus its added holiday years, only when
+    TFB_XCAL_DATA_EXT is on and `name` has an extension (XSES); None
+    otherwise or on any error, and the caller keeps the pinned calendar.
+    Never raises."""
+    try:
+        from core.exchange_calendar_ext import extended_calendar
+        return extended_calendar(name)
+    except Exception:
+        return None
+
+
 @functools.lru_cache(maxsize=128)
 def _outcome_calendar_schedule(name: str, utc_day: str) -> Tuple[Tuple[str, datetime, datetime], ...]:
     import exchange_calendars as calendars
-    cal = calendars.get_calendar(name)
+    cal = _outcome_calendar_ext(name)   # v6.58.0 [XCAL-DATA-EXT] (default off: None)
+    if cal is None:
+        cal = calendars.get_calendar(name)
     day = datetime.fromisoformat(utc_day).date()
     sessions = cal.sessions_in_range(
         (day - timedelta(days=14)).isoformat(), (day + timedelta(days=14)).isoformat())
