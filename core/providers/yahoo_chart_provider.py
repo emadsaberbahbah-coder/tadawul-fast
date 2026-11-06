@@ -2,7 +2,22 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.15.1
+Yahoo Chart Provider (Global + KSA History) -- v8.16.0
+
+v8.16.0 -- HISTORY 404 MISS CACHE (TFB_YC_HISTORY_MISS_TTL_SEC, default 0 =
+off = byte-identical to v8.15.1). Render logs 6 Nov 2026 21:19Z: retired or
+renamed tickers (HEWW, FM, KLD, IGN, IBML, IBDO, EMBH, IECS, JKE, JKK, SPLG)
+404 on BOTH raw chart hosts, then fetch_history_raw fell through to yfinance,
+which calls the same /v8/finance/chart id and up to 3 times (retry ladder),
+and repeated the whole sequence for each spelling (X and X.US) and each
+caller. The wasted calls drew 429 "Too Many Requests" that also hit live
+symbols' history (EEX, BK in the same second), and a symbol without history
+loses its technical factors (v8.3.0 note). With a TTL > 0: a raw-chart
+failure that is symbol-local 404 on every host (not provider-wide by
+_quote_failure_provider_wide) returns [] without the yfinance fallback and
+is remembered per Yahoo id for the TTL (bounded [60, 86400] s); later
+history calls for that id return [] with no HTTP. Any 429/5xx/auth/network
+outcome on either host is never cached. No price or history is invented.
 
 v8.15.1 -- isolate symbol-local quote misses from provider outages. A 404
 or an empty instrument cannot open the shared quote breaker. Mixed host
@@ -749,7 +764,7 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.15.1"
+PROVIDER_VERSION = "8.16.0"
 # -----------------------------------------------------------------------------
 # v8.14.0 (2026-09-01) - OPEN HEALED FROM THE SESSION CANDLE, COHERENCE-GUARDED
 # -----------------------------------------------------------------------------
@@ -1054,6 +1069,60 @@ def _yf_history_retry_cap_sec() -> float:
     except Exception:
         v = DEFAULT_YF_HISTORY_RETRY_CAP_SEC
     return max(0.1, min(8.0, v))
+
+
+# ---------------------------------------------------------------------------
+# v8.16.0: history 404 miss cache (TFB_YC_HISTORY_MISS_TTL_SEC, default off)
+# ---------------------------------------------------------------------------
+_YC_HISTORY_MISS: Dict[str, float] = {}
+_YC_HISTORY_MISS_MAX = 5000
+
+
+def _yc_history_miss_ttl_sec() -> float:
+    """0 (default / unset / unparsable) = off. Otherwise bounded [60, 86400]."""
+    raw = (os.getenv("TFB_YC_HISTORY_MISS_TTL_SEC") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except Exception:
+        return 0.0
+    if v <= 0:
+        return 0.0
+    return max(60.0, min(86400.0, v))
+
+
+def _yc_history_miss_active(ysym: str, ttl: float) -> bool:
+    if ttl <= 0 or not ysym:
+        return False
+    exp = _YC_HISTORY_MISS.get(ysym)
+    if exp is None:
+        return False
+    if exp > time.monotonic():
+        return True
+    _YC_HISTORY_MISS.pop(ysym, None)
+    return False
+
+
+def _yc_history_miss_record(ysym: str, ttl: float) -> None:
+    if ttl <= 0 or not ysym:
+        return
+    if len(_YC_HISTORY_MISS) >= _YC_HISTORY_MISS_MAX:
+        now = time.monotonic()
+        for k in [k for k, e in list(_YC_HISTORY_MISS.items()) if e <= now]:
+            _YC_HISTORY_MISS.pop(k, None)
+        if len(_YC_HISTORY_MISS) >= _YC_HISTORY_MISS_MAX:
+            return
+    _YC_HISTORY_MISS[ysym] = time.monotonic() + ttl
+
+
+def _yc_history_symbol_local_404(exc: Exception) -> bool:
+    """True only for a raw-ladder failure whose every host answered 404."""
+    if not isinstance(exc, YahooFetchError):
+        return False
+    if "http_404" not in str(exc):
+        return False
+    return not _quote_failure_provider_wide(exc)
 
 
 def _is_rate_limit_error(exc: Any) -> bool:
@@ -3165,6 +3234,9 @@ class YahooChartProvider:
         # endpoint, same bar shape, YC-2-equivalent identity check on the
         # payload's own meta.symbol. Any failure logs its reason and falls
         # through to the untouched yfinance retry ladder below.
+        _miss_ttl = _yc_history_miss_ttl_sec()  # v8.16.0; 0 = off
+        if _miss_ttl > 0 and _yc_history_miss_active(_yc_yahoo_symbol(sym), _miss_ttl):
+            return []
         if _raw_chart_enabled() and _HAS_HTTPX:
             try:
                 _r_info, _r_meta, _r_hist = await _raw_chart_fetch_triple(
@@ -3186,6 +3258,15 @@ class YahooChartProvider:
                     PROVIDER_VERSION, sym,
                 )
             except Exception as _raw_exc:
+                if _miss_ttl > 0 and _yc_history_symbol_local_404(_raw_exc):
+                    # v8.16.0: yfinance would ask the same chart id again.
+                    _yc_history_miss_record(_yc_yahoo_symbol(sym), _miss_ttl)
+                    logger.warning(
+                        "[yahoo_chart v%s YC-MISS] raw chart history 404 on every host for %s — "
+                        "no yfinance fallback; id held as a miss for %.0fs",
+                        PROVIDER_VERSION, sym, _miss_ttl,
+                    )
+                    return []
                 logger.warning(
                     "[yahoo_chart v%s YC-RAW] raw chart history failed for %s: %s — falling back to yfinance",
                     PROVIDER_VERSION, sym, _raw_exc,
