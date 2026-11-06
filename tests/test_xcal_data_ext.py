@@ -63,7 +63,12 @@ X7  golden negative: X5a-on, X5e-on and X6b-on FAIL on the untouched main
     copies
 X8  ENV lane: both tracker steps map TFB_XCAL_DATA_EXT with || 'off'
     exactly once and identically; the reader's fallback literal is "off";
-    ci.yml's heavy job runs this file with the base required
+    ci.yml (parsed) runs this file in a heavy-job step with the base
+    required, no `if`, no continue-on-error and nothing after the pytest
+    line
+X9  retirement: once the pinned package records XSES 2027 the extension
+    returns None with the gate on (the defect and bound legs above then
+    SKIP instead of failing the upgrade)
 V1  version floors, verify_deployment pins, title line, WHY order, ASCII
 V1b against the base: only the version lines (and the one re-indented
     get_calendar line) removed, added lines ASCII (the title aside), exactly
@@ -106,7 +111,7 @@ BASE_SHA = "a85edfc6"   # main 2026-11-06; track_performance v6.53.0, opportunit
 BASE_FULL = "a85edfc6099ac3b44ff0a24b36d74f712843a33a"
 GATE = "TFB_XCAL_DATA_EXT"
 UTC = timezone.utc
-OFF_WORDS = [None, "", "off", "0", "false", "no", "enforce", "observe", "onn", "y", "enabled"]
+OFF_WORDS = [None, "", "off", "0", "false", "no", "enforce", "observe", "onn", "y", "enabled", "enable"]
 ON_WORDS = ["on", "ON", " on ", "1", "true", "Yes"]
 _MODS = {}
 
@@ -118,6 +123,14 @@ EXPECTED = {
 EXPECTED_HALF = {
     "XSES": ("12:00", ("2026-12-24", "2026-12-31", "2027-02-05", "2027-12-24", "2027-12-31")),
 }
+
+
+# The defect legs need the pinned package to stop at 2026 (true for 4.13.2).
+# A release that records XSES 2027 retires the extension (X9) and these SKIP.
+_PINNED_XSES_BOUND = type(xc.get_calendar("XSES")).bound_max()
+RETIRED = _PINNED_XSES_BOUND >= pd.Timestamp("2027-01-01")
+bounded = pytest.mark.skipif(RETIRED, reason="the pinned exchange_calendars records XSES 2027: the extension "
+                                             "retired (X9)")
 
 
 def _load(name, path):
@@ -209,6 +222,7 @@ def _at(y, mo, d, h, mi):
 
 
 # ------------------------------------------------------------------- X1 ----
+@bounded
 def test_x1_table_is_pinned_and_extends_only_past_the_pinned_bound():
     e = ext()
     assert e.XCAL_EXTRA_HOLIDAYS == EXPECTED and e.XCAL_HALF_DAYS == EXPECTED_HALF
@@ -244,6 +258,7 @@ def test_x2b_on_words_read_on(monkeypatch, word):
 
 
 # ------------------------------------------------------------------- X3 ----
+@bounded
 def test_x3_extended_xses_keeps_every_pinned_session_and_adds_2027(monkeypatch):
     _set_gate(monkeypatch, "on")
     e = ext()
@@ -304,6 +319,7 @@ DAYS = [_at(2026, 11, 6, 9, 0), _at(2026, 12, 17, 3, 0), _at(2026, 12, 18, 3, 0)
 SG = ("D05.SI", "D05.SG", "Z74.SI")
 
 
+@bounded
 @pytest.mark.parametrize("word", OFF_WORDS)
 def test_x4_tracker_off_equals_the_untouched_v6530(monkeypatch, word):
     tp, b = tracker(), tracker_base()
@@ -315,6 +331,7 @@ def test_x4_tracker_off_equals_the_untouched_v6530(monkeypatch, word):
     assert got[("D05.SI", _at(2026, 12, 17, 3, 0))][0] == "XSES"
 
 
+@bounded
 def test_x4b_tracker_on_changes_only_singapore_windows_past_2026(monkeypatch):
     tp, b = tracker(), tracker_base()
     _set_gate(monkeypatch, "on")
@@ -404,6 +421,7 @@ def _x5a_on(tp, monkeypatch):
     assert receipt.get("target_session_close") == "2026-12-23T09:00:00+00:00", receipt
 
 
+@bounded
 def test_x5a_singapore_record_due_on_23_dec_2026(monkeypatch):
     tp = tracker()
     _set_gate(monkeypatch, None)
@@ -413,6 +431,7 @@ def test_x5a_singapore_record_due_on_23_dec_2026(monkeypatch):
     _x5a_on(tp, monkeypatch)
 
 
+@bounded
 def test_x5b_singapore_record_due_in_january_2027(monkeypatch):
     tp = tracker()
     _set_gate(monkeypatch, None)
@@ -424,6 +443,7 @@ def test_x5b_singapore_record_due_in_january_2027(monkeypatch):
     assert receipt.get("target_session") == "2027-01-08", receipt
 
 
+@bounded
 def test_x5c_singapore_holiday_target_moves_to_the_next_session(monkeypatch):
     tp = tracker()
     _set_gate(monkeypatch, "on")
@@ -448,6 +468,7 @@ def _x5e_on(tp, monkeypatch):
     assert receipt.get("target_session") == "2026-12-28", receipt                          # after the half-day close
 
 
+@bounded
 def test_x5e_singapore_half_day_closes_at_noon(monkeypatch):
     tp = tracker()
     _set_gate(monkeypatch, None)
@@ -505,6 +526,7 @@ def _x6b_on(ob, monkeypatch):
     assert detail.get("mode") == "session_closed" and detail.get("prev_close") == "2026-12-31T04:00:00+00:00", detail
 
 
+@bounded
 def test_x6a_builder_venue_state_after_2026(monkeypatch):
     ob = builder()
     ob._VENUE_CAL_CACHE.clear()
@@ -516,6 +538,7 @@ def test_x6a_builder_venue_state_after_2026(monkeypatch):
     assert is_open is True and prev_close == _at(2026, 12, 31, 4, 0)
 
 
+@bounded
 def test_x6b_builder_certifies_the_last_close_on_a_2027_holiday(monkeypatch):
     ob = builder()
     _set_gate(monkeypatch, None)
@@ -525,6 +548,7 @@ def test_x6b_builder_certifies_the_last_close_on_a_2027_holiday(monkeypatch):
     _x6b_on(ob, monkeypatch)
 
 
+@bounded
 def test_x6d_builder_half_day_reads_closed_after_noon(monkeypatch):
     ob = builder()
     case = ("D05.SI", _at(2026, 12, 24, 4, 6), _at(2026, 12, 24, 6, 0))
@@ -550,6 +574,7 @@ def test_x6c_other_venue_states_identical_on_and_off(monkeypatch, symbol, now):
 
 
 # ----------------------------------------------------------------- GOLD ----
+@bounded
 def test_x7_golden_negative_on_legs_fail_on_the_base(monkeypatch):
     tpb, obb = tracker_base(), builder_base()
     with pytest.raises(AssertionError):
@@ -586,13 +611,30 @@ def test_x8_env_lane_parity_reader_and_ci():
     src = (ROOT / "core" / "exchange_calendar_ext.py").read_text(encoding="utf-8")
     m = re.search(r"^def calendar_ext_enabled\(\)[^\n]*:\n(.*?)(?=^def |^@|\Z)", src, re.M | re.S)
     assert m and re.search(r'os\.getenv\("%s"\)\s*or\s*"off"' % GATE, m.group(1))
-    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    heavy = ci.split("\n  heavy:\n", 1)[1].split("\n  summary:\n", 1)[0]
-    step = heavy.split("- name: Singapore calendar data through 2027", 1)[1].split("\n      - name: ", 1)[0]
-    assert re.search(r"python -m pytest -q tests/test_xcal_data_ext\.py", step)
-    assert "git fetch --no-tags --depth=1 origin %s" % BASE_FULL in step
-    assert re.search(r'^\s+TFB_TEST_REQUIRE_BASE: "1"$', step, re.M), step
+    yaml = pytest.importorskip("yaml")
+    ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    heavy = ci["jobs"]["heavy"]
+    assert not heavy.get("continue-on-error") and "if" not in heavy, {k: heavy.get(k) for k in ("if", "continue-on-error")}
+    steps = [st for st in heavy["steps"] if str(st.get("name", "")).startswith("Singapore calendar data through 2027")]
+    assert len(steps) == 1, len(steps)
+    step = steps[0]
+    assert "if" not in step and not step.get("continue-on-error"), step
+    assert str((step.get("env") or {}).get("TFB_TEST_REQUIRE_BASE")) == "1", step.get("env")
+    lines = [ln.strip() for ln in str(step.get("run") or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert lines[-1] == "python -m pytest -q tests/test_xcal_data_ext.py", lines        # nothing after it
+    assert sum("tests/test_xcal_data_ext.py" in ln for ln in lines) == 1, lines
+    assert "git fetch --no-tags --depth=1 origin %s \\" % BASE_FULL in lines, lines
     assert BASE_FULL.startswith(BASE_SHA)
+
+
+# ------------------------------------------------------------------- X9 ----
+def test_x9_extension_retires_once_the_package_covers_its_years(monkeypatch):
+    _set_gate(monkeypatch, "on")
+    cal = ext().extended_calendar("XSES")
+    if RETIRED:
+        assert cal is None                                                  # the newer package wins
+    else:
+        assert cal is not None and str(_PINNED_XSES_BOUND.date()) == "2026-12-31"
 
 
 # ------------------------------------------------------------------- V -----
