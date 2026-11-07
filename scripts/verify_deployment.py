@@ -294,6 +294,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
+    # 2026-11-07: 6.59.0 [CALIB-CALL-SPLIT] the calibration's per-bucket call mix
+    # (TRACK_CALIB_CALL_SPLIT, default off; 6.54.0-6.58.0 are claimed by open
+    # #845 / #857 / #915 / #922 / #923). Pin only.
     ("track_performance", "6.59.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe

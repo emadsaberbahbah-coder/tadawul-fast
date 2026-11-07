@@ -10,12 +10,13 @@
 # v1.1.71: run tests/test_calib_call_split.py (track_performance v6.59.0
 # [CALIB-CALL-SPLIT], TRACK_CALIB_CALL_SPLIT default off = v6.53.0: the
 # reliability calibration's per-bucket buy / sell / hold split, call-signed
-# ROI and like-for-like INVESTABLE vs WATCHLIST notes) in the blocking lean
-# lane right after tests/test_performance_summary_integrity.py. Offline
-# fixtures; the off identity is pinned by an embedded v6.53.0 golden, and
-# the legs that read main a85edfc6 with `git show` skip in this shallow
-# checkout. PyYAML (already in the lane) reads the two tracker workflows.
-# Nothing is removed and no existing entry moves.
+# ROI and like-for-like INVESTABLE vs WATCHLIST notes) in its own blocking
+# lean-unit step after the board scorecard harness. Offline fixtures and an
+# embedded v6.53.0 golden; the step fetches main a85edfc6 by SHA for the
+# legs that read it with `git show` and sets TFB_TEST_REQUIRE_BASE=1, so a
+# missing base FAILS those legs instead of skipping them. PyYAML (already in
+# the lane) reads the tracker and CI workflows. Nothing is removed and no
+# existing entry moves.
 #
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
@@ -1141,7 +1142,6 @@ jobs:
             tests/test_tp_zero_baseline_p201.py \
             tests/test_learning_metric_fixes.py \
             tests/test_performance_summary_integrity.py \
-            tests/test_calib_call_split.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
@@ -1202,6 +1202,17 @@ jobs:
             f60cff37707812bd89f41c47ed4ddd3f2c4c9746 \
             || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
           python tests/test_board_scorecard_p182.py
+
+      - name: 📊 Calibration call mix (track_performance v6.59.0, golden base fetched by SHA)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
+        run: |
+          # v1.1.71: the off-identity, V2 and X1 legs read track_performance
+          # v6.53.0 at main a85edfc6; with TFB_TEST_REQUIRE_BASE=1 a failed
+          # fetch FAILS them instead of skipping them.
+          git fetch --no-tags --depth=1 origin a85edfc6099ac3b44ff0a24b36d74f712843a33a \
+            || echo "::warning::a85edfc6 base not fetched - the golden legs will FAIL"
+          python -m pytest -q tests/test_calib_call_split.py
 
       - name: ✅ Coverage note
         run: |
