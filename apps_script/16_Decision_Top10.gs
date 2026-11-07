@@ -1,11 +1,48 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.23.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.23.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.23.1 (2026-11-08) [CONFIRM-WINDOW-FIX] -- THE WINDOW HISTORY CARRIES ITS DAY-KEY (TWO REVIEW FINDINGS)
+ * WHY (Codex review of PR #927, 8 Nov 2026, two P2 findings on v1.22.0):
+ * (1) STALE HISTORY. While TFB_T10_CONFIRM_WINDOW was off, st.qh stayed in
+ *   the blob but stopped advancing, while ci followed the consecutive clock.
+ *   Re-arming then trusted the old bits: qh=[1,1], seven unarmed WATCH days
+ *   (ci -> 0), re-arm, one qualified day -> ci 3 and a sized 'NEW (confirmed
+ *   3/3)' from two confirmations outside the window.
+ * (2) OUTAGE PAUSE + SAME-DAY RECOVERY. When the day's first render outage-
+ *   pauses a symbol (v1.11.10 P-168) no bit is appended, so the newest bit is
+ *   yesterday's; a later render of the same day-key that qualified the name
+ *   RAISED that bit (already 1 -> no change: a pending 2/3 never counted its
+ *   third day; a 0 -> history rewritten) instead of recording today.
+ * WHAT (no gate, floor, cap, sizing or exit rule changes; no function or
+ *   var added; the knob and its default-off semantics are unchanged):
+ * (a) st.qd = the day-key of the newest bit, written by every armed
+ *   day-advance beside st.qh; parsed only beside qh (dt10StabParseState_).
+ * (b) UNARMED day-advance: an entry that still carries qh loses qh and qd --
+ *   a render day passed without the window running, so the bits no longer
+ *   describe the last N render days; re-arming migrates the consecutive
+ *   count again (the v1.22.0 migration rule). Entries without qh: untouched,
+ *   so a blob the window never touched stays byte-identical to v1.21.1.
+ * (c) ARMED same-day render that qualifies the name: when qd is an earlier
+ *   day-key the day's bit is APPENDED (window trimmed, ci = sum, qd = today);
+ *   when qd is today (or absent: a 1.22.0/1.23.0 blob until its next
+ *   day-advance) the v1.22.0 raise-only rule stands.
+ * (d) hard exit deletes qd with qh. Soft / capacity / displacement exits keep
+ *   both, as before.
+ * (e) dt10SelfTest 'confirm window core' gains both cases: armed d1-d2, an
+ *   unarmed d3 drops qh, re-armed d4 reads 1/3 (not 3/3); an outage-paused
+ *   d3 first render appends nothing, the same-day qualified render appends
+ *   the bit (2/3 -> 3/3) and stamps qd.
+ * GATES: none new. ROLLBACK: re-paste v1.23.0 (blobs with qd keep parsing
+ *   there: unknown keys are dropped by its parser).
+ * Harness: tests/test_dt10_v1231_confirm_window_fix.js (golden negatives on
+ *   the rebuilt v1.23.0 file reproduce both findings; the fix passes both;
+ *   unarmed replays deep-equal the base).
  *
  * v1.23.0 (2026-11-08) [REENTRY-COOLDOWN] -- A NAME SOLD RECENTLY CANNOT BE RE-SEATED (KNOB, DEFAULT OFF)
  * WHY (owner review 7 Nov 2026, item A4; the HCI pattern of 9 Sep repeated):
@@ -2527,7 +2564,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.23.0';
+var DT10_VERSION = '1.23.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -4617,7 +4654,15 @@ function dt10StabParseState_(raw) {
         for (var vqi = vqs; vqi < v.qh.length; vqi++) {
           vqh.push(Number(v.qh[vqi]) === 1 ? 1 : 0);
         }
-        if (vqh.length) out.symbols[sym].qh = vqh;
+        if (vqh.length) {
+          out.symbols[sym].qh = vqh;
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: the day-key of the newest bit, kept
+          // only beside qh. A 1.22.0 / 1.23.0 blob has none: its same-day
+          // renders then only raise (as before) until a day-advance stamps it.
+          if (typeof v.qd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.qd)) {
+            out.symbols[sym].qd = v.qd;
+          }
+        }
       }
     }
   }
@@ -5127,6 +5172,13 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
           if (cwBits.length > cwLen) cwBits = cwBits.slice(cwBits.length - cwLen);
           st.qh = cwBits;
           st.ci = dt10StabQhSum_(cwBits);
+          st.qd = today;   // v1.23.1 [CONFIRM-WINDOW-FIX]: the day this bit belongs to
+        } else if (st.qh) {
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: a render day passed with the window
+          // off, so the bits no longer describe the last N render days. Drop
+          // them; re-arming migrates the consecutive count (v1.22.0 rule).
+          delete st.qh;
+          if (st.qd) delete st.qd;
         }
       }
     } else {
@@ -5136,14 +5188,26 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
         else st.hist.push(Math.round(sc * 10) / 10);
       }
       if (cwLen > 0 && st.qh && st.qh.length &&
-          (rawSet[sym] === true || (qualifiedBasis && qualifiedWithin(sym))) &&
-          st.qh[st.qh.length - 1] !== 1) {
-        // v1.22.0 [CONFIRM-WINDOW]: a later render of the same day-key can
-        // only RAISE today's bit (the first render after a sync is the
-        // noisiest read of the day); it never lowers one, and a blob with no
-        // window entry waits for the next day-advance.
-        st.qh[st.qh.length - 1] = 1;
-        st.ci = dt10StabQhSum_(st.qh);
+          (rawSet[sym] === true || (qualifiedBasis && qualifiedWithin(sym)))) {
+        if (st.qd !== undefined && st.qd !== today) {
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: the newest bit is an earlier day's
+          // (the day's first render outage-paused this symbol, so no bit was
+          // recorded): today's qualified read APPENDS the day's bit instead
+          // of rewriting yesterday's. A blob with no qd keeps the raise rule.
+          var cwLate = dt10StabQhBits_({ ci: st.ci, qh: st.qh }, cwLen);
+          cwLate.push(1);
+          if (cwLate.length > cwLen) cwLate = cwLate.slice(cwLate.length - cwLen);
+          st.qh = cwLate;
+          st.ci = dt10StabQhSum_(cwLate);
+          st.qd = today;
+        } else if (st.qh[st.qh.length - 1] !== 1) {
+          // v1.22.0 [CONFIRM-WINDOW]: a later render of the same day-key can
+          // only RAISE today's bit (the first render after a sync is the
+          // noisiest read of the day); it never lowers one, and a blob with no
+          // window entry waits for the next day-advance.
+          st.qh[st.qh.length - 1] = 1;
+          st.ci = dt10StabQhSum_(st.qh);
+        }
       }
     }
     if (st.hist.length > knobs.smooth_days) {
@@ -5162,7 +5226,10 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     if (dt10InList_(pausedSyms, ms)) { survivors.push(ms); continue; }
     if (hardOut(ms)) {
       stm.member = false; stm.ci = 0; stm.co = 0;
-      if (cwLen > 0 && stm.qh) delete stm.qh;   // v1.22.0 [CONFIRM-WINDOW]
+      if (cwLen > 0 && stm.qh) {   // v1.22.0 [CONFIRM-WINDOW]
+        delete stm.qh;
+        if (stm.qd) delete stm.qd;   // v1.23.1 [CONFIRM-WINDOW-FIX]
+      }
       exitedHard.push(ms);
       if (cooledDown(ms)) {   // v1.23.0 [REENTRY-COOLDOWN]: a sold holding
         cooldownHeld.push({ symbol: ms, days: cdMap[ms].days, date: cdMap[ms].date, member: true });
@@ -11693,6 +11760,18 @@ function dt10SelfTest() {
   cwBlk[cwBlk.length - 2].structural_block = true;          // B.US
   var cwHard = dt10StabCore_(cbRaw[0], cwBlk, dt10StabParseState_(cbSeed),
                              cwKnobs(5), 2, cbDays[0]);
+  /* v1.23.1 [CONFIRM-WINDOW-FIX]: (1) armed d1-d2 (CHAL qh [1,1], qd d2), an
+     UNARMED d3 drops qh/qd, a re-armed qualified d4 reads 1/3 (v1.23.0 read
+     3/3 from the stale bits). (2) armed d3 first render outage-pauses CHAL
+     (absent from raw, outage sighting): no bit, qd stays d2; the same-day
+     render with CHAL raw APPENDS the bit -> ci 3, qd d3 (v1.23.0 stayed 2). */
+  var cwSt2 = dt10StabParseState_(cw5[1].state);
+  var cwU3 = dt10StabCore_(cbRaw[2], cbGrid(86, 'WATCH'), cwSt2, cwKnobs(0), 2, cbDays[2]);
+  var cwR4 = dt10StabCore_(cbRaw[3], cbGrid(86), dt10StabParseState_(cwU3.state), cwKnobs(5), 2, cbDays[3]);
+  var cwOutage = {}; cwOutage['CHAL.US'] = true;
+  var cwP3 = dt10StabCore_([cbTk('A.US', 95)], cbGrid(86), dt10StabParseState_(cw5[1].state),
+                           cwKnobs(5), 2, cbDays[2], cwOutage);
+  var cwP3b = dt10StabCore_(cbRaw[3], cbGrid(86), dt10StabParseState_(cwP3.state), cwKnobs(5), 2, cbDays[2]);
   report.push('confirm window core: ' +
       ((JSON.stringify(cw0) === JSON.stringify(cbW) &&
         JSON.stringify(cwA) === JSON.stringify(cbW) &&
@@ -11716,10 +11795,23 @@ function dt10SelfTest() {
         cwRe.state.symbols['CHAL.US'].ci === 3 &&
         cwRe.note.indexOf('near 1 CHAL.US(3/3)') > 0 &&
         cwHard.audit.exited_hard.length === 1 && cwHard.audit.exited_hard[0] === 'B.US' &&
-        cwHard.state.symbols['B.US'].ci === 0 && cwHard.state.symbols['B.US'].qh === undefined)
+        cwHard.state.symbols['B.US'].ci === 0 && cwHard.state.symbols['B.US'].qh === undefined &&
+        cwHard.state.symbols['B.US'].qd === undefined &&
+        cw5[1].state.symbols['CHAL.US'].qd === cbDays[1] &&
+        cwU3.state.symbols['CHAL.US'].qh === undefined && cwU3.state.symbols['CHAL.US'].qd === undefined &&
+        cwU3.state.symbols['CHAL.US'].ci === 0 &&
+        cwR4.state.symbols['CHAL.US'].ci === 1 && cwR4.state.symbols['CHAL.US'].qh.length === 1 &&
+        cwR4.state.symbols['CHAL.US'].qd === cbDays[3] && cbTk4([0, 0, 0, cwR4], 'CHAL.US') === null &&
+        cwP3.audit.outage_paused.length === 1 && cwP3.audit.outage_paused[0] === 'CHAL.US' &&
+        cwP3.state.symbols['CHAL.US'].ci === 2 && cwP3.state.symbols['CHAL.US'].qd === cbDays[1] &&
+        cwP3b.state.symbols['CHAL.US'].ci === 3 && cwP3b.state.symbols['CHAL.US'].qh.length === 3 &&
+        cwP3b.state.symbols['CHAL.US'].qd === cbDays[2])
        ? 'ok (0/absent = v1.21.1 clocks; window 5: WATCH day keeps 2/3 -> NEW 3/3 next raw day, ' +
-         'migration ci 3 -> 4 bits, window 2 raised to 3, same-day raise, hard exit clears qh)'
-       : 'FAIL [' + cw5[2].note + ' | ' + cw5[3].note + ' | ' + cwRe.note + ']'));
+         'migration ci 3 -> 4 bits, window 2 raised to 3, same-day raise, hard exit clears qh; ' +
+         'v1.23.1: unarmed day drops the history (re-arm 1/3), outage pause + same-day recovery appends (3/3))'
+       : 'FAIL [' + cw5[2].note + ' | ' + cw5[3].note + ' | ' + cwRe.note + ' | ' +
+         (cwR4.state.symbols['CHAL.US'] && cwR4.state.symbols['CHAL.US'].ci) + ' | ' +
+         (cwP3b.state.symbols['CHAL.US'] && cwP3b.state.symbols['CHAL.US'].ci) + ']'));
   /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
      confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
      the buffer boundary: off / junk = the v1.14.0 qualified replay byte for

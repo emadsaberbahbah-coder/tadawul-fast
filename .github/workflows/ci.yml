@@ -2,8 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.63 (2026-11-08) -- REENTRY COOLDOWN HARNESS
+# VERSION 1.1.64 (2026-11-08) -- CONFIRM WINDOW FIX HARNESS
 #
+# v1.1.64: run tests/test_dt10_v1231_confirm_window_fix.js (16_Decision_Top10.gs
+# v1.23.1: the window history carries its day-key; a disarmed render day drops
+# the stale bits and a same-day recovery after an outage pause appends today's
+# bit -- the two Codex findings on PR #927) beside the other cockpit harnesses;
+# its golden negatives rebuild the v1.23.0 file from the delivered one.
 # v1.1.63: run tests/test_dt10_v1230_reentry_cooldown.js (16_Decision_Top10.gs
 # v1.23.0: a name sold inside the last N calendar days per _Portfolio_CostBasis
 # cannot be seated on the Top-10 board, Script Property
@@ -1227,6 +1232,7 @@ jobs:
           node tests/test_dt10_post_earnings.js
           node tests/test_dt10_v1220_confirm_window.js
           node tests/test_dt10_v1230_reentry_cooldown.js
+          node tests/test_dt10_v1231_confirm_window_fix.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js

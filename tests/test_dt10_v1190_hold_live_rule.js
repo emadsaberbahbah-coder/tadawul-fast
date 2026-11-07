@@ -78,7 +78,7 @@ const s1190 = /^var DT10_VERSION = '1\.19\.0';$/m.test(newSource) ? newSource : 
 // count reaches the readiness reason in the REAL refresh's Logger lines, so the refresh-level golden
 // negative reads the v1.21.0 file rebuilt from the delivered one (v1.21.1 edits reversed, SHA-256
 // pinned); tests/test_dt10_v1211_mf_scope.js proves v1.21.1 = v1.21.0 apart from that data.
-const S1210 = /^var DT10_VERSION = '1\.2(?:1\.1|2\.0|3\.0)';$/m.test(newSource) ? history.v1210Source(newSource) : newSource;   // 2026-11-08: v1.22.0 stacked; the oracle reverses it first
+const S1210 = /^var DT10_VERSION = '1\.2(?:1\.1|2\.0|3\.[01])';$/m.test(newSource) ? history.v1210Source(newSource) : newSource;   // 2026-11-08: v1.22.0 stacked; the oracle reverses it first
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const NOW = Date.parse(FIX.frozen_now);            // 2026-10-10T19:28:22Z
@@ -573,7 +573,7 @@ function seatRow(run, sym) { for (const r of run.seats) if (r[1] === sym) return
 const stripToken = s => String(s).replace(/, qhold: (?:would hold|held) \d+(?: [A-Z0-9.]+)*/, '');
 /* The version string reaches the meta footer, the B2 status line, the Logger lines and the
  * run-marker property; comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19\.0|20\.0|21\.[01]|22\.0|23\.0)/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too; 2026-11-05: v1.21.1
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:19\.0|20\.0|21\.[01]|22\.0|23\.[01])/g, 'v1.18.0'));   // 2026-11-02: v1.20.0 too; 2026-11-05: v1.21.1
 
 /* ============================================================ battery */
 function battery() {
@@ -585,9 +585,9 @@ function battery() {
   test('T0 base oracle is the reviewed v1.18.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1180_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.18.0', 'base version');
-    eq(N.DT10_VERSION, '1.23.0', 'delivered version');   // 2026-11-02: v1.20.0 pins moved; 2026-11-05: v1.21.1
-    ok(/^ \* Version: 1\.23\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
-    ok(newSource.indexOf("var DT10_VERSION = '1.23.0';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.23.1', 'delivered version');   // 2026-11-02: v1.20.0 pins moved; 2026-11-05: v1.21.1
+    ok(/^ \* Version: 1\.23\.1 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
+    ok(newSource.indexOf("var DT10_VERSION = '1.23.1';") > 0, 'DT10_VERSION literal');
     ok(/^ \* Version: 1\.19\.0 /.test(s1190.split('\n')[3]) && s1190.indexOf("var DT10_VERSION = '1.19.0';") > 0, 'rebuilt v1.19.0 lockstep');
     eq(N.DT10_QUALIFIED_HOLD_PROP, HOLD); eq(N.DT10_SEAT_LIVE_FILL_PROP, LIVE); eq(N.DT10_OWNER_RULE_PROP, RULE);
     eq(N.DT10_OWNER_RULE_ROI_MAX, 34, 'the owner rule threshold is a display constant');
@@ -867,7 +867,7 @@ function battery() {
 
   test('T6 embedded dt10SelfTest: the three new core lines ok, property lines follow the properties, every base line kept, zero FAIL; the base lacks the lines', () => {
     const rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
-    ok(rep.indexOf('[DT10 v1.23.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
+    ok(rep.indexOf('[DT10 v1.23.1] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
     for (const l of ['qualified hold (DT10_QUALIFIED_HOLD): off (off = v1.18.0 board; observe lists; enforce holds)', 'qualified hold core: ok',
       'seat live fill (DT10_SEAT_LIVE_FILL): off (off = v1.18.0 render)', 'seat live fill core: ok',
       'owner rule mark (DT10_OWNER_RULE_MARK): off (High + Engine ROI 12M < 34; display only)', 'owner rule core: ok']) {

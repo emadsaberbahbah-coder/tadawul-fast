@@ -1,5 +1,5 @@
 /**
- * zz_Property_Tool.gs -- Script Property tool, v2.3 (8 Nov 2026).
+ * zz_Property_Tool.gs -- Script Property tool, v2.4 (8 Nov 2026).
  * WHY: Project Settings -> Script Properties turns read-only above 50
  * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
  * property is set from code instead: pick a function in the toolbar list,
@@ -188,13 +188,13 @@ function tfbPropsConfirmWindowOn() {
   p.setProperty('TFB_T10_CONFIRM_WINDOW', '5');
   var ver = (typeof DT10_VERSION === 'string') ? DT10_VERSION : 'not pasted';
   Logger.log('TFB_T10_CONFIRM_WINDOW=' + p.getProperty('TFB_T10_CONFIRM_WINDOW') + ' | 16_Decision_Top10 ' + ver +
-      (ver === 'not pasted' || ver < '1.22.0' ? ' (paste 1.22.0 first: the knob is ignored below it)' : '') +
+      (ver === 'not pasted' || ver < '1.23.1' ? ' (paste 1.23.1 first: the knob is ignored below 1.22.0 and 1.22.0/1.23.0 carry the two review findings fixed in 1.23.1)' : '') +
       ' | now run dt10SelfTest (expect: confirm window (TFB_T10_CONFIRM_WINDOW): 5 ... and confirm window core: ok)');
 }
 
 function tfbPropsConfirmWindowOff() {
   PropertiesService.getScriptProperties().deleteProperty('TFB_T10_CONFIRM_WINDOW');
-  Logger.log('TFB_T10_CONFIRM_WINDOW deleted (consecutive clock; existing qh bits stay parsed and inert)');
+  Logger.log('TFB_T10_CONFIRM_WINDOW deleted (consecutive clock from the next render; 16_Decision_Top10 1.23.1 drops each entry\'s window history on the first render day with the window off, so re-arming migrates the consecutive count afresh)');
 }
 
 function tfbPropsCooldownOn() {
@@ -202,7 +202,7 @@ function tfbPropsCooldownOn() {
   p.setProperty('TFB_T10_REENTRY_COOLDOWN_DAYS', '10');
   var ver = (typeof DT10_VERSION === 'string') ? DT10_VERSION : 'not pasted';
   Logger.log('TFB_T10_REENTRY_COOLDOWN_DAYS=' + p.getProperty('TFB_T10_REENTRY_COOLDOWN_DAYS') + ' | 16_Decision_Top10 ' + ver +
-      (ver === 'not pasted' || ver < '1.23.0' ? ' (paste 1.23.0 first: the knob is ignored below it)' : '') +
+      (ver === 'not pasted' || ver < '1.23.1' ? ' (paste 1.23.1 first: the knob is ignored below 1.23.0)' : '') +
       ' | now run dt10SelfTest (expect: reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS): 10 ... and reentry cooldown core: ok)');
 }
 

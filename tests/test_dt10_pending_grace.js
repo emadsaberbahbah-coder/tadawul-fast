@@ -223,9 +223,9 @@ function battery() {
     // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
     // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
     // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
-    eq(N.DT10_VERSION, '1.23.0', 'delivered version');   // 2026-11-05: v1.21.1 pins moved; 2026-11-08: v1.22.0
-    assert(/^ \* Version: 1\.23\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
-    assert(newSource.indexOf("var DT10_VERSION = '1.23.0';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.23.1', 'delivered version');   // 2026-11-05: v1.21.1 pins moved; 2026-11-08: v1.22.0
+    assert(/^ \* Version: 1\.23\.1 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
+    assert(newSource.indexOf("var DT10_VERSION = '1.23.1';") > 0, 'DT10_VERSION literal');
     eq(N.DT10_T10_PENDING_GRACE_MAX, 5, 'clamp constant');
   });
 
@@ -360,7 +360,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('pending grace core: ok') > 0, 'battery line');
     assert(rep.indexOf('pending grace (TFB_T10_PENDING_GRACE_DAYS): 0 (') > 0, 'property line default');
-    assert(rep.indexOf('[DT10 v1.23.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
+    assert(rep.indexOf('[DT10 v1.23.1] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
     // property memo, so the memo line reports one more key (keys=3); pin moved
@@ -385,7 +385,7 @@ function battery() {
       assert(!/\b(let|const|class)\s|=>|`/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l);
       if (!/^[\x09\x20-\x7e]*$/.test(l)) {
         // the only non-ASCII added line is the version header rewrite (pre-existing em dash)
-        assert(baseLines[l.replace('1.23.0', '1.14.0')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
+        assert(baseLines[l.replace('1.23.1', '1.14.0')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
       }
     });
     function nonAscii(s) { var m = {}; for (var j = 0; j < s.length; j++) { var c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
