@@ -1,5 +1,5 @@
 /**
- * zz_Property_Tool.gs -- Script Property tool, v2.2 (8 Nov 2026).
+ * zz_Property_Tool.gs -- Script Property tool, v2.3 (8 Nov 2026).
  * WHY: Project Settings -> Script Properties turns read-only above 50
  * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
  * property is set from code instead: pick a function in the toolbar list,
@@ -28,6 +28,13 @@
  *                     1.22.0: three qualified days inside the last five day-keys
  *                     confirm a seat; 0 or deleted = the consecutive clock) and
  *                     runs dt10SelfTest. tfbPropsConfirmWindowOff deletes it.
+ *  tfbPropsCooldownOn (v2.3)  sets TFB_T10_REENTRY_COOLDOWN_DAYS=10 (16_Decision_Top10
+ *                     1.23.0: a name whose _Portfolio_CostBasis sell date is inside
+ *                     the last 10 calendar days cannot be seated on the Top-10
+ *                     board; 0 or deleted = no cool-down). tfbPropsCooldownOff
+ *                     deletes it.
+ *  tfbPropsStabilityArmAll (v2.3)  both of the above in one run, then the
+ *                     reminder to run dt10SelfTest.
  *  tfbPropsCleanStale optional: deletes 9 stale keys (listed below).
  * Removed in 2.0: tfbDoAll (it re-set POR_MODE=observe and re-installed a
  * trigger on every run).
@@ -188,6 +195,26 @@ function tfbPropsConfirmWindowOn() {
 function tfbPropsConfirmWindowOff() {
   PropertiesService.getScriptProperties().deleteProperty('TFB_T10_CONFIRM_WINDOW');
   Logger.log('TFB_T10_CONFIRM_WINDOW deleted (consecutive clock; existing qh bits stay parsed and inert)');
+}
+
+function tfbPropsCooldownOn() {
+  var p = PropertiesService.getScriptProperties();
+  p.setProperty('TFB_T10_REENTRY_COOLDOWN_DAYS', '10');
+  var ver = (typeof DT10_VERSION === 'string') ? DT10_VERSION : 'not pasted';
+  Logger.log('TFB_T10_REENTRY_COOLDOWN_DAYS=' + p.getProperty('TFB_T10_REENTRY_COOLDOWN_DAYS') + ' | 16_Decision_Top10 ' + ver +
+      (ver === 'not pasted' || ver < '1.23.0' ? ' (paste 1.23.0 first: the knob is ignored below it)' : '') +
+      ' | now run dt10SelfTest (expect: reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS): 10 ... and reentry cooldown core: ok)');
+}
+
+function tfbPropsCooldownOff() {
+  PropertiesService.getScriptProperties().deleteProperty('TFB_T10_REENTRY_COOLDOWN_DAYS');
+  Logger.log('TFB_T10_REENTRY_COOLDOWN_DAYS deleted (no cool-down; the board is the v1.22.0 board)');
+}
+
+function tfbPropsStabilityArmAll() {
+  tfbPropsConfirmWindowOn();
+  tfbPropsCooldownOn();
+  Logger.log('both set | run dt10SelfTest once, then Refresh Decision Top-10 from the menu');
 }
 
 function tfbPropsExitSanityOn() {

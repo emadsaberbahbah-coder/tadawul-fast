@@ -1,11 +1,62 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.22.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.23.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.23.0 (2026-11-08) [REENTRY-COOLDOWN] -- A NAME SOLD RECENTLY CANNOT BE RE-SEATED (KNOB, DEFAULT OFF)
+ * WHY (owner review 7 Nov 2026, item A4; the HCI pattern of 9 Sep repeated):
+ * ITRN.US was stopped out at IBKR on 5 Nov 17:53Z (67 sh @ 49.89, -169 USD)
+ * and the 7 Nov 04:38 board seated it again as FAST-TRACK day 1 at rank 3;
+ * HCI.US re-qualified FAST-TRACK day 1 one day after its full exit on 9 Sep.
+ * The owner's standing lesson (no re-buy of a name just sold at a loss) has
+ * no gate: the board reads the engine's raw top-N, the ledger records the
+ * sale, and nothing joins the two.
+ * WHAT: Script Property TFB_T10_REENTRY_COOLDOWN_DAYS
+ *   (DT10_T10_COOLDOWN_PROP), read ONCE in dt10ApplyStability_
+ *   (dt10StabCooldownDays_, the dt10StabConfirmWindow_ pattern) into
+ *   knobs.cooldown_days ONLY when armed (an integer 1..60; absent/blank/0/
+ *   junk/fault = 0 = the v1.22.0 board byte for byte, knobs object
+ *   included). While armed the same function reads the lot ledger
+ *   (_Portfolio_CostBasis, DT10_LEDGER_SHEET) once per render through
+ *   dt10CooldownMap_ and hands the pure core a plain map as its 8th argument
+ *   (older callers and the self-test replays pass nothing = off).
+ * (a) dt10CooldownMapFromValues_ (PURE): header row = the first row carrying
+ *   a 'Symbol' token and a sell-date token ('Sell Date', 'Sold Date' or
+ *   'Exit Date'); each later row with a parseable sell day (dt10CalendarDay_:
+ *   a Date cell is a Riyadh instant, a text cell an ISO date) whose age in
+ *   calendar days is 0..N joins the map as {days, date}; the most recent sale
+ *   per symbol wins; a blank symbol, a blank, future or older date, and a
+ *   repeated header are skipped. A tab without the two headers gives {}.
+ * (b) dt10StabCore_: a raw ticket whose symbol is in the map is removed from
+ *   rawSyms BEFORE the counter pass (it cannot be seated, fast-tracked,
+ *   counted or displace anyone) and listed in cooldownHeld; a member in the
+ *   map hard-exits through the existing hardOut path (a sold holding has no
+ *   seat to keep). hardOut therefore also makes the name non-qualified for
+ *   the v1.14.0 basis and the near list. Every other clock, label and rule
+ *   is v1.22.0.
+ * (c) read-back: note token ', cooldown=Nd' and, when names were held,
+ *   ' held k SYM(sold Md ago) ...' (up to 3); audit.cooldown_held lists
+ *   {symbol, days, date, member}. Unarmed: note, audit, knobs, state byte-
+ *   identical to v1.22.0.
+ * (d) dt10SelfTest gains 'reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS):
+ *   ...' and the pure battery 'reentry cooldown core: ok' (parser: header at
+ *   row 4, Date and ISO cells, age bounds, most recent sale wins; core: CHAL
+ *   sold 3 days ago is not seated and is named; member B sold yesterday
+ *   hard-exits; map absent = the v1.22.0 replay byte for byte).
+ * Functions added (0 removed): dt10StabCooldownDays_,
+ * dt10CooldownMapFromValues_, dt10CooldownMap_; vars added:
+ * DT10_T10_COOLDOWN_PROP, DT10_T10_COOLDOWN_MAX, DT10_LEDGER_SHEET.
+ * Harness: tests/test_dt10_v1230_reentry_cooldown.js (REAL file; golden
+ * negative on the v1.22.0 base rebuilt by reversing these edits, SHA-256
+ * pinned; unarmed deep-equal; parser table; ES5/ASCII lint; inventory;
+ * mutants). Rollback: Script Property deleted or 0 (no re-paste) or re-paste
+ * v1.22.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.22.0 (2026-11-08) [CONFIRM-WINDOW] -- CONFIRMATION COUNTS QUALIFIED DAYS IN A ROLLING WINDOW (KNOB, DEFAULT OFF)
  * WHY (owner, Sat 7 Nov 2026 review, "go with the best options"): since 1 Oct
@@ -2476,7 +2527,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.22.0';
+var DT10_VERSION = '1.23.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3354,6 +3405,12 @@ var DT10_T10_PENDING_GRACE_MAX = 5;
 // confirm_days, capped at 30).
 var DT10_T10_CONFIRM_WINDOW_PROP = 'TFB_T10_CONFIRM_WINDOW';
 var DT10_T10_CONFIRM_WINDOW_MAX = 30;
+// v1.23.0 [REENTRY-COOLDOWN]: a name sold in the last N calendar days (the
+// lot ledger's sell date) cannot be seated -- see the v1.23.0 header block.
+// Absent/0/junk = v1.22.0 board; 1..60 arms.
+var DT10_T10_COOLDOWN_PROP = 'TFB_T10_REENTRY_COOLDOWN_DAYS';
+var DT10_T10_COOLDOWN_MAX = 60;
+var DT10_LEDGER_SHEET = '_Portfolio_CostBasis';
 // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
 // that the audited grid still rates INVEST inside the rank buffer -- see the
 // v1.19.0 header block. off (default) | observe | enforce.
@@ -4793,7 +4850,64 @@ function dt10StabQhSum_(bits) {
   for (var qs = 0; qs < bits.length; qs++) qsum += bits[qs] === 1 ? 1 : 0;
   return qsum;
 }
-function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
+/**
+ * v1.23.0 [REENTRY-COOLDOWN] PURE: {SYMBOL: {days, date}} of the names sold in
+ * the last maxDays calendar days, from a lot-ledger values grid. The header
+ * row is the first row carrying a 'Symbol' token and a sell-date token
+ * ('Sell Date' / 'Sold Date' / 'Exit Date'); rows above it (titles) are
+ * ignored. A row joins when its sell day parses (dt10CalendarDay_) and its
+ * age is 0..maxDays; the most recent sale per symbol wins; blank symbols,
+ * blank / future / older dates and a repeated header are skipped. A grid
+ * without both headers gives {}. Never throws.
+ */
+function dt10CooldownMapFromValues_(values, asOfDate, maxDays) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var lim = parseInt(maxDays, 10) || 0;
+  if (!(lim > 0)) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, r, c, cells, tok;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    var s0 = -1, d0 = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol' && s0 < 0) s0 = c;
+      else if ((tok === 'selldate' || tok === 'solddate' || tok === 'exitdate') && d0 < 0) d0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0) { iSym = s0; iDate = d0; }
+  }
+  if (iSym < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL') continue;
+    var day = dt10CalendarDay_(cells[iDate]);
+    if (day === null) continue;
+    var age = today - day;
+    if (age < 0 || age > lim) continue;
+    if (map.hasOwnProperty(sym) && map[sym].days <= age) continue;
+    map[sym] = { days: age, date: new Date(day * 86400000).toISOString().slice(0, 10) };
+  }
+  return map;
+}
+/** v1.23.0 [REENTRY-COOLDOWN]: live lot-ledger read (DT10_LEDGER_SHEET,
+ * columns A:Z, bounded like Calendar_Events). ANY failure, an absent tab or
+ * an oversized grid -> {} -> no cool-down hold. Never throws. */
+function dt10CooldownMap_(ss, maxDays, asOfDate) {
+  try {
+    var sh = ss && ss.getSheetByName(DT10_LEDGER_SHEET);
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 26);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10CooldownMapFromValues_(sh.getRange(1, 1, rows, cols).getValues(), asOfDate, maxDays);
+  } catch (eCd) {
+    return {};
+  }
+}
+function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, cooldown) {
   rawTickets = rawTickets || [];
   cands = cands || [];
   limit = Math.max(1, parseInt(limit, 10) || 10);
@@ -4840,7 +4954,20 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   for (var gr = 0; gr < rankedSyms.length; gr++) {
     globalRank[rankedSyms[gr]] = gr + 1;
   }
+  // v1.23.0 [REENTRY-COOLDOWN]: the map rides as the plain 8th argument and
+  // counts only while the knob is armed; absent (older callers, the self-test
+  // replays, the property unset) is the v1.22.0 board byte for byte.
+  var cdDays = parseInt(knobs && knobs.cooldown_days, 10) || 0;
+  var cdMap = (cdDays > 0 && cooldown && typeof cooldown === 'object') ? cooldown : null;
+  var cooldownHeld = [];
+  function cooledDown(sym) {
+    return cdMap !== null && Object.prototype.hasOwnProperty.call(cdMap, sym);
+  }
   function hardOut(sym) {
+    // v1.23.0 [REENTRY-COOLDOWN]: a name sold inside the cool-down has no
+    // seat to keep and cannot qualify (the v1.14.0 basis and the near list
+    // consult this predicate).
+    if (cooledDown(sym)) return true;
     var c = candBySym[sym];
     // v1.6.6 (S-2): ABSENCE from today's audited candidates is jitter,
     // not a safety verdict — it flows to the day-keyed miss clock
@@ -4863,7 +4990,15 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   for (var ri = 0; ri < rawTickets.length; ri++) {
     var t = rawTickets[ri] || {};
     var ts = dt10NormSym_(t.symbol);
-    if (ts && !rawBySym[ts]) { rawSyms.push(ts); rawBySym[ts] = t; }
+    if (ts && !rawBySym[ts]) {
+      if (cooledDown(ts)) {
+        // v1.23.0 [REENTRY-COOLDOWN]: the raw ticket leaves before the counter
+        // pass -- never seated, fast-tracked, counted or displacing anyone.
+        cooldownHeld.push({ symbol: ts, days: cdMap[ts].days, date: cdMap[ts].date, member: false });
+        continue;
+      }
+      rawSyms.push(ts); rawBySym[ts] = t;
+    }
   }
   var rawSet = {};
   for (var rsi = 0; rsi < rawSyms.length; rsi++) rawSet[rawSyms[rsi]] = true;
@@ -5029,6 +5164,9 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       stm.member = false; stm.ci = 0; stm.co = 0;
       if (cwLen > 0 && stm.qh) delete stm.qh;   // v1.22.0 [CONFIRM-WINDOW]
       exitedHard.push(ms);
+      if (cooledDown(ms)) {   // v1.23.0 [REENTRY-COOLDOWN]: a sold holding
+        cooldownHeld.push({ symbol: ms, days: cdMap[ms].days, date: cdMap[ms].date, member: true });
+      }
     } else if ((stm.co || 0) >= knobs.exit_days) {
       stm.member = false; stm.ci = 0; stm.co = 0;
       if (cwLen > 0 && stm.qh) stm.ci = dt10StabQhSum_(stm.qh);   // v1.22.0 [CONFIRM-WINDOW]
@@ -5367,6 +5505,18 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   // v1.22.0 [CONFIRM-WINDOW]: read-back token only while armed (0 leaves the
   // note and the audit byte-identical to v1.21.1).
   if (cwLen > 0) note += ', cwin=' + cwLen;
+  // v1.23.0 [REENTRY-COOLDOWN]: read-back token only while armed (0 leaves
+  // the note and the audit byte-identical to v1.22.0).
+  if (cdMap !== null) {
+    note += ', cooldown=' + cdDays + 'd';
+    if (cooldownHeld.length) {
+      var cdParts = [];
+      for (var cdi = 0; cdi < cooldownHeld.length && cdParts.length < 3; cdi++) {
+        cdParts.push(cooldownHeld[cdi].symbol + '(sold ' + cooldownHeld[cdi].days + 'd ago)');
+      }
+      note += ' held ' + cooldownHeld.length + ' ' + cdParts.join(' ');
+    }
+  }
   var coreOut = {
     tickets: tickets,
     state: state,
@@ -5384,6 +5534,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0
   if (qhMode !== 'off') coreOut.audit.qualified_held = qualifiedHeld;   // v1.19.0
   if (cwLen > 0) coreOut.audit.confirm_window = cwLen;   // v1.22.0 [CONFIRM-WINDOW]
+  if (cdMap !== null) coreOut.audit.cooldown_held = cooldownHeld;   // v1.23.0 [REENTRY-COOLDOWN]
   return coreOut;
 }
 // ---------------------------------------------------------------------------
@@ -5566,6 +5717,23 @@ function dt10StabPendingGrace_() {
  * v1.21.1 clocks. Mirrors dt10StabPendingGrace_ (service read outside the
  * pure core); never throws.
  */
+function dt10StabCooldownDays_() {
+  // v1.23.0 [REENTRY-COOLDOWN]: Script Property TFB_T10_REENTRY_COOLDOWN_DAYS
+  // (DT10_T10_COOLDOWN_PROP). An integer 1..DT10_T10_COOLDOWN_MAX arms the
+  // cool-down (larger values clamp to the max); absent, blank, 0, negative,
+  // junk or a PropertiesService fault read as 0 = the v1.22.0 board. Mirrors
+  // dt10StabConfirmWindow_ (service read outside the pure core); never throws.
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_COOLDOWN_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n > 0)) return 0;
+    return Math.min(DT10_T10_COOLDOWN_MAX, n);
+  } catch (eCd) {}
+  return 0;
+}
 function dt10StabConfirmWindow_() {
   try {
     var raw = String(PropertiesService.getScriptProperties()
@@ -8489,6 +8657,15 @@ function dt10ApplyStability_(payload, panel, outage) {
   // knobs object byte for byte.
   var cwRead = dt10StabConfirmWindow_();
   if (cwRead > 0) knobs.confirm_window = cwRead;
+  // v1.23.0 [REENTRY-COOLDOWN]: same pattern -- one service read here; the
+  // knob and the ledger read happen ONLY when armed so an unarmed run
+  // publishes the v1.22.0 knobs object byte for byte and reads no tab.
+  var cdRead = dt10StabCooldownDays_();
+  var cdMapApply = null;
+  if (cdRead > 0) {
+    knobs.cooldown_days = cdRead;
+    cdMapApply = dt10CooldownMap_(SpreadsheetApp.getActiveSpreadsheet(), cdRead);
+  }
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -8515,7 +8692,8 @@ function dt10ApplyStability_(payload, panel, outage) {
   }
   var out = dt10StabCore_(payload.selected || [],
                           payload.candidates_rows || [],
-                          state, knobs, limit, epoch.key, outageMap);
+                          state, knobs, limit, epoch.key, outageMap,
+                          cdMapApply);   // v1.23.0 [REENTRY-COOLDOWN]
   if (!dt10EpochKeyLegacy_()) {
     out.note += ' | epoch=' + epoch.key + '/' + epoch.src +
                 (epoch.held ? '(frozen)' : '');
@@ -11437,6 +11615,57 @@ function dt10SelfTest() {
        ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +
          'two soft misses -> reset, structural block -> reset, member untouched)'
        : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));
+  /* v1.23.0 [REENTRY-COOLDOWN]: property line (one read) + pure battery on the
+     confirm-basis board, day 1 (raw [A, CHAL]). Ledger grid: two title rows,
+     header at row 4 (Symbol .. Sell Date), CHAL sold 3 days ago (a Date cell,
+     Riyadh midnight), B sold yesterday (ISO text), OLD sold 40 days ago, FUT
+     dated tomorrow, a blank symbol, a repeated header. Map (10 days): CHAL 3
+     and B 1 only; most recent sale wins. Core: CHAL is not seated and is
+     named; member B hard-exits and is named; token; audit; map absent = the
+     cbQ day-1 replay byte for byte. */
+  report.push('reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS): ' + dt10StabCooldownDays_() +
+              ' (0 = v1.22.0 board; 1..' + DT10_T10_COOLDOWN_MAX + ' arms)');
+  var rcAsOf = '2026-10-21';
+  var rcGrid = [['Ledger', ''], ['', ''], ['', ''],
+                ['Symbol', 'Status', 'Buy Date', 'Sell Date'],
+                ['CHAL.US', 'Sold', '2026-09-01', new Date(Date.UTC(2026, 9, 17, 21, 0, 0))],
+                ['CHAL.US', 'Sold', '2026-08-01', '2026-10-12'],
+                ['B.US', 'Sold', '2026-09-01', '2026-10-20'],
+                ['OLD.US', 'Sold', '2026-08-01', '2026-09-11'],
+                ['FUT.US', 'Active', '2026-10-01', '2026-10-22'],
+                ['', 'Sold', '2026-09-01', '2026-10-19'],
+                ['Symbol', 'Status', 'Buy Date', 'Sell Date'],
+                ['A.US', 'Active', '2026-09-01', '']];
+  var rcMap = dt10CooldownMapFromValues_(rcGrid, rcAsOf, 10);
+  var rcKnobs = cbKnobs('qualified');
+  rcKnobs.cooldown_days = 10;
+  var rcOn = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0], undefined, rcMap);
+  var rcOff = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), cbKnobs('qualified'), 2, cbDays[0]);
+  var rcNoMap = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0]);
+  var rcChal = null, rcB = null;
+  for (var rci = 0; rci < rcOn.tickets.length; rci++) {
+    if (rcOn.tickets[rci].symbol === 'CHAL.US') rcChal = rcOn.tickets[rci];
+    if (rcOn.tickets[rci].symbol === 'B.US') rcB = rcOn.tickets[rci];
+  }
+  report.push('reentry cooldown core: ' +
+      ((Object.keys(rcMap).sort().join(',') === 'B.US,CHAL.US' &&
+        rcMap['CHAL.US'].days === 3 && rcMap['CHAL.US'].date === '2026-10-18' &&
+        rcMap['B.US'].days === 1 &&
+        Object.keys(dt10CooldownMapFromValues_(rcGrid, rcAsOf, 2)).join(',') === 'B.US' &&
+        Object.keys(dt10CooldownMapFromValues_([['Symbol', 'Status']], rcAsOf, 10)).length === 0 &&
+        rcChal === null && rcB === null &&
+        rcOn.audit.exited_hard.length === 1 && rcOn.audit.exited_hard[0] === 'B.US' &&
+        rcOn.audit.cooldown_held.length === 2 &&
+        rcOn.audit.cooldown_held[0].symbol === 'CHAL.US' && rcOn.audit.cooldown_held[0].member === false &&
+        rcOn.audit.cooldown_held[1].symbol === 'B.US' && rcOn.audit.cooldown_held[1].member === true &&
+        rcOn.note.indexOf('cooldown=10d held 2 CHAL.US(sold 3d ago) B.US(sold 1d ago)') > 0 &&
+        rcOn.state.symbols['CHAL.US'] === undefined &&
+        JSON.stringify(rcNoMap) === JSON.stringify(rcOff) &&
+        JSON.stringify(rcOff) === JSON.stringify(cbQ[0]) &&
+        rcOff.note.indexOf('cooldown') < 0 && rcOff.audit.cooldown_held === undefined)
+       ? 'ok (parser: header row 4, Date + ISO cells, 0..N days, most recent sale wins; ' +
+         'core: sold name not seated and named, sold member hard-exits; map absent = v1.22.0)'
+       : 'FAIL [' + rcOn.note + ' | ' + Object.keys(rcMap).join(',') + ']'));
   /* v1.22.0 [CONFIRM-WINDOW]: property line (one read) + pure battery on the
      confirm-basis board. CHAL raw d1-d2, WATCH at rank 12 on d3 (a reset day
      for v1.21.1), raw d4. window 0 / absent: deep-equals the cbW replay.

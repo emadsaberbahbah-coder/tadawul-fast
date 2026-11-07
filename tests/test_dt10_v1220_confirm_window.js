@@ -52,7 +52,10 @@ var history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js')
 var EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1220.json'));
 var PROP = 'TFB_T10_CONFIRM_WINDOW';
 
-var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-08: v1.23.0 (re-entry cool-down) is stacked on this change; this harness keeps proving
+// v1.22.0 = v1.21.1 apart from the window, so it reads the v1.22.0 file rebuilt from the delivered
+// one (the v1.23.0 edits reversed, SHA-256 pinned); tests/test_dt10_v1230_reentry_cooldown.js owns v1.23.0.
+var newSource = history.v1220Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 var baseSource;
 try {
