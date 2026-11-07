@@ -1,11 +1,163 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.21.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.23.1 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.23.1 (2026-11-08) [CONFIRM-WINDOW-FIX] -- THE WINDOW HISTORY CARRIES ITS DAY-KEY (TWO REVIEW FINDINGS)
+ * WHY (Codex review of PR #927, 8 Nov 2026, two P2 findings on v1.22.0):
+ * (1) STALE HISTORY. While TFB_T10_CONFIRM_WINDOW was off, st.qh stayed in
+ *   the blob but stopped advancing, while ci followed the consecutive clock.
+ *   Re-arming then trusted the old bits: qh=[1,1], seven unarmed WATCH days
+ *   (ci -> 0), re-arm, one qualified day -> ci 3 and a sized 'NEW (confirmed
+ *   3/3)' from two confirmations outside the window.
+ * (2) OUTAGE PAUSE + SAME-DAY RECOVERY. When the day's first render outage-
+ *   pauses a symbol (v1.11.10 P-168) no bit is appended, so the newest bit is
+ *   yesterday's; a later render of the same day-key that qualified the name
+ *   RAISED that bit (already 1 -> no change: a pending 2/3 never counted its
+ *   third day; a 0 -> history rewritten) instead of recording today.
+ * WHAT (no gate, floor, cap, sizing or exit rule changes; no function or
+ *   var added; the knob and its default-off semantics are unchanged):
+ * (a) st.qd = the day-key of the newest bit, written by every armed
+ *   day-advance beside st.qh; parsed only beside qh (dt10StabParseState_).
+ * (b) UNARMED day-advance: an entry that still carries qh loses qh and qd --
+ *   a render day passed without the window running, so the bits no longer
+ *   describe the last N render days; re-arming migrates the consecutive
+ *   count again (the v1.22.0 migration rule). Entries without qh: untouched,
+ *   so a blob the window never touched stays byte-identical to v1.21.1.
+ * (c) ARMED same-day render that qualifies the name: when qd is an earlier
+ *   day-key the day's bit is APPENDED (window trimmed, ci = sum, qd = today);
+ *   when qd is today (or absent: a 1.22.0/1.23.0 blob until its next
+ *   day-advance) the v1.22.0 raise-only rule stands.
+ * (d) hard exit deletes qd with qh. Soft / capacity / displacement exits keep
+ *   both, as before.
+ * (e) dt10SelfTest 'confirm window core' gains both cases: armed d1-d2, an
+ *   unarmed d3 drops qh, re-armed d4 reads 1/3 (not 3/3); an outage-paused
+ *   d3 first render appends nothing, the same-day qualified render appends
+ *   the bit (2/3 -> 3/3) and stamps qd.
+ * GATES: none new. ROLLBACK: re-paste v1.23.0 (blobs with qd keep parsing
+ *   there: unknown keys are dropped by its parser).
+ * Harness: tests/test_dt10_v1231_confirm_window_fix.js (golden negatives on
+ *   the rebuilt v1.23.0 file reproduce both findings; the fix passes both;
+ *   unarmed replays deep-equal the base).
+ *
+ * v1.23.0 (2026-11-08) [REENTRY-COOLDOWN] -- A NAME SOLD RECENTLY CANNOT BE RE-SEATED (KNOB, DEFAULT OFF)
+ * WHY (owner review 7 Nov 2026, item A4; the HCI pattern of 9 Sep repeated):
+ * ITRN.US was stopped out at IBKR on 5 Nov 17:53Z (67 sh @ 49.89, -169 USD)
+ * and the 7 Nov 04:38 board seated it again as FAST-TRACK day 1 at rank 3;
+ * HCI.US re-qualified FAST-TRACK day 1 one day after its full exit on 9 Sep.
+ * The owner's standing lesson (no re-buy of a name just sold at a loss) has
+ * no gate: the board reads the engine's raw top-N, the ledger records the
+ * sale, and nothing joins the two.
+ * WHAT: Script Property TFB_T10_REENTRY_COOLDOWN_DAYS
+ *   (DT10_T10_COOLDOWN_PROP), read ONCE in dt10ApplyStability_
+ *   (dt10StabCooldownDays_, the dt10StabConfirmWindow_ pattern) into
+ *   knobs.cooldown_days ONLY when armed (an integer 1..60; absent/blank/0/
+ *   junk/fault = 0 = the v1.22.0 board byte for byte, knobs object
+ *   included). While armed the same function reads the lot ledger
+ *   (_Portfolio_CostBasis, DT10_LEDGER_SHEET) once per render through
+ *   dt10CooldownMap_ and hands the pure core a plain map as its 8th argument
+ *   (older callers and the self-test replays pass nothing = off).
+ * (a) dt10CooldownMapFromValues_ (PURE): header row = the first row carrying
+ *   a 'Symbol' token and a sell-date token ('Sell Date', 'Sold Date' or
+ *   'Exit Date'); each later row with a parseable sell day (dt10CalendarDay_:
+ *   a Date cell is a Riyadh instant, a text cell an ISO date) whose age in
+ *   calendar days is 0..N joins the map as {days, date}; the most recent sale
+ *   per symbol wins; a blank symbol, a blank, future or older date, and a
+ *   repeated header are skipped. A tab without the two headers gives {}.
+ * (b) dt10StabCore_: a raw ticket whose symbol is in the map is removed from
+ *   rawSyms BEFORE the counter pass (it cannot be seated, fast-tracked,
+ *   counted or displace anyone) and listed in cooldownHeld; a member in the
+ *   map hard-exits through the existing hardOut path (a sold holding has no
+ *   seat to keep). hardOut therefore also makes the name non-qualified for
+ *   the v1.14.0 basis and the near list. Every other clock, label and rule
+ *   is v1.22.0.
+ * (c) read-back: note token ', cooldown=Nd' and, when names were held,
+ *   ' held k SYM(sold Md ago) ...' (up to 3); audit.cooldown_held lists
+ *   {symbol, days, date, member}. Unarmed: note, audit, knobs, state byte-
+ *   identical to v1.22.0.
+ * (d) dt10SelfTest gains 'reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS):
+ *   ...' and the pure battery 'reentry cooldown core: ok' (parser: header at
+ *   row 4, Date and ISO cells, age bounds, most recent sale wins; core: CHAL
+ *   sold 3 days ago is not seated and is named; member B sold yesterday
+ *   hard-exits; map absent = the v1.22.0 replay byte for byte).
+ * Functions added (0 removed): dt10StabCooldownDays_,
+ * dt10CooldownMapFromValues_, dt10CooldownMap_; vars added:
+ * DT10_T10_COOLDOWN_PROP, DT10_T10_COOLDOWN_MAX, DT10_LEDGER_SHEET.
+ * Harness: tests/test_dt10_v1230_reentry_cooldown.js (REAL file; golden
+ * negative on the v1.22.0 base rebuilt by reversing these edits, SHA-256
+ * pinned; unarmed deep-equal; parser table; ES5/ASCII lint; inventory;
+ * mutants). Rollback: Script Property deleted or 0 (no re-paste) or re-paste
+ * v1.22.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
+ *
+ * v1.22.0 (2026-11-08) [CONFIRM-WINDOW] -- CONFIRMATION COUNTS QUALIFIED DAYS IN A ROLLING WINDOW (KNOB, DEFAULT OFF)
+ * WHY (owner, Sat 7 Nov 2026 review, "go with the best options"): since 1 Oct
+ * the board created 319 seats; 195 (61%) lasted one day, 4 ever reached
+ * ACTIVE, and 180 exits (56%) were DROPPED by rank jitter, not by a rule
+ * (BigQuery tfb_archive.v_board_episodes). The 7 Nov board carries
+ * FAST-TRACK seats reading 'day 4, 1/3 confirmed' (MRL.MC, 2020.HK): every
+ * non-qualified day-key still ZEROES ci (the v1.14.0 reset branch), so a
+ * seat that qualifies on 4 of 5 days never confirms when the misses are not
+ * consecutive. Replay of the archive (1 Oct - 7 Nov, seat presence at the
+ * first render of each UTC day): the consecutive clock confirms 24
+ * symbol-days / 20 symbols on 16 of 38 days; '3 of the last 5 day-keys'
+ * confirms 72 / 39 / 31, and 137 / 52 / 35 when a later render of the same
+ * day may count. The owner's purpose for the 3-day rule (22 Oct: no INVEST
+ * that drops off the list the day after a buy) is kept: three qualified
+ * days are still required; only the demand that they be consecutive goes.
+ * WHAT: Script Property TFB_T10_CONFIRM_WINDOW (DT10_T10_CONFIRM_WINDOW_PROP),
+ *   read ONCE in dt10ApplyStability_ (dt10StabConfirmWindow_, the
+ *   dt10StabPendingGrace_ pattern) into knobs.confirm_window ONLY when armed
+ *   (an integer >= 2; absent/blank/0/1/junk/fault = 0 = the v1.21.1 clocks
+ *   byte for byte, knobs object included). The core raises a window below
+ *   'T10: Stability Confirm Days' to it and caps it at 30
+ *   (dt10StabConfirmWindowLen_).
+ * (a) counter pass, day-advance, not outage-paused: the v1.21.1 chain runs
+ *   UNCHANGED (co, cp, the score point, pendingHeld, the qualified branch);
+ *   then the day's bit (1 = in rawSet, or INVEST inside the rank buffer
+ *   under confirm=qualified; else 0) joins st.qh (newest last, trimmed to
+ *   the window) and ci becomes the window's SUM (dt10StabQhSum_). A miss
+ *   therefore lowers the count by at most the bit that leaves the window; it
+ *   never zeroes it. A blob written before the window (no qh) migrates its
+ *   consecutive count as ci ones (dt10StabQhBits_), so a run in progress
+ *   keeps its progress.
+ * (b) same day-key re-run: a later render that finds the symbol qualified
+ *   RAISES today's bit to 1 and recomputes ci (the first render after a sync
+ *   is the noisiest read of the day); it never lowers a bit, and a blob with
+ *   no window entry waits for the next day-advance. Everything else on a
+ *   re-run is v1.21.1 (clocks frozen, score point refreshed).
+ * (c) exits: a hard exit (structural block / safety verdict) deletes qh and
+ *   zeroes ci as before; soft, capacity and displacement exits keep qh and
+ *   set ci to its sum, so a still-qualified name pushed out by a better one
+ *   does not restart (the owner's 22 Oct complaint). Entry still requires a
+ *   sized raw ticket; fast-track, displacement, grace and every label are
+ *   v1.21.1. The persisted FAST-TRACK label shows min(ci, confirm_days) and
+ *   pending shows the same cap, so '4/3' never renders.
+ * (d) read-back: note token ', cwin=N' and audit.confirm_window = N only
+ *   while armed; the state blob gains qh only for symbols the armed window
+ *   has touched (dt10StabParseState_ keeps 0/1 bits, newest 30). Unarmed:
+ *   note, audit, blob and knobs byte-identical to v1.21.1.
+ * (e) dt10SelfTest gains 'confirm window (TFB_T10_CONFIRM_WINDOW): ...' and
+ *   the pure battery 'confirm window core: ok' (window 0/absent = the cbW
+ *   replay byte for byte; window 5: CHAL raw d1-d2, WATCH d3, raw d4 -> ci
+ *   1,2,2,3 and NEW 3/3 sized on d4 where v1.21.1 reads 1,2,0,1 and seats
+ *   nothing; window 2 raised to 3 -> 2 on d4; same-day raise; hard exit
+ *   clears qh; migration ci 3 -> four ones; tokens).
+ * Functions added (0 removed): dt10StabConfirmWindow_,
+ * dt10StabConfirmWindowLen_, dt10StabQhBits_, dt10StabQhSum_; vars added:
+ * DT10_T10_CONFIRM_WINDOW_PROP, DT10_T10_CONFIRM_WINDOW_MAX.
+ * Harness: tests/test_dt10_v1220_confirm_window.js (REAL file; golden
+ * negative on the v1.21.1 base rebuilt by reversing these edits, SHA-256
+ * pinned; unarmed deep-equal; ES5/ASCII lint; inventory; mutants).
+ * Rollback: Script Property TFB_T10_CONFIRM_WINDOW deleted or 0 (no
+ * re-paste; blobs with qh keep parsing) or re-paste v1.21.1.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped
+ * in lockstep.
  *
  * v1.21.1 (2026-11-05) [MF-SCOPE-2422] -- THE APPROVED FUND TAB DROPS 52 DEAD ROWS (POLICY DATA ONLY)
  * WHY (owner, Thu 5 Nov 2026 12:51 Riyadh: "Approved to be removed"): sync run
@@ -2412,7 +2564,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.21.1';
+var DT10_VERSION = '1.23.1';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3284,6 +3436,18 @@ var DT10_T10_CONFIRM_BASIS_PROP = 'TFB_T10_CONFIRM_BASIS';
 // v1.15.0 header block. Absent/0/junk = v1.14.0 clocks; capped at 5.
 var DT10_T10_PENDING_GRACE_PROP = 'TFB_T10_PENDING_GRACE_DAYS';
 var DT10_T10_PENDING_GRACE_MAX = 5;
+// v1.22.0 [CONFIRM-WINDOW]: confirmation counts qualified day-keys inside a
+// rolling window instead of a consecutive run -- see the v1.22.0 header
+// block. Absent/0/1/junk = v1.21.1 clocks; an integer >= 2 arms (raised to
+// confirm_days, capped at 30).
+var DT10_T10_CONFIRM_WINDOW_PROP = 'TFB_T10_CONFIRM_WINDOW';
+var DT10_T10_CONFIRM_WINDOW_MAX = 30;
+// v1.23.0 [REENTRY-COOLDOWN]: a name sold in the last N calendar days (the
+// lot ledger's sell date) cannot be seated -- see the v1.23.0 header block.
+// Absent/0/junk = v1.22.0 board; 1..60 arms.
+var DT10_T10_COOLDOWN_PROP = 'TFB_T10_REENTRY_COOLDOWN_DAYS';
+var DT10_T10_COOLDOWN_MAX = 60;
+var DT10_LEDGER_SHEET = '_Portfolio_CostBasis';
 // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
 // that the audited grid still rates INVEST inside the rank buffer -- see the
 // v1.19.0 header block. off (default) | observe | enforce.
@@ -4480,6 +4644,26 @@ function dt10StabParseState_(raw) {
       // when > 0 so a blob that never paused stays byte-identical to v1.14.0.
       var vcp = Math.max(0, parseInt(v.cp, 10) || 0);
       if (vcp > 0) out.symbols[sym].cp = vcp;
+      // v1.22.0 [CONFIRM-WINDOW]: qualified-day bits (0/1, newest last).
+      // Absent in older blobs -> no key; written only for symbols an armed
+      // window touched, so a blob that never ran it stays byte-identical to
+      // v1.21.1. Newest DT10_T10_CONFIRM_WINDOW_MAX bits kept.
+      if (v.qh && v.qh.length) {
+        var vqh = [];
+        var vqs = Math.max(0, v.qh.length - DT10_T10_CONFIRM_WINDOW_MAX);
+        for (var vqi = vqs; vqi < v.qh.length; vqi++) {
+          vqh.push(Number(v.qh[vqi]) === 1 ? 1 : 0);
+        }
+        if (vqh.length) {
+          out.symbols[sym].qh = vqh;
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: the day-key of the newest bit, kept
+          // only beside qh. A 1.22.0 / 1.23.0 blob has none: its same-day
+          // renders then only raise (as before) until a day-advance stamps it.
+          if (typeof v.qd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.qd)) {
+            out.symbols[sym].qd = v.qd;
+          }
+        }
+      }
     }
   }
   return out;
@@ -4676,7 +4860,99 @@ function dt10StabSoftMiss_(sym, candBySym, globalRank, knobs, hardOut) {
  * Returns { tickets, state, audit, note }. §8: selects AMONG the backend's
  * audited candidates only — never recomputes a gate, score, or verdict.
  */
-function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
+/**
+ * v1.22.0 [CONFIRM-WINDOW]: the armed window length for this run -- 0 when the
+ * knob is absent/0/1/junk (the v1.21.1 clocks), else the knob raised to
+ * confirm_days and capped at DT10_T10_CONFIRM_WINDOW_MAX. Pure.
+ */
+function dt10StabConfirmWindowLen_(knobs) {
+  var n = parseInt(knobs && knobs.confirm_window, 10) || 0;
+  if (!(n >= 2)) return 0;
+  var cd = Math.max(1, parseInt(knobs.confirm_days, 10) || 1);
+  return Math.min(DT10_T10_CONFIRM_WINDOW_MAX, Math.max(cd, n));
+}
+/**
+ * v1.22.0 [CONFIRM-WINDOW]: the qualified-day bits of one state entry, newest
+ * last, trimmed to win. An entry written before the window (no qh) migrates
+ * its consecutive count as ci ones (capped at win), so a run in progress keeps
+ * its progress. Pure; never mutates the entry; always returns a new array.
+ */
+function dt10StabQhBits_(st, win) {
+  var out = [];
+  var src = (st && st.qh && st.qh.length) ? st.qh : null;
+  if (src) {
+    for (var qb = 0; qb < src.length; qb++) out.push(Number(src[qb]) === 1 ? 1 : 0);
+  } else {
+    var qci = Math.max(0, parseInt(st && st.ci, 10) || 0);
+    for (var qm = 0; qm < Math.min(qci, win); qm++) out.push(1);
+  }
+  if (out.length > win) out = out.slice(out.length - win);
+  return out;
+}
+/** v1.22.0 [CONFIRM-WINDOW]: the number of qualified bits. Pure. */
+function dt10StabQhSum_(bits) {
+  var qsum = 0;
+  for (var qs = 0; qs < bits.length; qs++) qsum += bits[qs] === 1 ? 1 : 0;
+  return qsum;
+}
+/**
+ * v1.23.0 [REENTRY-COOLDOWN] PURE: {SYMBOL: {days, date}} of the names sold in
+ * the last maxDays calendar days, from a lot-ledger values grid. The header
+ * row is the first row carrying a 'Symbol' token and a sell-date token
+ * ('Sell Date' / 'Sold Date' / 'Exit Date'); rows above it (titles) are
+ * ignored. A row joins when its sell day parses (dt10CalendarDay_) and its
+ * age is 0..maxDays; the most recent sale per symbol wins; blank symbols,
+ * blank / future / older dates and a repeated header are skipped. A grid
+ * without both headers gives {}. Never throws.
+ */
+function dt10CooldownMapFromValues_(values, asOfDate, maxDays) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var lim = parseInt(maxDays, 10) || 0;
+  if (!(lim > 0)) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, r, c, cells, tok;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    var s0 = -1, d0 = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol' && s0 < 0) s0 = c;
+      else if ((tok === 'selldate' || tok === 'solddate' || tok === 'exitdate') && d0 < 0) d0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0) { iSym = s0; iDate = d0; }
+  }
+  if (iSym < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL') continue;
+    var day = dt10CalendarDay_(cells[iDate]);
+    if (day === null) continue;
+    var age = today - day;
+    if (age < 0 || age > lim) continue;
+    if (map.hasOwnProperty(sym) && map[sym].days <= age) continue;
+    map[sym] = { days: age, date: new Date(day * 86400000).toISOString().slice(0, 10) };
+  }
+  return map;
+}
+/** v1.23.0 [REENTRY-COOLDOWN]: live lot-ledger read (DT10_LEDGER_SHEET,
+ * columns A:Z, bounded like Calendar_Events). ANY failure, an absent tab or
+ * an oversized grid -> {} -> no cool-down hold. Never throws. */
+function dt10CooldownMap_(ss, maxDays, asOfDate) {
+  try {
+    var sh = ss && ss.getSheetByName(DT10_LEDGER_SHEET);
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 26);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10CooldownMapFromValues_(sh.getRange(1, 1, rows, cols).getValues(), asOfDate, maxDays);
+  } catch (eCd) {
+    return {};
+  }
+}
+function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, cooldown) {
   rawTickets = rawTickets || [];
   cands = cands || [];
   limit = Math.max(1, parseInt(limit, 10) || 10);
@@ -4723,7 +4999,20 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   for (var gr = 0; gr < rankedSyms.length; gr++) {
     globalRank[rankedSyms[gr]] = gr + 1;
   }
+  // v1.23.0 [REENTRY-COOLDOWN]: the map rides as the plain 8th argument and
+  // counts only while the knob is armed; absent (older callers, the self-test
+  // replays, the property unset) is the v1.22.0 board byte for byte.
+  var cdDays = parseInt(knobs && knobs.cooldown_days, 10) || 0;
+  var cdMap = (cdDays > 0 && cooldown && typeof cooldown === 'object') ? cooldown : null;
+  var cooldownHeld = [];
+  function cooledDown(sym) {
+    return cdMap !== null && Object.prototype.hasOwnProperty.call(cdMap, sym);
+  }
   function hardOut(sym) {
+    // v1.23.0 [REENTRY-COOLDOWN]: a name sold inside the cool-down has no
+    // seat to keep and cannot qualify (the v1.14.0 basis and the near list
+    // consult this predicate).
+    if (cooledDown(sym)) return true;
     var c = candBySym[sym];
     // v1.6.6 (S-2): ABSENCE from today's audited candidates is jitter,
     // not a safety verdict — it flows to the day-keyed miss clock
@@ -4746,7 +5035,15 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   for (var ri = 0; ri < rawTickets.length; ri++) {
     var t = rawTickets[ri] || {};
     var ts = dt10NormSym_(t.symbol);
-    if (ts && !rawBySym[ts]) { rawSyms.push(ts); rawBySym[ts] = t; }
+    if (ts && !rawBySym[ts]) {
+      if (cooledDown(ts)) {
+        // v1.23.0 [REENTRY-COOLDOWN]: the raw ticket leaves before the counter
+        // pass -- never seated, fast-tracked, counted or displacing anyone.
+        cooldownHeld.push({ symbol: ts, days: cdMap[ts].days, date: cdMap[ts].date, member: false });
+        continue;
+      }
+      rawSyms.push(ts); rawBySym[ts] = t;
+    }
   }
   var rawSet = {};
   for (var rsi = 0; rsi < rawSyms.length; rsi++) rawSet[rawSyms[rsi]] = true;
@@ -4779,6 +5076,10 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   var qhMode = (knobs.qualified_hold === 'observe' ||
                 knobs.qualified_hold === 'enforce') ? knobs.qualified_hold : 'off';
   var qualifiedHeld = [];
+  // v1.22.0 [CONFIRM-WINDOW]: the window rides as a plain knob (service read
+  // in dt10ApplyStability_); 0 (older callers, the self-test replays, the
+  // property unset) is the v1.21.1 clock byte for byte.
+  var cwLen = dt10StabConfirmWindowLen_(knobs);
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -4816,6 +5117,11 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       // a non-outage day-advance resets the pause counter. A symbol
       // present in raw qualified today and is never paused.
       var opPrev = st.op || 0;
+      // v1.22.0 [CONFIRM-WINDOW]: the count before today's chain (migration
+      // source) and whether today qualifies under the v1.21.1 definitions.
+      var cwPrev = st.ci || 0;
+      var cwQual = cwLen > 0 &&
+          (rawSet[sym] === true || (qualifiedBasis && qualifiedWithin(sym)));
       var opClock = st.member === true || (st.ci || 0) > 0;
       var opNow = opClock && !rawSet[sym] && outageOf(sym);
       if (opNow) st.op = opPrev + 1; else if (st.op) delete st.op;
@@ -4857,11 +5163,52 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
           }
         }
         if (sc !== null) st.hist.push(Math.round(sc * 10) / 10);
+        if (cwLen > 0) {
+          // v1.22.0 [CONFIRM-WINDOW]: today's bit joins the window and ci
+          // becomes the window's sum -- a miss no longer zeroes the run.
+          // Everything above (co, cp, score point, pendingHeld) is v1.21.1.
+          var cwBits = dt10StabQhBits_({ ci: cwPrev, qh: st.qh }, cwLen);
+          cwBits.push(cwQual ? 1 : 0);
+          if (cwBits.length > cwLen) cwBits = cwBits.slice(cwBits.length - cwLen);
+          st.qh = cwBits;
+          st.ci = dt10StabQhSum_(cwBits);
+          st.qd = today;   // v1.23.1 [CONFIRM-WINDOW-FIX]: the day this bit belongs to
+        } else if (st.qh) {
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: a render day passed with the window
+          // off, so the bits no longer describe the last N render days. Drop
+          // them; re-arming migrates the consecutive count (v1.22.0 rule).
+          delete st.qh;
+          if (st.qd) delete st.qd;
+        }
       }
-    } else if (sc !== null) {
-      // Same-day re-run: clocks frozen; refresh the day's score point.
-      if (st.hist.length) st.hist[st.hist.length - 1] = Math.round(sc * 10) / 10;
-      else st.hist.push(Math.round(sc * 10) / 10);
+    } else {
+      if (sc !== null) {
+        // Same-day re-run: clocks frozen; refresh the day's score point.
+        if (st.hist.length) st.hist[st.hist.length - 1] = Math.round(sc * 10) / 10;
+        else st.hist.push(Math.round(sc * 10) / 10);
+      }
+      if (cwLen > 0 && st.qh && st.qh.length &&
+          (rawSet[sym] === true || (qualifiedBasis && qualifiedWithin(sym)))) {
+        if (st.qd !== undefined && st.qd !== today) {
+          // v1.23.1 [CONFIRM-WINDOW-FIX]: the newest bit is an earlier day's
+          // (the day's first render outage-paused this symbol, so no bit was
+          // recorded): today's qualified read APPENDS the day's bit instead
+          // of rewriting yesterday's. A blob with no qd keeps the raise rule.
+          var cwLate = dt10StabQhBits_({ ci: st.ci, qh: st.qh }, cwLen);
+          cwLate.push(1);
+          if (cwLate.length > cwLen) cwLate = cwLate.slice(cwLate.length - cwLen);
+          st.qh = cwLate;
+          st.ci = dt10StabQhSum_(cwLate);
+          st.qd = today;
+        } else if (st.qh[st.qh.length - 1] !== 1) {
+          // v1.22.0 [CONFIRM-WINDOW]: a later render of the same day-key can
+          // only RAISE today's bit (the first render after a sync is the
+          // noisiest read of the day); it never lowers one, and a blob with no
+          // window entry waits for the next day-advance.
+          st.qh[st.qh.length - 1] = 1;
+          st.ci = dt10StabQhSum_(st.qh);
+        }
+      }
     }
     if (st.hist.length > knobs.smooth_days) {
       st.hist = st.hist.slice(st.hist.length - knobs.smooth_days);
@@ -4879,9 +5226,17 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     if (dt10InList_(pausedSyms, ms)) { survivors.push(ms); continue; }
     if (hardOut(ms)) {
       stm.member = false; stm.ci = 0; stm.co = 0;
+      if (cwLen > 0 && stm.qh) {   // v1.22.0 [CONFIRM-WINDOW]
+        delete stm.qh;
+        if (stm.qd) delete stm.qd;   // v1.23.1 [CONFIRM-WINDOW-FIX]
+      }
       exitedHard.push(ms);
+      if (cooledDown(ms)) {   // v1.23.0 [REENTRY-COOLDOWN]: a sold holding
+        cooldownHeld.push({ symbol: ms, days: cdMap[ms].days, date: cdMap[ms].date, member: true });
+      }
     } else if ((stm.co || 0) >= knobs.exit_days) {
       stm.member = false; stm.ci = 0; stm.co = 0;
+      if (cwLen > 0 && stm.qh) stm.ci = dt10StabQhSum_(stm.qh);   // v1.22.0 [CONFIRM-WINDOW]
       exitedSoft.push(ms);
     } else {
       survivors.push(ms);
@@ -4912,6 +5267,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     for (var xc = limit; xc < survivors.length; xc++) {
       var stc = symbols[survivors[xc]];
       stc.member = false; stc.ci = 0; stc.co = 0;
+      if (cwLen > 0 && stc.qh) stc.ci = dt10StabQhSum_(stc.qh);   // v1.22.0 [CONFIRM-WINDOW]
       exitedCapacity.push(survivors[xc]);
     }
     survivors = survivors.slice(0, limit);
@@ -4940,6 +5296,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       finalSyms.pop();
       var stw = symbols[weakest];
       stw.member = false; stw.ci = 0; stw.co = 0;
+      if (cwLen > 0 && stw.qh) stw.ci = dt10StabQhSum_(stw.qh);   // v1.22.0 [CONFIRM-WINDOW]
       exitedDisplaced.push(weakest);
       entered.push(es);
       finalSyms.push(es);
@@ -4954,7 +5311,10 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   for (var pi = 0; pi < rawSyms.length; pi++) {
     var ps = rawSyms[pi];
     if (!inFinal(ps) && !symbols[ps].member) {
-      pending.push({ symbol: ps, confirmed_days: symbols[ps].ci || 0,
+      pending.push({ symbol: ps,
+                     confirmed_days: cwLen > 0 ?   // v1.22.0 [CONFIRM-WINDOW]
+                         Math.min(symbols[ps].ci || 0, knobs.confirm_days) :
+                         (symbols[ps].ci || 0),
                      required_days: knobs.confirm_days });
     }
   }
@@ -5076,7 +5436,9 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
       // v1.11.2 [P-61]: persisted, still-unconfirmed fast-track seat — same
       // prefix (same withholding downstream) and, under strict, the same
       // sizing suspension it carried on day 1.
-      status = 'FAST-TRACK (day ' + daysIn + ', ' + (ost.ci || 0) + '/' +
+      status = 'FAST-TRACK (day ' + daysIn + ', ' +
+               (cwLen > 0 ? Math.min(ost.ci || 0, knobs.confirm_days) :   // v1.22.0
+                            (ost.ci || 0)) + '/' +
                knobs.confirm_days + ' confirmed)';
       if (DT10_V1810_FASTTRACK_SIZING_SUSPEND && src &&
           knobs && knobs.hard_strict === true) {
@@ -5207,6 +5569,21 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
     note += ', qhold: ' + (qhMode === 'enforce' ? 'held ' : 'would hold ') +
             qualifiedHeld.length + (qhParts.length ? ' ' + qhParts.join(' ') : '');
   }
+  // v1.22.0 [CONFIRM-WINDOW]: read-back token only while armed (0 leaves the
+  // note and the audit byte-identical to v1.21.1).
+  if (cwLen > 0) note += ', cwin=' + cwLen;
+  // v1.23.0 [REENTRY-COOLDOWN]: read-back token only while armed (0 leaves
+  // the note and the audit byte-identical to v1.22.0).
+  if (cdMap !== null) {
+    note += ', cooldown=' + cdDays + 'd';
+    if (cooldownHeld.length) {
+      var cdParts = [];
+      for (var cdi = 0; cdi < cooldownHeld.length && cdParts.length < 3; cdi++) {
+        cdParts.push(cooldownHeld[cdi].symbol + '(sold ' + cooldownHeld[cdi].days + 'd ago)');
+      }
+      note += ' held ' + cooldownHeld.length + ' ' + cdParts.join(' ');
+    }
+  }
   var coreOut = {
     tickets: tickets,
     state: state,
@@ -5223,6 +5600,8 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage) {
   };
   if (pgDays > 0) coreOut.audit.pending_held = pendingHeld;   // v1.15.0
   if (qhMode !== 'off') coreOut.audit.qualified_held = qualifiedHeld;   // v1.19.0
+  if (cwLen > 0) coreOut.audit.confirm_window = cwLen;   // v1.22.0 [CONFIRM-WINDOW]
+  if (cdMap !== null) coreOut.audit.cooldown_held = cooldownHeld;   // v1.23.0 [REENTRY-COOLDOWN]
   return coreOut;
 }
 // ---------------------------------------------------------------------------
@@ -5393,6 +5772,45 @@ function dt10StabPendingGrace_() {
     if (!(n > 0)) return 0;
     return Math.min(DT10_T10_PENDING_GRACE_MAX, n);
   } catch (ePg) {}
+  return 0;
+}
+
+/**
+ * v1.22.0 [CONFIRM-WINDOW]: confirmation window -- Script Property
+ * TFB_T10_CONFIRM_WINDOW (DT10_T10_CONFIRM_WINDOW_PROP). An integer >= 2 arms
+ * the rolling window (values above DT10_T10_CONFIRM_WINDOW_MAX clamp to it;
+ * the core raises a window below confirm_days to confirm_days); absent,
+ * blank, 0, 1, negative, junk or a PropertiesService fault read as 0 = the
+ * v1.21.1 clocks. Mirrors dt10StabPendingGrace_ (service read outside the
+ * pure core); never throws.
+ */
+function dt10StabCooldownDays_() {
+  // v1.23.0 [REENTRY-COOLDOWN]: Script Property TFB_T10_REENTRY_COOLDOWN_DAYS
+  // (DT10_T10_COOLDOWN_PROP). An integer 1..DT10_T10_COOLDOWN_MAX arms the
+  // cool-down (larger values clamp to the max); absent, blank, 0, negative,
+  // junk or a PropertiesService fault read as 0 = the v1.22.0 board. Mirrors
+  // dt10StabConfirmWindow_ (service read outside the pure core); never throws.
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_COOLDOWN_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n > 0)) return 0;
+    return Math.min(DT10_T10_COOLDOWN_MAX, n);
+  } catch (eCd) {}
+  return 0;
+}
+function dt10StabConfirmWindow_() {
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_CONFIRM_WINDOW_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n >= 2)) return 0;
+    return Math.min(DT10_T10_CONFIRM_WINDOW_MAX, n);
+  } catch (eCw) {}
   return 0;
 }
 
@@ -8301,6 +8719,20 @@ function dt10ApplyStability_(payload, panel, outage) {
   // object byte for byte.
   var qhRead = dt10StabQualifiedHoldMode_();
   if (qhRead !== 'off') knobs.qualified_hold = qhRead;
+  // v1.22.0 [CONFIRM-WINDOW]: same pattern -- one service read here; the knob
+  // is set ONLY when armed (>= 2) so an unarmed run publishes the v1.21.1
+  // knobs object byte for byte.
+  var cwRead = dt10StabConfirmWindow_();
+  if (cwRead > 0) knobs.confirm_window = cwRead;
+  // v1.23.0 [REENTRY-COOLDOWN]: same pattern -- one service read here; the
+  // knob and the ledger read happen ONLY when armed so an unarmed run
+  // publishes the v1.22.0 knobs object byte for byte and reads no tab.
+  var cdRead = dt10StabCooldownDays_();
+  var cdMapApply = null;
+  if (cdRead > 0) {
+    knobs.cooldown_days = cdRead;
+    cdMapApply = dt10CooldownMap_(SpreadsheetApp.getActiveSpreadsheet(), cdRead);
+  }
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -8327,7 +8759,8 @@ function dt10ApplyStability_(payload, panel, outage) {
   }
   var out = dt10StabCore_(payload.selected || [],
                           payload.candidates_rows || [],
-                          state, knobs, limit, epoch.key, outageMap);
+                          state, knobs, limit, epoch.key, outageMap,
+                          cdMapApply);   // v1.23.0 [REENTRY-COOLDOWN]
   if (!dt10EpochKeyLegacy_()) {
     out.note += ' | epoch=' + epoch.key + '/' + epoch.src +
                 (epoch.held ? '(frozen)' : '');
@@ -11249,6 +11682,136 @@ function dt10SelfTest() {
        ? 'ok (0/absent = v1.14.0 clocks; grace 1: soft miss pauses 2/3 -> NEW 3/3 next raw day, ' +
          'two soft misses -> reset, structural block -> reset, member untouched)'
        : 'FAIL [' + pg1[2].note + ' | ' + pg1[3].note + ' | ' + pg1x2[3].note + ']'));
+  /* v1.23.0 [REENTRY-COOLDOWN]: property line (one read) + pure battery on the
+     confirm-basis board, day 1 (raw [A, CHAL]). Ledger grid: two title rows,
+     header at row 4 (Symbol .. Sell Date), CHAL sold 3 days ago (a Date cell,
+     Riyadh midnight), B sold yesterday (ISO text), OLD sold 40 days ago, FUT
+     dated tomorrow, a blank symbol, a repeated header. Map (10 days): CHAL 3
+     and B 1 only; most recent sale wins. Core: CHAL is not seated and is
+     named; member B hard-exits and is named; token; audit; map absent = the
+     cbQ day-1 replay byte for byte. */
+  report.push('reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS): ' + dt10StabCooldownDays_() +
+              ' (0 = v1.22.0 board; 1..' + DT10_T10_COOLDOWN_MAX + ' arms)');
+  var rcAsOf = '2026-10-21';
+  var rcGrid = [['Ledger', ''], ['', ''], ['', ''],
+                ['Symbol', 'Status', 'Buy Date', 'Sell Date'],
+                ['CHAL.US', 'Sold', '2026-09-01', new Date(Date.UTC(2026, 9, 17, 21, 0, 0))],
+                ['CHAL.US', 'Sold', '2026-08-01', '2026-10-12'],
+                ['B.US', 'Sold', '2026-09-01', '2026-10-20'],
+                ['OLD.US', 'Sold', '2026-08-01', '2026-09-11'],
+                ['FUT.US', 'Active', '2026-10-01', '2026-10-22'],
+                ['', 'Sold', '2026-09-01', '2026-10-19'],
+                ['Symbol', 'Status', 'Buy Date', 'Sell Date'],
+                ['A.US', 'Active', '2026-09-01', '']];
+  var rcMap = dt10CooldownMapFromValues_(rcGrid, rcAsOf, 10);
+  var rcKnobs = cbKnobs('qualified');
+  rcKnobs.cooldown_days = 10;
+  var rcOn = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0], undefined, rcMap);
+  var rcOff = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), cbKnobs('qualified'), 2, cbDays[0]);
+  var rcNoMap = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0]);
+  var rcChal = null, rcB = null;
+  for (var rci = 0; rci < rcOn.tickets.length; rci++) {
+    if (rcOn.tickets[rci].symbol === 'CHAL.US') rcChal = rcOn.tickets[rci];
+    if (rcOn.tickets[rci].symbol === 'B.US') rcB = rcOn.tickets[rci];
+  }
+  report.push('reentry cooldown core: ' +
+      ((Object.keys(rcMap).sort().join(',') === 'B.US,CHAL.US' &&
+        rcMap['CHAL.US'].days === 3 && rcMap['CHAL.US'].date === '2026-10-18' &&
+        rcMap['B.US'].days === 1 &&
+        Object.keys(dt10CooldownMapFromValues_(rcGrid, rcAsOf, 2)).join(',') === 'B.US' &&
+        Object.keys(dt10CooldownMapFromValues_([['Symbol', 'Status']], rcAsOf, 10)).length === 0 &&
+        rcChal === null && rcB === null &&
+        rcOn.audit.exited_hard.length === 1 && rcOn.audit.exited_hard[0] === 'B.US' &&
+        rcOn.audit.cooldown_held.length === 2 &&
+        rcOn.audit.cooldown_held[0].symbol === 'CHAL.US' && rcOn.audit.cooldown_held[0].member === false &&
+        rcOn.audit.cooldown_held[1].symbol === 'B.US' && rcOn.audit.cooldown_held[1].member === true &&
+        rcOn.note.indexOf('cooldown=10d held 2 CHAL.US(sold 3d ago) B.US(sold 1d ago)') > 0 &&
+        rcOn.state.symbols['CHAL.US'] === undefined &&
+        JSON.stringify(rcNoMap) === JSON.stringify(rcOff) &&
+        JSON.stringify(rcOff) === JSON.stringify(cbQ[0]) &&
+        rcOff.note.indexOf('cooldown') < 0 && rcOff.audit.cooldown_held === undefined)
+       ? 'ok (parser: header row 4, Date + ISO cells, 0..N days, most recent sale wins; ' +
+         'core: sold name not seated and named, sold member hard-exits; map absent = v1.22.0)'
+       : 'FAIL [' + rcOn.note + ' | ' + Object.keys(rcMap).join(',') + ']'));
+  /* v1.22.0 [CONFIRM-WINDOW]: property line (one read) + pure battery on the
+     confirm-basis board. CHAL raw d1-d2, WATCH at rank 12 on d3 (a reset day
+     for v1.21.1), raw d4. window 0 / absent: deep-equals the cbW replay.
+     window 5: ci 1,2,2,3; d4 'NEW (confirmed 3/3)' sized, B displaced; A's
+     seeded ci 3 migrates to four ones; token 'cwin=5'; audit.confirm_window;
+     qh in the blob. window 2 is raised to 3 (2 on d4, not seated). A d3
+     same-day re-run with CHAL back to INVEST raises the bit (ci 3, 'near 1
+     CHAL.US(3/3)'). B structural_block on d1 hard-exits and loses qh. */
+  report.push('confirm window (TFB_T10_CONFIRM_WINDOW): ' + dt10StabConfirmWindow_() +
+              ' (0 = v1.21.1 clocks; 2..' + DT10_T10_CONFIRM_WINDOW_MAX + ' arms)');
+  function cwKnobs(win) {
+    var k = cbKnobs('qualified');
+    if (win !== undefined) k.confirm_window = win;
+    return k;
+  }
+  var cw5 = cbRun(cwKnobs(5), 86, 'WATCH');
+  var cw0 = cbRun(cwKnobs(0), 86, 'WATCH');
+  var cwA = cbRun(cwKnobs(undefined), 86, 'WATCH');
+  var cw2 = cbRun(cwKnobs(2), 86, 'WATCH');
+  var cwChal4 = cbTk4(cw5, 'CHAL.US');
+  var cwBlob = JSON.stringify(cw5[1].state.symbols['CHAL.US']);
+  var cwSt3 = dt10StabParseState_(cw5[2].state);            // after the d3 miss
+  var cwRe = dt10StabCore_(cbRaw[2], cbGrid(86), cwSt3, cwKnobs(5), 2, cbDays[2]);
+  var cwBlk = cbGrid(86);
+  cwBlk[cwBlk.length - 2].structural_block = true;          // B.US
+  var cwHard = dt10StabCore_(cbRaw[0], cwBlk, dt10StabParseState_(cbSeed),
+                             cwKnobs(5), 2, cbDays[0]);
+  /* v1.23.1 [CONFIRM-WINDOW-FIX]: (1) armed d1-d2 (CHAL qh [1,1], qd d2), an
+     UNARMED d3 drops qh/qd, a re-armed qualified d4 reads 1/3 (v1.23.0 read
+     3/3 from the stale bits). (2) armed d3 first render outage-pauses CHAL
+     (absent from raw, outage sighting): no bit, qd stays d2; the same-day
+     render with CHAL raw APPENDS the bit -> ci 3, qd d3 (v1.23.0 stayed 2). */
+  var cwSt2 = dt10StabParseState_(cw5[1].state);
+  var cwU3 = dt10StabCore_(cbRaw[2], cbGrid(86, 'WATCH'), cwSt2, cwKnobs(0), 2, cbDays[2]);
+  var cwR4 = dt10StabCore_(cbRaw[3], cbGrid(86), dt10StabParseState_(cwU3.state), cwKnobs(5), 2, cbDays[3]);
+  var cwOutage = {}; cwOutage['CHAL.US'] = true;
+  var cwP3 = dt10StabCore_([cbTk('A.US', 95)], cbGrid(86), dt10StabParseState_(cw5[1].state),
+                           cwKnobs(5), 2, cbDays[2], cwOutage);
+  var cwP3b = dt10StabCore_(cbRaw[3], cbGrid(86), dt10StabParseState_(cwP3.state), cwKnobs(5), 2, cbDays[2]);
+  report.push('confirm window core: ' +
+      ((JSON.stringify(cw0) === JSON.stringify(cbW) &&
+        JSON.stringify(cwA) === JSON.stringify(cbW) &&
+        cw5[0].state.symbols['CHAL.US'].ci === 1 &&
+        cw5[1].state.symbols['CHAL.US'].ci === 2 &&
+        cw5[2].state.symbols['CHAL.US'].ci === 2 &&
+        cw5[3].state.symbols['CHAL.US'].ci === 3 &&
+        cbW[2].state.symbols['CHAL.US'].ci === 0 &&
+        cwChal4 !== null && cwChal4._stab_status === 'NEW (confirmed 3/3)' &&
+        cwChal4.suggested_sar === 5000 && cwChal4._grace_hold !== true &&
+        cw5[3].audit.exited_displaced.length === 1 &&
+        cw5[3].audit.exited_displaced[0] === 'B.US' &&
+        cw5[0].state.symbols['A.US'].ci === 4 &&
+        cw5[0].state.symbols['A.US'].qh.length === 4 &&
+        cwBlob.indexOf('"qh":[1,1]') > 0 &&
+        JSON.stringify(cbW[1].state.symbols['CHAL.US']).indexOf('qh') < 0 &&
+        cw5[0].note.indexOf('cwin=5') > 0 && cbW[0].note.indexOf('cwin') < 0 &&
+        cw5[0].audit.confirm_window === 5 && cbW[0].audit.confirm_window === undefined &&
+        cw2[3].state.symbols['CHAL.US'].ci === 2 && cbTk4(cw2, 'CHAL.US') === null &&
+        cw2[0].audit.confirm_window === 3 &&
+        cwRe.state.symbols['CHAL.US'].ci === 3 &&
+        cwRe.note.indexOf('near 1 CHAL.US(3/3)') > 0 &&
+        cwHard.audit.exited_hard.length === 1 && cwHard.audit.exited_hard[0] === 'B.US' &&
+        cwHard.state.symbols['B.US'].ci === 0 && cwHard.state.symbols['B.US'].qh === undefined &&
+        cwHard.state.symbols['B.US'].qd === undefined &&
+        cw5[1].state.symbols['CHAL.US'].qd === cbDays[1] &&
+        cwU3.state.symbols['CHAL.US'].qh === undefined && cwU3.state.symbols['CHAL.US'].qd === undefined &&
+        cwU3.state.symbols['CHAL.US'].ci === 0 &&
+        cwR4.state.symbols['CHAL.US'].ci === 1 && cwR4.state.symbols['CHAL.US'].qh.length === 1 &&
+        cwR4.state.symbols['CHAL.US'].qd === cbDays[3] && cbTk4([0, 0, 0, cwR4], 'CHAL.US') === null &&
+        cwP3.audit.outage_paused.length === 1 && cwP3.audit.outage_paused[0] === 'CHAL.US' &&
+        cwP3.state.symbols['CHAL.US'].ci === 2 && cwP3.state.symbols['CHAL.US'].qd === cbDays[1] &&
+        cwP3b.state.symbols['CHAL.US'].ci === 3 && cwP3b.state.symbols['CHAL.US'].qh.length === 3 &&
+        cwP3b.state.symbols['CHAL.US'].qd === cbDays[2])
+       ? 'ok (0/absent = v1.21.1 clocks; window 5: WATCH day keeps 2/3 -> NEW 3/3 next raw day, ' +
+         'migration ci 3 -> 4 bits, window 2 raised to 3, same-day raise, hard exit clears qh; ' +
+         'v1.23.1: unarmed day drops the history (re-arm 1/3), outage pause + same-day recovery appends (3/3))'
+       : 'FAIL [' + cw5[2].note + ' | ' + cw5[3].note + ' | ' + cwRe.note + ' | ' +
+         (cwR4.state.symbols['CHAL.US'] && cwR4.state.symbols['CHAL.US'].ci) + ' | ' +
+         (cwP3b.state.symbols['CHAL.US'] && cwP3b.state.symbols['CHAL.US'].ci) + ']'));
   /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
      confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
      the buffer boundary: off / junk = the v1.14.0 qualified replay byte for
