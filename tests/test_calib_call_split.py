@@ -66,7 +66,7 @@ HELPERS = {"_calib_call_split_enabled", "_calib_call_split", "_fmt_call_family",
 OFF_WORDS = (None, "", " ", "0", "off", "OFF", "false", "no", "enable", "enabled",
              "observe", "enforce", "2", "onn", "of", "yes please")
 ON_WORDS = ("1", "on", "ON", " true ", "yes", "Yes")
-TITLE = "TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
+TITLE = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
 UNAVAILABLE = "  Call mix %s: unavailable (the split could not be computed; see the log)" % TAG
 
 
@@ -529,6 +529,7 @@ def test_v1_version_title_why_pin_and_ci():
     assert any(BASE_SHA in ln for ln in run) and run[-1].strip() == "python -m pytest -q tests/test_calib_call_split.py"
     assert "|| true" not in step["run"]
     assert tp._CALL_SPLIT_TAG == TAG
+    assert Path(__file__).read_text(encoding="utf-8").isascii()      # this harness itself
 
 
 # ----------------------------------------------------------------- V2 -------
@@ -553,7 +554,7 @@ def test_v2_against_main_ascii_nothing_removed():
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
     gone = defs(old_text) - defs(new_text)
     assert not gone, gone
-    others = re.findall(r"^# v6\.(?:5[4-8]|59\.[1-9]|[6-9]\d)\.\d+ \(", new_text, re.M)
+    others = re.findall(r"^# v6\.(?:(?:5[4-8]|[6-9]\d)\.\d+|59\.[1-9]\d*) \(", new_text, re.M)
     if tp.SCRIPT_VERSION == "6.59.0" and not others:      # exactly this release
         assert set(removed) == mine, removed
         assert defs(new_text) - defs(old_text) == HELPERS

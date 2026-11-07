@@ -70,7 +70,7 @@ The harness fixture `fixture_artifact` reproduces the shape on synthetic records
   - no split (gate off: no attribute) prints nothing.
 - `ReliabilityCalibrator.calibrate` builds the report into `_rep`. When the gate is on it sets `_rep.call_split` inside a try (an error: one WARNING and `{}`). `call_split` is an instance attribute rather than a dataclass field, so `to_dict()` and the `_calibration.json` export do not change even when on. It returns `_rep`.
 - `render_calibration_report` prints `_calib_call_split_lines(getattr(rep, "call_split", None))` right after the discrimination note.
-- Definitions: 4 functions added, 0 removed (at any depth, classes included). Two lines were replaced besides the version lines: `return CalibrationReport(` -> `_rep = CalibrationReport(`, and the hook.
+- Definitions: 4 functions added, 0 removed (at any depth, classes included). One line was replaced besides the version lines (`return CalibrationReport(` -> `_rep = CalibrationReport(`); the calibrate guard and the render hook are insertions.
 
 **Workflows** (ENV PARITY; not armed):
 - `track_performance.yml` 1.0.13: a header block plus `TRACK_CALIB_CALL_SPLIT: ${{ vars.TRACK_CALIB_CALL_SPLIT || 'off' }}` in 'Run performance clock', after `TRACK_DEDUP_SIGNAL_HISTORY`. No open PR edits those lines.
@@ -107,7 +107,7 @@ In a copy without git history: 34 passed, 3 skipped, and with `TFB_TEST_REQUIRE_
 | N4 | STRONG_SELL / AVOID as sells, ACCUMULATE as a buy, an UNSPECIFIED bucket, a thin bucket "(thin)", EXIT / TRIM text as sells and an unknown word or blank as hold, a breakeven-only family `decided=0`, a rounded zero `+0.00`, HOLD-only `call roi=n/a`, both-sides-absent `n/a` lines, the empty report, both sides present (the calibrator's own note) |
 | R1 | None / NaN / inf / text ROIs; a raising calibrator -> `{}` and one WARNING; junk -> no lines; malformed splits -> one `unavailable` line; a split that raises inside `calibrate()` -> one WARNING, `call_split {}`, the off report plus one `unavailable` line |
 | W1 | both tracker steps map the Variable once with default 'off' (YAML parsed: the clock step by name, the daily_sync step that runs the tracker); the 1.0.13 header present and above 1.0.7; the reader's fallback is "off" |
-| V1 | version floor >= 6.59.0, title, WHY order (6.53.0 < 6.59.0 < `SCRIPT_VERSION`), verifier pin. ci.yml parsed: exactly one lean-unit step runs the harness, with no `if`, no `continue-on-error`, `TFB_TEST_REQUIRE_BASE=1`, the base SHA fetched, no `|| true`, and the pytest line last |
+| V1 | version floor >= 6.59.0, title, WHY order (6.53.0 < 6.59.0 < `SCRIPT_VERSION`), verifier pin, the harness file itself ASCII. ci.yml parsed: exactly one lean-unit step runs the harness, with no `if`, no `continue-on-error`, `TFB_TEST_REQUIRE_BASE=1`, the base SHA fetched, no `|| true`, and the pytest line last |
 | V2 | against main `a85edfc6`: the title, version and `return CalibrationReport(` lines replaced; no main WHY line removed; added lines ASCII; no definition removed. Exactly those removals and exactly the 4 helpers when this release stands alone; the subset form after merges |
 | X1 | the main copy has no split and prints the pooled warning only |
 

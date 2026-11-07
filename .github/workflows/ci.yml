@@ -1203,7 +1203,7 @@ jobs:
             || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
           python tests/test_board_scorecard_p182.py
 
-      - name: 📊 Calibration call mix (track_performance v6.59.0, golden base fetched by SHA)
+      - name: Calibration call mix (track_performance v6.59.0, golden base fetched by SHA)
         env:
           TFB_TEST_REQUIRE_BASE: "1"
         run: |
