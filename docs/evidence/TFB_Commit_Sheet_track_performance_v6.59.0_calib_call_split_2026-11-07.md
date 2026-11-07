@@ -163,16 +163,38 @@ With the gate on, only the stdout block is added (O2).
 | `-0.00%` next to `+0.00%` | PLAUSIBLE | normalised |
 | "what following the calls returned"; "78% HOLD"; "a header line"; the `_calib_call_split_lines` docstring; no dated comment on the verifier pin; dead helpers; X1 named a golden negative | CONFIRMED / PLAUSIBLE (nits) | reworded / added / removed / renamed |
 
-**Round 2** (fix-by-fix verification and a fresh regression hunt, each refuted): see the PR body.
+**Round 2** (a fix-by-fix check and a fresh regression hunt, each re-checked by its own refuter).
 
-**Lanes on an export of the head:** LEAN FAILS 0 on the first head, and the contract-lane emulation rc 0. The re-run on the fixed head is in the PR body.
+Every round-1 fix held, except one:
+- **(major, CONFIRMED)** the harness title template still had a literal en dash; the editor had turned the escape back into the character. Fixed in `24e3a04` with the `\u2013` escape, and V1 now asserts the harness file itself is ASCII. The new CI step name was made ASCII as well.
+
+Smaller fixes (CONFIRMED, fixed):
+- **(minor)** this sheet's owner guidance read every non-WARNING like-for-like outcome as a call-mix artifact. S6 now separates the four outcomes.
+- **(nits)**
+  - V2's regex for later releases;
+  - the replaced-line count in S2;
+  - the archive-bar test's N2 docstring.
+
+The regression hunt drove `PerformanceTrackerApp.run_once --analyze --calibrate --export --verbose --format all` over a fake store and sheet:
+- 16,000 records over 1W / 2W / 1M / 3M, with every bucket spelling, ACTIVE and MATURED records, duplicates, and NaN and zero ROIs;
+- timestamps were frozen;
+- with the gate unset, off, `enable` or `observe`, this head and the main copy match on stdout, stderr, every log record, the `_calibration.json` / CSV / HTML exports and every sheet operation (`_Status`, `_S1_Calibration` A12:D18, the `_Run_Log` append).
+
+**Lanes on an export of the head:**
+- LEAN FAILS 0 on `e573b10` and again on `5631947`; on `5631947` the new step ran with the base fetched: 37 passed;
+- the contract-lane emulation rc 0 on both.
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
 1. Merge. No Render deploy: the tracker runs in GitHub Actions.
 2. Set the repository Variable `TRACK_CALIB_CALL_SPLIT=on`. It adds report lines only, so it is safe at once.
 3. On the next clock run, read the 'Call mix' block under 'By investability bucket':
-   - **the like-for-like buy line answers R1:** if it still says WATCHLIST outperforms INVESTABLE, the inversion is real within buy calls, and the investability gate is the thing to investigate. If not, the pooled warning is a call-mix artifact. Read the CIs against the `sym` counts: overlapping daily records make them optimistic;
+   - **the like-for-like buy line answers R1, in one of four ways:**
+     - `WARNING: WATCHLIST outperforms INVESTABLE`: the inversion holds within buy calls, so the investability gate is what to investigate;
+     - `INVESTABLE significantly outperforms WATCHLIST`: the pooled warning was the call mix;
+     - `not yet statistically distinguishable` or `insufficient sample`: not settled. The buy-only subsets are smaller than the pooled buckets, so their intervals are wider. Compare the buy-only point estimates, the CI widths and the `sym` counts, and wait for more buy records before calling the pooled warning an artifact.
+
+     Read every interval against the `sym` counts: overlapping daily records make them optimistic;
    - **the BLOCKED row answers R11:** its sell calls' win rate, and its call roi next to its price roi.
 
 Rollback: unset the Variable.

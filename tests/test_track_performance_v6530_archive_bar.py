@@ -58,7 +58,8 @@ Cases
   W1  workflow files: the third cron, the five env lines in both tracker
       steps (ENV PARITY), the 1.0.7 header, the verifier pin, the version
   N1  off == main 953f84e2 on a mixed fixture (records, Notes, stats, logs)
-  N2  added lines are ASCII, nothing removed, the new function set is exact
+  N2  added lines are ASCII, nothing removed; the 6.53.0 function set exact
+      for 6.53.0 itself, a subset in later releases
 
 Golden negative: TFB_TEST_TP_DELIVERED=<main copy> runs every case against
 v6.50.0 as the delivered module (all but D1/N1 fail).
