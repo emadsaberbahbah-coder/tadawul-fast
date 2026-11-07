@@ -1030,11 +1030,13 @@ def test_w1_workflows_crons_env_parity_version_and_pin():
         assert clock_line == daily_line and len(clock_line) == 1, name          # ENV PARITY
     assert "TRACK_HIST_TARGET_CLOSE" not in daily                               # the v6.47.0 invariant holds
     src = DELIVERED.read_text(encoding="utf-8")
-    assert tp.SCRIPT_VERSION == "6.53.0"
+    # 2026-11-07 (track_performance 6.59.0 [CALIB-CALL-SPLIT]): the exact
+    # 6.53.0 pins are floors now.
+    assert tuple(int(x) for x in tp.SCRIPT_VERSION.split(".")[:3]) >= (6, 53, 0), tp.SCRIPT_VERSION
     assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]
     assert re.search(r'os\.getenv\("TRACK_HIST_CLOSE_SOURCE"\)\s*or\s*"yfinance"', src)
     assert re.search(r'os\.getenv\("TRACK_AUDIT_DUE_ONLY"\)\s*or\s*"0"', src)
-    version_line = re.search(r'^SCRIPT_VERSION = "6\.53\.0"', src, re.M)
+    version_line = re.search(r'^SCRIPT_VERSION = "%s"' % re.escape(tp.SCRIPT_VERSION), src, re.M)
     assert version_line and src.index("# v6.53.0 (2026-11-02)") < version_line.start()
     assert src.index("# v6.50.0 (2026-10-25)") < src.index("# v6.53.0 (2026-11-02)")
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
@@ -1095,7 +1097,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
     title = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
     assert title % "6.50.0" in removed and 'SCRIPT_VERSION = "6.50.0"' in removed
     assert len(removed) <= 16, removed                             # the anchored replacements only
-    fresh = [ln for ln in added if ln != title % "6.53.0"]
+    fresh = [ln for ln in added if ln != title % tp.SCRIPT_VERSION]
     assert fresh and all(ln.isascii() for ln in fresh), [ln for ln in fresh if not ln.isascii()][:3]
     import ast
 
@@ -1103,11 +1105,15 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
         return {n.name for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     gone = fns("\n".join(old)) - fns("\n".join(new))
     assert not gone, gone
-    assert fns("\n".join(new)) - fns("\n".join(old)) == {
+    mine = {
         "_hist_close_source", "_bq_project", "_bq_dataset", "_bq_location", "_audit_due_only_enabled",
         "_audit_due_symbols", "_archive_bar_module", "_archive_bar_session", "_archive_bar_scrub",
         "_archive_bar_query", "_archive_bar_rows", "_hist_archive_prefetch", "_hist_close_bars_for",
         "_hist_close_candidate_session"}
+    if tp.SCRIPT_VERSION == "6.53.0":           # exactly this release's additions
+        assert fns("\n".join(new)) - fns("\n".join(old)) == mine
+    else:                                       # 2026-11-07: a later release (6.59.0) adds its own
+        assert mine <= fns("\n".join(new)) - fns("\n".join(old))
 
 
 if __name__ == "__main__":

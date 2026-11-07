@@ -1,5 +1,18 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.13 (2026-11-07) -- CALIBRATION CALL MIX, LIKE FOR LIKE (OWNER OPT-IN)
+# (1.0.8-1.0.12 are claimed by the open PRs #845, #857, #915, #922 and #923.)
+# track_performance v6.59.0 [CALIB-CALL-SPLIT]: TRACK_CALIB_CALL_SPLIT
+# (default 'off' = v6.53.0) adds report lines to the reliability calibration:
+# each investability bucket's buy / sell / hold split with directional win
+# rates, a call-signed ROI, and the INVESTABLE-vs-WATCHLIST note recomputed
+# within buy calls and within sell calls (the 7 Nov run printed 'the gate is
+# inverted' over buckets whose call mixes differ). No factor, cell, gate or
+# verdict changes. The 'Run performance clock' step maps it; daily_sync.yml's
+# tracker step maps the same Variable (ENV PARITY). No cron, concurrency or
+# other step changes. ARMING (owner): set the Variable to on (report lines
+# only). ROLLBACK: unset it.
+#
 # VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT
 # WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve today,
 # results tomorrow"): Performance_Log holds 13,856 active forecast records
@@ -419,6 +432,12 @@ jobs:
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}
+          # (2026-11-07) 1.0.13: track_performance v6.59.0 [CALIB-CALL-SPLIT]: the
+          # reliability calibration adds each investability bucket's buy / sell /
+          # hold split, a call-signed ROI and like-for-like INVESTABLE vs WATCHLIST
+          # notes per call family (report lines only). 'off' = v6.53.0.
+          # Mirrored in daily_sync.yml (ENV PARITY). ROLLBACK: unset or off.
+          TRACK_CALIB_CALL_SPLIT: ${{ vars.TRACK_CALIB_CALL_SPLIT || 'off' }}
           # (2026-10-11) v6.45.0 prospective schema / publication identities.
           # Defaults off: arm one measured lane-consistent feature at a time.
           # Immutable snapshots retain first and subsequent daily publications;

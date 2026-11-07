@@ -2,6 +2,21 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.71 (2026-11-07) -- CALIBRATION CALL MIX (track_performance v6.59.0)
+# (1.1.62 and 1.1.63 are claimed by open #778, 1.1.64 by open #882, 1.1.65 by
+# open #889, 1.1.66 by open #897, 1.1.67 by open #909, 1.1.68 by open #915,
+# 1.1.69 by open #922, 1.1.70 by open #923.)
+#
+# v1.1.71: run tests/test_calib_call_split.py (track_performance v6.59.0
+# [CALIB-CALL-SPLIT], TRACK_CALIB_CALL_SPLIT default off = v6.53.0: the
+# reliability calibration's per-bucket buy / sell / hold split, call-signed
+# ROI and like-for-like INVESTABLE vs WATCHLIST notes) in the blocking lean
+# lane right after tests/test_performance_summary_integrity.py. Offline
+# fixtures; the off identity is pinned by an embedded v6.53.0 golden, and
+# the legs that read main a85edfc6 with `git show` skip in this shallow
+# checkout. PyYAML (already in the lane) reads the two tracker workflows.
+# Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
@@ -1126,6 +1141,7 @@ jobs:
             tests/test_tp_zero_baseline_p201.py \
             tests/test_learning_metric_fixes.py \
             tests/test_performance_summary_integrity.py \
+            tests/test_calib_call_split.py \
             tests/test_argaam_loopguard_b6.py \
             tests/test_ycp_quote_breaker_isolation.py \
             tests/test_ycp_singleflight_cancellation.py \
