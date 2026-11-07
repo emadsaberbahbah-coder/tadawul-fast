@@ -42,7 +42,10 @@ const ROOT = path.join(__dirname, '..');
 const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js'));
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
-const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-08: v1.22.0 (confirmation window) is stacked on this change; this harness keeps proving
+// v1.21.1 = v1.21.0 apart from the scope data, so it reads the v1.21.1 file rebuilt from the delivered
+// one (the v1.22.0 edits reversed, SHA-256 pinned); tests/test_dt10_v1220_confirm_window.js owns v1.22.0.
+const newSource = history.v1211Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const sha256 = s => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 let baseSource;
 try {

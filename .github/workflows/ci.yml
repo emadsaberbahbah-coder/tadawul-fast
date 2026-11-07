@@ -2,7 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
+# VERSION 1.1.62 (2026-11-08) -- CONFIRMATION WINDOW HARNESS
+#
+# v1.1.62: run tests/test_dt10_v1220_confirm_window.js (16_Decision_Top10.gs
+# v1.22.0: entry confirmation counts qualified day-keys inside a rolling
+# window, Script Property TFB_T10_CONFIRM_WINDOW, default off = v1.21.1 byte
+# for byte) in the native Apps Script step beside the other cockpit
+# harnesses; its golden negative rebuilds the v1.21.1 file from the delivered
+# one (tests/js/dt10_edits_v1220.json, SHA-256 pinned) so no fetch is needed.
+# The sibling harnesses' delivered-version pins move to 1.22.0 in the same
+# change, as every prior cockpit release did.
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
 # #859 (1.1.50) and #875-#879 (1.1.56-1.1.60)): run
@@ -1210,6 +1219,7 @@ jobs:
           node tests/test_dt10_shadow_rank_log.js
           node tests/test_dt10_shadow_momentum.js
           node tests/test_dt10_post_earnings.js
+          node tests/test_dt10_v1220_confirm_window.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js

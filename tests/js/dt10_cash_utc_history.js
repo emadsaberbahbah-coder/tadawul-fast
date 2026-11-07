@@ -102,6 +102,15 @@ const EDITS_V1210 = require('./dt10_edits_v1210.json');
  * v1.21.0 file, origin/main 7fb3f77f). */
 const V1210_SHA256 = 'e153f4dc516f4837e3665357242d6c1ad6edff176a7abde15d4c5839feb762f9';
 const EDITS_V1211 = require('./dt10_edits_v1211.json');
+/* v1.22.0 edits (confirmation counts qualified day-keys in a rolling window;
+ * Script Property TFB_T10_CONFIRM_WINDOW, default off), reversed FIRST of
+ * all, before the v1.21.1 edits (current -> v1.21.1 text). Nineteen hunks
+ * derived from the build script and stored verbatim in
+ * tests/js/dt10_edits_v1220.json; each 'current' is unique at its turn. The
+ * result is hash-pinned (V1211_SHA256 = the reviewed v1.21.1 file,
+ * origin/main a85edfc6). */
+const V1211_SHA256 = 'd4afc834881a68d6e4e8e84004eb650141723f6ae332263373ed08862dd5cca1';
+const EDITS_V1220 = require('./dt10_edits_v1220.json');
 const EDITS_V1150 = [
   [" * Version: 1.15.0 (see DT10_VERSION; header kept in lockstep — restored\n",
     " * Version: 1.14.0 (see DT10_VERSION; header kept in lockstep — restored\n"],
@@ -248,10 +257,26 @@ function feedHistorySource(source) {
 }
 /* v1.21.0 source (the approved-scope 2422 oracle): only the v1.21.1 edits
  * are reversed, each exactly once, and the result must be the reviewed file. */
+function v1211Source(source) {
+  // already the reviewed v1.21.1 file (a base given on the command line, or a harness's rebuilt v1.21.1)
+  if (crypto.createHash('sha256').update(source).digest('hex') === V1211_SHA256) return source;
+  let prior = source;
+  for (const [current, previous] of EDITS_V1220) {
+    assert.equal(prior.split(current).length - 1, 1,
+      'exactly one approved v1.22.0 edit: ' + current.split('\n')[0]);
+    prior = prior.replace(current, () => previous);
+  }
+  assert.equal(crypto.createHash('sha256').update(prior).digest('hex'), V1211_SHA256,
+    'v1.22.0 may change only its enumerated edits');
+  return prior;
+}
+/* v1.21.0 source (the approved-scope 2422 oracle): the v1.22.0 and then the
+ * v1.21.1 edits are reversed, each exactly once, and the result must be the
+ * reviewed file. (2026-11-08: starts from v1211Source since v1.22.0.) */
 function v1210Source(source) {
   // already the reviewed v1.21.0 file (a base given on the command line, or a harness's rebuilt v1.21.0)
   if (crypto.createHash('sha256').update(source).digest('hex') === V1210_SHA256) return source;
-  let prior = source;
+  let prior = v1211Source(source);
   for (const [current, previous] of EDITS_V1211) {
     assert.equal(prior.split(current).length - 1, 1,
       'exactly one approved v1.21.1 edit: ' + current.split('\n')[0]);
@@ -401,4 +426,4 @@ function v11310Source(source) {
     'v1.13.11 may change only its enumerated edits');
   return prior;
 }
-module.exports = {feedHistorySource, HISTORY_SHA256, v1210Source, V1210_SHA256, v1200Source, V1200_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256, v1160Source, V1160_SHA256, v1170Source, V1170_SHA256, v1171Source, V1171_SHA256, v1180Source, V1180_SHA256, v1190Source, V1190_SHA256};
+module.exports = {feedHistorySource, HISTORY_SHA256, v1211Source, V1211_SHA256, v1210Source, V1210_SHA256, v1200Source, V1200_SHA256, v11310Source, V11310_SHA256, v11311Source, V11311_SHA256, v1140Source, V1140_SHA256, v1150Source, V1150_SHA256, v1160Source, V1160_SHA256, v1170Source, V1170_SHA256, v1171Source, V1171_SHA256, v1180Source, V1180_SHA256, v1190Source, V1190_SHA256};

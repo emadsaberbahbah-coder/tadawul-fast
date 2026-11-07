@@ -223,9 +223,9 @@ function battery() {
     // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
     // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
     // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
-    eq(N.DT10_VERSION, '1.21.1', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
-    assert(/^ \* Version: 1\.21\.1 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    assert(newSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.22.0', 'delivered version');   // 2026-11-05: v1.21.1 pins moved; 2026-11-08: v1.22.0
+    assert(/^ \* Version: 1\.22\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
+    assert(newSource.indexOf("var DT10_VERSION = '1.22.0';") > 0, 'DT10_VERSION literal');
     eq(N.DT10_T10_PENDING_GRACE_MAX, 5, 'clamp constant');
   });
 
@@ -360,7 +360,7 @@ function battery() {
     var rep = String(N.dt10SelfTest()), repB = String(B.dt10SelfTest());
     assert(rep.indexOf('pending grace core: ok') > 0, 'battery line');
     assert(rep.indexOf('pending grace (TFB_T10_PENDING_GRACE_DAYS): 0 (') > 0, 'property line default');
-    assert(rep.indexOf('[DT10 v1.21.1] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
+    assert(rep.indexOf('[DT10 v1.22.0] self-test') === 0, 'version line');   // 2026-11-02: v1.20.0 pin moved
     assert(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0, 'no FAIL');
     // 2026-10-27: v1.17.1 (shadow momentum) keeps the shadow log mode in the per-execution
     // property memo, so the memo line reports one more key (keys=3); pin moved
@@ -385,7 +385,7 @@ function battery() {
       assert(!/\b(let|const|class)\s|=>|`/.test(code) || /^\s*(\*|\/\*)/.test(l), 'ES6 token: ' + l);
       if (!/^[\x09\x20-\x7e]*$/.test(l)) {
         // the only non-ASCII added line is the version header rewrite (pre-existing em dash)
-        assert(baseLines[l.replace('1.21.1', '1.14.0')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
+        assert(baseLines[l.replace('1.22.0', '1.14.0')] === true, 'non-ASCII added line: ' + l);   // 2026-11-02: v1.20.0
       }
     });
     function nonAscii(s) { var m = {}; for (var j = 0; j < s.length; j++) { var c = s.charCodeAt(j); if (c > 126) m[c] = (m[c] || 0) + 1; } return m; }
@@ -418,11 +418,13 @@ function battery() {
     // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) adds dt10TicketGuard*,
     //   dt10KpiPlan*, dt10Venue*, dt10RiyadhClock_ and fourteen DT10_* vars
     // 2026-11-03: v1.21.0 (ex-dividend guard) adds dt10ExDivHold_, dt10ExDivMapFromValues_, dt10ExDivMap_ and six DT10_* vars
-    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10AppendShadowRankLog_', 'dt10ApplyPostEarnTags_', 'dt10ExDivHold_', 'dt10ExDivMapFromValues_', 'dt10ExDivMap_', 'dt10FundingAge_', 'dt10FundingApplyCore_', 'dt10FundingApply_', 'dt10FundingCashCents_', 'dt10FundingDecimal_', 'dt10FundingDiv_', 'dt10FundingExcludeList_', 'dt10FundingLinks_', 'dt10FundingMode_', 'dt10FundingNative_', 'dt10FundingNote_', 'dt10FundingRates_', 'dt10FundingSym_', 'dt10FundingUnits_', 'dt10FundingValueSar_', 'dt10KpiPlanGainMode_', 'dt10KpiPlanGain_', 'dt10KpiPlanLabelMark_', 'dt10OwnerRuleCell_', 'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleNote_', 'dt10PoolFieldsWithShadow_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_', 'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10RiyadhClock_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFillOn_', 'dt10SeatLiveFill_', 'dt10SeatLiveIndex_', 'dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10StabPendingGrace_', 'dt10StabQualifiedHoldMode_', 'dt10StabQualifiedHoldSeat_', 'dt10StabSoftMiss_', 'dt10TicketGuardApply_', 'dt10TicketGuardConfig_', 'dt10TicketGuardCore_', 'dt10TicketGuardExec_', 'dt10TicketGuardHeldCount_', 'dt10TicketGuardMode_', 'dt10TicketGuardToken_', 'dt10TicketGuard_', 'dt10VenueLineOn_', 'dt10VenueLine_', 'dt10VenueOf_', 'dt10VenueSession_', 'dt10VenueSummer_', 'dt10WeekdaysBetween_'], 'top-level functions added');
-    eq(Object.keys(tb).length, 197, 'base top-level census'); eq(Object.keys(tn).length, 253, 'new top-level census');
+    // 2026-11-08: v1.22.0 (confirmation window) adds dt10StabConfirmWindow_, dt10StabConfirmWindowLen_,
+    //   dt10StabQhBits_, dt10StabQhSum_ and DT10_T10_CONFIRM_WINDOW_PROP / _MAX
+    deq(Object.keys(tn).filter(function (k) { return !tb[k]; }).sort(), ['dt10AppendShadowRankLog_', 'dt10ApplyPostEarnTags_', 'dt10ExDivHold_', 'dt10ExDivMapFromValues_', 'dt10ExDivMap_', 'dt10FundingAge_', 'dt10FundingApplyCore_', 'dt10FundingApply_', 'dt10FundingCashCents_', 'dt10FundingDecimal_', 'dt10FundingDiv_', 'dt10FundingExcludeList_', 'dt10FundingLinks_', 'dt10FundingMode_', 'dt10FundingNative_', 'dt10FundingNote_', 'dt10FundingRates_', 'dt10FundingSym_', 'dt10FundingUnits_', 'dt10FundingValueSar_', 'dt10KpiPlanGainMode_', 'dt10KpiPlanGain_', 'dt10KpiPlanLabelMark_', 'dt10OwnerRuleCell_', 'dt10OwnerRuleMarkOn_', 'dt10OwnerRuleNote_', 'dt10PoolFieldsWithShadow_', 'dt10PostEarnAnnotate_', 'dt10PostEarnMapFromValues_', 'dt10PostEarnMap_', 'dt10PostEarnMode_', 'dt10RiyadhClock_', 'dt10SeatLiveFillCore_', 'dt10SeatLiveFillOn_', 'dt10SeatLiveFill_', 'dt10SeatLiveIndex_', 'dt10ShadowLogMode_', 'dt10ShadowLogRows_', 'dt10StabConfirmWindowLen_', 'dt10StabConfirmWindow_', 'dt10StabPendingGrace_', 'dt10StabQhBits_', 'dt10StabQhSum_', 'dt10StabQualifiedHoldMode_', 'dt10StabQualifiedHoldSeat_', 'dt10StabSoftMiss_', 'dt10TicketGuardApply_', 'dt10TicketGuardConfig_', 'dt10TicketGuardCore_', 'dt10TicketGuardExec_', 'dt10TicketGuardHeldCount_', 'dt10TicketGuardMode_', 'dt10TicketGuardToken_', 'dt10TicketGuard_', 'dt10VenueLineOn_', 'dt10VenueLine_', 'dt10VenueOf_', 'dt10VenueSession_', 'dt10VenueSummer_', 'dt10WeekdaysBetween_'], 'top-level functions added');
+    eq(Object.keys(tb).length, 197, 'base top-level census'); eq(Object.keys(tn).length, 257, 'new top-level census');
     var vb = names(baseSource, /^var\s+([A-Za-z_$][\w$]*)/mg), vn = names(newSource, /^var\s+([A-Za-z_$][\w$]*)/mg);
     deq(Object.keys(vb).filter(function (k) { return !vn[k]; }), [], 'vars removed');
-    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_DIVIDEND_SHEET', 'DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_GUARD_EARN_DAYS_DEF', 'DT10_GUARD_EARN_DAYS_MAX', 'DT10_GUARD_EARN_DAYS_PROP', 'DT10_GUARD_EXDIV_DAYS_MAX', 'DT10_GUARD_EXDIV_DAYS_PROP', 'DT10_GUARD_EXDIV_PCT_DEF', 'DT10_GUARD_EXDIV_PCT_MAX', 'DT10_GUARD_EXDIV_PCT_PROP', 'DT10_GUARD_MAX_TICKETS_MAX', 'DT10_GUARD_MAX_TICKETS_PROP', 'DT10_GUARD_OWNER_RULE_PROP', 'DT10_KPI_PLAN_GAIN_LABEL', 'DT10_KPI_PLAN_GAIN_PROP', 'DT10_KPI_PLAN_LABEL_PROP', 'DT10_OWNER_RULE_HEADERS', 'DT10_OWNER_RULE_PROP', 'DT10_OWNER_RULE_ROI_MAX', 'DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_QUALIFIED_HOLD_PROP', 'DT10_SEAT_LIVE_FILL_PROP', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP', 'DT10_TGUARD_LIVE_RE', 'DT10_TGUARD_TAGS_RE', 'DT10_TICKET_GUARD_PROP', 'DT10_VENUES', 'DT10_VENUE_LINE_PROP'], 'vars added');
+    deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_DIVIDEND_SHEET', 'DT10_FUNDING_EXCLUDE_PROP', 'DT10_FUNDING_MAX_AGE_MS', 'DT10_FUNDING_MAX_ITEMS', 'DT10_FUNDING_PROP', 'DT10_FUNDING_SAFE', 'DT10_GUARD_EARN_DAYS_DEF', 'DT10_GUARD_EARN_DAYS_MAX', 'DT10_GUARD_EARN_DAYS_PROP', 'DT10_GUARD_EXDIV_DAYS_MAX', 'DT10_GUARD_EXDIV_DAYS_PROP', 'DT10_GUARD_EXDIV_PCT_DEF', 'DT10_GUARD_EXDIV_PCT_MAX', 'DT10_GUARD_EXDIV_PCT_PROP', 'DT10_GUARD_MAX_TICKETS_MAX', 'DT10_GUARD_MAX_TICKETS_PROP', 'DT10_GUARD_OWNER_RULE_PROP', 'DT10_KPI_PLAN_GAIN_LABEL', 'DT10_KPI_PLAN_GAIN_PROP', 'DT10_KPI_PLAN_LABEL_PROP', 'DT10_OWNER_RULE_HEADERS', 'DT10_OWNER_RULE_PROP', 'DT10_OWNER_RULE_ROI_MAX', 'DT10_POST_EARN_MAX_DAYS', 'DT10_POST_EARN_PROP', 'DT10_POST_EARN_SESSIONS', 'DT10_POST_EARN_SESSIONS_NEG', 'DT10_QUALIFIED_HOLD_PROP', 'DT10_SEAT_LIVE_FILL_PROP', 'DT10_SHADOW_LOG_HEADERS', 'DT10_SHADOW_LOG_PROP', 'DT10_SHADOW_LOG_SHEET', 'DT10_SHADOW_LOG_STATE_PROP', 'DT10_SHADOW_POOL_FIELDS', 'DT10_T10_CONFIRM_WINDOW_MAX', 'DT10_T10_CONFIRM_WINDOW_PROP', 'DT10_T10_PENDING_GRACE_MAX', 'DT10_T10_PENDING_GRACE_PROP', 'DT10_TGUARD_LIVE_RE', 'DT10_TGUARD_TAGS_RE', 'DT10_TICKET_GUARD_PROP', 'DT10_VENUES', 'DT10_VENUE_LINE_PROP'], 'vars added');
     var core = newSource.slice(newSource.indexOf('function dt10StabCore_('), newSource.indexOf('\n// ----', newSource.indexOf('function dt10StabCore_(')));
     ['outageOf', 'hardOut', 'scoreOf', 'smoothed', 'boardSort', 'inFinal', 'inList', 'qualifiedWithin', 'softMiss'].forEach(function (f) {
       assert(core.indexOf('function ' + f + '(') > 0, 'nested ' + f);

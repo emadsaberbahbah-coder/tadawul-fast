@@ -1,5 +1,5 @@
 /**
- * zz_Property_Tool.gs -- Script Property tool, v2.1 (5 Nov 2026).
+ * zz_Property_Tool.gs -- Script Property tool, v2.2 (8 Nov 2026).
  * WHY: Project Settings -> Script Properties turns read-only above 50
  * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
  * property is set from code instead: pick a function in the toolbar list,
@@ -24,6 +24,10 @@
  *  tfbPropsList       logs every property (secrets hidden) and the count.
  *  tfbPropsExitSanityOn / tfbPropsEarlyT10On   the two switches one by one.
  *  tfbPropsPorObserve / tfbPropsPorOn / tfbPropsPorSession   Plan of Record.
+ *  tfbPropsConfirmWindowOn (v2.2)  sets TFB_T10_CONFIRM_WINDOW=5 (16_Decision_Top10
+ *                     1.22.0: three qualified days inside the last five day-keys
+ *                     confirm a seat; 0 or deleted = the consecutive clock) and
+ *                     runs dt10SelfTest. tfbPropsConfirmWindowOff deletes it.
  *  tfbPropsCleanStale optional: deletes 9 stale keys (listed below).
  * Removed in 2.0: tfbDoAll (it re-set POR_MODE=observe and re-installed a
  * trigger on every run).
@@ -170,6 +174,20 @@ function tfbPropsPorOn() {
 function tfbPropsPorSession() {
   PropertiesService.getScriptProperties().setProperty('POR_VALIDITY', 'session');
   Logger.log('POR_VALIDITY=session');
+}
+
+function tfbPropsConfirmWindowOn() {
+  var p = PropertiesService.getScriptProperties();
+  p.setProperty('TFB_T10_CONFIRM_WINDOW', '5');
+  var ver = (typeof DT10_VERSION === 'string') ? DT10_VERSION : 'not pasted';
+  Logger.log('TFB_T10_CONFIRM_WINDOW=' + p.getProperty('TFB_T10_CONFIRM_WINDOW') + ' | 16_Decision_Top10 ' + ver +
+      (ver === 'not pasted' || ver < '1.22.0' ? ' (paste 1.22.0 first: the knob is ignored below it)' : '') +
+      ' | now run dt10SelfTest (expect: confirm window (TFB_T10_CONFIRM_WINDOW): 5 ... and confirm window core: ok)');
+}
+
+function tfbPropsConfirmWindowOff() {
+  PropertiesService.getScriptProperties().deleteProperty('TFB_T10_CONFIRM_WINDOW');
+  Logger.log('TFB_T10_CONFIRM_WINDOW deleted (consecutive clock; existing qh bits stay parsed and inert)');
 }
 
 function tfbPropsExitSanityOn() {
