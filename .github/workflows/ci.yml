@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.69 (2026-11-08) -- RISK-BUDGET SIZING SUITE
+#
+# v1.1.69: run tests/test_ob_risk_sizing.py (opportunity_builder v1.29.0:
+# TFB_OPP_SIZING_MODE=risk sizes each ticket so its loss at the printed stop
+# is TFB_OPP_RISK_BUDGET_PCT of the sizing basis; default cap byte-identical)
+# in the blocking lean lane next to the conviction suite.
+#
 # VERSION 1.1.68 (2026-11-08) -- CORP-EVENT GUARD HARNESS
 #
 # v1.1.68: run tests/test_dt10_v1270_corp_guard.js (16_Decision_Top10.gs
@@ -1178,7 +1185,8 @@ jobs:
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
-            tests/test_ob_conviction_sizing.py $EXTRA
+            tests/test_ob_conviction_sizing.py \
+            tests/test_ob_risk_sizing.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
