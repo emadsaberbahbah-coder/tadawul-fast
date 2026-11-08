@@ -634,7 +634,7 @@ const BR = stop => ({ tp: null, stop: stop, known: true, stopQty: null, shares: 
 
 function battery() {
   const parts = [];
-  test('P0 oracle: v1.2.34 rebuilt from the delivered file (SHA-256 pinned); version lockstep 1.2.35; both compile; inventory +6 functions +4 vars, 0 removed; 20 hunks reverse to the base', () => {
+  test('P0 oracle: v1.2.34 rebuilt from the delivered file (SHA-256 pinned); version lockstep 1.2.35; both compile; inventory +6 functions +4 vars, 0 removed; 27 hunks reverse to the base', () => {
     eq(sha256(OLD), V1234_SHA256, 'base SHA-256');
     ok(NEW.indexOf("var DP2_VERSION = '1.2.35';   // lockstep with the header") > 0 && /^ \* Version: 1\.2\.35 \(2026-11-08\)$/.test(NEW.split('\n')[3]), 'version lockstep');
     new vm.Script(NEW); new vm.Script(OLD);
@@ -646,7 +646,7 @@ function battery() {
     deq(Object.keys(vb).filter(k => !vn[k]), [], 'vars removed');
     deq(Object.keys(vn).filter(k => !vb[k]).sort(), ['DP2X_SR_FROM_', 'DP2X_SR_READ_', 'DP2_STOP_RULE_PROP'], 'vars added (line starts)');
     ok(NEW.indexOf('var DP2X_SR_READ_ = false, DP2X_SR_ = null;') > 0 && OLD.indexOf('DP2X_SR_') < 0, 'the fourth var DP2X_SR_ shares a line');
-    eq(EDITS.length, 20, 'hunk count');
+    eq(EDITS.length, 27, 'hunk count');
     for (const [cur] of EDITS) eq(NEW.split(cur).length - 1, 1, 'each current is unique: ' + cur.split('\n')[0].slice(0, 80));
     eq(sha256(reverseEdits(NEW)), V1234_SHA256, 'reversal of the delivered file');
   });
@@ -666,7 +666,13 @@ function battery() {
 
   test('P2 armed with the default start (2026-11-08): the FRST lot of 26 Oct keeps the trailing engine (Portfolio_Decision_v2 = v1.2.34); every funded Top_10_v2 seat risks 8% of its allocation', () => {
     const n = build(NEW, 'pd', { props: FIXED, fetch: FRST_FETCH }), o = build(OLD, 'pd', { props: FIXED, fetch: FRST_FETCH });
-    deq(norm(n), norm(o), 'Portfolio_Decision_v2 unchanged for a lot before the start date');
+    const NOTE = ' DP2_STOP_RULE: lots entered from 2026-11-08 use a fixed stop 8% under the entry and a time stop after 45 sessions.';
+    const FOOT = 'Lots entered from 2026-11-08: a fixed stop 8% under the entry and a time stop after 45 sessions. Older lots: ';
+    const nj = JSON.stringify(norm(n));
+    ok(nj.indexOf(NOTE) > 0, 'the holdings note names the rule while armed');
+    const DSTOP = ' Lots entered from 2026-11-08 follow DP2_STOP_RULE instead: a fixed stop 8% under the entry and a time stop after 45 sessions; keep their stop fixed (no trailing order).';
+    ok(nj.indexOf(DSTOP) > 0, 'the D-stop note names the rule while armed');
+    deq(JSON.parse(nj.split(NOTE).join('').split(FOOT).join('').split(DSTOP).join('')), norm(o), 'Portfolio_Decision_v2 otherwise unchanged for a lot before the start date');
     const tn = t10View(build(NEW, 't10', { props: FIXED, fetch: NO_NET })), to = t10View(build(OLD, 't10', { props: {}, fetch: NO_NET }));
     let funded = 0, moved = 0;
     tn.seats.forEach((s, i) => {
@@ -684,6 +690,12 @@ function battery() {
     ok(tn.indexOf('13.98') >= 0, 'the fixed stop 13.98');
     ok(to.indexOf('fixed stop -8%') < 0 && to.indexOf('trail 2×ATR') >= 0, 'GOLDEN NEGATIVE: v1.2.34 trails 2xATR');
     ok(tn.indexOf('trail 2×ATR') < 0, 'no trailing text for the fixed lot');
+    ok(tn.indexOf('null × ATR') < 0 && tn.indexOf('null') < 0, 'no null in any page text (review fix: the page action never offers a trailing order)');
+    const frstActs = pdView(n).actions.filter(a => a.indexOf('FRST.US') === 0);
+    ok(frstActs.every(a => a.indexOf('trailing') < 0 && a.indexOf('null') < 0), 'no trailing advice in the FRST actions: ' + JSON.stringify(frstActs));
+    ok(tn.indexOf('let the trail') < 0 && tn.indexOf('HOLD · trailing') < 0, 'no trailing hold or TP advice for the fixed lot');
+    ok(tn.indexOf('Lots entered from 2026-10-01 follow DP2_STOP_RULE instead') >= 0, 'the D-stop note names the rule');
+    ok(tn.indexOf('DP2_STOP_RULE: lots entered from 2026-10-01 use a fixed stop 8% under the entry') >= 0, 'the holdings note names the rule');
     eq(n.env.reads[GATE], 1, 'one property read per execution');
     parts.push(tn.length);
   });
@@ -742,7 +754,8 @@ function battery() {
     const bl = new Set(OLD.split('\n'));
     const added = NEW.split('\n').filter(l => !bl.has(l));
     ok(added.length >= 80 && added.length <= 140, 'added lines ' + added.length);
-    for (const l of added) ok(!/\b(let|const|class)\b|=>|`/.test(l), 'ES5 violation: ' + l);
+    const code = l => l.replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""');   // string literals out
+    for (const l of added) ok(!/\b(let|const|class)\b|=>|`/.test(code(l)), 'ES5 violation: ' + l);
     const nonAscii = s => (s.match(/[^\x00-\x7f]/g) || []).sort().join('');
     for (const [cur, prev] of EDITS) {
       const extra = nonAscii(cur).split(''), have = nonAscii(prev).split('');

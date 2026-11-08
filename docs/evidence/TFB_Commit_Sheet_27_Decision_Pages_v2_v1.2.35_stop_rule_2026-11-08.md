@@ -20,16 +20,17 @@
 - Older lots keep the trailing rule.
 - Top_10_Investments_v2 seats show the initial stop 8% under the price, so the risk per seat is 8% of its allocation.
 - The holding texts, the e-mail lines and the engine cell name the fixed rule (`fixed stop -8%, time stop in N sessions`, `HOLD - fixed stop X, time stop in N sessions`).
+- Review fix (Codex P2 on #931): the page's per-lot actions (place/raise stop, TP watch), the uncertified HOLD label, the holdings note, the D-stop note and the e-mail footer name the fixed rule; a fixed lot is never offered a trailing order (it read `trail amount 0.00 (null × ATR)`).
 - `dp2SelfTest` adds one line while the gate is on.
 
 **Diff.**
-- 20 anchored hunks.
+- 27 anchored hunks.
 - Functions: +6 (`dp2StopRuleParse_`, `dp2StopRule_`, `dp2StopRuleFor_`, `dp2ExitFixed_`, `dp2StopTimeTxt_`, `dp2StopRuleCoreOk_`). Vars: +4 (`DP2_STOP_RULE_PROP`, `DP2X_SR_FROM_`, `DP2X_SR_READ_`, `DP2X_SR_`). Nothing removed.
 - ES5. No new non-ASCII character in any hunk. Every prior WHY kept.
 - Base: v1.2.34, sha256 `992fb7f77e0d4c4c59f1eb6fb42b7b45be41e1ffaa47957797222662246811c0`.
-- New: v1.2.35, sha256 `b949af436614df5890c4b0df7dae9f4092abe3c2df4d2e89cfd100449cf0a6e8`, 3,975 lines.
+- New: v1.2.35, sha256 `dc88cfab7cc706b391f6288dcc44d8e9e0cf6479015b22a725f134c6fd694abf`, 3,975 lines.
 
-**Harness.** `tests/test_dp2_v1235_stop_rule.js` (+ `.py`) gives PASS 9/9, x2 identical, digest `9e9e51d49482cfbd`.
+**Harness.** `tests/test_dp2_v1235_stop_rule.js` (+ `.py`) gives PASS 9/9, x2 identical, digest `015c462f961b0770`.
 - P1 GOLDEN NEGATIVE / KILL. Seven off-values and a property fault all give both pages equal to the v1.2.34 build on two boards.
 - P2 armed, default start. The 26 Oct FRST lot keeps the trailing engine, and Portfolio_Decision_v2 equals v1.2.34. Funded Top_10_v2 seats risk 8% of allocation.
 - P3 armed from 2026-10-01. The FRST lot replays the fixed rule (stop 13.98), while v1.2.34 trails 2xATR.
