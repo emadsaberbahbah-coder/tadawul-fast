@@ -31,6 +31,23 @@ NOW = _registry_clock()
 REVIEW_NOW = NOW
 
 
+def _binding_clock(symbol):
+    """One minute after this symbol's own lifecycle review.
+
+    The weekly renewal re-stamps only the bindings it can re-verify and holds
+    retired symbols (VFLQ.US left Mutual_Funds on 5 Nov 2026, so the renewal
+    of 6 Nov kept its 24 Oct review). The registry-wide clock then lands after
+    a held binding's expiry; a case about one binding is judged inside that
+    binding's own 7-day review window instead.
+    """
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    stamps = [datetime.fromisoformat(item["reviewed_at_utc"]) for item in data["bindings"]
+              if item.get("symbol") == symbol and "news_lifecycle" in (item.get("identifiers") or {})]
+    assert len(stamps) == 1, symbol
+    return stamps[0].astimezone(timezone.utc) + timedelta(minutes=1)
+
+
 def test_irbo_legacy_caption_never_fetches_or_substitutes_arty(monkeypatch):
     from core import verified_name_labels as labels
     data = json.loads(labels.REGISTRY_PATH.read_text())
@@ -91,7 +108,8 @@ def test_cli_legacy_is_excluded_without_remapping(monkeypatch):
 
 
 def test_terminated_symbol_is_excluded_without_inventing_a_successor(monkeypatch):
-    monkeypatch.setattr(archive, "_utc_now", lambda: REVIEW_NOW)
+    vflq_now = _binding_clock("VFLQ.US")
+    monkeypatch.setattr(archive, "_utc_now", lambda: vflq_now)
     args = options(); args.universe = ["VFLQ.US", "ACTIVE.US"]
     universe, items, evidence = archive._select_news_universe(args, None, "2026-10-24")
     assert universe == ["ACTIVE.US"] and items == [{"symbol": "ACTIVE.US"}]
