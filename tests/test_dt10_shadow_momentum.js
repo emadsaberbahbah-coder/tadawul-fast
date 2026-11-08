@@ -235,7 +235,7 @@ console.log('M7 PASS embedded self-test lines');
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
 // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
 const s1171 = history.v1171Source(src);
-ok((src.match(/^var DT10_VERSION = '1\.26\.0';$/m) || []).length === 1 && /^ \* Version: 1\.26\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&   // 2026-11-08: v1.22.0 pin moved
+ok((src.match(/^var DT10_VERSION = '1\.27\.0';$/m) || []).length === 1 && /^ \* Version: 1\.27\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]) &&   // 2026-11-08: v1.22.0 pin moved
    (s1171.match(/^var DT10_VERSION = '1\.17\.1';$/m) || []).length === 1 && /^ \* Version: 1\.17\.1 \(see DT10_VERSION;/.test(s1171.split('\n')[3]),
    'M8 version lockstep 1.23.0 (delivered) and 1.17.1 (rebuilt)');
 const why = src.slice(src.indexOf(' * v1.17.1 (2026-10-27) [SHADOW-MOMENTUM]'), src.indexOf(' * v1.17.0 (2026-10-27) [SHADOW-RANK-LOG]'));
