@@ -1,6 +1,9 @@
 /* tests/js/decision_input_truth.test.js -- full-source node vm harness for
  * 16_Decision_Top10.gs v1.13.9 [WP-8 COCKPIT INPUT TRUTH].
  * (2026-10-14, v1.13.9: cash-label and UTC adapter pins; no census change.)
+ * (2026-11-08, v1.24.0: version pins; census +2 functions dt10StabHardExitConfirm_,
+ *  dt10StabSeatGuardDays_; +3 vars DT10_T10_HARD_EXIT_CONFIRM_PROP, DT10_T10_SEAT_GUARD_PROP,
+ *  DT10_T10_SEAT_GUARD_MAX.)
  * (2026-10-25, v1.15.0: version pins; census +2 functions dt10StabSoftMiss_,
  * dt10StabPendingGrace_; +2 vars DT10_T10_PENDING_GRACE_PROP, DT10_T10_PENDING_GRACE_MAX)
  * (2026-10-26, v1.16.0: version pins; census +15 dt10Funding* functions; +5 DT10_FUNDING_* vars)
@@ -486,7 +489,7 @@ check('T6 enforce: KPI L15:M16, hidden _T10_Candidates (stamp/headers/rows), poi
   deq(find(C, x => x[0] === 'insertSheet').map(x => x[1]), ['_T10_Candidates_Staging', '_T10_Candidates']);
   const tabGrid = setValuesAt(C, '_T10_Candidates', 1, 1, 502, 25)[0];
   const stamp = tabGrid[0][0];
-  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.21\.1$/);   // 2026-11-02: v1.20.0 pin moved
+  assert.match(stamp, /^run 2026-10-10T19:28:22\.000Z \| route v4\.18\.1 \| builder v1\.25\.0 \| pool=body_rows\/9786 \| funding=final\/0exec \| 27895ms \| req d2c065e9fd85 \| rows 500 \| DT10 v1\.26\.0$/);   // 2026-11-08: v1.22.0 confirm window + v1.23.0 reentry cooldown, pin moved; 2026-11-02: v1.20.0 pin moved
   deq(tabGrid[1], ctx.DT10_CAND_HEADERS);
   deq(tabGrid.slice(2), setValuesAt(offRun.calls, 'Top_10_Investments', 77, 1, 500, 25)[0], 'tab rows == the off run cockpit grid rows');
   assert.equal(find(C, x => x[0] === 'hideSheet' && x[1] === '_T10_Candidates').length, 1);
@@ -580,7 +583,9 @@ check('T8 REAL dt10SelfTest (fresh context): every prior core line, the USX line
     'fx USX row: ABSENT', 'finding usx-subunit',
     'input truth (DT10_INPUT_TRUTH): off | cand tab (DT10_CAND_TAB): off | vintage cols (DT10_VINTAGE_COLS): off | policy ref: none',
     'evaluability core: ok', 'panel reference core: ok', 'label scan core: ok', 'vintage core: ok', 'cand pointer core: ok',
-    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v1.21.1] self-test',
+    'cal coverage core: ok', 'policy ref parse core: ok', '[DT10 v1.26.0] self-test',
+    'confirm window (TFB_T10_CONFIRM_WINDOW): 0 (', 'confirm window core: ok',
+    'reentry cooldown (TFB_T10_REENTRY_COOLDOWN_DAYS): 0 (', 'reentry cooldown core: ok',
     'ticket guard (DT10_TICKET_GUARD): off (off = v1.19.0 board; observe names; enforce holds) | core: ok',
     'kpi plan gain (DT10_KPI_PLAN_GAIN): off (', 'venue line (DT10_VENUE_LINE): off (',
     'qualified hold (DT10_QUALIFIED_HOLD): off', 'qualified hold core: ok',
@@ -612,16 +617,16 @@ const DESIGNED_FUNCTIONS = ['dt10FeedCohortBindOn_', 'dt10FeedCohortCheck_', 'dt
 const DESIGNED_VARS = ['DT10_FEED_COHORT_BIND_PROP', 'DT10_SOURCE_APPROVED_SCOPE', 'DT10_CANDTAB_STAGE_SHEET', 'DT10_VINT_PUBLISHED_RE', 'DT10_IT_PROP', 'DT10_IT_POLICY_PROP', 'DT10_IT_UNKNOWN_MAX_PCT', 'DT10_IT_REF_LABELS', 'DT10_IT_DECISION_REF', 'DT10_CANDTAB_PROP',
   'DT10_CANDTAB_SHEET', 'DT10_CANDTAB_COCKPIT_TARGET_ROWS', 'DT10_VINTAGE_PROP', 'DT10_VINTAGE_HEADERS', 'DT10_VINT_ASOF_RE', 'DT10_VINT_LKG_RE'].sort();
 function census(src, re) { const out = new Set(); let m; while ((m = re.exec(src))) out.add(m[1]); return out; }
-check('T9 static: DT10_VERSION 1.21.1 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
+check('T9 static: DT10_VERSION 1.24.0 in lockstep with header line 4, ES5 source compiles, zero smart quotes, exact census', () => {
   const { ctx } = loadTree(source);
-  assert.equal(ctx.DT10_VERSION, '1.21.1');   // 2026-11-05: v1.21.1 approved fund scope, pin moved
-  assert.match(source.split('\n')[3], /^ \* Version: 1\.21\.1 /);
-  assert(source.includes("var DT10_VERSION = '1.21.1';"));
+  assert.equal(ctx.DT10_VERSION, '1.26.0');   // 2026-11-08: v1.22.0 confirm window + v1.23.0 reentry cooldown, pin moved; 2026-11-05: v1.21.1 approved fund scope, pin moved
+  assert.match(source.split('\n')[3], /^ \* Version: 1\.26\.0 /);
+  assert(source.includes("var DT10_VERSION = '1.26.0';"));
   assert.doesNotThrow(() => new vm.Script(source, { filename: '16_Decision_Top10.gs' }), 'syntax (node --check equivalent)');
   assert.equal((source.match(/[‘’“”]/g) || []).length, 0, 'smart quotes');
   assert(!source.includes('\r'), 'LF only');
   const fns = census(source, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), vars = census(source, /^var\s+([A-Za-z_$][\w$]*)/mg);
-  assert.equal(fns.size,253,'full v1.21.1 function census (v1.13.9 191 + dt10HoldingFxRate_, dt10RefreshFailed_, dt10RefreshDecisionTop10Run_ in v1.13.10 + dt10BulkPaint_ in v1.13.11 + dt10StabQualifiedWithin_, dt10StabConfirmBasis_ in v1.14.0 + dt10StabSoftMiss_, dt10StabPendingGrace_ in v1.15.0 + 15 dt10Funding* in v1.16.0 + dt10ShadowLogMode_, dt10ShadowLogRows_, dt10AppendShadowRankLog_ in v1.17.0 + dt10PoolFieldsWithShadow_ in v1.17.1 + dt10PostEarnMode_, dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_, dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_ in v1.18.0 + dt10StabQualifiedHoldSeat_, dt10StabQualifiedHoldMode_, dt10SeatLiveFillOn_, dt10SeatLiveIndex_, dt10SeatLiveFillCore_, dt10SeatLiveFill_, dt10OwnerRuleMarkOn_, dt10OwnerRuleCell_, dt10OwnerRuleNote_ in v1.19.0 + dt10TicketGuardMode_, dt10TicketGuardConfig_, dt10TicketGuardExec_, dt10TicketGuardCore_, dt10TicketGuardToken_, dt10TicketGuardHeldCount_, dt10TicketGuardApply_, dt10TicketGuard_, dt10KpiPlanGainMode_, dt10KpiPlanLabelMark_, dt10KpiPlanGain_, dt10VenueLineOn_, dt10VenueOf_, dt10VenueSummer_, dt10VenueSession_, dt10RiyadhClock_, dt10VenueLine_ in v1.20.0 + dt10ExDivMapFromValues_, dt10ExDivMap_, dt10ExDivHold_ in v1.21.0)'); assert.equal(vars.size,146,'full v1.21.0 variable census (v1.13.9 103 + DT10_FX_SUBUNIT_PARENT + DT10_T10_CONFIRM_BASIS_PROP + DT10_T10_PENDING_GRACE_PROP + DT10_T10_PENDING_GRACE_MAX + DT10_FUNDING_PROP, DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS, DT10_FUNDING_SAFE + DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET, DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS + DT10_SHADOW_POOL_FIELDS in v1.17.1 + DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG, DT10_POST_EARN_MAX_DAYS in v1.18.0 + DT10_QUALIFIED_HOLD_PROP, DT10_SEAT_LIVE_FILL_PROP, DT10_OWNER_RULE_PROP, DT10_OWNER_RULE_ROI_MAX, DT10_OWNER_RULE_HEADERS in v1.19.0 + DT10_TICKET_GUARD_PROP, DT10_GUARD_EARN_DAYS_PROP, DT10_GUARD_EARN_DAYS_DEF, DT10_GUARD_EARN_DAYS_MAX, DT10_GUARD_OWNER_RULE_PROP, DT10_GUARD_MAX_TICKETS_PROP, DT10_GUARD_MAX_TICKETS_MAX, DT10_TGUARD_TAGS_RE, DT10_TGUARD_LIVE_RE, DT10_KPI_PLAN_GAIN_PROP, DT10_KPI_PLAN_GAIN_LABEL, DT10_KPI_PLAN_LABEL_PROP, DT10_VENUE_LINE_PROP, DT10_VENUES in v1.20.0 + DT10_GUARD_EXDIV_DAYS_PROP, DT10_GUARD_EXDIV_DAYS_MAX, DT10_GUARD_EXDIV_PCT_PROP, DT10_GUARD_EXDIV_PCT_DEF, DT10_GUARD_EXDIV_PCT_MAX, DT10_DIVIDEND_SHEET in v1.21.0)');
+  assert.equal(fns.size,269,'full v1.26.0 function census (2026-11-08 v1.26.0: + dt10StabFundableParse_, dt10StabFundableText_, dt10StabFundable_) (2026-11-08 v1.25.0: + dt10OwnerRuleBandsParse_, dt10OwnerRuleBandOk_, dt10OwnerRuleBandsText_, dt10OwnerRuleBands_)  (v1.13.9 191 + dt10HoldingFxRate_, dt10RefreshFailed_, dt10RefreshDecisionTop10Run_ in v1.13.10 + dt10BulkPaint_ in v1.13.11 + dt10StabQualifiedWithin_, dt10StabConfirmBasis_ in v1.14.0 + dt10StabSoftMiss_, dt10StabPendingGrace_ in v1.15.0 + 15 dt10Funding* in v1.16.0 + dt10ShadowLogMode_, dt10ShadowLogRows_, dt10AppendShadowRankLog_ in v1.17.0 + dt10PoolFieldsWithShadow_ in v1.17.1 + dt10PostEarnMode_, dt10WeekdaysBetween_, dt10PostEarnMapFromValues_, dt10PostEarnMap_, dt10ApplyPostEarnTags_, dt10PostEarnAnnotate_ in v1.18.0 + dt10StabQualifiedHoldSeat_, dt10StabQualifiedHoldMode_, dt10SeatLiveFillOn_, dt10SeatLiveIndex_, dt10SeatLiveFillCore_, dt10SeatLiveFill_, dt10OwnerRuleMarkOn_, dt10OwnerRuleCell_, dt10OwnerRuleNote_ in v1.19.0 + dt10TicketGuardMode_, dt10TicketGuardConfig_, dt10TicketGuardExec_, dt10TicketGuardCore_, dt10TicketGuardToken_, dt10TicketGuardHeldCount_, dt10TicketGuardApply_, dt10TicketGuard_, dt10KpiPlanGainMode_, dt10KpiPlanLabelMark_, dt10KpiPlanGain_, dt10VenueLineOn_, dt10VenueOf_, dt10VenueSummer_, dt10VenueSession_, dt10RiyadhClock_, dt10VenueLine_ in v1.20.0 + dt10ExDivMapFromValues_, dt10ExDivMap_, dt10ExDivHold_ in v1.21.0 + dt10StabConfirmWindowLen_, dt10StabQhBits_, dt10StabQhSum_, dt10StabConfirmWindow_ in v1.22.0 + dt10CooldownMapFromValues_, dt10CooldownMap_, dt10StabCooldownDays_ in v1.23.0 + dt10StabHardExitConfirm_, dt10StabSeatGuardDays_ in v1.24.0)'); assert.equal(vars.size,157,'full v1.26.0 variable census (2026-11-08 v1.26.0: + DT10_T10_FUNDABLE_PROP)  (2026-11-08 v1.25.0: + DT10_OWNER_RULE_BANDS_PROP, DT10_OWNER_RULE_BAND_ORDER)  (v1.13.9 103 + DT10_FX_SUBUNIT_PARENT + DT10_T10_CONFIRM_BASIS_PROP + DT10_T10_PENDING_GRACE_PROP + DT10_T10_PENDING_GRACE_MAX + DT10_FUNDING_PROP, DT10_FUNDING_EXCLUDE_PROP, DT10_FUNDING_MAX_AGE_MS, DT10_FUNDING_MAX_ITEMS, DT10_FUNDING_SAFE + DT10_SHADOW_LOG_PROP, DT10_SHADOW_LOG_SHEET, DT10_SHADOW_LOG_STATE_PROP, DT10_SHADOW_LOG_HEADERS + DT10_SHADOW_POOL_FIELDS in v1.17.1 + DT10_POST_EARN_PROP, DT10_POST_EARN_SESSIONS, DT10_POST_EARN_SESSIONS_NEG, DT10_POST_EARN_MAX_DAYS in v1.18.0 + DT10_QUALIFIED_HOLD_PROP, DT10_SEAT_LIVE_FILL_PROP, DT10_OWNER_RULE_PROP, DT10_OWNER_RULE_ROI_MAX, DT10_OWNER_RULE_HEADERS in v1.19.0 + DT10_TICKET_GUARD_PROP, DT10_GUARD_EARN_DAYS_PROP, DT10_GUARD_EARN_DAYS_DEF, DT10_GUARD_EARN_DAYS_MAX, DT10_GUARD_OWNER_RULE_PROP, DT10_GUARD_MAX_TICKETS_PROP, DT10_GUARD_MAX_TICKETS_MAX, DT10_TGUARD_TAGS_RE, DT10_TGUARD_LIVE_RE, DT10_KPI_PLAN_GAIN_PROP, DT10_KPI_PLAN_GAIN_LABEL, DT10_KPI_PLAN_LABEL_PROP, DT10_VENUE_LINE_PROP, DT10_VENUES in v1.20.0 + DT10_GUARD_EXDIV_DAYS_PROP, DT10_GUARD_EXDIV_DAYS_MAX, DT10_GUARD_EXDIV_PCT_PROP, DT10_GUARD_EXDIV_PCT_DEF, DT10_GUARD_EXDIV_PCT_MAX, DT10_DIVIDEND_SHEET in v1.21.0 + DT10_T10_CONFIRM_WINDOW_PROP, DT10_T10_CONFIRM_WINDOW_MAX in v1.22.0 + DT10_T10_COOLDOWN_PROP, DT10_T10_COOLDOWN_MAX, DT10_LEDGER_SHEET in v1.23.0 + DT10_T10_HARD_EXIT_CONFIRM_PROP, DT10_T10_SEAT_GUARD_PROP, DT10_T10_SEAT_GUARD_MAX in v1.24.0)');
   for (const f of DESIGNED_FUNCTIONS) assert(fns.has(f), 'missing ' + f);
   for (const v of DESIGNED_VARS) assert(vars.has(v), 'missing ' + v);
   for (const f of DESIGNED_FUNCTIONS) assert.equal(typeof ctx[f], 'function', f);
@@ -661,7 +666,7 @@ check('T10 _Run_Log: off -> no row; observe/enforce -> exactly one INPUT-TRUTH r
   assert(row[5].startsWith('gates: news 0/500')); assert(row[5].length <= 400);
   const details = JSON.parse(row[9]);
   deq(Object.keys(details).sort(), ['alerts', 'cal', 'cand_rows', 'cand_tab', 'cand_tab_result', 'ev', 'input_truth', 'notes', 'ref', 'version', 'vintage_cols']);
-  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.21.1', 'observe', 'observe', 'observe', 500]);   // 2026-11-02: v1.20.0 pin moved
+  deq([details.version, details.input_truth, details.cand_tab, details.vintage_cols, details.cand_rows], ['1.26.0', 'observe', 'observe', 'observe', 500]);   // 2026-11-08: v1.23.0 pin moved; 2026-11-02: v1.20.0 pin moved
   assert.equal(details.ev.news.unknown, 500); assert.equal(details.ref.drift_seed, 1); assert.equal(details.cal.sel_covered, 8);
   deq(details.alerts.map(a => [a.type, a.count]), [['gate_not_evaluable', 500], ['gate_not_evaluable', 500], ['panel_reference_drift', 1]]);
   assert(!/cash|nav|deployable/i.test(row[9]), 'details carry no portfolio words');

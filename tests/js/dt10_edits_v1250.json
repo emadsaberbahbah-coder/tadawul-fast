@@ -1,0 +1,66 @@
+[
+ [
+  " * Version: 1.25.0 (see DT10_VERSION; header kept in lockstep",
+  " * Version: 1.24.0 (see DT10_VERSION; header kept in lockstep"
+ ],
+ [
+  "var DT10_VERSION = '1.25.0';",
+  "var DT10_VERSION = '1.24.0';"
+ ],
+ [
+  " * v1.25.0 (2026-11-08) [OWNER-BANDS] -- THE OWNER RULE CAN ACCEPT MEDIUM (ONE KNOB, DEFAULT OFF)\n * WHY (owner decision A, 8 Nov 2026): the v1.19.0 owner rule (Confidence High\n *   AND Engine ROI 12M < 34, enforced by the v1.20.0 ticket guard under\n *   DT10_GUARD_OWNER_RULE=on) held the only funded ACTIVE seat of the 10:14\n *   Riyadh render ('tguard: held 1 (EFC.US owner rule)', Confidence Medium).\n *   The archive (tfb_archive.v_outcome_engine, engine-scored INVESTABLE calls,\n *   snapshot 8 Nov) says the High band is the weaker one: 1M High 26.0% wins,\n *   avg -7.68 pp (n=177, 35 names) vs Medium 61.3%, +0.64 pp (n=328, 101\n *   names); 1W 33.3% vs 58.6%; 2W 23.1% vs 55.6%; 3M 24.1% vs 48.1%\n *   (v_outcome_calibration flags 'High confidence under-delivers'). The ROI\n *   part keeps its evidence (opportunity_builder v1.28.0 WHY: names at the\n *   34% cap beat their reference 34-35% of the time vs 53-61% below it). The\n *   owner chose 'High or Medium; keep ROI < 34 and the 2-ticket cap; Low\n *   stays held'.\n * WHAT: Script Property DT10_OWNER_RULE_BANDS = a list of confidence bands\n *   (HIGH / MEDIUM / LOW; comma, space, '+', ';' or '/' separated, any case).\n *   HIGH is always included. Absent, blank, junk, 'HIGH' alone or a\n *   PropertiesService fault = off: the v1.24.0 rule byte for byte (no new\n *   payload or cfg key, same cells, tokens and logs). Armed (e.g.\n *   'HIGH,MEDIUM'): dt10OwnerRuleCell_ accepts every listed band (the failing\n *   part is still named: 'rule: no (Low; ROI ...)'); the ticket guard (cfg\n *   key ownerBands, set ONLY when DT10_GUARD_OWNER_RULE=on and armed), the\n *   Owner Rule column and its note use the same set; the tguard status token\n *   gains ', rule bands HIGH/MEDIUM' and its Logger line names the bands.\n *   Rollback: delete the property.\n *\n * v1.24.0 (2026-11-08) [SEAT-GUARD] -- FRESH SEATS STOP CHURNING",
+  " * v1.24.0 (2026-11-08) [SEAT-GUARD] -- FRESH SEATS STOP CHURNING"
+ ],
+ [
+  "var DT10_OWNER_RULE_HEADERS = ['Owner Rule'];\nvar DT10_OWNER_RULE_BANDS_PROP = 'DT10_OWNER_RULE_BANDS';   // v1.25.0 [OWNER-BANDS]\nvar DT10_OWNER_RULE_BAND_ORDER = ['HIGH', 'MEDIUM', 'LOW'];",
+  "var DT10_OWNER_RULE_HEADERS = ['Owner Rule'];"
+ ],
+ [
+  "function dt10OwnerRuleCell_(t, bands) {\n  t = t || {};",
+  "function dt10OwnerRuleCell_(t) {\n  t = t || {};"
+ ],
+ [
+  "  if (!dt10OwnerRuleBandOk_(band, bands)) parts.push(band ? band : 'conf unknown');",
+  "  if (band.toUpperCase() !== 'HIGH') parts.push(band ? band : 'conf unknown');"
+ ],
+ [
+  "function dt10OwnerRuleNote_(selected, bands) {\n  var sel = selected || [], yes = 0;\n  for (var i = 0; i < sel.length; i++) {\n    if (dt10OwnerRuleCell_(sel[i], bands) === 'rule: yes') yes++;",
+  "function dt10OwnerRuleNote_(selected) {\n  var sel = selected || [], yes = 0;\n  for (var i = 0; i < sel.length; i++) {\n    if (dt10OwnerRuleCell_(sel[i]) === 'rule: yes') yes++;"
+ ],
+ [
+  "        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eOr) {}\n  return false;\n}\n/** v1.25.0 [OWNER-BANDS] PURE: the accepted confidence bands from the raw\n * DT10_OWNER_RULE_BANDS text. HIGH is always in the set; null (= the v1.24.0\n * High-only rule) when no listed band widens it (absent, blank, junk, 'HIGH'\n * alone or any unknown word in the list). Never throws. */\nfunction dt10OwnerRuleBandsParse_(raw) {\n  var txt = String(raw === null || raw === undefined ? '' : raw).replace(/^\\s+|\\s+$/g, '');\n  if (!txt) return null;\n  var toks = txt.toUpperCase().split(/[\\s,;+\\/]+/), set = { HIGH: true }, wide = false;\n  for (var i = 0; i < toks.length; i++) {\n    if (!toks[i]) continue;\n    if (DT10_OWNER_RULE_BAND_ORDER.indexOf(toks[i]) < 0) return null;\n    if (toks[i] !== 'HIGH') wide = true;\n    set[toks[i]] = true;\n  }\n  return wide ? set : null;\n}\n/** v1.25.0 [OWNER-BANDS] PURE: does the printed band pass the rule? No set =\n * the v1.24.0 test (High only, any case). */\nfunction dt10OwnerRuleBandOk_(band, bands) {\n  var b = String(band === null || band === undefined ? '' : band)\n      .replace(/^\\s+|\\s+$/g, '').toUpperCase();\n  if (!bands || typeof bands !== 'object') return b === 'HIGH';\n  return b !== '' && Object.prototype.hasOwnProperty.call(bands, b) && bands[b] === true;\n}\n/** v1.25.0 [OWNER-BANDS] PURE: 'HIGH/MEDIUM' in the fixed band order. */\nfunction dt10OwnerRuleBandsText_(bands) {\n  var out = [];\n  for (var i = 0; i < DT10_OWNER_RULE_BAND_ORDER.length; i++) {\n    var b = DT10_OWNER_RULE_BAND_ORDER[i];\n    if (bands && Object.prototype.hasOwnProperty.call(bands, b) && bands[b] === true) out.push(b);\n  }\n  return out.join('/');\n}\n/** v1.25.0 [OWNER-BANDS]: Script Property DT10_OWNER_RULE_BANDS (one read);\n * null when off or on a PropertiesService fault. Never throws. */\nfunction dt10OwnerRuleBands_() {\n  try {\n    return dt10OwnerRuleBandsParse_(PropertiesService.getScriptProperties()\n        .getProperty(DT10_OWNER_RULE_BANDS_PROP));\n  } catch (eOb) {}\n  return null;\n}",
+  "        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eOr) {}\n  return false;\n}"
+ ],
+ [
+  "  // v1.25.0 [OWNER-BANDS]: the band set rides only when the owner rule is on\n  // and the knob is armed (else cfg is the v1.24.0 object).\n  if (cfg.ownerRule === true) {\n    var obSet = dt10OwnerRuleBands_();\n    if (obSet) cfg.ownerBands = obSet;\n  }\n  // v1.21.0 [EXDIV-GUARD]: two more knobs; an absent / blank / junk days\n  // knob leaves cfg exactly the v1.20.0 object (no exdiv keys at all).",
+  "  // v1.21.0 [EXDIV-GUARD]: two more knobs; an absent / blank / junk days\n  // knob leaves cfg exactly the v1.20.0 object (no exdiv keys at all)."
+ ],
+ [
+  "    } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t, cfg.ownerBands) !== 'rule: yes') {",
+  "    } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t) !== 'rule: yes') {"
+ ],
+ [
+  "        (tg.ownerRule === true ? 'on' + (tg.ownerBands ? ' (' +\n            dt10OwnerRuleBandsText_(tg.ownerBands) + ')' : '') : 'off') +\n        ', cap ' + (cap > 0 ? cap : 'none') +",
+  "        (tg.ownerRule === true ? 'on' : 'off') + ', cap ' + (cap > 0 ? cap : 'none') +"
+ ],
+ [
+  "    return dt10TicketGuardToken_(res, tg.mode) +\n        (tg.ownerRule === true && tg.ownerBands ?             // v1.25.0\n            ', rule bands ' + dt10OwnerRuleBandsText_(tg.ownerBands) : '');\n  } catch (eTg) {",
+  "    return dt10TicketGuardToken_(res, tg.mode);\n  } catch (eTg) {"
+ ],
+ [
+  "  if (ruleOn) {\n    payload._dt10_rule = { mode: 'on' };\n    var ruleBands = dt10OwnerRuleBands_();   // v1.25.0 [OWNER-BANDS]\n    if (ruleBands) payload._dt10_rule.bands = ruleBands;\n  }",
+  "  if (ruleOn) payload._dt10_rule = { mode: 'on' };"
+ ],
+ [
+  "    payload._dt10_rule_note = dt10OwnerRuleNote_(selected, payload._dt10_rule.bands);",
+  "    payload._dt10_rule_note = dt10OwnerRuleNote_(selected);"
+ ],
+ [
+  "    if (_or) selRows[selRows.length - 1].push(dt10OwnerRuleCell_(selected[s],\n        payload._dt10_rule.bands));   // v1.19.0; v1.25.0 bands",
+  "    if (_or) selRows[selRows.length - 1].push(dt10OwnerRuleCell_(selected[s]));   // v1.19.0"
+ ],
+ [
+  "       ? 'ok (High + ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' = yes; the failing part is named)'\n       : 'FAIL [' + orCells.join('|') + ']'));\n  /* v1.25.0 [OWNER-BANDS]: property line (one read) + pure battery. */\n  var obNow = dt10OwnerRuleBands_();\n  report.push('owner rule bands (DT10_OWNER_RULE_BANDS): ' +\n              (obNow ? dt10OwnerRuleBandsText_(obNow) : 'off (High only)'));\n  var obHM = dt10OwnerRuleBandsParse_('high, medium');\n  var obCells = [];\n  for (var obi = 0; obi < orSel.length; obi++) obCells.push(dt10OwnerRuleCell_(orSel[obi], obHM));\n  var obGuard = dt10TicketGuardCore_([\n      { symbol: 'M.US', confidence_band: 'Medium', engine_roi_pct: 20, suggested_shares: 3, suggested_sar: 900 },\n      { symbol: 'L.US', confidence_band: 'Low', engine_roi_pct: 20, suggested_shares: 3, suggested_sar: 900 }],\n      true, {}, { earnDays: 3, ownerRule: true, ownerBands: obHM });\n  report.push('owner rule bands core: ' +\n      ((dt10OwnerRuleBandsParse_('') === null && dt10OwnerRuleBandsParse_('HIGH') === null &&\n        dt10OwnerRuleBandsParse_('HIGH,MEDIUM,JUNK') === null &&\n        dt10OwnerRuleBandsText_(dt10OwnerRuleBandsParse_('medium')) === 'HIGH/MEDIUM' &&\n        obCells.join('|') === 'rule: yes|rule: no (ROI 34.8)|rule: no (ROI 34.0)|' +\n            'rule: yes|rule: no (conf unknown; ROI unknown)|rule: yes|' +\n            'rule: no (Low; ROI unknown)' &&\n        dt10OwnerRuleNote_(orSel, obHM) === 'owner-rule 3/7 yes' &&\n        obGuard.held.length === 1 && obGuard.held[0].symbol === 'L.US' &&\n        dt10OwnerRuleCell_(orSel[1]) === 'rule: no (Medium; ROI 34.8)')\n       ? 'ok (HIGH/MEDIUM: Medium ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' passes, Low is held; ' +\n         'no set = High only)'\n       : 'FAIL [' + obCells.join('|') + ' held ' + obGuard.held.length + ']'));",
+  "       ? 'ok (High + ROI < ' + DT10_OWNER_RULE_ROI_MAX + ' = yes; the failing part is named)'\n       : 'FAIL [' + orCells.join('|') + ']'));"
+ ]
+]
