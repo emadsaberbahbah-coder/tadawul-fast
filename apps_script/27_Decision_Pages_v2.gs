@@ -1,7 +1,21 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.34 (2026-11-05)
+ * Version: 1.2.35 (2026-11-08)
+ *   1.2.35: ONE STOP RULE FOR EVERY NEW TICKET (owner decision B6, Sun 8 Nov 2026): a replay of 269 Top-10 entries
+ *           (2 Sep - 4 Nov, tfb_archive.v_board_episodes + symbol_bars_daily) put the 2xATR fixed stop at mean -0.60%,
+ *           median -1.65%, 42% stopped and 10.4% stopped within 3 sessions (3 of the 6 November entries); -8% hard +
+ *           a 45-session time stop had the same mean, the best median (+0.06%) and win rate (50.6%) and 23% stopped.
+ *           The owner chose it as the one rule; the cockpit's tickets already carry it (Render TFB_OPP_STOP_VOL_MULT=0,
+ *           every stop 8% under the price). This page's exit engine still trailed 2xATR under the highest close and
+ *           would have advised 'RAISE STOP' over the -8% stop on the first new lot. Script Property DP2_STOP_RULE
+ *           (default OFF = the 1.2.34 engine byte for byte): 'fixed' (or 'fixed:YYYY-MM-DD'; default start 2026-11-08)
+ *           -> a lot entered on/after the start date replays a FIXED stop DP2X.FIXED_STOP_PCT (8) % under its entry
+ *           (no trailing, no breakeven lock, no profit-protection exit) plus a time stop DP2X.TIME_STOP_SESSIONS (45)
+ *           sessions after the entry bar, an exit episode that latches like a stop touch ('SELL - rule exit ... (time
+ *           stop, 45 sessions held ...)'); older lots keep the trailing rule; Top_10_Investments_v2 seats show the
+ *           initial stop 8% under the price. The texts name the fixed rule. dp2SelfTest adds one line while the gate is
+ *           on. Rollback: delete the property.
  *   1.2.34: THE SECOND PAGE IS NEVER STARVED AND A STOPPED RENDER IS NAMED (owner review, Thu 5 Nov 2026 01:48 Riyadh):
  *           Top_10_Investments_v2 still read 'Status: Last run 2026-11-05 00:03:55 | status: running...' at 01:48. The
  *           hourly buildDecisionPagesV2 always built Portfolio_Decision_v2 first and skipped this page whenever that
@@ -366,7 +380,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.34';   // lockstep with the header
+var DP2_VERSION = '1.2.35';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -434,6 +448,8 @@ var DP2X = {
   FETCH_SLEEP_MS: 200,
   FETCH_BUDGET_MS: 120000,   // v1.2.23: price-history downloads stop after 2 min per execution; the rest use the cached bars
   RUN_SOFT_LIMIT_MS: 270000, // v1.2.23: 'Refresh both' skips Top_10_v2 when Portfolio_Decision_v2 alone took 4.5 min (limit 6 min)
+  FIXED_STOP_PCT: 8,         // v1.2.35 [STOP-RULE]: the fixed stop under the entry (DP2_STOP_RULE on)
+  TIME_STOP_SESSIONS: 45,    // v1.2.35 [STOP-RULE]: sessions after the entry bar
   PROP_ALERTS: 'DP2_EXIT_ALERTS',
   PROP_ALERT_TO: 'DP2_EXIT_ALERT_TO',
   PROP_HISTORY_URL: 'DP2_HISTORY_URL',
@@ -1785,7 +1801,7 @@ function dp2Atr_(bars, n) {
 }
 function dp2Sma_(bars, i, n) { if (i + 1 < n) return null; var s = 0; for (var k = i - n + 1; k <= i; k++) s += bars[k].c; return s / n; }
 /* Replays the rule from the entry bar to the last bar. entryDate 'yyyy-MM-dd' (or '' → last bar). lastOverride = live price if known. */
-function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
+function dp2ExitCompute_(bars, entry, entryDate, lastOverride, rule) {
   if (!bars || bars.length < DP2X.ATR_N + 1 || !entry) return null;
   // v1.2.11 (review finding): the replay is only valid when the history reaches the entry — a series that starts
   // after the entry would rebuild the trade from the wrong bar (highs, episodes and the entry ATR all lost).
@@ -1797,6 +1813,7 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
   var a0 = atr[e], atrApprox = false;
   if (a0 === null) { atrApprox = true; for (i = 0; i < atr.length; i++) { if (atr[i] !== null) { a0 = atr[i]; break; } } }
   if (a0 === null || !(a0 > 0)) return null;
+  if (rule === 'fixed') return dp2ExitFixed_(bars, entry, e, a0, atr, atrApprox, lastOverride);   // v1.2.35 [STOP-RULE]
   var s0 = entry - DP2X.ATR_MULT_STOP * a0, R = entry - s0;
   var stop = s0, hi = bars[e].c, a = a0, gainR = 0, trailMult = DP2X.ATR_MULT_STOP, beLocked = false, mom = false, sma = null;
   var firstHit = null, firstMom = null, hits = [], moms = [], prevHit = false, prevMom = false;
@@ -1831,6 +1848,7 @@ function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {
 function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
   var out = { code: 'HOLD', kind: 'navy', text: 'HOLD — trailing', alert: false, advisory: false, dist: null, last: x ? x.last : fallbackLast, latched: null, latchedAck: false };
   if (!x) { out.code = 'ENGINE_NA'; out.kind = 'grey'; out.text = 'HOLD — exit engine n/a'; return out; }
+  if (x.rule === 'fixed') out.text = 'HOLD - fixed stop ' + dp2Fmt_(x.stop, 2) + ', ' + dp2StopTimeTxt_(x);   // v1.2.35
   var last = x.last;
   out.dist = last ? (last / x.stop - 1) * 100 : null;
   var tpDist = (br && br.tp && last) ? (br.tp / last - 1) * 100 : null;
@@ -1861,13 +1879,15 @@ function dp2ExitSignal_(x, br, fallbackLast, ackDate) {
   var hitsArr = x.hits || (x.firstHit ? [x.firstHit] : []), momsArr = x.moms || (x.firstMom ? [x.firstMom] : []);
   for (ei = 0; ei < hitsArr.length; ei++) episodes.push({ date: hitsArr[ei].date, kind: 'stop', price: hitsArr[ei].stop });
   for (ei = 0; ei < momsArr.length; ei++) episodes.push({ date: momsArr[ei].date, kind: 'momentum', price: momsArr[ei].price });
+  var timesArr = x.times || [];   // v1.2.35 [STOP-RULE]: the time stop is an exit episode
+  for (ei = 0; ei < timesArr.length; ei++) episodes.push({ date: timesArr[ei].date, kind: 'time', price: timesArr[ei].price });
   episodes.sort(function (p1, p2) { return p1.date < p2.date ? -1 : (p1.date > p2.date ? 1 : (p1.kind < p2.kind ? -1 : 1)); });
   if (episodes.length && out.code !== 'STOP_HIT' && out.code !== 'SELL_NOW') {
     // v1.2.7: the acknowledgement covers every episode up to its date; the earliest episode AFTER it latches again
     var ack = ackDate ? String(ackDate) : '';
     var trig = null, covered = null;
     for (ei = 0; ei < episodes.length; ei++) { if (ack && episodes[ei].date <= ack) covered = episodes[ei]; else if (!trig) trig = episodes[ei]; }
-    var fmtEp = function (ep) { return ep.date + ' (' + (ep.kind === 'momentum' ? 'profit protection, close ' + dp2Fmt_(ep.price, 2) : 'stop ' + dp2Fmt_(ep.price, 2) + ' touched') + ')'; };
+    var fmtEp = function (ep) { return ep.date + ' (' + (ep.kind === 'time' ? 'time stop, ' + DP2X.TIME_STOP_SESSIONS + ' sessions held, close ' + dp2Fmt_(ep.price, 2) : ep.kind === 'momentum' ? 'profit protection, close ' + dp2Fmt_(ep.price, 2) : 'stop ' + dp2Fmt_(ep.price, 2) + ' touched') + ')'; };
     if (trig) {
       out.latched = { date: trig.date, kind: trig.kind, price: trig.price, text: fmtEp(trig), episodes: episodes.length };
       out.code = 'EXIT_LATCHED'; out.kind = 'red'; out.alert = true; out.advisory = false;
@@ -1898,6 +1918,74 @@ var DP2X_SAN_ = null;                           // the gate, read once per execu
 function dp2ExitSanityOn_() {
   if (DP2X_SAN_ === null) DP2X_SAN_ = /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_EXIT_SANITY_PROP)).trim());
   return DP2X_SAN_;
+}
+/* v1.2.35 [STOP-RULE]: Script Property DP2_STOP_RULE = 'fixed' or 'fixed:YYYY-MM-DD' (any case; default OFF = the
+ * 1.2.34 trailing engine). Read once per execution. Lots entered on/after the start date (default DP2X_SR_FROM_) and
+ * the Top_10_Investments_v2 seats use the fixed rule; older lots keep the trailing rule. */
+var DP2_STOP_RULE_PROP = 'DP2_STOP_RULE';
+var DP2X_SR_FROM_ = '2026-11-08';
+var DP2X_SR_READ_ = false, DP2X_SR_ = null;
+/* PURE: null (off) | { from: 'YYYY-MM-DD' } */
+function dp2StopRuleParse_(raw) {
+  var m = /^fixed(?:\s*[:=\s]\s*(\d{4}-\d{2}-\d{2}))?$/i.exec(dp2Str_(raw).trim());
+  return m ? { from: m[1] || DP2X_SR_FROM_ } : null;
+}
+function dp2StopRule_() {
+  if (!DP2X_SR_READ_) { DP2X_SR_ = dp2StopRuleParse_(dp2Prop_(DP2_STOP_RULE_PROP)); DP2X_SR_READ_ = true; }
+  return DP2X_SR_;
+}
+/* 'fixed' for a lot entered on/after the start date while the gate is on; else undefined (the trailing engine). */
+function dp2StopRuleFor_(entryDate) {
+  var r = dp2StopRule_(), d = dp2Str_(entryDate);
+  return (r && d && d >= r.from) ? 'fixed' : undefined;
+}
+/* PURE: the fixed replay - a stop FIXED_STOP_PCT % under the entry, no trailing, no breakeven lock, no profit
+ * protection; a time-stop episode on the bar TIME_STOP_SESSIONS sessions after the entry bar. Same keys as the
+ * trailing replay (sma null, trailMult null, moms []) plus rule, times, sessionsHeld, sessionsLeft. */
+function dp2ExitFixed_(bars, entry, e, a0, atr, atrApprox, lastOverride) {
+  var s0 = entry * (1 - DP2X.FIXED_STOP_PCT / 100), R = entry - s0, hi = bars[e].c, a = a0;
+  var hits = [], times = [], prevHit = false;
+  for (var i = e; i < bars.length; i++) {
+    a = atr[i] !== null ? atr[i] : a0;
+    var hitNow = (i > e && bars[i].l <= s0);
+    if (hitNow && !prevHit) hits.push({ date: bars[i].date, stop: s0 });
+    prevHit = hitNow;
+    if (bars[i].c > hi) hi = bars[i].c;
+    if (i - e === DP2X.TIME_STOP_SESSIONS) times.push({ date: bars[i].date, price: bars[i].c });
+  }
+  var lastBar = bars[bars.length - 1];
+  var last = (lastOverride !== null && lastOverride !== undefined && lastOverride > 0) ? lastOverride : lastBar.c;
+  var held = bars.length - 1 - e;
+  return { entry: entry, entryBar: bars[e].date, atrEntry: a0, s0: s0, R: R, hi: hi, gainR: R > 0 ? (hi - entry) / R : 0, atr: a, sma: null, stop: s0, trailMult: null,
+           beLocked: false, momentum: false, last: last, lastDate: lastBar.date, barsSinceEntry: bars.length - e, firstHit: hits.length ? hits[0] : null, firstMom: null,
+           hits: hits, moms: [], hitNow: prevHit, momNow: false, atrApprox: atrApprox, barsBeforeEntry: e, lastR: R > 0 ? (last - entry) / R : null,
+           rule: 'fixed', times: times, sessionsHeld: held, sessionsLeft: Math.max(0, DP2X.TIME_STOP_SESSIONS - held) };
+}
+/* PURE: 'time stop reached YYYY-MM-DD' | 'time stop in N sessions' */
+function dp2StopTimeTxt_(x) {
+  return 'time stop ' + (x && x.times && x.times.length ? 'reached ' + x.times[0].date : 'in ' + (x ? x.sessionsLeft : '?') + ' sessions');
+}
+/* The dp2SelfTest core (pure): the fixed stop, a stop touch, the time stop and its latch; the trailing engine without
+ * the rule; the parser. */
+function dp2StopRuleCoreOk_() {
+  try {
+    var bars = [], t0 = Date.UTC(2026, 0, 1);
+    for (var q = 0; q < 70; q++) { var c = 100 + (q % 5); bars.push({ date: new Date(t0 + q * 86400000).toISOString().slice(0, 10), o: c, h: c + 1, l: c - 1, c: c }); }
+    var x = dp2ExitCompute_(bars, 100, bars[20].date, null, 'fixed');
+    var okF = !!x && Math.abs(x.stop - 92) < 1e-9 && x.hits.length === 0 && x.times.length === 1 && x.times[0].date === bars[65].date && x.sessionsLeft === 0;
+    var sig = dp2ExitSignal_(x, { tp: null, stop: 92, known: true, stopQty: null, shares: 10, stops: null, lotOfMany: false }, null, '');
+    var okS = sig.code === 'EXIT_LATCHED' && sig.latched.kind === 'time' && sig.text.indexOf('time stop, ' + DP2X.TIME_STOP_SESSIONS + ' sessions held') > 0;
+    var y = dp2ExitCompute_(bars, 100, bars[60].date, null, 'fixed');
+    var okY = !!y && y.times.length === 0 && y.sessionsLeft === 36 && dp2ExitSignal_(y, { tp: null, stop: 92, known: true, stopQty: null, shares: 10, stops: null, lotOfMany: false }, null, '').code === 'HOLD';
+    var crash = bars.slice(0, 69).concat([{ date: bars[69].date, o: 90, h: 91, l: 89, c: 90 }]);
+    var z = dp2ExitCompute_(crash, 100, bars[60].date, null, 'fixed');
+    var okZ = !!z && z.hits.length === 1 && z.hits[0].date === bars[69].date;
+    var a = dp2ExitCompute_(bars, 100, bars[20].date, null);
+    var okA = !!a && a.rule === undefined && a.trailMult !== null;
+    var okP = dp2StopRuleParse_('fixed').from === DP2X_SR_FROM_ && dp2StopRuleParse_(' Fixed:2026-12-01 ').from === '2026-12-01' &&
+              dp2StopRuleParse_('atr') === null && dp2StopRuleParse_('') === null && dp2StopRuleParse_('fixed:2026-1-1') === null;
+    return okF && okS && okY && okZ && okA && okP;
+  } catch (e) { return false; }
 }
 function dp2DayMs_(d) { return new Date(String(d) + 'T00:00:00Z').getTime(); }
 /* PURE: does this history belong to the lot? The first bar on or after the entry date (within DP2_EXIT_ANCHOR_GAP_D
@@ -2169,26 +2257,27 @@ function dp2ExitLine_(it, fx) {
   var lastPx = x ? x.last : (s.last !== null && s.last !== undefined ? s.last : null);
   var pnl = (lastPx !== null && it.qty && it.entry) ? (lastPx - it.entry) * it.qty * (it.fx || fx) : null;
   var why = '';
-  if (s.code === 'STOP_HIT') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + x.trailMult + ' × ATR ' + dp2Fmt_(x.atr, 2) + ' under it' + (x.beLocked ? ', breakeven locked' : '') + ').';
+  if (s.code === 'STOP_HIT' && x.rule === 'fixed') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the fixed stop ' + dp2Fmt_(x.stop, 2) + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry ' + dp2Fmt_(x.entry, 2) + ').';   // v1.2.35
+  else if (s.code === 'STOP_HIT') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + x.trailMult + ' × ATR ' + dp2Fmt_(x.atr, 2) + ' under it' + (x.beLocked ? ', breakeven locked' : '') + ').';
   else if (s.code === 'SELL_NOW') why = 'in profit, close ' + dp2Fmt_(x.last, 2) + ' is below the 10-day average ' + dp2Fmt_(x.sma, 2) + ' after giving back ' + dp2Fmt_((x.hi - x.last) / x.atr, 1) + ' ATR from the high ' + dp2Fmt_(x.hi, 2) + ' (the move at the high was ' + dp2RFmt_(x.gainR) + ').';
   else if (s.code === 'STOP_NEAR') why = 'last ' + dp2Fmt_(x.last, 2) + ' is only ' + dp2PctPlain_(s.dist, 1) + ' above the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ATR ' + dp2Fmt_(x.atr, 2) + ')' + (it.brokerStop ? '; the fixed broker stop ' + dp2Fmt_(it.brokerStop, 2) + ' is ' + dp2Pct_((it.brokerStop / x.last - 1) * 100, 1) + ' away.' : '; no working broker stop is listed.');
-  else if (s.code === 'RAISE_STOP') why = 'the trailing rule puts the stop at ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + dp2RFmt_(x.gainR) + ' at the high); the working broker stop is ' + dp2Fmt_(it.brokerStop, 2) + '.';
+  else if (s.code === 'RAISE_STOP') why = 'the ' + (x.rule === 'fixed' ? 'fixed ' + DP2X.FIXED_STOP_PCT + '% rule' : 'trailing rule') + ' puts the stop at ' + dp2Fmt_(x.stop, 2) + ' (highest close ' + dp2Fmt_(x.hi, 2) + ', ' + dp2RFmt_(x.gainR) + ' at the high); the working broker stop is ' + dp2Fmt_(it.brokerStop, 2) + '.';
   else if (s.code === 'NO_BROKER_STOP') why = 'no working stop order is listed in _IBKR_Orders; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
   else if (s.code === 'STOP_PARTIAL') why = 'the active stop covers only part of the lot (' + dp2Fmt_(s.uncovered) + ' sh unprotected); the rule\'s stop is ' + dp2Fmt_(x.stop, 2) + '.';
-  else if (s.code === 'EXIT_LATCHED') why = 'the rule exited this lot on ' + s.latched.text + ' and the position is still open; the alert for that day was never acted on, and a later recovery does not reinstate the trade. Today: last ' + dp2Fmt_(x.last, 2) + ', trailing stop ' + dp2Fmt_(x.stop, 2) + '.';
+  else if (s.code === 'EXIT_LATCHED') why = 'the rule exited this lot on ' + s.latched.text + ' and the position is still open; the alert for that day was never acted on, and a later recovery does not reinstate the trade. Today: last ' + dp2Fmt_(x.last, 2) + ', ' + (x.rule === 'fixed' ? 'fixed' : 'trailing') + ' stop ' + dp2Fmt_(x.stop, 2) + '.';
   else why = s.text;
   if (s.staleBars) why += ' PRICE HISTORY IS STALE (fetch failed; cached bars) — the engine ran on the cockpit quote; confirm the live price before any order.';
   // v1.2.3 (review finding): the action is specific to the signal code — a stop instruction only for RAISE_STOP /
   // NO_BROKER_STOP; HOLD-type codes never say "raise" to a lower level; a rotation-only mail carries the switch action.
   var action = null;
-  var trailTxt = ' — or a trailing stop order, trail amount ' + (x ? dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR)' : 'n/a') + '.';
+  var trailTxt = (x && x.rule === 'fixed') ? ' (a fixed stop: no trailing order).' : ' — or a trailing stop order, trail amount ' + (x ? dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR)' : 'n/a') + '.';
   if (s.code === 'STOP_HIT' || s.code === 'SELL_NOW') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ').';
-  else if (s.code === 'EXIT_LATCHED') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ') — or, to hold by decision, acknowledge the ' + s.latched.date + ' exit (📊 Decision v2 ▸ ✅ Acknowledge rule exit); the trailing stop ' + dp2Fmt_(x.stop, 2) + ' then governs and must be working at the broker.';
+  else if (s.code === 'EXIT_LATCHED') action = 'Sell now (market, or a limit no lower than ' + dp2Fmt_(x.last - 0.25 * x.atr, 2) + ') — or, to hold by decision, acknowledge the ' + s.latched.date + ' exit (📊 Decision v2 ▸ ✅ Acknowledge rule exit); the ' + (x.rule === 'fixed' ? 'fixed' : 'trailing') + ' stop ' + dp2Fmt_(x.stop, 2) + ' then governs and must be working at the broker.';
   else if (s.code === 'STOP_NEAR') action = 'Decide now: pre-empt at ' + dp2Fmt_(x.last, 2) + ', or let the dynamic stop ' + dp2Fmt_(x.stop, 2) + ' decide — and make sure a broker stop at least that high is working.';
   else if (s.code === 'RAISE_STOP') action = 'Raise the IBKR stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) + trailTxt;
   else if (s.code === 'NO_BROKER_STOP') action = 'Place a stop at ' + dp2Fmt_(x.stop, 2) + (s.lotOfMany && s.lotShares ? ' for this lot\'s ' + dp2Fmt_(s.lotShares) + ' sh' : '') + ' (no working stop is listed' + (s.lotOfMany ? ' for this lot' : '') + ')' + trailTxt;
   else if (s.code === 'STOP_PARTIAL') action = 'Place a stop for the uncovered ' + dp2Fmt_(s.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (it.brokerStop && x.stop >= it.brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ', and raise the existing stop from ' + dp2Fmt_(it.brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + trailTxt;
-  else if (s.code === 'TP_WATCH') action = 'No stop change. The broker take-profit ' + dp2Fmt_(it.brokerTp, 2) + ' is close: keep it to bank the gain, or cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.';
+  else if (s.code === 'TP_WATCH') action = 'No stop change. The broker take-profit ' + dp2Fmt_(it.brokerTp, 2) + ' is close: keep it to bank the gain, or cancel it to ' + (x.rule === 'fixed' ? 'hold to the time stop (fixed stop ' + dp2Fmt_(x.stop, 2) + ').' : 'let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.');
   else if (s.code === 'HOLD_BROKER_UNKNOWN') action = 'No stop change from this page — the broker orders are unknown here; confirm at the broker that a stop at or above ' + (x ? dp2Fmt_(x.stop, 2) : 'the rule\'s level') + ' is working.';
   else if (s.code === 'HOLD' || s.code === 'HOLD_BE') action = 'No stop change — the working broker stop ' + (it.brokerStop && x ? dp2Fmt_(it.brokerStop, 2) + ' is at or above the rule\'s ' + dp2Fmt_(x.stop, 2) : 'is where the rule puts it') + '; keep it. Never lower a stop.';
   else action = s.text + ' — no stop change.';
@@ -2220,7 +2309,7 @@ function dp2ExitSendMail_(items, fx, to) {
       '<div style="margin-top:6px;color:#4a5a6b">Why: ' + L.why + '</div>',
       '<div style="margin-top:4px"><b>Do:</b> ' + L.action + '</div></div>');
   }
-  var foot = 'Rule: initial stop entry − 2 × ATR14; breakeven lock after +1R; trail 2 × ATR under the highest close (1.5 × ATR after +2R); profit protection when a profitable name closes below its 10-day average after giving back ≥ 1 ATR. Prices: daily bars + last from the chart API (may lag the tape by minutes). This page placed no order — act at the broker. Pause: Today ▸ 🔔 Dynamic Exits — alerts on/off.';
+  var foot = (dp2StopRule_() ? 'Lots entered from ' + dp2StopRule_().from + ': a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions. Older lots: ' : '') + 'Rule: initial stop entry − 2 × ATR14; breakeven lock after +1R; trail 2 × ATR under the highest close (1.5 × ATR after +2R); profit protection when a profitable name closes below its 10-day average after giving back ≥ 1 ATR. Prices: daily bars + last from the chart API (may lag the tape by minutes). This page placed no order — act at the broker. Pause: Today ▸ 🔔 Dynamic Exits — alerts on/off.';
   text.push(foot);
   html.push('<p style="font-size:11px;color:#898781">' + foot + '</p></div>');
   MailApp.sendEmail({ to: to, subject: subject, body: text.join('\n'), htmlBody: html.join('') });
@@ -2654,7 +2743,7 @@ function dp2PlanSeats_(t, fx, xbars, qmap, cfg) {
     sectors[sec] = (sectors[sec] || 0) + 1; markets[mkey] = (markets[mkey] || 0) + 1;
     out.push({ sym: sym, name: dp2Str_(s['Name']), sector: sec, market: mkt, ccy: ccy, fxUse: fxUse, fxSource: fxSource, price: price, priceSar: (price !== null && fxUse !== null) ? price * fxUse : null,
                roi3: roi3, roi12: roi12, roiVal: roiVal, roiValSource: roiValSource, rel: rel, dq: dp2Num_(s['DQ']), risk: risk, rank: dp2Num_(s['Rank']), stability: stability, atr: atr,
-               stop0: (price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null, ticketEngine: dp2Num_(s['Ticket SAR']),
+               stop0: dp2StopRule_() ? (price !== null ? price * (1 - DP2X.FIXED_STOP_PCT / 100) : null) : ((price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null), ticketEngine: dp2Num_(s['Ticket SAR']),
                sharesEngine: dp2Num_(s['Shares']) });   // v1.2.31: the engine's Shares (mirrored with Ticket SAR on an engine board)
   }
   return out;
@@ -3237,7 +3326,7 @@ function buildPortfolioDecisionV2() {
   row++;
 
   // holdings table — dynamic exits
-  row = dp2Section_(sh, row, 1, 16, 'HOLDINGS — ledger lots, dynamic exits and IBKR order status', 'Dyn. stop = trailing rule: entry − 2 × ATR14 at entry; breakeven lock after +1R; 2 × ATR under the highest close (1.5 × ATR after +2R); never loosens. SELL NOW = last at/below the dynamic stop, or a profitable name closing below its 10-day average after giving back ≥ 1 ATR. Broker levels from _IBKR_Orders; the fixed broker stop is only a floor — RAISE STOP tells you when to move it.');
+  row = dp2Section_(sh, row, 1, 16, 'HOLDINGS — ledger lots, dynamic exits and IBKR order status', 'Dyn. stop = trailing rule: entry − 2 × ATR14 at entry; breakeven lock after +1R; 2 × ATR under the highest close (1.5 × ATR after +2R); never loosens. SELL NOW = last at/below the dynamic stop, or a profitable name closing below its 10-day average after giving back ≥ 1 ATR. Broker levels from _IBKR_Orders; the fixed broker stop is only a floor — RAISE STOP tells you when to move it.' + (dp2StopRule_() ? ' DP2_STOP_RULE: lots entered from ' + dp2StopRule_().from + ' use a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions.' : ''));
   var hdrs = ['Symbol', 'Name · sector', '3-month close', 'Qty', 'Avg cost', 'Last', 'Value SAR', '% NAV', 'Unreal.', 'Broker TP / stop', 'Dyn. stop (trail)', 'Exit engine', 'Order status (IBKR)', 'Exit signal'];
   var spans = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1];
   var trows = [], sigKinds = [], exitItems = [];
@@ -3275,7 +3364,7 @@ function buildPortfolioDecisionV2() {
     // v1.2.9 (review finding): on STALE bars the live last is the cockpit quote (never the cached close), and no
     // actionable alert is issued — the signal is shown and flagged, mailed at most as an advisory.
     var lastOv = (xb && xb.last !== null && !xb.stale) ? xb.last : ((xb && xb.stale && l.price) ? l.price : null);
-    var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, lastOv) : null;
+    var x = (xb && xb.bars && xb.bars.length) ? dp2ExitCompute_(xb.bars, cost, entryDate, lastOv, dp2StopRuleFor_(entryDate)) : null;
     // v1.2.33 [EXIT-SANITY] (gate on only): a history that is not this lot's gives no signal; a dividend is not a fall
     var xMiss = null, xDiv = null;
     if (xSan && xb && xb.bars && xb.bars.length) {
@@ -3283,7 +3372,7 @@ function buildPortfolioDecisionV2() {
       if (xMiss) x = null;
       else {
         xDiv = dp2ExitDivAdjust_(xb.bars, cost, entryDate, dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), xToday);
-        if (xDiv.applied.length) x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv); else xDiv = null;
+        if (xDiv.applied.length) x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv, dp2StopRuleFor_(entryDate)); else xDiv = null;
       }
     }
     xTotal++;
@@ -3308,7 +3397,7 @@ function buildPortfolioDecisionV2() {
     var spark = dp2SparkFormula_(l.symbol);
     var dynTxt = x ? (dp2Fmt_(x.stop, 2) + ' (' + dp2Pct_(stopPct, 1) + ')\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) + (x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' ↑ raise' : '') : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')))
                    : ('—\n' + (brokerStop ? 'broker ' + dp2Fmt_(brokerStop, 2) : (br.lastStop ? 'broker ' + dp2Fmt_(br.lastStop, 2) + ' not working' : 'no broker stop')));
-    var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + ' · trail ' + x.trailMult + '×ATR' + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
+    var engTxt = x ? ('ATR ' + dp2Fmt_(x.atr, 2) + ' · high ' + dp2Fmt_(x.hi, 2) + ' (' + dp2RFmt_(x.gainR) + ' at the high) · now ' + dp2RFmt_(x.lastR) + (x.sma !== null ? ' · SMA10 ' + dp2Fmt_(x.sma, 2) : '') + (x.rule === 'fixed' ? ' \u00b7 fixed stop -' + DP2X.FIXED_STOP_PCT + '%, ' + dp2StopTimeTxt_(x) : ' · trail ' + x.trailMult + '×ATR') + (x.beLocked ? ' · BE locked' : '') + ' · R ' + dp2Fmt_(x.R, 2) + '\n' + (xb.stale ? 'STALE bars (' + dp2Str_(xb.fetched) + ') — ' + dp2Str_(xb.error).slice(0, 60) : dp2Str_(xb.source) + ' · bars to ' + x.lastDate + (xb.marketState ? ' · ' + xb.marketState.toLowerCase() : '')))
                    : (dp2EngineNaWhy_(xb, entryDate) + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''));
     if (x && x.atrApprox) engTxt += ' · entry ATR approximated (' + x.barsBeforeEntry + ' bars before the entry)';
     if (xMiss) engTxt = dp2ExitAnchorWhy_(xMiss);   // v1.2.33 [EXIT-SANITY]
@@ -3336,9 +3425,9 @@ function buildPortfolioDecisionV2() {
     } else if (sig.code === 'STOP_PARTIAL') {
       actions.push({ p: 2, t: l.symbol + (lotOfMany ? ' (lot ' + entryDate + ')' : '') + ': the active stop covers ' + dp2Fmt_(br.stopQty) + ' of the position\'s ' + dp2Fmt_(posShares) + ' sh — place a stop for the uncovered ' + dp2Fmt_(sig.uncovered) + ' sh at ' + dp2Fmt_(x.stop, 2) + (brokerStop && x.stop >= brokerStop * (1 + DP2X.RAISE_MIN_PCT / 100) ? ' and raise the existing stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : '') + '.' });
     } else if (sig.code === 'RAISE_STOP' || sig.code === 'NO_BROKER_STOP') {
-      actions.push({ p: 2, t: l.symbol + ': ' + (sig.code === 'RAISE_STOP' ? 'raise the IBKR stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : 'place a stop at ' + dp2Fmt_(x.stop, 2) + (sig.lotOfMany && sig.lotShares ? ' for this lot\'s ' + dp2Fmt_(sig.lotShares) + ' sh' : '') + ' (no working stop listed' + (sig.lotOfMany ? ' for this lot' : '') + ')') + ' — or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.' });
+      actions.push({ p: 2, t: l.symbol + ': ' + (sig.code === 'RAISE_STOP' ? 'raise the IBKR stop from ' + dp2Fmt_(brokerStop, 2) + ' to ' + dp2Fmt_(x.stop, 2) : 'place a stop at ' + dp2Fmt_(x.stop, 2) + (sig.lotOfMany && sig.lotShares ? ' for this lot\'s ' + dp2Fmt_(sig.lotShares) + ' sh' : '') + ' (no working stop listed' + (sig.lotOfMany ? ' for this lot' : '') + ')') + (x.rule === 'fixed' ? ' (the fixed rule: ' + DP2X.FIXED_STOP_PCT + '% under the entry, no trailing order; ' + dp2StopTimeTxt_(x) + ').' : ' — or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' × ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.') });
     } else if (sig.code === 'TP_WATCH') {
-      actions.push({ p: 2, t: l.symbol + ' is ' + dp2Pct_(tpPct, 1) + ' from the broker take-profit ' + dp2Fmt_(br.tp, 2) + '; a fill returns ≈ ' + dp2Fmt_(l.shares * br.tp * lfx) + ' SAR to cash. Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.' });
+      actions.push({ p: 2, t: l.symbol + ' is ' + dp2Pct_(tpPct, 1) + ' from the broker take-profit ' + dp2Fmt_(br.tp, 2) + '; a fill returns ≈ ' + dp2Fmt_(l.shares * br.tp * lfx) + ' SAR to cash. ' + (x.rule === 'fixed' ? 'Under the fixed rule the stop stays at ' + dp2Fmt_(x.stop, 2) + ' (' + dp2StopTimeTxt_(x) + '): keep the TP to bank the gain, or cancel it and let the time stop close the trade.' : 'Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.') });
     }
     if (xb && xb.stale && x) actions.push({ p: 3, t: l.symbol + ' exit engine is running on cached bars (' + dp2Str_(xb.fetched) + '): ' + dp2Str_(xb.error || 'fetch failed').slice(0, 120) + '.' });
     if (xMiss) actions.push({ p: 1, t: 'CHECK ' + l.symbol + ' (' + dp2Fmt_(l.shares) + ' sh): ' + dp2ExitAnchorWhy_(xMiss).replace(/^exit engine n\/a \u2014 /, '') + '. No exit signal or alert is given for this lot until its symbol prices the shares the broker holds.' });   // v1.2.33
@@ -3357,7 +3446,7 @@ function buildPortfolioDecisionV2() {
       engTxt += '\n↻ ' + oLbl + ' basis would rotate → ' + rotO.sym + ' (edge +' + dp2Fmt_(rotO.rotation.edge, 1) + ' pp) — not the production basis (' + bLbl + '), no action';
     }
     var decision = sig.text;
-    if (sig.code === 'HOLD' && !certified) decision = 'HOLD · trailing · uncertified';
+    if (sig.code === 'HOLD' && !certified) decision = 'HOLD · ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' · uncertified';
     sigKinds.push(sig.kind);
     trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
@@ -3422,7 +3511,7 @@ function buildPortfolioDecisionV2() {
   }
   var meaning = 'Net ' + dp2Signed_(net) + ' USD (≈ ' + dp2Signed_(net * fx) + ' SAR) over ' + ib.trades.length + ' closed names. ' +
     (winRate !== null && winRate < 0.45 ? 'Stops sit a few percent below entry while the names move 1–1.5% a day, so the stop is reached far more often than the target: a payoff ratio near 2 cannot carry a ' + dp2PctPlain_(winRate * 100, 0) + ' win rate. ' : '') +
-    'D-stop is live on this page as the dynamic exit rule (initial stop 2 × ATR-14, breakeven lock after +1R, trailing stop, SMA10 profit protection); the broker brackets still have to be moved by hand — follow the RAISE STOP actions or replace fixed stops with trailing stop orders.' +
+    'D-stop is live on this page as the dynamic exit rule (initial stop 2 × ATR-14, breakeven lock after +1R, trailing stop, SMA10 profit protection); the broker brackets still have to be moved by hand — follow the RAISE STOP actions or replace fixed stops with trailing stop orders.' + (dp2StopRule_() ? ' Lots entered from ' + dp2StopRule_().from + ' follow DP2_STOP_RULE instead: a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions; keep their stop fixed (no trailing order).' : '') +
     (led.totals.closed !== undefined && led.totals.closed !== null ? ' Ledger closed total (lifetime) ' + dp2Fmt_(led.totals.closed) + ' SAR vs broker realized here ' + dp2Fmt_(net * fx) + ' SAR — reconcile in Broker_Reconciliation.' : '');
   var mRng = dp2Range_(sh, tradeTop + 3, 9, 16, Math.max(3, tradeRowsNeeded - 3)).merge();
   mRng.setValue(meaning).setWrap(true).setVerticalAlignment('top').setFontSize(9.5).setBackground(DP2C.surface).setBorder(true, true, true, true, false, false, DP2C.border, SpreadsheetApp.BorderStyle.SOLID);
@@ -3644,7 +3733,7 @@ function buildTop10V2() {
     if (fxUse === null && planObj && planObj.fxUse !== null) fxUse = planObj.fxUse;
     var shares = ar && ar.state === 'FUNDED' ? ar.qty : null;
     var allocSar = ar && ar.state === 'FUNDED' ? ar.alloc : null;
-    var stop0 = (entry !== null && xatr !== null) ? entry - DP2X.ATR_MULT_STOP * xatr : null;
+    var stop0 = dp2StopRule_() ? (entry !== null ? entry * (1 - DP2X.FIXED_STOP_PCT / 100) : null) : ((entry !== null && xatr !== null) ? entry - DP2X.ATR_MULT_STOP * xatr : null);   // v1.2.35
     var riskSar = (stop0 !== null && shares !== null && fxUse !== null) ? shares * (entry - stop0) * fxUse : null;
     var gain3 = (allocSar !== null && roi3 !== null) ? allocSar * roi3 / 100 : null;
     var note = dp2Str_(s['Advisor Note']);
@@ -3869,6 +3958,7 @@ function dp2SelfTest() {
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
+  if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var probe = null;
   var probeSym = 'SPY';
