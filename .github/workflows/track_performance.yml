@@ -1,5 +1,17 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.14 (2026-11-08) -- HIST-CLOSE OUTCOME PREVIEW (OWNER OPT-IN)
+# (1.0.8-1.0.13 are claimed by the open PRs #845, #857, #915, #922, #923 and #926.)
+# track_performance v6.60.0 [HIST-PREVIEW]: TRACK_HIST_CLOSE_PREVIEW (default
+# 'off' = v6.53.0) makes TRACK_HIST_TARGET_CLOSE=observe log what enforce
+# would publish for the records the archive witnesses: directional wins and
+# losses, the ROI spread, the split by horizon and by entry investability,
+# and the largest moves. Log lines only; no record, receipt or sheet changes.
+# The 'Run performance clock' step maps it beside the judge's other knobs;
+# daily_sync.yml maps none of them (the v6.47.0 lane rule). No cron,
+# concurrency or other step changes. ARMING (owner): set the Variable to on.
+# ROLLBACK: unset it.
+#
 # VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT
 # WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve today,
 # results tomorrow"): Performance_Log holds 13,856 active forecast records
@@ -367,6 +379,11 @@ jobs:
           TRACK_HIST_TARGET_CLOSE: ${{ vars.TRACK_HIST_TARGET_CLOSE || 'off' }}
           TRACK_HIST_CLOSE_BUDGET: ${{ vars.TRACK_HIST_CLOSE_BUDGET || '60' }}
           TRACK_HIST_CLOSE_TIME_SEC: ${{ vars.TRACK_HIST_CLOSE_TIME_SEC || '240' }}
+          # (2026-11-08) 1.0.14: track_performance v6.60.0 [HIST-PREVIEW]: under
+          # TRACK_HIST_TARGET_CLOSE=observe, log the outcomes enforce would publish
+          # (win / loss, ROI, by horizon and bucket, outliers). Log lines only;
+          # 'off' = v6.53.0. Clock lane only, like the judge. ROLLBACK: unset or off.
+          TRACK_HIST_CLOSE_PREVIEW: ${{ vars.TRACK_HIST_CLOSE_PREVIEW || 'off' }}
           # (2026-11-02) 1.0.7: track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY].
           # TRACK_HIST_CLOSE_SOURCE: 'yfinance' (default) = the v6.47.0 pull;
           # 'bq_archive' reads the target-session close from BigQuery
