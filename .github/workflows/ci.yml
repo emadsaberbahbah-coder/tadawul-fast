@@ -2,11 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.68 (2026-11-04) -- OUTCOME CALENDARS FOR MORE VENUES (track_performance 6.56.0)
-# (1.1.62 and 1.1.63 are claimed by open #778, 1.1.64 by open #882, 1.1.65 by
-# open #889, 1.1.66 by open #897, 1.1.67 by open #909.)
+# VERSION 1.1.73 (2026-11-04) -- OUTCOME CALENDARS FOR MORE VENUES (track_performance 6.56.0)
+# (1.1.62-1.1.70 are on main. Open claims, re-numbered 2026-11-08 when main
+# took 1.1.68-1.1.70: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922,
+# 1.1.75 #923, 1.1.76 #909. This release first claimed 1.1.68.)
 #
-# v1.1.68: run tests/test_track_outcome_cal_ext.py (track_performance v6.56.0
+# v1.1.73: run tests/test_track_outcome_cal_ext.py (track_performance v6.56.0
 # [OUTCOME-CAL-EXT], TRACK_OUTCOME_CAL_EXT default off = v6.53.0: a forecast on
 # a venue the outcome map lacks uses the opportunity builder's reviewed venue
 # calendar) in its own heavy-job step after the outcome-evidence step; it needs
@@ -16,7 +17,65 @@
 # FAILS those legs instead of skipping them. Nothing is removed and no
 # existing entry moves.
 #
-# VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
+# VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
+#
+# v1.1.70: run tests/test_pre_open_check.py (scripts/pre_open_check.py
+# v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
+# and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
+# the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
+#
+# VERSION 1.1.69 (2026-11-08) -- RISK-BUDGET SIZING SUITE
+#
+# v1.1.69: run tests/test_ob_risk_sizing.py (opportunity_builder v1.29.0:
+# TFB_OPP_SIZING_MODE=risk sizes each ticket so its loss at the printed stop
+# is TFB_OPP_RISK_BUDGET_PCT of the sizing basis; default cap byte-identical)
+# in the blocking lean lane next to the conviction suite.
+#
+# VERSION 1.1.68 (2026-11-08) -- CORP-EVENT GUARD HARNESS
+#
+# v1.1.68: run tests/test_dt10_v1270_corp_guard.js (16_Decision_Top10.gs
+# v1.27.0: DT10_GUARD_CORP_DAYS makes the ticket guard hold a name whose
+# Corporate_Events row - SEC EDGAR 8-K merger / control / charter /
+# delisting / restatement / bankruptcy filings, scripts/run_corporate_events.py
+# v1.0.0 - lies within the window; default off) beside the other cockpit
+# harnesses; its golden negatives rebuild the v1.26.0 file from the delivered
+# one. The lean job also runs tests/test_run_corporate_events.py.
+# v1.1.67: run tests/test_dt10_v1260_fundable_seats.js (16_Decision_Top10.gs
+# v1.26.0: TFB_T10_FUNDABLE_CCY makes the stability core seat listed
+# currencies first; an unlisted name never takes a listed seat; default off)
+# beside the other cockpit harnesses; its golden negatives rebuild the
+# v1.25.0 file from the delivered one.
+# v1.1.66: run tests/test_dt10_v1250_owner_bands.js (16_Decision_Top10.gs
+# v1.25.0: DT10_OWNER_RULE_BANDS lets the owner rule and the ticket guard
+# accept the listed confidence bands, e.g. HIGH,MEDIUM; ROI 12M < 34 and every
+# other gate unchanged; default off) beside the other cockpit harnesses; its
+# golden negatives rebuild the v1.24.0 file from the delivered one.
+# v1.1.65: run tests/test_dt10_v1240_seat_guard.js (16_Decision_Top10.gs
+# v1.24.0: TFB_T10_HARD_EXIT_CONFIRM keeps a seat one day-key on a data-side
+# hard exit; TFB_T10_SEAT_GUARD_DAYS makes displacement take a non-qualifying
+# or unconfirmed fast-track seat before a confirmed one and never a confirmed
+# seat in its first N day-keys; both default off; the cool-down token names a
+# seated sold name once) beside the other cockpit harnesses; its golden
+# negatives rebuild the v1.23.1 file from the delivered one.
+# v1.1.64: run tests/test_dt10_v1231_confirm_window_fix.js (16_Decision_Top10.gs
+# v1.23.1: the window history carries its day-key; a disarmed render day drops
+# the stale bits and a same-day recovery after an outage pause appends today's
+# bit -- the two Codex findings on PR #927) beside the other cockpit harnesses;
+# its golden negatives rebuild the v1.23.0 file from the delivered one.
+# v1.1.63: run tests/test_dt10_v1230_reentry_cooldown.js (16_Decision_Top10.gs
+# v1.23.0: a name sold inside the last N calendar days per _Portfolio_CostBasis
+# cannot be seated on the Top-10 board, Script Property
+# TFB_T10_REENTRY_COOLDOWN_DAYS, default off = v1.22.0 byte for byte) beside
+# the v1.22.0 harness; its golden negative rebuilds the v1.22.0 file from the
+# delivered one (tests/js/dt10_edits_v1230.json, SHA-256 pinned).
+# v1.1.62: run tests/test_dt10_v1220_confirm_window.js (16_Decision_Top10.gs
+# v1.22.0: entry confirmation counts qualified day-keys inside a rolling
+# window, Script Property TFB_T10_CONFIRM_WINDOW, default off = v1.21.1 byte
+# for byte) in the native Apps Script step beside the other cockpit
+# harnesses; its golden negative rebuilds the v1.21.1 file from the delivered
+# one (tests/js/dt10_edits_v1220.json, SHA-256 pinned) so no fetch is needed.
+# The sibling harnesses' delivered-version pins move to 1.22.0 in the same
+# change, as every prior cockpit release did.
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
 # #859 (1.1.50) and #875-#879 (1.1.56-1.1.60)): run
@@ -1067,6 +1126,7 @@ jobs:
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
+            tests/test_run_corporate_events.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
@@ -1147,7 +1207,9 @@ jobs:
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
-            tests/test_ob_conviction_sizing.py $EXTRA
+            tests/test_ob_conviction_sizing.py \
+            tests/test_ob_risk_sizing.py \
+            tests/test_pre_open_check.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
@@ -1224,6 +1286,13 @@ jobs:
           node tests/test_dt10_shadow_rank_log.js
           node tests/test_dt10_shadow_momentum.js
           node tests/test_dt10_post_earnings.js
+          node tests/test_dt10_v1220_confirm_window.js
+          node tests/test_dt10_v1230_reentry_cooldown.js
+          node tests/test_dt10_v1231_confirm_window_fix.js
+          node tests/test_dt10_v1240_seat_guard.js
+          node tests/test_dt10_v1250_owner_bands.js
+          node tests/test_dt10_v1260_fundable_seats.js
+          node tests/test_dt10_v1270_corp_guard.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
@@ -1377,7 +1446,7 @@ jobs:
         env:
           TFB_TEST_REQUIRE_BASE: "1"
         run: |
-          # v1.1.68: the golden legs read track_performance v6.53.0 at main
+          # v1.1.73: the golden legs read track_performance v6.53.0 at main
           # c54eba40; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them.
           git fetch --no-tags --depth=1 origin c54eba40fb82e0a8a0cf8c69b69f7f59ffc3f272 \
             || echo "::warning::tracker v6.53.0 base not fetched - its golden legs will FAIL"

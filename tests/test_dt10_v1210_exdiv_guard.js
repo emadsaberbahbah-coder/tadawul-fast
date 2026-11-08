@@ -116,7 +116,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and B2; comparisons against
  * the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.21\.[01]/g, 'v1.20.0'));   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.2(?:1\.[01]|2\.0|3\.[01]|4\.0|5\.0|6\.0|7\.0)/g, 'v1.20.0'));   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0
 
 /* The Dividend_Events grid (scripts/run_calendar_sync.py v1.3.0 DIV_HEADERS),
  * ex-dates relative to the Riyadh day `d0`. */
@@ -594,9 +594,9 @@ function battery() {
   test('E0 base oracle is the reviewed v1.20.0 file (SHA-256 pinned); versions in lockstep; both files compile; the new constants (the base lacks them)', () => {
     eq(sha256(baseSource), history.V1200_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.20.0', 'base version');
-    eq(N.DT10_VERSION, '1.21.1', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
-    ok(/^ \* Version: 1\.21\.1 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
-    ok(newSource.indexOf("var DT10_VERSION = '1.21.1';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.27.0', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
+    ok(/^ \* Version: 1\.27\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
+    ok(newSource.indexOf("var DT10_VERSION = '1.27.0';") > 0, 'DT10_VERSION literal');
     deq([N.DT10_GUARD_EXDIV_DAYS_PROP, N.DT10_GUARD_EXDIV_PCT_PROP, N.DT10_DIVIDEND_SHEET], [KNOB, PCTK, 'Dividend_Events'], 'names');
     deq([N.DT10_GUARD_EXDIV_DAYS_MAX, N.DT10_GUARD_EXDIV_PCT_DEF, N.DT10_GUARD_EXDIV_PCT_MAX], [30, 2, 100], 'bounds');
     for (const k of ['DT10_GUARD_EXDIV_DAYS_PROP', 'DT10_DIVIDEND_SHEET', 'dt10ExDivHold_', 'dt10ExDivMap_', 'dt10ExDivMapFromValues_']) eq(typeof B[k], 'undefined', 'the base lacks ' + k);
@@ -659,7 +659,7 @@ function battery() {
     deq(o.payload.selected, getOff().payload.selected, 'observe changes no ticket');
     deq(o.payload.kpis, getOff().payload.kpis, 'observe changes no KPI');
     eq(o.token, 'tguard: would hold CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%)', 'token');
-    deq(o.logs.filter(l => /ticket guard/.test(l)), ['[DT10 v1.21.1] ticket guard (observe): would hold 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2%'], 'one Logger line');
+    deq(o.logs.filter(l => /ticket guard/.test(l)), ['[DT10 v1.27.0] ticket guard (observe): would hold 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2%'], 'one Logger line');
     deq(o.logs.filter(l => !/ticket guard/.test(l)), getOff().logs, 'every other Logger line identical');
     eq(o.divReads.length, 1, 'one Dividend_Events read per render');
     eq(o.calReads.length, getOff().calReads.length, 'Calendar_Events reads unchanged');
@@ -715,7 +715,7 @@ function battery() {
     }
     eq(e.ctx.dt10TicketGuardHeldCount_(e.payload.selected), 3, 'three _tguard_held markers');
     const un = Math.round(e.payload.kpis.capital_unallocated_sar - getOff().payload.kpis.capital_unallocated_sar);
-    ok(e.logs.some(l => l === '[DT10 v1.21.1] ticket guard (enforce): held 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2% | executable 6 -> 3, unallocated +' + un + ' SAR'), 'Logger line');
+    ok(e.logs.some(l => l === '[DT10 v1.27.0] ticket guard (enforce): held 3 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) INDV.US(ex-div 1d 22.4%) | earnings <= 3d, owner rule off, cap none, ex-div <= 3d >= 2% | executable 6 -> 3, unallocated +' + un + ' SAR'), 'Logger line');
     // the REAL refresh
     const r = refresh(newSource, { [GUARD]: 'enforce', [KNOB]: '3' });
     ok(/\| output: EXECUTABLE \|/.test(r.status) && /funding=final\/3exec/.test(r.status), 'B2 output / funding: ' + r.status);
@@ -875,7 +875,10 @@ function battery() {
     deq(noB2(r.calls), noB2(refresh(newSource, { [GUARD]: 'enforce' }).calls), 'REAL refresh without the tab: every write = the v1.20.0 enforce');
   });
 
-  const vAll = s => String(s).replace(/1\.21\.[01]/g, '1.20.0');   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0
+  const vAll = s => String(s).replace(/1\.2(?:1\.[01]|2\.0|3\.[01]|4\.0|5\.0|6\.0|7\.0)/g, '1.20.0');   // 2026-11-05: delivered v1.21.1, rebuilt v1.21.0; 2026-11-08: delivered v1.22.0
+  // 2026-11-08: v1.22.0 adds two self-test lines ('confirm window (TFB_T10_CONFIRM_WINDOW): ...' and 'confirm window
+  // core: ...'); they have their own harness, so the v1.20.0 report comparisons read the delivered report without them.
+  const drop1220 = s => String(s).split('\n').filter(l => !/^(?:confirm window|reentry cooldown|hard-exit confirm|seat guard|owner rule bands|fundable seats) /.test(l)).join('\n');   // 2026-11-08: + the two v1.23.0 lines; + the four v1.24.0 lines
   test('E9 embedded dt10SelfTest: the v1.20.0 report while the knob is unset (or the guard off); one core-ok line while it is set and the guard is armed; a fault reads off', () => {
     const mini = (src, props, throwIt) => {
       const statusRows = []; for (let r = 0; r < 60; r++) statusRows.push(['', '']);
@@ -887,11 +890,11 @@ function battery() {
       return String(ctx.dt10SelfTest());
     };
     for (const props of [{}, { [GUARD]: 'observe' }, { [GUARD]: 'enforce', [KNOB]: 'abc' }, { [KNOB]: '3' }, { [GUARD]: 'off', [KNOB]: '3', [PCTK]: '1' }]) {
-      eq(vAll(mini(newSource, props)), mini(baseSource, props), 'the v1.20.0 report ' + JSON.stringify(props));
+      eq(vAll(drop1220(mini(newSource, props))), mini(baseSource, props), 'the v1.20.0 report ' + JSON.stringify(props));
     }
     const rep = mini(newSource, { [GUARD]: 'observe', [KNOB]: '3' });
-    ok(rep.indexOf('[DT10 v1.21.1] self-test') === 0, 'version line');
-    const lines = rep.split('\n'), baseLines = mini(baseSource, { [GUARD]: 'observe', [KNOB]: '3' }).split('\n');
+    ok(rep.indexOf('[DT10 v1.27.0] self-test') === 0, 'version line');
+    const lines = drop1220(rep).split('\n'), baseLines = mini(baseSource, { [GUARD]: 'observe', [KNOB]: '3' }).split('\n');
     eq(lines.length, baseLines.length + 1, 'exactly one line added');
     const want = 'ticket guard ex-div (DT10_GUARD_EXDIV_DAYS): <= 3d, >= 2% of price, tab Dividend_Events | core: ok (INDV 22.4% held, FRST 0.7% passes at 2% and holds at 0.5%, GBP size unknown, GBX on a GBp price measured, earnings first)';
     const at = lines.indexOf(want);
@@ -901,7 +904,7 @@ function battery() {
     ok(rep.indexOf('FAIL') < 0, 'no FAIL');
     const p05 = mini(newSource, { [GUARD]: 'enforce', [KNOB]: '7', [PCTK]: '0.5' });
     ok(p05.indexOf('ticket guard ex-div (DT10_GUARD_EXDIV_DAYS): <= 7d, >= 0.5% of price, tab Dividend_Events | core: ok (') > 0 && p05.indexOf('FAIL') < 0, 'the knobs are reported');
-    eq(vAll(mini(newSource, { [GUARD]: 'enforce', [KNOB]: '3' }, true)), mini(baseSource, { [GUARD]: 'enforce', [KNOB]: '3' }, true), 'a property fault: the v1.20.0 report');
+    eq(vAll(drop1220(mini(newSource, { [GUARD]: 'enforce', [KNOB]: '3' }, true))), mini(baseSource, { [GUARD]: 'enforce', [KNOB]: '3' }, true), 'a property fault: the v1.20.0 report');
   });
 
   test('E10 ES5 / ASCII lint of the v1.21.0 diff; inventory: 3 functions and 6 vars added, 0 removed; 13 hunks whose reversal is the reviewed v1.20.0 file; WHY block; every prior WHY verbatim', () => {
@@ -977,9 +980,9 @@ function battery() {
       eq(mk(p).dt10TicketGuardConfig_().exdivPct, want, 'pct ' + JSON.stringify(v));
     }
     const off = mk({ [KNOB]: '3', [PCTK]: '1' }); eq(off.dt10TicketGuardConfig_(), null, 'off -> null'); deq(off.__propReads, [GUARD], 'off: one read');
-    const a0 = mk({ [GUARD]: 'enforce' }); a0.dt10TicketGuardConfig_(); deq(a0.__propReads, [GUARD].concat(KNOBS, [KNOB]), 'armed, no days knob: + one read');
-    const a1 = mk({ [GUARD]: 'enforce', [KNOB]: '3' }); a1.dt10TicketGuardConfig_(); deq(a1.__propReads, [GUARD].concat(KNOBS, [KNOB, PCTK]), 'armed + days: the pct knob once');
-    const aj = mk({ [GUARD]: 'enforce', [KNOB]: 'abc', [PCTK]: '1' }); aj.dt10TicketGuardConfig_(); deq(aj.__propReads, [GUARD].concat(KNOBS, [KNOB]), 'junk days: the pct knob is not read');
+    const a0 = mk({ [GUARD]: 'enforce' }); a0.dt10TicketGuardConfig_(); deq(a0.__propReads, [GUARD].concat(KNOBS, [KNOB, 'DT10_GUARD_CORP_DAYS']), 'armed, no days knob: + one read (+ the v1.27.0 corp-days knob)');
+    const a1 = mk({ [GUARD]: 'enforce', [KNOB]: '3' }); a1.dt10TicketGuardConfig_(); deq(a1.__propReads, [GUARD].concat(KNOBS, [KNOB, PCTK, 'DT10_GUARD_CORP_DAYS']), 'armed + days: the pct knob once (+ the v1.27.0 corp-days knob)');
+    const aj = mk({ [GUARD]: 'enforce', [KNOB]: 'abc', [PCTK]: '1' }); aj.dt10TicketGuardConfig_(); deq(aj.__propReads, [GUARD].concat(KNOBS, [KNOB, 'DT10_GUARD_CORP_DAYS']), 'junk days: the pct knob is not read (+ the v1.27.0 corp-days knob)');
     eq(mk({ [GUARD]: 'enforce', [KNOB]: '3' }, true).dt10TicketGuardConfig_(), null, 'fault -> off');
     deq(plain(mk({ [GUARD]: 'enforce', [KNOB]: '3' }).dt10TicketGuardConfig_()), { mode: 'enforce', earnDays: 3, ownerRule: false, maxTickets: 0, exdivDays: 3, exdivPct: 2 }, 'the armed object');
   });
