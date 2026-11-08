@@ -282,7 +282,7 @@ PENDING = {
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
     "v_outcome_engine": "85d51279fdaa42b351c5ab8c277b507923005c6395fbf9b866aab01deed64c5e",
-    "v_outcome_excess": "3e4a104a9165c63497fe48b67003496d4b418d1501fabe8fe6f5cdc621c876e0",
+    "v_outcome_excess": "6a085d68f0862f1bae7d32c8ed29ae3c9c370931c6e924c98ddf52a5b61f6fc7",
     "v_market_regime": "422399a6120a712f93eae28ef9441f6f3eadabc54a24f08f086486fb9032483c",
     "v_seat_regime": "9860388614461fd67e344c04c5661f084bbc55b924eae43ceaec824c21816426",
     "v_regime_outcomes": "3a4c2de8caba465cf406f459358c7f6a492f4065e21a6d3327c3bec01c037188",
@@ -1878,6 +1878,10 @@ def case_v31():
                  "ARRAY_AGG(IF(b.date >= e.base_bar_date, b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS bench_base",
                  "ARRAY_AGG(IF(e.target_bar_date IS NOT NULL AND b.date >= e.target_bar_date, b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS bench_target",
                  "AND b.date >= e.base_bar_date",
+                 # review on #934 (P2): the scan reaches the target bar for every horizon
+                 # (6M / 1Y) and keeps the 98-day ladder window, as the engine's own scan does
+                 "AND b.date <= GREATEST(DATE_ADD(e.recorded_day, INTERVAL 98 DAY),",
+                 "DATE_ADD(COALESCE(e.target_bar_date, e.recorded_day), INTERVAL 7 DAY))",
                  "WHERE e.base_bar_date IS NOT NULL",
                  "ROUND(x.engine_roi_pp - x.bench_roi_pp, 4) AS excess_pp",
                  "WHEN x.entry_stance = 'bullish' THEN IF(x.engine_roi_pp > x.bench_roi_pp, 'WIN', 'LOSS')",
@@ -1896,6 +1900,11 @@ def case_v31():
     assert _bench_return(spy, 1, 5) == -4.4                                   # from the recording day: the wrong window
     assert _bench_return(spy, 2, 6) == -3.9604                                # day 6 has no bar: the first on/after (day 8)
     assert _bench_return(spy, 2, 9) is None
+    # a 1Y horizon: the target bar sits far beyond 98 days; the scan must reach it
+    assert "AND b.date <= DATE_ADD(e.recorded_day, INTERVAL 98 DAY)\n" not in code
+    long_spy = [{"date": 2, "close": 100.0}, {"date": 90, "close": 104.0}, {"date": 366, "close": 110.0}]
+    assert _bench_return(long_spy, 2, 365) == 10.0                            # found at the 1Y target bar
+    assert _bench_return([b for b in long_spy if b["date"] <= 98], 2, 365) is None   # the old 98-day cut: NULL
 
 
 def _regime(r1, r5, dd, vix, vol20, vs50):

@@ -12,8 +12,10 @@
 -- to the outcome bar, each benchmark close being the first archived
 -- benchmark bar on/after that date; the ladder steps use the first benchmark
 -- bar 7 / 14 / 30 / 91 days after the recording, as the engine does for the
--- stock. Benchmark closes are price closes (indices carry no dividends; the
--- ETF dividend over a few weeks is below the rounding).
+-- stock; the scan reaches the target bar for every horizon (6M, 1Y included)
+-- and the 98-day ladder window, as the engine's own scan does. Benchmark
+-- closes are price closes (indices carry no dividends; the ETF dividend over
+-- a few weeks is below the rounding).
 -- COLUMNS beyond v_outcome_engine's own: benchmark_symbol, bench_roi_pp (to
 -- the target bar), excess_pp = engine_roi_pp - bench_roi_pp, excess_call
 -- (WIN when a bullish call beat its market or a bearish one trailed it; LOSS
@@ -57,7 +59,10 @@ agg AS (
   JOIN b
     ON b.symbol = e.benchmark_symbol
    AND b.date >= e.base_bar_date
-   AND b.date <= DATE_ADD(e.recorded_day, INTERVAL 98 DAY)
+   -- the scan reaches the target bar for every horizon (6M, 1Y) and keeps
+   -- the 98-day ladder window, as the engine's own bar scan does
+   AND b.date <= GREATEST(DATE_ADD(e.recorded_day, INTERVAL 98 DAY),
+                          DATE_ADD(COALESCE(e.target_bar_date, e.recorded_day), INTERVAL 7 DAY))
   WHERE e.base_bar_date IS NOT NULL
   GROUP BY e.record_id
 ),
