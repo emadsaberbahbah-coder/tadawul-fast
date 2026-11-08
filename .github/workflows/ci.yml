@@ -2,8 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.65 (2026-11-08) -- SEAT GUARD HARNESS
+# VERSION 1.1.66 (2026-11-08) -- OWNER BANDS HARNESS
 #
+# v1.1.66: run tests/test_dt10_v1250_owner_bands.js (16_Decision_Top10.gs
+# v1.25.0: DT10_OWNER_RULE_BANDS lets the owner rule and the ticket guard
+# accept the listed confidence bands, e.g. HIGH,MEDIUM; ROI 12M < 34 and every
+# other gate unchanged; default off) beside the other cockpit harnesses; its
+# golden negatives rebuild the v1.24.0 file from the delivered one.
 # v1.1.65: run tests/test_dt10_v1240_seat_guard.js (16_Decision_Top10.gs
 # v1.24.0: TFB_T10_HARD_EXIT_CONFIRM keeps a seat one day-key on a data-side
 # hard exit; TFB_T10_SEAT_GUARD_DAYS makes displacement take a non-qualifying
@@ -1241,6 +1246,7 @@ jobs:
           node tests/test_dt10_v1230_reentry_cooldown.js
           node tests/test_dt10_v1231_confirm_window_fix.js
           node tests/test_dt10_v1240_seat_guard.js
+          node tests/test_dt10_v1250_owner_bands.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
