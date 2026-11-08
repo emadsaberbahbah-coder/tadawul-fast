@@ -16,22 +16,24 @@
   - (a) Confirmed challengers and the fast-track fill take listed names first. Score order is kept within each group.
   - (b) A listed challenger takes the seat guard's non-qualifying pick when there is one. Otherwise it takes the weakest unlisted seat without the score test (tag `nf`). Outage-paused seats and seats entered on this run are never taken this way.
   - (c) An unlisted challenger may only take an unlisted seat, and only by the v1.25.0 score test (tag `u`). If there is none, it waits.
+    - With the seat guard armed, the guard's own rules apply, restricted to unlisted seats. A fresh confirmed seat therefore stays protected (review fix, Codex P2 on #933: `guardVictim` takes an optional filter; absent = the v1.24.0 pick).
+    - A listed challenger's `nf` take ignores seat age: the owner's priority is a fundable seat.
 - Status line: note token `, fundable=SAR/USD[ took SYM(nf)]`. `audit.fundable {ccys, took}` is written only while armed.
 
 **Diff.**
-- 14 anchored hunks.
+- 15 anchored hunks.
 - Functions: +3 (`dt10StabFundableParse_`, `dt10StabFundableText_`, `dt10StabFundable_`) plus three closures inside the core (`fundOk`, `fundFirst`, `fundVictim`). Vars: +1 (`DT10_T10_FUNDABLE_PROP`). Nothing removed.
 - ES5 / ASCII. `dt10SelfTest` gains 2 lines, zero FAIL.
 - Base: v1.25.0, sha256 `ce61ed2346b74131a5f5f0e0573006d3cf0163960ad128d0ceb30ddff3013860`.
-- New: v1.26.0, sha256 `3294a4affdc58e441d1a103f8db3930680da0060fa7c767ef0865961e23a40e9`.
+- New: v1.26.0, sha256 `aecda7002feaa355b64cc83fbf283fc0f9d0775d91ba054ab991dbe62f393eba`.
 
-**Harness.** `tests/test_dt10_v1260_fundable_seats.js` (+ `.py`) gives PASS 7/7, x3 identical, digest `ba36d9b785c89552`.
+**Harness.** `tests/test_dt10_v1260_fundable_seats.js` (+ `.py`) gives PASS 7/7, x3 identical, digest `3eeb20390a720ad6`.
 - F1: GOLDEN NEGATIVE (the #929 trace) on v1.25.0, which ignores the knob.
-- F2: the seven armed rules.
+- F2: the armed rules, including the guard-age case: a fresh unlisted seat stays protected from an unlisted challenger, and is taken by the score test once past the guard.
 - F3: kill. With no knob the core deep-equals v1.25.0 on eight scenarios, with and without the seat guard.
 - F4: self-test.
 - F5: lint.
-- F6: four mutants.
+- F6: five mutants.
 
 **History and pins.** `v1250Source` (SHA pinned) now heads the chain, and the v1.25.0 harness reads the rebuilt v1.25.0.
 - Pins moved to 1.26.0 in 14 harnesses.

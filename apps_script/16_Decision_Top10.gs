@@ -23,7 +23,9 @@
  *   (b) a listed confirmed challenger takes the seat guard's non-qualifying pick when there is one, else the weakest
  *       unlisted seat WITHOUT the score test (tag 'nf'); outage-paused seats and seats entered on this run are never
  *       taken that way; otherwise the v1.25.0 victim and test apply;
- *   (c) an unlisted challenger may only take an unlisted seat (the v1.25.0 test); with none, it waits.
+ *   (c) an unlisted challenger may only take an unlisted seat (the v1.25.0 score test; with the seat guard armed,
+ *       the guard's own rules restricted to unlisted seats, so a fresh confirmed seat stays protected); with none,
+ *       it waits. A listed challenger's 'nf' take ignores seat age: the owner's priority is a fundable seat.
  *   Note token ', fundable=USD/SAR[ took SYM(nf)]'; audit.fundable {ccys, took} only while armed.
  *   Rollback: delete the property.
  *
@@ -5460,10 +5462,11 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   // test), else the weakest confirmed seat past its first sgDays day-keys
   // (score test). Outage-paused seats are never taken without the score test;
   // a seat entered on this run is never taken.
-  function guardVictim() {
+  function guardVictim(allow) {   // v1.26.0: optional filter (absent = the v1.24.0 pick)
     var gi, gs, gst;
     for (gi = finalSyms.length - 1; gi >= 0; gi--) {
       gs = finalSyms[gi]; gst = symbols[gs];
+      if (allow && !allow(gs)) continue;
       if (gst && gst.member === true && !dt10InList_(pausedSyms, gs) &&
           (dt10InList_(hardHeld, gs) ||
            !(rawSet[gs] === true || (qualifiedBasis && qualifiedWithin(gs))))) {
@@ -5472,6 +5475,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     }
     for (gi = finalSyms.length - 1; gi >= 0; gi--) {
       gs = finalSyms[gi]; gst = symbols[gs];
+      if (allow && !allow(gs)) continue;
       if (gst && gst.member === true && gst.ft === true && !dt10InList_(pausedSyms, gs) &&
           (gst.ci || 0) < knobs.confirm_days) {
         return { sym: gs, force: true, tag: 'ft' };
@@ -5479,6 +5483,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     }
     for (gi = finalSyms.length - 1; gi >= 0; gi--) {
       gs = finalSyms[gi]; gst = symbols[gs];
+      if (allow && !allow(gs)) continue;
       if (!gst || gst.member !== true) continue;
       if (dt10StabDays_(gst.since || today, today) + 1 <= sgDays) continue;
       return { sym: gs, force: false, tag: '' };
@@ -5504,6 +5509,11 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     }
     var cur = gPick !== null ? gPick.sym : finalSyms[finalSyms.length - 1];
     if (cur && !fundOk(cur)) return null;
+    if (sgDays > 0) {   // the seat guard's rules, restricted to unlisted seats
+      var gu = guardVictim(function (gsym) { return !fundOk(gsym); });
+      return gu.sym ? { sym: gu.sym, force: gu.force, tag: 'u' + (gu.tag ? '-' + gu.tag : '') } :
+                      { sym: '', force: false, tag: '' };
+    }
     for (vi = finalSyms.length - 1; vi >= 0; vi--) {
       vs = finalSyms[vi]; vst = symbols[vs];
       if (vst && vst.member === true && !fundOk(vs) && !dt10InList_(entered, vs)) {

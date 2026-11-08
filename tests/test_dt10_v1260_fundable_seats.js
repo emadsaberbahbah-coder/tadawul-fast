@@ -125,6 +125,15 @@ var SC = {
   /* the candidate row has no currency; the raw ticket says USD */
   G: { raw: [tk('E.PA', 95, 'EUR'), tk('R.US', 70, 'USD')], grid: [cand('E.PA', 95, 'EUR'), cand('R.US', 70)],
        seed: seed({ 'E.PA': seat([95, 95]), 'R.US': chal([70, 70]) }), limit: 1 },
+  /* Codex P2 on #933: guard 3, an old listed seat O.US at 50, a FRESH confirmed unlisted seat F.PA at 80, an unlisted
+     challenger X.PA confirming at 92: the guard picks O.US; the unlisted path must keep F.PA's age protection */
+  I: { raw: [tk('X.PA', 92, 'EUR'), tk('F.PA', 80, 'EUR'), tk('O.US', 50, 'USD')],
+       grid: [cand('X.PA', 92, 'EUR'), cand('F.PA', 80, 'EUR'), cand('O.US', 50, 'USD')],
+       seed: seed({ 'O.US': seat([50, 50]), 'F.PA': seat([80, 80], { since: '2026-10-20' }), 'X.PA': chal([92, 92]) }), limit: 2 },
+  /* the same with F.PA past the guard: the unlisted challenger takes it by the score test */
+  J: { raw: [tk('X.PA', 92, 'EUR'), tk('F.PA', 80, 'EUR'), tk('O.US', 50, 'USD')],
+       grid: [cand('X.PA', 92, 'EUR'), cand('F.PA', 80, 'EUR'), cand('O.US', 50, 'USD')],
+       seed: seed({ 'O.US': seat([50, 50]), 'F.PA': seat([80, 80]), 'X.PA': chal([92, 92]) }), limit: 2 },
   /* no currency anywhere: unlisted */
   H: { raw: [tk('E.PA', 95, 'EUR'), tk('X.US', 70)], grid: [cand('E.PA', 95, 'EUR'), cand('X.US', 70)],
        seed: seed({ 'E.PA': seat([95, 95]), 'X.US': chal([70, 70]) }), limit: 1 }
@@ -135,7 +144,7 @@ function battery() {
   var N = load(newSource, {}), B = load(baseSource, {});
   var parts = [];
 
-  test('F0 base oracle is the reviewed v1.25.0 file (SHA-256 pinned); versions in lockstep; both compile; census +3 functions +1 var, 0 removed; 14 hunks reverse to the base', function () {
+  test('F0 base oracle is the reviewed v1.25.0 file (SHA-256 pinned); versions in lockstep; both compile; census +3 functions +1 var, 0 removed; 15 hunks reverse to the base', function () {
     eq(sha256(baseSource), history.V1250_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.25.0'); eq(N.DT10_VERSION, '1.26.0');
     assert(/^ \* Version: 1\.26\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');
@@ -147,7 +156,7 @@ function battery() {
     deq(Object.keys(vb).filter(function (k) { return !vn[k]; }), [], 'vars removed');
     deq(Object.keys(vn).filter(function (k) { return !vb[k]; }).sort(), ['DT10_T10_FUNDABLE_PROP'], 'vars added');
     eq(N.DT10_T10_FUNDABLE_PROP, FD);
-    eq(EDITS.length, 14, 'hunk count');
+    eq(EDITS.length, 15, 'hunk count');
     for (var e = 0; e < EDITS.length; e++) eq(newSource.split(EDITS[e][0]).length - 1, 1, 'each current is unique: ' + EDITS[e][0].split('\n')[0]);
     eq(sha256(history.v1250Source(newSource)), history.V1250_SHA256, 'reversal of the delivered file');
   });
@@ -181,6 +190,14 @@ function battery() {
     var pz = core(N, [tk('U.US', 70, 'USD')], [cand('U.US', 70, 'USD')], SC.B.seed, knobs(true), 1, { 'E.PA': true });
     eq(pz.audit.exited_displaced.length, 0, 'an outage-paused unlisted seat (row missing in an outage) is never force-taken');
     eq(pz.state.symbols['E.PA'].member, true, 'the paused seat keeps its seat');
+    var i0 = run(B, 'I', false, { seat_guard_days: 3 }), i1 = run(N, 'I', true, { seat_guard_days: 3 });
+    eq(i0.audit.exited_displaced.join(','), 'O.US', 'base: the guard takes the old listed seat');
+    eq(i1.audit.exited_displaced.length, 0, 'armed: the fresh unlisted seat keeps its age protection, X.PA waits');
+    assert(i1.state.symbols['F.PA'].member === true && i1.state.symbols['O.US'].member === true && i1.note.indexOf('X.PA(3/3)') > 0, 'note: ' + i1.note);
+    var j1 = run(N, 'J', true, { seat_guard_days: 3 });
+    eq(j1.audit.exited_displaced.join(','), 'F.PA', 'past the guard the unlisted seat goes by the score test');
+    assert(j1.note.indexOf('took F.PA(u)') > 0, 'note: ' + j1.note);
+    parts.push(i1.note, j1.note);
     var g = run(N, 'G', true);
     eq(g.audit.exited_displaced.join(','), 'E.PA', 'raw-ticket USD stands in for the row');
     var h = run(N, 'H', true);
@@ -231,12 +248,13 @@ function battery() {
     assert(why > 0 && prev > why, 'WHY block newest-first');
   });
 
-  test('F6 mutants: four one-line mutations are each caught', function () {
+  test('F6 mutants: five one-line mutations are each caught', function () {
     var mutants = [
       ['fill in raw order', "  var ftSyms = fundFirst(rawSyms);   // v1.26.0: listed names fill first (armed only)", "  var ftSyms = rawSyms;"],
       ['nf needs the score test', "          return { sym: vs, force: true, tag: 'nf' };", "          return { sym: vs, force: false, tag: 'nf' };"],
       ['unlisted challenger may take a listed seat', "    if (cur && !fundOk(cur)) return null;", "    if (cur) return null;"],
-      ['no raw-ticket fallback', "    if ((fccy === null || fccy === undefined || fccy === '') && rawBySym[sym]) fccy = rawBySym[sym].currency;", "    // (mutant: no fallback)"]
+      ['no raw-ticket fallback', "    if ((fccy === null || fccy === undefined || fccy === '') && rawBySym[sym]) fccy = rawBySym[sym].currency;", "    // (mutant: no fallback)"],
+      ['unlisted path ignores the seat guard', "    if (sgDays > 0) {   // the seat guard's rules, restricted to unlisted seats", "    if (false) {"]
     ];
     mutants.forEach(function (mu) {
       eq(newSource.split(mu[1]).length - 1, 1, 'mutant anchor unique: ' + mu[0]);
@@ -247,7 +265,8 @@ function battery() {
         var ok2 = run(M, 'B', true).audit.exited_displaced.join(',') === 'E.PA';
         var ok3 = run(M, 'A', true).audit.exited_displaced.length === 0;
         var ok4 = run(M, 'G', true).audit.exited_displaced.join(',') === 'E.PA';
-        caught = !(ok1 && ok2 && ok3 && ok4);
+        var ok5 = run(M, 'I', true, { seat_guard_days: 3 }).audit.exited_displaced.length === 0;
+        caught = !(ok1 && ok2 && ok3 && ok4 && ok5);
       } catch (eM) { caught = true; }
       assert(caught, 'mutant not caught: ' + mu[0]);
     });
