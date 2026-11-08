@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.5.0 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.6.0 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
 pages; 2d: candles, analysts, news and the TFB rating per symbol; 2e: the
-learning loop from the archive). Offline: the BigQuery session is a fake, no
-google library is imported.
+learning loop from the archive; 2f: the signal edge). Offline: the BigQuery
+session is a fake, no google library is imported.
 
-  V1  the 41 objects load in apply order (6 functions, then the views and
+  V1  the 43 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
@@ -16,11 +16,11 @@ google library is imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the objects v1.5.0 adds or changes hash to their reviewed files (pending
-      pins, confirmed by bq_views --verify after the next --write; v1.2.0's
-      were read back on 31 Oct, v1.3.0's on 1 Nov and v1.3.1 / 1.4.0 / 1.4.1's
-      on 1 Nov 15:27 Riyadh, and are installed pins); a table function keeps
-      the query after its 'AS' line
+      the objects v1.6.0 adds hash to their reviewed files (pending pins,
+      confirmed by bq_views --verify after the next --write; v1.2.0's were
+      read back on 31 Oct, v1.3.0's on 1 Nov, v1.3.1 / 1.4.0 / 1.4.1's on 1 Nov
+      15:27 Riyadh and v1.5.0's on 8 Nov, and are installed pins); a table
+      function keeps the query after its 'AS' line
   V5  the static checks refuse a data-changing statement, a hard-coded
       project, a forward reference, two statements, a function after a view,
       a misnamed file, a CREATE TABLE and an unknown source table; they accept
@@ -146,6 +146,24 @@ google library is imported.
       unchanged; the file now applies after v_outcome_engine (fails when the
       ALL row drops an engine column, when the engine rate is taken over
       every scored row instead of the cohort)
+  V28 v_signal_edge_daily (v1.6.0): one row per symbol and recording day
+      from the day's first recording time; the scoring signals of the
+      forecast's own run (the earliest snapshot 0-60 s after it; else the
+      newest before it, at most 3 days older - never a later run); per day,
+      market group (ALL / US / Tadawul / Other markets),
+      feature and horizon with >= 20 names and two distinct values: the
+      Spearman IC over average ranks for ties (tie keys INT64, since BigQuery
+      cannot partition by FLOAT64), the top / bottom-third excess return and
+      the horizon length (simulated - fails on min ranks for uneven ties, on
+      the previous run's signal when the forecast's own snapshot exists, on a
+      later run's signal, on 19 names, on a return beyond 300 %, on a window
+      partitioned by a FLOAT64 value)
+  V29 v_signal_edge (v1.6.0): mean daily IC, the overlap-adjusted t
+      (mean / sd x SQRT(days / horizon_days)), first- and second-half IC and
+      the fixed verdict thin / edge / inverse / no edge / unstable, thin
+      first (simulated - fails when a 1M signal with 90 days reads 'edge' on
+      the naive t, when a sign that flipped between halves reads 'edge', when
+      a short history is judged)
 """
 from __future__ import annotations
 
@@ -221,16 +239,19 @@ INSTALLED = {
     "v_symbol_rating": "3a07d374b2b1c175e9dd040a0fbd87b6dda158b1d35edf00bf56d263a2b7d0d1",
     "v_top10_insight": "66d2facf68aadfb9088e05eed29669daf063b04bb1b82a8ccf0928911438e9cf",
     "v_portfolio_insight": "a905416997fa03335516b028edfa60a215d21d22ee6c75fdc54aba52eb64216b",
-}
-# The objects apply_bq_views 1.5.0 adds or changes (2 Nov 2026), hashed from the
-# reviewed files: bq_views --verify after the next --write must find these exact
-# bodies in INFORMATION_SCHEMA (then they move to INSTALLED). Installed body
-# v_outcome_coverage replaces: ab308c8c736d (1.4.1).
-PENDING = {
+    # apply_bq_views 1.5.0, installed by bq_views write run 41441740101 (2 Nov) and read
+    # back from INFORMATION_SCHEMA on 8 Nov 2026 (all four matched their reviewed files)
     "v_outcome_engine": "a7f75e0528a36bed30147611165696df9f8074f4c2551d96dc0e83b9d8f71d62",
     "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
     "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
     "v_outcome_coverage": "341bd1f3a44d5d35e88c309a3f3a6ac6dd6e4678d640843c373fddad87447f31",
+}
+# The objects apply_bq_views 1.6.0 adds (8 Nov 2026), hashed from the reviewed
+# files: bq_views --verify after the next --write must find these exact bodies
+# in INFORMATION_SCHEMA (then they move to INSTALLED).
+PENDING = {
+    "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
+    "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -244,9 +265,10 @@ EXPECTED_ORDER = [
     "v_dive_signals", "v_dive_board", "v_dive_events",
     "v_top10_insight", "v_portfolio_insight",
     "v_outcome_engine", "v_outcome_calibration", "v_board_archive", "v_outcome_coverage",
+    "v_signal_edge_daily", "v_signal_edge",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 13)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 15)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -1524,9 +1546,187 @@ def case_v27():
     assert _coverage_engine(rows, cohort=False)["1W"][:3] == (3, 2, 66.7)     # every copy counted: wrong
 
 
+
+def _avg_ranks(vals, average=True):
+    """1-based ranks of vals as the view computes them: RANK() (1 + the number of
+    smaller values) plus (ties - 1) / 2; average=False is the plain RANK() mutant."""
+    order = sorted(vals)
+    return [order.index(v) + 1 + ((order.count(v) - 1) / 2 if average else 0) for v in vals]
+
+
+def _pearson(a, b):
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    if not va or not vb:
+        return None
+    return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb) ** 0.5
+
+
+def _edge_day(xs, rs, min_n=20, average=True):
+    """v_signal_edge_daily for one day / market group / feature / horizon: (n, ic,
+    top_ex, bottom_ex), or None under the floor (>= 20 names, two distinct values)."""
+    pairs = [(x, r) for x, r in zip(xs, rs) if x is not None and r is not None and abs(r) <= 300]
+    n = len(pairs)
+    xk = [int(round(x * 10000)) for x, _ in pairs]
+    if n < min_n or len(set(xk)) < 2:
+        return None
+    rx = _avg_ranks(xk, average)
+    rr = _avg_ranks([int(round(r * 10000)) for _, r in pairs], average)
+    mean = sum(r for _, r in pairs) / n
+    top = [r - mean for (_, r), q in zip(pairs, rx) if q > 2 * n / 3]
+    bot = [r - mean for (_, r), q in zip(pairs, rx) if q <= n / 3]
+    return (n, _pearson(rx, rr), sum(top) / len(top) if top else None,
+            sum(bot) / len(bot) if bot else None)
+
+
+def _own_run_signal(signals, rec_at, after=60.0, days=3):
+    """The signal v_signal_edge_daily joins (times in seconds): the earliest
+    (recorded_at, value) 0-`after` s after the forecast - the snapshot its own
+    tracker run writes seconds later - else the newest one before it, at most
+    `days` older; None when there is none."""
+    own = [s for s in signals if rec_at <= s[0] <= rec_at + after]
+    if own:
+        return min(own)[1]
+    prior = [s for s in signals if rec_at - days * 86400 <= s[0] < rec_at]
+    return max(prior)[1] if prior else None
+
+
+def case_v28():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_signal_edge_daily"]
+    assert o.path.name == "74_v_signal_edge_daily.sql" and o.kind == "VIEW"
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_signal_edge_daily"} == {"v_outcome_engine", "v_signal_history"}
+    for frag in (
+            # the day's first recording time only: a later re-record cannot borrow the day's move
+            "SELECT symbol, recorded_date, MIN(recorded_at) AS first_at",
+            "ON f.symbol = e.symbol AND f.recorded_date = e.recorded_date AND f.first_at = e.recorded_at",
+            # the scoring signals of the forecast's own run (written seconds after it), else the
+            # newest earlier one - never a later run (Codex P2 on #932)
+            "AND s.recorded_at <= TIMESTAMP_ADD(r.rec_at, INTERVAL 60 SECOND)",
+            "AND s.recorded_at >= TIMESTAMP_SUB(r.rec_at, INTERVAL 3 DAY)",
+            "ORDER BY IF(s.recorded_at >= r.rec_at, 0, 1),",
+            "IF(s.recorded_at >= r.rec_at, UNIX_MICROS(s.recorded_at), -UNIX_MICROS(s.recorded_at))) = 1",
+            "IF(j.market IN ('US', 'Tadawul'), j.market, 'Other markets') AS market_group",
+            "UNPIVOT (r FOR horizon IN (r_1w AS '1W', r_2w AS '2W', r_1m AS '1M', r_3m AS '3M'))",
+            "WHERE ABS(r) <= 300\n",
+            "CAST(ROUND(x * 10000) AS INT64) AS xk",
+            "CAST(ROUND(r * 10000) AS INT64) AS rk",
+            "RANK() OVER (PARTITION BY d, market_group, feature, horizon ORDER BY xk)",
+            "+ (COUNT(*) OVER (PARTITION BY d, market_group, feature, horizon, xk) - 1) / 2 AS rx",
+            "RANK() OVER (PARTITION BY d, market_group, feature, horizon ORDER BY rk)",
+            "+ (COUNT(*) OVER (PARTITION BY d, market_group, feature, horizon, rk) - 1) / 2 AS rr",
+            "COUNT(DISTINCT xk) OVER (PARTITION BY d, market_group, feature, horizon) AS nx",
+            "CORR(rx, rr) AS ic",
+            "AVG(IF(rx > 2 * n / 3, r - r_mean, NULL)) AS top_ex",
+            "AVG(IF(rx <= n / 3, r - r_mean, NULL)) AS bottom_ex",
+            "WHERE n >= 20 AND nx >= 2",
+            "CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91 END AS horizon_days",
+            "ROUND(top_ex - bottom_ex, 4) AS spread_pp"):
+        assert frag in code, frag
+    feats = re.search(r"UNPIVOT \(x FOR feature IN \(([^)]*)\)\)", code).group(1)
+    assert [f.strip() for f in feats.split(",")] == [
+        "engine_roi_1w", "engine_roi_2w", "engine_roi_1m", "engine_roi_3m", "reliability", "data_quality",
+        "confidence", "recommendation", "investability", "stance", "overall_score", "risk_score",
+        "target_upside"], feats
+    # BigQuery refuses a window partitioned by a FLOAT64: no window partitions by the raw x or r
+    parts = re.findall(r"PARTITION BY ([a-z_, .]+?)(?:\s+ORDER BY|\))", code)
+    assert len(parts) == 8, parts                       # the as-of pick + the seven rank windows
+    for part in parts:
+        keys = [k.strip() for k in part.split(",")]
+        assert "x" not in keys and "r" not in keys, part
+    assert "the live system never reads BigQuery" in o.template
+    # simulated: a perfect order, its reverse, the floor, the 300 % filter, the thirds
+    xs = [float(i) for i in range(1, 21)]
+    n, ic, top, bot = _edge_day(xs, [2.0 * x for x in xs])
+    assert n == 20 and abs(ic - 1.0) < 1e-12 and top > 0 > bot
+    assert abs(_edge_day(xs, [-x for x in xs])[1] + 1.0) < 1e-12
+    assert _edge_day(xs[:19], xs[:19]) is None                               # 19 names: no IC that day
+    assert _edge_day([5.0] * 20, xs) is None                                 # one distinct value
+    assert _edge_day(xs + [21.0], xs + [400.0])[0] == 20                     # a 400 % "return" is a data error
+    x21 = [float(i) for i in range(1, 22)]
+    day = _edge_day(x21, x21)
+    assert day[2] == (sum(range(15, 22)) / 7 - 11) and day[3] == (sum(range(1, 8)) / 7 - 11)  # 7 + 7 of 21
+    # ties: average ranks (the tie-corrected Spearman); plain RANK() is a golden negative
+    # (12 names at x = 1 split 6 / 6 between the lowest and the highest return, 8 names at
+    # x = 2 in the middle: no association, IC 0; min ranks of the uneven return ties invent -0.09)
+    tied = [1.0] * 12 + [2.0] * 8
+    ret = [1.0] * 6 + [3.0] * 6 + [2.0] * 8
+    good = _edge_day(tied, ret)[1]
+    assert abs(good) < 1e-12 and abs(good - _pearson(_avg_ranks(tied), _avg_ranks(ret))) < 1e-12
+    assert _edge_day(tied, ret, average=False)[1] < -0.05, "min ranks must not pass for average ranks"
+    # the forecast's own run: the tracker appends the forecast, then writes that run's snapshot
+    # seconds later; the next run comes 68 s or more after (times in seconds)
+    rec = 1000.0
+    sig = [(rec - 18000, "previous run"), (rec + 2, "own run"), (rec + 3, "own run, 2nd write"),
+           (rec + 68, "next run"), (rec + 28800, "later run")]
+    assert _own_run_signal(sig, rec) == "own run"
+    strict = max(s for s in sig if s[0] <= rec)[1]                            # the 1st version's cut
+    assert strict == "previous run" != _own_run_signal(sig, rec)
+    newest_in_5min = max(s for s in sig if s[0] <= rec + 300)[1]              # a wider, newest-first window
+    assert newest_in_5min == "next run" != _own_run_signal(sig, rec)
+    assert _own_run_signal([(rec - 600, "prior"), (rec + 68, "next run")], rec) == "prior"
+    assert _own_run_signal([(rec - 4 * 86400, "too old"), (rec + 120, "next run")], rec) is None
+
+
+def _edge_verdict(days, horizon_days, mean_ic, sd_ic, m1, m2):
+    """v_signal_edge's t_adj and verdict, arm for arm."""
+    t = mean_ic / sd_ic * (days / horizon_days) ** 0.5 if sd_ic else None
+    if days < 10 or days < 2 * horizon_days:
+        return "thin", t
+    if t is not None and t >= 2 and m1 > 0 and m2 > 0:
+        return "edge", t
+    if t is not None and t <= -2 and m1 < 0 and m2 < 0:
+        return "inverse", t
+    if t is not None and abs(t) < 1:
+        return "no edge", t
+    return "unstable", t
+
+
+def case_v29():
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_signal_edge"]
+    assert o.path.name == "75_v_signal_edge.sql" and o.kind == "VIEW"
+    names = [x.name for x in bv.load_objects()]
+    assert names.index("v_signal_edge") == names.index("v_signal_edge_daily") + 1   # applies after its source
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_signal_edge"} == {"v_signal_edge_daily"}
+    for frag in ("WHERE ic IS NOT NULL",
+                 "NTILE(2) OVER (PARTITION BY market_group, feature, horizon ORDER BY signal_day) AS half",
+                 "AVG(IF(half = 1, ic, NULL)) AS m1",
+                 "AVG(IF(half = 2, ic, NULL)) AS m2",
+                 "SAFE_DIVIDE(m, sd) * SQRT(days / horizon_days) AS t_adj",
+                 "ROUND(pos * 100, 1) AS pct_days_positive",
+                 "WHEN days < 10 OR days < 2 * horizon_days THEN 'thin'",
+                 "WHEN t_adj >= 2 AND m1 > 0 AND m2 > 0 THEN 'edge'",
+                 "WHEN t_adj <= -2 AND m1 < 0 AND m2 < 0 THEN 'inverse'",
+                 "WHEN ABS(t_adj) < 1 THEN 'no edge'",
+                 "ELSE 'unstable'"):
+        assert frag in code, frag
+    assert re.findall(r"THEN '([a-z ]+)'", code) == ["thin", "edge", "inverse", "no edge"]  # thin is judged first
+    assert "the live system never reads BigQuery" in o.template
+    # simulated verdicts (98 days of a 1W signal: SQRT(98 / 7) = 3.74)
+    assert _edge_verdict(98, 7, 0.10, 0.15, 0.08, 0.12)[0] == "edge"
+    assert _edge_verdict(98, 7, 0.10, 0.15, 0.20, -0.01)[0] == "unstable"     # the sign flipped: not an edge
+    assert _edge_verdict(98, 7, -0.10, 0.15, -0.08, -0.12)[0] == "inverse"
+    assert _edge_verdict(98, 7, 0.02, 0.15, 0.01, 0.03)[0] == "no edge"
+    assert _edge_verdict(98, 7, 0.05, 0.15, 0.04, 0.06)[0] == "unstable"      # t 1.25
+    assert _edge_verdict(9, 7, 0.30, 0.10, 0.3, 0.3)[0] == "thin"
+    assert _edge_verdict(50, 30, 0.30, 0.10, 0.3, 0.3)[0] == "thin"           # under two 1M lengths
+    assert _edge_verdict(150, 91, 0.30, 0.10, 0.3, 0.3)[0] == "thin"
+    # golden negative: the naive t (no overlap correction) calls 90 days of a 1M signal an edge
+    verdict, t = _edge_verdict(90, 30, 0.06, 0.20, 0.05, 0.07)
+    naive = 0.06 / 0.20 * 90 ** 0.5
+    assert naive >= 2 and verdict == "no edge" and abs(t - 0.3 * 3 ** 0.5) < 1e-12
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
-         case_v22, case_v23, case_v24, case_v25, case_v26, case_v27]
+         case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
+         case_v28, case_v29]
 
 
 def test_v1(): case_v1()
@@ -1556,6 +1756,8 @@ def test_v24(): case_v24()
 def test_v25(): case_v25()
 def test_v26(): case_v26()
 def test_v27(): case_v27()
+def test_v28(): case_v28()
+def test_v29(): case_v29()
 
 
 if __name__ == "__main__":
