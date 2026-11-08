@@ -23,6 +23,8 @@ for sizing that bounds the loss, not the ticket.
   R7  the research stage is never sized; the allocate replay sizes only the
       eligible seats on the same rule
   R8  the enforced absolute cash floor is honoured under risk
+  R8b worst-entry sizing (TFB_OPP_SIZE_AT_ENTRY_HIGH): the loss from the
+      booked entry to the stop never exceeds the budget (review on #936)
   R9  the worked example from the WHY block (NAV 100,000, 0.5%, cap 15%)
   R10 the env reads live in the fingerprinted TFB_OPP_ family; version floor
 
@@ -265,6 +267,38 @@ def test_r8_enforced_absolute_cash_floor_is_kept(monkeypatch):
     assert payload["meta"]["sizing"]["basis_sar"] == CASH
     assert sizes["ALPHA.SR"] == 6_000.0 and sizes["BRAVO.SR"] == 3_000.0
     assert sizes.get("CHARLIE.SR", 0.0) <= 1_000.0 + 1e-6 or "CHARLIE.SR" not in sizes
+
+
+def test_r8b_worst_entry_sizing_keeps_the_loss_within_the_budget(monkeypatch):
+    # review on #936 (P2): with TFB_OPP_SIZE_AT_ENTRY_HIGH the ticket is booked at
+    # price x 1.01 while the stop sits at price x (1 - stop); the distance must be
+    # measured from the booked entry or the worst fill risks more than the budget
+    monkeypatch.setenv("TFB_OPP_SIZING_MODE", "risk")
+    monkeypatch.setenv("TFB_OPP_RISK_BUDGET_PCT", "2")
+    monkeypatch.setenv("TFB_OPP_SIZE_AT_ENTRY_HIGH", "1")
+    payload = _build()
+    assert payload["status"] == "ok", payload.get("message")
+    meta = payload["meta"]["sizing"]
+    assert meta["entry_mult"] == 1.01 and meta["risk_sar"] == 600.0
+    for t in payload["selected"]:
+        sp = STOPS[t["symbol"]]
+        shares = float(t["suggested_shares"])
+        worst_fill, stop = 100.0 * 1.01, 100.0 * (1.0 - sp / 100.0)
+        assert shares > 0
+        assert shares * (worst_fill - stop) <= 600.0 + 1e-6, (t["symbol"], shares * (worst_fill - stop))
+        assert float(t["suggested_sar"]) == pytest.approx(shares * worst_fill)
+    # CHARLIE (stop 8 %): 600 / (1 - 0.92 / 1.01) = 6,733 -> 66 shares at 101 risk 594, not 74 shares risking 666
+    charlie = [t for t in payload["selected"] if t["symbol"] == "CHARLIE.SR"][0]
+    assert float(charlie["suggested_shares"]) == 66
+    assert meta["targets"]["CHARLIE.SR"] == 6_733.0
+    # the pure rule: entry_mult 1.0 is the plain stop distance; 1.01 shortens it; junk -> 1.0
+    rows = [{"symbol": "C", "stop_pct": 8.0}]
+    assert ob._risk_targets(rows, 30_000.0, 30_000.0, 0.0, 2.0, 35.0)[0] == {"C": 7_500.0}
+    assert ob._risk_targets(rows, 30_000.0, 30_000.0, 0.0, 2.0, 35.0, 1.01)[0] == {"C": 6_733.33}
+    assert ob._risk_targets(rows, 30_000.0, 30_000.0, 0.0, 2.0, 35.0, 0.5)[0] == {"C": 7_500.0}
+    assert ob._risk_targets(rows, 30_000.0, 30_000.0, 0.0, 2.0, 35.0, "x") == ({}, {})
+    monkeypatch.delenv("TFB_OPP_SIZE_AT_ENTRY_HIGH", raising=False)
+    assert _build()["meta"]["sizing"]["entry_mult"] == 1.0
 
 
 def test_r9_worked_example_from_the_why_block():

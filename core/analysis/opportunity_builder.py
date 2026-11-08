@@ -1685,7 +1685,12 @@ from typing import Optional
 #           Each INVEST seat's target = risk budget / its own stop distance
 #           (cand stop_pct, the stop the ticket prints: max(floor 8%, 2.5 x
 #           vol30) capped at 35%; a missing stop counts as the 35% maximum,
-#           i.e. the smallest ticket), capped at the per-seat cap. A target
+#           i.e. the smallest ticket), capped at the per-seat cap. The
+#           distance is measured from the booked entry: with
+#           TFB_OPP_SIZE_AT_ENTRY_HIGH the ticket is booked at price x 1.01,
+#           so the distance is 1 - (1 - stop) / 1.01 and the loss from the
+#           advertised worst fill to the stop stays within the budget
+#           (review on PR #936). A target
 #           below the minimum ticket floor is released with a countable
 #           deferral ("kept in cash"). In the loop a seat is sized as
 #           _size_one(..., min(remaining, target)) so every existing deferral
@@ -1698,8 +1703,8 @@ from typing import Optional
 #   Worked example (NAV 100,000, risk 0.5%, cap 15%): stop 8% -> 6,250; stop
 #   10% -> 5,000; stop 20% -> 2,500; stop 35% -> 1,429. Ten seats at 10% stops
 #   deploy ~50% and a three-stop day costs 1.5%, not 4.7%.
-#   meta.sizing = {mode: risk, risk_pct, risk_sar, basis_sar, cap_sar,
-#   budget_sar, cohort, stop_pct, targets, released}. A released seat is a
+#   meta.sizing = {mode: risk, risk_pct, entry_mult, risk_sar, basis_sar,
+#   cap_sar, budget_sar, cohort, stop_pct, targets, released}. A released seat is a
 #   Funding near-miss ("Risk sizing: ...") with its own how-to text.
 # NOT CHANGED: gates, ranking, max_selected, diversification caps, cash
 #   floors, funding plans, rotation, capital calls, the conviction mode and its
@@ -5988,28 +5993,37 @@ def _env_risk_budget_pct():
     return min(_RISK_BUDGET_MAX_PCT, max(_RISK_BUDGET_MIN_PCT, v))
 
 
-def _risk_targets(rows, budget_base, cap_sar, floor_sar, risk_pct, stop_fallback_pct):
+def _risk_targets(rows, budget_base, cap_sar, floor_sar, risk_pct, stop_fallback_pct,
+                  entry_mult=1.0):
     """PURE. rows: the sizing cohort in rank order (each with symbol and
     stop_pct). A seat's target is the ticket whose loss at its own stop
-    equals the risk budget: budget_base x risk_pct / stop_pct, capped at
-    cap_sar. A seat whose target falls below floor_sar is released (it does
-    not get a target). A missing or non-positive stop_pct counts as
-    stop_fallback_pct (the widest stop -> the smallest ticket). Returns
-    ({symbol: target_sar}, {symbol: stop_pct_used}); ({}, {}) when nothing
-    can be sized. Deterministic; the targets do not depend on each other,
-    so the budget they consume is bounded by the loop's `remaining`."""
+    equals the risk budget: budget_base x risk_pct / stop distance, capped
+    at cap_sar. The stop distance is measured from the price the ticket is
+    booked at: entry_mult = 1.0 (the quote) or 1.01 when the worst-entry
+    sizing (TFB_OPP_SIZE_AT_ENTRY_HIGH) books the ticket at price x 1.01,
+    so the loss from the advertised worst fill to the stop never exceeds
+    the budget (review on PR #936). A seat whose target falls below
+    floor_sar is released (it does not get a target). A missing or
+    non-positive stop_pct counts as stop_fallback_pct (the widest stop ->
+    the smallest ticket). Returns ({symbol: target_sar}, {symbol:
+    stop_pct_used}); ({}, {}) when nothing can be sized. Deterministic; the
+    targets do not depend on each other, so the budget they consume is
+    bounded by the loop's `remaining`."""
     try:
         base = max(0.0, float(budget_base or 0.0))
         cap = max(0.0, float(cap_sar or 0.0))
         floor = max(0.0, float(floor_sar or 0.0))
         rp = float(risk_pct)
         fb = float(stop_fallback_pct)
+        em = float(entry_mult)
     except (TypeError, ValueError):
         return {}, {}
     if base <= 0.0 or cap <= 0.0 or not math.isfinite(rp) or rp <= 0.0:
         return {}, {}
     if not math.isfinite(fb) or fb <= 0.0:
         fb = 35.0
+    if not math.isfinite(em) or em < 1.0:
+        em = 1.0
     risk_sar = base * rp / 100.0
     targets, stops = {}, {}
     for c in rows or []:
@@ -6023,7 +6037,11 @@ def _risk_targets(rows, budget_base, cap_sar, floor_sar, risk_pct, stop_fallback
         if not math.isfinite(sp) or sp <= 0.0:
             sp = fb
         stops[sym] = sp
-        t = min(cap, risk_sar / (sp / 100.0))
+        # loss fraction of the booked ticket from the booked entry to the stop
+        dist = 1.0 - (1.0 - min(sp, 100.0) / 100.0) / em
+        if dist <= 0.0:
+            continue
+        t = min(cap, risk_sar / dist)
         if t > 0.0 and t >= floor - 1e-9:
             targets[sym] = round(t, 2)
     return targets, stops
@@ -6548,10 +6566,12 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         _sz_cohort = {c["symbol"] for c in _sz_rows}
         # targets for every INVEST seat (they do not depend on each other),
         # so a seat the loop reaches after a release is sized on its own stop
+        _sz_em = 1.01 if _size_at_entry_high() else 1.0
         _sz_targets, _sz_stops = _risk_targets(invest_cands, budget_base, _sz_cap,
                                                criteria.get("min_ticket_sar", 0.0) or 0.0,
-                                               _sz_risk, criteria.get("stop_max_pct") or 35.0)
-        _LAST_SIZING.update({"risk_pct": _sz_risk,
+                                               _sz_risk, criteria.get("stop_max_pct") or 35.0,
+                                               _sz_em)
+        _LAST_SIZING.update({"risk_pct": _sz_risk, "entry_mult": _sz_em,
                              "risk_sar": round(budget_base * _sz_risk / 100.0, 0),
                              "basis_sar": round(budget_base, 0),
                              "cap_sar": round(_sz_cap, 0),
