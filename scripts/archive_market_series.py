@@ -2,8 +2,14 @@
 # scripts/archive_market_series.py
 """
 ================================================================================
-TFB Market Series - v1.1.1 (program register C8, Phase 2b: global markets page)
+TFB Market Series - v1.2.0 (program register C8, Phase 2b: global markets page)
 ================================================================================
+v1.2.0 (8 Nov 2026, regime evidence): series 14 ^VIX, kind "Volatility
+index" (a level in volatility points, not a price: its "return" is the
+change of the level). WHY (owner, 8 Nov: "how we can avoid that in the
+future" after the 5 Nov -4.4 % day): the board scorecard can be read by
+market regime only if the regime is archived beside it; the archive had
+SPY but no fear gauge. v_market_regime (views 1.7.0) reads it.
 v1.1.1 (29 Oct 2026, review of #880): the 30-bar minimum is a history test
 for the nightly 1,100-day window, but a --days 30 run (the smallest window
 the job accepts) holds only 20-22 trading days, so every complete answer was
@@ -80,7 +86,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 TABLE = "market_series_daily"
 DEFAULT_DAYS = 1100
@@ -98,7 +104,7 @@ BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
 
 KINDS = ("Index", "Market ETF (USD)", "US sector ETF (USD)", "World sector ETF (USD)",
-         "Commodity (USD)")
+         "Commodity (USD)", "Volatility index")
 REGIONS = ("US", "Europe", "China", "Japan", "Gulf", "World", "Commodities")
 
 # (series_id, yahoo symbol, display name, region, country, kind, currency, sector)
@@ -116,6 +122,7 @@ SERIES: Tuple[Tuple[int, str, str, str, str, str, str, str], ...] = (
     (11, "^HSI", "Hang Seng", "China", "Hong Kong", "Index", "HKD", ""),
     (12, "^N225", "Nikkei 225", "Japan", "Japan", "Index", "JPY", ""),
     (13, "^TASI.SR", "Tadawul All Share (TASI)", "Gulf", "Saudi Arabia", "Index", "SAR", ""),
+    (14, "^VIX", "CBOE Volatility Index (VIX)", "US", "United States", "Volatility index", "USD", ""),
     (20, "SPY", "US market ETF (SPY)", "US", "United States", "Market ETF (USD)", "USD", ""),
     (21, "VGK", "Europe ETF (VGK)", "Europe", "Europe", "Market ETF (USD)", "USD", ""),
     (22, "MCHI", "China ETF (MCHI)", "China", "China", "Market ETF (USD)", "USD", ""),

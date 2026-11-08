@@ -321,14 +321,17 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
     # 2026-11-08 (manifest pin only): 1.5.0 -> 1.6.0 (v_signal_edge_daily and
-    # v_signal_edge; research views, nothing live reads them).
-    ("apply_bq_views", "1.6.0", "bigquery looker views"),
+    # v_signal_edge) -> 1.7.0 (total-return engine, v_outcome_excess, the
+    # regime views); research views, nothing live reads them.
+    ("apply_bq_views", "1.7.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
     # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
     # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
-    ("archive_market_series", "1.1.1", "bigquery market series"),
+    # 2026-11-08 (manifest pin only): 1.1.1 -> 1.2.0 (series 14 ^VIX, kind
+    # "Volatility index", for the regime views).
+    ("archive_market_series", "1.2.0", "bigquery market series"),
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
