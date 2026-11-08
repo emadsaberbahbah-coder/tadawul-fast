@@ -8,11 +8,17 @@
 # v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
 # and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
 # the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
-# 1.1.68 and 1.1.69 are claimed by open PRs #935 and #936; whichever lands
-# later re-bumps.
+# 1.1.69 is claimed by open PR #936; whichever lands later re-bumps.
 #
-# VERSION 1.1.67 (2026-11-08) -- FUNDABLE SEATS HARNESS
+# VERSION 1.1.68 (2026-11-08) -- CORP-EVENT GUARD HARNESS
 #
+# v1.1.68: run tests/test_dt10_v1270_corp_guard.js (16_Decision_Top10.gs
+# v1.27.0: DT10_GUARD_CORP_DAYS makes the ticket guard hold a name whose
+# Corporate_Events row - SEC EDGAR 8-K merger / control / charter /
+# delisting / restatement / bankruptcy filings, scripts/run_corporate_events.py
+# v1.0.0 - lies within the window; default off) beside the other cockpit
+# harnesses; its golden negatives rebuild the v1.26.0 file from the delivered
+# one. The lean job also runs tests/test_run_corporate_events.py.
 # v1.1.67: run tests/test_dt10_v1260_fundable_seats.js (16_Decision_Top10.gs
 # v1.26.0: TFB_T10_FUNDABLE_CCY makes the stability core seat listed
 # currencies first; an unlisted name never takes a listed seat; default off)
@@ -1099,6 +1105,7 @@ jobs:
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
+            tests/test_run_corporate_events.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
@@ -1263,6 +1270,7 @@ jobs:
           node tests/test_dt10_v1240_seat_guard.js
           node tests/test_dt10_v1250_owner_bands.js
           node tests/test_dt10_v1260_fundable_seats.js
+          node tests/test_dt10_v1270_corp_guard.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
