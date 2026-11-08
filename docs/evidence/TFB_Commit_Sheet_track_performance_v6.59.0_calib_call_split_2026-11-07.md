@@ -209,3 +209,12 @@ Rollback: unset the Variable.
 - Records whose entry call does not parse count as hold, as `_reco_trade_sign` has them.
 - No change to factors, `TFB_CALIBRATION_FACTORS`, the pooled warning itself, the maturation rules, the cron or the concurrency.
 - No live workbook read or write and no provider call: everything is offline.
+
+## Addendum 2026-11-08 - merge of main `4b478e7`
+
+Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header conflicted: main took 1.1.68-1.1.70.
+
+- ci.yml: this release keeps 1.1.71 (still above main).
+- The header's claim note lists the open claims after the re-numbering: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.
+- Main's 1.1.70 / 1.1.69 / 1.1.68 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- After the merge: `tests/test_calib_call_split.py` 37 passed with `TFB_TEST_REQUIRE_BASE=1`. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.
