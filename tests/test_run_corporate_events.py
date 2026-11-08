@@ -205,6 +205,37 @@ def test_c4_main(monkeypatch, capsys):
     assert ca.main(["--write"], book=book, edgar=edgar, now=NOW) == 2
     assert edgar.skipped == ["FRST.US"] and len(edgar.failures) == 2 and len(book.tab.requests) == before
     assert "EDGAR read incomplete" in capsys.readouterr().out
+    # v1.0.1 (review P1): ONE failed issuer beside a successful one also fails closed -
+    # the failed issuer's prior merger row must not vanish (the guard would release it)
+    one_bad = fake_fetch({9999: FRST}, fail={ca.EDGAR_SUBMISSIONS.format(cik=1385508)})
+    edgar = ca.Edgar("ua", 20, fetch=one_bad, sleep=lambda s: None)
+    assert ca.main(["--write"], book=book, edgar=edgar, now=NOW) == 2
+    assert edgar.reached == 2 and edgar.skipped == [] and len(edgar.failures) == 1
+    assert len(book.tab.requests) == before
+    out = capsys.readouterr().out
+    assert "EDGAR read incomplete" in out and "INDV.US: ConnectionError" in out
+    # ... while the same partial read still prints in a dry run
+    edgar = ca.Edgar("ua", 20, fetch=fake_fetch({9999: FRST}, fail={ca.EDGAR_SUBMISSIONS.format(cik=1385508)}),
+                     sleep=lambda s: None)
+    assert ca.main(["--dry-run"], book=book, edgar=edgar, now=NOW) == 0 and len(book.tab.requests) == before
+    # v1.0.1 (review P1): a decision page that cannot be read fails the write closed
+    class _Broken:
+        def get(self, *_a, **_k):
+            raise RuntimeError("quota")
+    book3 = Book({"Top_10_Investments": page(["INDV.US"]), "My_Portfolio": _Broken()},
+                 tab=Sheet([ca.HEADERS, ["FRST.US", "merger_completed", "2026-11-01", "", "8-K", "2.01", "", "", ""]], 9))
+    edgar = ca.Edgar("ua", 20, fetch=fake_fetch({1385508: INDV}), sleep=lambda s: None)
+    assert ca.main(["--write"], book=book3, edgar=edgar, now=NOW) == 2 and book3.tab.requests == []
+    out = capsys.readouterr().out
+    assert "cannot read page My_Portfolio" in out and "decision page(s) unreadable" in out and "My_Portfolio: RuntimeError" in out
+    # both pages unreadable: nothing is read from EDGAR and nothing is written (the old path cleared the tab)
+    book4 = Book({"Top_10_Investments": _Broken(), "My_Portfolio": _Broken()}, tab=Sheet([ca.HEADERS], 9))
+    fetch4 = fake_fetch({1385508: INDV})
+    assert ca.main(["--write"], book=book4, edgar=ca.Edgar("ua", 20, fetch=fetch4, sleep=lambda s: None), now=NOW) == 2
+    assert book4.tab.requests == [] and fetch4.calls == []
+    # a complete read with no US listing still writes the (empty) register
+    book5 = Book({"Top_10_Investments": page(["2222.SR"]), "My_Portfolio": page(["1120.SR"])})
+    assert ca.main(["--write"], book=book5, now=NOW) == 0 and book5.added == [("Corporate_Events", 200, 9)]
     # a prior tab beyond the bound is preserved
     book2 = Book({"Top_10_Investments": page(["INDV.US"])}, tab=Sheet([ca.HEADERS], 9, row_count=ca.MAX_ROWS + 5))
     edgar = ca.Edgar("ua", 20, fetch=fake_fetch({1385508: INDV}), sleep=lambda s: None)
@@ -231,4 +262,4 @@ def test_c5_workflow():
     assert 'MODE="--dry-run"' in run_step["run"] and "python scripts/run_corporate_events.py $MODE" in run_step["run"]
     assert wf["permissions"] == {"contents": "read"}
     src = (ROOT / "scripts" / "run_corporate_events.py").read_text(encoding="utf-8")
-    assert '__version__ = "1.0.0"' in src and "TFB_SEC_USER_AGENT" in src
+    assert '__version__ = "1.0.1"' in src and "TFB_SEC_USER_AGENT" in src

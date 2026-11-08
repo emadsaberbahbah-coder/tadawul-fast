@@ -2,8 +2,21 @@
 # scripts/run_corporate_events.py
 """
 ================================================================================
-TFB Corporate Events - v1.0.0 (the Corporate_Events tab; workflow-scoped)
+TFB Corporate Events - v1.0.1 (the Corporate_Events tab; workflow-scoped)
 ================================================================================
+v1.0.1 (2026-11-08) -- ANY INCOMPLETE READ PRESERVES THE REGISTER
+WHY (Codex review on PR #935, two P1s): a failed issuer fetch beside a
+  successful one left `skipped` empty and `reached` > 0, so the write went
+  ahead and dropped the failed issuer's rows - with the guard armed, exactly
+  the hold that could not be re-checked disappeared. A decision page that
+  could not be read was only warned about, so its symbols fell out of scope
+  and (both pages failing) --write cleared the whole tab.
+WHAT: --write now refuses (exit 2, tab untouched) when ANY issuer fetch
+  failed, when ANY decision page could not be read, or when the ticker map
+  was unreadable; the message names what failed. The dry run still prints
+  what it could read. The breaker (2 consecutive failures skip the rest) is
+  unchanged and is now one case of the general rule.
+--------------------------------------------------------------------------------
 v1.0.0 (2026-11-08) -- THE CORPORATE-EVENT REGISTER
 WHY (owner, 8 Nov 2026, after the week of 2-6 Nov: "how we can avoid that in
   the future" / "let's do the requirement and implement it"): the board
@@ -66,7 +79,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
@@ -336,11 +349,13 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, edgar: Optional[Edg
             _out(f"ERROR: cannot open workbook: {type(e).__name__}")
             return 2
     symbols: List[str] = []
+    page_failures: List[str] = []
     for p in pages:
         try:
             vals = book.worksheet(p).get("A1:DZ2000")
         except Exception as e:  # noqa: BLE001
             _out(f"WARN: cannot read page {p}: {type(e).__name__}")
+            page_failures.append(f"{p}: {type(e).__name__}")
             continue
         got = harvest_symbols(vals)
         _out(f"page {p}: {len(got)} symbols")
@@ -364,8 +379,16 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, edgar: Optional[Edg
     if not write:
         _out("dry run - nothing written")
         return 0
-    if edgar is not None and (edgar.skipped or (edgar.failures and edgar.reached == 0)):
-        _out("ERROR: EDGAR read incomplete - a partial table would read as 'no corporate action'; tab preserved")
+    # v1.0.1: an incomplete read of ANY kind never replaces the register - an
+    # absent row reads as "no corporate action" in the cockpit guard.
+    if page_failures:
+        _out("ERROR: decision page(s) unreadable - scope incomplete; tab preserved: "
+             + "; ".join(page_failures))
+        return 2
+    if edgar is not None and (edgar.failures or edgar.skipped):
+        _out("ERROR: EDGAR read incomplete - a partial table would read as 'no corporate action'; "
+             "tab preserved: " + "; ".join(edgar.failures[:5])
+             + (f" | skipped after the breaker: {len(edgar.skipped)}" if edgar.skipped else ""))
         return 2
     return write_tab(book, tab, rows)
 
