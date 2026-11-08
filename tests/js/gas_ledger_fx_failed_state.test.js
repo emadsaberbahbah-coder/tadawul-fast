@@ -81,7 +81,7 @@ function dt10Context(extra) {
     }}, extra || {});
   vm.createContext(ctx);
   vm.runInContext(DT10, ctx, {filename: '16_Decision_Top10.gs'});
-  assert.equal(ctx.DT10_VERSION, '1.24.0');   // 2026-11-08: v1.22.0 confirm window + v1.23.0 reentry cooldown, pin moved; 2026-11-05: v1.21.1 approved fund scope, pin moved   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved
+  assert.equal(ctx.DT10_VERSION, '1.25.0');   // 2026-11-08: v1.22.0 confirm window + v1.23.0 reentry cooldown, pin moved; 2026-11-05: v1.21.1 approved fund scope, pin moved   // 2026-10-27: v1.17.0 shadow rank log, v1.17.1 shadow momentum, v1.18.0 post-earnings tag, pin moved; 2026-11-01: v1.19.0 qualified hold / seat live fill / owner rule, pin moved; 2026-11-02: v1.20.0 ticket guard / KPI plan gain / venue line, pin moved
   return ctx;
 }
 const FX_ROWS = [['USD', '', '', 3.75], ['GBP', '', '', 5], ['ZAR', '', '', 0.2], ['ILS', '', '', 1]];
