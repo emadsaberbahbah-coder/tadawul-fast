@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """tests/test_xcal_data_ext.py - core/exchange_calendar_ext.py 1.0.0,
-track_performance v6.58.0 and opportunity_builder 1.28.3 [XCAL-DATA-EXT]
-(TFB_XCAL_DATA_EXT, default off = main a85edfc6 byte for byte apart from the
-version strings).
+track_performance v6.58.0 and opportunity_builder 1.29.1 (first numbered
+1.28.3) [XCAL-DATA-EXT] (TFB_XCAL_DATA_EXT, default off = main byte for byte
+apart from the version strings: a85edfc6 for the tracker; for the builder
+a85edfc6 before main's 1.29.0 and 4b478e72 after it).
 
 WHY (2026-11-06): the pinned exchange_calendars==4.13.2 records SGX holidays
 only to 2026, so XSES ends at the 2026-12-31 close. The tracker's +/-14-day
@@ -73,11 +74,13 @@ V1  version floors, verify_deployment pins, title line, WHY order, ASCII
 V1b against the base: only the version lines (and the one re-indented
     get_calendar line) removed, added lines ASCII (the title aside), exactly
     the one new function in each file (this PR's diff alone: SKIPs once an
-    open PR's block is merged in)
+    open PR's block is merged in). Since 2026-11-08 the builder leg runs
+    against main 4b478e72 (1.29.0, #936) while the builder is 1.29.1
 
 Base copies: TFB_TEST_TRACK_BASE / TFB_TEST_OB_BASE=<path> (must be v6.53.0 /
-1.28.0), else `git show a85edfc6:<path>`; without them the base legs SKIP, or
-FAIL when TFB_TEST_REQUIRE_BASE=1 (ci.yml sets it).
+1.28.0), else `git show a85edfc6:<path>`; TFB_TEST_OB_MAIN_BASE=<path> (must
+be 1.29.0), else `git show 4b478e72:<path>`; without them the base legs SKIP,
+or FAIL when TFB_TEST_REQUIRE_BASE=1 (ci.yml sets it).
 Golden negative of a whole file: TFB_TEST_TRACK_DELIVERED / TFB_TEST_OB_DELIVERED
 =<base copy>.
 
@@ -109,6 +112,10 @@ pd = pytest.importorskip("pandas")
 
 BASE_SHA = "a85edfc6"   # main 2026-11-06; track_performance v6.53.0, opportunity_builder 1.28.0
 BASE_FULL = "a85edfc6099ac3b44ff0a24b36d74f712843a33a"
+# 2026-11-08: main took opportunity_builder 1.29.0 (#936); the builder's
+# exact-diff leg runs against this main once this PR's block sits on top.
+OB_MAIN_SHA = "4b478e72"   # main 2026-11-08; opportunity_builder 1.29.0
+OB_MAIN_FULL = "4b478e72d631871936fb86e84180262f7c75266e"
 GATE = "TFB_XCAL_DATA_EXT"
 UTC = timezone.utc
 OFF_WORDS = [None, "", "off", "0", "false", "no", "enforce", "observe", "onn", "y", "enabled", "enable"]
@@ -162,12 +169,12 @@ def builder():
                       "opportunity_builder_v1283_delivered")
 
 
-def _base_copy(key, env, rel, version_re, name, check):
+def _base_copy(key, env, rel, version_re, name, check, sha=None):
     if key not in _MODS:
         path = os.getenv(env, "").strip()
         if not path:
             try:
-                blob = subprocess.run(["git", "-C", str(ROOT), "show", BASE_SHA + ":" + rel],
+                blob = subprocess.run(["git", "-C", str(ROOT), "show", (sha or BASE_SHA) + ":" + rel],
                                       capture_output=True, timeout=60)
             except Exception:
                 blob = None
@@ -194,6 +201,17 @@ def _check_tp(mod, path):
 def _check_ob(mod, path):
     assert getattr(mod, "OPPORTUNITY_BUILDER_VERSION", "") == "1.28.0", path
     assert not hasattr(mod, "_venue_cal_data_ext"), path
+
+
+def _check_ob_main(mod, path):
+    assert getattr(mod, "OPPORTUNITY_BUILDER_VERSION", "") == "1.29.0", path
+    assert not hasattr(mod, "_venue_cal_data_ext"), path
+
+
+def builder_main_base():
+    return _base_copy("ob_main_base", "TFB_TEST_OB_MAIN_BASE", "core/analysis/opportunity_builder.py",
+                      rb'OPPORTUNITY_BUILDER_VERSION = "1\.29\.0"', "opportunity_builder_v1290_base_xcal",
+                      _check_ob_main, OB_MAIN_SHA)
 
 
 def tracker_base():
@@ -625,6 +643,8 @@ def test_x8_env_lane_parity_reader_and_ci():
     assert sum("tests/test_xcal_data_ext.py" in ln for ln in lines) == 1, lines
     assert "git fetch --no-tags --depth=1 origin %s \\" % BASE_FULL in lines, lines
     assert BASE_FULL.startswith(BASE_SHA)
+    assert "git fetch --no-tags --depth=1 origin %s \\" % OB_MAIN_FULL in lines, lines   # 2026-11-08
+    assert OB_MAIN_FULL.startswith(OB_MAIN_SHA)
 
 
 # ------------------------------------------------------------------- X9 ----
@@ -641,7 +661,7 @@ def test_x9_extension_retires_once_the_package_covers_its_years(monkeypatch):
 def test_v1_versions_pins_title_why_ascii():
     tp, ob, e = tracker(), builder(), ext()
     assert _vt(tp.SCRIPT_VERSION) >= (6, 58, 0)
-    assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 28, 3)
+    assert _vt(ob.OPPORTUNITY_BUILDER_VERSION) >= (1, 29, 1)
     assert _vt(e.CALENDAR_EXT_VERSION) >= (1, 0, 0)
     src = Path(tp.__file__).read_text(encoding="utf-8")
     assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]
@@ -649,9 +669,10 @@ def test_v1_versions_pins_title_why_ascii():
     assert src.index("# v6.53.0 (2026-11-02) [ARCHIVE-BAR + DUE-ONLY]") < i58 < src.index("\nSCRIPT_VERSION = ")
     obs = Path(ob.__file__).read_text(encoding="utf-8")
     # 2026-11-08: main took opportunity_builder 1.29.0 (#936); this block is
-    # re-numbered 1.29.1 on top of it, so the WHY line is matched by its tag.
-    j = re.search(r"^# v1\.(28\.3|29\.1) \(2026-11-06\) \[XCAL-DATA-EXT\]", obs, re.M).start()
-    assert obs.index("# v1.28.0 (2026-10-27) - RANKING CHALLENGER IN SHADOW") < j < obs.index("\nOPPORTUNITY_BUILDER_VERSION = ")
+    # re-numbered 1.29.1 and sits after main's 1.29.0 block.
+    j = obs.index("# v1.29.1 (2026-11-06) [XCAL-DATA-EXT]")
+    assert obs.index("# v1.29.0 (2026-11-08) - RISK-BUDGET TICKET SIZING") < j < obs.index("\nOPPORTUNITY_BUILDER_VERSION = ")
+    assert "# v1.28.3 (2026-11-06) [XCAL-DATA-EXT]" not in obs and "v1.28.3 [XCAL-DATA-EXT]" not in obs
     vd = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("track_performance", "%s", "track performance")' % tp.SCRIPT_VERSION in vd
     assert re.search(r'\("core\.analysis\.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",\s*"%s"'
@@ -681,17 +702,21 @@ def test_v1b_against_the_base_ascii_and_functions():
     src = Path(tp.__file__).read_text(encoding="utf-8")
     obs = Path(ob.__file__).read_text(encoding="utf-8")
     # 2026-11-08: each module's exact diff runs while that module carries this
-    # PR's change alone. After main took opportunity_builder 1.29.0 (#936)
-    # the builder leg skips; the tracker leg still runs.
+    # PR's change alone. Main took opportunity_builder 1.29.0 (#936), so the
+    # builder leg runs against main 4b478e72 while the builder is 1.29.1.
     tp_alone = tp.SCRIPT_VERSION == "6.58.0" and not re.search(r"^# v6\.5[4-7]\.0 \(", src, re.M)
     ob_alone = (ob.OPPORTUNITY_BUILDER_VERSION == "1.28.3"
                 and not re.search(r"^# v1\.28\.[12] \(", obs, re.M))
-    if not (tp_alone or ob_alone):
+    ob_on_main = (ob.OPPORTUNITY_BUILDER_VERSION == "1.29.1"
+                  and not re.search(r"^# v1\.28\.[12] \(|^# v1\.(29\.([2-9]|\d\d)|[3-9]\d\.\d+) \(", obs, re.M))
+    if not (tp_alone or ob_alone or ob_on_main):
         pytest.skip("the exact a85edfc6 -> 6.58.0 / 1.28.3 diff checks apply to this PR's diff alone")
     if tp_alone:
         _v1b_tracker(src, Path(tpb.__file__).read_text(encoding="utf-8"))
     if ob_alone:
         _v1b_builder(obs, Path(obb.__file__).read_text(encoding="utf-8"))
+    if ob_on_main:
+        _v1b_builder(obs, Path(builder_main_base().__file__).read_text(encoding="utf-8"), "1.29.0")
 
 
 def _v1b_tracker(src, old):
@@ -704,9 +729,9 @@ def _v1b_tracker(src, old):
     assert _defs(src) - _defs(old) == {"_outcome_calendar_ext"} and not _defs(old) - _defs(src)
 
 
-def _v1b_builder(obs, old_ob):
+def _v1b_builder(obs, old_ob, old_version="1.28.0"):
     added, removed = _diff(old_ob, obs)
-    assert removed == ['OPPORTUNITY_BUILDER_VERSION = "1.28.0"'], removed
+    assert removed == ['OPPORTUNITY_BUILDER_VERSION = "%s"' % old_version], removed
     assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()][:3]
     assert _defs(obs) - _defs(old_ob) == {"_venue_cal_data_ext"} and not _defs(old_ob) - _defs(obs)
 

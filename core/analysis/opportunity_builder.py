@@ -4837,7 +4837,7 @@ def _venue_cal_code(suffix):
         return _VENUE_CAL_EXT_MAP.get(suffix)
     return None
 def _venue_cal_data_ext(code):
-    """v1.28.3 [XCAL-DATA-EXT]: core.exchange_calendar_ext.extended_calendar,
+    """v1.29.1 [XCAL-DATA-EXT]: core.exchange_calendar_ext.extended_calendar,
     the pinned calendar plus its added holiday years, only when
     TFB_XCAL_DATA_EXT is on and `code` has an extension (XSES); None
     otherwise or on any error (the caller keeps the pinned calendar).
@@ -4873,7 +4873,7 @@ def _venue_state(symbol, now_utc):
             import exchange_calendars as _xc  # lazy; present on Render
             cal = _xc.get_calendar(code)
             _VENUE_CAL_CACHE[code] = cal
-        _ext_cal = _venue_cal_data_ext(code)  # v1.28.3 [XCAL-DATA-EXT] (default off: None)
+        _ext_cal = _venue_cal_data_ext(code)  # v1.29.1 [XCAL-DATA-EXT] (default off: None)
         if _ext_cal is not None:
             cal = _ext_cal
         import pandas as _pd  # lazy

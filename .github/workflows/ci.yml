@@ -1444,10 +1444,13 @@ jobs:
           TFB_TEST_REQUIRE_BASE: "1"
         run: |
           # v1.1.75: the golden legs read track_performance v6.53.0 and
-          # opportunity_builder 1.28.0 at main a85edfc6; with
+          # opportunity_builder 1.28.0 at main a85edfc6, and the builder
+          # 1.29.0 at main 4b478e72 (2026-11-08); with
           # TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them.
           git fetch --no-tags --depth=1 origin a85edfc6099ac3b44ff0a24b36d74f712843a33a \
             || echo "::warning::a85edfc6 base not fetched - the golden legs will FAIL"
+          git fetch --no-tags --depth=1 origin 4b478e72d631871936fb86e84180262f7c75266e \
+            || echo "::warning::4b478e72 base not fetched - the builder golden leg will FAIL"
           python -m pytest -q tests/test_xcal_data_ext.py
 
       - name: ⚙️ Run outcome evidence with production calendars
