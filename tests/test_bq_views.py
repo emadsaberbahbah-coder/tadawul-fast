@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # tests/test_bq_views.py
 """
-Harness for scripts/apply_bq_views.py v1.6.0 and the SQL in sql/bigquery/
+Harness for scripts/apply_bq_views.py v1.7.0 and the SQL in sql/bigquery/
 (C8 Phase 2: typed BigQuery views for Looker Studio; 2b: the global markets
 page; 2c: the World Top-25 ROI, My Portfolio / Top-10 evidence and symbol
 pages; 2d: candles, analysts, news and the TFB rating per symbol; 2e: the
-learning loop from the archive; 2f: the signal edge). Offline: the BigQuery
-session is a fake, no google library is imported.
+learning loop from the archive; 2f: the signal edge; 2g: total return,
+benchmarks and regimes). Offline: the BigQuery session is a fake, no google
+library is imported.
 
-  V1  the 43 objects load in apply order (6 functions, then the views and
+  V1  the 47 objects load in apply order (6 functions, then the views and
       table functions in file order) and the static checks pass
   V2  every header a view reads with f_cell exists in that tab's archived
       header row (fixture: the 2026-10-29 snapshot)
@@ -16,7 +17,7 @@ session is a fake, no google library is imported.
       are refused
   V4  the body each object keeps in BigQuery hashes to the definitions read
       back from INFORMATION_SCHEMA after the 29 Oct creation (installed pins);
-      the objects v1.6.0 adds hash to their reviewed files (pending pins,
+      the objects v1.6.0 / v1.7.0 add or change hash to their reviewed files (pending pins,
       confirmed by bq_views --verify after the next --write; v1.2.0's were
       read back on 31 Oct, v1.3.0's on 1 Nov, v1.3.1 / 1.4.0 / 1.4.1's on 1 Nov
       15:27 Riyadh and v1.5.0's on 8 Nov, and are installed pins); a table
@@ -164,6 +165,33 @@ session is a fake, no google library is imported.
       first (simulated - fails when a 1M signal with 90 days reads 'edge' on
       the naive t, when a sign that flipped between halves reads 'edge', when
       a short history is judged)
+  V30 v_outcome_engine 1.6.0 (views 1.7.0): every return is a TOTAL return -
+      the outcome price is restated in entry-day terms with adj_close
+      (outcome adj x base close / base adj; raw close when either adj is
+      missing), engine_roi_raw_pp and dividend_adj_pp disclose the
+      difference; a record's bars come from its alias (INDV.US -> SUPN.US)
+      and bars_symbol says so; an entry price more than 35 % from the base
+      bar's close is 'entry_price_mismatch', never scored (simulated: the
+      SUPN $8.13 special dividend reads -4.7 %, not -26 %; a 2:1 split reads
+      0; the stale 41.92 pre-merger quote is a mismatch - fails on the raw
+      close, on a 10 % band, on the old symbol's own bars)
+  V31 v_outcome_excess (v1.7.0): each engine-scored forecast beside its
+      market benchmark by market (US SPY, Tadawul TASI, Hong Kong HSI,
+      London FTSE, Europe Euro Stoxx, Tokyo Nikkei, else ACWI), from the
+      base bar to the outcome bar and on the ladder; excess_call WIN when a
+      bullish call beat its market or a bearish one trailed it (simulated -
+      fails when a -3 % call in a -4.4 % market reads LOSS, when the
+      benchmark runs from the recording day instead of the base bar)
+  V32 v_market_regime (v1.7.0): SPY 1 / 5 / 20-session changes, distance
+      from the 50-session average and the 250-session high, 20-session
+      volatility, the VIX close, one label in a fixed order crash_day /
+      drawdown / stress / weak / calm (simulated - fails when a -2 % day
+      reads 'weak', when the 50-day average is judged on 49 bars)
+  V33 v_seat_regime + v_regime_outcomes (v1.7.0): each seat reads the
+      regime at the LAST US close before its seat date (a Monday seat reads
+      Friday; never the seat day's own close); outcomes per regime and
+      currency group with 'small sample' under 30 scored seats or 5 days
+      (simulated - fails on the same-day close, on a missing ALL group)
 """
 from __future__ import annotations
 
@@ -240,18 +268,25 @@ INSTALLED = {
     "v_top10_insight": "66d2facf68aadfb9088e05eed29669daf063b04bb1b82a8ccf0928911438e9cf",
     "v_portfolio_insight": "a905416997fa03335516b028edfa60a215d21d22ee6c75fdc54aba52eb64216b",
     # apply_bq_views 1.5.0, installed by bq_views write run 41441740101 (2 Nov) and read
-    # back from INFORMATION_SCHEMA on 8 Nov 2026 (all four matched their reviewed files)
-    "v_outcome_engine": "a7f75e0528a36bed30147611165696df9f8074f4c2551d96dc0e83b9d8f71d62",
+    # back from INFORMATION_SCHEMA on 8 Nov 2026 (all four matched their reviewed files;
+    # v_outcome_engine changes again in 1.7.0 and moves to PENDING)
     "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
     "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
-    "v_outcome_coverage": "341bd1f3a44d5d35e88c309a3f3a6ac6dd6e4678d640843c373fddad87447f31",
 }
-# The objects apply_bq_views 1.6.0 adds (8 Nov 2026), hashed from the reviewed
-# files: bq_views --verify after the next --write must find these exact bodies
-# in INFORMATION_SCHEMA (then they move to INSTALLED).
+# The objects apply_bq_views 1.6.0 and 1.7.0 add or change (8 Nov 2026), hashed
+# from the reviewed files: bq_views --verify after the next --write must find
+# these exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
+# Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
+# 341bd1f3a44d (1.5.0).
 PENDING = {
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
+    "v_outcome_engine": "85d51279fdaa42b351c5ab8c277b507923005c6395fbf9b866aab01deed64c5e",
+    "v_outcome_excess": "3e4a104a9165c63497fe48b67003496d4b418d1501fabe8fe6f5cdc621c876e0",
+    "v_market_regime": "422399a6120a712f93eae28ef9441f6f3eadabc54a24f08f086486fb9032483c",
+    "v_seat_regime": "9860388614461fd67e344c04c5661f084bbc55b924eae43ceaec824c21816426",
+    "v_regime_outcomes": "3a4c2de8caba465cf406f459358c7f6a492f4065e21a6d3327c3bec01c037188",
+    "v_outcome_coverage": "fba5c320643c6ceecabb3b294b64527ffab44cb8b35cca89065b1386323e0f2b",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -266,9 +301,10 @@ EXPECTED_ORDER = [
     "v_top10_insight", "v_portfolio_insight",
     "v_outcome_engine", "v_outcome_calibration", "v_board_archive", "v_outcome_coverage",
     "v_signal_edge_daily", "v_signal_edge",
+    "v_outcome_excess", "v_market_regime", "v_seat_regime", "v_regime_outcomes",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 15)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 19)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -1240,7 +1276,7 @@ def case_v24():
             "WHEN s.engine_roi_pp > 0 THEN 'LOSS' ELSE 'BREAKEVEN' END") in code
     assert "WHEN r.entry_stance NOT IN ('bullish', 'bearish') OR r.entry_stance IS NULL THEN 'unscorable_stance'" in code
     for state in ("no_entry_price", "unscorable_stance", "target_not_due", "no_bar_for_symbol", "scored_from_bar",
-                  "awaiting_bar", "no_bar_at_target"):
+                  "awaiting_bar", "no_bar_at_target", "entry_price_mismatch"):
         assert f"'{state}'" in code, state
     assert "ROW_NUMBER() OVER (PARTITION BY c.record_key, IFNULL(c.engine_call_outcome IN ('WIN', 'LOSS'), FALSE)" in code
     assert "ORDER BY c.recorded_at, c.sheet_row, c.record_id) = 1" in code
@@ -1528,6 +1564,8 @@ def case_v27():
                 "SUM(engine_scored) AS engine_scored", "SUM(engine_wins) AS engine_wins",
                 "SUM(engine_scorable_now) AS engine_scorable_now", "SUM(engine_awaiting_bar) AS engine_awaiting_bar",
                 "SUM(engine_no_bar) AS engine_no_bar", "SUM(engine_no_bar_at_target) AS engine_no_bar_at_target",
+                "COUNTIF(engine_state = 'entry_price_mismatch') AS engine_entry_mismatch",
+                "SUM(engine_entry_mismatch) AS engine_entry_mismatch",
                 "ROUND(SAFE_DIVIDE(u.engine_wins, u.engine_scored) * 100, 1) AS engine_win_rate_pct"):
         assert col in code, col
     # the tracker's columns are unchanged (V23 reads them too)
@@ -1723,10 +1761,251 @@ def case_v29():
     naive = 0.06 / 0.20 * 90 ** 0.5
     assert naive >= 2 and verdict == "no edge" and abs(t - 0.3 * 3 ** 0.5) < 1e-12
 
+
+def _total_return_price(out_close, out_adj, base_close, base_adj, use_adj=True):
+    """v_outcome_engine 1.6.0: an outcome price restated in entry-day terms - outcome adj x base
+    close / base adj - or the raw close when either adj is missing (use_adj=False is the 1.5.0
+    raw-close mutant)."""
+    if use_adj and out_adj is not None and base_adj is not None and base_adj > 0 and base_close > 0:
+        return out_adj * base_close / base_adj
+    return out_close
+
+
+def _engine_roi(entry, out_close, out_adj, base_close, base_adj, use_adj=True):
+    return round((_total_return_price(out_close, out_adj, base_close, base_adj, use_adj) / entry - 1) * 100, 4)
+
+
+def _alias_bars(bars, aliases):
+    """the bars CTE: an aliased old symbol's bars are the NEW symbol's bars, relabelled; every other
+    symbol keeps its own; the old symbol's own partial series is set aside."""
+    old = {o for o, _ in aliases}
+    out = [dict(b, bars_symbol=b["symbol"]) for b in bars if b["symbol"] not in old]
+    for o, n in aliases:
+        out += [dict(b, symbol=o, bars_symbol=n) for b in bars if b["symbol"] == n]
+    return out
+
+
+def _entry_mismatch(entry, base_close, band=0.35):
+    return base_close > 0 and (entry / base_close > 1 + band or entry / base_close < 1 - band)
+
+
+def case_v30():
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_outcome_engine"]
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_engine"} == {"v_performance_log", "symbol_bars_daily"}
+    for frag in (
+            "('INDV.US', 'SUPN.US')",
+            "LEFT JOIN alias AS al ON al.old_symbol = b.symbol",
+            "WHERE al.old_symbol IS NULL",
+            "SELECT al.old_symbol AS symbol, b.symbol AS bars_symbol, b.date, b.high, b.low, b.close, b.adj_close, b.source",
+            "JOIN alias AS al ON al.new_symbol = b.symbol",
+            "ARRAY_AGG(STRUCT(b.date AS date, b.close AS close, b.adj_close AS adj) ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS base",
+            "IF(a.tb.adj IS NOT NULL AND a.base.adj > 0 AND a.base.close > 0, a.tb.adj * a.base.close / a.base.adj, a.tb.close) AS target_close_adj",
+            "IF(sl.last_adj IS NOT NULL AND a.base.adj > 0 AND a.base.close > 0, sl.last_adj * a.base.close / a.base.adj, sl.last_close) AS last_close_adj",
+            "WHEN a.base.close > 0 AND (r.entry_price / a.base.close > 1.35 OR r.entry_price / a.base.close < 0.65) THEN 'entry_price_mismatch'",
+            "ROUND((SAFE_DIVIDE(j.target_close_adj, j.entry_price) - 1) * 100, 4), NULL) AS engine_roi_pp",
+            "ROUND((SAFE_DIVIDE(j.target_close, j.entry_price) - 1) * 100, 4), NULL) AS engine_roi_raw_pp",
+            "ROUND(c.engine_roi_pp - c.engine_roi_raw_pp, 4), NULL) AS dividend_adj_pp",
+            "SAFE_DIVIDE(c.last_close_adj, c.entry_price)",
+            "c.bars_symbol, c.base_bar_date,"):
+        assert frag in code, frag
+    for step, days in (("l1w", 7), ("l2w", 14), ("l1m", 30), ("l3m", 91)):
+        assert f"IF(b.date >= DATE_ADD(r.recorded_day, INTERVAL {days} DAY), STRUCT(b.close AS close, b.adj_close AS adj), NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS {step}" in code, step
+        assert f"IF(a.{step}.adj IS NOT NULL AND a.base.adj > 0 AND a.base.close > 0, a.{step}.adj * a.base.close / a.base.adj, a.{step}.close) AS close_" in code, step
+    # the mismatch test sits after the bar check and before scoring
+    i_bar, i_mm, i_sc = (code.index("THEN 'no_bar_for_symbol'"), code.index("THEN 'entry_price_mismatch'"),
+                         code.index("THEN 'scored_from_bar'"))
+    assert i_bar < i_mm < i_sc
+    # excursions and the touched target stay on raw highs and lows
+    assert "a.tb.high >= r.target_price" in code and "b.adj_close AS adj, b.source" in code
+    # simulated: SUPN - bought 35.43 on 2 Nov (base bar close 36.28 / adj 28.15, the $8.13 special
+    # dividend of 3 Nov already in the adj series); 6 Nov close 26.16 / adj 26.16
+    assert _engine_roi(35.43, 26.16, 26.16, 36.28, 28.15) == -4.8398          # the economic result
+    assert _engine_roi(35.43, 26.16, 26.16, 36.28, 28.15, use_adj=False) == -26.1643   # the 1.5.0 false loss
+    assert round(_engine_roi(35.43, 26.16, 26.16, 36.28, 28.15) - _engine_roi(35.43, 26.16, 26.16, 36.28, 28.15, use_adj=False), 4) == 21.3245
+    # a 2:1 split: close halves, adj series continuous -> 0 %
+    assert _engine_roi(100.0, 50.0, 50.0, 100.0, 50.0) == 0.0
+    assert _engine_roi(100.0, 50.0, 50.0, 100.0, 50.0, use_adj=False) == -50.0
+    # a missing adj on either bar falls back to the raw close
+    assert _engine_roi(10.0, 11.0, None, 10.0, 10.0) == 10.0 and _engine_roi(10.0, 11.0, 11.0, 10.0, None) == 10.0
+    # alias: the record keeps INDV.US, the bars are SUPN.US's; INDV's own stub is set aside
+    bars = [{"symbol": "INDV.US", "date": 1, "close": 36.26, "adj_close": None},
+            {"symbol": "SUPN.US", "date": 1, "close": 36.28, "adj_close": 28.15},
+            {"symbol": "SUPN.US", "date": 2, "close": 28.15, "adj_close": 28.15},
+            {"symbol": "FRST.US", "date": 1, "close": 15.0, "adj_close": 14.9}]
+    ab = _alias_bars(bars, [("INDV.US", "SUPN.US")])
+    indv = [b for b in ab if b["symbol"] == "INDV.US"]
+    assert [(b["date"], b["close"], b["bars_symbol"]) for b in sorted(indv, key=lambda b: b["date"])] == \
+        [(1, 36.28, "SUPN.US"), (2, 28.15, "SUPN.US")]
+    assert all(b["adj_close"] is not None for b in indv)                     # the old stub (no adj) is gone
+    assert [b["bars_symbol"] for b in ab if b["symbol"] == "FRST.US"] == ["FRST.US"]
+    assert not [b for b in ab if b["symbol"] == "SUPN.US" and b["bars_symbol"] != "SUPN.US"]
+    assert len(ab) == 5
+    # entry price mismatch: the stale 41.92 pre-merger quote against the merged company's 28.15
+    assert _entry_mismatch(41.92, 28.15) and not _entry_mismatch(35.43, 36.28) and not _entry_mismatch(13.0, 10.0)
+    assert _entry_mismatch(6.0, 10.0) and not _entry_mismatch(6.6, 10.0)
+    assert _entry_mismatch(13.0, 10.0, band=0.10), "a 10 % band would refuse an ordinary intraday move"
+
+
+def _excess(roi, bench, stance):
+    if roi is None or bench is None:
+        return None, None
+    ex = round(roi - bench, 4)
+    win = (roi > bench) if stance == "bullish" else (roi < bench)
+    return ex, "WIN" if win else "LOSS"
+
+
+def _bench_return(series, start_date, end_date):
+    """first benchmark close on/after each date (the engine's own rule for the stock)."""
+    s = min((b for b in series if b["date"] >= start_date), key=lambda b: b["date"], default=None)
+    e = min((b for b in series if b["date"] >= end_date), key=lambda b: b["date"], default=None)
+    return None if s is None or e is None else round((e["close"] / s["close"] - 1) * 100, 4)
+
+
+def case_v31():
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_outcome_excess"]
+    assert o.path.name == "76_v_outcome_excess.sql" and o.kind == "VIEW"
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_excess"} == {"v_outcome_engine", "market_series_daily"}
+    names = [x.name for x in bv.load_objects()]
+    assert names.index("v_outcome_excess") > names.index("v_outcome_engine")
+    for frag in ("('US', 'SPY'), ('Tadawul', '^TASI.SR'), ('Hong Kong', '^HSI'), ('London', '^FTSE'),",
+                 "('Europe', '^STOXX50E'), ('Tokyo', '^N225')",
+                 "COALESCE(m.benchmark, 'ACWI') AS benchmark_symbol",
+                 # the benchmark runs from the engine's base bar, never from the recording day
+                 "ARRAY_AGG(IF(b.date >= e.base_bar_date, b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS bench_base",
+                 "ARRAY_AGG(IF(e.target_bar_date IS NOT NULL AND b.date >= e.target_bar_date, b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS bench_target",
+                 "AND b.date >= e.base_bar_date",
+                 "WHERE e.base_bar_date IS NOT NULL",
+                 "ROUND(x.engine_roi_pp - x.bench_roi_pp, 4) AS excess_pp",
+                 "WHEN x.entry_stance = 'bullish' THEN IF(x.engine_roi_pp > x.bench_roi_pp, 'WIN', 'LOSS')",
+                 "WHEN x.entry_stance = 'bearish' THEN IF(x.engine_roi_pp < x.bench_roi_pp, 'WIN', 'LOSS')",
+                 "ROUND(x.roi_3m_pp - x.bench_3m_pp, 4) AS excess_3m_pp"):
+        assert frag in code, frag
+    for days in (7, 14, 30, 91):
+        assert f"IF(b.date >= DATE_ADD(e.recorded_day, INTERVAL {days} DAY), b.close, NULL) IGNORE NULLS ORDER BY b.date LIMIT 1)[SAFE_OFFSET(0)] AS bench_" in code, days
+    assert "the live system never reads BigQuery" in o.template
+    # simulated: the 5 Nov week - a -3 % call in a -4.4 % market beat it
+    assert _excess(-3.0, -4.4, "bullish") == (1.4, "WIN")
+    assert _excess(-3.0, -4.4, "bearish") == (1.4, "LOSS")                    # a short that fell less than the market lost
+    assert _excess(2.0, 3.0, "bullish") == (-1.0, "LOSS") and _excess(None, 1.0, "bullish") == (None, None)
+    spy = [{"date": 1, "close": 100.0}, {"date": 2, "close": 101.0}, {"date": 5, "close": 95.6}, {"date": 8, "close": 97.0}]
+    assert _bench_return(spy, 2, 5) == -5.3465                                # base bar day 2 (recorded on a weekend day 1 -> first bar day 2)
+    assert _bench_return(spy, 1, 5) == -4.4                                   # from the recording day: the wrong window
+    assert _bench_return(spy, 2, 6) == -3.9604                                # day 6 has no bar: the first on/after (day 8)
+    assert _bench_return(spy, 2, 9) is None
+
+
+def _regime(r1, r5, dd, vix, vol20, vs50):
+    if r1 is not None and r1 <= -2:
+        return "crash_day"
+    if (r5 is not None and r5 <= -3) or (dd is not None and dd <= -8):
+        return "drawdown"
+    if (vix is not None and vix >= 25) or (vol20 is not None and vol20 >= 25):
+        return "stress"
+    if vs50 is not None and vs50 < 0:
+        return "weak"
+    return "calm"
+
+
+def case_v32():
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_market_regime"]
+    assert o.path.name == "77_v_market_regime.sql" and o.kind == "VIEW"
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_market_regime"} == {"market_series_daily"}
+    for frag in ("WHERE symbol = 'SPY' AND close IS NOT NULL AND close > 0",
+                 "WHERE symbol = '^VIX' AND close IS NOT NULL",
+                 "LAG(s.close, 1) OVER (ORDER BY s.date) AS c1", "LAG(s.close, 5) OVER (ORDER BY s.date) AS c5",
+                 "LAG(s.close, 20) OVER (ORDER BY s.date) AS c20",
+                 "COUNT(*) OVER (ORDER BY l.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS n50",
+                 "AVG(l.close) OVER (ORDER BY l.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50",
+                 "MAX(l.close) OVER (ORDER BY l.date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) AS high250",
+                 "STDDEV_SAMP(SAFE_DIVIDE(l.close, l.c1) - 1)",
+                 "OVER (ORDER BY l.date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sd20",
+                 "IF(w.n50 = 50, ROUND((SAFE_DIVIDE(w.spy_close, w.ma50) - 1) * 100, 4), NULL) AS spy_vs_50d_pct",
+                 "IF(w.n20 = 20, ROUND(w.sd20 * SQRT(252) * 100, 4), NULL) AS spy_vol20_pct",
+                 "LEFT JOIN vix AS v ON v.date = w.date",
+                 "WHEN m.spy_r1_pct <= -2 THEN 'crash_day'",
+                 "WHEN m.spy_r5_pct <= -3 OR m.spy_dd_from_high_pct <= -8 THEN 'drawdown'",
+                 "WHEN m.vix_close >= 25 OR m.spy_vol20_pct >= 25 THEN 'stress'",
+                 "WHEN m.spy_vs_50d_pct < 0 THEN 'weak'",
+                 "ELSE 'calm'"):
+        assert frag in code, frag
+    import re
+    assert re.findall(r"THEN '([a-z_]+)'", code) == ["crash_day", "drawdown", "stress", "weak"]   # fixed order
+    assert "the live system never reads BigQuery" in o.template
+    # simulated: 5 Nov 2026 (SPY -4.41 %) is a crash day whatever else is true
+    assert _regime(-4.41, -2.7, -5.4, None, 18.0, 1.0) == "crash_day"
+    assert _regime(0.3, -3.1, -5.0, None, 18.0, 1.0) == "drawdown"
+    assert _regime(0.3, -1.0, -8.5, None, 18.0, 1.0) == "drawdown"
+    assert _regime(0.3, -1.0, -2.0, 26.0, 18.0, 1.0) == "stress"
+    assert _regime(0.3, -1.0, -2.0, None, 25.0, 1.0) == "stress"
+    assert _regime(0.3, -1.0, -2.0, None, 18.0, -0.5) == "weak"
+    assert _regime(0.3, -1.0, -2.0, None, 18.0, 0.5) == "calm"
+    assert _regime(0.3, -1.0, -2.0, None, 18.0, None) == "calm"               # the first 49 sessions: no 50-day verdict
+    assert _regime(-2.0, 1.0, 0.0, 12.0, 10.0, 2.0) == "crash_day"           # the boundary belongs to the crash
+
+
+def _seat_regime(seat_date, regime_days):
+    """the LAST regime date strictly before the seat date (a Monday seat reads Friday)."""
+    prior = [d for d in regime_days if d < seat_date]
+    return max(prior) if prior else None
+
+
+def _regime_outcomes(rows, min_scored=30, min_days=5):
+    out = {}
+    groups = {"ALL": rows, "USD": [r for r in rows if r["ccy"] == "USD"]}
+    for g, rs in groups.items():
+        for regime in sorted({r["regime"] for r in rs if r["regime"] is not None}):
+            k = [r for r in rs if r["regime"] == regime]
+            scored = [r for r in k if r["ret5"] is not None]
+            days = len({r["seat_date"] for r in k})
+            out[(g, regime)] = (len(k), days, len(scored),
+                                round(sum(r["ret5"] for r in scored) / len(scored), 2) if scored else None,
+                                "small sample" if len(scored) < min_scored or days < min_days else "")
+    return out
+
+
+def case_v33():
+    objs = {o.name: o for o in bv.load_objects()}
+    seat, outc = objs["v_seat_regime"], objs["v_regime_outcomes"]
+    assert seat.path.name == "78_v_seat_regime.sql" and outc.path.name == "79_v_regime_outcomes.sql"
+    code = bv._code(seat.template)
+    assert set(bv._REF.findall(code)) - {"v_seat_regime"} == {"v_board_episodes", "v_market_regime"}
+    for frag in ("WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_board_episodes`)",
+                 "LEAD(r.date) OVER (ORDER BY r.date) AS next_date",
+                 "ON g.date < s.seat_date", "AND (g.next_date >= s.seat_date OR g.next_date IS NULL)",
+                 "g.date AS regime_date", "g.regime,", "g.vix_close"):
+        assert frag in code, frag
+    assert "g.date <= s.seat_date" not in code                                 # never the seat day's own close
+    code2 = bv._code(outc.template)
+    assert set(bv._REF.findall(code2)) - {"v_regime_outcomes"} == {"v_seat_regime"}
+    for frag in ("WHERE regime IS NOT NULL", "SELECT 'USD' AS ccy_group, s.* FROM s WHERE s.ccy = 'USD'",
+                 "SELECT 'ALL' AS ccy_group, s.* FROM s\n", "COUNT(DISTINCT seat_date) AS days",
+                 "COUNTIF(ret_plus5_pct IS NOT NULL) AS scored5", "ROUND(AVG(win_plus5) * 100, 1) AS win5_pct",
+                 "IF(scored5 < 30 OR days < 5, 'small sample', '') AS sample_note"):
+        assert frag in code2, frag
+    names = [x.name for x in bv.load_objects()]
+    assert names.index("v_market_regime") < names.index("v_seat_regime") < names.index("v_regime_outcomes")
+    # simulated: regime dates are US sessions; a Monday-9 seat reads Friday-6, never Monday's own close
+    assert _seat_regime(9, [5, 6, 9, 10]) == 6 and _seat_regime(7, [5, 6, 9, 10]) == 6 and _seat_regime(5, [5, 6]) is None
+    rows = ([{"ccy": "USD", "regime": "calm", "seat_date": d, "ret5": 1.0} for d in range(1, 7)] * 6
+            + [{"ccy": "EUR", "regime": "calm", "seat_date": 1, "ret5": 2.0}]
+            + [{"ccy": "USD", "regime": "crash_day", "seat_date": 20, "ret5": -3.5}] * 7
+            + [{"ccy": "USD", "regime": "weak", "seat_date": 30, "ret5": None}])
+    o = _regime_outcomes(rows)
+    assert o[("USD", "calm")] == (36, 6, 36, 1.0, "") and o[("ALL", "calm")] == (37, 6, 37, 1.03, "")
+    assert o[("USD", "crash_day")] == (7, 1, 7, -3.5, "small sample")          # the 8 Nov state of the archive
+    assert o[("USD", "weak")] == (1, 1, 0, None, "small sample")
+    assert ("ALL", "crash_day") in o and ("EUR", "calm") not in o
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33]
 
 
 def test_v1(): case_v1()
@@ -1758,6 +2037,10 @@ def test_v26(): case_v26()
 def test_v27(): case_v27()
 def test_v28(): case_v28()
 def test_v29(): case_v29()
+def test_v30(): case_v30()
+def test_v31(): case_v31()
+def test_v32(): case_v32()
+def test_v33(): case_v33()
 
 
 if __name__ == "__main__":
