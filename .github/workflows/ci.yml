@@ -2,6 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
+#
+# v1.1.70: run tests/test_pre_open_check.py (scripts/pre_open_check.py
+# v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
+# and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
+# the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
+# 1.1.68 and 1.1.69 are claimed by open PRs #935 and #936; whichever lands
+# later re-bumps.
+#
 # VERSION 1.1.67 (2026-11-08) -- FUNDABLE SEATS HARNESS
 #
 # v1.1.67: run tests/test_dt10_v1260_fundable_seats.js (16_Decision_Top10.gs
@@ -1170,7 +1179,8 @@ jobs:
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
-            tests/test_ob_conviction_sizing.py $EXTRA
+            tests/test_ob_conviction_sizing.py \
+            tests/test_pre_open_check.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
