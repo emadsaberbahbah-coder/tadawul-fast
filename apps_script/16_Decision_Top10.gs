@@ -1,11 +1,72 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.23.1 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.24.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.24.0 (2026-11-08) [SEAT-GUARD] -- FRESH SEATS STOP CHURNING (TWO KNOBS, DEFAULT OFF) + ONE NOTE FIX
+ * WHY (morning review, 8 Nov 2026, live _Selection_Log):
+ * (1) DISPLACEMENT TOOK THE WRONG SEAT. 03:53 SPFI.US entered 'NEW
+ *   (confirmed 3/3)'; 07:33 EFC.US and PFS.US confirmed and 'displaced
+ *   SPFI.US/MBIN.US' while WDP.BR and MRL.MC sat in GRACE (1/3 missed). The
+ *   v1.3.0 rule compares the challenger with the LAST seat by smoothed score
+ *   only; grace seats keep the high scores of the days they qualified, so a
+ *   fresh qualifying seat is the one that goes. The board paid two exits and
+ *   two entries for no gain in qualifying seats.
+ * (2) DATA BLIPS ARE EXITS. Under strict (v1.8.6 default) a member whose
+ *   audited row reads structural_block, DO_NOT_INVEST or BLOCKED for ONE
+ *   render leaves at once and loses its window history; 94 hard exits in five
+ *   weeks (7 Nov review, B3), many on rows the next sync repaired.
+ * (3) NOTE FIX. 03:53 token 'cooldown=10d held 3 ITRN.US(sold 3d ago)
+ *   SNDA.US(sold 3d ago) ITRN.US(sold 3d ago)': a seated name that is also in
+ *   the raw list was pushed by the raw loop AND by the membership pass.
+ * WHAT:
+ * (a) [HARD-EXIT-CONFIRM] Script Property TFB_T10_HARD_EXIT_CONFIRM ('on'
+ *   arms; absent / anything else = the v1.23.1 exits byte for byte) ->
+ *   knobs.hard_exit_confirm (set ONLY when armed). Armed: a member that is
+ *   hard-out for a DATA-CLASS reason (structural_block; strict DO_NOT_INVEST
+ *   or BLOCKED) keeps its seat on the first day-key it is seen (st.hx = that
+ *   day-key) and exits on a LATER day-key that is still hard-out. A clean
+ *   render clears hx. Sold inside the cool-down and SELL/AVOID/EXIT verdicts
+ *   (DT10_STAB_HARD_VERDICT_RE) stay immediate. The kept seat renders
+ *   'GRACE (co/n missed) - hard-exit pending' with sizing suspended even when
+ *   a raw ticket exists (dt10GraceSuspend_), so it is never executable.
+ *   Outage-paused members (v1.11.10) are untouched, as before.
+ * (b) [SEAT-GUARD] Script Property TFB_T10_SEAT_GUARD_DAYS (integer 1..10;
+ *   absent/0/junk = the v1.23.1 displacement byte for byte) ->
+ *   knobs.seat_guard_days (set ONLY when armed). Armed, a CONFIRMED
+ *   challenger on a full board takes, in this order: the weakest
+ *   NON-QUALIFYING seat (not raw, not qualifiedWithin, or hard-exit pending;
+ *   outage-paused seats excluded), then the weakest UNCONFIRMED fast-track
+ *   seat -- both without the score test (a confirmed qualifying name beats a
+ *   seat that does not qualify today) -- else the weakest confirmed seat past
+ *   its first N day-keys, with the v1.3.0 smoothed-score test. A seat in its
+ *   first N day-keys and a seat entered on this run are never taken. The
+ *   victim leaves exactly as a v1.3.0 displacement (its window bits kept).
+ * (c) [COOLDOWN-NOTE-FIX] the membership pass names a sold seat once: an
+ *   existing raw-loop entry for the same symbol is marked member:true instead
+ *   of a second entry being pushed. No membership change.
+ * SURFACE: note tokens ', hxconfirm[ held k SYM ...]' and ', guard=Nd[ took
+ *   SYM(nq|ft) ...]' only while armed; audit.hard_exit_held and
+ *   audit.seat_guard only while armed; the state blob writes hx only while a
+ *   member is pending (parsed as yyyy-mm-dd only), so a blob that never held
+ *   stays byte-identical. dt10SelfTest gains 4 lines (2 property lines, 2
+ *   core batteries) and the reentry cooldown core battery gains the dedupe.
+ * Functions added (0 removed): dt10StabHardExitConfirm_,
+ *   dt10StabSeatGuardDays_; vars added: DT10_T10_HARD_EXIT_CONFIRM_PROP,
+ *   DT10_T10_SEAT_GUARD_PROP, DT10_T10_SEAT_GUARD_MAX.
+ * SECTION 8 KEPT: no gate, score or verdict is recomputed; the reasons are
+ *   read from the backend's own audited row.
+ * Harness: tests/test_dt10_v1240_seat_guard.js (REAL file; golden negatives
+ *   on the v1.23.1 file rebuilt by reversing these edits, SHA-256 pinned).
+ * Rollback: delete either property (no re-paste) or re-paste v1.23.1 (blobs
+ *   with hx keep parsing there: unknown keys are dropped by its parser).
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in
+ *   lockstep. Arming is an owner step (recommended: SEAT_GUARD_DAYS=3 and
+ *   HARD_EXIT_CONFIRM=on together, after the merge and paste).
  *
  * v1.23.1 (2026-11-08) [CONFIRM-WINDOW-FIX] -- THE WINDOW HISTORY CARRIES ITS DAY-KEY (TWO REVIEW FINDINGS)
  * WHY (Codex review of PR #927, 8 Nov 2026, two P2 findings on v1.22.0):
@@ -2564,7 +2625,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.23.1';
+var DT10_VERSION = '1.24.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3447,6 +3508,16 @@ var DT10_T10_CONFIRM_WINDOW_MAX = 30;
 // Absent/0/junk = v1.22.0 board; 1..60 arms.
 var DT10_T10_COOLDOWN_PROP = 'TFB_T10_REENTRY_COOLDOWN_DAYS';
 var DT10_T10_COOLDOWN_MAX = 60;
+// v1.24.0 [HARD-EXIT-CONFIRM]: a data-side hard exit (structural block, or
+// the strict DO_NOT_INVEST / BLOCKED verdict) must be seen on two day-keys --
+// see the v1.24.0 header block. 'on' arms; anything else = the v1.23.1 board.
+var DT10_T10_HARD_EXIT_CONFIRM_PROP = 'TFB_T10_HARD_EXIT_CONFIRM';
+// v1.24.0 [SEAT-GUARD]: displacement takes a non-qualifying seat first, then
+// an unconfirmed fast-track seat, never a confirmed seat in its first N
+// day-keys -- see the v1.24.0 header block. Absent/0/junk = the v1.23.1
+// board; 1..10 arms.
+var DT10_T10_SEAT_GUARD_PROP = 'TFB_T10_SEAT_GUARD_DAYS';
+var DT10_T10_SEAT_GUARD_MAX = 10;
 var DT10_LEDGER_SHEET = '_Portfolio_CostBasis';
 // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
 // that the audited grid still rates INVEST inside the rank buffer -- see the
@@ -4644,6 +4715,12 @@ function dt10StabParseState_(raw) {
       // when > 0 so a blob that never paused stays byte-identical to v1.14.0.
       var vcp = Math.max(0, parseInt(v.cp, 10) || 0);
       if (vcp > 0) out.symbols[sym].cp = vcp;
+      // v1.24.0 [HARD-EXIT-CONFIRM]: the day-key a member was first seen
+      // data-side hard-out. Absent in older blobs; written only while armed
+      // and pending, so a blob that never held stays byte-identical.
+      if (typeof v.hx === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.hx)) {
+        out.symbols[sym].hx = v.hx;
+      }
       // v1.22.0 [CONFIRM-WINDOW]: qualified-day bits (0/1, newest last).
       // Absent in older blobs -> no key; written only for symbols an armed
       // window touched, so a blob that never ran it stays byte-identical to
@@ -5080,6 +5157,20 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   // in dt10ApplyStability_); 0 (older callers, the self-test replays, the
   // property unset) is the v1.21.1 clock byte for byte.
   var cwLen = dt10StabConfirmWindowLen_(knobs);
+  // v1.24.0 [HARD-EXIT-CONFIRM]: plain knob (service read in
+  // dt10ApplyStability_); absent = the v1.23.1 exits byte for byte.
+  var hxOn = knobs.hard_exit_confirm === true;
+  var hardHeld = [];
+  function hardImmediate(sym) {
+    // sold inside the cool-down, or a safety verdict (SELL/AVOID/EXIT): never held
+    if (cooledDown(sym)) return true;
+    var hc = candBySym[sym];
+    return !!hc && DT10_STAB_HARD_VERDICT_RE.test(String(hc.verdict || ''));
+  }
+  // v1.24.0 [SEAT-GUARD]: plain knob; absent/0 = the v1.23.1 displacement.
+  var sgDays = Math.max(0, Math.min(DT10_T10_SEAT_GUARD_MAX,
+                                    parseInt(knobs.seat_guard_days, 10) || 0));
+  var sgTook = [];
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -5224,7 +5315,18 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     // v1.11.10 [P-168]: an outage-paused member keeps its seat untouched --
     // today's absence/verdict is a data failure, not a market read.
     if (dt10InList_(pausedSyms, ms)) { survivors.push(ms); continue; }
-    if (hardOut(ms)) {
+    // v1.24.0 [HARD-EXIT-CONFIRM]: the pending mark lives only while armed
+    // and only while the member is still hard-out.
+    if (stm.hx !== undefined && (!hxOn || !hardOut(ms))) delete stm.hx;
+    if (hxOn && hardOut(ms) && !hardImmediate(ms) &&
+        !(stm.hx !== undefined && stm.hx < today)) {
+      // first day-key of a data-side hard-out: the seat is kept (sizing
+      // suspended in the output pass); a LATER day-key still hard-out exits.
+      if (stm.hx === undefined) stm.hx = today;
+      hardHeld.push(ms);
+      survivors.push(ms);
+    } else if (hardOut(ms)) {
+      if (stm.hx !== undefined) delete stm.hx;   // v1.24.0 [HARD-EXIT-CONFIRM]
       stm.member = false; stm.ci = 0; stm.co = 0;
       if (cwLen > 0 && stm.qh) {   // v1.22.0 [CONFIRM-WINDOW]
         delete stm.qh;
@@ -5232,7 +5334,15 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
       }
       exitedHard.push(ms);
       if (cooledDown(ms)) {   // v1.23.0 [REENTRY-COOLDOWN]: a sold holding
-        cooldownHeld.push({ symbol: ms, days: cdMap[ms].days, date: cdMap[ms].date, member: true });
+        // v1.24.0 [COOLDOWN-NOTE-FIX]: a seated name also in the raw list is
+        // named once (the raw-loop entry is marked member instead).
+        var cdSeen = false;
+        for (var cds = 0; cds < cooldownHeld.length; cds++) {
+          if (cooldownHeld[cds].symbol === ms) { cooldownHeld[cds].member = true; cdSeen = true; }
+        }
+        if (!cdSeen) {
+          cooldownHeld.push({ symbol: ms, days: cdMap[ms].days, date: cdMap[ms].date, member: true });
+        }
       }
     } else if ((stm.co || 0) >= knobs.exit_days) {
       stm.member = false; stm.ci = 0; stm.co = 0;
@@ -5280,6 +5390,36 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     }
     return false;
   }
+  // v1.24.0 [SEAT-GUARD]: the armed victim -- the weakest non-qualifying seat,
+  // else the weakest unconfirmed fast-track seat (both without the score
+  // test), else the weakest confirmed seat past its first sgDays day-keys
+  // (score test). Outage-paused seats are never taken without the score test;
+  // a seat entered on this run is never taken.
+  function guardVictim() {
+    var gi, gs, gst;
+    for (gi = finalSyms.length - 1; gi >= 0; gi--) {
+      gs = finalSyms[gi]; gst = symbols[gs];
+      if (gst && gst.member === true && !dt10InList_(pausedSyms, gs) &&
+          (dt10InList_(hardHeld, gs) ||
+           !(rawSet[gs] === true || (qualifiedBasis && qualifiedWithin(gs))))) {
+        return { sym: gs, force: true, tag: 'nq' };
+      }
+    }
+    for (gi = finalSyms.length - 1; gi >= 0; gi--) {
+      gs = finalSyms[gi]; gst = symbols[gs];
+      if (gst && gst.member === true && gst.ft === true && !dt10InList_(pausedSyms, gs) &&
+          (gst.ci || 0) < knobs.confirm_days) {
+        return { sym: gs, force: true, tag: 'ft' };
+      }
+    }
+    for (gi = finalSyms.length - 1; gi >= 0; gi--) {
+      gs = finalSyms[gi]; gst = symbols[gs];
+      if (!gst || gst.member !== true) continue;
+      if (dt10StabDays_(gst.since || today, today) + 1 <= sgDays) continue;
+      return { sym: gs, force: false, tag: '' };
+    }
+    return { sym: '', force: false, tag: '' };
+  }
   for (var ei = 0; ei < rawSyms.length; ei++) {   // confirmed challengers
     var es = rawSyms[ei];
     if (inFinal(es)) continue;
@@ -5292,8 +5432,13 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     // DISPLACEMENT: a CONFIRMED challenger replaces the weakest incumbent
     // only when its SMOOTHED score is higher. Fast-track never displaces.
     var weakest = finalSyms[finalSyms.length - 1];
-    if (weakest && smoothed(es) > smoothed(weakest)) {
-      finalSyms.pop();
+    var sgPick = null;   // v1.24.0 [SEAT-GUARD]
+    if (sgDays > 0) { sgPick = guardVictim(); weakest = sgPick.sym; }
+    if (weakest && ((sgPick !== null && sgPick.force) || smoothed(es) > smoothed(weakest))) {
+      for (var wi = finalSyms.length - 1; wi >= 0; wi--) {
+        if (finalSyms[wi] === weakest) { finalSyms.splice(wi, 1); break; }
+      }
+      if (sgPick !== null) sgTook.push(weakest + (sgPick.tag ? '(' + sgPick.tag + ')' : ''));
       var stw = symbols[weakest];
       stw.member = false; stw.ci = 0; stw.co = 0;
       if (cwLen > 0 && stw.qh) stw.ci = dt10StabQhSum_(stw.qh);   // v1.22.0 [CONFIRM-WINDOW]
@@ -5408,6 +5553,17 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
       // marker so the allocation replay is offered the seat; no sizing here.
       status = 'ACTIVE (day ' + daysIn + ')';
       dt10StabQualifiedHoldSeat_(tk);
+    } else if (hxOn && inList(hardHeld, osym)) {
+      // v1.24.0 [HARD-EXIT-CONFIRM]: same 'GRACE' prefix (same withholding
+      // downstream); sizing suspended even when a raw ticket exists.
+      status = 'GRACE (' + (ost.co || 0) + '/' + knobs.exit_days +
+               ' missed) - hard-exit pending';
+      if (src) {
+        dt10GraceSuspend_(tk, status);
+      } else {
+        tk.advisor_note = String(tk.advisor_note || '') +
+            ' Hard-exit pending: kept one more sync day to rule out a data blip.';
+      }
     } else if (!rawSet[osym] || (ost.co || 0) > 0) {
       status = 'GRACE (' + (ost.co || 0) + '/' + knobs.exit_days + ' missed)';
       // v1.11.10 [P-168]: disclose the pause on the label (paint and the
@@ -5456,6 +5612,10 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     tickets.push(tk);
   }
   // ---- state hygiene ---------------------------------------------------------
+  for (var hxk in symbols) {   // v1.24.0 [HARD-EXIT-CONFIRM]
+    if (symbols.hasOwnProperty(hxk) && symbols[hxk].hx !== undefined &&
+        symbols[hxk].member !== true) delete symbols[hxk].hx;
+  }
   var pruned = 0;
   for (var pk in symbols) {
     if (!symbols.hasOwnProperty(pk) || symbols[pk].member) continue;
@@ -5584,6 +5744,19 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
       note += ' held ' + cooldownHeld.length + ' ' + cdParts.join(' ');
     }
   }
+  // v1.24.0 [HARD-EXIT-CONFIRM] / [SEAT-GUARD]: read-back tokens only while
+  // armed (absent leaves the note and the audit byte-identical to v1.23.1).
+  var hxFinal = [];
+  for (var hxf = 0; hxf < hardHeld.length; hxf++) {
+    if (inFinal(hardHeld[hxf])) hxFinal.push(hardHeld[hxf]);
+  }
+  if (hxOn) {
+    note += ', hxconfirm' + (hxFinal.length ? ' held ' + hxFinal.length + ' ' +
+                             hxFinal.slice(0, 3).join(' ') : '');
+  }
+  if (sgDays > 0) {
+    note += ', guard=' + sgDays + 'd' + (sgTook.length ? ' took ' + sgTook.slice(0, 3).join(' ') : '');
+  }
   var coreOut = {
     tickets: tickets,
     state: state,
@@ -5602,6 +5775,8 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   if (qhMode !== 'off') coreOut.audit.qualified_held = qualifiedHeld;   // v1.19.0
   if (cwLen > 0) coreOut.audit.confirm_window = cwLen;   // v1.22.0 [CONFIRM-WINDOW]
   if (cdMap !== null) coreOut.audit.cooldown_held = cooldownHeld;   // v1.23.0 [REENTRY-COOLDOWN]
+  if (hxOn) coreOut.audit.hard_exit_held = hxFinal;                 // v1.24.0 [HARD-EXIT-CONFIRM]
+  if (sgDays > 0) coreOut.audit.seat_guard = { days: sgDays, took: sgTook };   // v1.24.0 [SEAT-GUARD]
   return coreOut;
 }
 // ---------------------------------------------------------------------------
@@ -5811,6 +5986,40 @@ function dt10StabConfirmWindow_() {
     if (!(n >= 2)) return 0;
     return Math.min(DT10_T10_CONFIRM_WINDOW_MAX, n);
   } catch (eCw) {}
+  return 0;
+}
+/**
+ * v1.24.0 [HARD-EXIT-CONFIRM]: Script Property TFB_T10_HARD_EXIT_CONFIRM
+ * (DT10_T10_HARD_EXIT_CONFIRM_PROP). Exactly 'on' (trimmed, any case) arms;
+ * absent, blank, 'off', junk or a PropertiesService fault read as false = the
+ * v1.23.1 board. Mirrors dt10StabQualifiedHoldMode_; never throws.
+ */
+function dt10StabHardExitConfirm_() {
+  try {
+    var v = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_HARD_EXIT_CONFIRM_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase();
+    return v === 'on';
+  } catch (eHx) {}
+  return false;
+}
+/**
+ * v1.24.0 [SEAT-GUARD]: Script Property TFB_T10_SEAT_GUARD_DAYS
+ * (DT10_T10_SEAT_GUARD_PROP). An integer 1..DT10_T10_SEAT_GUARD_MAX arms the
+ * guard (larger values clamp to the max); absent, blank, 0, negative, junk or
+ * a PropertiesService fault read as 0 = the v1.23.1 board. Mirrors
+ * dt10StabCooldownDays_; never throws.
+ */
+function dt10StabSeatGuardDays_() {
+  try {
+    var raw = String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_SEAT_GUARD_PROP) || '')
+        .replace(/^\s+|\s+$/g, '');
+    if (!/^\d+$/.test(raw)) return 0;
+    var n = parseInt(raw, 10);
+    if (!(n > 0)) return 0;
+    return Math.min(DT10_T10_SEAT_GUARD_MAX, n);
+  } catch (eSg) {}
   return 0;
 }
 
@@ -8733,6 +8942,12 @@ function dt10ApplyStability_(payload, panel, outage) {
     knobs.cooldown_days = cdRead;
     cdMapApply = dt10CooldownMap_(SpreadsheetApp.getActiveSpreadsheet(), cdRead);
   }
+  // v1.24.0 [HARD-EXIT-CONFIRM] / [SEAT-GUARD]: same pattern -- one service
+  // read each here; the knobs are set ONLY when armed so an unarmed run
+  // publishes the v1.23.1 knobs object byte for byte.
+  if (dt10StabHardExitConfirm_()) knobs.hard_exit_confirm = true;
+  var sgRead = dt10StabSeatGuardDays_();
+  if (sgRead > 0) knobs.seat_guard_days = sgRead;
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -11709,6 +11924,10 @@ function dt10SelfTest() {
   var rcOn = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0], undefined, rcMap);
   var rcOff = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), cbKnobs('qualified'), 2, cbDays[0]);
   var rcNoMap = dt10StabCore_(cbRaw[0], cbGrid(86), dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0]);
+  // v1.24.0 [COOLDOWN-NOTE-FIX]: B is seated AND in the raw list (one entry).
+  var rcDup = dt10StabCore_([cbTk('A.US', 95), cbTk('B.US', 84)], cbGrid(86),
+                            dt10StabParseState_(cbSeed), rcKnobs, 2, cbDays[0], undefined,
+                            dt10CooldownMapFromValues_(rcGrid, rcAsOf, 10));
   var rcChal = null, rcB = null;
   for (var rci = 0; rci < rcOn.tickets.length; rci++) {
     if (rcOn.tickets[rci].symbol === 'CHAL.US') rcChal = rcOn.tickets[rci];
@@ -11729,9 +11948,12 @@ function dt10SelfTest() {
         rcOn.state.symbols['CHAL.US'] === undefined &&
         JSON.stringify(rcNoMap) === JSON.stringify(rcOff) &&
         JSON.stringify(rcOff) === JSON.stringify(cbQ[0]) &&
-        rcOff.note.indexOf('cooldown') < 0 && rcOff.audit.cooldown_held === undefined)
+        rcOff.note.indexOf('cooldown') < 0 && rcOff.audit.cooldown_held === undefined &&
+        rcDup.audit.cooldown_held.length === 1 && rcDup.audit.cooldown_held[0].member === true &&
+        rcDup.note.indexOf('held 1 B.US(sold 1d ago)') > 0)
        ? 'ok (parser: header row 4, Date + ISO cells, 0..N days, most recent sale wins; ' +
-         'core: sold name not seated and named, sold member hard-exits; map absent = v1.22.0)'
+         'core: sold name not seated and named, sold member hard-exits; map absent = v1.22.0; ' +
+         'v1.24.0: a seated name in the raw list is named once)'
        : 'FAIL [' + rcOn.note + ' | ' + Object.keys(rcMap).join(',') + ']'));
   /* v1.22.0 [CONFIRM-WINDOW]: property line (one read) + pure battery on the
      confirm-basis board. CHAL raw d1-d2, WATCH at rank 12 on d3 (a reset day
@@ -11812,6 +12034,112 @@ function dt10SelfTest() {
        : 'FAIL [' + cw5[2].note + ' | ' + cw5[3].note + ' | ' + cwRe.note + ' | ' +
          (cwR4.state.symbols['CHAL.US'] && cwR4.state.symbols['CHAL.US'].ci) + ' | ' +
          (cwP3b.state.symbols['CHAL.US'] && cwP3b.state.symbols['CHAL.US'].ci) + ']'));
+  /* v1.24.0 [HARD-EXIT-CONFIRM]: property line (one read) + pure battery on
+     the confirm-basis board (limit 2, seed A + B). B structural_block on d1:
+     unarmed -> hard exit (the v1.23.1 board); armed -> kept as 'GRACE (1/3
+     missed) - hard-exit pending' with no sizing, hx = d1, token 'hxconfirm
+     held 1 B.US'; a same-day re-run keeps it; d2 still blocked -> hard exit,
+     hx gone; d2 clean -> kept, hx gone; SELL on d1 stays immediate; the knob
+     false deep-equals the knob absent. */
+  report.push('hard-exit confirm (TFB_T10_HARD_EXIT_CONFIRM): ' +
+              (dt10StabHardExitConfirm_() ? 'on' : 'off') + ' (off = v1.23.1 exits)');
+  function hxKnobs(on) {
+    var k = cbKnobs('qualified');
+    if (on !== undefined) k.hard_exit_confirm = on;
+    return k;
+  }
+  var hxBlk = cbGrid(86);
+  hxBlk[hxBlk.length - 2].structural_block = true;          // B.US
+  var hxSell = cbGrid(86);
+  hxSell[hxSell.length - 2].verdict = 'SELL';               // B.US
+  var hxOff = dt10StabCore_(cbRaw[0], hxBlk, dt10StabParseState_(cbSeed), hxKnobs(), 2, cbDays[0]);
+  var hxF = dt10StabCore_(cbRaw[0], hxBlk, dt10StabParseState_(cbSeed), hxKnobs(false), 2, cbDays[0]);
+  var hx1 = dt10StabCore_(cbRaw[0], hxBlk, dt10StabParseState_(cbSeed), hxKnobs(true), 2, cbDays[0]);
+  var hx1b = dt10StabCore_(cbRaw[0], hxBlk, dt10StabParseState_(hx1.state), hxKnobs(true), 2, cbDays[0]);
+  var hx2 = dt10StabCore_(cbRaw[1], hxBlk, dt10StabParseState_(hx1.state), hxKnobs(true), 2, cbDays[1]);
+  var hx2c = dt10StabCore_(cbRaw[1], cbGrid(86), dt10StabParseState_(hx1.state), hxKnobs(true), 2, cbDays[1]);
+  var hxS = dt10StabCore_(cbRaw[0], hxSell, dt10StabParseState_(cbSeed), hxKnobs(true), 2, cbDays[0]);
+  var hxB1 = null;
+  for (var hxt = 0; hxt < hx1.tickets.length; hxt++) {
+    if (hx1.tickets[hxt].symbol === 'B.US') hxB1 = hx1.tickets[hxt];
+  }
+  report.push('hard-exit confirm core: ' +
+      ((hxOff.audit.exited_hard.length === 1 && hxOff.audit.exited_hard[0] === 'B.US' &&
+        JSON.stringify(hxF) === JSON.stringify(hxOff) &&
+        hxOff.note.indexOf('hxconfirm') < 0 && hxOff.audit.hard_exit_held === undefined &&
+        hx1.audit.exited_hard.length === 0 && hxB1 !== null &&
+        String(hxB1._stab_status).indexOf(' - hard-exit pending') > 0 && hxB1._grace_hold === true &&
+        hx1.state.symbols['B.US'].hx === cbDays[0] &&
+        hx1.note.indexOf('hxconfirm held 1 B.US') > 0 &&
+        hx1b.audit.exited_hard.length === 0 && hx1b.state.symbols['B.US'].hx === cbDays[0] &&
+        hx2.audit.exited_hard.length === 1 && hx2.audit.exited_hard[0] === 'B.US' &&
+        hx2.state.symbols['B.US'].hx === undefined &&
+        hx2c.audit.exited_hard.length === 0 && hx2c.state.symbols['B.US'].member === true &&
+        hx2c.state.symbols['B.US'].hx === undefined &&
+        hxS.audit.exited_hard.length === 1 && hxS.audit.exited_hard[0] === 'B.US')
+       ? 'ok (off = v1.23.1 exit; on: a structural block keeps the seat one day-key with no ' +
+         'sizing, exits on the next day-key still blocked, clears when clean; SELL stays immediate)'
+       : 'FAIL [' + hxOff.note + ' | ' + hx1.note + ' | ' + hx2.note + ' | ' + hx2c.note + ']'));
+  /* v1.24.0 [SEAT-GUARD]: property line (one read) + pure battery, limit 3.
+     Seed: A seated since 10-01; G seated (co 1), WATCH today, so not
+     qualifying, smoothed 99; N confirmed and seated since 10-20 (day 2 on
+     10-21); C a challenger at 2 that today's raw ticket confirms. Absent / 0:
+     N is the weakest by smoothed score and is displaced (the v1.23.1 rule).
+     Guard 3: G (non-qualifying) goes and N stays. G INVEST 90 (qualifying)
+     with N protected: no seat is taken and C waits at 3/3. N past the guard:
+     the score test takes N. An unconfirmed fast-track seat (1/3) goes before
+     any confirmed seat. */
+  report.push('seat guard (TFB_T10_SEAT_GUARD_DAYS): ' + dt10StabSeatGuardDays_() +
+              ' (0 = v1.23.1 displacement; 1..' + DT10_T10_SEAT_GUARD_MAX + ' arms)');
+  function sgKnobs(n) {
+    var k = cbKnobs('qualified');
+    if (n !== undefined) k.seat_guard_days = n;
+    return k;
+  }
+  function sgSeed(nSince, withFt) {
+    var s = { v: 1, date: '2026-10-20', symbols: {
+        'A.US': { ci: 3, co: 0, member: true, since: '2026-10-01', ls: '2026-10-20', hist: [95, 95], ft: false },
+        'G.US': { ci: 3, co: 1, member: true, since: '2026-10-01', ls: '2026-10-20', hist: [99, 99], ft: false },
+        'N.US': { ci: 3, co: 0, member: true, since: nSince, ls: '2026-10-20', hist: [80], ft: false },
+        'C.US': { ci: 2, co: 0, member: false, since: '', ls: '2026-10-20', hist: [88, 88], ft: false } } };
+    if (withFt) {
+      delete s.symbols['A.US'];
+      s.symbols['FT.US'] = { ci: 1, co: 0, member: true, since: '2026-10-20', ls: '2026-10-20',
+                             hist: [97], ft: true };
+    }
+    return s;
+  }
+  function sgGrid(gVerdict, gScore, withFt) {
+    return [cbCand(withFt ? 'FT.US' : 'A.US', withFt ? 97 : 95), cbCand('C.US', 88),
+            cbCand('N.US', 80), cbCand('G.US', gScore, gVerdict)];
+  }
+  var sgRaw = [cbTk('A.US', 95), cbTk('C.US', 88), cbTk('N.US', 80)];
+  var sgRawFt = [cbTk('FT.US', 97), cbTk('C.US', 88), cbTk('N.US', 80)];
+  var sgDay = '2026-10-21';
+  var sgOff = dt10StabCore_(sgRaw, sgGrid('WATCH', 70), dt10StabParseState_(sgSeed('2026-10-20')), sgKnobs(), 3, sgDay);
+  var sgZero = dt10StabCore_(sgRaw, sgGrid('WATCH', 70), dt10StabParseState_(sgSeed('2026-10-20')), sgKnobs(0), 3, sgDay);
+  var sgOn = dt10StabCore_(sgRaw, sgGrid('WATCH', 70), dt10StabParseState_(sgSeed('2026-10-20')), sgKnobs(3), 3, sgDay);
+  var sgQ = dt10StabCore_(sgRaw, sgGrid('INVEST', 90), dt10StabParseState_(sgSeed('2026-10-20')), sgKnobs(3), 3, sgDay);
+  var sgOld = dt10StabCore_(sgRaw, sgGrid('INVEST', 90), dt10StabParseState_(sgSeed('2026-10-01')), sgKnobs(3), 3, sgDay);
+  var sgFt = dt10StabCore_(sgRawFt, sgGrid('INVEST', 90, true), dt10StabParseState_(sgSeed('2026-10-20', true)),
+                           sgKnobs(3), 3, sgDay);
+  report.push('seat guard core: ' +
+      ((sgOff.audit.exited_displaced.join(',') === 'N.US' &&
+        JSON.stringify(sgZero) === JSON.stringify(sgOff) &&
+        sgOff.note.indexOf('guard=') < 0 && sgOff.audit.seat_guard === undefined &&
+        sgOn.audit.exited_displaced.join(',') === 'G.US' &&
+        sgOn.state.symbols['N.US'].member === true && sgOn.state.symbols['C.US'].member === true &&
+        sgOn.note.indexOf('guard=3d took G.US(nq)') > 0 &&
+        sgQ.audit.exited_displaced.length === 0 && sgQ.state.symbols['C.US'].member === false &&
+        sgQ.note.indexOf('pending C.US(3/3)') > 0 &&
+        sgOld.audit.exited_displaced.join(',') === 'N.US' &&
+        sgFt.audit.exited_displaced.join(',') === 'FT.US' &&
+        sgFt.note.indexOf('took FT.US(ft)') > 0 && sgFt.state.symbols['N.US'].member === true)
+       ? 'ok (0/absent = v1.23.1: the fresh seat goes; guard 3: the non-qualifying seat goes first, ' +
+         'a fresh confirmed seat is never taken, past the guard the score test applies, an ' +
+         'unconfirmed fast-track seat goes before a confirmed one)'
+       : 'FAIL [' + sgOff.note + ' | ' + sgOn.note + ' | ' + sgQ.note + ' | ' + sgOld.note + ' | ' +
+         sgFt.note + ']'));
   /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
      confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
      the buffer boundary: off / junk = the v1.14.0 qualified replay byte for
