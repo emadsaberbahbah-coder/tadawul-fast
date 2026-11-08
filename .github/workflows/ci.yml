@@ -8,7 +8,13 @@
 # v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
 # and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
 # the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
-# 1.1.69 is claimed by open PR #936; whichever lands later re-bumps.
+#
+# VERSION 1.1.69 (2026-11-08) -- RISK-BUDGET SIZING SUITE
+#
+# v1.1.69: run tests/test_ob_risk_sizing.py (opportunity_builder v1.29.0:
+# TFB_OPP_SIZING_MODE=risk sizes each ticket so its loss at the printed stop
+# is TFB_OPP_RISK_BUDGET_PCT of the sizing basis; default cap byte-identical)
+# in the blocking lean lane next to the conviction suite.
 #
 # VERSION 1.1.68 (2026-11-08) -- CORP-EVENT GUARD HARNESS
 #
@@ -1187,6 +1193,7 @@ jobs:
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
             tests/test_ob_conviction_sizing.py \
+            tests/test_ob_risk_sizing.py \
             tests/test_pre_open_check.py $EXTRA
           echo "::endgroup::"
 
