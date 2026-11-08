@@ -29,6 +29,10 @@
 -- the archive has not reached the target yet), engine_no_bar (due records
 -- whose symbol has no archived bars) and engine_no_bar_at_target (bars exist,
 -- none within 7 days of the target). The tracker's columns are unchanged.
+-- 1.5.1 (views 1.7.0): engine_entry_mismatch - due records whose recorded
+-- entry price is more than 35 % from the base bar's close (a split, a stale
+-- pre-merger quote, another security's price; engine 1.6.0 never scores
+-- them), so the backlog states still account for every due record.
 CREATE OR REPLACE VIEW `{{DS}}.v_outcome_coverage`
 OPTIONS (description = "TFB Looker v4: Performance_Log scoring coverage per horizon - due, matured, the outcome cohort, scored, wins, win rate over the cohort, matured share, overdue records, the oldest overdue target, and the archive engine's scored / wins / backlog states beside them")
 AS
@@ -61,7 +65,8 @@ by_h AS (
     COUNTIF(engine_state = 'scored_from_bar') AS engine_scorable_now,
     COUNTIF(engine_state = 'awaiting_bar') AS engine_awaiting_bar,
     COUNTIF(engine_state = 'no_bar_for_symbol') AS engine_no_bar,
-    COUNTIF(engine_state = 'no_bar_at_target') AS engine_no_bar_at_target
+    COUNTIF(engine_state = 'no_bar_at_target') AS engine_no_bar_at_target,
+    COUNTIF(engine_state = 'entry_price_mismatch') AS engine_entry_mismatch
   FROM p
   WHERE horizon IS NOT NULL
   GROUP BY snapshot_date, horizon
@@ -85,7 +90,8 @@ all_h AS (
     SUM(engine_scorable_now) AS engine_scorable_now,
     SUM(engine_awaiting_bar) AS engine_awaiting_bar,
     SUM(engine_no_bar) AS engine_no_bar,
-    SUM(engine_no_bar_at_target) AS engine_no_bar_at_target
+    SUM(engine_no_bar_at_target) AS engine_no_bar_at_target,
+    SUM(engine_entry_mismatch) AS engine_entry_mismatch
   FROM by_h
   GROUP BY snapshot_date
 ),
