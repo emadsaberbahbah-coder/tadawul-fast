@@ -2,8 +2,32 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.6.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.7.0 (program register C8, Phase 2)
 ================================================================================
+v1.7.0 (8 Nov 2026, total return, benchmarks and regimes). WHY (owner, 8
+Nov 2026, after the week of 2-6 Nov: "how we can avoid that in the future";
+"let's do the requirement and implement it"): three lessons from that week
+belong in the learning loop. (1) Supernus went ex an $8.13 special dividend
+on 3 Nov (22 % of the price) the day after the owner bought it; the engine
+scored raw closes, so it would have learned a -22 % loss that was mostly a
+dividend, and the stale 41.92 pre-merger SUPN quote recorded on 3 Nov would
+have scored -37 %. v_outcome_engine 1.6.0: every return is a total return
+(adj_close restated in entry-day terms, raw close when adj is missing),
+engine_roi_raw_pp / dividend_adj_pp disclose the difference, a record's
+bars come from its alias (INDV.US -> SUPN.US) and an entry price more than
+35 % from the base bar's close is entry_price_mismatch, never scored (226
+of 25,715 records on 8 Nov: splits, stale quotes, another security's
+price). (2) The 5 Nov -4.4 % day took three stops; an absolute win rate
+reads that as five bad picks. New v_outcome_excess: each engine-scored
+forecast beside its market benchmark (SPY / TASI / HSI / FTSE / Euro Stoxx /
+Nikkei / ACWI by market) with an excess return and verdict at the target
+and on the ladder. (3) Nothing said what kind of day a seat was taken on.
+New v_market_regime (SPY changes, 50-day and 250-day distance, 20-day
+volatility, VIX, one label crash_day / drawdown / stress / weak / calm),
+v_seat_regime (every board seat tagged with the regime at the last US close
+before it) and v_regime_outcomes (seat outcomes per regime and currency
+group with sample sizes). Research views: the live system never reads
+BigQuery; no decision, gate, count or broker action depends on them.
 v1.6.0 (8 Nov 2026, the signal edge). WHY (owner, 8 Nov 2026: "make full
 review for the Project and need to improve the outcome and analysis"): the
 October review and the 8 Nov archive study (8,230 symbol-days, 28 Jun - 8
@@ -144,7 +168,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
