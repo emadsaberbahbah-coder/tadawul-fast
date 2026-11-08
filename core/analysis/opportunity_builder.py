@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.28.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.29.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.29.0 (2026-11-08): risk-budget ticket sizing, TFB_OPP_SIZING_MODE = risk
+(cap and conviction unchanged). Each seat's ticket is the amount whose loss
+at its own printed stop equals TFB_OPP_RISK_BUDGET_PCT (default 0.5%) of the
+sizing basis, within the per-seat cap; a ticket below the minimum floor is
+kept in cash, and so is whatever the risk budget does not spend (no top-up).
+After the 2-6 Nov week: three cap-sized stop-outs in one session cost 4.7%.
 
 v1.28.0 (2026-10-27): ranking challenger in shadow, TFB_OPP_RANK_MODE =
 legacy (default, byte-identical) | shadow | enforce. Shadow computes a second
@@ -1661,7 +1668,55 @@ from typing import Optional
 #   inside _rank_challenger. Removed: 0.
 #   Rollback: unset TFB_OPP_RANK_MODE (or set legacy), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.28.0"
+# v1.29.0 (2026-11-08) - RISK-BUDGET TICKET SIZING (post-mortem 2-6 Nov, item 3)
+# WHY: the week of 2-6 Nov lost 4.7% of the account on three stop-outs in one
+#   session (5 Nov, the SPY -1.1% / VIX +15% day) plus the SUPN special-
+#   dividend and merger mechanics (project doc TFB_PostMortem_Week_2026-11-02_
+#   to_06.md). Every ticket was sized at the per-seat cap (PF Max Position
+#   15%) and stopped 5-8% below entry, so each stop-out cost 0.75-1.2% of the
+#   account and three in a day cost the week. The cap sizes by capital; it
+#   knows nothing about how far the stop sits. The owner asked for sizing that
+#   bounds the loss, not the ticket.
+# WHAT: TFB_OPP_SIZING_MODE gains a third value, risk; cap (DEFAULT) and
+#   conviction are byte-identical to v1.28.0.
+#   risk -> the risk budget is TFB_OPP_RISK_BUDGET_PCT (default 0.5, clamped
+#           0.1..2.0, invalid -> 0.5) percent of the sizing basis (portfolio
+#           value + deployable cash, the same base the per-seat cap uses).
+#           Each INVEST seat's target = risk budget / its own stop distance
+#           (cand stop_pct, the stop the ticket prints: max(floor 8%, 2.5 x
+#           vol30) capped at 35%; a missing stop counts as the 35% maximum,
+#           i.e. the smallest ticket), capped at the per-seat cap. The
+#           distance is measured from the booked entry: with
+#           TFB_OPP_SIZE_AT_ENTRY_HIGH the ticket is booked at price x 1.01,
+#           so the distance is 1 - (1 - stop) / 1.01 and the loss from the
+#           advertised worst fill to the stop stays within the budget
+#           (review on PR #936). A target
+#           below the minimum ticket floor is released with a countable
+#           deferral ("kept in cash"). In the loop a seat is sized as
+#           _size_one(..., min(remaining, target)) so every existing deferral
+#           (lot, floor, sector weight, price check) and the funding ledger
+#           apply unchanged. NO top-up: cash the risk budget does not spend
+#           stays in cash by design (the point of the mode). The research
+#           stage is never sized; the allocate replay sizes the frozen subset
+#           on the same rule. Targets do not depend on each other, so a seat
+#           the loop reaches after a release is sized on its own stop.
+#   Worked example (NAV 100,000, risk 0.5%, cap 15%): stop 8% -> 6,250; stop
+#   10% -> 5,000; stop 20% -> 2,500; stop 35% -> 1,429. Ten seats at 10% stops
+#   deploy ~50% and a three-stop day costs 1.5%, not 4.7%.
+#   meta.sizing = {mode: risk, risk_pct, entry_mult, risk_sar, basis_sar,
+#   cap_sar, budget_sar, cohort, stop_pct, targets, released}. A released seat is a
+#   Funding near-miss ("Risk sizing: ...") with its own how-to text.
+# NOT CHANGED: gates, ranking, max_selected, diversification caps, cash
+#   floors, funding plans, rotation, capital calls, the conviction mode and its
+#   top-up, the research stage, the frozen-snapshot replay contract, the ticket
+#   schema (stop_pct and rr already print). TFB_OPP_* is part of the board-
+#   funding policy fingerprint: arm outside a sync.
+#   Functions added: 2 (_env_risk_budget_pct, _risk_targets). Removed: 0.
+#   Version note: 1.29.0 was claimed by PR #929 (fundable-first), closed
+#   unmerged on 8 Nov and superseded by the cockpit-side #933; reused here.
+#   Rollback: unset TFB_OPP_SIZING_MODE (or set cap), or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.29.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -5912,9 +5967,84 @@ _LAST_SIZING: dict = {"mode": "cap"}
 
 
 def _env_sizing_mode():
-    """TFB_OPP_SIZING_MODE: cap (default; v1.26.2 byte-identical) | conviction."""
+    """TFB_OPP_SIZING_MODE: cap (default; v1.26.2 byte-identical) | conviction
+    | risk (v1.29.0). Any other value -> cap."""
     v = str(_env_str("TFB_OPP_SIZING_MODE", "cap") or "cap").strip().lower()
-    return "conviction" if v == "conviction" else "cap"
+    return v if v in ("conviction", "risk") else "cap"
+
+
+# v1.29.0 [RISK SIZING] ---------------------------------------------------------
+_RISK_BUDGET_DEFAULT_PCT = 0.5
+_RISK_BUDGET_MIN_PCT = 0.1
+_RISK_BUDGET_MAX_PCT = 2.0
+
+
+def _env_risk_budget_pct():
+    """TFB_OPP_RISK_BUDGET_PCT: the loss a seat may take at its stop, as a
+    percent of the sizing basis (portfolio value + deployable cash). Default
+    0.5; clamped 0.1..2.0; invalid -> default."""
+    try:
+        v = float(_env_str("TFB_OPP_RISK_BUDGET_PCT", str(_RISK_BUDGET_DEFAULT_PCT))
+                  or _RISK_BUDGET_DEFAULT_PCT)
+    except (TypeError, ValueError):
+        return _RISK_BUDGET_DEFAULT_PCT
+    if not math.isfinite(v):
+        return _RISK_BUDGET_DEFAULT_PCT
+    return min(_RISK_BUDGET_MAX_PCT, max(_RISK_BUDGET_MIN_PCT, v))
+
+
+def _risk_targets(rows, budget_base, cap_sar, floor_sar, risk_pct, stop_fallback_pct,
+                  entry_mult=1.0):
+    """PURE. rows: the sizing cohort in rank order (each with symbol and
+    stop_pct). A seat's target is the ticket whose loss at its own stop
+    equals the risk budget: budget_base x risk_pct / stop distance, capped
+    at cap_sar. The stop distance is measured from the price the ticket is
+    booked at: entry_mult = 1.0 (the quote) or 1.01 when the worst-entry
+    sizing (TFB_OPP_SIZE_AT_ENTRY_HIGH) books the ticket at price x 1.01,
+    so the loss from the advertised worst fill to the stop never exceeds
+    the budget (review on PR #936). A seat whose target falls below
+    floor_sar is released (it does not get a target). A missing or
+    non-positive stop_pct counts as stop_fallback_pct (the widest stop ->
+    the smallest ticket). Returns ({symbol: target_sar}, {symbol:
+    stop_pct_used}); ({}, {}) when nothing can be sized. Deterministic; the
+    targets do not depend on each other, so the budget they consume is
+    bounded by the loop's `remaining`."""
+    try:
+        base = max(0.0, float(budget_base or 0.0))
+        cap = max(0.0, float(cap_sar or 0.0))
+        floor = max(0.0, float(floor_sar or 0.0))
+        rp = float(risk_pct)
+        fb = float(stop_fallback_pct)
+        em = float(entry_mult)
+    except (TypeError, ValueError):
+        return {}, {}
+    if base <= 0.0 or cap <= 0.0 or not math.isfinite(rp) or rp <= 0.0:
+        return {}, {}
+    if not math.isfinite(fb) or fb <= 0.0:
+        fb = 35.0
+    if not math.isfinite(em) or em < 1.0:
+        em = 1.0
+    risk_sar = base * rp / 100.0
+    targets, stops = {}, {}
+    for c in rows or []:
+        sym = str((c or {}).get("symbol") or "")
+        if not sym:
+            continue
+        try:
+            sp = float(c.get("stop_pct"))
+        except (TypeError, ValueError):
+            sp = float("nan")
+        if not math.isfinite(sp) or sp <= 0.0:
+            sp = fb
+        stops[sym] = sp
+        # loss fraction of the booked ticket from the booked entry to the stop
+        dist = 1.0 - (1.0 - min(sp, 100.0) / 100.0) / em
+        if dist <= 0.0:
+            continue
+        t = min(cap, risk_sar / dist)
+        if t > 0.0 and t >= floor - 1e-9:
+            targets[sym] = round(t, 2)
+    return targets, stops
 
 
 def _env_sizing_tilt():
@@ -6406,7 +6536,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     picked, deferrals = [], {}
     # v1.27.0 [CONVICTION SIZING]: cap (default) runs none of this.
     _sz_mode = _env_sizing_mode()
-    _sz_targets, _sz_weights, _sz_cohort = {}, {}, set()
+    _sz_targets, _sz_weights, _sz_cohort, _sz_stops = {}, {}, set(), {}
     _LAST_SIZING.clear()
     _LAST_SIZING["mode"] = _sz_mode
     if _sz_mode == "conviction" and criteria.get("board_funding_stage") != "research":
@@ -6424,6 +6554,33 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                              "weights": {k: round(v, 4) for k, v in _sz_weights.items()},
                              "targets": {k: round(v, 0) for k, v in _sz_targets.items()},
                              "topup_sar": 0.0})
+    elif _sz_mode == "risk" and criteria.get("board_funding_stage") != "research":
+        # v1.29.0 [RISK SIZING]: a seat's ticket is the amount whose loss at
+        # its own stop equals the risk budget (TFB_OPP_RISK_BUDGET_PCT of the
+        # sizing basis), within the per-seat cap. The remainder stays in
+        # cash by design: no top-up.
+        _sz_risk = _env_risk_budget_pct()
+        _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
+        _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
+                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+        _sz_cohort = {c["symbol"] for c in _sz_rows}
+        # targets for every INVEST seat (they do not depend on each other),
+        # so a seat the loop reaches after a release is sized on its own stop
+        _sz_em = 1.01 if _size_at_entry_high() else 1.0
+        _sz_targets, _sz_stops = _risk_targets(invest_cands, budget_base, _sz_cap,
+                                               criteria.get("min_ticket_sar", 0.0) or 0.0,
+                                               _sz_risk, criteria.get("stop_max_pct") or 35.0,
+                                               _sz_em)
+        _LAST_SIZING.update({"risk_pct": _sz_risk, "entry_mult": _sz_em,
+                             "risk_sar": round(budget_base * _sz_risk / 100.0, 0),
+                             "basis_sar": round(budget_base, 0),
+                             "cap_sar": round(_sz_cap, 0),
+                             "budget_sar": round(remaining, 0),
+                             "cohort": [c["symbol"] for c in _sz_rows],
+                             "stop_pct": {c["symbol"]: round(_sz_stops.get(c["symbol"], 0.0), 2) for c in _sz_rows},
+                             "targets": {c["symbol"]: round(_sz_targets[c["symbol"]], 0)
+                                         for c in _sz_rows if c["symbol"] in _sz_targets},
+                             "released": [c["symbol"] for c in _sz_rows if c["symbol"] not in _sz_targets]})
     # v1.21.0 [PRICE-XCHECK]: per-build context, env read per call.
     _xc_mode = _env_xcheck_mode()
     _xcheck_reset(_xc_mode)
@@ -6547,7 +6704,19 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             picked.append({"cand": cand, "suggested_sar": 0,
                            "suggested_shares": 0, "funds_from": "Research — no allocation"})
             continue
-        if _sz_mode == "conviction":
+        if _sz_mode == "risk":
+            # v1.29.0: the seat's risk target bounds its allocation; a seat
+            # whose risk-budget ticket is below the minimum ticket is released
+            # to cash with a countable reason (every INVEST seat has a stop).
+            if cand["symbol"] not in _sz_targets:
+                deferrals[cand["symbol"]] = (
+                    "Risk sizing: at a {:.1f}% stop the risk budget buys less than "
+                    "the minimum ticket floor \u2014 kept in cash".format(
+                        float(_sz_stops.get(cand["symbol"]) or 0.0)))
+                continue
+            suggested, shares = _size_one(cand, criteria, budget_base,
+                                          min(remaining, _sz_targets[cand["symbol"]]))
+        elif _sz_mode == "conviction":
             # v1.27.0: the seat's conviction target bounds its allocation;
             # a cohort seat released by the floor rule is a countable deferral.
             if cand["symbol"] in _sz_cohort and cand["symbol"] not in _sz_targets:
@@ -6985,7 +7154,17 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
             # near-miss, not a diversification one — classify it distinctly so
             # the gate / required / how-to columns are accurate. Real
             # diversification deferrals keep their byte-identical labeling.
-            if "minimum ticket floor" in _reason:
+            if _reason.startswith("Risk sizing:"):
+                # v1.29.0: a risk-budget release is a FUNDING near-miss with
+                # its own how-to (the floor text below names the wrong lever).
+                gate, cur, req = "Funding", _reason, (
+                    "risk-budget ticket \u2265 minimum ticket floor (" +
+                    _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
+                note = ("Qualified (INVEST) \u2014 at this stop distance the risk "
+                        "budget (TFB_OPP_RISK_BUDGET_PCT) buys less than the minimum "
+                        "ticket; raise the risk budget, lower the floor, or wait for "
+                        "a tighter stop. Cash is kept, not lost.")
+            elif "minimum ticket floor" in _reason:
                 if _env_nearmiss_text_legacy():
                     gate, cur, req = "Funding", _reason, (
                         "fundable amount \u2265 minimum ticket floor (" +

@@ -181,3 +181,12 @@ Rollback: unset the Variable. Records that matured meanwhile keep their receipts
 - The advisory "Whole suite (pinned Python 3.11)" job (`timeout-minutes: 15`, `continue-on-error: true`) was cancelled at its timeout in push run 42042240471 at 97%.
 - It passed on the same commit in the pull_request run 42042353188, in 13m43s.
 - It is cancelled the same way on main `a85edfc6` (push run 42017020363). Not this PR's; noted on the PR. Raising the cap or sharding the suite is an owner choice.
+
+## Addendum 2026-11-08 - merge of main `4b478e7`
+
+Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header conflicted: main took 1.1.68-1.1.70.
+
+- ci.yml: this release is re-numbered **1.1.69 -> 1.1.74** (its header, its `v1.1.74` line and its step comment).
+- The header's claim note lists the open claims after the re-numbering: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.
+- Main's 1.1.70 / 1.1.69 / 1.1.68 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- After the merge: `tests/test_track_session_overrides.py` 40 passed with `TFB_TEST_REQUIRE_BASE=1`. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.
