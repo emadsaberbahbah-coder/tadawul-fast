@@ -1992,7 +1992,7 @@ from urllib.error import HTTPError, URLError
 #   pass 2026-12-31, which raise on the pinned calendar. Otherwise (and on
 #   any error) None, and the pinned calendar is used exactly as before.
 # GATE: TFB_XCAL_DATA_EXT, DEFAULT OFF = v6.53.0 byte for byte apart from the
-#   version string. The same Variable is read by opportunity_builder 1.28.3
+#   version string. The same Variable is read by opportunity_builder 1.29.1
 #   on Render (the .SI quote-freshness venue state).
 # ENV LANE: track_performance.yml 'Run performance clock' (1.0.12) and
 #   daily_sync.yml's tracker step map TFB_XCAL_DATA_EXT (|| 'off') - ENV

@@ -199,3 +199,14 @@ An independent four-lens review ran before the PR opened: calendar correctness, 
 
 **Left as it is:**
 - **(nit) Arming visibility.** The Render arming is not visible in the verifier or /health. That would mean registering a FLAGS entry, which is an owner choice; precedent leaves builder gates unregistered.
+
+## Addendum 2026-11-08 - merge of main `4b478e7`
+
+Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header conflicted: main took 1.1.68-1.1.70.
+
+- ci.yml: this release is re-numbered **1.1.70 -> 1.1.75** (its header, its `v1.1.75` line and its step comment).
+- The header's claim note lists the open claims after the re-numbering: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.
+- Main's 1.1.70 / 1.1.69 / 1.1.68 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- opportunity_builder also conflicted: main took 1.29.0 (#936, risk-budget sizing). This release is re-numbered **1.28.3 -> 1.29.1**. Main's v1.29.0 WHY block stays verbatim, and this release's block follows it with a dated re-number note; the OFF line now reads 'byte-identical v1.29.0'. The verifier pin is 1.29.1 (main's comment kept), and the `exchange_calendar_ext` pin is kept.
+- The harness's V1 finds the WHY line by its tag (1.28.3 or 1.29.1). V1b now runs each module's exact diff while that module carries this PR's change alone: the tracker leg still runs, and the builder leg skips now that main's 1.29.0 sits under it.
+- After the merge: `tests/test_xcal_data_ext.py` 52 passed with `TFB_TEST_REQUIRE_BASE=1`. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.

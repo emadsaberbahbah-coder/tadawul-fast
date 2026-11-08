@@ -648,7 +648,9 @@ def test_v1_versions_pins_title_why_ascii():
     i58 = src.index("# v6.58.0 (2026-11-06) [XCAL-DATA-EXT]")
     assert src.index("# v6.53.0 (2026-11-02) [ARCHIVE-BAR + DUE-ONLY]") < i58 < src.index("\nSCRIPT_VERSION = ")
     obs = Path(ob.__file__).read_text(encoding="utf-8")
-    j = obs.index("# v1.28.3 (2026-11-06) [XCAL-DATA-EXT]")
+    # 2026-11-08: main took opportunity_builder 1.29.0 (#936); this block is
+    # re-numbered 1.29.1 on top of it, so the WHY line is matched by its tag.
+    j = re.search(r"^# v1\.(28\.3|29\.1) \(2026-11-06\) \[XCAL-DATA-EXT\]", obs, re.M).start()
     assert obs.index("# v1.28.0 (2026-10-27) - RANKING CHALLENGER IN SHADOW") < j < obs.index("\nOPPORTUNITY_BUILDER_VERSION = ")
     vd = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("track_performance", "%s", "track performance")' % tp.SCRIPT_VERSION in vd
@@ -678,10 +680,21 @@ def test_v1b_against_the_base_ascii_and_functions():
     tpb, obb = tracker_base(), builder_base()
     src = Path(tp.__file__).read_text(encoding="utf-8")
     obs = Path(ob.__file__).read_text(encoding="utf-8")
-    if (tp.SCRIPT_VERSION != "6.58.0" or re.search(r"^# v6\.5[4-7]\.0 \(", src, re.M)
-            or ob.OPPORTUNITY_BUILDER_VERSION != "1.28.3" or re.search(r"^# v1\.28\.[12] \(", obs, re.M)):
+    # 2026-11-08: each module's exact diff runs while that module carries this
+    # PR's change alone. After main took opportunity_builder 1.29.0 (#936)
+    # the builder leg skips; the tracker leg still runs.
+    tp_alone = tp.SCRIPT_VERSION == "6.58.0" and not re.search(r"^# v6\.5[4-7]\.0 \(", src, re.M)
+    ob_alone = (ob.OPPORTUNITY_BUILDER_VERSION == "1.28.3"
+                and not re.search(r"^# v1\.28\.[12] \(", obs, re.M))
+    if not (tp_alone or ob_alone):
         pytest.skip("the exact a85edfc6 -> 6.58.0 / 1.28.3 diff checks apply to this PR's diff alone")
-    old = Path(tpb.__file__).read_text(encoding="utf-8")
+    if tp_alone:
+        _v1b_tracker(src, Path(tpb.__file__).read_text(encoding="utf-8"))
+    if ob_alone:
+        _v1b_builder(obs, Path(obb.__file__).read_text(encoding="utf-8"))
+
+
+def _v1b_tracker(src, old):
     added, removed = _diff(old, src)
     title = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
     assert sorted(removed) == sorted([title % "6.53.0", 'SCRIPT_VERSION = "6.53.0"',
@@ -689,7 +702,9 @@ def test_v1b_against_the_base_ascii_and_functions():
     fresh = [ln for ln in added if ln != title % "6.58.0"]
     assert fresh and all(ln.isascii() for ln in fresh), [ln for ln in fresh if not ln.isascii()][:3]
     assert _defs(src) - _defs(old) == {"_outcome_calendar_ext"} and not _defs(old) - _defs(src)
-    old_ob = Path(obb.__file__).read_text(encoding="utf-8")
+
+
+def _v1b_builder(obs, old_ob):
     added, removed = _diff(old_ob, obs)
     assert removed == ['OPPORTUNITY_BUILDER_VERSION = "1.28.0"'], removed
     assert added and all(ln.isascii() for ln in added), [ln for ln in added if not ln.isascii()][:3]
