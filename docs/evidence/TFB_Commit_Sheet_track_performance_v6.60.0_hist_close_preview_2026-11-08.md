@@ -53,19 +53,23 @@
   - With the preview on, it appends `(record, context, verdict)`.
   - `_hist_close_judge` is still called exactly once per candidate.
 
+- **The CA-GUARD.** It is on by default (`TFB_TRACK_CA_GUARD` unset), and no workflow maps it. With it on, `_hist_close_preview` applies the deterministic part of enforce's corporate-action step the way enforce does: a confirmed `_Corporate_Actions` factor between entry and the target session re-bases the ROI (`_ca_ledger_factor` / `_ca_ledger_roi` / `_ca_decide_v2`, no network).
+  - A record without a factor whose |ROI| reaches `_ca_verify_pct()` (15 pp by default) is in the **verify band**. Enforce checks it against the adjusted series and may keep, re-base, defer or expire it, which observe cannot know.
+  - The band is counted, and a **settled** tally leaves it out: what enforce matures exactly as shown.
 - After the HIST-CLOSE and ARCHIVE-BAR lines:
   - `_hist_close_preview` summarises the witnessed verdicts;
   - `_LAST_HIST_PREVIEW` keeps the dict;
   - each line of `_hist_close_preview_lines` is logged at WARNING. The lines are:
-    1. `[v6.60.0 HIST-PREVIEW] mode=observe witnessed=N decided=D wins=W losses=L breakeven=B hold=H win=x% CI[lo,hi] price_roi mean=.. median=.. min=.. max=.. call_roi=.. outliers(|roi|>=50pp)=K (before CA-GUARD and dedup; nothing written)`;
-    2. `... by horizon: 1W n= decided= win= CI | 2W ... | 1M ... | 3M ...`;
-    3. `... by bucket: <entry investability> n= decided= win= CI | ...` (blank reads UNSPECIFIED, as in the calibration);
-    4. `... outliers: <symbol> <horizon> <roi> (entry -> close, session) | ...`: the five largest |ROI|, ties by symbol, only when K > 0.
-  - With nothing witnessed, there is one `witnessed=0` line. If the summary fails, one WARNING (`preview unavailable: <class>`) and one `unavailable` line are logged.
+    1. `[v6.60.0 HIST-PREVIEW] mode=observe witnessed=N decided=D wins=W losses=L breakeven=B hold=H win=x% CI[lo,hi] price_roi mean=.. median=.. min=.. max=.. call_roi=.. outliers(|roi|>=50pp)=K ca_guard=on ledger=J verify(|roi|>=15pp)=V (ledger factors applied; dedup is enforce's; nothing written)` (`ca_guard=off` when the guard is off);
+    2. `... settled (the verify band left out: what enforce matures as shown): all n= decided= win= CI wins= losses= breakeven= hold=` (only with the guard on);
+    3. `... by horizon: 1W n= decided= win= CI | 2W ... | 1M ... | 3M ...`;
+    4. `... by bucket: <entry investability> n= decided= win= CI | ...` (blank reads UNSPECIFIED, as in the calibration);
+    5. `... outliers: <symbol> <horizon> <roi> (entry -> close, session) | ...`: the five largest |ROI|, ties by symbol, only when K > 0.
+  - With nothing witnessed, there is one `witnessed=0` line. If the summary fails, two WARNING lines are logged: `preview unavailable: <class>` and one `unavailable` line.
 
 - **Definitions:**
   - the outcome is `_directional_outcome` of the entry call (HOLD neutral), the definition every report uses;
-  - the ROI is the one `_hist_close_judge` computes from the archive close and the entry price, the same value enforce stores;
+  - the ROI is the one `_hist_close_judge` computes from the archive close and the entry price, after any confirmed ledger re-basing. It is the value enforce stores for every record outside the verify band;
   - `call_roi` is price ROI x call sign over the buy and sell calls.
 
 - **What stays unchanged, on or off:** records, Notes, receipts, `_last_audit_stats`, `_hist_stats` / `_LAST_HIST_CLOSE`, the HIST-CLOSE and ARCHIVE-BAR lines, every other log line, and every sheet.
@@ -74,7 +78,7 @@
 
 **Workflow:**
 - `track_performance.yml` 1.0.14 gets a header block, plus `TRACK_HIST_CLOSE_PREVIEW: ${{ vars.TRACK_HIST_CLOSE_PREVIEW || 'off' }}` in 'Run performance clock' after `TRACK_HIST_CLOSE_TIME_SEC`. No open PR edits those lines.
-- `daily_sync.yml` maps none of the HIST-CLOSE knobs (the v6.47.0 lane rule), so it is not changed.
+- `daily_sync.yml` maps neither this gate nor `TRACK_HIST_TARGET_CLOSE` (the v6.47.0 lane rule; it does map `TRACK_HIST_CLOSE_SOURCE`, under ENV PARITY), so it is not changed.
 - No cron, concurrency or other step changes. **Not armed.**
 
 **CI:** `ci.yml` 1.1.72 adds its own blocking lean-unit step after the witnessed-maturity preflight, away from #926's step. It fetches main `c7e666a4` by SHA and runs `tests/test_hist_close_preview.py` with `TFB_TEST_REQUIRE_BASE=1`.
@@ -199,11 +203,9 @@ The harness drives the REAL audit loop: `PerformanceTrackerApp.audit_active_reco
 
 ## S7 - Known limits and not done
 
-- **An upper bound for one pass.** Enforce still runs each record through:
-  - the CA-GUARD, when armed: it can defer the record or mark it `CORP_ACTION_SUSPECT`;
-  - the matured-duplicate dedup;
-  - the save.
-- **The yfinance source** admits at most `TRACK_HIST_CLOSE_BUDGET` symbols per pass. The archive source asks for up to 2,000.
+- **The verify band is counted, not resolved.** The settled line is what enforce matures exactly as shown. Enforce may still mature some of the band, when an adjusted series agrees or re-bases it, within its CA verification budget (60 symbols / 240 s per run by default). It defers or expires the rest.
+- **Left to enforce:** the matured-duplicate dedup and the save.
+- **The yfinance source:** both modes admit the same `TRACK_HIST_CLOSE_BUDGET` window, so the preview already reflects it.
 - **The 50 pp mark** is a reporting flag, not a gate.
 - **The preview is not saved anywhere:** not in a receipt, `_Run_Log` or the summary panel. It lives in the job log only, on purpose.
 - **Not changed:** the judge, the maturation rules, enforce, the factors, the cron and the concurrency. No gate is armed.
