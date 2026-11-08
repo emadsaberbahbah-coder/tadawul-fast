@@ -4,11 +4,11 @@
 | --- | --- |
 | Date | 2026-11-08 (daily improvement routine) |
 | Branch | `claude/daily-2026-11-08` |
-| Base | origin/main `c7e666a4` (track_performance v6.53.0, track_performance.yml 1.0.7, ci.yml 1.1.67) |
+| Base | origin/main `c7e666a4` (track_performance v6.53.0, track_performance.yml 1.0.7, ci.yml 1.1.67); main `4b478e7` merged in before the PR (#935-#937: ci.yml 1.1.68-1.1.70 and two verifier pins; neither tracker file changed, so the golden base stays `c7e666a4`) |
 | Lane | GitHub Actions only: track_performance.yml 'Run performance clock' (the HIST-CLOSE judge's lane). No Render deploy, no Apps Script paste |
 | Gate | `TRACK_HIST_CLOSE_PREVIEW` = on / 1 / true / yes (repository Variable), effective only with `TRACK_HIST_TARGET_CLOSE=observe`; default off = v6.53.0 byte for byte (the version strings aside) |
 | Priority | (b) a silent pipeline hiding missing outcome numbers: 6,735 forecasts are past their target, observe says the archive could mature 3,598 of them, and nothing shows what they would publish |
-| Versions | track_performance 6.60.0 (6.54.0-6.59.0 are claimed by the open PRs #845, #857, #915, #922, #923 and #926). track_performance.yml 1.0.14 (1.0.8-1.0.13 claimed). ci.yml 1.1.72 (1.1.68-1.1.71 claimed). Whichever lands later re-numbers |
+| Versions | track_performance 6.60.0 (6.54.0-6.59.0 are claimed by the open PRs #845, #857, #915, #922, #923 and #926). track_performance.yml 1.0.14 (1.0.8-1.0.13 claimed). ci.yml 1.1.72 (1.1.68-1.1.70 are on main from #935-#937; 1.1.71 is claimed by #926; #915, #922, #923 and #909 re-numbered to 1.1.73-1.1.76 on the same day). Whichever lands later re-numbers |
 
 ## S1 - Evidence
 

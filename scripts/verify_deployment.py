@@ -206,8 +206,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
+    # 2026-11-08 (post-mortem item 3; manifest pin only): 1.28.0 -> 1.29.0
+    # (TFB_OPP_SIZING_MODE=risk + TFB_OPP_RISK_BUDGET_PCT, default cap).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.28.0", "opportunity builder"),
+     "1.29.0", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
@@ -345,6 +347,14 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
+    # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
+    # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
+    # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete
+    # read - a failed issuer or an unreadable page - preserves the register).
+    ("run_corporate_events", "1.0.1", "corporate events tab"),
+    # 2026-11-08 (new script, pinned on arrival): the Pre_Open_Check tab ~30
+    # min before the US open (ES=F + pre-market gap verdicts per ticket).
+    ("pre_open_check", "1.0.0", "pre-open check tab"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
