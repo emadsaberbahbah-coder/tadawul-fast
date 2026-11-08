@@ -1981,8 +1981,9 @@ from urllib.error import HTTPError, URLError
 #     (1M:826 1W:945 2W:893 3M:934) matured=0 refused=111'; 'matured-fresh=0
 #     | pending-price=6735'; calibration on 3,911 decided outcomes.
 #   Past-due records keep growing (6,492 -> 6,735 in a day) and every one the
-#   archive witnesses would mature under enforce, nearly doubling the
-#   decided sample the calibration and its published factors rest on. The
+#   archive witnesses would mature under enforce: 3,598 records in one pass
+#   against 13,104 matured today, moving the sample the calibration and its
+#   published factors rest on. The
 #   observe line says how MANY; it never says WHAT: no win / loss split, no
 #   ROI, no outlier. The judge already computes each candidate's ROI from the
 #   archive close (_hist_close_judge returns it) and observe discards it, so
