@@ -38,7 +38,9 @@ var history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js')
 var EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1250.json'));
 var OB = 'DT10_OWNER_RULE_BANDS', TG = 'DT10_TICKET_GUARD', OR = 'DT10_GUARD_OWNER_RULE';
 
-var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-08: the delivered file is v1.26.0 [FUNDABLE-SEATS]; this harness proves the v1.25.0 diff, so it reads
+// the v1.25.0 file rebuilt from the delivered one (tests/js/dt10_edits_v1260.json reversed, SHA-256 pinned).
+var newSource = history.v1250Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 var baseSource;
 try {

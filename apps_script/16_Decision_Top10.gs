@@ -1,11 +1,31 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.25.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.26.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.26.0 (2026-11-08) [FUNDABLE-SEATS] -- A NAME IBKR CANNOT FUND NEVER TAKES A SEAT FROM ONE IT CAN (ONE KNOB, DEFAULT OFF)
+ * WHY (owner decision C, 8 Nov 2026: 'fundable names first - non-USD names stay visible but no longer take a seat
+ *   from a USD/SAR name'): the 10:14 and 11:13 Riyadh renders seated six names the allocate stage can never fund
+ *   (BBOX.L GBX; ACA.PA, WDP.BR, MRL.MC, BNP.PA EUR; 2020.HK HKD): the IBKR capture proves the USD rate only and the
+ *   backend's FX Evidence gate defers every other currency; every funded ticket since 15 Oct was a US listing. A
+ *   backend re-sort (opportunity_builder 1.29.0, PR #929) cannot hold: the research stage returns every qualifying
+ *   pick and THIS core seats by smoothed score - a confirmed EUR challenger at 90 displaces a SAR seat at 60
+ *   (Codex review P1 on #929, traced here: limit 1, SAR seated, EUR confirms -> v1.25.0 displaces the SAR seat).
+ * WHAT: Script Property TFB_T10_FUNDABLE_CCY = a list of 3-letter currency codes (comma, space, ';', '+' or '/';
+ *   any case). Absent, blank, any token that is not 3 letters, or a PropertiesService fault = off: the v1.25.0 seats
+ *   byte for byte (knobs.fundable is set ONLY when armed). Armed, in dt10StabCore_ (the currency is the candidate
+ *   row's, else the raw ticket's; a missing currency is unlisted):
+ *   (a) confirmed challengers and the fast-track fill take listed names first (score order kept inside each group);
+ *   (b) a listed confirmed challenger takes the seat guard's non-qualifying pick when there is one, else the weakest
+ *       unlisted seat WITHOUT the score test (tag 'nf'); outage-paused seats and seats entered on this run are never
+ *       taken that way; otherwise the v1.25.0 victim and test apply;
+ *   (c) an unlisted challenger may only take an unlisted seat (the v1.25.0 test); with none, it waits.
+ *   Note token ', fundable=USD/SAR[ took SYM(nf)]'; audit.fundable {ccys, took} only while armed.
+ *   Rollback: delete the property.
  *
  * v1.25.0 (2026-11-08) [OWNER-BANDS] -- THE OWNER RULE CAN ACCEPT MEDIUM (ONE KNOB, DEFAULT OFF)
  * WHY (owner decision A, 8 Nov 2026): the v1.19.0 owner rule (Confidence High
@@ -2651,7 +2671,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.25.0';
+var DT10_VERSION = '1.26.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3544,6 +3564,7 @@ var DT10_T10_HARD_EXIT_CONFIRM_PROP = 'TFB_T10_HARD_EXIT_CONFIRM';
 // board; 1..10 arms.
 var DT10_T10_SEAT_GUARD_PROP = 'TFB_T10_SEAT_GUARD_DAYS';
 var DT10_T10_SEAT_GUARD_MAX = 10;
+var DT10_T10_FUNDABLE_PROP = 'TFB_T10_FUNDABLE_CCY';   // v1.26.0 [FUNDABLE-SEATS]
 var DT10_LEDGER_SHEET = '_Portfolio_CostBasis';
 // v1.19.0 [QUALIFIED-HOLD]: a confirmed member absent from the sized list
 // that the audited grid still rates INVEST inside the rank buffer -- see the
@@ -5199,6 +5220,22 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   var sgDays = Math.max(0, Math.min(DT10_T10_SEAT_GUARD_MAX,
                                     parseInt(knobs.seat_guard_days, 10) || 0));
   var sgTook = [];
+  // v1.26.0 [FUNDABLE-SEATS]: plain knob (a currency set); absent = the v1.25.0 seats.
+  var fdSet = (knobs.fundable && typeof knobs.fundable === 'object') ? knobs.fundable : null;
+  var fdTook = [];
+  function fundOk(sym) {
+    if (!fdSet) return true;
+    var fc = candBySym[sym], fccy = fc ? fc.currency : null;
+    if ((fccy === null || fccy === undefined || fccy === '') && rawBySym[sym]) fccy = rawBySym[sym].currency;
+    var fk = String(fccy === null || fccy === undefined ? '' : fccy).replace(/^\s+|\s+$/g, '').toUpperCase();
+    return fk !== '' && Object.prototype.hasOwnProperty.call(fdSet, fk) && fdSet[fk] === true;
+  }
+  function fundFirst(list) {
+    if (!fdSet) return list;
+    var fa = [], fb = [];
+    for (var fli = 0; fli < list.length; fli++) (fundOk(list[fli]) ? fa : fb).push(list[fli]);
+    return fa.concat(fb);
+  }
   // ---- counter pass (day-keyed) -------------------------------------------
   var uni = {};
   var us;
@@ -5448,8 +5485,36 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     }
     return { sym: '', force: false, tag: '' };
   }
-  for (var ei = 0; ei < rawSyms.length; ei++) {   // confirmed challengers
-    var es = rawSyms[ei];
+  // v1.26.0 [FUNDABLE-SEATS]: the armed victim for challenger es, or null (keep
+  // the v1.25.0 pick). A listed challenger: the seat guard's non-qualifying
+  // pick stands, else the weakest unlisted seat without the score test ('nf').
+  // An unlisted challenger: only an unlisted seat ({sym: ''} = none: it waits).
+  function fundVictim(cs, gPick) {
+    var vi, vs, vst;
+    if (fundOk(cs)) {
+      if (gPick !== null && gPick.force && gPick.tag === 'nq') return null;
+      for (vi = finalSyms.length - 1; vi >= 0; vi--) {
+        vs = finalSyms[vi]; vst = symbols[vs];
+        if (vst && vst.member === true && !fundOk(vs) && !dt10InList_(pausedSyms, vs) &&
+            !dt10InList_(entered, vs)) {
+          return { sym: vs, force: true, tag: 'nf' };
+        }
+      }
+      return null;
+    }
+    var cur = gPick !== null ? gPick.sym : finalSyms[finalSyms.length - 1];
+    if (cur && !fundOk(cur)) return null;
+    for (vi = finalSyms.length - 1; vi >= 0; vi--) {
+      vs = finalSyms[vi]; vst = symbols[vs];
+      if (vst && vst.member === true && !fundOk(vs) && !dt10InList_(entered, vs)) {
+        return { sym: vs, force: false, tag: 'u' };
+      }
+    }
+    return { sym: '', force: false, tag: '' };
+  }
+  var chSyms = fundFirst(rawSyms);   // v1.26.0: listed challengers first (armed only)
+  for (var ei = 0; ei < chSyms.length; ei++) {   // confirmed challengers
+    var es = chSyms[ei];
     if (inFinal(es)) continue;
     if ((symbols[es].ci || 0) < knobs.confirm_days) continue;
     if (finalSyms.length < limit) {
@@ -5462,11 +5527,15 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
     var weakest = finalSyms[finalSyms.length - 1];
     var sgPick = null;   // v1.24.0 [SEAT-GUARD]
     if (sgDays > 0) { sgPick = guardVictim(); weakest = sgPick.sym; }
-    if (weakest && ((sgPick !== null && sgPick.force) || smoothed(es) > smoothed(weakest))) {
+    var fdPick = fdSet ? fundVictim(es, sgPick) : null;   // v1.26.0 [FUNDABLE-SEATS]
+    if (fdPick !== null) weakest = fdPick.sym;
+    if (weakest && ((fdPick !== null ? fdPick.force : (sgPick !== null && sgPick.force)) ||
+                    smoothed(es) > smoothed(weakest))) {
       for (var wi = finalSyms.length - 1; wi >= 0; wi--) {
         if (finalSyms[wi] === weakest) { finalSyms.splice(wi, 1); break; }
       }
-      if (sgPick !== null) sgTook.push(weakest + (sgPick.tag ? '(' + sgPick.tag + ')' : ''));
+      if (fdPick !== null) fdTook.push(weakest + '(' + fdPick.tag + ')');   // v1.26.0
+      else if (sgPick !== null) sgTook.push(weakest + (sgPick.tag ? '(' + sgPick.tag + ')' : ''));
       var stw = symbols[weakest];
       stw.member = false; stw.ci = 0; stw.co = 0;
       if (cwLen > 0 && stw.qh) stw.ci = dt10StabQhSum_(stw.qh);   // v1.22.0 [CONFIRM-WINDOW]
@@ -5476,8 +5545,9 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
       finalSyms.sort(boardSort);
     }
   }
-  for (var ff = 0; ff < rawSyms.length && finalSyms.length < limit; ff++) {
-    var fs = rawSyms[ff];                          // fast-track fill
+  var ftSyms = fundFirst(rawSyms);   // v1.26.0: listed names fill first (armed only)
+  for (var ff = 0; ff < ftSyms.length && finalSyms.length < limit; ff++) {
+    var fs = ftSyms[ff];                          // fast-track fill
     if (!inFinal(fs)) { fastTracked.push(fs); finalSyms.push(fs); }
   }
   var pending = [];
@@ -5785,6 +5855,9 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   if (sgDays > 0) {
     note += ', guard=' + sgDays + 'd' + (sgTook.length ? ' took ' + sgTook.slice(0, 3).join(' ') : '');
   }
+  if (fdSet) {   // v1.26.0 [FUNDABLE-SEATS]
+    note += ', fundable=' + dt10StabFundableText_(fdSet) + (fdTook.length ? ' took ' + fdTook.slice(0, 3).join(' ') : '');
+  }
   var coreOut = {
     tickets: tickets,
     state: state,
@@ -5805,6 +5878,7 @@ function dt10StabCore_(rawTickets, cands, state, knobs, limit, today, outage, co
   if (cdMap !== null) coreOut.audit.cooldown_held = cooldownHeld;   // v1.23.0 [REENTRY-COOLDOWN]
   if (hxOn) coreOut.audit.hard_exit_held = hxFinal;                 // v1.24.0 [HARD-EXIT-CONFIRM]
   if (sgDays > 0) coreOut.audit.seat_guard = { days: sgDays, took: sgTook };   // v1.24.0 [SEAT-GUARD]
+  if (fdSet) coreOut.audit.fundable = { ccys: dt10StabFundableText_(fdSet), took: fdTook };   // v1.26.0
   return coreOut;
 }
 // ---------------------------------------------------------------------------
@@ -6038,6 +6112,35 @@ function dt10StabHardExitConfirm_() {
  * a PropertiesService fault read as 0 = the v1.23.1 board. Mirrors
  * dt10StabCooldownDays_; never throws.
  */
+/** v1.26.0 [FUNDABLE-SEATS] PURE: the listed currencies from the raw
+ * TFB_T10_FUNDABLE_CCY text as {CCY: true}, or null (off) when blank or when
+ * any token is not 3 letters. Never throws. */
+function dt10StabFundableParse_(raw) {
+  var txt = String(raw === null || raw === undefined ? '' : raw).replace(/^\s+|\s+$/g, '');
+  if (!txt) return null;
+  var toks = txt.toUpperCase().split(/[\s,;+\/]+/), set = {}, n = 0;
+  for (var i = 0; i < toks.length; i++) {
+    if (!toks[i]) continue;
+    if (!/^[A-Z]{3}$/.test(toks[i])) return null;
+    if (!set[toks[i]]) { set[toks[i]] = true; n++; }
+  }
+  return n ? set : null;
+}
+/** v1.26.0 [FUNDABLE-SEATS] PURE: 'SAR/USD' (sorted). */
+function dt10StabFundableText_(set) {
+  var out = [];
+  for (var k in set) if (Object.prototype.hasOwnProperty.call(set, k) && set[k] === true) out.push(k);
+  return out.sort().join('/');
+}
+/** v1.26.0 [FUNDABLE-SEATS]: Script Property TFB_T10_FUNDABLE_CCY (one read);
+ * null when off or on a PropertiesService fault. Never throws. */
+function dt10StabFundable_() {
+  try {
+    return dt10StabFundableParse_(PropertiesService.getScriptProperties()
+        .getProperty(DT10_T10_FUNDABLE_PROP));
+  } catch (eFd) {}
+  return null;
+}
 function dt10StabSeatGuardDays_() {
   try {
     var raw = String(PropertiesService.getScriptProperties()
@@ -9028,6 +9131,9 @@ function dt10ApplyStability_(payload, panel, outage) {
   if (dt10StabHardExitConfirm_()) knobs.hard_exit_confirm = true;
   var sgRead = dt10StabSeatGuardDays_();
   if (sgRead > 0) knobs.seat_guard_days = sgRead;
+  // v1.26.0 [FUNDABLE-SEATS]: same pattern -- one service read, the knob only when armed.
+  var fdRead = dt10StabFundable_();
+  if (fdRead) knobs.fundable = fdRead;
   // v1.11.10 [P-168]: the outage map (from the pool rows) rides as a plain
   // 7th core argument; null under the kill property or when the pool was
   // not sheet-sourced this run => v1.11.9-identical clocks.
@@ -12225,6 +12331,46 @@ function dt10SelfTest() {
          'unconfirmed fast-track seat goes before a confirmed one)'
        : 'FAIL [' + sgOff.note + ' | ' + sgOn.note + ' | ' + sgQ.note + ' | ' + sgOld.note + ' | ' +
          sgFt.note + ']'));
+  /* v1.26.0 [FUNDABLE-SEATS]: property line (one read) + pure battery, limit 1.
+     (A) S.SR seated at 60, E.PA (EUR) confirms at 90: absent = the v1.25.0
+     displacement (E.PA takes the seat); USD,SAR: E.PA waits at 3/3. (B) E.PA
+     seated at 95, U.US confirms at 70: absent = no seat (score test); armed:
+     U.US takes E.PA without the score test ('nf'). (C) empty board, raw E.PA
+     95 then U.US 70: the fill takes U.US when armed. */
+  var fdNow = dt10StabFundable_();
+  report.push('fundable seats (TFB_T10_FUNDABLE_CCY): ' + (fdNow ? dt10StabFundableText_(fdNow) : 'off (every currency)'));
+  function fdCand(sym, sc, ccy) { var fc0 = cbCand(sym, sc); fc0.currency = ccy; return fc0; }
+  function fdTk(sym, sc, ccy) { var ft0 = cbTk(sym, sc); ft0.currency = ccy; return ft0; }
+  function fdKnobs(on) { var fk0 = cbKnobs('qualified'); if (on) fk0.fundable = dt10StabFundableParse_('USD,SAR'); return fk0; }
+  function fdSeed(seatSym, seatHist, chalSym, chalHist) {
+    var s0 = { v: 1, date: '2026-10-20', symbols: {} };
+    if (seatSym) s0.symbols[seatSym] = { ci: 3, co: 0, member: true, since: '2026-10-01', ls: '2026-10-20', hist: seatHist, ft: false };
+    if (chalSym) s0.symbols[chalSym] = { ci: 2, co: 0, member: false, since: '', ls: '2026-10-20', hist: chalHist, ft: false };
+    return s0;
+  }
+  var fdRawA = [fdTk('E.PA', 90, 'EUR'), fdTk('S.SR', 60, 'SAR')];
+  var fdGridA = [fdCand('E.PA', 90, 'EUR'), fdCand('S.SR', 60, 'SAR')];
+  var fdA0 = dt10StabCore_(fdRawA, fdGridA, dt10StabParseState_(fdSeed('S.SR', [60, 60], 'E.PA', [90, 90])), fdKnobs(false), 1, cbDays[0]);
+  var fdA1 = dt10StabCore_(fdRawA, fdGridA, dt10StabParseState_(fdSeed('S.SR', [60, 60], 'E.PA', [90, 90])), fdKnobs(true), 1, cbDays[0]);
+  var fdRawB = [fdTk('E.PA', 95, 'EUR'), fdTk('U.US', 70, 'USD')];
+  var fdGridB = [fdCand('E.PA', 95, 'EUR'), fdCand('U.US', 70, 'USD')];
+  var fdB0 = dt10StabCore_(fdRawB, fdGridB, dt10StabParseState_(fdSeed('E.PA', [95, 95], 'U.US', [70, 70])), fdKnobs(false), 1, cbDays[0]);
+  var fdB1 = dt10StabCore_(fdRawB, fdGridB, dt10StabParseState_(fdSeed('E.PA', [95, 95], 'U.US', [70, 70])), fdKnobs(true), 1, cbDays[0]);
+  var fdC0 = dt10StabCore_(fdRawB, fdGridB, dt10StabParseState_(fdSeed('', null, '', null)), fdKnobs(false), 1, cbDays[0]);
+  var fdC1 = dt10StabCore_(fdRawB, fdGridB, dt10StabParseState_(fdSeed('', null, '', null)), fdKnobs(true), 1, cbDays[0]);
+  report.push('fundable seats core: ' +
+      ((fdA0.audit.exited_displaced.join(',') === 'S.SR' && fdA0.state.symbols['E.PA'].member === true &&
+        fdA0.note.indexOf('fundable=') < 0 && fdA0.audit.fundable === undefined &&
+        fdA1.audit.exited_displaced.length === 0 && fdA1.state.symbols['S.SR'].member === true &&
+        fdA1.state.symbols['E.PA'].member === false && fdA1.note.indexOf(', fundable=SAR/USD') > 0 &&
+        fdB0.audit.exited_displaced.length === 0 && fdB0.state.symbols['E.PA'].member === true &&
+        fdB1.audit.exited_displaced.join(',') === 'E.PA' && fdB1.state.symbols['U.US'].member === true &&
+        fdB1.note.indexOf('fundable=SAR/USD took E.PA(nf)') > 0 &&
+        fdC0.state.symbols['E.PA'].member === true && fdC1.state.symbols['U.US'].member === true &&
+        (fdC1.state.symbols['E.PA'] === undefined || fdC1.state.symbols['E.PA'].member !== true))
+       ? 'ok (absent = v1.25.0 seats; USD,SAR: an unlisted challenger never takes a listed seat, a listed ' +
+         'challenger takes the weakest unlisted seat, listed names fill first)'
+       : 'FAIL [' + fdA1.note + ' | ' + fdB1.note + ' | ' + fdC1.note + ']'));
   /* v1.19.0 [QUALIFIED-HOLD]: property line (one read) + pure battery on the
      confirm-basis board, day 1. Member B (GRACE 1/3) is INVEST at rank 15 =
      the buffer boundary: off / junk = the v1.14.0 qualified replay byte for
