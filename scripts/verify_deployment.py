@@ -206,8 +206,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
+    # 2026-11-08 (manifest pin only): 1.28.0 -> 1.29.0 (TFB_OPP_FUNDABLE_CCY,
+    # default off).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.28.0", "opportunity builder"),
+     "1.29.0", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",

@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.28.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.29.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.29.0 (2026-11-08): fundable names first, TFB_OPP_FUNDABLE_CCY = a comma
+list of currency codes (e.g. "USD,SAR"; absent/blank/no valid code = off,
+byte-identical v1.28.0). Armed, the INVEST pool keeps its score order inside
+two groups - currencies in the list first, every other currency after - so a
+name the allocate stage cannot fund no longer takes a board seat from one it
+can; it still fills seats when too few fundable names qualify. The allocate
+replay is never re-ordered. See the dated WHY block above
+OPPORTUNITY_BUILDER_VERSION.
 
 v1.28.0 (2026-10-27): ranking challenger in shadow, TFB_OPP_RANK_MODE =
 legacy (default, byte-identical) | shadow | enforce. Shadow computes a second
@@ -1661,7 +1670,33 @@ from typing import Optional
 #   inside _rank_challenger. Removed: 0.
 #   Rollback: unset TFB_OPP_RANK_MODE (or set legacy), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.28.0"
+# v1.29.0 (2026-11-08) - FUNDABLE NAMES FIRST (owner decision C, 8 Nov 2026)
+# WHY: the 10:14 Riyadh render of 8 Nov applied fresh IBKR funding evidence
+#   (capture 4 min old, 4/4 holdings linked, 23,363 SAR deployable) and still
+#   produced no ticket. Six of the ten seats (BBOX.L GBX, ACA.PA / WDP.BR /
+#   MRL.MC / BNP.PA EUR, 2020.HK HKD) can never be funded: the capture proves
+#   the USD rate only (SAMA peg) and the allocate stage's FX Evidence gate
+#   (_certified_fx_assessment against the packet's proven rates) defers every
+#   other currency. Every funded ticket since 15 Oct (13 rows, 8 symbols) was
+#   a US listing. Seats spent on names that cannot be ticketed are the
+#   board's largest single loss of executable capacity. The owner chose
+#   "fundable names first" (non-USD names stay visible but no longer take a
+#   seat from a USD/SAR name) over proving more FX rates.
+# WHAT: env TFB_OPP_FUNDABLE_CCY = comma/space list of 3-letter currency codes
+#   (case-insensitive; other tokens ignored), read per build. No valid code
+#   (absent, blank, junk) -> off, byte-identical v1.28.0: no new key, no
+#   order change. Armed, on the build stage only (never the allocate replay,
+#   whose subset and order are frozen): once the live order of the INVEST pool
+#   is fixed, a stable re-sort puts rows whose currency is in the list first;
+#   order inside each group is unchanged, so the cap, sector/market caps and
+#   the rank challenger see the same scores. A name outside the list still
+#   takes a seat when fewer than Max Selected fundable names qualify. Its
+#   capacity near-miss note names the reason. meta.fundable_first =
+#   {ccys, pool, fundable, moved_down} on armed builds only.
+#   Functions added: 1 (_env_fundable_ccys). Removed: 0.
+#   Rollback: unset TFB_OPP_FUNDABLE_CCY, or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.29.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3106,6 +3141,20 @@ def _env_rank_mode():
         return raw if raw in ("shadow", "enforce") else "legacy"
     except Exception:
         return "legacy"
+
+
+def _env_fundable_ccys():
+    """v1.29.0 [FUNDABLE-FIRST]: TFB_OPP_FUNDABLE_CCY = comma/space list of
+    3-letter currency codes, read per call. Returns a sorted tuple of the
+    valid codes (upper case), or None (off) when there is none. Never
+    raises."""
+    try:
+        raw = str(_env_str("TFB_OPP_FUNDABLE_CCY", "") or "")
+        codes = sorted({tok.upper() for tok in re.split(r"[\s,;]+", raw)
+                        if re.match(r"^[A-Za-z]{3}$", tok or "")})
+        return tuple(codes) if codes else None
+    except Exception:
+        return None
 
 
 def _env_issuer_dedup():
@@ -7057,6 +7106,12 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
             gate, cur, req = "Capacity", "rank beyond Max Selected", (
                 "Max Selected = " + str(criteria["max_selected"]))
             note = "Qualified (INVEST) \u2014 ranked below the cap"
+            # v1.29.0 [FUNDABLE-FIRST]: name the reason on armed builds.
+            _ffc = _env_fundable_ccys()
+            _ffr = str(a.get("currency") or "").strip().upper()
+            if _ffc and _ffr not in _ffc:
+                note += (" (fundable first: " + (_ffr or "no currency") + " after " +
+                         "/".join(_ffc) + " names)")
         else:
             ff = a.get("first_fail")
             gate = ff["gate"] if ff else "?"
@@ -7462,6 +7517,19 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         invest.sort(key=lambda a: (-(a["opportunity_score"] or 0.0),
                                    -(a["_cand"]["ann_roi_pct"] or 0.0),
                                    a["symbol"]))
+    # v1.29.0 [FUNDABLE-FIRST]: armed builds only, never the allocate replay;
+    # a stable re-sort keeps the score order inside each group.
+    _ff_ccys = None if _board_replay else _env_fundable_ccys()
+    _ff_info = None
+    if _ff_ccys:
+        def _ff_ok(a):
+            return str(a.get("currency") or "").strip().upper() in _ff_ccys
+        _ff_before = [a["symbol"] for a in invest]
+        invest.sort(key=lambda a: 0 if _ff_ok(a) else 1)
+        _ff_n = sum(1 for a in invest if _ff_ok(a))
+        _ff_info = {"ccys": list(_ff_ccys), "pool": len(invest), "fundable": _ff_n,
+                    "moved_down": sum(1 for i, a in enumerate(invest)
+                                      if not _ff_ok(a) and _ff_before.index(a["symbol"]) < i)}
     # v1.28.0 [RANK-CHALLENGER] (A2/L4): the shadow order of the SAME pool,
     # computed once the live order above is fixed. legacy -> nothing runs.
     # The allocate replay never ranks (frozen subset; see WHY). Selection
@@ -7867,6 +7935,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     if _TIMING_STATE.get("mode") in ("observe", "enforce"):
         meta["timing_gate"] = dict(_TIMING_STATE)    # v1.23.0 [P-181] read-back
+    if _ff_info is not None:
+        meta["fundable_first"] = _ff_info   # v1.29.0 [FUNDABLE-FIRST], armed only
     # v1.28.0 [RANK-CHALLENGER]: meta block + ONE log line, armed builds only.
     if _rank_info is not None:
         meta["rank_challenger"] = _rank_info
