@@ -294,11 +294,13 @@ def build_rows(now: _dt.datetime, us_open: Optional[_dt.datetime], tickets: List
 def preopen_window(now: _dt.datetime, cal: Any) -> Tuple[Optional[_dt.datetime], bool, str]:
     """(today's NYSE open in UTC or None, inside the window?, why). The
     window is [open - WINDOW_BEFORE_MIN, open + WINDOW_AFTER_MIN]."""
-    import pandas as pd  # local import: pinned with exchange_calendars
-    day = pd.Timestamp(now.astimezone(UTC).date())
+    day = now.astimezone(UTC).date().isoformat()      # exchange_calendars takes a date string
     if not cal.is_session(day):
         return None, False, "no US session today"
-    op = cal.session_open(day).to_pydatetime().astimezone(UTC)
+    op = cal.session_open(day)
+    if hasattr(op, "to_pydatetime"):
+        op = op.to_pydatetime()
+    op = op.astimezone(UTC) if op.tzinfo else op.replace(tzinfo=UTC)
     lo, hi = op - _dt.timedelta(minutes=WINDOW_BEFORE_MIN), op + _dt.timedelta(minutes=WINDOW_AFTER_MIN)
     if lo <= now <= hi:
         return op, True, "inside the pre-open window"

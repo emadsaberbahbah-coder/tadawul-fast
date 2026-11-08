@@ -10,7 +10,8 @@
       gap either way, GO inside the band, CHECK on a missing or unread
       quote, SKIP for another session or a research seat; never a silent GO
   P4  the pre-open window on the NYSE calendar (winter and summer opens,
-      a holiday, early and late firings)
+      a holiday, early and late firings) on a fake calendar; P4b checks the
+      real exchange_calendars XNYS agrees where it is installed
   P5  main: outside the window nothing is read or written; inside, the tab
       is written whole (header + market row + tickets); dry run writes
       nothing; a broken page refuses; --ignore-window rehearses; the
@@ -289,9 +290,25 @@ def test_p3_verdicts():
     assert rows[1][5:9] == ["25.40", "24.90", "-1.97", "-1.20"] and all(len(r) == len(pc.HEADERS) for r in rows)
 
 
+class FakeXNYS:
+    """The NYSE sessions the tests need, without exchange_calendars (the lean
+    CI lane installs no market libraries): 9 Nov 2026 opens 14:30 UTC (winter),
+    6 Jul 2026 opens 13:30 UTC (summer), 26 Nov 2026 is Thanksgiving."""
+    OPENS = {"2026-11-09": dt.datetime(2026, 11, 9, 14, 30, tzinfo=UTC),
+             "2026-07-06": dt.datetime(2026, 7, 6, 13, 30, tzinfo=UTC)}
+
+    def is_session(self, day):
+        return str(day)[:10] in self.OPENS
+
+    def session_open(self, day):
+        return self.OPENS[str(day)[:10]]
+
+
+CAL = FakeXNYS()
+
+
 def test_p4_window():
-    import exchange_calendars as xcals
-    cal = xcals.get_calendar("XNYS")
+    cal = CAL
     op, inside, why = pc.preopen_window(NOW, cal)
     assert op == dt.datetime(2026, 11, 9, 14, 30, tzinfo=UTC) and inside and why == "inside the pre-open window"
     assert pc.preopen_window(dt.datetime(2026, 11, 9, 13, 0, tzinfo=UTC), cal)[1] is False     # the 13:00 firing in winter
@@ -307,6 +324,14 @@ def test_p4_window():
         pc.preopen_window(dt.datetime(2026, 11, 9, 10, 0, tzinfo=UTC), cal)[2]
 
 
+def test_p4b_real_xnys_calendar_agrees():
+    xcals = pytest.importorskip("exchange_calendars")       # whole-suite lane only
+    cal = xcals.get_calendar("XNYS")
+    for when in (NOW, dt.datetime(2026, 11, 9, 13, 0, tzinfo=UTC), dt.datetime(2026, 7, 6, 13, 0, tzinfo=UTC),
+                 dt.datetime(2026, 7, 6, 14, 0, tzinfo=UTC), dt.datetime(2026, 11, 26, 14, 0, tzinfo=UTC)):
+        assert pc.preopen_window(when, cal) == pc.preopen_window(when, CAL), when
+
+
 def _env(monkeypatch):
     for k in ("TFB_PREOPEN_ES_WAIT_PCT", "TFB_PREOPEN_GAP_PCT", "TFB_PREOPEN_SHEET", "TFB_PREOPEN_PAGE",
               "TFB_PREOPEN_TIMEOUT_S"):
@@ -314,8 +339,7 @@ def _env(monkeypatch):
 
 
 def test_p5_main(monkeypatch, capsys):
-    import exchange_calendars as xcals
-    cal = xcals.get_calendar("XNYS")
+    cal = CAL
     _env(monkeypatch)
     book = Book({"Top_10_Investments": TOP10})
     # outside the window: nothing read from Yahoo, nothing written
