@@ -207,3 +207,12 @@ Left as is (nits):
 - the missing-header `ValueError` fires after the reads and leaves no `_Run_Log` row (a red run is the signal);
 - the lane env outliving `main` (one process per run);
 - FLOOR_LOCKED rows read `BLOCKED - SCREEN_RETIRED`, which is the board's own wording.
+
+## Addendum 2026-11-08 - merge of main `4b478e7`
+
+Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header conflicted: main took 1.1.68-1.1.70.
+
+- ci.yml: this release is re-numbered **1.1.67 -> 1.1.76** (its header, its `v1.1.76` line and its step comment).
+- The header's claim note lists the open claims after the re-numbering: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.
+- Main's 1.1.70 / 1.1.69 / 1.1.68 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- After the merge: `tests/test_weekly_brief_board_parity.py` 55 passed with `TFB_TEST_REQUIRE_BASE=1`. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.

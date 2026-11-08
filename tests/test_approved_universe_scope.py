@@ -17,7 +17,7 @@ from scripts import approved_universe_scope as scope
 def scoped_symbols():
     """Synthetic full-size memberships, never copies of private workbook rows."""
     return {"Market_Leaders": [f"{1000 + i}.SR" for i in range(255)],
-            "Mutual_Funds": [f"F{i:04d}.US" for i in range(2474)]}
+            "Mutual_Funds": [f"F{i:04d}.US" for i in range(2422)]}
 
 
 def manifest_payload(symbols=None):
@@ -29,7 +29,7 @@ def manifest_payload(symbols=None):
             "pages": {}}
     for page, kind, count, old_floor in (
         ("Market_Leaders", "saudi_only", 255, 1025),
-        ("Mutual_Funds", "current_fund_tab", 2474, 4496),
+        ("Mutual_Funds", "current_fund_tab", 2422, 4496),
     ):
         fingerprints = sorted(scope.symbol_fingerprint(s) for s in symbols[page])
         data["pages"][page] = {"scope": kind, "approved_count": count,
@@ -82,7 +82,7 @@ import scripts.approved_universe_scope
 def test_valid_policy_is_immutable_and_receipt_binds_whole_bytes(approved):
     policy, _, path = approved
     assert policy.policy_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert scope.approved_floors(policy=policy) == {"Market_Leaders": 255, "Mutual_Funds": 2474}
+    assert scope.approved_floors(policy=policy) == {"Market_Leaders": 255, "Mutual_Funds": 2422}
     assert scope.approved_count("Market_Leaders", policy=policy) == 255
     assert scope.approved_count("Global_Markets", policy=policy) is None
     assert policy.receipt()["pages"]["Market_Leaders"]["supersedes_min_rows"] == 1025

@@ -206,8 +206,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.enriched_quote", "MODULE_VERSION", "4.11.2", "enriched quote"),
     # 2026-10-27 (A2; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note): 1.27.2 -> 1.28.0 (TFB_OPP_RANK_MODE, default legacy).
+    # 2026-11-08 (post-mortem item 3; manifest pin only): 1.28.0 -> 1.29.0
+    # (TFB_OPP_SIZING_MODE=risk + TFB_OPP_RISK_BUDGET_PCT, default cap).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.28.0", "opportunity builder"),
+     "1.29.0", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
@@ -245,7 +247,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
 SCRIPTS: List[Tuple[str, str, str]] = [
     ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
-    ("approved_universe_scope", "1.0.0", "approved exact physical roster membership"),
+    ("approved_universe_scope", "1.0.1", "approved exact physical roster membership"),
     ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
     # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
     # (the FEED banner detail keeps up to 1,000 characters).
@@ -264,7 +266,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
 
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
-    ("finalize_decision_publication", "1.1.2", "final decision-publication acceptance"),
+    ("finalize_decision_publication", "1.1.3", "final decision-publication acceptance"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
     # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
@@ -323,13 +325,18 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
     # the market_series_daily source for the global markets page), plus NEW
     # scripts/archive_market_series.py, the daily bars of the reference markets.
-    ("apply_bq_views", "1.5.0", "bigquery looker views"),  # 2 Nov 2026: views 1.5.0
+    # 2026-11-08 (manifest pin only): 1.5.0 -> 1.6.0 (v_signal_edge_daily and
+    # v_signal_edge) -> 1.7.0 (total-return engine, v_outcome_excess, the
+    # regime views); research views, nothing live reads them.
+    ("apply_bq_views", "1.7.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
     # 2026-10-29 (same rule): 1.1.0 -> 1.1.1 (the minimum is window-aware:
     # --days 30 needs 11 bars, not 30; the nightly 1,100 days still 30).
-    ("archive_market_series", "1.1.1", "bigquery market series"),
+    # 2026-11-08 (manifest pin only): 1.1.1 -> 1.2.0 (series 14 ^VIX, kind
+    # "Volatility index", for the regime views).
+    ("archive_market_series", "1.2.0", "bigquery market series"),
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.
@@ -340,6 +347,14 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.0.2", "news macro gate"),
+    # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
+    # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
+    # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete
+    # read - a failed issuer or an unreadable page - preserves the register).
+    ("run_corporate_events", "1.0.1", "corporate events tab"),
+    # 2026-11-08 (new script, pinned on arrival): the Pre_Open_Check tab ~30
+    # min before the US open (ES=F + pre-market gap verdicts per ticket).
+    ("pre_open_check", "1.0.0", "pre-open check tab"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
