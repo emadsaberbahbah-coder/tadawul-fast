@@ -1,11 +1,45 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.26.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.27.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.27.0 (2026-11-08) [CORP-EVENT-GUARD] -- A TICKET ON A NAME WITH A FILED CORPORATE EVENT IS HELD (ONE KNOB, DEFAULT OFF)
+ * WHY (owner, 8 Nov 2026, after the week of 2-6 Nov: 'how we can avoid that in the future' / 'let's do the
+ *   requirement and implement it'): the board seated and the owner bought INDV.US at the 2 Nov open, the day its
+ *   merger with Supernus closed (8-K items 2.01 and 5.03 filed that day); on 3 Nov the combined company traded as
+ *   SUPN, opened ex an 8.13 USD special dividend (22 % of the price) and slid another 7 % by 6 Nov. The v1.20.0
+ *   guard reads earnings, the v1.21.0 guard reads Dividend_Events (EODHD showed that ex-date a day late); a merger
+ *   closing, a change of control, a charter / name / ticker change, a delisting notice, a restatement or a
+ *   bankruptcy filing had no row anywhere. scripts/run_corporate_events.py v1.0.0 now writes those 8-K filings
+ *   (SEC EDGAR, US listings, newest first) to the Corporate_Events tab: Symbol | Event | Event Date | ...
+ * WHAT: one knob of the EXISTING guard (DT10_TICKET_GUARD observe | enforce), read only while it is armed:
+ *   DT10_GUARD_CORP_DAYS (integer 0..60; absent, blank or junk = the filter is off -- the v1.26.0 guard byte for
+ *   byte, apart from that one property read while the guard is armed). With the knob set, the refresh-side guard
+ *   reads the Corporate_Events tab once per render (dt10CorpEventMapFromValues_, pure; the first row per symbol
+ *   wins -- the tab is newest first; a Riyadh calendar day like the earnings map; any read failure = an empty map =
+ *   no hold, as for earnings and ex-dividends) into {SYMBOL: {days, event, form}} where days = event day - today
+ *   (negative = filed that many days ago). dt10TicketGuardCore_ gains one filter AFTER the ex-dividend filter and
+ *   BEFORE the owner rule and the cap: an executable ticket whose event day lies within -DT10_GUARD_CORP_DAYS..
+ *   +DT10_GUARD_CORP_DAYS days is held, reason 'corporate event: <event> (<N>d ago | in <N>d | today)', tag
+ *   'corp <event> <N>d'. observe names them in the existing token; enforce sends them through the existing
+ *   research path exactly like an earnings hold. The guard's Logger line gains ', corp events <= Nd' and the
+ *   self-test a line, only while the knob is set. Nothing else changes: no other filter, seat, KPI, read or line.
+ *   The hold covers the recorded symbol only: a name that changes ticker (INDV -> SUPN) is caught on its old row
+ *   while the filing is within the window; the new ticker's own filings follow on the next run of the lane.
+ * GATES: DT10_GUARD_CORP_DAYS (with DT10_TICKET_GUARD observe first, then enforce); the data lane is
+ *   .github/workflows/corporate_events.yml (repository secret TFB_SEC_USER_AGENT).
+ * Functions added (0 removed): dt10CorpEventMapFromValues_ (pure), dt10CorpEventMap_, dt10CorpEventHold_ (pure).
+ *   Changed: dt10TicketGuardConfig_ (one knob while armed), dt10TicketGuardCore_ (one filter; a sixth argument),
+ *   dt10TicketGuard_ (the tab read and the Logger suffix while the knob is set), dt10SelfTest (one line). Vars
+ *   added: DT10_GUARD_CORP_DAYS_PROP, DT10_GUARD_CORP_DAYS_MAX, DT10_CORP_EVENTS_SHEET.
+ * Harness: tests/test_dt10_v1270_corp_guard.js (REAL file; golden negative on the v1.26.0 base rebuilt by reversing
+ *   these edits, SHA-256 pinned).
+ * ROLLBACK: delete DT10_GUARD_CORP_DAYS (no re-paste); or re-paste v1.26.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in lockstep.
  *
  * v1.26.0 (2026-11-08) [FUNDABLE-SEATS] -- A NAME IBKR CANNOT FUND NEVER TAKES A SEAT FROM ONE IT CAN (ONE KNOB, DEFAULT OFF)
  * WHY (owner decision C, 8 Nov 2026: 'fundable names first - non-USD names stay visible but no longer take a seat
@@ -2673,7 +2707,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.26.0';
+var DT10_VERSION = '1.27.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3602,6 +3636,11 @@ var DT10_GUARD_EXDIV_PCT_PROP = 'DT10_GUARD_EXDIV_PCT';
 var DT10_GUARD_EXDIV_PCT_DEF = 2;
 var DT10_GUARD_EXDIV_PCT_MAX = 100;
 var DT10_DIVIDEND_SHEET = 'Dividend_Events';
+// v1.27.0 [CORP-EVENT-GUARD]: the corporate-event filter of the same guard
+// (read only while it is armed; absent days knob = the v1.26.0 guard).
+var DT10_GUARD_CORP_DAYS_PROP = 'DT10_GUARD_CORP_DAYS';
+var DT10_GUARD_CORP_DAYS_MAX = 60;
+var DT10_CORP_EVENTS_SHEET = 'Corporate_Events';
 // The research-context tags a held note keeps: the forward / post-earnings
 // prefix (the dt10UvWithholdRow_ pattern) and the v1.19.0 live-fill suffix.
 var DT10_TGUARD_TAGS_RE = /^((?:\u26a0 earnings \u2264\d+d \u00b7 )?(?:\u26a0 post-earnings \d+\/\d+ \u00b7 EPS (?:n\/a|[+-]?\d+\.\d%) \u00b7 )?)/;
@@ -7441,6 +7480,12 @@ function dt10TicketGuardConfig_() {
     cfg.exdivPct = (pctRaw !== '' && isFinite(pct) && pct >= 0) ?
         Math.min(pct, DT10_GUARD_EXDIV_PCT_MAX) : DT10_GUARD_EXDIV_PCT_DEF;
   }
+  // v1.27.0 [CORP-EVENT-GUARD]: one more knob; an absent / blank / junk knob
+  // leaves cfg exactly the v1.26.0 object (no corpDays key at all).
+  var cpRaw = read(DT10_GUARD_CORP_DAYS_PROP);
+  if (/^\d{1,2}$/.test(cpRaw) && Number(cpRaw) <= DT10_GUARD_CORP_DAYS_MAX) {
+    cfg.corpDays = Number(cpRaw);
+  }
   return cfg;
 }
 /** v1.20.0 [TICKET-GUARD] PURE: is `t` an EXECUTABLE ticket of the final
@@ -7457,13 +7502,15 @@ function dt10TicketGuardExec_(t) {
  * filter wins: (1) earnings -- 0 <= map[SYMBOL] <= cfg.earnDays, map being
  * the v1.6.0 tagger's Calendar_Events {SYMBOL: days to earnings}; (1b)
  * v1.21.0 ex-dividend -- only when cfg.exdivDays is a number, divMap
- * (dt10ExDivMapFromValues_) via dt10ExDivHold_; (2) owner
+ * (dt10ExDivMapFromValues_) via dt10ExDivHold_; (1c) v1.27.0 corporate
+ * event -- only when cfg.corpDays is a number, corpMap
+ * (dt10CorpEventMapFromValues_) via dt10CorpEventHold_; (2) owner
  * rule -- only when cfg.ownerRule, a ticket for which dt10OwnerRuleCell_
  * (the v1.19.0 Owner Rule predicate) is not 'rule: yes'; (3) cap -- when
  * cfg.maxTickets > 0, a ticket after the first maxTickets survivors.
  * Returns {checked, kept, held: [{index, symbol, kind, reason, tag}]}.
  * Never mutates its input. */
-function dt10TicketGuardCore_(selected, feedOk, map, cfg, divMap) {
+function dt10TicketGuardCore_(selected, feedOk, map, cfg, divMap, corpMap) {
   var out = { checked: 0, kept: 0, held: [] };
   if (feedOk !== true) return out;
   var sel = selected || [];
@@ -7484,6 +7531,9 @@ function dt10TicketGuardCore_(selected, feedOk, map, cfg, divMap) {
     } else if (typeof cfg.exdivDays === 'number' &&
                (h = dt10ExDivHold_(t, divMap, cfg.exdivDays, cfg.exdivPct)) !== null) {
       // v1.21.0 [EXDIV-GUARD]: h set by dt10ExDivHold_.
+    } else if (typeof cfg.corpDays === 'number' &&
+               (h = dt10CorpEventHold_(t, corpMap, cfg.corpDays)) !== null) {
+      // v1.27.0 [CORP-EVENT-GUARD]: h set by dt10CorpEventHold_.
     } else if (cfg.ownerRule === true && dt10OwnerRuleCell_(t, cfg.ownerBands) !== 'rule: yes') {
       h = { kind: 'rule', reason: 'owner rule', tag: 'owner rule' };
     } else if (cap > 0 && out.kept >= cap) {
@@ -7589,6 +7639,75 @@ function dt10ExDivHold_(t, divMap, maxDays, pct) {
   return { kind: 'exdiv', reason: 'ex-dividend in ' + e.days + 'd (size unknown)',
            tag: 'ex-div ' + e.days + 'd ?' };
 }
+/** v1.27.0 [CORP-EVENT-GUARD] PURE: {SYMBOL: {days, event, form}} from the
+ * Corporate_Events grid (header row found by its Symbol and Event Date
+ * tokens; Event and Form optional). Days = the event's Riyadh calendar day
+ * minus asOfDate's (negative = filed that many days ago); the FIRST row per
+ * symbol wins (the lane writes newest first); a malformed date or row is
+ * skipped. */
+function dt10CorpEventMapFromValues_(values, asOfDate) {
+  var map = {};
+  if (!values || !values.length) return map;
+  var today = dt10CalendarDay_(asOfDate === undefined ? new Date() : asOfDate);
+  if (today === null) return map;
+  var iSym = -1, iDate = -1, iEv = -1, iForm = -1, r, c, cells, tok;
+  for (r = 0; r < values.length && iSym < 0; r++) {
+    cells = values[r] || [];
+    var s0 = -1, d0 = -1, e0 = -1, f0 = -1;
+    for (c = 0; c < cells.length; c++) {
+      tok = dt10NormToken_(cells[c]);
+      if (tok === 'symbol') s0 = c;
+      else if (tok === 'eventdate') d0 = c;
+      else if (tok === 'event') e0 = c;
+      else if (tok === 'form') f0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0) { iSym = s0; iDate = d0; iEv = e0; iForm = f0; }
+  }
+  if (iSym < 0) return map;
+  for (; r < values.length; r++) {
+    cells = values[r] || [];
+    var sym = dt10NormSym_(cells[iSym]);
+    if (!sym || sym === 'SYMBOL' || map.hasOwnProperty(sym)) continue;
+    var day = dt10CalendarDay_(cells[iDate]);
+    if (day === null) continue;
+    var ev = iEv >= 0 ? String(cells[iEv] === null || cells[iEv] === undefined ? '' : cells[iEv])
+        .replace(/^\s+|\s+$/g, '') : '';
+    var form = iForm >= 0 ? String(cells[iForm] === null || cells[iForm] === undefined ? '' : cells[iForm])
+        .replace(/^\s+|\s+$/g, '') : '';
+    map[sym] = { days: day - today, event: ev || 'event', form: form };
+  }
+  return map;
+}
+/** v1.27.0 [CORP-EVENT-GUARD]: live Corporate_Events read
+ * (DT10_CORP_EVENTS_SHEET, columns A:J, bounded like Calendar_Events). ANY
+ * failure, an absent tab or an oversized grid gives {}, so no hold. Never throws. */
+function dt10CorpEventMap_(ss, asOfDate) {
+  try {
+    var sh = ss && ss.getSheetByName(DT10_CORP_EVENTS_SHEET);
+    if (!sh) return {};
+    var rows = sh.getLastRow(), cols = Math.min(sh.getLastColumn(), 10);
+    if (!isFinite(rows) || !isFinite(cols) || rows < 2 || cols < 2 ||
+        rows > DT10_CALENDAR_MAX_ROWS + 1) return {};
+    return dt10CorpEventMapFromValues_(sh.getRange(1, 1, rows, cols).getValues(), asOfDate);
+  } catch (eCe) {
+    return {};
+  }
+}
+/** v1.27.0 [CORP-EVENT-GUARD] PURE: the hold for the ticket t when its symbol
+ * has a corporate event whose day lies within -maxDays..+maxDays of today
+ * (a filing maxDays ago still holds; a dated future event holds too).
+ * null = no hold. */
+function dt10CorpEventHold_(t, corpMap, maxDays) {
+  var sym = dt10NormSym_(t && t.symbol);
+  var e = (corpMap && sym && Object.prototype.hasOwnProperty.call(corpMap, sym)) ? corpMap[sym] : null;
+  if (!e || typeof e.days !== 'number' || !isFinite(e.days) || e.days < -maxDays || e.days > maxDays) {
+    return null;
+  }
+  var when = e.days === 0 ? 'today' : (e.days < 0 ? (-e.days) + 'd ago' : 'in ' + e.days + 'd');
+  var n = e.days < 0 ? -e.days : e.days;
+  return { kind: 'corp', reason: 'corporate event: ' + e.event + ' (' + when + ')',
+           tag: 'corp ' + e.event + ' ' + n + 'd' };
+}
 /** v1.20.0 [TICKET-GUARD] PURE: the status token (ASCII). observe: 'tguard:
  * would hold SYM(tag) SYM(tag)' or 'tguard: would hold none'; enforce:
  * 'tguard: held N (SYM tag, SYM tag)' or 'tguard: held 0'. */
@@ -7684,7 +7803,9 @@ function dt10TicketGuard_(payload, map, ss) {
     var feedOk = !!(payload._dt10_uv && payload._dt10_uv.state === 'EXECUTABLE');
     // v1.21.0 [EXDIV-GUARD]: one Dividend_Events read, only while the knob is set.
     var divMap = typeof tg.exdivDays === 'number' ? dt10ExDivMap_(ss) : null;
-    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg, divMap);
+    // v1.27.0 [CORP-EVENT-GUARD]: one Corporate_Events read, only while the knob is set.
+    var corpMap = typeof tg.corpDays === 'number' ? dt10CorpEventMap_(ss) : null;
+    var res = dt10TicketGuardCore_(payload.selected || [], feedOk, map, tg, divMap, corpMap);
     var tail = '';
     if (tg.mode === 'enforce' && res.held.length) {
       var k = payload.kpis || {};
@@ -7708,7 +7829,8 @@ function dt10TicketGuard_(payload, map, ss) {
             dt10OwnerRuleBandsText_(tg.ownerBands) + ')' : '') : 'off') +
         ', cap ' + (cap > 0 ? cap : 'none') +
         (typeof tg.exdivDays === 'number' ? ', ex-div <= ' + tg.exdivDays + 'd >= ' +
-            tg.exdivPct + '%' : '') + tail);
+            tg.exdivPct + '%' : '') +
+        (typeof tg.corpDays === 'number' ? ', corp events <= ' + tg.corpDays + 'd' : '') + tail);
     return dt10TicketGuardToken_(res, tg.mode) +
         (tg.ownerRule === true && tg.ownerBands ?             // v1.25.0
             ', rule bands ' + dt10OwnerRuleBandsText_(tg.ownerBands) : '');
@@ -12683,6 +12805,44 @@ function dt10SelfTest() {
         (exOk ? 'ok (INDV 22.4% held, FRST 0.7% passes at 2% and holds at 0.5%, GBP size unknown, ' +
                 'GBX on a GBp price measured, earnings first)' : 'FAIL [' + tgSyms(exA) + ' | ' +
                 tgSyms(exB) + ' | ' + tgSyms(exE) + ']'));
+  }
+  /* v1.27.0 [CORP-EVENT-GUARD]: only while DT10_GUARD_CORP_DAYS is set (the
+     self-test is the v1.26.0 report otherwise): the knob and a pure battery
+     -- INDV.US merger_completed+charter_change filed 2 Nov holds on 8 Nov
+     (6d ago); a restatement filed 57 days back passes at 10 and holds at
+     60; a dated future event holds; a malformed date is skipped; a symbol
+     without a row passes; earnings win first. */
+  if (tgCfgNow && typeof tgCfgNow.corpDays === 'number') {
+    var cpMap = dt10CorpEventMapFromValues_([
+        ['Symbol', 'Event', 'Event Date', 'Filed At (UTC)', 'Form'],
+        ['INDV.US', 'merger_completed+charter_change', '2026-11-02', '2026-11-02 21:05', '8-K'],
+        ['INDV.US', 'change_in_control', '2026-10-01', '2026-10-01 21:00', '8-K'],
+        ['OLD.US', 'restatement', '2026-09-12', '2026-09-12 20:00', '8-K/A'],
+        ['FUT.US', 'rights_modified', '2026-11-12', '2026-11-10 21:00', '8-K'],
+        ['BAD.US', 'bankruptcy', 'n/a', '', '8-K']], '2026-11-08');
+    var cpT = function (sym) {
+      return { symbol: sym, price: 20, currency: 'USD', suggested_sar: 1000,
+               suggested_shares: 10, advisor_note: 'INVEST ' + sym, detail: {} };
+    };
+    var cpBoard = [cpT('INDV.US'), cpT('OLD.US'), cpT('FUT.US'), cpT('BAD.US'), cpT('NEW.US')];
+    var cpA = dt10TicketGuardCore_(cpBoard, true, {}, { earnDays: 3, corpDays: 10 }, null, cpMap);
+    var cpB = dt10TicketGuardCore_(cpBoard, true, {}, { earnDays: 3, corpDays: 60 }, null, cpMap);
+    var cpE = dt10TicketGuardCore_(cpBoard, true, { 'INDV.US': 1 }, { earnDays: 3, corpDays: 10 }, null, cpMap);
+    var cpOk = tgSyms(cpA) === 'INDV.US:corp,FUT.US:corp/5/3' &&
+        tgSyms(cpB) === 'INDV.US:corp,OLD.US:corp,FUT.US:corp/5/2' &&
+        tgSyms(cpE) === 'INDV.US:earn,FUT.US:corp/5/3' &&
+        cpA.held[0].reason === 'corporate event: merger_completed+charter_change (6d ago)' &&
+        cpA.held[0].tag === 'corp merger_completed+charter_change 6d' &&
+        cpA.held[1].reason === 'corporate event: rights_modified (in 4d)' &&
+        cpMap['INDV.US'].days === -6 && cpMap['OLD.US'].days === -57 &&
+        !cpMap.hasOwnProperty('BAD.US') &&
+        dt10TicketGuardToken_(cpA, 'observe') ===
+            'tguard: would hold INDV.US(corp merger_completed+charter_change 6d) FUT.US(corp rights_modified 4d)';
+    report.push('ticket guard corp events (DT10_GUARD_CORP_DAYS): <= ' + tgCfgNow.corpDays +
+        'd either side, tab ' + DT10_CORP_EVENTS_SHEET + ' | core: ' +
+        (cpOk ? 'ok (INDV merger filed 6d ago held, a 57d-old filing passes at 10 and holds at 60, ' +
+                'a dated future event held, no row passes, earnings first)' : 'FAIL [' + tgSyms(cpA) +
+                ' | ' + tgSyms(cpB) + ' | ' + tgSyms(cpE) + ']'));
   }
   /* v1.20.0 [KPI-PLAN-GAIN]: property line (the gate, and the label marker
      while the gate is not on) + the pure sum on the same board: 1000 x 0.20
