@@ -94,10 +94,10 @@
 
 ## S3 - Measured
 
-**`tests/test_hist_close_preview.py`: PASS 43/43** (script), 43 passed (pytest, tfb-venv), 43 passed (lean venv with `TFB_TEST_REQUIRE_BASE=1`).
+**`tests/test_hist_close_preview.py`: PASS 44/44** (script), 44 passed (pytest, tfb-venv), 44 passed (lean venv with `TFB_TEST_REQUIRE_BASE=1`).
 
-- Without git history: 40 passed and 3 skipped; with the base required those 3 fail. CI fetches the base, so they run there.
-- Run in one pytest process with `tests/test_track_performance_v6530_archive_bar.py` and `tests/test_tracker_hist_target_close.py`, in both orders: 92 passed, 1 skipped.
+- Without git history: 41 passed and 3 skipped; with the base required those 3 fail. CI fetches the base, so they run there.
+- Run in one pytest process with `tests/test_track_performance_v6530_archive_bar.py` and `tests/test_tracker_hist_target_close.py`, in both orders: 93 passed, 1 skipped.
 
 The harness drives the REAL audit loop (`PerformanceTrackerApp.audit_active_records`) with a fake backend transport, offline calendar sessions and a fake BigQuery session.
 
@@ -115,15 +115,16 @@ The harness drives the REAL audit loop (`PerformanceTrackerApp.audit_active_reco
 | N3 | only a refused record: one `witnessed=0` line |
 | N4 | the pure summary, hermetic, guard on: refusals and NaN ROIs skipped, HOLD neutral, REDUCE a sell, a breakeven sell, -0.004 printing +0.00, all-HOLD printing `win=n/a` and `call_roi=n/a`, the inclusive 50 pp mark |
 | N5 | the CA-GUARD on with the REAL `_ca_ledger_factor` over a confirmed-action index. A factor agreeing within 0.5 pp flips nothing (-0.3 stays a loss). A 21:20 bonus re-bases -3 to +1.85. 2:1 re-bases -50 to 0 and -75 to -50 (outlier marked `ledger-rebased`). A small factor confirms +20. The verify band holds an adjusted series that agrees (enforce keeps +20), one that disagrees (enforce re-bases to +1) and one that is missing (enforce leaves it pending). Every settled record's ROI and outcome equal a real enforce pass; the settled tally equals enforce's matured set less the band. With the ledger off, the caveat reads `ledger off` |
+| N5b | an infinite confirmed factor re-bases to an infinite ROI: enforce leaves the record pending (`outcome_roi_nonfinite`), and the preview leaves it out too, so the means stay finite |
 | R1 | a malformed triple -> `{}` and one WARNING. Junk -> one `unavailable` line. A summary failing inside the audit -> two WARNING lines, with records and the HIST-CLOSE stats unchanged |
 | W1 | the clock step maps the Variable once with default 'off' (YAML parsed), with `TRACK_HIST_TARGET_CLOSE` beside it; daily_sync.yml maps neither; the 1.0.14 header sits above 1.0.7; the reader falls back to "off" |
 | V1 | version floor >= 6.60.0, title, WHY order, verifier pin. ci.yml parsed: exactly one blocking lean-unit step with the base fetched and required and the pytest line last. The tag and the 50 pp constant. The harness file itself is ASCII |
 | V2 | against main `c7e666a4`: only the title, version and judge-loop lines replaced, and no main WHY line removed. Added lines ASCII, no definition removed. When this release stands alone, exactly the 3 helpers and their 3 nested functions are added; after merges, the subset form |
 | X1 | the main copy has no preview and logs none with the gate on |
 
-**Golden negative** (`TFB_TEST_PREVIEW_TARGET` = the untouched main copy): 37 failed, 6 passed. The passes are the off legs (O1 x5) and X1, which describe main itself.
+**Golden negative** (`TFB_TEST_PREVIEW_TARGET` = the untouched main copy): 38 failed, 6 passed. The passes are the off legs (O1 x5) and X1, which describe main itself.
 
-**55 / 55 mutants killed** (see S5 for the list; MUTANTS_RESULT).
+**55 / 55 mutants killed** on the final harness (each one applied to an export of the head and the harness run under pytest; see S5 for the list). One survivor of the first pass (a non-finite ledger re-base kept) is killed by N5b.
 
 **Other checks:**
 - compileall (main.py core routes scripts tests) clean.
@@ -168,6 +169,8 @@ The harness drives the REAL audit loop (`PerformanceTrackerApp.audit_active_reco
 | With the yfinance sources, enforce's hist time window also covers the CA-GUARD's in-loop pulls, so enforce can defer settled records | CONFIRMED (minor) | KNOWN LIMITS; the settled line no longer says "exactly" |
 | S3 of this sheet was stale | CONFIRMED (minor) | rewritten |
 | The caveat said "ledger factors applied" with the guard or the ledger off; a re-based outlier was unmarked; a non-finite re-base was kept; a missing session printed "None"; "re-bases" was listed as a deduction; S1 said every record would mature | CONFIRMED (nits) | fixed |
+
+**Mutants** (55, all killed): 1 gate default on; 2 any word on; 3 enable read as on; 4 gate bypassed; 5 not observe-only; 6 gate read first; 7 verdicts not kept; 8 lines not logged; 9 logged at info; 10 hist stats touched; 11 read-back dropped; 12 refused counted; 13 nan counted; 14 price outcome; 15 breakeven as win; 16 hold in decided; 17 call roi unsigned; 18 median = mean; 19 min/max swapped; 20 outlier threshold 60; 21 outlier strict; 22 samples 4; 23 ties unsorted; 24 horizon order alpha; 25 bucket blank kept; 26 -0.0 kept; 27 exception escapes; 28 warning dropped; 29 unavailable dropped; 30 zero line dropped; 31 caveat dropped; 32 ledger not applied; 33 ledger without decide; 34 verify band ignored; 35 verify band in settled; 36 verify pp fixed 50; 37 guard ignored; 38 ca part dropped; 39 m3 ledger roi always; 40 m4 verify before ledger; 41 m5 confirmed as verify; 42 nonfinite kept; 43 rebased marker dropped; 44 caveat claims ledger when off; 45 ledger-off caveat; 46 settled line dropped; 47 outlier line dropped; 48 daily_sync mapped; 49 clock default on; 50 clock unmapped; 51 ci step removed; 52 ci base not required; 53 ci fetch dropped; 54 ci step advisory; 55 off-path debug log.
 
 **Lanes on an export of the head:** LANES_RESULT.
 

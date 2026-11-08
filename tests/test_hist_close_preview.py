@@ -619,6 +619,24 @@ def test_n5_ca_guard_on_matches_enforce():
     assert off.preview["ca_ledger"] == 0 and "(ledger off; dedup is enforce's" in preview_lines(off)[0]
 
 
+def test_n5b_nonfinite_ledger_roi_left_out_like_enforce():
+    # An infinite confirmed factor re-bases to an infinite ROI: enforce
+    # leaves the record PENDING (outcome_roi_nonfinite), so the preview must
+    # not count it either (a kept row would also poison the ROI mean).
+    case = {k: CA_CASE[k] for k in ("AAA.US", "LZR.US")}
+    case["INF.US"] = ("BUY", "INVESTABLE", "WEEK_1", 100.0, 104.0, 105.0, "yahoo_chart_v8")
+    index = dict(CA_INDEX, **{"INF.US": [(ACT, float("inf"))]})
+    patches = dict(_ca_patches(tp), _ca_ledger_index=lambda: index)
+    pv = audit(tp, "observe", "on", case, patches=patches).preview
+    assert [r["symbol"] for r in pv["records"]] == ["AAA.US", "LZR.US"]
+    assert (pv["n"], pv["ca_ledger"], pv["settled"]["n"]) == (2, 0, 2)
+    assert all(tp.math.isfinite(pv[k]) for k in ("price_roi_mean", "price_roi_max", "call_roi_mean"))
+    enf = audit(tp, "enforce", None, case, patches=patches)
+    status = {r.symbol: (r.status, r.realized_roi) for r in enf.records}
+    assert status["INF.US"][0] != tp.PerformanceStatus.MATURED and status["INF.US"][1] is None
+    assert {s for s, v in status.items() if v[0] == tp.PerformanceStatus.MATURED} == {"AAA.US", "LZR.US"}
+
+
 def test_o2b_guard_on_gate_changes_only_the_preview():
     snaps = {}
     for word in (None, "on"):
