@@ -24,9 +24,12 @@ FAILS the base legs instead of skipping them; set in CI).
   N1  the summary of a nine-record pass (one refused): counts, ROI, call
       ROI, by horizon, by bucket, outliers, and the exact lines; the yfinance
       source; one symbol at two horizons; a weekend target's session date
-  N5  the CA-GUARD on (its production default): a confirmed ledger factor
-      re-bases the ROI as enforce does, the verify band is counted, and the
-      'settled' tally equals what a real enforce pass matures
+  N5  the CA-GUARD on (its production default), the real ledger code over a
+      confirmed-action index: ledger factors that agree within 0.5 pp (one
+      flips the sign) or re-base (2:1 on prints past 15 pp), the verify band
+      with adjusted series that agree, disagree or are missing; every
+      settled record's ROI equals a real enforce pass's realized_roi
+  O2b the CA-GUARD on: the gate changes nothing but the preview lines
   N2  outlier samples: the five largest |ROI|, ties by symbol
   N3  no witnessed record: one 'witnessed=0' line
   N4  the pure summary: refusals, NaN ROIs, HOLD, breakeven, sells, -0.00,
@@ -451,8 +454,7 @@ def test_n1_summary_and_lines():
     assert preview_lines(run) == [
         "%s mode=observe witnessed=8 decided=6 wins=3 losses=3 breakeven=1 hold=1 win=50.0%% %s "
         "price_roi mean=+0.25%% median=+1.00%% min=-60.00%% max=+60.00%% call_roi=+0.29%% "
-        "outliers(|roi|>=50pp)=2 ca_guard=off (ledger factors applied; dedup is enforce's; nothing written)"
-        % (TAG, ci(3, 6)),
+        "outliers(|roi|>=50pp)=2 ca_guard=off (dedup is enforce's; nothing written)" % (TAG, ci(3, 6)),
         "%s by horizon: 1W n=4 decided=3 win=66.7%% %s | 2W n=1 decided=1 win=0.0%% %s | "
         "1M n=2 decided=1 win=0.0%% %s | 3M n=1 decided=1 win=100.0%% %s" % (
             TAG, ci(2, 3), ci(0, 1), ci(0, 1), ci(1, 1)),
@@ -541,7 +543,8 @@ def _n4_body():
     assert set(pv["by_bucket"]) == {"UNSPECIFIED", "WATCHLIST"}
     lines = tp._hist_close_preview_lines(pv)
     assert len(lines) == 4 and "median=+0.00%" in lines[0]
-    assert " ca_guard=on ledger=0 verify(|roi|>=15pp)=0 " in lines[0] and " settled " in lines[1]
+    assert (" ca_guard=on ledger=0 verify(|roi|>=15pp)=0 (ledger factors applied; dedup is enforce's; "
+            "nothing written)") in lines[0] and " settled " in lines[1]
     holds = tp._hist_close_preview([(mk("H.US", "HOLD"), {}, (_Ev(1.0), "", 3.0))])
     assert holds["call_roi_mean"] is None and holds["win_rate"] is None
     assert "win=n/a" in tp._hist_close_preview_lines(holds)[0] and "call_roi=n/a" in tp._hist_close_preview_lines(holds)[0]
@@ -555,40 +558,80 @@ def _n4_body():
 
 
 # ----------------------------------------------------------------- N5 -------
+from datetime import date as _date   # noqa: E402
+
+ACT = _date(2026, 9, 28)              # confirmed actions between entry (24 Sep) and the target (1 Oct)
+CA_CASE = {
+    # symbol: (call, inv, horizon, entry, target close, quote, source)
+    "AAA.US": ("BUY", "INVESTABLE", "WEEK_1", 100.0, 104.0, 105.0, "yahoo_chart_v8"),   # +4, no action
+    "LZR.US": ("BUY", "INVESTABLE", "WEEK_1", 100.0, 99.7, 100.0, "yahoo_chart_v8"),    # -0.3, f 1.004 agrees
+    "BBB.US": ("BUY", "INVESTABLE", "WEEK_1", 100.0, 97.0, 98.0, "yahoo_chart_v8"),     # -3, bonus 21:20 -> +1.85
+    "L2S.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 50.0, 51.0, "yahoo_chart_v8"),      # -50, 2:1 -> 0
+    "L75.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 25.0, 26.0, "yahoo_chart_v8"),      # -75, 2:1 -> -50 (outlier)
+    "LBH.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 120.0, 121.0, "yahoo_chart_v8"),    # +20, f 1.001 agrees
+    "VAG.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 120.0, 121.0, "yahoo_chart_v8"),    # +20, adjusted +22 agrees
+    "VDG.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 130.0, 131.0, "yahoo_chart_v8"),    # +30, adjusted +1 disagrees
+    "VNA.US": ("BUY", "WATCHLIST", "WEEK_1", 100.0, 125.0, 126.0, "yahoo_chart_v8"),    # +25, no adjusted history
+}
+CA_INDEX = {"LZR.US": [(ACT, 1.004)], "BBB.US": [(ACT, 1.05)], "L2S.US": [(ACT, 2.0)],
+            "L75.US": [(ACT, 2.0)], "LBH.US": [(ACT, 1.001)]}
+CA_ADJ = {"VAG.US": 22.0, "VDG.US": 1.0}
+
+
 def _ca_patches(mod):
-    """The CA-GUARD on (production default), a confirmed 21:20 bonus on
-    BBB.US between entry and the target session, and no adjusted history
-    (no network): the verify band cannot be resolved this pass."""
-    def ledger(symbol, entry_date, target_session=None):
-        if target_session is None:            # the judge's post-target check
-            return None
-        return 1.05 if mod._safe_str(symbol).upper() == "BBB.US" else None
-    return {"_ca_guard_enabled": lambda: True, "_ca_ledger_factor": ledger,
-            "_ca_adjusted_roi": lambda *a, **k: None}
+    """The CA-GUARD on (production default); the REAL _ca_ledger_factor over
+    a confirmed-action index; adjusted history from a table (no network)."""
+    return {"_ca_guard_enabled": lambda: True, "_ca_ledger_index": lambda: CA_INDEX,
+            "_ca_adjusted_roi": lambda symbol, *a, **k: CA_ADJ.get(mod._safe_str(symbol).upper())}
 
 
 def test_n5_ca_guard_on_matches_enforce():
-    run = audit(tp, "observe", "on", patches=_ca_patches(tp))
+    run = audit(tp, "observe", "on", CA_CASE, patches=_ca_patches(tp))
     pv = run.preview
-    assert (pv["ca_guard"], pv["ca_ledger"], pv["ca_verify"], pv["ca_verify_pp"]) == (True, 1, 2, 15.0)
-    bbb = ((1 - 0.03) * 1.05 - 1) * 100.0                     # print -3% re-based by the bonus
-    assert pv["price_roi_mean"] == round((4 + bbb - 5 + 4 + 2 + 60 + 0 - 60) / 8, 2)
-    assert (pv["wins"], pv["losses"], pv["breakeven"], pv["hold"]) == (4, 2, 1, 1)   # BBB a win now
-    # a real enforce pass on the same fixture, same CA patches
-    enf = audit(tp, "enforce", None, patches=_ca_patches(tp))
-    matured = [r for r in enf.records if r.status == tp.PerformanceStatus.MATURED]
-    assert sorted(r.symbol for r in matured) == ["AAA.US", "BBB.US", "CCC.US", "DDD.US", "EEE.US", "GGG.US"]
-    assert [r.realized_roi for r in matured if r.symbol == "BBB.US"] == [bbb]
-    outcomes = [tp._record_outcome(r) for r in matured]
+    assert (pv["ca_guard"], pv["ca_ledger_on"], pv["ca_ledger"], pv["ca_verify"], pv["ca_verify_pp"]) == \
+           (True, True, 3, 3, 15.0)
+    by = {r["symbol"]: r for r in pv["records"]}
+    assert {s for s, r in by.items() if r["ca"] == "verify"} == {"VAG.US", "VDG.US", "VNA.US"}
+    assert {s for s, r in by.items() if r["ca"] == "confirmed"} == {"LZR.US", "LBH.US"}
+    enf = audit(tp, "enforce", None, CA_CASE, patches=_ca_patches(tp))
+    matured = {r.symbol: r for r in enf.records if r.status == tp.PerformanceStatus.MATURED}
+    settled = {s for s, r in by.items() if r["ca"] != "verify"}
+    assert set(matured) == settled | {"VAG.US", "VDG.US"}                  # VNA stays pending
+    for sym in settled:                                                    # the exact stored ROI
+        assert by[sym]["roi"] == matured[sym].realized_roi, sym
+        assert by[sym]["outcome"] == tp._record_outcome(matured[sym]), sym
+    assert (round(matured["VAG.US"].realized_roi, 9), matured["VDG.US"].realized_roi) == (20.0, 1.0)
+    assert by["LZR.US"]["outcome"] == "LOSS" and by["L2S.US"]["roi"] == 0.0 and by["L75.US"]["roi"] == -50.0
     st = pv["settled"]
+    outs = [tp._record_outcome(matured[s]) for s in settled]
     assert (st["n"], st["wins"], st["losses"], st["breakeven"], st["hold"]) == (
-        len(matured), outcomes.count("WIN"), outcomes.count("LOSS"), outcomes.count("BREAKEVEN"),
-        outcomes.count(None))
+        len(settled), outs.count("WIN"), outs.count("LOSS"), outs.count("BREAKEVEN"), outs.count(None)) == \
+        (6, 3, 2, 1, 0)
     lines = preview_lines(run)
-    assert " ca_guard=on ledger=1 verify(|roi|>=15pp)=2 " in lines[0]
+    assert (" ca_guard=on ledger=3 verify(|roi|>=15pp)=3 (ledger factors applied; dedup is enforce's; "
+            "nothing written)") in lines[0]
     assert lines[1] == ("%s settled (the verify band left out: what enforce matures as shown): all n=6 "
-                        "decided=4 win=75.0%% %s wins=3 losses=1 breakeven=1 hold=1" % (TAG, ci(3, 4)))
+                        "decided=5 win=60.0%% %s wins=3 losses=2 breakeven=1 hold=0" % (TAG, ci(3, 5)))
+    assert lines[-1] == ("%s outliers: L75.US 1W -50.00%% (entry 100.0000 -> close 25.0000, 2026-10-01, "
+                         "ledger-rebased)" % TAG)
     assert len(lines) == 5
+    off = audit(tp, "observe", "on", CA_CASE, patches=dict(_ca_patches(tp), _ca_ledger_enabled=lambda: False))
+    assert off.preview["ca_ledger"] == 0 and "(ledger off; dedup is enforce's" in preview_lines(off)[0]
+
+
+def test_o2b_guard_on_gate_changes_only_the_preview():
+    snaps = {}
+    for word in (None, "on"):
+        tp._CA_BUDGET.update({"pulls": 0, "t0": 0.0, "deferred": 0})
+        run = audit(tp, "observe", word, CA_CASE, patches=_ca_patches(tp))
+        snaps[word] = (run, dict(tp._CA_BUDGET))
+    off, on = snaps[None][0], snaps["on"][0]
+    assert [state(r) for r in on.records] == [state(r) for r in off.records]
+    assert on.stats == off.stats and on.hist == off.hist
+    assert {k: v for k, v in snaps["on"][1].items() if k != "t0"} == \
+           {k: v for k, v in snaps[None][1].items() if k != "t0"}
+    assert norm_logs(tp, [x for x in on.logs if not x[1].startswith(TAG)]) == norm_logs(tp, off.logs)
+    assert preview_lines(on) and not preview_lines(off)
 
 
 # ----------------------------------------------------------------- R1 -------

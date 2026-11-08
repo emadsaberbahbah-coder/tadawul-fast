@@ -1983,8 +1983,9 @@ from urllib.error import HTTPError, URLError
 #     decided (the calibration's sample).
 #   Past-due records keep growing (6,492 -> 6,735 in a day). Every record
 #   the archive witnesses is a maturation candidate under enforce (3,598 in
-#   one pass), less those the default-on CA-GUARD defers, re-bases or
-#   expires; only buy and sell calls add decided outcomes. The observe line
+#   one pass), less those the default-on CA-GUARD defers or expires (a
+#   re-based one still matures, on the re-based ROI); only buy and sell
+#   calls add decided outcomes. The observe line
 #   says how MANY; it never says WHAT: no win / loss split, no ROI, no
 #   outlier. The judge already computes each candidate's ROI from the
 #   archive close (_hist_close_judge returns it) and observe discards it, so
@@ -2005,15 +2006,19 @@ from urllib.error import HTTPError, URLError
 #       losses=L breakeven=B hold=H win=x% CI[lo,hi] price_roi mean=..
 #       median=.. min=.. max=.. call_roi=.. outliers(|roi|>=50pp)=K
 #       ca_guard=on ledger=J verify(|roi|>=15pp)=V (ledger factors applied;
-#       dedup is enforce's; nothing written)' (ca_guard=off when the guard
-#       is off);
+#       dedup is enforce's; nothing written)' ('ledger off' with
+#       TFB_TRACK_CA_LEDGER off; 'ca_guard=off (dedup is enforce's; nothing
+#       written)' with the guard off);
 #     '... settled (the verify band left out: what enforce matures as
 #       shown): all n= decided= win= CI wins= losses= breakeven= hold='
 #       (only with the guard on);
 #     '... by horizon: 1W n= decided= win= | 2W ...';
 #     '... by bucket: <entry investability> n= decided= win= | ...';
-#     '... outliers: <symbol> <horizon> <roi> (entry -> close, session) |
-#       ...' (the five largest |ROI|, ties by symbol, only when K > 0).
+#     '... outliers: <symbol> <horizon> <roi> (entry -> close, session[,
+#       ledger-rebased]) | ...' (the five largest |ROI|, ties by symbol, only
+#       when K > 0; a re-based ROI is marked, its prices are the raw prints).
+#   A ledger re-base that is not finite is left out, as enforce leaves the
+#   record PENDING (outcome_roi_nonfinite).
 #   Outcome = _directional_outcome of the entry call (HOLD neutral), the
 #   definition every report uses; call_roi = ROI x call sign over the buy
 #   and sell calls. _LAST_HIST_PREVIEW keeps the summary dict. Records,
@@ -2027,13 +2032,16 @@ from urllib.error import HTTPError, URLError
 #   beside TRACK_HIST_TARGET_CLOSE; daily_sync.yml maps neither (the v6.47.0
 #   lane rule). Safe to arm at once: log lines only.
 # KNOWN LIMITS: the VERIFY band is counted, not resolved: the 'settled'
-#   line is what enforce matures exactly as shown, and enforce may still
-#   mature some of the band (an adjusted series that agrees or re-bases)
-#   within its CA verification budget (60 symbols / 240 s per run by
-#   default). The matured-duplicate dedup and the save are enforce's. With
-#   the yfinance source both modes admit the same TRACK_HIST_CLOSE_BUDGET
-#   window, so the preview already reflects it. The 50 pp outlier mark is a
-#   reporting flag, not a gate.
+#   line is what enforce matures as shown once it reaches a record, and
+#   enforce may still mature some of the band (an adjusted series that
+#   agrees or re-bases) within its CA verification budget (60 symbols /
+#   240 s per run by default). The matured-duplicate dedup and the save are
+#   enforce's. With the yfinance sources both modes admit the same
+#   TRACK_HIST_CLOSE_BUDGET symbol window, but under enforce the
+#   TRACK_HIST_CLOSE_TIME_SEC window also covers the CA-GUARD's in-loop
+#   verification pulls (observe judges after the loop), so enforce can defer
+#   some settled records to a later pass; the archive source (production)
+#   pulls nothing. The 50 pp outlier mark is a reporting flag, not a gate.
 # ZERO functions removed. Additions: _hist_close_preview_enabled,
 #   _hist_close_preview, _hist_close_preview_lines (+ _HIST_PREVIEW_TAG,
 #   _HIST_PREVIEW_OUTLIER_PP, _LAST_HIST_PREVIEW). Changed: the observe judge
@@ -4399,7 +4407,7 @@ def _hist_close_preview(judged: List[Any]) -> Dict[str, Any]:
             roi = float(roi)
             if not math.isfinite(roi):
                 continue
-            session = _safe_str((context or {}).get("target_session"))[:10]
+            session = _safe_str((context or {}).get("target_session") or "")[:10]
             ca = ""
             if guard:
                 ledger_roi = _ca_ledger_roi(roi, _ca_ledger_factor(
@@ -4407,6 +4415,8 @@ def _hist_close_preview(judged: List[Any]) -> Dict[str, Any]:
                 if ledger_roi is not None:
                     basis, roi = _ca_decide_v2(roi, None, ledger_roi)
                     ca = "ledger" if basis == "ledger" else "confirmed"
+                    if not math.isfinite(roi):
+                        continue    # enforce leaves it PENDING (outcome_roi_nonfinite)
                 elif abs(roi) >= verify_pp:
                     ca = "verify"
             rows.append((record, evidence, roi,
@@ -4438,6 +4448,7 @@ def _hist_close_preview(judged: List[Any]) -> Dict[str, Any]:
             call_roi_mean=(round(sum(signed) / len(signed), 2) + 0.0 if signed else None),
             outliers=sum(1 for x in rows if abs(x[2]) >= _HIST_PREVIEW_OUTLIER_PP),
             ca_guard=bool(guard), ca_verify_pp=float(verify_pp),
+            ca_ledger_on=bool(guard and _ca_ledger_enabled()),
             ca_ledger=sum(1 for x in rows if x[5] == "ledger"),
             ca_verify=sum(1 for x in rows if x[5] == "verify"),
             settled=tally([x for x in rows if x[5] != "verify"]))
@@ -4454,7 +4465,10 @@ def _hist_close_preview(judged: List[Any]) -> Dict[str, Any]:
         out["outlier_samples"] = [
             {"symbol": _safe_str(x[0].symbol), "horizon": _safe_str(getattr(x[0].horizon, "value", x[0].horizon)),
              "roi": round(x[2], 2) + 0.0, "entry": float(x[0].entry_price), "close": float(x[1].price),
-             "session": x[4]} for x in worst]
+             "session": x[4], "ca": x[5]} for x in worst]
+        out["records"] = [{"symbol": _safe_str(x[0].symbol),
+                           "horizon": _safe_str(getattr(x[0].horizon, "value", x[0].horizon)),
+                           "roi": x[2], "outcome": x[3], "ca": x[5]} for x in rows]
         return out
     except Exception as exc:
         logger.warning("%s preview unavailable: %s", _HIST_PREVIEW_TAG, type(exc).__name__)
@@ -4480,14 +4494,15 @@ def _hist_close_preview_lines(summary: Any) -> List[str]:
         if not summary["witnessed"]:
             return ["%s mode=observe witnessed=0 (nothing for enforce to mature this pass)" % _HIST_PREVIEW_TAG]
         if summary["ca_guard"]:
-            ca_part = "ca_guard=on ledger=%d verify(|roi|>=%gpp)=%d" % (
-                summary["ca_ledger"], summary["ca_verify_pp"], summary["ca_verify"])
+            ca_part = "ca_guard=on ledger=%d verify(|roi|>=%gpp)=%d (%s; dedup is enforce's; nothing written)" % (
+                summary["ca_ledger"], summary["ca_verify_pp"], summary["ca_verify"],
+                "ledger factors applied" if summary["ca_ledger_on"] else "ledger off")
         else:
-            ca_part = "ca_guard=off"
+            ca_part = "ca_guard=off (dedup is enforce's; nothing written)"
         lines = [
             "%s mode=observe witnessed=%d decided=%d wins=%d losses=%d breakeven=%d hold=%d %s "
             "price_roi mean=%+.2f%% median=%+.2f%% min=%+.2f%% max=%+.2f%% call_roi=%s "
-            "outliers(|roi|>=%dpp)=%d %s (ledger factors applied; dedup is enforce's; nothing written)" % (
+            "outliers(|roi|>=%dpp)=%d %s" % (
                 _HIST_PREVIEW_TAG, summary["witnessed"], summary["decided"], summary["wins"],
                 summary["losses"], summary["breakeven"], summary["hold"], rate(summary),
                 summary["price_roi_mean"], summary["price_roi_median"], summary["price_roi_min"],
@@ -4508,8 +4523,9 @@ def _hist_close_preview_lines(summary: Any) -> List[str]:
         ]
         if summary["outlier_samples"]:
             lines.append("%s outliers: %s" % (_HIST_PREVIEW_TAG, " | ".join(
-                "%s %s %+.2f%% (entry %.4f -> close %.4f, %s)" % (
-                    o["symbol"], o["horizon"], o["roi"], o["entry"], o["close"], o["session"] or "-")
+                "%s %s %+.2f%% (entry %.4f -> close %.4f, %s%s)" % (
+                    o["symbol"], o["horizon"], o["roi"], o["entry"], o["close"], o["session"] or "-",
+                    ", ledger-rebased" if o.get("ca") == "ledger" else "")
                 for o in summary["outlier_samples"])))
         return lines
     except Exception:
