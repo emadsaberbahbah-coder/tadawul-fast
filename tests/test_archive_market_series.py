@@ -1,4 +1,4 @@
-"""scripts/archive_market_series.py v1.1.1 - the daily bars of the world's
+"""scripts/archive_market_series.py v1.2.0 - the daily bars of the world's
 reference markets for the Looker global markets page (program register C8,
 Phase 2b).
 
@@ -68,7 +68,7 @@ PROJECT, DATASET = "proj-x", "tfb_archive"
 # reused id would mix two instruments in one partition.
 PINNED_IDS = {
     1: "^GSPC", 2: "^IXIC", 3: "^DJI", 4: "^STOXX50E", 5: "^FTSE", 6: "^GDAXI", 7: "^FCHI",
-    8: "000001.SS", 9: "399001.SZ", 10: "000300.SS", 11: "^HSI", 12: "^N225", 13: "^TASI.SR",
+    8: "000001.SS", 9: "399001.SZ", 10: "000300.SS", 11: "^HSI", 12: "^N225", 13: "^TASI.SR", 14: "^VIX",
     20: "SPY", 21: "VGK", 22: "MCHI", 23: "EWJ", 24: "KSA", 25: "UAE", 26: "QAT", 27: "KWT",
     28: "ACWI", 29: "EEM",
     40: "XLK", 41: "XLF", 42: "XLE", 43: "XLV", 44: "XLI", 45: "XLY", 46: "XLP", 47: "XLU",
@@ -201,7 +201,7 @@ def _run(monkeypatch, argv, session, fetch, capsys=None):
 # --------------------------------------------------------------------------- M1
 def test_m1_series_integrity():
     ids = [s[0] for s in ms.SERIES]
-    assert len(ids) == len(set(ids)) == 48
+    assert len(ids) == len(set(ids)) == 49
     assert {s[0]: s[1] for s in ms.SERIES} == PINNED_IDS
     assert all(1 <= i <= ms.MAX_SERIES_ID for i in ids)
     syms = [s[1] for s in ms.SERIES]
