@@ -316,6 +316,10 @@ def audit(mod, mode, preview, case=None, source="bq_archive", pull=None, patches
         asyncio.run(app.audit_active_records(records))
         run.stats = dict(getattr(app, "_last_audit_stats", {}) or {})
         run.hist = json.loads(json.dumps(dict(mod._LAST_HIST_CLOSE), default=str, sort_keys=True))
+        # 2026-11-08 (review): the archive's query_sec is wall-clock (0.00 vs
+        # 0.01 under load); masked like norm_logs masks it in the log text.
+        if isinstance(run.hist.get("archive"), dict) and "query_sec" in run.hist["archive"]:
+            run.hist["archive"]["query_sec"] = "T"
         run.preview = dict(getattr(mod, "_LAST_HIST_PREVIEW", {}) or {})
         run.records = records
     return run
