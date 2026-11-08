@@ -315,7 +315,7 @@ console.log('S7 PASS embedded self-test core');
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
 // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
-ok((src.match(/^var DT10_VERSION = '1\.26\.0';$/m) || []).length === 1 && /^ \* Version: 1\.26\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.24.0 (delivered)');   // 2026-11-08: v1.22.0 pin moved
+ok((src.match(/^var DT10_VERSION = '1\.27\.0';$/m) || []).length === 1 && /^ \* Version: 1\.27\.0 \(see DT10_VERSION;/.test(src.split('\n')[3]), 'S8 version lockstep 1.24.0 (delivered)');   // 2026-11-08: v1.22.0 pin moved
 const orchStart = src.indexOf('  var exitNote = dt10AppendExitLog_(ss,');
 ok(orchStart > 0 && src.lastIndexOf('\nfunction ', orchStart) === src.indexOf('\nfunction dt10RefreshDecisionTop10Run_(run) {'),
    'S8 exit-log call located inside dt10RefreshDecisionTop10Run_ (the refreshDecisionTop10 body)');

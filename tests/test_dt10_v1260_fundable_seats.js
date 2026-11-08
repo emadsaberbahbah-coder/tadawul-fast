@@ -30,7 +30,9 @@ var history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js')
 var EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1260.json'));
 var FD = 'TFB_T10_FUNDABLE_CCY';
 
-var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-08: the delivered file is v1.27.0 [CORP-EVENT-GUARD]; this harness proves the v1.26.0 diff, so it reads
+// the v1.26.0 file rebuilt from the delivered one (tests/js/dt10_edits_v1270.json reversed, SHA-256 pinned).
+var newSource = history.v1260Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 var baseSource;
 try {
