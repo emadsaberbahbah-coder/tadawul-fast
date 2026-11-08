@@ -172,7 +172,7 @@ The harness drives the REAL audit loop (`PerformanceTrackerApp.audit_active_reco
 
 **Mutants** (55, all killed): 1 gate default on; 2 any word on; 3 enable read as on; 4 gate bypassed; 5 not observe-only; 6 gate read first; 7 verdicts not kept; 8 lines not logged; 9 logged at info; 10 hist stats touched; 11 read-back dropped; 12 refused counted; 13 nan counted; 14 price outcome; 15 breakeven as win; 16 hold in decided; 17 call roi unsigned; 18 median = mean; 19 min/max swapped; 20 outlier threshold 60; 21 outlier strict; 22 samples 4; 23 ties unsorted; 24 horizon order alpha; 25 bucket blank kept; 26 -0.0 kept; 27 exception escapes; 28 warning dropped; 29 unavailable dropped; 30 zero line dropped; 31 caveat dropped; 32 ledger not applied; 33 ledger without decide; 34 verify band ignored; 35 verify band in settled; 36 verify pp fixed 50; 37 guard ignored; 38 ca part dropped; 39 m3 ledger roi always; 40 m4 verify before ledger; 41 m5 confirmed as verify; 42 nonfinite kept; 43 rebased marker dropped; 44 caveat claims ledger when off; 45 ledger-off caveat; 46 settled line dropped; 47 outlier line dropped; 48 daily_sync mapped; 49 clock default on; 50 clock unmapped; 51 ci step removed; 52 ci base not required; 53 ci fetch dropped; 54 ci step advisory; 55 off-path debug log.
 
-**Lanes on an export of the head:** LANES_RESULT.
+**Lanes on an export of the merged head** (main `4b478e7` merged in): the lean-unit emulation reads **LEAN FAILS 0**. That covers the decision-layer suites (4,486 passed, 36 skipped), the other lean steps, and this release's own step (44 passed). The contract-lane emulation returns rc 0 (426 passed, 13 skipped, the same as main).
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
