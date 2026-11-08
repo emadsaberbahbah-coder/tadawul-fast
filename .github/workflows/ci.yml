@@ -2,8 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.64 (2026-11-08) -- CONFIRM WINDOW FIX HARNESS
+# VERSION 1.1.65 (2026-11-08) -- SEAT GUARD HARNESS
 #
+# v1.1.65: run tests/test_dt10_v1240_seat_guard.js (16_Decision_Top10.gs
+# v1.24.0: TFB_T10_HARD_EXIT_CONFIRM keeps a seat one day-key on a data-side
+# hard exit; TFB_T10_SEAT_GUARD_DAYS makes displacement take a non-qualifying
+# or unconfirmed fast-track seat before a confirmed one and never a confirmed
+# seat in its first N day-keys; both default off; the cool-down token names a
+# seated sold name once) beside the other cockpit harnesses; its golden
+# negatives rebuild the v1.23.1 file from the delivered one.
 # v1.1.64: run tests/test_dt10_v1231_confirm_window_fix.js (16_Decision_Top10.gs
 # v1.23.1: the window history carries its day-key; a disarmed render day drops
 # the stale bits and a same-day recovery after an outage pause appends today's
@@ -1233,6 +1240,7 @@ jobs:
           node tests/test_dt10_v1220_confirm_window.js
           node tests/test_dt10_v1230_reentry_cooldown.js
           node tests/test_dt10_v1231_confirm_window_fix.js
+          node tests/test_dt10_v1240_seat_guard.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
