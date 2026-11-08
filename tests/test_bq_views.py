@@ -147,15 +147,17 @@ session is a fake, no google library is imported.
       ALL row drops an engine column, when the engine rate is taken over
       every scored row instead of the cohort)
   V28 v_signal_edge_daily (v1.6.0): one row per symbol and recording day
-      from the day's first recording time; the scoring signals AS OF the
-      forecast (newest signal at or before it, at most 3 days older - never a
-      later one); per day, market group (ALL / US / Tadawul / Other markets),
+      from the day's first recording time; the scoring signals of the
+      forecast's own run (the earliest snapshot 0-60 s after it; else the
+      newest before it, at most 3 days older - never a later run); per day,
+      market group (ALL / US / Tadawul / Other markets),
       feature and horizon with >= 20 names and two distinct values: the
       Spearman IC over average ranks for ties (tie keys INT64, since BigQuery
       cannot partition by FLOAT64), the top / bottom-third excess return and
       the horizon length (simulated - fails on min ranks for uneven ties, on
-      a later same-day signal, on 19 names, on a return beyond 300 %, on a
-      window partitioned by a FLOAT64 value)
+      the previous run's signal when the forecast's own snapshot exists, on a
+      later run's signal, on 19 names, on a return beyond 300 %, on a window
+      partitioned by a FLOAT64 value)
   V29 v_signal_edge (v1.6.0): mean daily IC, the overlap-adjusted t
       (mean / sd x SQRT(days / horizon_days)), first- and second-half IC and
       the fixed verdict thin / edge / inverse / no edge / unstable, thin
@@ -248,7 +250,7 @@ INSTALLED = {
 # files: bq_views --verify after the next --write must find these exact bodies
 # in INFORMATION_SCHEMA (then they move to INSTALLED).
 PENDING = {
-    "v_signal_edge_daily": "17d8d490e8bf8d5362ca3d306880ec8216e61044eb0c6f9fcf8f100e457bba21",
+    "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
 }
 EXPECTED_ORDER = [
@@ -1579,11 +1581,16 @@ def _edge_day(xs, rs, min_n=20, average=True):
             sum(bot) / len(bot) if bot else None)
 
 
-def _as_of(signals, rec_at, days=3):
-    """The signal v_signal_edge_daily joins: the newest (recorded_at, value) at or
-    before the forecast and at most `days` older; None when there is none."""
-    ok = [s for s in signals if rec_at - days <= s[0] <= rec_at]
-    return max(ok)[1] if ok else None
+def _own_run_signal(signals, rec_at, after=60.0, days=3):
+    """The signal v_signal_edge_daily joins (times in seconds): the earliest
+    (recorded_at, value) 0-`after` s after the forecast - the snapshot its own
+    tracker run writes seconds later - else the newest one before it, at most
+    `days` older; None when there is none."""
+    own = [s for s in signals if rec_at <= s[0] <= rec_at + after]
+    if own:
+        return min(own)[1]
+    prior = [s for s in signals if rec_at - days * 86400 <= s[0] < rec_at]
+    return max(prior)[1] if prior else None
 
 
 def case_v28():
@@ -1597,10 +1604,12 @@ def case_v28():
             # the day's first recording time only: a later re-record cannot borrow the day's move
             "SELECT symbol, recorded_date, MIN(recorded_at) AS first_at",
             "ON f.symbol = e.symbol AND f.recorded_date = e.recorded_date AND f.first_at = e.recorded_at",
-            # the scoring signals AS OF the forecast - never a later one
-            "AND s.recorded_at <= r.rec_at",
+            # the scoring signals of the forecast's own run (written seconds after it), else the
+            # newest earlier one - never a later run (Codex P2 on #932)
+            "AND s.recorded_at <= TIMESTAMP_ADD(r.rec_at, INTERVAL 60 SECOND)",
             "AND s.recorded_at >= TIMESTAMP_SUB(r.rec_at, INTERVAL 3 DAY)",
-            "QUALIFY ROW_NUMBER() OVER (PARTITION BY r.symbol, r.d ORDER BY s.recorded_at DESC) = 1",
+            "ORDER BY IF(s.recorded_at >= r.rec_at, 0, 1),",
+            "IF(s.recorded_at >= r.rec_at, UNIX_MICROS(s.recorded_at), -UNIX_MICROS(s.recorded_at))) = 1",
             "IF(j.market IN ('US', 'Tadawul'), j.market, 'Other markets') AS market_group",
             "UNPIVOT (r FOR horizon IN (r_1w AS '1W', r_2w AS '2W', r_1m AS '1M', r_3m AS '3M'))",
             "WHERE ABS(r) <= 300\n",
@@ -1624,7 +1633,7 @@ def case_v28():
         "confidence", "recommendation", "investability", "stance", "overall_score", "risk_score",
         "target_upside"], feats
     # BigQuery refuses a window partitioned by a FLOAT64: no window partitions by the raw x or r
-    parts = re.findall(r"PARTITION BY ([a-z_, .]+?)(?: ORDER BY|\))", code)
+    parts = re.findall(r"PARTITION BY ([a-z_, .]+?)(?:\s+ORDER BY|\))", code)
     assert len(parts) == 8, parts                       # the as-of pick + the seven rank windows
     for part in parts:
         keys = [k.strip() for k in part.split(",")]
@@ -1649,11 +1658,18 @@ def case_v28():
     good = _edge_day(tied, ret)[1]
     assert abs(good) < 1e-12 and abs(good - _pearson(_avg_ranks(tied), _avg_ranks(ret))) < 1e-12
     assert _edge_day(tied, ret, average=False)[1] < -0.05, "min ranks must not pass for average ranks"
-    # as-of: the newest signal at or before the forecast, within 3 days; a later one never
-    sig = [(10.0, "a"), (12.5, "b"), (13.2, "later")]                       # (time in days, value)
-    assert _as_of(sig, 13.0) == "b"
-    assert _as_of(sig, 13.0) != max(sig)[1]                                  # newest-of-day would read 13.2
-    assert _as_of(sig, 16.0) == "later" and _as_of([(10.0, "a")], 13.5) is None
+    # the forecast's own run: the tracker appends the forecast, then writes that run's snapshot
+    # seconds later; the next run comes 68 s or more after (times in seconds)
+    rec = 1000.0
+    sig = [(rec - 18000, "previous run"), (rec + 2, "own run"), (rec + 3, "own run, 2nd write"),
+           (rec + 68, "next run"), (rec + 28800, "later run")]
+    assert _own_run_signal(sig, rec) == "own run"
+    strict = max(s for s in sig if s[0] <= rec)[1]                            # the 1st version's cut
+    assert strict == "previous run" != _own_run_signal(sig, rec)
+    newest_in_5min = max(s for s in sig if s[0] <= rec + 300)[1]              # a wider, newest-first window
+    assert newest_in_5min == "next run" != _own_run_signal(sig, rec)
+    assert _own_run_signal([(rec - 600, "prior"), (rec + 68, "next run")], rec) == "prior"
+    assert _own_run_signal([(rec - 4 * 86400, "too old"), (rec + 120, "next run")], rec) is None
 
 
 def _edge_verdict(days, horizon_days, mean_ic, sd_ic, m1, m2):

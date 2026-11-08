@@ -16,10 +16,17 @@
 -- move). Features: the engine's forecast ROI of each horizon (target_roi_pp
 -- of the 1W / 2W / 1M / 3M record), the entry fields (forecast reliability,
 -- data quality, confidence, recommendation, investability, stance; the
--- highest value when the horizons disagree) and, from v_signal_history AS OF
--- the recording, overall_score, risk_score and target_upside_pp: the newest
--- signal of the symbol recorded at or before the forecast and at most 3 days
--- older - never a later one, so nothing is read from after the forecast.
+-- highest value when the horizons disagree) and, from v_signal_history,
+-- overall_score, risk_score and target_upside_pp of the forecast's OWN
+-- observation: track_performance appends the forecast first and then writes
+-- that run's Signal_History snapshot from the same prefetched rows, seconds
+-- later (8 Nov: 8,230 of 8,230 symbol-days have one within 60 s, median 2 s;
+-- the next run's snapshot comes 68 s or more after the forecast). So the
+-- join takes the EARLIEST signal recorded 0-60 s after the forecast, and only
+-- when a symbol has none, the newest signal recorded before the forecast and
+-- at most 3 days older. Nothing from a later run is read (Codex P2 on #932:
+-- a strict "at or before" cut read the previous run for 5,995 symbol-days
+-- and no signal at all for 2,235).
 -- Outcomes: the realized ladder roi_1w_pp / roi_2w_pp / roi_1m_pp /
 -- roi_3m_pp (the close of the first archived bar 7 / 14 / 30 / 91 days after
 -- the recording, against the entry price; NULL until reached). A realized
@@ -80,9 +87,12 @@ sig AS (
   FROM rec AS r
   JOIN `{{DS}}.v_signal_history` AS s
     ON s.symbol = r.symbol
-   AND s.recorded_at <= r.rec_at
+   AND s.recorded_at <= TIMESTAMP_ADD(r.rec_at, INTERVAL 60 SECOND)
    AND s.recorded_at >= TIMESTAMP_SUB(r.rec_at, INTERVAL 3 DAY)
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY r.symbol, r.d ORDER BY s.recorded_at DESC) = 1
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY r.symbol, r.d
+    ORDER BY IF(s.recorded_at >= r.rec_at, 0, 1),
+      IF(s.recorded_at >= r.rec_at, UNIX_MICROS(s.recorded_at), -UNIX_MICROS(s.recorded_at))) = 1
 ),
 j AS (
   SELECT
