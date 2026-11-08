@@ -143,11 +143,16 @@ def read_tickets(values: List[List[Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in values or []:
         cells = [str(c if c is not None else "").strip() for c in row]
+        low = [c.lower() for c in cells]
         if hdr is None:
-            low = [c.lower() for c in cells]
             if "symbol" in low and "ticket sar" in low:
                 hdr = {c: i for i, c in enumerate(low)}
             continue
+        # the SELECTED table ends at its first blank row; the ALL QUALIFIED
+        # section (its own title and header) that follows is never read with
+        # the SELECTED column map (review on PR #937)
+        if not any(cells) or "symbol" in low or any(c.startswith("all qualified") for c in low):
+            break
 
         def cell(name: str) -> str:
             i = hdr.get(name)
@@ -167,7 +172,11 @@ def parse_prepost(payload: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     """From a Yahoo v8 chart (range=1d, includePrePost): the last printed
     price, which session printed it (pre / regular / post / none) and the
     previous close. A print after the regular open is a regular-session
-    print, so a check that runs late still reads the real open."""
+    print, so a check that runs late still reads the real open. Only
+    prints of the CURRENT trading period count (at or after its pre-market
+    start, or 6 h before its regular open when no pre-market period is
+    given); a chart that still holds only the prior session's bars reads
+    as no print, never as a fresh pre-market quote (review on PR #937)."""
     res: Dict[str, Any] = {"last": None, "last_ts": None, "prev_close": None,
                            "session": "none", "currency": ""}
     try:
@@ -183,11 +192,23 @@ def parse_prepost(payload: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     closes = (((r.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
     periods = meta.get("currentTradingPeriod") or {}
     reg = periods.get("regular") or {}
+    pre = periods.get("pre") or {}
     reg_start, reg_end = _num(reg.get("start")), _num(reg.get("end"))
+    if reg_start is None:
+        return res                                   # no session frame: no print is current
+    if now_ts is not None and abs(reg_start - now_ts) > 20 * 3600:
+        return res                                   # the frame is not today's session
+    lo = _num(pre.get("start"))
+    if lo is None or lo > reg_start:
+        lo = reg_start - 6 * 3600
     last_i = None
     for i in range(min(len(ts), len(closes)) - 1, -1, -1):
-        c = _num(closes[i])
-        if c is not None and c > 0 and (now_ts is None or _num(ts[i]) is None or ts[i] <= now_ts):
+        c, t = _num(closes[i]), _num(ts[i])
+        if c is None or c <= 0 or t is None:
+            continue
+        if t < lo:
+            break                                    # older than this session: stop
+        if now_ts is None or t <= now_ts:
             last_i = i
             break
     if last_i is None:

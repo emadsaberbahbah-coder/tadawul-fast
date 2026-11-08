@@ -189,9 +189,21 @@ def test_p1_symbols_numbers_and_grid():
     assert [x["executable"] for x in t] == [True, True, True, True, False, False]
     assert t[0]["price"] == 25.40 and t[0]["market"] == "US" and t[0]["ccy"] == "USD"
     assert pc.read_tickets([]) == [] and pc.read_tickets([["Symbol", "Price"]]) == []     # no Ticket SAR: no header
-    # a repeated header row and a note row inside the body are skipped
-    assert [x["symbol"] for x in pc.read_tickets(TOP10.values + [HDR, ["", "Research seats below"]])] == \
+    # a note row inside the body is skipped; the table ENDS at its first blank row
+    assert [x["symbol"] for x in pc.read_tickets(TOP10.values + [["", "Research seats below"]])] == \
         ["SNDA.US", "IBOC.US", "BRK.B.US", "2222.SR", "FRST.US", "GHOST.US"]
+    # review on #937 (P2): the ALL QUALIFIED section follows the SELECTED table on the
+    # real page (blank row, title, its own header); its rows must never be read with the
+    # SELECTED column map (DQ as Ticket SAR, Risk as Shares, Ann ROI as Price)
+    qual_hdr = ["Rank", "Symbol", "Name", "Market", "Sector", "ROI % (TP1)", "Engine ROI % (12M)", "Ann ROI %",
+                "R/R (TP2)", "Rel", "DQ", "Risk", "Score"]
+    qual_rows = [[1, "NEWCO.US", "Name", "US", "Sector", "18.0", "22.0", "19.5", "2.4", "88", "96", "Low", "81"],
+                 [2, "SNDA.US", "Name", "US", "Sector", "15.0", "20.0", "16.2", "2.1", "90", "95", "Low", "79"]]
+    grid = TOP10.values + [[""] * 13, ["ALL QUALIFIED — INVEST opportunity set (2)"] + [""] * 12, qual_hdr] + qual_rows
+    assert [x["symbol"] for x in pc.read_tickets(grid)] == ["SNDA.US", "IBOC.US", "BRK.B.US", "2222.SR", "FRST.US", "GHOST.US"]
+    # the same without the blank row: the title row and a second header row also end the table
+    assert len(pc.read_tickets(TOP10.values + [["ALL QUALIFIED — INVEST opportunity set (2)"] + [""] * 12, qual_hdr] + qual_rows)) == 6
+    assert len(pc.read_tickets(TOP10.values + [qual_hdr] + qual_rows)) == 6
 
 
 def test_p2_chart_parser():
@@ -208,6 +220,25 @@ def test_p2_chart_parser():
     q = pc.parse_prepost(chart("X", 10.0, [(PRE - 60, None), (PRE, None)]))
     assert q["last"] is None and q["session"] == "none" and q["prev_close"] == 10.0
     assert pc.parse_prepost(PAYLOADS["BRK-B"])["last"] is None
+    # review on #937 (P1): a chart that still holds only the PRIOR session's bars is no
+    # pre-market print - yesterday's close must never read as a fresh quote (and GO)
+    stale = chart("X", 10.0, [(OPEN_TS - 24 * 3600 + 3600, 10.4), (OPEN_TS - 24 * 3600 + 6 * 3600, 10.2)])
+    q = pc.parse_prepost(stale, int(NOW.timestamp()))
+    assert q["last"] is None and q["session"] == "none" and q["prev_close"] == 10.0
+    # a print inside this session's pre-market period counts; one a minute before it does not
+    pre_start = OPEN_TS - 5 * 3600 + 1800
+    assert pc.parse_prepost(chart("X", 10.0, [(pre_start, 10.1)]), int(NOW.timestamp()))["session"] == "pre"
+    assert pc.parse_prepost(chart("X", 10.0, [(pre_start - 60, 10.1)]), int(NOW.timestamp()))["last"] is None
+    # no pre-market period in the frame: 6 h before the open is the bound
+    nopre = chart("X", 10.0, [(OPEN_TS - 7 * 3600, 9.0), (OPEN_TS - 5 * 3600, 9.5)])
+    del nopre["chart"]["result"][0]["meta"]["currentTradingPeriod"]["pre"]
+    assert pc.parse_prepost(nopre, int(NOW.timestamp()))["last"] == 9.5
+    # a frame that is not today's session (the check ran on a holiday rehearsal) reads nothing
+    assert pc.parse_prepost(PAYLOADS["SNDA"], int(NOW.timestamp()) + 2 * 24 * 3600)["last"] is None
+    # no session frame at all: nothing is current
+    noframe = chart("X", 10.0, [(PRE, 9.9)])
+    del noframe["chart"]["result"][0]["meta"]["currentTradingPeriod"]
+    assert pc.parse_prepost(noframe)["last"] is None and pc.parse_prepost(noframe)["prev_close"] == 10.0
     for bad in ({}, {"chart": {"result": []}}, {"chart": {"result": [None]}}, None, "x"):
         assert pc.parse_prepost(bad)["last"] is None, bad
     assert pc.pct(97.0, 100.0) == -3.0 and pc.pct(None, 1.0) is None and pc.pct(1.0, 0.0) is None
