@@ -19,7 +19,7 @@
 | 42352240437 (7 Nov 07:40Z) | `candidates=1843 witnessed=1735 (1M:389 1W:394 2W:367 3M:585) refused=108 (hist_close_archive_not_daily:108)` | `pending-price=6492` | `matured-fresh=77` |
 | 42460376051 (8 Nov 07:49Z) | `candidates=3709 witnessed=3598 (1M:826 1W:945 2W:893 3M:934) refused=111` | `pending-price=6735` | `matured-fresh=0` |
 
-- The calibration on 8 Nov rests on 3,911 decided outcomes. Every witnessed record would mature under enforce.
+- The calibration on 8 Nov rests on 3,911 decided outcomes. Every witnessed record is a maturation candidate under enforce, less those the default-on CA-GUARD defers or expires; a re-based record still matures, on the re-based ROI.
 - How many of those would be decided calls is unknown. In today's matured cohort, 3,911 of 13,104 records were decided (9,155 HOLD, 38 breakeven). The preview is what tells the owner the real split.
 - So arming enforce could add up to 3,598 matured records in one pass, against 13,104 matured today. That would move the sample behind the published `TFB_CALIBRATION_FACTORS` and the INVESTABLE / WATCHLIST reading (R1 in the 6 Nov audit).
 
@@ -94,100 +94,82 @@
 
 ## S3 - Measured
 
-**`tests/test_hist_close_preview.py`: PASS 39/39** (script), 39 passed (pytest, tfb-venv), 39 passed (lean venv with `TFB_TEST_REQUIRE_BASE=1`).
+**`tests/test_hist_close_preview.py`: PASS 43/43** (script), 43 passed (pytest, tfb-venv), 43 passed (lean venv with `TFB_TEST_REQUIRE_BASE=1`).
 
-Without git history the result is 36 passed and 3 skipped, and with the base required those 3 fail. CI fetches the base, so they run there.
+- Without git history: 40 passed and 3 skipped; with the base required those 3 fail. CI fetches the base, so they run there.
+- Run in one pytest process with `tests/test_track_performance_v6530_archive_bar.py` and `tests/test_tracker_hist_target_close.py`, in both orders: 92 passed, 1 skipped.
 
-The harness drives the REAL audit loop: `PerformanceTrackerApp.audit_active_records`, with a fake backend transport, offline calendar sessions and a fake BigQuery session.
+The harness drives the REAL audit loop (`PerformanceTrackerApp.audit_active_records`) with a fake backend transport, offline calendar sessions and a fake BigQuery session.
 
 | Case | What it checks |
 | --- | --- |
 | G1 | unset and 15 off words (incl. `enable`, `observe`, `enforce`, `onn`) read off; 6 on spellings read on |
-| O1 | off in observe (4 spellings): no preview line, `_LAST_HIST_PREVIEW` empty, the exact HIST-CLOSE line. Observe off, enforce on/off and judge-off with the gate on all equal the untouched main copy (records, receipts, stats, `_LAST_HIST_CLOSE`, every log line and level, timings masked). Under off and enforce the gate is not even read |
-| O2 | on: records, receipts, stats and `_LAST_HIST_CLOSE` unchanged; the other log lines equal off; the preview lines are WARNING, ASCII, contiguous and right after the ARCHIVE-BAR line |
-| N1 | nine records, one refused (an hourly-rebuilt archive bar). Witnessed 8: 3 wins, 3 losses, 1 breakeven, 1 hold, win 50%. Price ROI mean +0.25, median +1.00, min -60, max +60; call ROI +0.29; 2 outliers. Exact split by horizon and by bucket, and the exact four lines |
+| O1 | observe with the gate off (4 spellings): no preview line, `_LAST_HIST_PREVIEW` empty, the exact HIST-CLOSE line. Against the untouched main copy, for each of the three sources (yfinance, bq_archive, bq_archive_then_yfinance): observe off / `off` / `enable` / `0`, enforce on and off, and the judge off with the gate on are equal on records, receipts, stats, `_LAST_HIST_CLOSE`, and every log line and level (timings masked). Under off and enforce the gate is not even read |
+| O2 | on: records, receipts, stats and `_LAST_HIST_CLOSE` unchanged; every other log line equals off; the preview lines are WARNING, ASCII, contiguous and right after the ARCHIVE-BAR line |
+| O2b | the CA-GUARD on, with the real ledger code: the gate changes nothing but the preview lines (records, stats, `_LAST_HIST_CLOSE`, `_CA_BUDGET`, every other line) |
+| N1 | nine records, one refused (an hourly-rebuilt archive bar). Witnessed 8: 3 wins, 3 losses, 1 breakeven, 1 hold, win 50%. Price ROI mean +0.25 / median +1.00 / min -60 / max +60; call ROI +0.29; 2 outliers. The exact split by horizon and by bucket and the exact lines; witnessed equals the HIST-CLOSE line's count |
 | N1b | the yfinance source previews too (9 witnessed) |
-| N2 | eight outliers: the five largest |ROI|, ties by symbol |
+| N1c | one symbol at two horizons with opposite calls is counted twice |
+| N1d | a Saturday target names its Monday session in the outlier line |
+| N2 | eight outliers: the five largest \|ROI\|, ties by symbol |
 | N3 | only a refused record: one `witnessed=0` line |
-| N4 | the pure summary: refusals and NaN ROIs skipped, HOLD neutral, REDUCE a sell, -0.004 prints +0.00, all-HOLD prints `win=n/a` and `call_roi=n/a`, the inclusive 50 pp mark |
-| R1 | a malformed triple -> `{}` and one WARNING. Junk -> one `unavailable` line. A summary failing inside the audit -> one WARNING plus one `unavailable` line, with records and the HIST-CLOSE stats unchanged |
-| W1 | the clock step maps the Variable once with default 'off' (YAML parsed); `TRACK_HIST_TARGET_CLOSE` beside it; daily_sync.yml maps none; the 1.0.14 header sits above 1.0.7; the reader falls back to "off" |
-| V1 | version floor >= 6.60.0, title, WHY order, verifier pin. ci.yml parsed: exactly one lean-unit step runs the harness (no `if`, no `continue-on-error`, `TFB_TEST_REQUIRE_BASE=1`, the base SHA fetched, the pytest line last). The tag and the 50 pp constant. The harness file itself is ASCII |
+| N4 | the pure summary, hermetic, guard on: refusals and NaN ROIs skipped, HOLD neutral, REDUCE a sell, a breakeven sell, -0.004 printing +0.00, all-HOLD printing `win=n/a` and `call_roi=n/a`, the inclusive 50 pp mark |
+| N5 | the CA-GUARD on with the REAL `_ca_ledger_factor` over a confirmed-action index. A factor agreeing within 0.5 pp flips nothing (-0.3 stays a loss). A 21:20 bonus re-bases -3 to +1.85. 2:1 re-bases -50 to 0 and -75 to -50 (outlier marked `ledger-rebased`). A small factor confirms +20. The verify band holds an adjusted series that agrees (enforce keeps +20), one that disagrees (enforce re-bases to +1) and one that is missing (enforce leaves it pending). Every settled record's ROI and outcome equal a real enforce pass; the settled tally equals enforce's matured set less the band. With the ledger off, the caveat reads `ledger off` |
+| R1 | a malformed triple -> `{}` and one WARNING. Junk -> one `unavailable` line. A summary failing inside the audit -> two WARNING lines, with records and the HIST-CLOSE stats unchanged |
+| W1 | the clock step maps the Variable once with default 'off' (YAML parsed), with `TRACK_HIST_TARGET_CLOSE` beside it; daily_sync.yml maps neither; the 1.0.14 header sits above 1.0.7; the reader falls back to "off" |
+| V1 | version floor >= 6.60.0, title, WHY order, verifier pin. ci.yml parsed: exactly one blocking lean-unit step with the base fetched and required and the pytest line last. The tag and the 50 pp constant. The harness file itself is ASCII |
 | V2 | against main `c7e666a4`: only the title, version and judge-loop lines replaced, and no main WHY line removed. Added lines ASCII, no definition removed. When this release stands alone, exactly the 3 helpers and their 3 nested functions are added; after merges, the subset form |
 | X1 | the main copy has no preview and logs none with the gate on |
 
-**Golden negative** (`TFB_TEST_PREVIEW_TARGET` = the untouched main copy): 33 failed, 6 passed. The passes are the off legs (O1 x5) and X1, which describe main itself.
+**Golden negative** (`TFB_TEST_PREVIEW_TARGET` = the untouched main copy): 37 failed, 6 passed. The passes are the off legs (O1 x5) and X1, which describe main itself.
 
-**40 / 40 mutants killed:**
-- **gate:**
-  - default on;
-  - any word on;
-  - `enable` read as on;
-  - the gate bypassed;
-  - the preview outside observe;
-  - the gate read before the mode;
-- **wiring:**
-  - verdicts not kept;
-  - lines not logged;
-  - logged at INFO;
-  - `_hist_stats` touched;
-  - the read-back dropped;
-  - an off-path DEBUG line;
-- **numbers:**
-  - refused records counted;
-  - NaN counted;
-  - price direction instead of the call's;
-  - breakeven as a win;
-  - HOLD in decided;
-  - call ROI unsigned;
-  - median = mean;
-  - min / max swapped;
-  - outlier mark moved;
-  - outlier mark strict;
-  - four samples;
-  - ties unsorted;
-  - horizons alphabetical;
-  - a blank bucket kept blank;
-  - -0.0 kept;
-- **errors:**
-  - an exception escaping;
-  - the WARNING dropped;
-  - the `unavailable` line dropped;
-  - the `witnessed=0` line dropped;
-  - the caveat dropped;
-  - the outlier line dropped;
-- **lanes:**
-  - daily_sync mapped;
-  - clock default on;
-  - clock unmapped;
-  - the CI line replaced;
-  - base not required;
-  - base fetch dropped;
-  - the step made advisory.
+**55 / 55 mutants killed** (see S5 for the list; MUTANTS_RESULT).
 
 **Other checks:**
 - compileall (main.py core routes scripts tests) clean.
-- ruff (CI rules E9,F63,F7,F82, whole tree) clean, and F401 / F841 clean on the harness.
-- Related suites, 23 files, the harness included: 625 passed, 1 skipped. They cover:
+- ruff (CI rules E9,F63,F7,F82, whole tree) clean, and F401 / F841 clean on the harness and the tracker.
+- Across the whole diff, the only non-ASCII added line is the replaced title line.
+- Related suites, 23 files including the harness, on `6ea2cc3`: 629 passed, 1 skipped. They cover:
   - outcome price evidence, hist target close, the archive-bar test, log read;
   - workflow flag mappings, verify pins, rollout flags, workflow audit and repairs;
   - tracker flags, record-only workflows, board and force coverage, canonical publications;
   - learning metrics and guards, summary integrity, calibration report, shadow calibration, activation.
-- LEAN and contract-lane emulations on an export of this head: see S5.
 
 ## S4 - Off identity
 
 - **Gate unset, `off` or any other word:**
   - `_hist_preview` is None;
   - the observe loop calls the judge exactly as before (the return value is bound to a local and not used);
-  - no preview line is logged and `_LAST_HIST_PREVIEW` is not touched;
-  - O1 compares the whole audit (records, receipts, stats, `_LAST_HIST_CLOSE`, every log line) with the untouched main copy.
-- **Judge in `off` or `enforce`:** the gate is never read (O1).
-- **Gate on, judge in observe:** only the preview lines and `_LAST_HIST_PREVIEW` are added (O2).
+  - no preview line is logged and `_LAST_HIST_PREVIEW` is not touched.
+- **Judge in `off` or `enforce`:** the gate is never read.
+- **Gate on, judge in observe:** only the preview lines and `_LAST_HIST_PREVIEW` are added, with the CA-GUARD off (O2) and on (O2b).
+- **Independent checks:** the round-2 review ran 222 configurations through the real audit loop against main: 3 sources x guard on and off x modes x 9 gate words, plus due-only, ledger off, a verify budget of 1, a 3 pp threshold and a close budget of 2. It found 0 differences outside the preview lines.
 
 ## S5 - Review and lanes
 
-(filled after the review)
+**Round 1** (four lenses: semantics, off identity and house rules, harness, workflow / CI / merge integration; each lens's findings re-checked by its own refuter). No off-identity break was found. Fixed in `6440007`:
+
+| Finding | Verdict | Fix |
+| --- | --- | --- |
+| The CA-GUARD is on by default and re-bases or re-verifies records with a confirmed ledger factor or \|ROI\| >= 15 pp, so the raw preview could differ from what enforce stores | PLAUSIBLE (major) | the ledger re-basing applied as enforce does; the verify band counted; a `settled` line |
+| The off-identity leg against main covered only the archive source | CONFIRMED | all three sources, more off words |
+| No case with one symbol at two horizons; the outlier session date never checked; N4 named a breakeven row it lacked | CONFIRMED | N1c, N1d, a breakeven row |
+| WHY wording: "every one ... would mature", "(when armed)", the yfinance budget clause, "one 'unavailable' line", "13,104 matured today" | CONFIRMED / PLAUSIBLE | reworded |
+| The workflow header said daily_sync maps none of the judge's knobs (it maps `TRACK_HIST_CLOSE_SOURCE`) | CONFIRMED (nit) | "maps neither this gate nor `TRACK_HIST_TARGET_CLOSE`" |
+| Integer CI bounds | REFUTED: the calibration's own bucket line prints `.0f` too | unchanged |
+| No direct preview-vs-enforce test | REFUTED for that fixture | added anyway as N5 |
+
+**Round 2** (a CA-fidelity lens and a fresh regression hunt, each refuted). The CA handling matches enforce's maturation step line by line, and the hunt found 0 differences over 222 configurations. Fixed in `6ea2cc3`:
+
+| Finding | Verdict | Fix |
+| --- | --- | --- |
+| N5 patched `_ca_ledger_factor`, so three wrong CA branches passed 42/42: always the ledger ROI, verify before ledger, confirmed counted as verify | CONFIRMED (minor) | N5 runs the real factor code over a real index; the three mutants are killed |
+| No gate-on identity check with the CA-GUARD on | CONFIRMED (minor) | O2b |
+| With the yfinance sources, enforce's hist time window also covers the CA-GUARD's in-loop pulls, so enforce can defer settled records | CONFIRMED (minor) | KNOWN LIMITS; the settled line no longer says "exactly" |
+| S3 of this sheet was stale | CONFIRMED (minor) | rewritten |
+| The caveat said "ledger factors applied" with the guard or the ledger off; a re-based outlier was unmarked; a non-finite re-base was kept; a missing session printed "None"; "re-bases" was listed as a deduction; S1 said every record would mature | CONFIRMED (nits) | fixed |
+
+**Lanes on an export of the head:** LANES_RESULT.
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
