@@ -230,7 +230,7 @@ for (const f of FUNCS.slice(2)) ok(block.indexOf('function ' + f + '(') > 0, 'F1
 // 2026-10-27: v1.18.0 (post-earnings tag) stacked as well; pins moved
 // 2026-11-01: v1.19.0 (qualified hold, seat live fill, owner rule) stacked as well; pins moved
 // 2026-11-02: v1.20.0 (ticket guard, KPI plan gain, venue line) stacked as well; pins moved
-ok((src.match(/var DT10_VERSION = '1\.21\.1';/) || []).length === 1 && /\* Version: 1\.21\.1 \(see DT10_VERSION;/.test(src), 'F10 version lockstep');
+ok((src.match(/var DT10_VERSION = '1\.24\.0';/) || []).length === 1 && /\* Version: 1\.24\.0 \(see DT10_VERSION;/.test(src), 'F10 version lockstep');   // 2026-11-08: v1.22.0 pin moved
 ok(src.indexOf("var fundingNote = dt10FundingApply_(body, Date.now());") > 0 && src.indexOf("cashNote + fundingNote + ' | '") > 0, 'F10 wired into the request + status line');
 console.log('F10 PASS lint + inventory');
 
