@@ -489,6 +489,11 @@ def test_n4_pure_summary():
     assert holds["call_roi_mean"] is None and holds["win_rate"] is None
     assert "win=n/a" in tp._hist_close_preview_lines(holds)[0] and "call_roi=n/a" in tp._hist_close_preview_lines(holds)[0]
     assert tp._hist_close_preview([])["witnessed"] == 0
+    # the outlier mark is inclusive: exactly 50 pp either way counts, 49.99 does not
+    edge = tp._hist_close_preview([(mk("P.US", "BUY"), {}, (_Ev(1.0), "", 50.0)),
+                                   (mk("Q.US", "SELL"), {}, (_Ev(1.0), "", -50.0)),
+                                   (mk("R.US", "BUY"), {}, (_Ev(1.0), "", 49.99))])
+    assert edge["outliers"] == 2 and [o["symbol"] for o in edge["outlier_samples"]] == ["P.US", "Q.US"]
 
 
 # ----------------------------------------------------------------- R1 -------
