@@ -5,11 +5,13 @@ name: 📈 TFB Performance Clock (record + audit + calibrate)
 # track_performance v6.60.0 [HIST-PREVIEW]: TRACK_HIST_CLOSE_PREVIEW (default
 # 'off' = v6.53.0) makes TRACK_HIST_TARGET_CLOSE=observe log what enforce
 # would publish for the records the archive witnesses: directional wins and
-# losses, the ROI spread, the split by horizon and by entry investability,
-# and the largest moves. Log lines only; no record, receipt or sheet changes.
-# The 'Run performance clock' step maps it beside the judge's other knobs;
-# daily_sync.yml maps none of them (the v6.47.0 lane rule). No cron,
-# concurrency or other step changes. ARMING (owner): set the Variable to on.
+# losses (with the CA-GUARD's confirmed ledger factors applied and its
+# 15 pp verify band counted), the ROI spread, the split by horizon and by
+# entry investability, and the largest moves. Log lines only; no record,
+# receipt or sheet changes.
+# The 'Run performance clock' step maps it beside TRACK_HIST_TARGET_CLOSE;
+# daily_sync.yml maps neither (the v6.47.0 lane rule). No cron, concurrency
+# or other step changes. ARMING (owner): set the Variable to on.
 # ROLLBACK: unset it.
 #
 # VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT

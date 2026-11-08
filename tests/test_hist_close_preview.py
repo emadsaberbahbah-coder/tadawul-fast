@@ -22,10 +22,15 @@ FAILS the base legs instead of skipping them; set in CI).
   O2  on: records, receipts, stats and every v6.53.0 log line unchanged; the
       preview lines follow the HIST-CLOSE and ARCHIVE-BAR lines
   N1  the summary of a nine-record pass (one refused): counts, ROI, call
-      ROI, by horizon, by bucket, outliers, and the exact lines
+      ROI, by horizon, by bucket, outliers, and the exact lines; the yfinance
+      source; one symbol at two horizons; a weekend target's session date
+  N5  the CA-GUARD on (its production default): a confirmed ledger factor
+      re-bases the ROI as enforce does, the verify band is counted, and the
+      'settled' tally equals what a real enforce pass matures
   N2  outlier samples: the five largest |ROI|, ties by symbol
   N3  no witnessed record: one 'witnessed=0' line
-  N4  the pure summary: refusals, NaN ROIs, HOLD, breakeven, sells, -0.00
+  N4  the pure summary: refusals, NaN ROIs, HOLD, breakeven, sells, -0.00,
+      the inclusive 50 pp mark
   R1  robustness: a raising summary (one WARNING, one 'unavailable' line),
       malformed summaries
   W1  the clock step maps the Variable once, default 'off'; daily_sync none
@@ -148,13 +153,13 @@ def calendar_fixture(name, day):
     return tuple(out)
 
 
-def record(mod, symbol, reco="BUY", inv="INVESTABLE", horizon="WEEK_1", entry=100.0):
+def record(mod, symbol, reco="BUY", inv="INVESTABLE", horizon="WEEK_1", entry=100.0, target=TARGET):
     return mod.PerformanceRecord(
         record_id="synthetic-%s-%s" % (symbol, horizon), symbol=symbol,
-        horizon=getattr(mod.HorizonType, horizon), date_recorded=TARGET - timedelta(days=7),
+        horizon=getattr(mod.HorizonType, horizon), date_recorded=target - timedelta(days=7),
         entry_price=entry, entry_recommendation=getattr(mod.RecommendationType, reco), entry_score=70,
         entry_risk_bucket="MEDIUM", entry_confidence="HIGH", origin_tab="synthetic",
-        target_price=entry * 1.1, target_roi=10, target_date=TARGET,
+        target_price=entry * 1.1, target_roi=10, target_date=target,
         status=mod.PerformanceStatus.ACTIVE, last_updated=NOW, entry_investability_status=inv)
 
 
@@ -164,15 +169,15 @@ def row(symbol, price):
             "acquisition_acquired_at": NOW.isoformat(), "acquisition_quote_asof": CLOSE.isoformat()}
 
 
-def bars(target_close, source="yahoo_chart_v8"):
+def bars(target_close, source="yahoo_chart_v8", session=SESSION):
     """Weekday daily bars 2026-09-21..2026-10-08; the target session closes at
     `target_close`, every other day at 100 + i."""
     out, day, i = [], datetime(2026, 9, 21), 0
     while day <= datetime(2026, 10, 8):
         if day.weekday() < 5:
             d = day.strftime("%Y-%m-%d")
-            out.append({"date": d, "close": target_close if d == SESSION else 100.0 + i,
-                        "source": source if d == SESSION else "yahoo_chart_v8"})
+            out.append({"date": d, "close": target_close if d == session else 100.0 + i,
+                        "source": source if d == session else "yahoo_chart_v8"})
             i += 1
         day += timedelta(days=1)
     return out
@@ -193,10 +198,18 @@ CASE = {
 
 
 def fixture(mod, case=None):
+    """case: {symbol: spec} or [(symbol, spec), ...] (one symbol may repeat at
+    other horizons; its first spec sets the quote and the archive series).
+    spec = (call, investability, horizon, entry, target close, quote, bar
+    source[, target time, target session])."""
     case = case or CASE
-    records = [record(mod, s, c[0], c[1], c[2], c[3]) for s, c in case.items()]
-    rows = [row(s, c[5]) for s, c in case.items()]
-    archive = {s: bars(c[4], c[6]) for s, c in case.items()}
+    items = list(case.items()) if isinstance(case, dict) else list(case)
+    records = [record(mod, s, c[0], c[1], c[2], c[3], *(c[7:8] or [TARGET])) for s, c in items]
+    rows, archive = [], {}
+    for s, c in items:
+        if s not in archive:
+            rows.append(row(s, c[5]))
+            archive[s] = bars(c[4], c[6], *(c[8:9] or [SESSION]))
     return records, rows, archive
 
 
@@ -245,7 +258,7 @@ class Run:
 
 
 @contextlib.contextmanager
-def harness(mod, env, archive, pull=None):
+def harness(mod, env, archive, pull=None, patches=None):
     run = Run()
     saved_env = {k: os.environ.get(k) for k in GATES}
     for k in GATES:
@@ -262,6 +275,7 @@ def harness(mod, env, archive, pull=None):
              "_archive_bar_session": lambda: FakeSession(archive),
              "_hist_close_pull": pull or (lambda symbol: (_ for _ in ()).throw(AssertionError("yfinance pull"))),
              "urlopen": lambda *a, **k: (_ for _ in ()).throw(AssertionError("live transport"))}
+    swaps.update(patches or {})
     saved = {k: getattr(mod, k) for k in swaps}
     saved_now = mod.RiyadhTime.__dict__["now"]
     handler = logging.Handler()
@@ -287,12 +301,12 @@ def harness(mod, env, archive, pull=None):
                 os.environ[k] = v
 
 
-def audit(mod, mode, preview, case=None, source="bq_archive", pull=None):
+def audit(mod, mode, preview, case=None, source="bq_archive", pull=None, patches=None):
     records, rows, archive = fixture(mod, case)
     env = {"TRACK_HIST_TARGET_CLOSE": mode, "TRACK_HIST_CLOSE_SOURCE": source, GATE: preview}
     if hasattr(mod, "_LAST_HIST_PREVIEW"):
         mod._LAST_HIST_PREVIEW.clear()
-    with harness(mod, env, archive, pull) as run:
+    with harness(mod, env, archive, pull, patches) as run:
         app = mod.PerformanceTrackerApp.__new__(mod.PerformanceTrackerApp)
         app.backend = mod.BackendClient("https://transport.invalid")
         app.backend.post_json = AsyncMock(return_value=({"rows": rows}, None, 200))
@@ -302,6 +316,17 @@ def audit(mod, mode, preview, case=None, source="bq_archive", pull=None):
         run.preview = dict(getattr(mod, "_LAST_HIST_PREVIEW", {}) or {})
         run.records = records
     return run
+
+
+def daily_pull(case=None):
+    """A yfinance pull answering the fixture's archive series as daily bars."""
+    archive = fixture(tp, case)[2]
+    daily = {s: [dict(bar, split=0.0, source="yahoo_chart_v8") for bar in v] for s, v in archive.items()}
+
+    def pull(symbol):
+        key = symbol if symbol in daily else symbol + ".US"
+        return [dict(bar) for bar in daily.get(key, [])]
+    return pull
 
 
 def state(rec):
@@ -357,13 +382,17 @@ def test_o1_off_observe_has_no_preview(word):
 
 def test_o1_off_equals_main_copy():
     b = base()
-    for mode, word in (("observe", None), ("observe", "off"), ("enforce", "on"), ("off", "on"),
-                       ("enforce", None)):
-        got, want = audit(tp, mode, word), audit(b, mode, word)
-        assert [state(r) for r in got.records] == [state(r) for r in want.records], (mode, word)
-        assert got.stats == want.stats and got.hist == want.hist, (mode, word)
-        assert norm_logs(tp, got.logs) == norm_logs(b, want.logs), (mode, word)
-        assert preview_lines(got) == [], (mode, word)
+    pairs = (("observe", None), ("observe", "off"), ("observe", "enable"), ("observe", "0"),
+             ("enforce", "on"), ("off", "on"), ("enforce", None))
+    for source in ("bq_archive", "yfinance", "bq_archive_then_yfinance"):
+        for mode, word in pairs:
+            got = audit(tp, mode, word, source=source, pull=daily_pull())
+            want = audit(b, mode, word, source=source, pull=daily_pull())
+            key = (source, mode, word)
+            assert [state(r) for r in got.records] == [state(r) for r in want.records], key
+            assert got.stats == want.stats and got.hist == want.hist, key
+            assert norm_logs(tp, got.logs) == norm_logs(b, want.logs), key
+            assert preview_lines(got) == [], key
 
 
 def test_o1_gate_not_read_outside_observe():
@@ -416,10 +445,14 @@ def test_n1_summary_and_lines():
     assert {b: (t["n"], t["decided"], t["wins"]) for b, t in pv["by_bucket"].items()} == \
            {"BLOCKED": (1, 1, 1), "INVESTABLE": (4, 3, 1), "WATCHLIST": (3, 2, 1)}
     assert list(pv["by_bucket"]) == ["BLOCKED", "INVESTABLE", "WATCHLIST"]
+    assert (pv["ca_guard"], pv["ca_ledger"], pv["ca_verify"]) == (False, 0, 0)
+    assert pv["witnessed"] == int(re.search(r"witnessed=(\d+)", [m for _l, m in run.logs
+                                  if m.startswith("[HIST-CLOSE v")][0]).group(1))
     assert preview_lines(run) == [
         "%s mode=observe witnessed=8 decided=6 wins=3 losses=3 breakeven=1 hold=1 win=50.0%% %s "
         "price_roi mean=+0.25%% median=+1.00%% min=-60.00%% max=+60.00%% call_roi=+0.29%% "
-        "outliers(|roi|>=50pp)=2 (before CA-GUARD and dedup; nothing written)" % (TAG, ci(3, 6)),
+        "outliers(|roi|>=50pp)=2 ca_guard=off (ledger factors applied; dedup is enforce's; nothing written)"
+        % (TAG, ci(3, 6)),
         "%s by horizon: 1W n=4 decided=3 win=66.7%% %s | 2W n=1 decided=1 win=0.0%% %s | "
         "1M n=2 decided=1 win=0.0%% %s | 3M n=1 decided=1 win=100.0%% %s" % (
             TAG, ci(2, 3), ci(0, 1), ci(0, 1), ci(1, 1)),
@@ -431,17 +464,31 @@ def test_n1_summary_and_lines():
 
 
 def test_n1b_yfinance_source_previews_too():
-    archive = fixture(tp)[2]
-    daily = {s: [dict(bar, split=0.0, source="yahoo_chart_v8") for bar in v] for s, v in archive.items()}
-
-    def pull(symbol):
-        key = symbol if symbol in daily else symbol + ".US"
-        return [dict(bar) for bar in daily.get(key, [])]
-    run = audit(tp, "observe", "on", source="yfinance", pull=pull)
+    run = audit(tp, "observe", "on", source="yfinance", pull=daily_pull())
     pv = run.preview
     # no archive refusal: HHH (+10, a buy) is witnessed too
     assert (pv["witnessed"], pv["wins"], pv["losses"], pv["breakeven"], pv["hold"]) == (9, 4, 3, 1, 1)
     assert len(preview_lines(run)) == 4
+
+
+def test_n1c_one_symbol_two_horizons():
+    case = [("DUP.US", ("BUY", "INVESTABLE", "WEEK_1", 100.0, 104.0, 105.0, "yahoo_chart_v8")),
+            ("DUP.US", ("SELL", "WATCHLIST", "MONTH_1", 100.0, 104.0, 105.0, "yahoo_chart_v8"))]
+    run = audit(tp, "observe", "on", case)
+    pv = run.preview
+    assert (pv["witnessed"], pv["decided"], pv["wins"], pv["losses"]) == (2, 2, 1, 1)
+    assert {h: (t["n"], t["decided"], t["wins"]) for h, t in pv["by_horizon"].items()} == \
+           {"1W": (1, 1, 1), "1M": (1, 1, 0)}
+    assert any("witnessed=2 (1M:1 1W:1)" in m for _l, m in run.logs if m.startswith("[HIST-CLOSE v"))
+
+
+def test_n1d_weekend_target_names_its_session():
+    sat = datetime(2026, 10, 3, 20, tzinfo=UTC)          # Saturday; the session is Mon 5 Oct
+    case = {"WKD.US": ("BUY", "INVESTABLE", "WEEK_1", 10.0, 16.0, 16.5, "yahoo_chart_v8", sat, "2026-10-05")}
+    run = audit(tp, "observe", "on", case)
+    assert run.preview["outlier_samples"][0]["session"] == "2026-10-05"
+    assert preview_lines(run)[-1] == ("%s outliers: WKD.US 1W +60.00%% (entry 10.0000 -> close 16.0000, "
+                                      "2026-10-05)" % TAG)
 
 
 # ----------------------------------------------------------------- N2 -------
@@ -472,19 +519,29 @@ class _Ev:
 
 
 def test_n4_pure_summary():
+    # the CA-GUARD on (its default) with no ledger entry; hermetic: no sheet read
+    with harness(tp, {}, {}, patches={"_ca_guard_enabled": lambda: True,
+                                      "_ca_ledger_factor": lambda *a, **k: None}):
+        _n4_body()
+
+
+def _n4_body():
     mk = lambda sym, reco, inv="WATCHLIST": record(tp, sym, reco, inv)   # noqa: E731
     judged = [(mk("A.US", "BUY"), {"target_session": SESSION}, (_Ev(1.0), "", 1.0)),
               (mk("B.US", "SELL"), {"target_session": SESSION}, (None, "hist_close_bar_missing", float("nan"))),
               (mk("C.US", "HOLD"), {"target_session": SESSION}, (_Ev(1.0), "", float("nan"))),
               (mk("D.US", "HOLD"), {}, (_Ev(1.0), "", -0.004)),
-              (mk("E.US", "REDUCE", ""), {"target_session": SESSION}, (_Ev(1.0), "", -2.0))]
+              (mk("E.US", "REDUCE", ""), {"target_session": SESSION}, (_Ev(1.0), "", -2.0)),
+              (mk("F.US", "SELL"), {"target_session": SESSION}, (_Ev(1.0), "", 0.0))]
     pv = tp._hist_close_preview(judged)
-    assert (pv["witnessed"], pv["wins"], pv["losses"], pv["hold"], pv["decided"]) == (3, 2, 0, 1, 2)
+    assert (pv["witnessed"], pv["wins"], pv["losses"], pv["hold"], pv["decided"], pv["breakeven"]) == \
+           (4, 2, 0, 1, 2, 1)
     assert pv["price_roi_min"] == -2.0 and str(pv["price_roi_median"]) == "0.0"   # -0.004 rounds to +0.00
-    assert pv["call_roi_mean"] == 1.5 and pv["outliers"] == 0 and pv["outlier_samples"] == []
+    assert pv["call_roi_mean"] == 1.0 and pv["outliers"] == 0 and pv["outlier_samples"] == []
     assert set(pv["by_bucket"]) == {"UNSPECIFIED", "WATCHLIST"}
     lines = tp._hist_close_preview_lines(pv)
-    assert len(lines) == 3 and "median=+0.00%" in lines[0]
+    assert len(lines) == 4 and "median=+0.00%" in lines[0]
+    assert " ca_guard=on ledger=0 verify(|roi|>=15pp)=0 " in lines[0] and " settled " in lines[1]
     holds = tp._hist_close_preview([(mk("H.US", "HOLD"), {}, (_Ev(1.0), "", 3.0))])
     assert holds["call_roi_mean"] is None and holds["win_rate"] is None
     assert "win=n/a" in tp._hist_close_preview_lines(holds)[0] and "call_roi=n/a" in tp._hist_close_preview_lines(holds)[0]
@@ -494,6 +551,44 @@ def test_n4_pure_summary():
                                    (mk("Q.US", "SELL"), {}, (_Ev(1.0), "", -50.0)),
                                    (mk("R.US", "BUY"), {}, (_Ev(1.0), "", 49.99))])
     assert edge["outliers"] == 2 and [o["symbol"] for o in edge["outlier_samples"]] == ["P.US", "Q.US"]
+
+
+
+# ----------------------------------------------------------------- N5 -------
+def _ca_patches(mod):
+    """The CA-GUARD on (production default), a confirmed 21:20 bonus on
+    BBB.US between entry and the target session, and no adjusted history
+    (no network): the verify band cannot be resolved this pass."""
+    def ledger(symbol, entry_date, target_session=None):
+        if target_session is None:            # the judge's post-target check
+            return None
+        return 1.05 if mod._safe_str(symbol).upper() == "BBB.US" else None
+    return {"_ca_guard_enabled": lambda: True, "_ca_ledger_factor": ledger,
+            "_ca_adjusted_roi": lambda *a, **k: None}
+
+
+def test_n5_ca_guard_on_matches_enforce():
+    run = audit(tp, "observe", "on", patches=_ca_patches(tp))
+    pv = run.preview
+    assert (pv["ca_guard"], pv["ca_ledger"], pv["ca_verify"], pv["ca_verify_pp"]) == (True, 1, 2, 15.0)
+    bbb = ((1 - 0.03) * 1.05 - 1) * 100.0                     # print -3% re-based by the bonus
+    assert pv["price_roi_mean"] == round((4 + bbb - 5 + 4 + 2 + 60 + 0 - 60) / 8, 2)
+    assert (pv["wins"], pv["losses"], pv["breakeven"], pv["hold"]) == (4, 2, 1, 1)   # BBB a win now
+    # a real enforce pass on the same fixture, same CA patches
+    enf = audit(tp, "enforce", None, patches=_ca_patches(tp))
+    matured = [r for r in enf.records if r.status == tp.PerformanceStatus.MATURED]
+    assert sorted(r.symbol for r in matured) == ["AAA.US", "BBB.US", "CCC.US", "DDD.US", "EEE.US", "GGG.US"]
+    assert [r.realized_roi for r in matured if r.symbol == "BBB.US"] == [bbb]
+    outcomes = [tp._record_outcome(r) for r in matured]
+    st = pv["settled"]
+    assert (st["n"], st["wins"], st["losses"], st["breakeven"], st["hold"]) == (
+        len(matured), outcomes.count("WIN"), outcomes.count("LOSS"), outcomes.count("BREAKEVEN"),
+        outcomes.count(None))
+    lines = preview_lines(run)
+    assert " ca_guard=on ledger=1 verify(|roi|>=15pp)=2 " in lines[0]
+    assert lines[1] == ("%s settled (the verify band left out: what enforce matures as shown): all n=6 "
+                        "decided=4 win=75.0%% %s wins=3 losses=1 breakeven=1 hold=1" % (TAG, ci(3, 4)))
+    assert len(lines) == 5
 
 
 # ----------------------------------------------------------------- R1 -------
