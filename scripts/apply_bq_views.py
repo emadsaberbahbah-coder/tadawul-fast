@@ -2,8 +2,27 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.5.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.6.0 (program register C8, Phase 2)
 ================================================================================
+v1.6.0 (8 Nov 2026, the signal edge). WHY (owner, 8 Nov 2026: "make full
+review for the Project and need to improve the outcome and analysis"): the
+October review and the 8 Nov archive study (8,230 symbol-days, 28 Jun - 8
+Nov) found that the engine's ROI forecast does not rank the next weeks
+(its top fifth trails the middle), that forecast reliability and confidence
+carry no edge, and that overall_score is the one signal with a stable
+positive rank correlation with the next week (US names). Those were one-off
+queries; owner rules, the ranking challenger and the fundable-currency choice
+need the same test kept current. New: v_signal_edge_daily (per signal day,
+market group ALL / US / Tadawul / Other markets, feature and horizon: the
+Spearman rank IC between each live signal - engine ROI forecasts 1W / 2W / 1M
+/ 3M, reliability, data quality, confidence, recommendation, investability,
+stance, overall / risk score, target upside - and the realized 1W / 2W / 1M /
+3M return, from the day's first recording time and with the scoring signals
+taken AS OF the forecast, plus the top / bottom-third excess return) and
+v_signal_edge (days, mean IC, the overlap-adjusted t, first- and second-half
+IC, share of positive days and a fixed verdict: thin / edge / inverse / no
+edge / unstable). Research views: the live system never reads BigQuery; no
+decision, gate, count or broker action depends on them.
 v1.5.0 (2 Nov 2026, the learning loop from the archive). WHY (owner, 2 Nov
 2026: "learning is slow ... improve today, results tomorrow"; "layers for
 recommendations so the system still issues them when one is available"):
@@ -125,7 +144,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
