@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
+#
+# v1.1.70: run tests/test_pre_open_check.py (scripts/pre_open_check.py
+# v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
+# and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
+# the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
+#
 # VERSION 1.1.69 (2026-11-08) -- RISK-BUDGET SIZING SUITE
 #
 # v1.1.69: run tests/test_ob_risk_sizing.py (opportunity_builder v1.29.0:
@@ -1186,7 +1193,8 @@ jobs:
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
             tests/test_ob_conviction_sizing.py \
-            tests/test_ob_risk_sizing.py $EXTRA
+            tests/test_ob_risk_sizing.py \
+            tests/test_pre_open_check.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions

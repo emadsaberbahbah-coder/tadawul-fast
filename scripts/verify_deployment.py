@@ -349,6 +349,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete
     # read - a failed issuer or an unreadable page - preserves the register).
     ("run_corporate_events", "1.0.1", "corporate events tab"),
+    # 2026-11-08 (new script, pinned on arrival): the Pre_Open_Check tab ~30
+    # min before the US open (ES=F + pre-market gap verdicts per ticket).
+    ("pre_open_check", "1.0.0", "pre-open check tab"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
