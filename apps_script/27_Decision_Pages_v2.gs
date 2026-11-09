@@ -1,7 +1,20 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.35 (2026-11-08)
+ * Version: 1.2.36 (2026-11-09)
+ *   1.2.36: THE EVIDENCE TILE SHOWS WHAT THE RULE CHANGE DID (owner, Mon 9 Nov 2026 11:44 Riyadh: 'MODEL EVIDENCE 48.70%
+ *           INVESTABLE hit rate, matured records - still our system is less than 49% I need to improve it between 60% -55%
+ *           at least'). The tile pools every matured Performance_Log WIN / LOSS record since June, so the engine rule that
+ *           answers it (data_engine_v2 5.160.0 [EVIDENCE-COHORT]: overall score floor 70, and a Tadawul name whose
+ *           forecast confidence is 0.75 or more is no longer INVESTABLE - 58.8% on the same matured records, 48.7% today)
+ *           cannot move that figure for months. Script Property DP2_EVIDENCE_SINCE (default OFF = the 1.2.35 pages byte for
+ *           byte) = 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (Riyadh time, compared with each record's 'Date Recorded (Riyadh)';
+ *           anything else reads off): Top_10_Investments_v2's Model evidence tile adds ' . since <when>: <rate> (n <records>)'
+ *           - or ' . since <when>: none matured yet' - for the INVESTABLE records made at or after that time, and the
+ *           MODEL EVIDENCE chart adds the bar 'INVESTABLE since <when> (n N)' under the INVESTABLE bar once one of them has
+ *           matured. The all-time figure and every other bar are unchanged. dp2SelfTest adds one line while the gate is on.
+ *           Read once per execution; a property fault reads off. No gate, ticket, sizing, alert, order or broker call
+ *           changes. Rollback: delete the property, or Project History -> 1.2.35.
  *   1.2.35: ONE STOP RULE FOR EVERY NEW TICKET (owner decision B6, Sun 8 Nov 2026): a replay of 269 Top-10 entries
  *           (2 Sep - 4 Nov, tfb_archive.v_board_episodes + symbol_bars_daily) put the 2xATR fixed stop at mean -0.60%,
  *           median -1.65%, 42% stopped and 10.4% stopped within 3 sessions (3 of the 6 November entries); -8% hard +
@@ -380,7 +393,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.35';   // lockstep with the header
+var DP2_VERSION = '1.2.36';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1397,6 +1410,51 @@ function dp2ReadGmInvestability_() {
   for (var r = 0; r < col.length; r++) { var v = dp2Str_(col[r][0]).trim().toUpperCase(); if (!v) continue; out.total++; out.counts[v] = (out.counts[v] || 0) + 1; }
   return out;
 }
+/* v1.2.36 [EVIDENCE-SINCE]: Script Property DP2_EVIDENCE_SINCE = 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (Riyadh; default OFF =
+ * the 1.2.35 pages), read once per execution. The INVESTABLE hit rate of the matured records made at or after that time
+ * (Performance_Log 'Date Recorded (Riyadh)') is shown beside the all-time figure; see dp2ReadHitRates_. */
+var DP2_EVIDENCE_SINCE_PROP = 'DP2_EVIDENCE_SINCE';
+var DP2_ES_READ_ = false, DP2_ES_ = null;
+/* PURE: null (off) | { label: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM', key: 'YYYY-MM-DD HH:MM:SS' } */
+function dp2EvidenceSinceParse_(raw) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?$/.exec(dp2Str_(raw).trim());
+  if (!m) return null;
+  var y = +m[1], mo = +m[2], d = +m[3], t = new Date(Date.UTC(y, mo - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d) return null;
+  if (m[4] !== undefined && (+m[4] > 23 || +m[5] > 59)) return null;
+  var day = m[1] + '-' + m[2] + '-' + m[3];
+  return m[4] === undefined ? { label: day, key: day + ' 00:00:00' } : { label: day + ' ' + m[4] + ':' + m[5], key: day + ' ' + m[4] + ':' + m[5] + ':00' };
+}
+function dp2EvidenceSince_() {
+  if (!DP2_ES_READ_) { DP2_ES_ = dp2EvidenceSinceParse_(dp2Prop_(DP2_EVIDENCE_SINCE_PROP)); DP2_ES_READ_ = true; }
+  return DP2_ES_;
+}
+/* A 'Date Recorded (Riyadh)' cell -> 'YYYY-MM-DD HH:MM:SS' ('' when it holds no date); a date-typed cell is formatted
+ * in Riyadh time (DP2.TZ), a text cell is read as written. */
+function dp2RecordedKey_(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, DP2.TZ, 'yyyy-MM-dd HH:mm:ss');
+  var m = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(dp2Str_(v).trim());
+  if (!m) return '';
+  return m[1] + ' ' + (m[2] === undefined ? '00:00:00' : m[2] + ':' + m[3] + ':' + (m[4] === undefined ? '00' : m[4]));
+}
+/* PURE: '' (off) | ' . since <when>: <rate> (n <records>)' | ' . since <when>: none matured yet' |
+ * ' . since <when>: n/a (no Date Recorded column)' */
+function dp2EvidenceSinceTxt_(s) {
+  if (!s) return '';
+  var head = ' \u00b7 since ' + s.label + ': ';
+  if (!s.col) return head + 'n/a (no Date Recorded column)';
+  return s.n ? head + dp2PctPlain_(s.wins / s.n * 100, 1) + ' (n ' + dp2Fmt_(s.n) + ')' : head + 'none matured yet';
+}
+/* The dp2SelfTest core: the parser, the record key and the tile text. */
+function dp2EvidenceSinceCoreOk_() {
+  try {
+    var a = dp2EvidenceSinceParse_('2026-11-09 13:05'), b = dp2EvidenceSinceParse_('2026-11-10');
+    var okP = !!a && a.key === '2026-11-09 13:05:00' && !!b && b.key === '2026-11-10 00:00:00' && dp2EvidenceSinceParse_('2026-02-30') === null && dp2EvidenceSinceParse_('on') === null;
+    var okK = dp2RecordedKey_('2026-11-09 13:04:59') < a.key && dp2RecordedKey_('2026-11-09 13:05:00') >= a.key && dp2RecordedKey_('n/a') === '';
+    var okT = dp2EvidenceSinceTxt_({ label: 'x', col: true, wins: 3, n: 5 }) === ' \u00b7 since x: 60.0% (n 5)' && dp2EvidenceSinceTxt_({ label: 'x', col: true, wins: 0, n: 0 }) === ' \u00b7 since x: none matured yet' && dp2EvidenceSinceTxt_(null) === '';
+    return okP && okK && okT;
+  } catch (e) { return false; }
+}
 function dp2ReadHitRates_() {
   var sh = dp2Sheet_(DP2.SRC_PERF, false);
   var out = { ok: false, labels: [] };
@@ -1407,6 +1465,7 @@ function dp2ReadHitRates_() {
   var h = dp2HeaderMap_(vals[hr]);
   var cStatus = h['Status'], cOut = h['Outcome'], cInv = h['Entry Investability'], cReco = h['Entry Recommendation'], cHor = h['Horizon'];
   var agg = { 'INVESTABLE': [0, 0], 'WATCHLIST': [0, 0], 'ACCUMULATE / 1M': [0, 0], 'ALL': [0, 0] };
+  var es = dp2EvidenceSince_(), cRec = es ? (h['Date Recorded (Riyadh)'] !== undefined ? h['Date Recorded (Riyadh)'] : h['Date Recorded']) : undefined, esW = 0, esN = 0;   // v1.2.36
   for (var r = hr + 1; r < vals.length; r++) {
     if (dp2Str_(vals[r][cStatus]).toLowerCase() !== 'matured') continue;
     var o = dp2Str_(vals[r][cOut]).toUpperCase();
@@ -1415,11 +1474,13 @@ function dp2ReadHitRates_() {
     agg['ALL'][0] += win; agg['ALL'][1]++;
     var inv = dp2Str_(vals[r][cInv]).toUpperCase();
     if (agg[inv]) { agg[inv][0] += win; agg[inv][1]++; }
+    if (es && inv === 'INVESTABLE' && cRec !== undefined && dp2RecordedKey_(vals[r][cRec]) >= es.key) { esW += win; esN++; }   // v1.2.36
     if (/ACCUMULATE/.test(dp2Str_(vals[r][cReco]).toUpperCase()) && dp2Str_(vals[r][cHor]) === '1M') { agg['ACCUMULATE / 1M'][0] += win; agg['ACCUMULATE / 1M'][1]++; }
   }
   out.ok = true;
   var order = ['INVESTABLE', 'WATCHLIST', 'ACCUMULATE / 1M', 'ALL'];
   for (var i = 0; i < order.length; i++) { var a = agg[order[i]]; out.labels.push({ label: order[i], wins: a[0], n: a[1], rate: a[1] ? a[0] / a[1] : null }); }
+  if (es) out.since = { label: es.label, key: es.key, col: cRec !== undefined, wins: esW, n: esN, rate: esN ? esW / esN : null };   // v1.2.36
   return out;
 }
 function dp2ReadS1_() {
@@ -3647,7 +3708,7 @@ function buildTop10V2() {
     { label: 'Executable', value: dp2Fmt_(executable), sub: 'of ' + seats.length + ' · ' + (t.output || ''), color: executable > 0 ? DP2C.green : DP2C.red },
     { label: 'Entered cash', value: dp2Fmt_(cashSar) + ' SAR', sub: cashSource + ' · deployable after the engine\'s reserve ' + dp2Fmt_(alloc ? alloc.deployable : deploy) + (alloc && alloc.reserve ? ' (' + (alloc.floorSar > 0 ? 'reserve ' + dp2Fmt_(alloc.floorSar) : 'no reserve') + ')' : '') },
     { label: executable > 0 ? 'Allocated (research)' : 'Sizing preview only', value: alloc ? dp2Fmt_(alloc.allocated) + ' SAR' : 'n/a', sub: alloc ? ((executable > 0 ? '' : 'preview only - nothing executable today - ') + 'of deployable ' + dp2Fmt_(alloc.deployable) + ' - ' + alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length + ' of ' + alloc.plans.length + ' plans ' + (executable > 0 ? 'funded' : 'sized') + ' - cap ' + dp2Fmt_(alloc.cap) + '/seat') : 'allocation unavailable', color: alloc && alloc.allocated > 0 && executable > 0 ? DP2C.green : DP2C.grey },
-    { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records', color: DP2C.amber }
+    { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records' + dp2EvidenceSinceTxt_(hit.since), color: DP2C.amber }
   ];
   // v1.2.31: the Held seats tile splits the seats by their Stability (active / fast-track / grace-held); an engine board's allocation tile is the
   // engine's, grey and prefixed with the feed state once the release is no longer live (expired, superseded or withdrawn)
@@ -3873,6 +3934,7 @@ function buildTop10V2() {
   for (i = 0; i < 9; i++) dp2Range_(sh, row + i, 1, 16).setBackground(DP2C.surface);
   var hRows = [];
   for (i = 0; i < hit.labels.length; i++) if (hit.labels[i].rate !== null) hRows.push([hit.labels[i].label + ' (n ' + dp2Fmt_(hit.labels[i].n) + ')', hit.labels[i].rate, 0.5]);
+  if (hit.since && hit.since.n > 0) { var esAt = 0; for (var ej = 0; ej < hRows.length; ej++) if (/^INVESTABLE \(/.test(hRows[ej][0])) esAt = ej + 1; hRows.splice(esAt, 0, ['INVESTABLE since ' + hit.since.label + ' (n ' + dp2Fmt_(hit.since.n) + ')', hit.since.rate, 0.5]); }   // v1.2.36
   if (hRows.length) {
     var rngH = dp2ChartData_('HitRate', ['Label', 'Hit rate', 'Coin flip'], hRows, '0%');
     dp2Chart_(sh, 'BAR', rngH, chartRow, 1, { width: 680, height: 185, colors: [DP2C.blue, '#c3c2b7'], title: 'Hit rate by engine label - 50% is a coin flip', titleTextStyle: { color: DP2C.ink, fontSize: 11, bold: true }, series: { 0: { dataLabel: 'value' } }, legend: { position: 'top', textStyle: { color: DP2C.ink2, fontSize: 9 } }, hAxis: { format: '0%', minValue: 0, maxValue: 1, gridlines: { color: '#e1e0d9' }, textStyle: { color: DP2C.muted, fontSize: 9 } }, vAxis: { textStyle: { color: DP2C.ink2, fontSize: 9 } }, chartArea: { left: 170, top: 28, width: '68%', height: '66%' }, bar: { groupWidth: '60%' } });
@@ -3959,6 +4021,7 @@ function dp2SelfTest() {
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
   if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
+  if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var probe = null;
   var probeSym = 'SPY';
