@@ -126,6 +126,9 @@ ENV names are derived statically from each entry's expression and the functions 
 | `tuple_noise_release` | `TFB_TUPLE_NOISE_RELEASE` | '' | 'off' | not recorded |
 | `settle_unresolved` | `TFB_SETTLE_UNRESOLVED` | '' | 'off' | not recorded |
 | `price_precision` | `TFB_PRICE_PRECISION` | '' | 'off' | not recorded |
+| `evidence_gate` | `TFB_EVIDENCE_GATE` | '' | 'off' | not recorded |
+| `evidence_cohorts` | `TFB_EVIDENCE_DEMOTE_COHORTS` | None | - | not recorded |
+| `conservative_floor` | `TFB_CONSERVATIVE_GATE_SCORE_FLOOR`, `TFB_MARKET_REGIME`, `TFB_REGIME_BEAR_SCORE_DELTA`, `TFB_REGIME_BULL_SCORE_DELTA` | TFB_CONSERVATIVE_GATE_SCORE_FLOOR=68.0; TFB_MARKET_REGIME='neutral'; TFB_REGIME_BEAR_SCORE_DELTA=4.0; TFB_REGIME_BULL_SCORE_DELTA=0.0 | 68.0 | not recorded |
 
 #### Cross-key rules behind `env_combo`
 

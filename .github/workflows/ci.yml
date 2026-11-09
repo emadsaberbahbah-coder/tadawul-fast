@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.72 (2026-11-09) -- EVIDENCE-COHORT SUITE
+#
+# v1.1.72: run tests/test_de_evidence_cohort.py (data_engine_v2 v5.160.0:
+# TFB_EVIDENCE_GATE off|observe|enforce demotes an INVESTABLE row whose
+# MARKET:CONFIDENCE cohort loses on matured Performance_Log records,
+# default SR:HIGH; off = byte-identical) next to the Fix P strict-gate
+# suite in the blocking data engine job.
+#
 # VERSION 1.1.71 (2026-11-09) -- RENDER-TIMING + CLEAR-LATE HARNESS
 #
 # v1.1.71: run tests/test_dt10_v1280_render_timing.js (16_Decision_Top10.gs
@@ -1470,6 +1478,7 @@ jobs:
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
+            tests/test_de_evidence_cohort.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \
