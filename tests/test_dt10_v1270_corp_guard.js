@@ -32,7 +32,9 @@ var history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js')
 var EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1270.json'));
 var GUARD = 'DT10_TICKET_GUARD', KNOB = 'DT10_GUARD_CORP_DAYS';
 
-var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-09: the delivered file is v1.28.0 [RENDER-TIMING]; this harness proves the v1.27.0 diff, so it reads
+// the v1.27.0 file rebuilt from the delivered one (tests/js/dt10_edits_v1280.json reversed, SHA-256 pinned).
+var newSource = history.v1270Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 var baseSource;
 try {
