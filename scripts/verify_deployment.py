@@ -247,7 +247,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
     # attribute does not exist in that module (only __version__), so the read
     # was surviving purely on the alternate-attribute fallback.
-    ("core.data_engine_v2", "__version__", "5.159.2", "data engine"),
+    # 2026-11-09 (manifest pin only): 5.159.2 -> 5.160.0 ([EVIDENCE-COHORT]:
+    # TFB_EVIDENCE_GATE off|observe|enforce + TFB_EVIDENCE_DEMOTE_COHORTS,
+    # default off = byte-identical; owner hit-rate review of 9 Nov).
+    ("core.data_engine_v2", "__version__", "5.160.0", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import

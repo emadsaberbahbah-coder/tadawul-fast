@@ -1,0 +1,110 @@
+[
+ [
+  " * Version: 1.2.35 (2026-11-08)\n *   1.2.35: ONE STOP RULE FOR EVERY NEW TICKET (owner decision B6, Sun 8 Nov 2026): a replay of 269 Top-10 entries\n *           (2 Sep - 4 Nov, tfb_archive.v_board_episodes + symbol_bars_daily) put the 2xATR fixed stop at mean -0.60%,\n *           median -1.65%, 42% stopped and 10.4% stopped within 3 sessions (3 of the 6 November entries); -8% hard +\n *           a 45-session time stop had the same mean, the best median (+0.06%) and win rate (50.6%) and 23% stopped.\n *           The owner chose it as the one rule; the cockpit's tickets already carry it (Render TFB_OPP_STOP_VOL_MULT=0,\n *           every stop 8% under the price). This page's exit engine still trailed 2xATR under the highest close and\n *           would have advised 'RAISE STOP' over the -8% stop on the first new lot. Script Property DP2_STOP_RULE\n *           (default OFF = the 1.2.34 engine byte for byte): 'fixed' (or 'fixed:YYYY-MM-DD'; default start 2026-11-08)\n *           -> a lot entered on/after the start date replays a FIXED stop DP2X.FIXED_STOP_PCT (8) % under its entry\n *           (no trailing, no breakeven lock, no profit-protection exit) plus a time stop DP2X.TIME_STOP_SESSIONS (45)\n *           sessions after the entry bar, an exit episode that latches like a stop touch ('SELL - rule exit ... (time\n *           stop, 45 sessions held ...)'); older lots keep the trailing rule; Top_10_Investments_v2 seats show the\n *           initial stop 8% under the price. The texts name the fixed rule. dp2SelfTest adds one line while the gate is\n *           on. Rollback: delete the property.\n",
+  " * Version: 1.2.34 (2026-11-05)\n"
+ ],
+ [
+  "var DP2_VERSION = '1.2.35';   // lockstep with the header",
+  "var DP2_VERSION = '1.2.34';   // lockstep with the header"
+ ],
+ [
+  "  FIXED_STOP_PCT: 8,         // v1.2.35 [STOP-RULE]: the fixed stop under the entry (DP2_STOP_RULE on)\n  TIME_STOP_SESSIONS: 45,    // v1.2.35 [STOP-RULE]: sessions after the entry bar\n  PROP_ALERTS: 'DP2_EXIT_ALERTS',",
+  "  PROP_ALERTS: 'DP2_EXIT_ALERTS',"
+ ],
+ [
+  "function dp2ExitCompute_(bars, entry, entryDate, lastOverride, rule) {\n",
+  "function dp2ExitCompute_(bars, entry, entryDate, lastOverride) {\n"
+ ],
+ [
+  "  if (rule === 'fixed') return dp2ExitFixed_(bars, entry, e, a0, atr, atrApprox, lastOverride);   // v1.2.35 [STOP-RULE]\n  var s0 = entry - DP2X.ATR_MULT_STOP * a0, R = entry - s0;\n",
+  "  var s0 = entry - DP2X.ATR_MULT_STOP * a0, R = entry - s0;\n"
+ ],
+ [
+  "  if (!x) { out.code = 'ENGINE_NA'; out.kind = 'grey'; out.text = 'HOLD \u2014 exit engine n/a'; return out; }\n  if (x.rule === 'fixed') out.text = 'HOLD - fixed stop ' + dp2Fmt_(x.stop, 2) + ', ' + dp2StopTimeTxt_(x);   // v1.2.35\n",
+  "  if (!x) { out.code = 'ENGINE_NA'; out.kind = 'grey'; out.text = 'HOLD \u2014 exit engine n/a'; return out; }\n"
+ ],
+ [
+  "  for (ei = 0; ei < momsArr.length; ei++) episodes.push({ date: momsArr[ei].date, kind: 'momentum', price: momsArr[ei].price });\n  var timesArr = x.times || [];   // v1.2.35 [STOP-RULE]: the time stop is an exit episode\n  for (ei = 0; ei < timesArr.length; ei++) episodes.push({ date: timesArr[ei].date, kind: 'time', price: timesArr[ei].price });\n",
+  "  for (ei = 0; ei < momsArr.length; ei++) episodes.push({ date: momsArr[ei].date, kind: 'momentum', price: momsArr[ei].price });\n"
+ ],
+ [
+  "var fmtEp = function (ep) { return ep.date + ' (' + (ep.kind === 'time' ? 'time stop, ' + DP2X.TIME_STOP_SESSIONS + ' sessions held, close ' + dp2Fmt_(ep.price, 2) : ep.kind === 'momentum' ? ",
+  "var fmtEp = function (ep) { return ep.date + ' (' + (ep.kind === 'momentum' ? "
+ ],
+ [
+  "  if (s.code === 'STOP_HIT' && x.rule === 'fixed') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the fixed stop ' + dp2Fmt_(x.stop, 2) + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry ' + dp2Fmt_(x.entry, 2) + ').';   // v1.2.35\n  else if (s.code === 'STOP_HIT') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the dynamic stop '",
+  "  if (s.code === 'STOP_HIT') why = 'last ' + dp2Fmt_(x.last, 2) + ' is at or below the dynamic stop '"
+ ],
+ [
+  "else if (s.code === 'RAISE_STOP') why = 'the ' + (x.rule === 'fixed' ? 'fixed ' + DP2X.FIXED_STOP_PCT + '% rule' : 'trailing rule') + ' puts the stop at '",
+  "else if (s.code === 'RAISE_STOP') why = 'the trailing rule puts the stop at '"
+ ],
+ [
+  "', ' + (x.rule === 'fixed' ? 'fixed' : 'trailing') + ' stop ' + dp2Fmt_(x.stop, 2) + '.';",
+  "', trailing stop ' + dp2Fmt_(x.stop, 2) + '.';"
+ ],
+ [
+  "the ' + (x.rule === 'fixed' ? 'fixed' : 'trailing') + ' stop ' + dp2Fmt_(x.stop, 2) + ' then governs",
+  "the trailing stop ' + dp2Fmt_(x.stop, 2) + ' then governs"
+ ],
+ [
+  "  var trailTxt = (x && x.rule === 'fixed') ? ' (a fixed stop: no trailing order).' : ' ",
+  "  var trailTxt = ' "
+ ],
+ [
+  "stop0: dp2StopRule_() ? (price !== null ? price * (1 - DP2X.FIXED_STOP_PCT / 100) : null) : ((price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null),",
+  "stop0: (price !== null && atr !== null) ? price - DP2X.ATR_MULT_STOP * atr : null,"
+ ],
+ [
+  "    var stop0 = dp2StopRule_() ? (entry !== null ? entry * (1 - DP2X.FIXED_STOP_PCT / 100) : null) : ((entry !== null && xatr !== null) ? entry - DP2X.ATR_MULT_STOP * xatr : null);   // v1.2.35\n",
+  "    var stop0 = (entry !== null && xatr !== null) ? entry - DP2X.ATR_MULT_STOP * xatr : null;\n"
+ ],
+ [
+  "dp2ExitCompute_(xb.bars, cost, entryDate, lastOv, dp2StopRuleFor_(entryDate)) : null;",
+  "dp2ExitCompute_(xb.bars, cost, entryDate, lastOv) : null;"
+ ],
+ [
+  "x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv, dp2StopRuleFor_(entryDate)); else xDiv = null;",
+  "x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv); else xDiv = null;"
+ ],
+ [
+  "(x.rule === 'fixed' ? ' \\u00b7 fixed stop -' + DP2X.FIXED_STOP_PCT + '%, ' + dp2StopTimeTxt_(x) : ' \u00b7 trail ' + x.trailMult + '\u00d7ATR')",
+  "' \u00b7 trail ' + x.trailMult + '\u00d7ATR'"
+ ],
+ [
+  "(x.rule === 'fixed' ? ' (the fixed rule: ' + DP2X.FIXED_STOP_PCT + '% under the entry, no trailing order; ' + dp2StopTimeTxt_(x) + ').' : ' \u2014 or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' \u00d7 ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.') });",
+  "' \u2014 or use a trailing stop order, trail amount ' + dp2Fmt_(x.trailMult * x.atr, 2) + ' (' + x.trailMult + ' \u00d7 ATR); the move at the high is ' + dp2RFmt_(x.gainR) + (x.beLocked ? ', breakeven is locked' : '') + '.' });"
+ ],
+ [
+  "SAR to cash. ' + (x.rule === 'fixed' ? 'Under the fixed rule the stop stays at ' + dp2Fmt_(x.stop, 2) + ' (' + dp2StopTimeTxt_(x) + '): keep the TP to bank the gain, or cancel it and let the time stop close the trade.' : 'Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.') });",
+  "SAR to cash. Under the trailing rule the TP is optional: cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner, or keep it and bank the gain.' });"
+ ],
+ [
+  "is close: keep it to bank the gain, or cancel it to ' + (x.rule === 'fixed' ? 'hold to the time stop (fixed stop ' + dp2Fmt_(x.stop, 2) + ').' : 'let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.');",
+  "is close: keep it to bank the gain, or cancel it to let the trail (' + dp2Fmt_(x.stop, 2) + ') run the winner.';"
+ ],
+ [
+  "    if (sig.code === 'HOLD' && !certified) decision = 'HOLD \u00b7 ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' \u00b7 uncertified';",
+  "    if (sig.code === 'HOLD' && !certified) decision = 'HOLD \u00b7 trailing \u00b7 uncertified';"
+ ],
+ [
+  "the fixed broker stop is only a floor \u2014 RAISE STOP tells you when to move it.' + (dp2StopRule_() ? ' DP2_STOP_RULE: lots entered from ' + dp2StopRule_().from + ' use a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions.' : ''));",
+  "the fixed broker stop is only a floor \u2014 RAISE STOP tells you when to move it.');"
+ ],
+ [
+  "  var foot = (dp2StopRule_() ? 'Lots entered from ' + dp2StopRule_().from + ': a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions. Older lots: ' : '') + 'Rule: initial stop entry \u2212 2 \u00d7 ATR14;",
+  "  var foot = 'Rule: initial stop entry \u2212 2 \u00d7 ATR14;"
+ ],
+ [
+  "follow the RAISE STOP actions or replace fixed stops with trailing stop orders.' + (dp2StopRule_() ? ' Lots entered from ' + dp2StopRule_().from + ' follow DP2_STOP_RULE instead: a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions; keep their stop fixed (no trailing order).' : '') +",
+  "follow the RAISE STOP actions or replace fixed stops with trailing stop orders.' +"
+ ],
+ [
+  "  return DP2X_SAN_;\n}\n/* v1.2.35 [STOP-RULE]: Script Property DP2_STOP_RULE = 'fixed' or 'fixed:YYYY-MM-DD' (any case; default OFF = the\n * 1.2.34 trailing engine). Read once per execution. Lots entered on/after the start date (default DP2X_SR_FROM_) and\n * the Top_10_Investments_v2 seats use the fixed rule; older lots keep the trailing rule. */\nvar DP2_STOP_RULE_PROP = 'DP2_STOP_RULE';\nvar DP2X_SR_FROM_ = '2026-11-08';\nvar DP2X_SR_READ_ = false, DP2X_SR_ = null;\n/* PURE: null (off) | { from: 'YYYY-MM-DD' } */\nfunction dp2StopRuleParse_(raw) {\n  var m = /^fixed(?:\\s*[:=\\s]\\s*(\\d{4}-\\d{2}-\\d{2}))?$/i.exec(dp2Str_(raw).trim());\n  return m ? { from: m[1] || DP2X_SR_FROM_ } : null;\n}\nfunction dp2StopRule_() {\n  if (!DP2X_SR_READ_) { DP2X_SR_ = dp2StopRuleParse_(dp2Prop_(DP2_STOP_RULE_PROP)); DP2X_SR_READ_ = true; }\n  return DP2X_SR_;\n}\n/* 'fixed' for a lot entered on/after the start date while the gate is on; else undefined (the trailing engine). */\nfunction dp2StopRuleFor_(entryDate) {\n  var r = dp2StopRule_(), d = dp2Str_(entryDate);\n  return (r && d && d >= r.from) ? 'fixed' : undefined;\n}\n/* PURE: the fixed replay - a stop FIXED_STOP_PCT % under the entry, no trailing, no breakeven lock, no profit\n * protection; a time-stop episode on the bar TIME_STOP_SESSIONS sessions after the entry bar. Same keys as the\n * trailing replay (sma null, trailMult null, moms []) plus rule, times, sessionsHeld, sessionsLeft. */\nfunction dp2ExitFixed_(bars, entry, e, a0, atr, atrApprox, lastOverride) {\n  var s0 = entry * (1 - DP2X.FIXED_STOP_PCT / 100), R = entry - s0, hi = bars[e].c, a = a0;\n  var hits = [], times = [], prevHit = false;\n  for (var i = e; i < bars.length; i++) {\n    a = atr[i] !== null ? atr[i] : a0;\n    var hitNow = (i > e && bars[i].l <= s0);\n    if (hitNow && !prevHit) hits.push({ date: bars[i].date, stop: s0 });\n    prevHit = hitNow;\n    if (bars[i].c > hi) hi = bars[i].c;\n    if (i - e === DP2X.TIME_STOP_SESSIONS) times.push({ date: bars[i].date, price: bars[i].c });\n  }\n  var lastBar = bars[bars.length - 1];\n  var last = (lastOverride !== null && lastOverride !== undefined && lastOverride > 0) ? lastOverride : lastBar.c;\n  var held = bars.length - 1 - e;\n  return { entry: entry, entryBar: bars[e].date, atrEntry: a0, s0: s0, R: R, hi: hi, gainR: R > 0 ? (hi - entry) / R : 0, atr: a, sma: null, stop: s0, trailMult: null,\n           beLocked: false, momentum: false, last: last, lastDate: lastBar.date, barsSinceEntry: bars.length - e, firstHit: hits.length ? hits[0] : null, firstMom: null,\n           hits: hits, moms: [], hitNow: prevHit, momNow: false, atrApprox: atrApprox, barsBeforeEntry: e, lastR: R > 0 ? (last - entry) / R : null,\n           rule: 'fixed', times: times, sessionsHeld: held, sessionsLeft: Math.max(0, DP2X.TIME_STOP_SESSIONS - held) };\n}\n/* PURE: 'time stop reached YYYY-MM-DD' | 'time stop in N sessions' */\nfunction dp2StopTimeTxt_(x) {\n  return 'time stop ' + (x && x.times && x.times.length ? 'reached ' + x.times[0].date : 'in ' + (x ? x.sessionsLeft : '?') + ' sessions');\n}\n/* The dp2SelfTest core (pure): the fixed stop, a stop touch, the time stop and its latch; the trailing engine without\n * the rule; the parser. */\nfunction dp2StopRuleCoreOk_() {\n  try {\n    var bars = [], t0 = Date.UTC(2026, 0, 1);\n    for (var q = 0; q < 70; q++) { var c = 100 + (q % 5); bars.push({ date: new Date(t0 + q * 86400000).toISOString().slice(0, 10), o: c, h: c + 1, l: c - 1, c: c }); }\n    var x = dp2ExitCompute_(bars, 100, bars[20].date, null, 'fixed');\n    var okF = !!x && Math.abs(x.stop - 92) < 1e-9 && x.hits.length === 0 && x.times.length === 1 && x.times[0].date === bars[65].date && x.sessionsLeft === 0;\n    var sig = dp2ExitSignal_(x, { tp: null, stop: 92, known: true, stopQty: null, shares: 10, stops: null, lotOfMany: false }, null, '');\n    var okS = sig.code === 'EXIT_LATCHED' && sig.latched.kind === 'time' && sig.text.indexOf('time stop, ' + DP2X.TIME_STOP_SESSIONS + ' sessions held') > 0;\n    var y = dp2ExitCompute_(bars, 100, bars[60].date, null, 'fixed');\n    var okY = !!y && y.times.length === 0 && y.sessionsLeft === 36 && dp2ExitSignal_(y, { tp: null, stop: 92, known: true, stopQty: null, shares: 10, stops: null, lotOfMany: false }, null, '').code === 'HOLD';\n    var crash = bars.slice(0, 69).concat([{ date: bars[69].date, o: 90, h: 91, l: 89, c: 90 }]);\n    var z = dp2ExitCompute_(crash, 100, bars[60].date, null, 'fixed');\n    var okZ = !!z && z.hits.length === 1 && z.hits[0].date === bars[69].date;\n    var a = dp2ExitCompute_(bars, 100, bars[20].date, null);\n    var okA = !!a && a.rule === undefined && a.trailMult !== null;\n    var okP = dp2StopRuleParse_('fixed').from === DP2X_SR_FROM_ && dp2StopRuleParse_(' Fixed:2026-12-01 ').from === '2026-12-01' &&\n              dp2StopRuleParse_('atr') === null && dp2StopRuleParse_('') === null && dp2StopRuleParse_('fixed:2026-1-1') === null;\n    return okF && okS && okY && okZ && okA && okP;\n  } catch (e) { return false; }\n}\n",
+  "  return DP2X_SAN_;\n}\n"
+ ],
+ [
+  "  if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \\u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33\n  if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \\u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35\n",
+  "  if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \\u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33\n"
+ ]
+]

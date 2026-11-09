@@ -212,3 +212,11 @@ Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header 
 - V1b runs each module's exact diff while that module carries this PR's change alone. The tracker leg runs against `a85edfc6`. The builder leg runs against main `4b478e72` (1.29.0), loaded by `git show` or `TFB_TEST_OB_MAIN_BASE`, and the CI step fetches that SHA too (X8 checks it). Only the version constant is removed, added lines are ASCII, and the one new function is `_venue_cal_data_ext`.
 - An independent review of this merge found the first resolution had left the builder leg dead (it only ran at 1.28.3). Eight mutants on a scratch copy are all killed: non-ASCII in the WHY line, main's WHY block edited, a function added, a function removed, a stale v1.28.3 tag, the block placed before 1.29.0, the hook dropped, and the new fetch dropped.
 - After the merge: `tests/test_xcal_data_ext.py` 52 passed with `TFB_TEST_REQUIRE_BASE=1`. The golden negative is unchanged (9 failed, 42 passed, 1 skipped). With the builder from untouched main 4b478e72 delivered, X6a, X6b, X6d and V1 fail. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.
+
+## Addendum 2026-11-09 - merge of main `86edd72`
+
+Main `86edd72` (#939-#945) was merged in with a merge commit. Main took ci.yml 1.1.71-1.1.73, and its 1.1.71 raises the advisory whole-suite job's cap from 15 to 25 minutes.
+
+- ci.yml: this release keeps 1.1.75 (still above main).
+- The claim note now reads: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909, 1.1.77 #926, 1.1.78 #938, 1.1.79 #915. Only the three claims main took moved.
+- Main's 1.1.73 / 1.1.72 / 1.1.71 blocks follow verbatim. Against main, the ci.yml diff adds lines only. No other file conflicted.
