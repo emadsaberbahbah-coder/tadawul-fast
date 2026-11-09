@@ -33,7 +33,9 @@ const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_
 const OLD_PATH = process.argv[3] || '';
 // 2026-11-08: v1.2.35 [STOP-RULE] is delivered; this harness proves an older diff, so it reads the v1.2.34 file
 // rebuilt from the delivered one (tests/js/dp2_history.js: the v1.2.35 hunks reversed, SHA-256 pinned).
-const NEW = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-09: v1.2.36 [EVIDENCE-SINCE] is delivered; the v1.2.35 file is rebuilt from it the same way (the v1.2.36
+// hunks reversed, SHA-256 pinned) and this harness proves the v1.2.35 diff on that file.
+const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1235Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1235.json'), 'utf8'));
 const V1234_SHA256 = '992fb7f77e0d4c4c59f1eb6fb42b7b45be41e1ffaa47957797222662246811c0';   // v1.2.34 (origin/main bdf2da2)
