@@ -35,12 +35,13 @@ That board is replayed offline on 1.2.36 at 11:00 Riyadh (the harness's fixture 
 
 The same holds under SYNC RUNNING (superseded) and NOT ACTIONABLE, and with `DP2_PREVIEW_LABEL` or `DP2_COHORT_LEGACY` on.
 
-**How often.** Only when the last render carried engine tickets and the feed has since stopped being live.
-- Releases last 6-7 h from issue, and each sync withdraws its predecessor for about an hour before the new render.
-- So on a ticket day a few hourly builds land in a non-live state.
-- Boards since 3 Nov carried 0 tickets (HELD / WITHHELD / QUALIFIED_UNFUNDED), so the next occurrence is the next ticket day.
+**How often.** Only on a day the cockpit's last render carried engine tickets, from the moment the feed stops being live until the next render. Two kinds of window:
+- **Expiry.** A release expires 480 minutes after the oldest audited decision input (`scripts/release_decision_feed.py` `release_window`), so it can end before the venue opens: on 2 Nov, at 10:42 for a US board.
+- **Sync running.** A new sync withdraws the release when it starts (`daily_sync.yml` "Supersede released decision feed"), and the next render follows that sync's own release: on 2 Nov, from 15:35 to 17:32.
 
-**Readers.** The owner. The page is rebuilt hourly by `dp2InstallTrigger` and on the decision chain. Owner quotes about this page drive the 1.2.26, 1.2.31, 1.2.32, 1.2.34 and 1.2.36 WHY entries.
+The hourly builds that land in those windows show the contradiction. No count of ticket days since 2 Nov is claimed here.
+
+**Readers.** The owner. The page is rebuilt by the hourly trigger `dp2InstallTrigger` installs (`buildDecisionPagesV2`) and from the Decision v2 menu. Owner quotes about this page drive the 1.2.26, 1.2.31, 1.2.32, 1.2.34 and 1.2.36 WHY entries.
 
 **Dedupe.**
 - No open PR (186 checked, codex/* included) touches the tile. The only open PR touching this file is #803 (a stale 1.2.0 rotation).
@@ -105,7 +106,7 @@ Inventory: functions +3, line-start vars +2 (`DP2_ETF_` shares a line), 0 remove
 
 **The older harnesses on the delivered file:** v1.2.31 11/11, v1.2.32 10/10, v1.2.33 10/10, v1.2.34 11/11, v1.2.35 9/9, v1.2.36 9/9.
 
-LANES_RESULT
+**Lanes on an export of the head** (`68003b12`; later commits change only comments, the WHY text, the harness header and this sheet): the lean-unit emulation gives **LEAN FAILS 0**. The decision-layer suites pass (4,486 passed, 36 skipped), and the native step runs this harness (PASS 10/10). The contract lane gives rc 0 (426 passed, 13 skipped, as on main). compileall is clean, and ruff (CI rules, plus F401 / F841 on the wrapper) is clean.
 
 ## S4 - Off identity
 
@@ -115,22 +116,50 @@ LANES_RESULT
 
 ## S5 - Review
 
-REVIEW_RESULT
+**Round 1.** Four independent lenses (semantics, off identity and house rules, harness, factual claims) reviewed the build, and a refuter re-checked each finding. No code defect was confirmed, and the reviewers' own mutants and probes found no surviving behaviour fault. Fixed before the PR:
+
+| Finding | Verdict | Fix |
+| --- | --- | --- |
+| S1 said "Boards since 3 Nov carried 0 tickets" with no source | CONFIRMED (major) | removed; no count is claimed |
+| S1 "How often": "releases last 6-7 h" and "a sync withdraws for about an hour" do not match `release_window` (oldest input + 480 min) or the 2 Nov timeline (15:35-17:32) | CONFIRMED (minor) | rewritten from the code and the timeline |
+| S1 said the page is rebuilt "on the decision chain"; `26_Decision_Chain` never builds the v2 pages | CONFIRMED (minor) | the hourly trigger and the Decision v2 menu |
+| S7 implied `DP2_PREVIEW_LABEL` qualifies the funnel stage and the SEATS title | CONFIRMED (nit) | S7 says what that flag does and does not qualify |
+| `zz_Property_Tool` `tfbSetupNov9` checks for exactly `1.2.36` and will ask the owner to paste the old file | CONFIRMED (minor) | documented in S6 and S7; that file is left to the owner, who edited it today |
+| The WHY said the gate is read "by the Top-10 build only" (`dp2SelfTest` reads it too); the harness header and the commit message stated the 2 Nov tile as observed, not replayed | refuted as defects (wording) | reworded anyway: "by the Top-10 build and dp2SelfTest"; "a build in that window reads ... (replayed on that board)" |
+| With no readable feed state the armed tile stays green while the Allocated (engine) tile reads "feed n/a" | refuted: deliberate and documented. DP2's parser does not trim the cell, while the cockpit's `dt10UvParse_` does, so "not executable now" could be false there | kept; now a named known limit in S7 |
+| No exactly-one-ticket case; no failing-core case; no anchored near-miss off word; P6 read count on one board only | refuted (coverage suggestions; the delivered code is correct, and probes showed the core check fails for each broken rule) | unchanged |
+
+The reviewers confirmed:
+- the 2 Nov timeline, the v1.2.31 follow-up line and the export-audit reader;
+- `DT10_UV_MAX_AGE_MIN` 480 is checked at render time only;
+- the line reference 3708 on 1.2.36;
+- the blocking lean-unit step;
+- the golden-negative split (3 passed / 7 failed);
+- the `.py` k == k check.
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
 1. Merge.
 2. Paste `apps_script/27_Decision_Pages_v2.gs` (1.2.37) over the 1.2.36 file in the Apps Script project, then Save.
 3. Set the Script Property **`DP2_EXEC_TILE_FEED=on`**. The Script Properties UI hit its 50-property cap on 4 Nov, so use `zz_Property_Tool`: put the key and value in `TFB_PT_SET_KEY` / `TFB_PT_SET_VALUE` and run `tfbSetAnyProperty`.
-4. Run `dp2SelfTest`. It should show "PASS - executable tile follows the feed (DP2_EXEC_TILE_FEED): on &middot; core ok".
+4. Run `dp2SelfTest` (not `tfbSetupNov9`, whose exact `1.2.36` check would ask for the old file; see S7). It should show "PASS - executable tile follows the feed (DP2_EXEC_TILE_FEED): on &middot; core ok".
 5. On the next ticket day, after the release's `expires=` time, the Executable tile reads grey with `feed EXPIRED - not executable now - ...`.
 
 **Rollback:** delete the property, or set it to off.
 
 ## S7 - Known limits and not done
 
-- **Only the tile changes.** Without `DP2_PREVIEW_LABEL`, which no setup function arms, these stay unqualified: the funnel stage "Plans -> executable (N)", the SEATS title "N engine tickets", and the bold-green seat Alloc cells. The header chip and the feed line already say EXPIRED / SYNC RUNNING.
+- **Only the tile changes.**
+  - No flag qualifies the funnel stage "Plans -> executable (N)" or the SEATS title "N engine tickets".
+  - Only `DP2_PREVIEW_LABEL` qualifies the SEATS subtitle ("PREVIEW ONLY - not tickets (feed EXPIRED)"), the seat headers and Alloc cells, and the allocation title, and no setup function arms it.
+  - The header chip and the feed line already say EXPIRED / SYNC RUNNING.
+- **A feed with no readable state.** The `TFB Decision Feed` key is missing, blank, or its value does not start with an upper-case token (DP2's `dp2ParseFeed_` does not trim; the cockpit's `dt10UvParse_` does).
+  - Armed or not, the tile keeps its v1.2.36 green, and the header falls back to the cockpit's own output.
+  - The Allocated (engine) tile beside it reads "feed n/a" in that case.
+  - This is deliberate. Such a value can be one the cockpit reads as EXECUTABLE, so "not executable now" could be false.
 - **The tile still counts the cockpit's `Ticket SAR > 0`.** The count is a fact about the last render. The tile now says that the feed no longer releases it.
 - **Not changed:** the cockpit (16_Decision_Top10) still does not re-render or zero tickets on expiry; the release window (480 minutes) and its timing.
 - **Not touched:** `zz_Property_Tool` (the owner edited it today, #945). Arming goes through `tfbSetAnyProperty`.
+  - Its `tfbSetupNov9` checks for exactly `1.2.36`. Once 1.2.37 is pasted it prints "PASTE 27_Decision_Pages_v2 1.2.36 FROM GITHUB MAIN"; ignore that line.
+  - Its check can move to 1.2.37 in the owner's next edit of that file.
 - No workbook read or write and no provider call; everything is offline.

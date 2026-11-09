@@ -6,18 +6,19 @@
  *           regardless of the current feed state'). Top_10_Investments_v2's Executable tile counts the seats that carry a Ticket
  *           SAR and was painted green whatever the decision feed said. The cockpit does not zero a ticket when its release
  *           expires (the 480-minute clock), and a new sync withdraws the release (SYNC RUNNING) before the next render, so
- *           between an expiry and the next render the hourly build showed 'Executable 6' in green under an EXPIRED or SYNC
+ *           between an expiry and the next render the hourly build shows 'Executable 6' in green under an EXPIRED or SYNC
  *           RUNNING chip. Mon 2 Nov (28_Plan_Of_Record v1.0.0 commit sheet): six tickets released until 10:42 Riyadh, the
  *           sync from 15:35, the WITHHELD render at 17:32; a build in that window reads 'Executable 6' green (replayed on that
  *           board), and inside it the owner placed four limit buys (16:40-16:47). The Allocated (engine) tile beside it has
  *           been grey with the feed state since v1.2.31. Script Property DP2_EXEC_TILE_FEED (default OFF = the 1.2.36 pages
  *           byte for byte; 1 / on / true / yes arms it, anything else or a property fault reads off; read once per execution,
- *           by the Top-10 build only): when the board carries an engine ticket and the feed has a state that is not live
- *           (EXPIRED, SYNC RUNNING, NOT ACTIONABLE), the tile is grey and its sub reads 'feed <state> - not executable now - of
- *           N . <output>'. The label 'Executable' and the count stay (scripts/tfb_export_audit.py reads both). A live release,
- *           a board without a ticket and a feed without a state leave the tile as it was; DP2_COHORT_LEGACY does not change
- *           the rule. dp2SelfTest adds one line while armed. No number, seat, gate, ticket, order or broker call changes;
- *           Portfolio_Decision_v2 is untouched. Rollback: unset DP2_EXEC_TILE_FEED.
+ *           by the Top-10 build and dp2SelfTest; Portfolio_Decision_v2 never reads it): when the board carries an engine
+ *           ticket and the feed has a state that is not live (EXPIRED, SYNC RUNNING, NOT ACTIONABLE), the tile is grey and its
+ *           sub reads 'feed <state> - not executable now - of N . <output>'. The label 'Executable' and the count stay
+ *           (scripts/tfb_export_audit.py reads both). A live release, a board without a ticket and a feed without a state
+ *           leave the tile as it was; DP2_COHORT_LEGACY does not change the rule. dp2SelfTest adds one line while armed. No
+ *           number, seat, gate, ticket, order or broker call changes; Portfolio_Decision_v2 is untouched. Rollback: unset
+ *           DP2_EXEC_TILE_FEED.
  *   1.2.36: THE EVIDENCE TILE SHOWS WHAT THE RULE CHANGE DID (owner, Mon 9 Nov 2026 11:44 Riyadh: 'MODEL EVIDENCE 48.70%
  *           INVESTABLE hit rate, matured records - still our system is less than 49% I need to improve it between 60% -55%
  *           at least'). The tile pools every matured Performance_Log WIN / LOSS record since June, so the engine rule that
@@ -2707,8 +2708,9 @@ function dp2CohortLegacy_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(
 var DP2_PREVIEW_LABEL_PROP = 'DP2_PREVIEW_LABEL';   // v1.2.32 gate: 1 / on / true / yes = a page that cannot be acted on labels its sizing a preview
 function dp2PreviewLabelOn_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_PREVIEW_LABEL_PROP)).trim()); }
 /* v1.2.37 [EXEC-TILE-FEED]: Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the 1.2.36 pages),
- * read once per execution by the Top-10 build. Armed, Top_10_Investments_v2's Executable tile turns grey and names the
- * feed once the release is not live (EXPIRED / SYNC RUNNING / NOT ACTIONABLE); its label and count stay. */
+ * read once per execution by the Top-10 build and dp2SelfTest. Armed, Top_10_Investments_v2's Executable tile turns
+ * grey and names the feed once the release is not live (EXPIRED / SYNC RUNNING / NOT ACTIONABLE); its label and count
+ * stay. */
 var DP2_EXEC_TILE_FEED_PROP = 'DP2_EXEC_TILE_FEED';
 var DP2_ETF_READ_ = false, DP2_ETF_ = false;
 function dp2ExecTileFeedOn_() {

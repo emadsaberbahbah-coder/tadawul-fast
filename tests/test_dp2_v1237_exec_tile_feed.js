@@ -2,8 +2,8 @@
 /* tests/test_dp2_v1237_exec_tile_feed.js
  * Harness for apps_script/27_Decision_Pages_v2.gs v1.2.37 [EXEC-TILE-FEED] (the v1.2.31 follow-up: Top_10_Investments_v2's
  * Executable tile counted the seats with a Ticket SAR and was green whatever the decision feed said; Mon 2 Nov the
- * 10:42 release expired and every hourly build until the 17:32 render showed 'Executable 6' green under an EXPIRED /
- * SYNC RUNNING chip). Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the v1.2.36 pages byte for
+ * 10:42 release expired, and a build before the 17:32 render reads 'Executable 6' green under an EXPIRED / SYNC RUNNING
+ * chip, replayed on that board). Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the v1.2.36 pages byte for
  * byte): when the board carries an engine ticket and the feed has a state that is not live, the tile is grey and its sub
  * reads 'feed <state> - not executable now - of N . <output>'; the label and the count stay.
  *
