@@ -1,5 +1,5 @@
 /**
- * zz_Property_Tool.gs -- Script Property tool, v2.4 (8 Nov 2026).
+ * zz_Property_Tool.gs -- Script Property tool, v2.5 (9 Nov 2026).
  * WHY: Project Settings -> Script Properties turns read-only above 50
  * properties ("Not able to add any as I reach to Max", owner, 4 Nov), so a
  * property is set from code instead: pick a function in the toolbar list,
@@ -17,6 +17,18 @@
  *                     27_Decision_Pages_v2 1.2.34 yield to a decision render),
  *                     reads it back, shows the three versions and runs
  *                     tfbDecisionChainStatus. Safe to repeat.
+ *  tfbSetupNov9       ONE RUN for 9 Nov (v2.5). Sets DT10_VERDICT_REUSE=on
+ *                     (16_Decision_Top10 1.29.0: two source checks fewer per
+ *                     render, about 49 s) and DP2_EVIDENCE_SINCE=2026-11-10
+ *                     (27_Decision_Pages_v2 1.2.36: the Model evidence tile
+ *                     adds the INVESTABLE hit rate of the records made from
+ *                     10 Nov, under the new engine rule), reads both back,
+ *                     shows the two file versions, reads the Render backend's
+ *                     /health (read-only GET, no secret in code) to confirm
+ *                     evidence_gate=enforce and conservative_floor=70, and
+ *                     runs dp2SelfTest for its 'evidence since' line. Render
+ *                     settings are changed only on Render itself; this file
+ *                     reads them back. Safe to repeat.
  *  tfbSetAnyProperty  any other key: type it in TFB_PT_SET_KEY and the value
  *                     in TFB_PT_SET_VALUE below, Save, Run. Refuses secrets
  *                     (TOKEN / SECRET / PASSWORD / API KEY names).
@@ -115,6 +127,86 @@ function tfbSetupRenderPriority() {
   out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
   Logger.log(out.join('\n'));
   return out.join('\n');
+}
+
+/* v2.5 (9 Nov 2026): the two switches of 9 Nov, in one run. */
+var TFB_PT_NOV9 = [
+  ['DT10_VERDICT_REUSE', 'on'],          // 16_Decision_Top10 1.29.0 (render speed)
+  ['DP2_EVIDENCE_SINCE', '2026-11-10']   // 27_Decision_Pages_v2 1.2.36 (Model evidence 'since' figure)
+];
+
+function tfbSetupNov9() {
+  var p = PropertiesService.getScriptProperties();
+  var out = ['TFB setup 9 Nov (zz_Property_Tool 2.5)'];
+  for (var i = 0; i < TFB_PT_NOV9.length; i++) {
+    var k = TFB_PT_NOV9[i][0], v = TFB_PT_NOV9[i][1], before = p.getProperty(k);
+    p.setProperty(k, v);
+    out.push('SET ' + k + ' = ' + p.getProperty(k) + ' (was ' + (before === null ? 'absent' : before) + ')');
+  }
+  var dt10 = typeof DT10_VERSION !== 'undefined' ? String(DT10_VERSION) : 'not found';
+  out.push('16_Decision_Top10 live: ' + dt10 + (dt10 === '1.29.0' ? ' (ok)' :
+      ' -> PASTE 16_Decision_Top10 1.29.0 FROM GITHUB MAIN, Save, then run this again'));
+  var dp2 = typeof DP2_VERSION !== 'undefined' ? String(DP2_VERSION) : 'not found';
+  out.push('27_Decision_Pages_v2 live: ' + dp2 + (dp2 === '1.2.36' ? ' (ok)' :
+      ' -> PASTE 27_Decision_Pages_v2 1.2.36 FROM GITHUB MAIN, Save, then run this again'));
+  out.push(tfbPtRenderGates_());
+  if (typeof dp2SelfTest === 'function') {
+    try {
+      var r = dp2SelfTest(), hit = false;
+      for (var j = 0; r && r.checks && j < r.checks.length; j++) {
+        if (/evidence since/i.test(String(r.checks[j].name))) {
+          out.push('dp2SelfTest: ' + (r.checks[j].ok ? 'PASS' : 'FAIL') + ' - ' + r.checks[j].name);
+          hit = true;
+        }
+      }
+      if (!hit) out.push('dp2SelfTest: no evidence-since line (27_Decision_Pages_v2 is older than 1.2.36)');
+    } catch (e1) {
+      out.push('dp2SelfTest error: ' + String(e1 && e1.message ? e1.message : e1).slice(0, 200));
+    }
+  } else {
+    out.push('dp2SelfTest not found (27_Decision_Pages_v2 missing)');
+  }
+  out.push('Script Properties now: ' + Object.keys(p.getProperties()).length);
+  out.push('NEXT: nothing by hand. The next cockpit render writes a TIMING row with ready and verdict2 near 0 s;' +
+      ' the Model evidence tile reads "since 2026-11-10: none matured yet" until the first 1W records mature (about 17 Nov).');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+/* v2.5: the Render backend's engine gates, read back from /health (a read-only GET; when the cockpit has an app
+ * token it comes from the cockpit's own property through dt10AppToken_ -- no secret is written in this file). */
+function tfbPtRenderGates_() {
+  try {
+    var base = (typeof dt10BackendUrl_ === 'function') ? dt10BackendUrl_() : 'https://tadawul-fast-bridge.onrender.com';
+    var headers = {};
+    if (typeof dt10AppToken_ === 'function') {
+      var t = dt10AppToken_();
+      if (t) headers['X-APP-TOKEN'] = t;
+    }
+    var resp = UrlFetchApp.fetch(String(base).replace(/\/+$/, '') + '/health',
+        { method: 'get', muteHttpExceptions: true, followRedirects: true, headers: headers });
+    var code = resp.getResponseCode();
+    if (code !== 200) return 'Render /health: HTTP ' + code + ' (not read; check Render -> Environment by hand)';
+    var g = tfbPtFindKey_(JSON.parse(resp.getContentText() || '{}'), 'engine_gates', 0) || {};
+    var ok = String(g.evidence_gate) === 'enforce' && Number(g.conservative_floor) === 70;
+    return 'Render engine gates: evidence_gate=' + g.evidence_gate + ', evidence_cohorts=' + g.evidence_cohorts +
+        ', conservative_floor=' + g.conservative_floor + (ok ? ' (ok)' :
+        ' -> on Render set TFB_EVIDENCE_GATE=enforce and TFB_CONSERVATIVE_GATE_SCORE_FLOOR=70, then deploy');
+  } catch (e) {
+    return 'Render /health read failed: ' + String(e && e.message ? e.message : e).slice(0, 160);
+  }
+}
+
+/* v2.5 PURE: the first value under the given key in a parsed JSON object (depth 5 at most). */
+function tfbPtFindKey_(o, key, depth) {
+  if (!o || typeof o !== 'object' || depth > 5) return null;
+  if (Object.prototype.hasOwnProperty.call(o, key)) return o[key];
+  for (var k in o) {
+    if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+    var f = tfbPtFindKey_(o[k], key, depth + 1);
+    if (f) return f;
+  }
+  return null;
 }
 
 function tfbPtSecretKey_(k) {
