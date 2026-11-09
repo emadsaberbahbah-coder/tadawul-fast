@@ -32,7 +32,9 @@ var history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js')
 var EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1270.json'));
 var GUARD = 'DT10_TICKET_GUARD', KNOB = 'DT10_GUARD_CORP_DAYS';
 
-var newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-09: the delivered file is v1.28.0 [RENDER-TIMING]; this harness proves the v1.27.0 diff, so it reads
+// the v1.27.0 file rebuilt from the delivered one (tests/js/dt10_edits_v1280.json reversed, SHA-256 pinned).
+var newSource = history.v1270Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 var baseSource;
 try {
@@ -59,6 +61,15 @@ function names(src, re) { var out = {}, m; while ((m = re.exec(src)) !== null) o
 
 /* The Corporate_Events grid (run_corporate_events.py HEADERS), event days relative to the Riyadh day 2026-11-08. */
 var TODAY = '2026-11-08';
+/* The context's Date is pinned to 12:00 Riyadh on TODAY (09:00 UTC): new Date() and Date.now() return it, every
+ * other constructor form and Date.parse / Date.UTC are the real ones. */
+var FROZEN_CLOCK = "(function () { var RealDate = Date, FIXED = RealDate.parse('" + TODAY + "T09:00:00Z');" +
+  " function FrozenDate() { var a = Array.prototype.slice.call(arguments);" +
+  " if (!(this instanceof FrozenDate)) return new RealDate(FIXED).toString();" +
+  " if (!a.length) return new RealDate(FIXED);" +
+  " return new (Function.prototype.bind.apply(RealDate, [null].concat(a)))(); }" +
+  " FrozenDate.prototype = RealDate.prototype; FrozenDate.now = function () { return FIXED; };" +
+  " FrozenDate.parse = RealDate.parse; FrozenDate.UTC = RealDate.UTC; Date = FrozenDate; })();";
 var GRID = [
   ['Symbol', 'Event', 'Event Date', 'Filed At (UTC)', 'Form', 'Items', 'Source', 'URL', 'Updated At (Riyadh)'],
   ['FUT.US', 'rights_modified', '2026-11-12', '2026-11-10 21:00', '8-K', '3.03', 'sec.gov EDGAR submissions', '', '2026-11-08 08:37'],
@@ -101,6 +112,10 @@ function load(source, props, options) {
     UrlFetchApp: { fetch: function () { throw new Error('no net'); } }
   };
   vm.createContext(c);
+  // 2026-11-09: freeze the context clock at the trace day. The fixture's event days are relative to TODAY and
+  // Utilities.formatDate returns TODAY, but the guard also reads new Date(); on the real clock the '6d ago'
+  // expectations turned into '7d' on 9 Nov and the blocking lean lane went red for every PR.
+  vm.runInContext(FROZEN_CLOCK, c, { filename: 'frozen_clock.js' });
   vm.runInContext(source, c, { filename: '16_Decision_Top10.gs' });
   c.__logs = logs; c.__corpReads = corpReads; c.__ss = ssStub;
   return c;

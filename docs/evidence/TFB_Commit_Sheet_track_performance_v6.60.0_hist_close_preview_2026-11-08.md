@@ -204,3 +204,11 @@ After the fix, PASS 44/44; golden negative 38 failed / 6 passed; siblings 93 pas
 - **The preview is not saved anywhere:** not in a receipt, `_Run_Log` or the summary panel. It lives in the job log only, on purpose.
 - **Not changed:** the judge, the maturation rules, enforce, the factors, the cron and the concurrency. No gate is armed.
 - **No live workbook read or write and no provider call:** everything is offline.
+
+## Addendum 2026-11-09 - merge of main `86edd72`
+
+Main `86edd72` (#939-#945) was merged in with a merge commit. Main took ci.yml 1.1.71-1.1.73, and its 1.1.71 raises the advisory whole-suite job's cap from 15 to 25 minutes.
+
+- ci.yml: this release is re-numbered **1.1.72 -> 1.1.78** (its header, its `v1.1.78` line and its step comment).
+- The claim note now reads: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909, 1.1.77 #926, 1.1.78 #938, 1.1.79 #915. Only the three claims main took moved.
+- Main's 1.1.73 / 1.1.72 / 1.1.71 blocks follow verbatim. Against main, the ci.yml diff adds lines only. No other file conflicted.

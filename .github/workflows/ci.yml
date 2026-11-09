@@ -2,12 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.72 (2026-11-08) -- HIST-CLOSE OUTCOME PREVIEW (track_performance v6.60.0)
-# (1.1.62-1.1.70 are on main. Open claims, re-numbered 2026-11-08 when main
-# took 1.1.68-1.1.70: 1.1.71 #926, 1.1.72 this release, 1.1.73 #915,
-# 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.)
+# VERSION 1.1.78 (2026-11-08) -- HIST-CLOSE OUTCOME PREVIEW (track_performance v6.60.0)
+# (1.1.62-1.1.73 are on main. Open claims, re-numbered 2026-11-09 when main
+# took 1.1.71-1.1.73: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909, 1.1.77 #926,
+# 1.1.78 #938, 1.1.79 #915. This release first claimed 1.1.72.)
 #
-# v1.1.72: run tests/test_hist_close_preview.py (track_performance v6.60.0
+# v1.1.78: run tests/test_hist_close_preview.py (track_performance v6.60.0
 # [HIST-PREVIEW], TRACK_HIST_CLOSE_PREVIEW default off = v6.53.0: under
 # TRACK_HIST_TARGET_CLOSE=observe the audit logs the outcomes enforce would
 # publish) in its own blocking lean-unit step after the witnessed maturity
@@ -17,6 +17,36 @@
 # TFB_TEST_REQUIRE_BASE=1, so a missing base FAILS those legs instead of
 # skipping them. PyYAML (already in the lane) reads the workflows. Nothing
 # is removed and no existing entry moves.
+#
+# VERSION 1.1.73 (2026-11-09) -- VERDICT-REUSE HARNESS
+#
+# v1.1.73: run tests/test_dt10_v1290_verdict_reuse.js (16_Decision_Top10.gs
+# v1.29.0: DT10_VERDICT_REUSE=on drops the two source checks that decide
+# nothing - the pre-POST readiness behind a Logger line and verdict 2 across
+# the stability step - about 49 s of a 205.6 s render; default off) in the
+# blocking lean lane after the v1.28.0 render-timing harness.
+#
+# VERSION 1.1.72 (2026-11-09) -- EVIDENCE-COHORT SUITE
+#
+# v1.1.72: run tests/test_de_evidence_cohort.py (data_engine_v2 v5.160.0:
+# TFB_EVIDENCE_GATE off|observe|enforce demotes an INVESTABLE row whose
+# MARKET:CONFIDENCE cohort loses on matured Performance_Log records,
+# default SR:HIGH; off = byte-identical) next to the Fix P strict-gate
+# suite in the blocking data engine job.
+#
+# VERSION 1.1.71 (2026-11-09) -- RENDER-TIMING + CLEAR-LATE HARNESS
+#
+# v1.1.71: run tests/test_dt10_v1280_render_timing.js (16_Decision_Top10.gs
+# v1.28.0: DT10_RENDER_TIMING=on times each phase of the cockpit render -
+# streamed console lines, the last phase reached in the P-195 marker and
+# one _Run_Log TIMING row; DT10_CLEAR_LATE=on clears the board zones right
+# before the paint, so a render stopped at 6 minutes keeps the previous
+# board; both default off, nothing a decision reads changes)
+# in the blocking lean lane after the v1.27.0 corp-guard harness. The
+# advisory whole-suite job gets 25 minutes instead of 15: pytest itself now
+# takes 11.3 min on a fast runner and ~14.5 on a slow one, and three main
+# pushes (7 Nov 22:53, 8 Nov 07:16 and 08:17 UTC) were cancelled at 15 min
+# seconds after reaching 100%.
 #
 # VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
 #
@@ -956,7 +986,7 @@ jobs:
   whole-suite:
     name: 🧪 Whole suite (pinned Python 3.11)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25   # v1.1.71: 15 cut slow runners off seconds after 100% (11.3-14.5 min of pytest)
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -1294,6 +1324,8 @@ jobs:
           node tests/test_dt10_v1250_owner_bands.js
           node tests/test_dt10_v1260_fundable_seats.js
           node tests/test_dt10_v1270_corp_guard.js
+          node tests/test_dt10_v1280_render_timing.js
+          node tests/test_dt10_v1290_verdict_reuse.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
@@ -1309,7 +1341,7 @@ jobs:
         env:
           TFB_TEST_REQUIRE_BASE: "1"
         run: |
-          # v1.1.72: the off-identity, V2 and X1 legs read track_performance
+          # v1.1.78: the off-identity, V2 and X1 legs read track_performance
           # v6.53.0 at main c7e666a4; with TFB_TEST_REQUIRE_BASE=1 a failed
           # fetch FAILS them instead of skipping them.
           git fetch --no-tags --depth=1 origin c7e666a4bba1165cace2cb839d7839a2bc01c78f \
@@ -1482,6 +1514,7 @@ jobs:
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
+            tests/test_de_evidence_cohort.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \
