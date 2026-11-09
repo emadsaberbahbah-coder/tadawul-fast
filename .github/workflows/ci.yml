@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.74 (2026-11-10) -- STAMP-REPAIR SUITE
+#
+# v1.1.74: run tests/test_sync_stamp_repair.py (run_dashboard_sync 6.72.0:
+# TFB_SYNC_STAMP_REPAIR=1 writes a _Status stamp that failed on a timeout
+# once more at the end of the run; default off) in the blocking lean lane
+# next to the v6.70.2 stamp-retry suite.
+#
 # VERSION 1.1.73 (2026-11-09) -- VERDICT-REUSE HARNESS
 #
 # v1.1.73: run tests/test_dt10_v1290_verdict_reuse.js (16_Decision_Top10.gs
@@ -1138,6 +1145,7 @@ jobs:
             tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
+            tests/test_sync_stamp_repair.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
