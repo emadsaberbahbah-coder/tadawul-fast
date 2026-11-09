@@ -7,7 +7,8 @@
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
  *
- * v1.28.0 (2026-11-09) [RENDER-TIMING] -- THE RENDER MEASURES EACH PHASE (ONE KNOB, DEFAULT OFF)
+ * v1.28.0 (2026-11-09) [RENDER-TIMING] + [CLEAR-LATE] -- THE RENDER MEASURES EACH PHASE; A STOPPED RENDER KEEPS
+ *   THE PREVIOUS BOARD (TWO KNOBS, BOTH DEFAULT OFF)
  * WHY (morning review, Mon 9 Nov 2026): the cockpit render now runs into the Apps Script 6-minute limit. _Run_Log
  *   counts, 4-9 Nov: ABORTED_PREV (a previous run left no completion) 2, 9, 4, 3, 2, 3 a day, beside 0-2
  *   NOT_FINISHED decision-chain renders a day; finished renders 140-344 s (medians 211-275 s). On 9 Nov the
@@ -20,7 +21,7 @@
  * WHAT: Script Property DT10_RENDER_TIMING = 'on' (any case, spaces trimmed). Absent, anything else, or a
  *   PropertiesService fault = off: DT10_PH_ stays null, every dt10PhaseMark_ is a no-op and the render is
  *   v1.27.0 byte for byte (one extra property read at start). Armed:
- *   (a) dt10PhaseMark_(name) at 34 points (setup, gates, inputs, funding, src, pool, ready, post, attach,
+ *   (a) dt10PhaseMark_(name) at 35 points (setup, gates, inputs, funding, src, pool, ready, post, attach,
  *       verdict1, stab, verdict2, alloc, final, r_clear, r_verdict, r_final, r_live, r_earn, r_postearn,
  *       r_guard, r_kpi, r_selected, r_qualified, r_nearmiss, r_alerts, r_gaps, r_cands, r_end, render, notes,
  *       sellog, exitlog, shadow, status) streams 'console.log [DT10 v1.28.0] t+123.4s pool +40.2s' at once;
@@ -31,7 +32,18 @@
  *   (c) a finished render logs 'phases 326.0s: setup 3.1 | gates 1.2 | ...' and writes ONE _Run_Log row
  *       (INFO, TIMING, the same line, details {version, total_ms, marks}).
  *   The status line, the board, the stability state and every decision value are untouched.
- *   Rollback: delete the property.
+ *   (d) [CLEAR-LATE] Script Property DT10_CLEAR_LATE = 'on' (same spellings; a fault = off): the refresh
+ *       attaches payload._dt10_clear_late = 1 and dt10RenderPayload_ clears the board zones (dt10ClearZones_,
+ *       the v1.27.0 clear unchanged) after the pre-paint steps - verdict recheck, finalize, live fill,
+ *       earnings and post-earnings tags, ticket guard - instead of before them (one extra mark,
+ *       r_clear_late, when the timer is armed too). On 9 Nov the 10:14 follow-up render was stopped after
+ *       the clear: Top_10_Investments showed the control panel and the KPI strip and nothing below row 16
+ *       until the next render. Armed, a render stopped inside those steps leaves the previous board on
+ *       screen (its own banner and verdict age; the Status line still says running); a finished render
+ *       paints the same board. Those steps read only other sheets (_Status, the source pages,
+ *       Calendar_Events, the dividend and corporate-event sheets) and the payload, never the board zones,
+ *       so none of their results change. Off (absent / anything else): no payload key, the v1.27.0 order.
+ *   Rollback: delete either property.
  *
  * v1.27.0 (2026-11-08) [CORP-EVENT-GUARD] -- A TICKET ON A NAME WITH A FILED CORPORATE EVENT IS HELD (ONE KNOB, DEFAULT OFF)
  * WHY (owner, 8 Nov 2026, after the week of 2-6 Nov: 'how we can avoid that in the future' / 'let's do the
@@ -3706,6 +3718,7 @@ var DT10_P195_LIMIT_MIN = 7;          // GAS 6-minute limit + skew
 var DT10_RENDER_TIMING_PROP = 'DT10_RENDER_TIMING';   // v1.28.0 [RENDER-TIMING]
 var DT10_RENDER_TIMING_MARKER_MS = 5000;   // v1.28.0: marker rewrite at most every 5 s
 var DT10_PH_ = null;   // v1.28.0: this execution's phase clock (null = off)
+var DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]
 // v1.11.12 [SYNC-INFLIGHT]: first/last legs of a daily_sync run and the bound.
 var DT10_INFLIGHT_PROP = 'DT10_SYNC_INFLIGHT';   // off | observe (default) | enforce
 var DT10_INFLIGHT_FIRST_KEY = 'TFB Feed Market_Leaders';
@@ -6501,6 +6514,18 @@ function dt10RenderTimingOn_() {
         .getProperty(DT10_RENDER_TIMING_PROP) || '')
         .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
   } catch (eRt) {}
+  return false;
+}
+/** v1.28.0 [CLEAR-LATE]: Script Property DT10_CLEAR_LATE = 'on' (trimmed, any
+ * case) moves the board-zone clear after the pre-paint steps; absent /
+ * anything else / a PropertiesService fault = off (the v1.27.0 order).
+ * Never throws. Read once per refresh (the payload carries the answer). */
+function dt10ClearLateOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_CLEAR_LATE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eCl) {}
   return false;
 }
 /** v1.28.0 [RENDER-TIMING] I/O: start this execution's phase clock when
@@ -10509,6 +10534,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   var tguardCfg = dt10TicketGuardConfig_();
   var kpiPlanMode = dt10KpiPlanGainMode_();
   var venueOn = dt10VenueLineOn_();
+  var clearLate = dt10ClearLateOn_();   // v1.28.0 [CLEAR-LATE]
   if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
@@ -10684,6 +10710,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   if (kpiPlanMode !== 'off') payload._dt10_kpi_plan = { mode: kpiPlanMode };
   if (kpiPlanMode === 'on') dt10KpiPlanLabelMark_(true);
   if (venueOn) payload._dt10_venue = { mode: 'on' };
+  if (clearLate) payload._dt10_clear_late = 1;   // v1.28.0 [CLEAR-LATE]: rides only when armed
   dt10PhaseMark_('attach');   // v1.28.0
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   dt10PhaseMark_('verdict1');   // v1.28.0
@@ -10971,9 +10998,10 @@ function dt10UvParse_(raw, nowMs) {
   return out;
 }
 
-function dt10RenderPayload_(sheet, payload, tokens) {
-  // Clear dynamic zones (breakApart first: section headers and empty-state
-  // lines are merged ranges; writing over stale merges throws in GAS).
+/** Clear the dynamic zones (breakApart first: section headers and empty-state
+ * lines are merged ranges; writing over stale merges throws in GAS).
+ * v1.28.0 [CLEAR-LATE]: lifted out of dt10RenderPayload_ unchanged. */
+function dt10ClearZones_(sheet) {
   var lastRow = sheet.getMaxRows();
   if (lastRow >= DT10_ZONES_START) {
     var zone = sheet.getRange(DT10_ZONES_START, 1,
@@ -10982,6 +11010,14 @@ function dt10RenderPayload_(sheet, payload, tokens) {
     zone.breakApart();
     zone.clear();
   }
+}
+function dt10RenderPayload_(sheet, payload, tokens) {
+  // v1.28.0 [CLEAR-LATE]: payload._dt10_clear_late (attached by the refresh
+  // only while DT10_CLEAR_LATE is on) moves this clear after the pre-paint
+  // steps below, so a render Google stops inside them keeps the previous
+  // board on screen. No key = the v1.27.0 order.
+  var clearLate = !!(payload && payload._dt10_clear_late === 1);
+  if (!clearLate) dt10ClearZones_(sheet);
   dt10PhaseMark_('r_clear');   // v1.28.0 [RENDER-TIMING]
   // Recheck after sheet preparation and before any financial values are
   // painted. The pre-pool generation must still match the latest sources.
@@ -11010,6 +11046,10 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   var tguardNote = dt10TicketGuard_(payload, earn && earn.map, sheet.getParent());
   if (tguardNote) payload._dt10_tguard_note = tguardNote;
   dt10PhaseMark_('r_guard');   // v1.28.0
+  if (clearLate) {   // v1.28.0 [CLEAR-LATE]: the zones clear here, right before the first paint
+    dt10ClearZones_(sheet);
+    dt10PhaseMark_('r_clear_late');
+  }
   // KPI strip
   sheet.getRange(DT10_ROW_KPI_LABELS, 1).setValue(DT10_KPI_LABELS[0]);
   var kpiRange = sheet.getRange(DT10_ROW_KPI_VALUES, 1, 1,
@@ -13048,7 +13088,9 @@ function dt10SelfTest() {
      clocks only (the execution's own DT10_PH_ is never touched). */
   report.push('render timing (DT10_RENDER_TIMING): ' + (dt10RenderTimingOn_() ? 'on' : 'off') +
       ' (phase lines stream to the execution log; a finished render writes one TIMING row to _Run_Log; ' +
-      'the P-195 marker keeps the last phase reached)');
+      'the P-195 marker keeps the last phase reached); clear late (DT10_CLEAR_LATE): ' +
+      (dt10ClearLateOn_() ? 'on' : 'off') + ' (the board zones clear after the pre-paint steps, so a stopped ' +
+      'render keeps the previous board)');
   var rtClock = { t0: 1000, last: 4300, marks: [['setup', 1200], ['pool', 2100]] };
   var rtLine = dt10PhaseLine_(rtClock);
   var rtTrail = dt10PhaseTrailNote_('{"started":"2026-11-09T05:44:28.522Z","v":"1.28.0",' +

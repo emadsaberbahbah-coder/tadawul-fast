@@ -136,8 +136,9 @@ const EDITS_V1231 = require('./dt10_edits_v1231.json');
  * reverses its enumerated edits (tests/js/dt10_edits_v1270.json) and the
  * result is hash-pinned (V1260_SHA256 = the reviewed v1.26.0 file); every
  * older oracle below starts from it. */
-/* 2026-11-09: v1.28.0 [RENDER-TIMING] (the render times each phase,
- * DT10_RENDER_TIMING, default off). v1270Source reverses its enumerated
+/* 2026-11-09: v1.28.0 [RENDER-TIMING] + [CLEAR-LATE] (the render times each
+ * phase, DT10_RENDER_TIMING; a stopped render keeps the previous board,
+ * DT10_CLEAR_LATE; both default off). v1270Source reverses its enumerated
  * edits (tests/js/dt10_edits_v1280.json) and the result is hash-pinned
  * (V1270_SHA256 = the reviewed v1.27.0 file, origin/main 55f53b7); every
  * older oracle below starts from it. */

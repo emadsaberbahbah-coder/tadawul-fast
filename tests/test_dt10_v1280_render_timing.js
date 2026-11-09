@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /* tests/test_dt10_v1280_render_timing.js
- * Harness for apps_script/16_Decision_Top10.gs v1.28.0 [RENDER-TIMING]
- * (morning review, Mon 9 Nov 2026: the 08:44 evidence follow-up render and
- * the 09:12 Decision Pages v2 build were stopped at the Apps Script
- * 6-minute limit; 2-9 ABORTED_PREV rows a day since 4 Nov). One Script
- * Property, DT10_RENDER_TIMING, default OFF.
+ * Harness for apps_script/16_Decision_Top10.gs v1.28.0 [RENDER-TIMING] +
+ * [CLEAR-LATE] (morning review, Mon 9 Nov 2026: the 08:44 evidence follow-up
+ * render and the 09:12 Decision Pages v2 build were stopped at the Apps
+ * Script 6-minute limit; 2-9 ABORTED_PREV rows a day since 4 Nov; the 10:14
+ * follow-up was stopped after the zone clear and left an empty board). Two
+ * Script Properties, DT10_RENDER_TIMING and DT10_CLEAR_LATE, default OFF.
  *
  * Dual-tree node harness over the REAL file: the delivered .gs and the
  * v1.27.0 BASE (a file given as the second argument, or the base rebuilt
- * from the delivered file by reversing exactly the 36 enumerated v1.28.0
+ * from the delivered file by reversing exactly the 38 enumerated v1.28.0
  * edits, tests/js/dt10_edits_v1280.json, SHA-256 pinned) run the REAL
  * refreshDecisionTop10 in the full-workbook shim of
  * tests/test_dt10_v1200_ticket_guard.js (the 2 Nov board; POST stub for the
@@ -16,11 +17,12 @@
  * clock captured.
  * Sections:
  *   R0 base oracle (SHA-256 pinned), versions in lockstep, both compile;
- *      census +5 functions +3 vars, 0 removed; 36 hunks reverse to the base
- *   R1 GOLDEN NEGATIVE / kill identity: the property absent / off / blank /
- *      junk / faulted -> the REAL refresh (B2, every sheet write, _Run_Log,
- *      _Selection_Log, Logger lines, POST bodies, the properties after the
- *      run) deep-equals the base; no console line; one extra property read
+ *      census +7 functions +4 vars, 0 removed; 38 hunks reverse to the base
+ *   R1 GOLDEN NEGATIVE / kill identity: either property absent / off /
+ *      blank / junk / faulted -> the REAL refresh (B2, every sheet write,
+ *      _Run_Log, _Selection_Log, Logger lines, POST bodies, the properties
+ *      after the run) deep-equals the base; no console line; one extra
+ *      property read per knob
  *   R2 armed ('on', ' ON '): the same board, writes, logs and properties as
  *      off, plus 35 streamed phase lines in the designed order, one Logger
  *      phase line and one _Run_Log TIMING row (marks = the 35 phases, total
@@ -29,10 +31,16 @@
  *      phase reached: <ph> at t+<at>s' and its details carry trail; a
  *      v1.27.0 marker (no ph) gives the base row byte for byte
  *   R4 pure: dt10PhaseLine_, dt10PhaseTrailNote_, dt10RenderTimingOn_
- *   R5 embedded dt10SelfTest: two lines added (off / on / faulted), core ok,
- *      every base line kept; the base lacks them; zero FAIL
+ *   R5 embedded dt10SelfTest: two lines added (off / on / faulted, both
+ *      knobs), core ok, every base line kept; the base lacks them; zero FAIL
  *   R6 lint: ES5 / ASCII of the diff, LF only, WHY block newest-first
- *   R7 mutants: five one-line mutations are each caught
+ *   R7 mutants: eight one-line mutations are each caught
+ *   R8 CLEAR-LATE: the refresh attaches payload._dt10_clear_late only when
+ *      armed (spellings) and paints the same board with every sheet write in
+ *      the same order; a render stopped in the pre-paint steps keeps the
+ *      previous board (cells and merges; off = the base = an empty zone);
+ *      a finished armed render still wipes stale rows and merges and equals
+ *      the off board; with the timer armed, one extra mark r_clear_late
  * The whole battery runs three times and the three digests must match; the
  * last line is 'PASS k/k' (exit 1 on any failure).
  * Usage: node tests/test_dt10_v1280_render_timing.js [new.gs] [base.gs]
@@ -312,9 +320,16 @@ function render(source, opts) {
   if (opts.kpi) p._dt10_kpi_plan = { mode: opts.kpi };
   if (opts.venue) p._dt10_venue = { mode: opts.venue };
   if (opts.live) p._dt10_live = opts.live;
-  const earn = ctx.dt10RenderPayload_(sheet, p, ctx.DT10_FALLBACK_TOKENS);
+  // v1.28.0 [CLEAR-LATE] battery only: a previous board in the zones, the armed key, a fault injected into a step
+  for (const [r, c, v] of opts.seedZone || []) sheet.getRange(r, c).setValue(v);
+  if (opts.seedMerge) sheet.getRange(...opts.seedMerge).merge();
+  if (opts.clearLate) p._dt10_clear_late = 1;
+  if (opts.inject) opts.inject(ctx);
+  let earn, threw = null;
+  try { earn = ctx.dt10RenderPayload_(sheet, p, ctx.DT10_FALLBACK_TOKENS); }
+  catch (e) { if (!opts.allowThrow) throw e; threw = String(e && e.message); }
   return { ctx, book, sheet, snap: snapshot(sheet), note: earn && earn.note, payload: p, propReads: ctx.__propReads.slice(),
-           logs: ctx.__logs.slice(), token: p._dt10_tguard_note, uv, calReads };
+           logs: ctx.__logs.slice(), token: p._dt10_tguard_note, uv, calReads, threw };
 }
 function diffCells(a, b) {
   const keys = new Set(Object.keys(a.cells).concat(Object.keys(b.cells)));
@@ -519,6 +534,7 @@ function refresh(source, props, opts) {
   });
   env.ctx.dt10BoardVerdict_ = () => ({ state: 'EXECUTABLE', reason: '', ageMin: 286, source_readiness: { ready: true, cohort: FIX.export_run, reason: '', issues: [], generation: {} } });
   env.ctx.dt10Post_ = postStub(env);
+  if (opts.inject) opts.inject(env.ctx);   // v1.28.0 [CLEAR-LATE] battery only
   env.ctx.refreshDecisionTop10();
   const seatRows = env.calls.filter(x => x[0] === 'setValues' && x[1] === 'Top_10_Investments' && x[2] === 20).map(x => JSON.parse(x[6]));
   return { env, top10, status: String(top10._val(2, 2)), calls: env.calls.slice(), runLog: plain(env.appended['_Run_Log'] || []),
@@ -534,13 +550,14 @@ const stripTok = (s, tok) => String(s).replace(' | ' + tok, '');
 
 
 /* ============================================================ v1.28.0 battery */
-const TIMING = 'DT10_RENDER_TIMING', MARKER = 'DT10_RUN_MARKER';
+const TIMING = 'DT10_RENDER_TIMING', MARKER = 'DT10_RUN_MARKER', CLEAR = 'DT10_CLEAR_LATE';
 const MARKS = ['setup', 'gates', 'inputs', 'funding', 'src', 'pool', 'ready', 'post', 'attach', 'verdict1', 'stab',
   'verdict2', 'alloc', 'final', 'r_clear', 'r_verdict', 'r_final', 'r_live', 'r_earn', 'r_postearn', 'r_guard', 'r_kpi',
   'r_selected', 'r_qualified', 'r_nearmiss', 'r_alerts', 'r_gaps', 'r_cands', 'r_end', 'render', 'notes', 'sellog',
   'exitlog', 'shadow', 'status'];
-const NEW_F = ['dt10PhaseLine_', 'dt10PhaseMark_', 'dt10PhaseStart_', 'dt10PhaseTrailNote_', 'dt10RenderTimingOn_'];
-const NEW_V = ['DT10_PH_', 'DT10_RENDER_TIMING_MARKER_MS', 'DT10_RENDER_TIMING_PROP'];
+const MARKS_CL = MARKS.slice(0, MARKS.indexOf('r_guard') + 1).concat(['r_clear_late'], MARKS.slice(MARKS.indexOf('r_guard') + 1));
+const NEW_F = ['dt10ClearLateOn_', 'dt10ClearZones_', 'dt10PhaseLine_', 'dt10PhaseMark_', 'dt10PhaseStart_', 'dt10PhaseTrailNote_', 'dt10RenderTimingOn_'];
+const NEW_V = ['DT10_CLEAR_LATE_PROP', 'DT10_PH_', 'DT10_RENDER_TIMING_MARKER_MS', 'DT10_RENDER_TIMING_PROP'];
 /* comparisons against the base read the delivered version as the base's */
 const n28 = x => JSON.parse(JSON.stringify(x).replace(/1\.28\.0/g, '1.27.0'));
 const isTimingCall = x => x[0] === 'appendRow' && x[1] === '_Run_Log' && JSON.parse(x[6])[4] === 'TIMING';
@@ -569,7 +586,8 @@ function ctxOf(src, props, throwIt) {
 }
 /* ---- reusable checks (also the mutant oracles) ---- */
 function checkGolden(src, out) {
-  const PROPSETS = [{}, { [TIMING]: 'off' }, { [TIMING]: '' }, { [TIMING]: 'yes' }, { [TIMING]: 'onn' }, { [TIMING]: '1' }];
+  const PROPSETS = [{}, { [TIMING]: 'off' }, { [TIMING]: '' }, { [TIMING]: 'yes' }, { [TIMING]: 'onn' }, { [TIMING]: '1' },
+                    { [CLEAR]: 'off' }, { [CLEAR]: 'yes' }, { [CLEAR]: 'true' }, { [TIMING]: 'no', [CLEAR]: '1' }];
   for (const props of PROPSETS) {
     const n = refresh(src, props), b = refresh(baseSource, props), tag = JSON.stringify(props);
     eq(n28(n.status), b.status, 'B2 ' + tag);
@@ -582,7 +600,8 @@ function checkGolden(src, out) {
     deq(n.cons, [], 'no console line ' + tag);
     deq(n28(n.sets), b.sets, 'property writes ' + tag);
     eq(n.propReads.byKey[TIMING], 1, 'the timing property is read once ' + tag);
-    const nr = plain(n.propReads); delete nr.byKey[TIMING]; nr.total -= 1;
+    eq(n.propReads.byKey[CLEAR], 1, 'the clear-late property is read once ' + tag);
+    const nr = plain(n.propReads); delete nr.byKey[TIMING]; delete nr.byKey[CLEAR]; nr.total -= 2;
     deq(nr, b.propReads, 'every other property read identical ' + tag);
     if (out) out.push([tag, n.status.length, n.calls.length]);
   }
@@ -647,12 +666,55 @@ function checkTrail(src, lastMarker, out) {
   deq(n28(n2.runLog), b2.runLog, 'GOLDEN NEGATIVE: an unphased marker -> the base _Run_Log');
   if (out) out.push([nr[0][5]]);
 }
+function checkClearLate(src, out) {
+  // (a) the REAL refresh: the key rides only when armed; the same board and every sheet write in the same order
+  const seen = [];
+  const spy = ctx => { const f = ctx.dt10RenderPayload_; ctx.dt10RenderPayload_ = (s, p, t) => {
+    seen.push(Object.prototype.hasOwnProperty.call(p, '_dt10_clear_late') ? p._dt10_clear_late : 'absent'); return f(s, p, t); }; };
+  const off = refresh(src, {}, { inject: spy });
+  for (const val of ['on', ' ON ', 'On']) {
+    const a = refresh(src, { [CLEAR]: val }, { inject: spy }), tag = JSON.stringify(val);
+    eq(a.status, off.status, 'B2 unchanged ' + tag);
+    deq(a.calls, off.calls, 'every sheet write unchanged, in the same order ' + tag);
+    deq(a.runLog, off.runLog, '_Run_Log unchanged ' + tag); deq(a.selLog, off.selLog, '_Selection_Log unchanged ' + tag);
+    deq(a.posted, off.posted, 'POST bodies unchanged ' + tag); deq(a.logs, off.logs, 'Logger unchanged ' + tag);
+    const ap = plain(a.props); delete ap[CLEAR]; deq(ap, off.props, 'properties unchanged ' + tag);
+  }
+  for (const val of ['off', 'yes', '1', '']) refresh(src, { [CLEAR]: val }, { inject: spy });
+  deq(seen, ['absent', 1, 1, 1, 'absent', 'absent', 'absent', 'absent'], 'payload._dt10_clear_late only for on / " ON " / On');
+  // (b) a render stopped in the pre-paint steps (the ticket guard step throws, as a 6-minute stop would end it there)
+  const STALE = [[40, 1, 'PREVIOUS BOARD ROW'], [390, 3, 'PREVIOUS FAR ROW']], MERGE = [395, 1, 1, 4];
+  const kill = ctx => { ctx.dt10TicketGuard_ = () => { throw new Error('STOPPED in r_guard'); }; };
+  const kOn = render(src, { clearLate: true, seedZone: STALE, seedMerge: MERGE, inject: kill, allowThrow: true });
+  const kOff = render(src, { seedZone: STALE, seedMerge: MERGE, inject: kill, allowThrow: true });
+  const kBase = render(baseSource, { seedZone: STALE, seedMerge: MERGE, inject: kill, allowThrow: true });
+  for (const k of [kOn, kOff, kBase]) eq(k.threw, 'STOPPED in r_guard', 'the injected stop');
+  eq(cellV(kOn.snap, 40, 1), 'PREVIOUS BOARD ROW', 'armed: a stopped render keeps the previous board');
+  eq(cellV(kOn.snap, 390, 3), 'PREVIOUS FAR ROW', 'armed: every previous row');
+  ok(kOn.snap.merges.indexOf(MERGE.join('|')) >= 0, 'armed: and its merges');
+  eq(kOn.book.counts.clear || 0, 0, 'armed: nothing cleared before the stop');
+  eq(cellV(kOff.snap, 40, 1), undefined, 'off: the zone is already empty (the 9 Nov 10:14 picture)');
+  deq(kOff.snap, kBase.snap, 'off: stopped there = the base stopped there');
+  // (c) a finished armed render: the late clear still wipes stale rows and merges; the same board as off
+  const fOn = render(src, { clearLate: true, seedZone: STALE, seedMerge: MERGE });
+  const fOff = render(src, { seedZone: STALE, seedMerge: MERGE });
+  eq(cellV(fOn.snap, 390, 3), undefined, 'armed: the stale far row is wiped');
+  ok(fOn.snap.merges.indexOf(MERGE.join('|')) < 0, 'armed: the stale merge is broken apart');
+  deq(fOn.snap, fOff.snap, 'armed: the finished board is the off board');
+  eq(fOn.book.counts.clear, fOff.book.counts.clear, 'one zone clear either way');
+  deq(fOn.calReads, fOff.calReads, 'the same Calendar_Events reads');
+  // (d) both knobs armed: one extra mark right after r_guard
+  const t = refresh(src, { [TIMING]: 'on', [CLEAR]: 'on' });
+  const det = JSON.parse(t.runLog[t.runLog.length - 1][9]);
+  deq(det.marks.map(m => m[0]), MARKS_CL, 'marks with r_clear_late after r_guard');
+  if (out) out.push([kOn.snap.merges.length, Object.keys(fOn.snap.cells).length, det.marks.length]);
+}
 function battery() {
   const digest = [];
-  test('R0 base oracle is the reviewed v1.27.0 file (SHA-256 pinned); versions in lockstep; both compile; census +5 functions +3 vars, 0 removed; 36 hunks reverse to the base', () => {
+  test('R0 base oracle is the reviewed v1.27.0 file (SHA-256 pinned); versions in lockstep; both compile; census +7 functions +4 vars, 0 removed; 38 hunks reverse to the base', () => {
     eq(sha256(baseSource), history.V1270_SHA256, 'base SHA-256');
     eq(sha256(history.v1270Source(newSource)), history.V1270_SHA256, 'reversal of the delivered file');
-    eq(EDITS.length, 36, 'hunk count');
+    eq(EDITS.length, 38, 'hunk count');
     const N = ctxOf(newSource, {}), B = ctxOf(baseSource, {});
     eq(N.DT10_VERSION, '1.28.0', 'delivered version'); eq(B.DT10_VERSION, '1.27.0', 'base version');
     ok(/^ \* Version: 1\.28\.0 \(see DT10_VERSION;/.test(newSource.split('\n')[3]), 'header line 4 lockstep');
@@ -663,7 +725,7 @@ function battery() {
     for (const f of NEW_F) eq(typeof N[f], 'function', f);
     digest.push([fn.size, vn.size]);
   });
-  test('R1 GOLDEN NEGATIVE / kill identity: the property absent / off / blank / junk / faulted -> the REAL refresh deep-equals the v1.27.0 base; no console line; one extra property read', () => {
+  test('R1 GOLDEN NEGATIVE / kill identity: the property absent / off / blank / junk / faulted (either knob) -> the REAL refresh deep-equals the v1.27.0 base; no console line; one extra read per knob', () => {
     checkGolden(newSource, digest);
   });
   let lastMarker = null;
@@ -702,13 +764,15 @@ function battery() {
     ok(rep.indexOf('[DT10 v1.28.0] self-test') === 0, 'version line');
     const nl = rep.split('\n'), bl = repB.split('\n');
     eq(nl.length, bl.length + 2, 'exactly two lines added');
-    const want = ['render timing (DT10_RENDER_TIMING): off (phase lines stream to the execution log; a finished render writes one TIMING row to _Run_Log; the P-195 marker keeps the last phase reached)',
+    const want = ['render timing (DT10_RENDER_TIMING): off (phase lines stream to the execution log; a finished render writes one TIMING row to _Run_Log; the P-195 marker keeps the last phase reached); clear late (DT10_CLEAR_LATE): off (the board zones clear after the pre-paint steps, so a stopped render keeps the previous board)',
                   'render timing core: ok (phase line, last-phase trail; a marker without a phase adds nothing)'];
     for (const l of want) { ok(nl.indexOf(l) > 0, 'line: ' + l); ok(repB.indexOf(l.split(' (')[0]) < 0, 'GOLDEN NEGATIVE: the base lacks ' + l.split(' (')[0]); }
     deq(nl.filter(l => want.indexOf(l) < 0).map(l => l.replace('[DT10 v1.28.0]', '[DT10 v1.27.0]')), bl, 'every other line identical');
     ok(rep.indexOf('FAIL') < 0, 'no FAIL');
     ok(String(ctxOf(newSource, { [TIMING]: 'on' }).dt10SelfTest()).indexOf('render timing (DT10_RENDER_TIMING): on (') > 0, 'armed line');
     ok(String(ctxOf(newSource, { [TIMING]: 'on' }, true).dt10SelfTest()).indexOf('render timing (DT10_RENDER_TIMING): off (') > 0, 'a fault reads off');
+    ok(String(ctxOf(newSource, { [CLEAR]: ' On ' }).dt10SelfTest()).indexOf('clear late (DT10_CLEAR_LATE): on (') > 0, 'clear late armed line');
+    ok(String(ctxOf(newSource, { [CLEAR]: 'on' }, true).dt10SelfTest()).indexOf('clear late (DT10_CLEAR_LATE): off (') > 0, 'clear late: a fault reads off');
     digest.push(nl.length);
   });
   test('R6 lint: ES5 / ASCII of the diff, LF only, WHY block newest-first', () => {
@@ -724,14 +788,17 @@ function battery() {
     ok(why > 0 && prev > why, 'WHY block newest-first');
     digest.push(added.length);
   });
-  test('R7 mutants: five one-line mutations are each caught', () => {
+  test('R7 mutants: eight one-line mutations are each caught', () => {
     const MUT = [
       ['always armed', ".getProperty(DT10_RENDER_TIMING_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';",
        ".getProperty(DT10_RENDER_TIMING_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() !== 'zz';", src => checkGolden(src)],
       ['the alloc mark dropped', "  dt10PhaseMark_('alloc');   // v1.28.0\n", '', src => checkArmed(src)],
       ['no throttle', 'now - ph.wrote >= DT10_RENDER_TIMING_MARKER_MS', 'now - ph.wrote >= 0', src => checkArmed(src)],
       ['no TIMING row', "dt10RunLogRow_('INFO', 'TIMING', phLine,", "dt10RunLogRow_('INFO', 'TIMNG', phLine,", src => checkArmed(src)],
-      ['no trail in the row', "'out before clearing its marker; this run proceeds' + trail,", "'out before clearing its marker; this run proceeds',", src => checkTrail(src, lastMarker)]
+      ['no trail in the row', "'out before clearing its marker; this run proceeds' + trail,", "'out before clearing its marker; this run proceeds',", src => checkTrail(src, lastMarker)],
+      ['the render ignores the key', 'var clearLate = !!(payload && payload._dt10_clear_late === 1);', 'var clearLate = false;', src => checkClearLate(src)],
+      ['the late clear dropped', "    dt10ClearZones_(sheet);\n    dt10PhaseMark_('r_clear_late');", "    dt10PhaseMark_('r_clear_late');", src => checkClearLate(src)],
+      ['the key never attached', '  if (clearLate) payload._dt10_clear_late = 1;', '  if (false) payload._dt10_clear_late = 1;', src => checkClearLate(src)]
     ];
     for (const [name, from, to, run] of MUT) {
       eq(newSource.split(from).length - 1, 1, 'mutant anchor ' + name);
@@ -740,6 +807,9 @@ function battery() {
       ok(caught, 'mutant survived: ' + name);
     }
     digest.push(MUT.length);
+  });
+  test('R8 CLEAR-LATE: the key rides only when armed; the same board and write order; a stopped render keeps the previous board; a finished one still wipes stale zones; one extra mark with the timer', () => {
+    checkClearLate(newSource, digest);
   });
   return sha256(JSON.stringify(digest)).slice(0, 16);
 }
