@@ -1,11 +1,38 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.28.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.29.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.29.0 (2026-11-09) [VERDICT-REUSE] -- ONE SOURCE CHECK FEWER BEFORE THE POST AND ONE FEWER AFTER STABILITY
+ *   (ONE KNOB, DEFAULT OFF)
+ * WHY (render timing, Mon 9 Nov 2026): the first armed DT10_RENDER_TIMING line, the 12:09 evidence follow-up
+ *   render, read 'phases 205.6s: ... src 9.5 | pool 29.6 | ready 26 | post 38 | attach 0.3 | verdict1 23.5 |
+ *   stab 1.5 | verdict2 22.9 | ... | r_verdict 22.2 | ... | r_cands 11.4 | ... | status 3.3'. The source
+ *   readiness (dt10SourceReadiness_: the approved-scope Symbol reads and digests of the four pool pages plus
+ *   _Status) runs five times per render, about 104 s of 205.6. Two of the five decide nothing:
+ *   - 'ready' (26 s) feeds only the Logger line before the POST; the status line is rebuilt from the
+ *     pre-paint recheck's readiness (finalSource) and never shows it;
+ *   - 'verdict2' (22.9 s) repeats verdict 1 across the stability step, which reads neither the feed nor the
+ *     source pages (1.5 s), and the render's own recheck (r_verdict) runs again before any value is
+ *     painted, followed by a second dt10FinalizeBoard_.
+ *   On 9 Nov 4 of 13 renders were stopped at the 6-minute limit.
+ * WHAT: Script Property DT10_VERDICT_REUSE = 'on' (any case, spaces trimmed). Absent, anything else, or a
+ *   PropertiesService fault = off: the render is v1.28.0 byte for byte (one extra property read per
+ *   refresh). Armed:
+ *   (a) the pre-POST readiness is not computed; the POST Logger line ends 'source readiness checked after
+ *       the POST (DT10_VERDICT_REUSE)';
+ *   (b) verdict 1 stands for verdict 2 (payload._dt10_uv is kept across the stability step).
+ *   The three checks that decide something stay: verdict 1 (it freezes stability on blocked sources), the
+ *   pre-paint recheck r_verdict (it re-finalizes the board before any value is painted) and the
+ *   selection-log recheck (it withholds logged tickets). A source change during the stability step is still
+ *   caught by r_verdict, as one during the allocation replay always was. With the timer armed the marks keep
+ *   their names; 'ready' and 'verdict2' read about 0. Expected saving: about 49 s per render (26.0 + 22.9 s
+ *   at 12:09). dt10SelfTest: the render-timing line names the knob (line count unchanged).
+ *   Rollback: delete the property.
  *
  * v1.28.0 (2026-11-09) [RENDER-TIMING] + [CLEAR-LATE] -- THE RENDER MEASURES EACH PHASE; A STOPPED RENDER KEEPS
  *   THE PREVIOUS BOARD (TWO KNOBS, BOTH DEFAULT OFF)
@@ -2745,7 +2772,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.28.0';
+var DT10_VERSION = '1.29.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3227,7 +3254,8 @@ function dt10PoolNote_(pool, source) {
       (pool.duplicatesSkipped ? '(' + pool.duplicatesSkipped + ' duplicate symbols removed) ' : '') +
       (pool.truncated ? '(TRUNCATED to cap ' + pool.cap + ' of ' + pool.total + ' available)' : '(all available sheet rows)') +
       (frame ? ' | pool_reconciliation_v1=' + JSON.stringify(frame) : '') +
-      ' | source readiness ' + (source.ready ? 'VERIFIED (run ' + source.cohort + ')' : 'WITHHELD: ' + source.reason);
+      ' | source readiness ' + (source === null ? 'checked after the POST (DT10_VERDICT_REUSE)' :   // v1.29.0
+          (source.ready ? 'VERIFIED (run ' + source.cohort + ')' : 'WITHHELD: ' + source.reason));
 }
 /** Local display result only; an empty Sheets pool never invokes providers
  * or fabricates backend acquisition/allocation proof. */
@@ -3719,6 +3747,7 @@ var DT10_RENDER_TIMING_PROP = 'DT10_RENDER_TIMING';   // v1.28.0 [RENDER-TIMING]
 var DT10_RENDER_TIMING_MARKER_MS = 5000;   // v1.28.0: marker rewrite at most every 5 s
 var DT10_PH_ = null;   // v1.28.0: this execution's phase clock (null = off)
 var DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]
+var DT10_VERDICT_REUSE_PROP = 'DT10_VERDICT_REUSE';   // v1.29.0 [VERDICT-REUSE]
 // v1.11.12 [SYNC-INFLIGHT]: first/last legs of a daily_sync run and the bound.
 var DT10_INFLIGHT_PROP = 'DT10_SYNC_INFLIGHT';   // off | observe (default) | enforce
 var DT10_INFLIGHT_FIRST_KEY = 'TFB Feed Market_Leaders';
@@ -6526,6 +6555,19 @@ function dt10ClearLateOn_() {
         .getProperty(DT10_CLEAR_LATE_PROP) || '')
         .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
   } catch (eCl) {}
+  return false;
+}
+/** v1.29.0 [VERDICT-REUSE]: Script Property DT10_VERDICT_REUSE = 'on' (trimmed,
+ * any case) drops the two source checks that decide nothing (the pre-POST
+ * readiness behind the Logger line; verdict 2, which repeats verdict 1 across
+ * the stability step); absent / anything else / a PropertiesService fault =
+ * off (the v1.28.0 checks). Never throws. Read once per refresh. */
+function dt10VerdictReuseOn_() {
+  try {
+    return String(PropertiesService.getScriptProperties()
+        .getProperty(DT10_VERDICT_REUSE_PROP) || '')
+        .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
+  } catch (eVr) {}
   return false;
 }
 /** v1.28.0 [RENDER-TIMING] I/O: start this execution's phase clock when
@@ -10535,6 +10577,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   var kpiPlanMode = dt10KpiPlanGainMode_();
   var venueOn = dt10VenueLineOn_();
   var clearLate = dt10ClearLateOn_();   // v1.28.0 [CLEAR-LATE]
+  var verdictReuse = dt10VerdictReuseOn_();   // v1.29.0 [VERDICT-REUSE]: one read; off => the v1.28.0 checks
   if (itMode !== 'enforce') dt10InputTruthKpiState_(sheet, itMode, null);
   var itRef = null;
   if (itMode !== 'off') {
@@ -10629,7 +10672,9 @@ function dt10RefreshDecisionTop10Run_(run) {
     if (pool.rows.length) {
       dt10Outage = dt10OutageMapFromPool_(pool.rows);   // v1.11.10 [P-168]
     }
-    poolNote = dt10PoolNote_(pool, dt10SourceReadiness_(ss, sourceContext));
+    // v1.29.0 [VERDICT-REUSE]: this readiness feeds only the Logger line below; armed, it is not computed
+    // (null) -- the status line is rebuilt from the pre-paint recheck's readiness.
+    poolNote = dt10PoolNote_(pool, verdictReuse ? null : dt10SourceReadiness_(ss, sourceContext));
   }
   dt10PhaseMark_('ready');   // v1.28.0
   Logger.log('[DT10 v' + DT10_VERSION + '] POST ' + DT10_ENDPOINT + ' | ' +
@@ -10719,7 +10764,9 @@ function dt10RefreshDecisionTop10Run_(run) {
       {note: 'stab: frozen (source readiness withheld)'} :
       dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]
   dt10PhaseMark_('stab');   // v1.28.0
-  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
+  // v1.29.0 [VERDICT-REUSE]: the stability step reads neither the feed nor the source pages, so armed,
+  // verdict 1 stands for verdict 2; the pre-paint recheck (r_verdict) still runs before any value is painted.
+  if (!verdictReuse) payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   dt10PhaseMark_('verdict2');   // v1.28.0
   if (resp.local !== true) dt10ReallocateBoard_(payload, body);
   dt10PhaseMark_('alloc');   // v1.28.0
@@ -13090,7 +13137,9 @@ function dt10SelfTest() {
       ' (phase lines stream to the execution log; a finished render writes one TIMING row to _Run_Log; ' +
       'the P-195 marker keeps the last phase reached); clear late (DT10_CLEAR_LATE): ' +
       (dt10ClearLateOn_() ? 'on' : 'off') + ' (the board zones clear after the pre-paint steps, so a stopped ' +
-      'render keeps the previous board)');
+      'render keeps the previous board); verdict reuse (DT10_VERDICT_REUSE): ' +
+      (dt10VerdictReuseOn_() ? 'on' : 'off') + ' (no log-only source check before the POST; verdict 1 stands ' +
+      'for verdict 2; the pre-paint and selection-log rechecks stay)');
   var rtClock = { t0: 1000, last: 4300, marks: [['setup', 1200], ['pool', 2100]] };
   var rtLine = dt10PhaseLine_(rtClock);
   var rtTrail = dt10PhaseTrailNote_('{"started":"2026-11-09T05:44:28.522Z","v":"1.28.0",' +
