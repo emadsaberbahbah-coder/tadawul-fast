@@ -218,3 +218,11 @@ Main `4b478e7` (#935-#937) was merged in with a merge commit. The ci.yml header 
 - The header's claim note lists the open claims after the re-numbering: 1.1.71 #926, 1.1.72 #938, 1.1.73 #915, 1.1.74 #922, 1.1.75 #923, 1.1.76 #909.
 - Main's 1.1.70 / 1.1.69 / 1.1.68 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
 - After the merge: `tests/test_calib_call_split.py` 37 passed with `TFB_TEST_REQUIRE_BASE=1`. The verifier pins, workflow flag mappings and tracker flags suites pass (49 passed). compileall and ruff (CI rules) are clean, and no conflict marker remains.
+
+## Addendum 2026-11-09 - merge of main `86edd72`
+
+Main `86edd72` (#939-#945) was merged in with a merge commit. Main took ci.yml 1.1.71-1.1.73, and its 1.1.71 raises the advisory whole-suite job's cap from 15 to 25 minutes.
+
+- ci.yml: this release is re-numbered **1.1.71 -> 1.1.77** (its header, its `v1.1.77` line and its step comment).
+- The claim note now reads: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909, 1.1.77 #926, 1.1.78 #938, 1.1.79 #915. Only the three claims main took moved.
+- Main's 1.1.73 / 1.1.72 / 1.1.71 blocks follow verbatim. Against main, the ci.yml diff adds lines only. No other file conflicted.

@@ -37,7 +37,9 @@ const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
 const OLD_PATH = process.argv[3] || '';
-const NEW = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-08: v1.2.35 [STOP-RULE] is delivered; this harness proves an older diff, so it reads the v1.2.34 file
+// rebuilt from the delivered one (tests/js/dp2_history.js: the v1.2.35 hunks reversed, SHA-256 pinned).
+const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1234Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1232.json'), 'utf8'));
 const V1231_SHA256 = 'd789cf502c08ed00278196707b4f6d3057c5c1bbd00b86ad47254ed77e3cac20';   // v1.2.31 (origin/main 8478029d)
