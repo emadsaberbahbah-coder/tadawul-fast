@@ -164,6 +164,8 @@ sys.path.insert(0, _ROOT)
 # 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
 # 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
 # requested; Commodities_FX name coverage). No verifier logic changed.
+# 2026-11-10 (same rule): run_dashboard_sync 6.71.0 -> 6.72.0 (STAMP-REPAIR,
+# default off).
 # 2026-10-29 (same rule): run_dashboard_sync 6.70.2 -> 6.71.0 (FW2-STALE-PE,
 # TFB_SYNC_FW2_STALE_PE, default off: a row FW-2 would strip for a mildly
 # stale P/E keeps its fresh quote with P/E and EPS cleared once its last-good
@@ -303,7 +305,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.71.0", "dashboard sync"),
+    ("run_dashboard_sync", "6.72.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
