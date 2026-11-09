@@ -69,6 +69,9 @@ jobs:
       # record the Register section 5 evidence-window boundary (criterion 1
       # was 17/28 on 2026-10-10). Rollback: unset/off repository Variable.
       TFB_S1_CRITERIA_V2: ${{ vars.TFB_S1_CRITERIA_V2 || 'off' }}
+      # v1.9.4 (2026-11-10): a seat that enters on a non-trading day stores its
+      # latest close as its base, so the next session can be scored. Rollback: off.
+      TFB_S1_SEED_NEW_SEATS: ${{ vars.TFB_S1_SEED_NEW_SEATS || 'on' }}
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is

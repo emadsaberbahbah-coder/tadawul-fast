@@ -1,6 +1,21 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.4 (2026-11-10) — A SEAT THAT ENTERS ON A NON-TRADING DAY GETS ITS BASE
+WHY: S-1 stayed at 26/28. The board rotated over the weekend (7-8 Nov) to five
+new names. A non-trading row stores a fresh bar or carries the previous stored
+price, so a NEW seat (no previous price, no bar newer than the previous row)
+was stored with no price at all. On Monday 9 Nov nothing could be paired:
+DAY_EXCLUDED_INFRA fresh=0/5 new=[EFC.US,MBIN.US,PFS.US,SPFI.US,ZTO.US], the
+55th excluded day. Every weekend rotation costs one evidence day this way.
+FIX: stored_prices_today (the unchanged snapshot rule, moved into a pure
+helper) also stores, on a DAY_NON_TRADING row only, the latest real close of
+a new seat as its base. No session happened since that close, so the next
+session's return pairs exactly one session; nothing is scored on the seeding
+row, and a fresh or carried price always wins. The row note gains
+"seeded=<names>". GATE: TFB_S1_SEED_NEW_SEATS = off (default, byte-identical)
+| on (shadow_scorer.yml maps on). Counting, basket math, criteria: unchanged.
+
 VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
 Lookup/read failures previously became empty regret or shadow history. A failed
 regret read could append an existing fork again, replace its summary and publish
@@ -461,7 +476,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+SCRIPT_VERSION = "1.9.4"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -587,6 +602,38 @@ def _num(x: Any) -> Optional[float]:
 # --------------------------------------------------------------------------- #
 # pure scoring core (fully selftested offline)                                 #
 # --------------------------------------------------------------------------- #
+def _seed_new_seats_enabled() -> bool:
+    """v1.9.4 [SEED-NEW-SEATS]: TFB_S1_SEED_NEW_SEATS=1/true/yes/on; default off."""
+    return (os.getenv("TFB_S1_SEED_NEW_SEATS") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def stored_prices_today(syms: List[str], spot: Dict[str, float], spot_asof: Dict[str, Any],
+                        p: Optional[Dict[str, Any]], p_date: Optional[date],
+                        day_non_trading: bool) -> Tuple[Dict[str, float], List[str]]:
+    """v1.9.4 PURE: the price snapshot a row stores. Fresh symbols at today's
+    bar; stale symbols carry their previous stored price so the next fresh bar
+    captures the full move; nothing is stored at an invented level. With
+    TFB_S1_SEED_NEW_SEATS on, a DAY_NON_TRADING row also stores the latest real
+    close of a seat that has neither a fresh bar nor a previous price (it
+    entered while no venue traded): that close is exactly the base the next
+    session's return needs. Returns (prices, seeded symbols)."""
+    prices_today: Dict[str, float] = {}
+    seeded: List[str] = []
+    prev_prices = (p.get("prices") or {}) if p else {}
+    for s in syms:
+        if s in spot and (not _price_honesty_enabled() or p_date is None
+                          or (spot_asof.get(s) is not None
+                              and spot_asof[s] > p_date)):
+            prices_today[s] = spot[s]
+        elif p and s in prev_prices:
+            prices_today[s] = prev_prices[s]
+        elif day_non_trading and _seed_new_seats_enabled() and spot.get(s):
+            prices_today[s] = spot[s]
+            seeded.append(s)
+    return prices_today, seeded
+
+
 def _price_honesty_enabled() -> bool:
     """v1.2.0 kill-switch — default ON (protective; guards ship armed)."""
     return (os.getenv("TFB_SHADOW_PRICE_HONESTY") or "1").strip().lower() \
@@ -2135,17 +2182,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Stored snapshot: fresh symbols at today's bar; stale symbols carry
         # their previous stored price so the next fresh bar captures the full
         # move; nothing is stored at an invented level.
-        prices_today: Dict[str, float] = {}
-        for s in syms:
-            if s in spot and (not _price_honesty_enabled() or p_date is None
-                              or (spot_asof.get(s) is not None
-                                  and spot_asof[s] > p_date)):
-                prices_today[s] = spot[s]
-            elif p and s in (p.get("prices") or {}):
-                prices_today[s] = p["prices"][s]
+        prices_today, _seeded = stored_prices_today(      # v1.9.4: same rule, pure helper
+            syms, spot, spot_asof, p, p_date, day_non_trading)
         if day_non_trading and p:                  # v1.5.0 B-2
             note = (f"DAY_NON_TRADING no-venue-session "
-                    f"fresh={m['n_fresh']}/{len(syms)}")
+                    f"fresh={m['n_fresh']}/{len(syms)}"
+                    + (f" seeded={','.join(_seeded[:6])}" if _seeded else ""))
         elif day_excluded and p:
             note = (f"DAY_EXCLUDED_INFRA fresh={m['n_fresh']}/{len(syms)} "
                     f"stale={m['n_stale']}")
