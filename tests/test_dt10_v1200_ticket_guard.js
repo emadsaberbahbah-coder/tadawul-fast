@@ -87,7 +87,7 @@ const s1200 = /^var DT10_VERSION = '1\.20\.0';$/m.test(newSource) ? newSource : 
 // count reaches the readiness reason in the REAL refresh's Logger lines, so the refresh-level golden
 // negative reads the v1.21.0 file rebuilt from the delivered one (v1.21.1 edits reversed, SHA-256
 // pinned); tests/test_dt10_v1211_mf_scope.js proves v1.21.1 = v1.21.0 apart from that data.
-const S1210 = /^var DT10_VERSION = '1\.2(?:1\.1|2\.0|3\.[01]|4\.0|5\.0|6\.0|7\.0)';$/m.test(newSource) ? history.v1210Source(newSource) : newSource;   // 2026-11-08: v1.22.0 stacked; the oracle reverses it first
+const S1210 = /^var DT10_VERSION = '1\.2(?:1\.1|2\.0|3\.[01]|4\.0|5\.0|6\.0|7\.0|8\.0)';$/m.test(newSource) ? history.v1210Source(newSource) : newSource;   // 2026-11-08: v1.22.0 stacked; the oracle reverses it first
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_candidates_2026-10-10.json'), 'utf8'));
 const PAGES = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dt10_pages_2026-10-05.json'), 'utf8'));
 const GUARD = 'DT10_TICKET_GUARD', KPI = 'DT10_KPI_PLAN_GAIN', VENUE = 'DT10_VENUE_LINE', MARK = 'DT10_KPI_PLAN_LABEL_STATE';
@@ -120,7 +120,7 @@ const r1 = x => Math.round(x * 10) / 10;
 const fmt = n => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 /* The version string reaches the Logger lines and the run-marker property;
  * comparisons against the base read the delivered version as the base's. */
-const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:20\.0|21\.[01]|22\.0|23\.[01]|24\.0|25\.0|26\.0|27\.0)/g, 'v1.19.0'));   // 2026-11-05: v1.21.1 too
+const nv = x => JSON.parse(JSON.stringify(x).replace(/v1\.(?:20\.0|21\.[01]|22\.0|23\.[01]|24\.0|25\.0|26\.0|27\.0|28\.0)/g, 'v1.19.0'));   // 2026-11-05: v1.21.1 too
 
 /* ============================================================ the live board of 2 Nov 2026 */
 const LIVE = [
@@ -572,9 +572,9 @@ function battery() {
   test('V0 base oracle is the reviewed v1.19.0 file (SHA-256 pinned); versions in lockstep; both files compile', () => {
     eq(sha256(baseSource), history.V1190_SHA256, 'base SHA-256');
     eq(B.DT10_VERSION, '1.19.0', 'base version');
-    eq(N.DT10_VERSION, '1.27.0', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
-    ok(/^ \* Version: 1\.27\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
-    ok(newSource.indexOf("var DT10_VERSION = '1.27.0';") > 0, 'DT10_VERSION literal');
+    eq(N.DT10_VERSION, '1.28.0', 'delivered version');   // 2026-11-05: v1.21.1 pins moved
+    ok(/^ \* Version: 1\.28\.0 /.test(newSource.split('\n')[3]), 'header line 4 lockstep');   // 2026-11-08: v1.22.0 pin moved
+    ok(newSource.indexOf("var DT10_VERSION = '1.28.0';") > 0, 'DT10_VERSION literal');
     eq(sha256(s1200), history.V1200_SHA256, 'rebuilt v1.20.0 SHA-256');
     ok(/^ \* Version: 1\.20\.0 /.test(s1200.split('\n')[3]) && s1200.indexOf("var DT10_VERSION = '1.20.0';") > 0, 'rebuilt v1.20.0 lockstep');
     eq(N.DT10_TICKET_GUARD_PROP, GUARD); eq(N.DT10_KPI_PLAN_GAIN_PROP, KPI); eq(N.DT10_VENUE_LINE_PROP, VENUE); eq(N.DT10_KPI_PLAN_LABEL_PROP, MARK);
@@ -656,7 +656,7 @@ function battery() {
       deq(o.payload.kpis, getOff().payload.kpis, 'observe changes no KPI');
       eq(o.token, 'tguard: would hold CRC.US(earn 0d) EFC.US(earn 2d)', 'token');
       const gl = o.logs.filter(l => /ticket guard \(observe\)/.test(l));
-      deq(gl, ['[DT10 v1.27.0] ticket guard (observe): would hold 2 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) | earnings <= 3d, owner rule off, cap none'], 'one Logger line');
+      deq(gl, ['[DT10 v1.28.0] ticket guard (observe): would hold 2 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) | earnings <= 3d, owner rule off, cap none'], 'one Logger line');
       deq(o.logs.filter(l => !/ticket guard/.test(l)), getOff().logs, 'every other Logger line identical');
     }
     // one Calendar_Events read per render: the guard takes the v1.6.0 tagger's map; it reads only when the tagger is switched off
@@ -729,7 +729,7 @@ function battery() {
     }
     eq(e.payload.kpis.total_suggested_sar, Math.round(LIVE.reduce((s, l) => s + l.sar, 0) - 8527.4 - 11467.4), 'spend = the four tickets, unchanged');
     eq(e.ctx.dt10TicketGuardHeldCount_(e.payload.selected), 2, 'two _tguard_held markers');
-    ok(e.logs.some(l => l === '[DT10 v1.27.0] ticket guard (enforce): held 2 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) | earnings <= 3d, owner rule off, cap none | executable 6 -> 4, unallocated +19994 SAR'), 'Logger line');
+    ok(e.logs.some(l => l === '[DT10 v1.28.0] ticket guard (enforce): held 2 of 6 executable ticket(s): CRC.US(earn 0d) EFC.US(earn 2d) | earnings <= 3d, owner rule off, cap none | executable 6 -> 4, unallocated +19994 SAR'), 'Logger line');
     // the research-context tags travel: the post-earnings prefix (INDV held by a cap of 3) and the live-fill suffix (a funded _qhold seat)
     const pe = render(newSource, { tguard: guardCfg('enforce', { maxTickets: 3 }) }), peC = render(newSource, { unfunded: ['CRC.US', 'EFC.US', 'INDV.US'] });
     eq(seatCells(pe.snap, 'INDV.US')[29], '[held: ticket cap 3] ' + seatCells(peC.snap, 'INDV.US')[29], 'post-earnings tag kept behind the prefix');
@@ -910,7 +910,7 @@ function battery() {
       return String(ctx.dt10SelfTest());
     };
     const rep = mini(newSource, {}), repB = mini(baseSource, {});
-    ok(rep.indexOf('[DT10 v1.27.0] self-test') === 0, 'version line');
+    ok(rep.indexOf('[DT10 v1.28.0] self-test') === 0, 'version line');
     const lines = ['ticket guard (DT10_TICKET_GUARD): off (off = v1.19.0 board; observe names; enforce holds) | core: ok (earnings 3 holds A, 5 adds C, owner rule adds B, cap 1 keeps B; apply ok)',
       'kpi plan gain (DT10_KPI_PLAN_GAIN): off (Exp. Gain TP1 (SAR) = sum Ticket SAR x (TP1 SAR / Price SAR - 1); off = v1.19.0 KPI) | core: ok (four tickets 1050 SAR; no ticket = em dash)',
       'venue line (DT10_VENUE_LINE): off (approximate regular sessions in Riyadh time, no holidays; display only) | core: ok (US 17:30 winter / 16:30 summer, London 11:00, Tadawul Sun 10:00, Friday night -> Mon; open now / withheld / unsized = none)'];
@@ -918,7 +918,7 @@ function battery() {
     ok(rep.indexOf(': FAIL') < 0 && rep.indexOf('FAIL [') < 0 && rep.indexOf('apply FAIL') < 0, 'no FAIL');
     const baseLines = repB.split('\n'), newLines = rep.split('\n');
     deq(baseLines.filter(l => l.indexOf('[DT10 v1.19.0]') !== 0 && newLines.indexOf(l) < 0), [], 'every base self-test line present');
-    eq(newLines.length, baseLines.length + 3 + 2 + 2 + 4 + 2 + 2, 'exactly three lines added (+ the two v1.22.0 window lines + the two v1.23.0 cool-down lines + the four v1.24.0 seat-guard lines + the two v1.25.0 owner-bands lines + the two v1.26.0 fundable-seat lines)');
+    eq(newLines.length, baseLines.length + 3 + 2 + 2 + 4 + 2 + 2 + 2, 'exactly three lines added (+ the two v1.22.0 window lines + the two v1.23.0 cool-down lines + the four v1.24.0 seat-guard lines + the two v1.25.0 owner-bands lines + the two v1.26.0 fundable-seat lines + the two v1.28.0 render-timing lines)');
     const armed = mini(newSource, { [GUARD]: ' Enforce ', DT10_GUARD_EARN_DAYS: '5', DT10_GUARD_OWNER_RULE: 'on', DT10_GUARD_MAX_TICKETS: '2', [KPI]: 'ON', [VENUE]: 'on' });
     ok(armed.indexOf('ticket guard (DT10_TICKET_GUARD): enforce [earnings <= 5d, owner rule on, cap 2]') > 0 && armed.indexOf('kpi plan gain (DT10_KPI_PLAN_GAIN): on (') > 0 &&
        armed.indexOf('venue line (DT10_VENUE_LINE): on (') > 0 && armed.indexOf('FAIL') < 0, 'armed lines');

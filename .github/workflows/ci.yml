@@ -2,6 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.71 (2026-11-09) -- RENDER-TIMING HARNESS
+#
+# v1.1.71: run tests/test_dt10_v1280_render_timing.js (16_Decision_Top10.gs
+# v1.28.0: DT10_RENDER_TIMING=on times each phase of the cockpit render -
+# streamed console lines, the last phase reached in the P-195 marker and
+# one _Run_Log TIMING row; default off, nothing a decision reads changes)
+# in the blocking lean lane after the v1.27.0 corp-guard harness. The
+# advisory whole-suite job gets 25 minutes instead of 15: pytest itself now
+# takes 11.3 min on a fast runner and ~14.5 on a slow one, and three main
+# pushes (7 Nov 22:53, 8 Nov 07:16 and 08:17 UTC) were cancelled at 15 min
+# seconds after reaching 100%.
+#
 # VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
 #
 # v1.1.70: run tests/test_pre_open_check.py (scripts/pre_open_check.py
@@ -940,7 +952,7 @@ jobs:
   whole-suite:
     name: 🧪 Whole suite (pinned Python 3.11)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25   # v1.1.71: 15 cut slow runners off seconds after 100% (11.3-14.5 min of pytest)
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -1278,6 +1290,7 @@ jobs:
           node tests/test_dt10_v1250_owner_bands.js
           node tests/test_dt10_v1260_fundable_seats.js
           node tests/test_dt10_v1270_corp_guard.js
+          node tests/test_dt10_v1280_render_timing.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
