@@ -2,8 +2,39 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.159.2
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.160.0
 ================================================================================
+
+WHY v5.160.0 - A COHORT THAT LOSES ON MATURED RECORDS IS NOT INVESTABLE
+(TFB_EVIDENCE_GATE off | observe | enforce, default off = byte-identical;
+TFB_EVIDENCE_DEMOTE_COHORTS, default 'SR:HIGH')
+- EVIDENCE (owner, 9 Nov 2026: "Still our system is less than 49% ... check
+  what is preventing that and let's correct it"): the Decision Pages v2
+  tile "INVESTABLE hit rate, matured records" reads 48.7% = 617 WIN of
+  1,268 matured WIN/LOSS Performance_Log records with Entry Investability
+  INVESTABLE (28 Jun - 9 Nov; WATCHLIST 47.7%, n=10,946). Split by market
+  and the tracker's own confidence bucket (forecast_confidence >= 0.75
+  HIGH), Tadawul HIGH won 82 of 288 (28.5%): 37.4% Jun-Aug (n=171) and
+  15.4% Sep-Nov (n=117) - a loser in both halves, 23% of all INVESTABLE
+  records. Tadawul MEDIUM won 56.9% (n=109); US HIGH 58.9%, US MEDIUM
+  54.9%. Within Tadawul, INVESTABLE did worse than WATCHLIST in Jul and Aug.
+- The second lever is not code: TFB_CONSERVATIVE_GATE_SCORE_FLOOR (v5.81.0,
+  default 68). INVESTABLE records scored 68-70 won 44-46%. Floor 70 plus
+  this cohort demotion: 58.8% (n=662) on the same records - 65.4% Jun-Aug
+  (market reference, WATCHLIST outside Tadawul: 55.3%) and 51.9% Sep-Nov
+  (reference 35.1%); every removed slice was below 50%.
+- FIX: one more DEMOTE-only tier in _apply_investability_gate, after the
+  conservative and thin-history tiers. A still-INVESTABLE row whose cohort
+  MARKET:CONFIDENCE is listed in TFB_EVIDENCE_DEMOTE_COHORTS becomes
+  WATCHLIST / WATCH with block_reason "Evidence gate: <cohort> ..." under
+  enforce; observe appends the substring-safe warning
+  evidence_cohort_watch:<cohort> and changes no verdict. MARKET is the
+  symbol suffix (SR for .SR and bare four-digit Tadawul codes); CONFIDENCE
+  uses scripts/track_performance.py _confidence_bucket thresholds on
+  forecast_confidence (a percent-scale value is read as points). A row with
+  no suffix or no confidence has no cohort and is never demoted. Never
+  promotes; no column; surface_gate_states() reports the mode, the cohort
+  list and the effective conservative floor.
 
 WHY v5.159.2 - THE NAME RESCUE ACCEPTS THE VERIFIED YAHOO ALIAS IT ASKED FOR
 (TFB_YAHOO_ID_ALIAS, the normalize v5.7.0 flag; off = byte-identical)
@@ -4474,7 +4505,11 @@ from core.financial_units import (
 # v5.159.2 (2026-10-28): BB-1 echo gate accepts the verified Yahoo alias it
 #   requested (see WHY v5.159.2). Off (TFB_YAHOO_ID_ALIAS unset) is
 #   byte-identical. Tests: tests/test_yahoo_id_alias.py (A10-A12).
-__version__ = "5.159.2"
+# v5.160.0 (2026-11-09): [EVIDENCE-COHORT] (see WHY v5.160.0). A still-
+#   INVESTABLE row in a listed MARKET:CONFIDENCE cohort (default SR:HIGH) is
+#   tagged (observe) or demoted to WATCHLIST (enforce). TFB_EVIDENCE_GATE
+#   default off = byte-identical. Tests: tests/test_de_evidence_cohort.py.
+__version__ = "5.160.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -6450,6 +6485,9 @@ def surface_gate_states() -> Dict[str, Any]:
             "tuple_noise_release": _tuple_noise_mode(),                # v5.152.0 (WP-3a)
             "settle_unresolved": _f7_unresolved_mode(),                # v5.153.0 (WP-2b)
             "price_precision": "on" if _price_precision_enabled() else "off",  # v5.152.0
+            "evidence_gate": _evidence_gate_mode(),                    # v5.160.0
+            "evidence_cohorts": _evidence_cohorts_label(),             # v5.160.0
+            "conservative_floor": _conservative_gate_score_floor(),    # v5.160.0 (v5.81.0 knob)
         }
     except Exception:
         return {}
@@ -7511,6 +7549,94 @@ def _conservative_gate_risk_cap() -> float:
     if _market_regime() == "bear":
         base -= _get_env_float("TFB_REGIME_BEAR_RISK_DELTA", _REGIME_BEAR_RISK_DELTA_DEFAULT)
     return base
+
+
+# -- v5.160.0 [EVIDENCE-COHORT] (see WHY v5.160.0) ------------------------------
+_EVIDENCE_COHORTS_DEFAULT: str = "SR:HIGH"
+_EVIDENCE_OBSERVE_TAG: str = "evidence_cohort_watch"   # substring-safe (no cap/forecast/target/roi/drop/reject)
+_EVIDENCE_CONF_LEVELS = ("HIGH", "MEDIUM", "LOW")
+_EVIDENCE_TADAWUL_BARE = re.compile(r"^[0-9]{4}$")
+
+
+def _evidence_gate_mode() -> str:
+    """v5.160.0: TFB_EVIDENCE_GATE -> 'off' (default, also any unknown word),
+    'observe' (tag only) or 'enforce' (demote). Never raises."""
+    raw = (os.getenv("TFB_EVIDENCE_GATE") or "").strip().lower()
+    if raw in {"enforce", "on", "1", "true", "yes"}:
+        return "enforce"
+    if raw in {"observe", "shadow"}:
+        return "observe"
+    return "off"
+
+
+def _evidence_demote_cohorts() -> frozenset:
+    """v5.160.0: TFB_EVIDENCE_DEMOTE_COHORTS, a comma list of MARKET:CONFIDENCE
+    (case and spaces ignored; CONFIDENCE in HIGH / MEDIUM / LOW). Unset ->
+    'SR:HIGH'; set but blank -> no cohort (the tier then cannot fire); a
+    malformed item is skipped."""
+    raw = os.getenv("TFB_EVIDENCE_DEMOTE_COHORTS")
+    if raw is None:
+        raw = _EVIDENCE_COHORTS_DEFAULT
+    out = set()
+    for part in str(raw).split(","):
+        p = part.strip().upper().replace(" ", "")
+        if p.count(":") != 1:
+            continue
+        mkt, conf = p.split(":")
+        if mkt and conf in _EVIDENCE_CONF_LEVELS:
+            out.add(mkt + ":" + conf)
+    return frozenset(out)
+
+
+def _evidence_market_of(symbol: Any) -> str:
+    """v5.160.0: the market code of a page symbol - its suffix ('2222.SR' ->
+    'SR', 'EFC.US' -> 'US', 'BBOX.L' -> 'L'); a bare four-digit code is
+    Tadawul ('SR'); no suffix -> '' (no cohort)."""
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    if _EVIDENCE_TADAWUL_BARE.match(s):
+        return "SR"
+    if "." in s:
+        suf = s.rsplit(".", 1)[1]
+        return suf if suf.isalpha() else ""
+    return ""
+
+
+def _evidence_confidence_bucket(value: Any) -> str:
+    """v5.160.0: scripts/track_performance.py _confidence_bucket thresholds
+    (the Performance_Log 'Confidence' column): >= 0.75 HIGH, >= 0.50 MEDIUM,
+    else LOW. A value above 1 is percent points (79.3 -> 0.793). Missing or
+    non-numeric -> '' (no cohort; the tracker would say MEDIUM, which is
+    never on the default list)."""
+    v = _as_float(value)
+    if v is None:
+        return ""
+    if v > 1.0:
+        v = v / 100.0
+    if v >= 0.75:
+        return "HIGH"
+    if v >= 0.50:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _evidence_cohort_of(row: Dict[str, Any]) -> str:
+    """v5.160.0: 'MARKET:CONFIDENCE' for a row, '' when either part is unknown."""
+    try:
+        mkt = _evidence_market_of(row.get("symbol"))
+        conf = _evidence_confidence_bucket(row.get("forecast_confidence"))
+    except Exception:
+        return ""
+    return (mkt + ":" + conf) if (mkt and conf) else ""
+
+
+def _evidence_cohorts_label() -> str:
+    """v5.160.0: the armed cohort list for surface_gate_states (sorted, comma-joined)."""
+    try:
+        return ",".join(sorted(_evidence_demote_cohorts()))
+    except Exception:
+        return ""
 
 
 def _thin_history_guard_enabled() -> bool:
@@ -8596,6 +8722,22 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         if not (w_hi is not None and w_lo is not None and w_hi > 0.0 and w_lo > 0.0):
             status, action = "WATCHLIST", "WATCH"
             reason = "Thin trading history (no 52W range) -- treat as new/IPO listing"
+
+    # -- v5.160.0 [EVIDENCE-COHORT] (see WHY v5.160.0): a measured-loser cohort.
+    # DEMOTE-only, after the conservative and thin-history tiers (a row they
+    # already demoted never reaches it). off (default) -> nothing read beyond
+    # the mode, byte-identical; observe -> the substring-safe warning
+    # evidence_cohort_watch:<cohort>, verdict unchanged; enforce -> WATCHLIST.
+    _ev_mode = _evidence_gate_mode()
+    if _ev_mode != "off" and status == "INVESTABLE" and action == "INVEST":
+        _ev_cohort = _evidence_cohort_of(row)
+        if _ev_cohort and _ev_cohort in _evidence_demote_cohorts():
+            if _ev_mode == "enforce":
+                status, action = "WATCHLIST", "WATCH"
+                reason = ("Evidence gate: %s cohort (market:confidence) is below a 50%% "
+                          "hit rate on matured records" % _ev_cohort)
+            else:
+                _v573_append_warning(row, _EVIDENCE_OBSERVE_TAG + ":" + _ev_cohort.lower())
 
     # -- v5.153.0 (WP-2b): settle-unresolved cap. Tag-driven (survives cache,
     # projection and a later switch of TFB_SETTLE_UNRESOLVED to off) and
