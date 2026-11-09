@@ -2,6 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.73 (2026-11-09) -- VERDICT-REUSE HARNESS
+#
+# v1.1.73: run tests/test_dt10_v1290_verdict_reuse.js (16_Decision_Top10.gs
+# v1.29.0: DT10_VERDICT_REUSE=on drops the two source checks that decide
+# nothing - the pre-POST readiness behind a Logger line and verdict 2 across
+# the stability step - about 49 s of a 205.6 s render; default off) in the
+# blocking lean lane after the v1.28.0 render-timing harness.
+#
 # VERSION 1.1.72 (2026-11-09) -- EVIDENCE-COHORT SUITE
 #
 # v1.1.72: run tests/test_de_evidence_cohort.py (data_engine_v2 v5.160.0:
@@ -1301,6 +1309,7 @@ jobs:
           node tests/test_dt10_v1260_fundable_seats.js
           node tests/test_dt10_v1270_corp_guard.js
           node tests/test_dt10_v1280_render_timing.js
+          node tests/test_dt10_v1290_verdict_reuse.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js

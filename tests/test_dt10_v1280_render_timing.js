@@ -56,11 +56,13 @@ const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js
 const EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1280.json'));
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
-const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-09: v1.29.0 [VERDICT-REUSE] is delivered; this harness proves the v1.28.0 diff on the v1.28.0 file
+// rebuilt from it (tests/js/dt10_cash_utc_history.js v1280Source: the v1.29.0 edits reversed, SHA-256 pinned).
+const newSource = history.v1280Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 let baseSource;
 try {
-  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1270Source(newSource);
+  baseSource = BASE_PATH ? fs.readFileSync(BASE_PATH, 'utf8') : history.v1270Source(newSource);   // 2026-11-09: chains through v1280Source (v1.29.0 delivered)
 } catch (eBase) {
   console.log('FAIL R0 base oracle: ' + String(eBase && eBase.message || eBase).split('\n')[0]);
   console.log('FAIL 0/1');
