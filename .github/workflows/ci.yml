@@ -2,6 +2,20 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.80 (2026-11-09) -- EXEC-TILE-FEED HARNESS (27_Decision_Pages_v2 1.2.37)
+# (1.1.62-1.1.73 are on main. Open claims: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909,
+# 1.1.77 #926, 1.1.78 #938, 1.1.79 #915.)
+#
+# v1.1.80: run tests/test_dp2_v1237_exec_tile_feed.js (27_Decision_Pages_v2.gs
+# v1.2.37: DP2_EXEC_TILE_FEED=on greys Top_10_Investments_v2's Executable tile
+# and names the feed once the release is not live - EXPIRED, SYNC RUNNING,
+# NOT ACTIONABLE; label and count unchanged; default off = v1.2.36 byte for
+# byte) in the native Apps Script step after the v1.29.0 verdict-reuse
+# harness. The first 27_Decision_Pages_v2 harness in a blocking lane: the
+# v1.2.31-v1.2.36 ones run only through their .py wrappers in the advisory
+# whole suite. Its golden base is rebuilt from the delivered file (SHA-256
+# pinned), so no fetch is needed.
+#
 # VERSION 1.1.73 (2026-11-09) -- VERDICT-REUSE HARNESS
 #
 # v1.1.73: run tests/test_dt10_v1290_verdict_reuse.js (16_Decision_Top10.gs
@@ -1310,6 +1324,7 @@ jobs:
           node tests/test_dt10_v1270_corp_guard.js
           node tests/test_dt10_v1280_render_timing.js
           node tests/test_dt10_v1290_verdict_reuse.js
+          node tests/test_dp2_v1237_exec_tile_feed.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js

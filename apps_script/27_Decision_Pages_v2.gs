@@ -1,7 +1,23 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.36 (2026-11-09)
+ * Version: 1.2.37 (2026-11-09)
+ *   1.2.37: THE EXECUTABLE TILE FOLLOWS THE FEED (the v1.2.31 follow-up: 'the Executable tile still counts Ticket SAR > 0
+ *           regardless of the current feed state'). Top_10_Investments_v2's Executable tile counts the seats that carry a Ticket
+ *           SAR and was painted green whatever the decision feed said. The cockpit does not zero a ticket when its release
+ *           expires (the 480-minute clock), and a new sync withdraws the release (SYNC RUNNING) before the next render, so
+ *           between an expiry and the next render the hourly build showed 'Executable 6' in green under an EXPIRED or SYNC
+ *           RUNNING chip. Mon 2 Nov (28_Plan_Of_Record v1.0.0 commit sheet): six tickets released until 10:42 Riyadh, the
+ *           sync from 15:35, the WITHHELD render at 17:32; a build in that window reads 'Executable 6' green (replayed on that
+ *           board), and inside it the owner placed four limit buys (16:40-16:47). The Allocated (engine) tile beside it has
+ *           been grey with the feed state since v1.2.31. Script Property DP2_EXEC_TILE_FEED (default OFF = the 1.2.36 pages
+ *           byte for byte; 1 / on / true / yes arms it, anything else or a property fault reads off; read once per execution,
+ *           by the Top-10 build only): when the board carries an engine ticket and the feed has a state that is not live
+ *           (EXPIRED, SYNC RUNNING, NOT ACTIONABLE), the tile is grey and its sub reads 'feed <state> - not executable now - of
+ *           N . <output>'. The label 'Executable' and the count stay (scripts/tfb_export_audit.py reads both). A live release,
+ *           a board without a ticket and a feed without a state leave the tile as it was; DP2_COHORT_LEGACY does not change
+ *           the rule. dp2SelfTest adds one line while armed. No number, seat, gate, ticket, order or broker call changes;
+ *           Portfolio_Decision_v2 is untouched. Rollback: unset DP2_EXEC_TILE_FEED.
  *   1.2.36: THE EVIDENCE TILE SHOWS WHAT THE RULE CHANGE DID (owner, Mon 9 Nov 2026 11:44 Riyadh: 'MODEL EVIDENCE 48.70%
  *           INVESTABLE hit rate, matured records - still our system is less than 49% I need to improve it between 60% -55%
  *           at least'). The tile pools every matured Performance_Log WIN / LOSS record since June, so the engine rule that
@@ -393,7 +409,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.36';   // lockstep with the header
+var DP2_VERSION = '1.2.37';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2690,6 +2706,29 @@ var DP2_COHORT_LEGACY_PROP = 'DP2_COHORT_LEGACY';   // v1.2.31 kill switch: 1 / 
 function dp2CohortLegacy_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_COHORT_LEGACY_PROP)).trim()); }
 var DP2_PREVIEW_LABEL_PROP = 'DP2_PREVIEW_LABEL';   // v1.2.32 gate: 1 / on / true / yes = a page that cannot be acted on labels its sizing a preview
 function dp2PreviewLabelOn_() { return /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_PREVIEW_LABEL_PROP)).trim()); }
+/* v1.2.37 [EXEC-TILE-FEED]: Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the 1.2.36 pages),
+ * read once per execution by the Top-10 build. Armed, Top_10_Investments_v2's Executable tile turns grey and names the
+ * feed once the release is not live (EXPIRED / SYNC RUNNING / NOT ACTIONABLE); its label and count stay. */
+var DP2_EXEC_TILE_FEED_PROP = 'DP2_EXEC_TILE_FEED';
+var DP2_ETF_READ_ = false, DP2_ETF_ = false;
+function dp2ExecTileFeedOn_() {
+  if (!DP2_ETF_READ_) { DP2_ETF_ = /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_EXEC_TILE_FEED_PROP)).trim()); DP2_ETF_READ_ = true; }
+  return DP2_ETF_;
+}
+/* PURE: the Executable tile of a board whose engine tickets the feed no longer releases: grey, 'feed <state> - not
+ * executable now - ' + the sub; the same object when nothing is executable, the feed has no state (the header then shows
+ * the cockpit output) or the release is live. */
+function dp2ExecTileFeedTile_(tile, executable, feedState, fv) {
+  if (!(executable > 0) || !feedState || !fv || fv.live === true) return tile;
+  return { label: tile.label, value: tile.value, sub: 'feed ' + (fv.label || 'n/a') + ' - not executable now - ' + tile.sub, color: DP2C.grey };
+}
+function dp2ExecTileFeedCoreOk_() {
+  var t = { label: 'Executable', value: '6', sub: 'of 10 \u00b7 EXECUTABLE', color: DP2C.green };
+  var x = dp2ExecTileFeedTile_(t, 6, 'EXECUTABLE', { label: 'EXPIRED', live: false });
+  return x.label === 'Executable' && x.value === '6' && x.color === DP2C.grey && x.sub === 'feed EXPIRED - not executable now - of 10 \u00b7 EXECUTABLE' &&
+    dp2ExecTileFeedTile_(t, 6, 'EXECUTABLE', { label: 'EXECUTABLE', live: true }) === t && dp2ExecTileFeedTile_(t, 0, 'NOT_ACTIONABLE', { label: 'NOT ACTIONABLE', live: false }) === t &&
+    dp2ExecTileFeedTile_(t, 6, '', { label: 'n/a', live: false }) === t && t.color === DP2C.green;
+}
 /* v1.2.32 PURE: why the seat sizing of this Top-10 page is a preview, or '' when it can be acted on (an engine ticket on
  * the board AND a live EXECUTABLE release, dp2FeedView_ live). 'nothing executable today' (+ the feed when it is not live)
  * / 'feed EXPIRED' / 'feed SYNC RUNNING' / 'feed NOT ACTIONABLE'. */
@@ -3713,6 +3752,7 @@ function buildTop10V2() {
   // v1.2.31: the Held seats tile splits the seats by their Stability (active / fast-track / grace-held); an engine board's allocation tile is the
   // engine's, grey and prefixed with the feed state once the release is no longer live (expired, superseded or withdrawn)
   if (!cohort.legacy) { for (var tq = 0; tq < tiles.length; tq++) { if (tiles[tq].label === 'Held seats') tiles[tq].sub = (seats.length - fast.length - grace.length) + ' active \u00b7 ' + fast.length + ' fast-track \u00b7 ' + grace.length + ' grace-held'; else if (tiles[tq].label === 'Allocated (research)' && alloc && alloc.mode === 'engine') { tiles[tq].label = 'Allocated (engine)'; if (!fv.live) { tiles[tq].color = DP2C.grey; tiles[tq].sub = 'feed ' + fv.label + ' - ' + tiles[tq].sub; } } } }
+  if (dp2ExecTileFeedOn_()) { for (var tx = 0; tx < tiles.length; tx++) if (tiles[tx].label === 'Executable') tiles[tx] = dp2ExecTileFeedTile_(tiles[tx], executable, feed.state, fv); }   // v1.2.37 [EXEC-TILE-FEED] (off: the 1.2.36 tiles)
   row = dp2Tiles_(sh, row, tiles); row++;
 
   // charts: funnel + universe/gates
@@ -4022,6 +4062,7 @@ function dp2SelfTest() {
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
   if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
   if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
+  if (dp2ExecTileFeedOn_()) { var etfOk = dp2ExecTileFeedCoreOk_(); checks.push({ name: 'executable tile follows the feed (DP2_EXEC_TILE_FEED): on \u00b7 core ' + (etfOk ? 'ok' : 'FAIL') + ' (grey and "feed <state> - not executable now" once the release is not live)', ok: etfOk }); }   // v1.2.37
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var probe = null;
   var probeSym = 'SPY';
