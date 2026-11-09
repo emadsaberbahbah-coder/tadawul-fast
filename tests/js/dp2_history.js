@@ -1,22 +1,35 @@
 'use strict';
 /* tests/js/dp2_history.js - the reviewed 27_Decision_Pages_v2.gs files rebuilt from the delivered one.
+ * 2026-11-09: v1.2.36 [EVIDENCE-SINCE] (DP2_EVIDENCE_SINCE, default off) is delivered; the v1.2.35 harness proves its own
+ * diff, so it reads the v1.2.35 file rebuilt by reversing the enumerated v1.2.36 hunks (tests/js/dp2_edits_v1236.json),
+ * SHA-256 pinned.
  * 2026-11-08: v1.2.35 [STOP-RULE] (DP2_STOP_RULE, default off) is delivered; the v1.2.31-v1.2.34 harnesses prove their
  * own diffs, so they read the v1.2.34 file rebuilt by reversing the enumerated v1.2.35 hunks
- * (tests/js/dp2_edits_v1235.json), SHA-256 pinned. A source that already is the v1.2.34 file is returned unchanged.
+ * (tests/js/dp2_edits_v1235.json) from the v1.2.35 file, SHA-256 pinned. A source that already is the older file is
+ * returned unchanged.
  */
 const crypto = require('crypto');
 const assert = require('assert');
+const V1235_SHA256 = 'dc88cfab7cc706b391f6288dcc44d8e9e0cf6479015b22a725f134c6fd694abf';   // v1.2.35 (origin/main 772a497)
 const V1234_SHA256 = '992fb7f77e0d4c4c59f1eb6fb42b7b45be41e1ffaa47957797222662246811c0';   // v1.2.34 (origin/main bdf2da2)
+const EDITS_V1236 = require('./dp2_edits_v1236.json');
 const EDITS_V1235 = require('./dp2_edits_v1235.json');
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
-function v1234Source(source) {
-  if (sha(source) === V1234_SHA256) return source;
+function reverse(source, edits, label, pin) {
   let prior = source;
-  for (const [current, previous] of EDITS_V1235) {
-    assert.equal(prior.split(current).length - 1, 1, 'exactly one approved v1.2.35 hunk: ' + current.split('\n')[0].slice(0, 90));
+  for (const [current, previous] of edits) {
+    assert.equal(prior.split(current).length - 1, 1, 'exactly one approved ' + label + ' hunk: ' + current.split('\n')[0].slice(0, 90));
     prior = prior.replace(current, () => previous);
   }
-  assert.equal(sha(prior), V1234_SHA256, 'v1.2.35 may change only its enumerated hunks');
+  assert.equal(sha(prior), pin, label + ' may change only its enumerated hunks');
   return prior;
 }
-module.exports = { v1234Source, V1234_SHA256, EDITS_V1235 };
+function v1235Source(source) {
+  if (sha(source) === V1235_SHA256 || sha(source) === V1234_SHA256) return source;
+  return reverse(source, EDITS_V1236, 'v1.2.36', V1235_SHA256);
+}
+function v1234Source(source) {
+  if (sha(source) === V1234_SHA256) return source;
+  return reverse(v1235Source(source), EDITS_V1235, 'v1.2.35', V1234_SHA256);
+}
+module.exports = { v1235Source, v1234Source, V1235_SHA256, V1234_SHA256, EDITS_V1236, EDITS_V1235 };
