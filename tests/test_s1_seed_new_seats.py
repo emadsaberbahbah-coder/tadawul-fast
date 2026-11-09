@@ -36,7 +36,7 @@ def _run(monkeypatch, gate, non_trading):
     else:
         monkeypatch.setenv("TFB_S1_SEED_NEW_SEATS", gate)
     monkeypatch.delenv("TFB_SHADOW_PRICE_HONESTY", raising=False)
-    return s1.stored_prices_today(SYMS, SPOT, ASOF, PREV, SAT, non_trading)
+    return s1.stored_prices_today(SYMS, SPOT, ASOF, PREV, SAT, non_trading, row_day=SUN)
 
 
 def test_n1_off_is_the_old_rule(monkeypatch):
@@ -50,7 +50,7 @@ def test_n2_on_non_trading_seeds_new_seats(monkeypatch):
     assert seeded == ["EFC.US", "PFS.US"]
     # a fresh bar always wins over seeding
     asof = dict(ASOF, **{"EFC.US": SUN})
-    prices2, seeded2 = s1.stored_prices_today(SYMS, SPOT, asof, PREV, SAT, True)
+    prices2, seeded2 = s1.stored_prices_today(SYMS, SPOT, asof, PREV, SAT, True, row_day=SUN)
     assert prices2["EFC.US"] == 11.26 and seeded2 == ["PFS.US"]
 
 
@@ -63,13 +63,29 @@ def test_n4_no_price_is_never_invented(monkeypatch):
     prices, _ = _run(monkeypatch, "on", True)
     assert "NEWNOPRICE.US" not in prices
     zero = dict(SPOT, **{"EFC.US": 0.0})
-    p2, s2 = s1.stored_prices_today(SYMS, zero, ASOF, PREV, SAT, True)
+    p2, s2 = s1.stored_prices_today(SYMS, zero, ASOF, PREV, SAT, True, row_day=SUN)
     assert "EFC.US" not in p2 and "EFC.US" not in s2
+
+
+def test_n7_only_the_last_session_close_is_a_base(monkeypatch):
+    # review on PR #949: a stale (Thursday) or undated close is never seeded
+    monkeypatch.setenv("TFB_S1_SEED_NEW_SEATS", "on")
+    thu = dict(ASOF, **{"EFC.US": date(2026, 11, 5)})
+    p1, s1d = s1.stored_prices_today(SYMS, SPOT, thu, PREV, SAT, True, row_day=SUN)
+    assert "EFC.US" not in p1 and s1d == ["PFS.US"]
+    undated = {"PFS.US": FRI}
+    p2, s2 = s1.stored_prices_today(SYMS, SPOT, undated, PREV, SAT, True, row_day=SUN)
+    assert "EFC.US" not in p2 and s2 == ["PFS.US"]
+    p3, s3 = s1.stored_prices_today(SYMS, SPOT, ASOF, PREV, SAT, True, row_day=None)
+    assert s3 == [] and p3 == {"ZTO.US": 17.9}
+    # a Monday holiday row keeps the Friday close; a Saturday row too
+    assert s1._prev_weekday(date(2026, 11, 9)) == FRI and s1._prev_weekday(SAT) == FRI
+    assert s1._prev_weekday(date(2026, 11, 11)) == date(2026, 11, 10)
 
 
 def test_n5_main_stores_through_the_helper():
     src = inspect.getsource(s1.main)
-    assert "stored_prices_today(" in src and "seeded=" in src
+    assert "stored_prices_today(" in src and "seeded=" in src and "row_day=today" in src
     assert "prices_today[s] = spot[s]" not in src          # the inline copy is gone
 
 

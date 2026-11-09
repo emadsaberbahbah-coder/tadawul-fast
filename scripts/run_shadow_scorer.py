@@ -608,16 +608,29 @@ def _seed_new_seats_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+def _prev_weekday(d: date) -> date:
+    """v1.9.4: the last Monday-Friday date strictly before d."""
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d
+
+
 def stored_prices_today(syms: List[str], spot: Dict[str, float], spot_asof: Dict[str, Any],
                         p: Optional[Dict[str, Any]], p_date: Optional[date],
-                        day_non_trading: bool) -> Tuple[Dict[str, float], List[str]]:
+                        day_non_trading: bool,
+                        row_day: Optional[date] = None) -> Tuple[Dict[str, float], List[str]]:
     """v1.9.4 PURE: the price snapshot a row stores. Fresh symbols at today's
     bar; stale symbols carry their previous stored price so the next fresh bar
     captures the full move; nothing is stored at an invented level. With
     TFB_S1_SEED_NEW_SEATS on, a DAY_NON_TRADING row also stores the latest real
     close of a seat that has neither a fresh bar nor a previous price (it
     entered while no venue traded): that close is exactly the base the next
-    session's return needs. Returns (prices, seeded symbols)."""
+    session's return needs - but only when that close is dated the last weekday
+    before the row (row_day), so the next return spans exactly one session; an
+    older or undated close is never a base (review on PR #949: a Thursday close
+    seeded on Sunday would pair Friday+Monday against a one-session benchmark).
+    Returns (prices, seeded symbols)."""
     prices_today: Dict[str, float] = {}
     seeded: List[str] = []
     prev_prices = (p.get("prices") or {}) if p else {}
@@ -628,7 +641,9 @@ def stored_prices_today(syms: List[str], spot: Dict[str, float], spot_asof: Dict
             prices_today[s] = spot[s]
         elif p and s in prev_prices:
             prices_today[s] = prev_prices[s]
-        elif day_non_trading and _seed_new_seats_enabled() and spot.get(s):
+        elif (day_non_trading and _seed_new_seats_enabled() and spot.get(s)
+              and row_day is not None and spot_asof.get(s) is not None
+              and spot_asof[s] == _prev_weekday(row_day)):
             prices_today[s] = spot[s]
             seeded.append(s)
     return prices_today, seeded
@@ -2183,7 +2198,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # their previous stored price so the next fresh bar captures the full
         # move; nothing is stored at an invented level.
         prices_today, _seeded = stored_prices_today(      # v1.9.4: same rule, pure helper
-            syms, spot, spot_asof, p, p_date, day_non_trading)
+            syms, spot, spot_asof, p, p_date, day_non_trading, row_day=today)
         if day_non_trading and p:                  # v1.5.0 B-2
             note = (f"DAY_NON_TRADING no-venue-session "
                     f"fresh={m['n_fresh']}/{len(syms)}"
