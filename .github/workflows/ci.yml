@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.77 (2026-11-10) -- S-1 LASTSCORED REPLAY SUITE
+#
+# v1.1.77: run tests/test_s1_lastscored_nov9_replay.py (run_shadow_scorer
+# 1.9.5 and shadow_scorer.yml 1.0.2: the P-186 base policy armed; the real
+# 6-9 Nov shape scores Monday under lastscored) in the blocking lean lane.
+#
 # VERSION 1.1.76 (2026-11-10) -- DAILY PLAN SUITE
 #
 # v1.1.76: run tests/test_daily_plan.py (scripts/daily_plan.py 1.0.0 and
@@ -1160,6 +1166,7 @@ jobs:
             tests/test_sync_stamp_repair.py \
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
+            tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \

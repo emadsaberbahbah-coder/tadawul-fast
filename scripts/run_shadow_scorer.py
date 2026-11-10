@@ -1,6 +1,18 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.5 (2026-11-10) — THE LASTSCORED READ-BACK NAMES ITS LEGS (P-186 armed)
+WHY: shadow_scorer.yml 1.0.2 arms TFB_S1_BASE_POLICY=lastscored (9 Nov was lost
+under legacy: DAY_EXCLUDED_INFRA fresh=0/5 because the 8 Nov row held no
+price; the last scored row, 6 Nov, held the basket actually carried into
+Monday). Under lastscored the [S1-BASE] read-back read 'pairable' from the
+inline pass-1 measurement, which never carries that key, so every lastscored
+run printed `readback_error=KeyError` instead of its pairing (observe was
+unaffected: there the lastscored side comes from _measure_one). The line now
+falls back to the base row's pairable count (_bp_pairable, the same number
+the floor divides by). Scoring, pairing, rows and gate are unchanged; only
+the informational read-back text changes. Changed: 1 line in main().
+
 VERSION 1.9.4 (2026-11-10) — A SEAT THAT ENTERS ON A NON-TRADING DAY GETS ITS BASE
 WHY: S-1 stayed at 26/28. The board rotated over the weekend (7-8 Nov) to five
 new names. A non-trading row stores a fresh bar or carries the previous stored
@@ -476,7 +488,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.4"
+SCRIPT_VERSION = "1.9.5"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -2144,7 +2156,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
                           f"lastscored={_f(_ls_c['ret'])}@{_ls_base or '-'} "
-                          f"legs={_ls_c['n_fresh']}/{_ls_c['pairable']} | "
+                          f"legs={_ls_c['n_fresh']}/{_ls_c.get('pairable', _bp_pairable)} | "
                           f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "
                           f"alpha legacy={_f(_a_leg)} lastscored={_f(_a_ls)} "
                           f"delta={'n/a' if _a_delta is None else f'{_a_delta:+.4f}pp'} | "
