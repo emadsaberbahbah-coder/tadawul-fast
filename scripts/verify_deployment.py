@@ -164,6 +164,8 @@ sys.path.insert(0, _ROOT)
 # 2026-10-28 (same rule): data_engine_v2 5.159.1 -> 5.159.2 and normalize
 # 5.7.0 -> 5.7.1 (the BB-1 name rescue accepts the verified Yahoo alias it
 # requested; Commodities_FX name coverage). No verifier logic changed.
+# 2026-11-10 (same rule): run_dashboard_sync 6.71.0 -> 6.72.0 (STAMP-REPAIR,
+# default off).
 # 2026-10-29 (same rule): run_dashboard_sync 6.70.2 -> 6.71.0 (FW2-STALE-PE,
 # TFB_SYNC_FW2_STALE_PE, default off: a row FW-2 would strip for a mildly
 # stale P/E keeps its fresh quote with P/E and EPS cleared once its last-good
@@ -289,7 +291,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # default strict; workflow-scoped, never on Render).
     ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
-    ("run_shadow_scorer", "1.9.3", "shadow scorer"),
+    ("run_shadow_scorer", "1.9.5", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
@@ -306,7 +308,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.71.0", "dashboard sync"),
+    ("run_dashboard_sync", "6.72.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
@@ -357,7 +359,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_corporate_events", "1.0.1", "corporate events tab"),
     # 2026-11-08 (new script, pinned on arrival): the Pre_Open_Check tab ~30
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
-    ("pre_open_check", "1.0.0", "pre-open check tab"),
+    ("pre_open_check", "1.1.0", "pre-open check tab"),
+    ("sync_watchdog", "1.0.0", "sync watchdog"),
+    ("daily_plan", "1.0.0", "daily plan"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
