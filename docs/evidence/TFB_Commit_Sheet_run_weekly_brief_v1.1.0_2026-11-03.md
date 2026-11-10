@@ -224,3 +224,12 @@ Main `86edd72` (#939-#945) was merged in with a merge commit. Main took ci.yml 1
 - ci.yml: this release keeps 1.1.76 (still above main).
 - The claim note now reads: 1.1.74 #922, 1.1.75 #923, 1.1.76 #909, 1.1.77 #926, 1.1.78 #938, 1.1.79 #915. Only the three claims main took moved.
 - Main's 1.1.73 / 1.1.72 / 1.1.71 blocks follow verbatim. Against main, the ci.yml diff adds lines only. No other file conflicted.
+
+## Addendum 2026-11-10 - merge of main `e008a514`
+
+Main `e008a514` (#947-#952) was merged in with a merge commit. Main took ci.yml 1.1.74, 1.1.76 and 1.1.77; it now holds every number up to 1.1.77 except 1.1.75.
+
+- ci.yml: this release is re-numbered **1.1.76 -> 1.1.83** (its header, its `v1.1.83` line and its step comment).
+- The claim note now reads: 1.1.78 #938, 1.1.79 #915, 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926. Every open claim sits above main's newest block: the three numbers main took moved, and so did #923's 1.1.75, which would otherwise sit below main's 1.1.76 and 1.1.77.
+- Main's 1.1.77 / 1.1.76 / 1.1.74 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- `scripts/verify_deployment.py` also conflicted: main moved the `run_shadow_scorer` pin to 1.9.5 on the line next to this release's `run_weekly_brief` pin. The resolution keeps both (`run_weekly_brief` 1.1.0, `run_shadow_scorer` 1.9.5, the module's own `SCRIPT_VERSION`).

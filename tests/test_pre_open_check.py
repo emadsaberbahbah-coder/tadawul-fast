@@ -334,7 +334,7 @@ def test_p4b_real_xnys_calendar_agrees():
 
 def _env(monkeypatch):
     for k in ("TFB_PREOPEN_ES_WAIT_PCT", "TFB_PREOPEN_GAP_PCT", "TFB_PREOPEN_SHEET", "TFB_PREOPEN_PAGE",
-              "TFB_PREOPEN_TIMEOUT_S"):
+              "TFB_PREOPEN_TIMEOUT_S", "TFB_PREOPEN_BOARD_GUARD", "TFB_PREOPEN_BOARD_MAX_AGE_H"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -428,7 +428,95 @@ def test_p6_workflow():
     assert "python scripts/pre_open_check.py $MODE $EXTRA" in run_step["run"]
     assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is True
     src = (ROOT / "scripts" / "pre_open_check.py").read_text(encoding="utf-8")
-    assert '__version__ = "1.0.0"' in src and "never silently GO" in src
+    assert '__version__ = "1.1.0"' in src and "never silently GO" in src
+    assert env["TFB_PREOPEN_BOARD_GUARD"] == "${{ vars.TFB_PREOPEN_BOARD_GUARD || 'enforce' }}"
+    assert env["TFB_PREOPEN_BOARD_MAX_AGE_H"] == "${{ vars.TFB_PREOPEN_BOARD_MAX_AGE_H || '3' }}"
+
+
+
+# ---------------------------------------------------------------- v1.1.0 BOARD-GUARD
+def status_page(line):
+    """TOP10 with its status line in B2, as 16_Decision_Top10 writes it."""
+    grid = deepcopy(TOP10.values)
+    grid[1] = ["Status:", line] + [""] * 11
+    return Sheet(grid, 13)
+
+
+FRESH = "Last run 2026-11-09 16:40:00 | status: OK | output: EXECUTABLE | sheets pool 9726 rows"
+
+
+def test_p7_board_state():
+    st = pc.board_state(status_page(FRESH).values, NOW, 3.0)     # NOW = 17:00 Riyadh
+    assert st["ok"] is True and st["output"] == "EXECUTABLE" and st["age_h"] == 0.33
+    cases = {
+        "Last run 2026-11-09 16:40:00 | status: WITHHELD | output: WITHHELD | source readiness WITHHELD":
+            "board output WITHHELD (status WITHHELD)",
+        "Last run 2026-11-09 16:40:00 | status: OK | output: QUALIFIED_UNFUNDED | funding":
+            "board output QUALIFIED_UNFUNDED (status OK)",
+        "Last run 2026-11-09 16:58:00 | status: running…": "board output none (status running…)",
+        "Last run 2026-11-09 09:10:00 | status: OK | output: EXECUTABLE | x":
+            "board last run 7.8 h ago (limit 3.0 h)",
+        "Last run 2026-11-09 19:00:00 | status: OK | output: EXECUTABLE": "board run time is in the future",
+        "Last run yesterday | status: OK": "board status line unreadable",
+    }
+    for line, why in cases.items():
+        st = pc.board_state(status_page(line).values, NOW, 3.0)
+        assert st["ok"] is False and st["reason"] == why, (line, st)
+    assert pc.board_state(TOP10.values, NOW, 3.0)["reason"] == "board status line not found"
+    assert pc.board_state([], NOW, 3.0)["ok"] is False
+
+
+def test_p7b_guard_knobs(monkeypatch):
+    _env(monkeypatch)
+    assert pc.board_guard_mode() == "off" and pc.board_max_age_h() == 3.0
+    for raw, want in (("enforce", "enforce"), ("OBSERVE", "observe"), ("on", "off"), ("", "off")):
+        monkeypatch.setenv("TFB_PREOPEN_BOARD_GUARD", raw)
+        assert pc.board_guard_mode() == want
+    for raw, want in (("0.1", 0.5), ("6", 6.0), ("99", 24.0), ("x", 3.0)):
+        monkeypatch.setenv("TFB_PREOPEN_BOARD_MAX_AGE_H", raw)
+        assert pc.board_max_age_h() == want
+
+
+CALM = dict(PAYLOADS, **{"ES=F": chart("ES=F", 6000.0, [(PRE, 6012.0)])})
+
+
+def _verdicts(monkeypatch, capsys, line, guard):
+    _env(monkeypatch)
+    if guard:
+        monkeypatch.setenv("TFB_PREOPEN_BOARD_GUARD", guard)
+    book = Book({"Top_10_Investments": status_page(line)})
+    assert pc.main(["--write"], book=book, quotes=quotes(CALM), now=NOW, cal=CAL) == 0
+    vals = book.tab.requests[-1]["values"]
+    return [r[2:5] for r in vals[1:8]], capsys.readouterr().out
+
+
+def test_p8_enforce_turns_every_ticket_into_check(monkeypatch, capsys):
+    withheld = "Last run 2026-11-09 16:40:00 | status: WITHHELD | output: WITHHELD | x"
+    rows, out = _verdicts(monkeypatch, capsys, withheld, "enforce")
+    assert [r[:2] for r in rows] == [["ES=F", "GO"], ["SNDA.US", "CHECK"], ["IBOC.US", "CHECK"],
+                                     ["BRK.B.US", "CHECK"], ["2222.SR", "SKIP"], ["FRST.US", "SKIP"],
+                                     ["GHOST.US", "SKIP"]]
+    assert rows[1][2].startswith("board not executable (board output WITHHELD (status WITHHELD)) - not an order; within")
+    assert "NOT executable (board output WITHHELD (status WITHHELD)) | guard enforce" in out
+    # stale but EXECUTABLE: also CHECK
+    stale = "Last run 2026-11-09 09:10:00 | status: OK | output: EXECUTABLE | x"
+    rows, _ = _verdicts(monkeypatch, capsys, stale, "enforce")
+    assert [r[1] for r in rows[1:4]] == ["CHECK", "CHECK", "CHECK"]
+    assert "board last run 7.8 h ago (limit 3.0 h)" in rows[1][2]
+
+
+def test_p8b_fresh_executable_board_keeps_1_0_0_verdicts(monkeypatch, capsys):
+    rows, out = _verdicts(monkeypatch, capsys, FRESH, "enforce")
+    assert [r[:2] for r in rows[:4]] == [["ES=F", "GO"], ["SNDA.US", "GO"], ["IBOC.US", "WAIT"], ["BRK.B.US", "CHECK"]]
+    assert "-> executable | guard enforce" in out
+
+
+def test_p8c_off_and_observe_leave_rows_unchanged(monkeypatch, capsys):
+    withheld = "Last run 2026-11-09 16:40:00 | status: WITHHELD | output: WITHHELD | x"
+    base, _ = _verdicts(monkeypatch, capsys, withheld, "")
+    assert [r[:2] for r in base[:4]] == [["ES=F", "GO"], ["SNDA.US", "GO"], ["IBOC.US", "WAIT"], ["BRK.B.US", "CHECK"]]
+    obs, out = _verdicts(monkeypatch, capsys, withheld, "observe")
+    assert obs == base and "observe: 3 US ticket row(s) would read CHECK" in out
 
 
 if __name__ == "__main__":   # pragma: no cover

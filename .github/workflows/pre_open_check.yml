@@ -17,6 +17,10 @@
 # summer (open 13:30 UTC); a US holiday writes nothing. A manual dispatch
 # writes ONLY with write=true; ignore_window=true rehearses outside the
 # window. Nothing here places an order or changes a count.
+# 2026-11-10 (v1.1.0 BOARD-GUARD): a ticket counts only when the board's own
+# status line reads 'output: EXECUTABLE' and is at most 3 h old; otherwise
+# every ticket row reads CHECK (never GO). Mapped to enforce below; rollback:
+# set the repository variable TFB_PREOPEN_BOARD_GUARD=off.
 name: ⏰ Pre-Open Check
 
 on:
@@ -92,6 +96,8 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_PREOPEN_ES_WAIT_PCT: ${{ vars.TFB_PREOPEN_ES_WAIT_PCT || '1.0' }}
           TFB_PREOPEN_GAP_PCT: ${{ vars.TFB_PREOPEN_GAP_PCT || '3.0' }}
+          TFB_PREOPEN_BOARD_GUARD: ${{ vars.TFB_PREOPEN_BOARD_GUARD || 'enforce' }}
+          TFB_PREOPEN_BOARD_MAX_AGE_H: ${{ vars.TFB_PREOPEN_BOARD_MAX_AGE_H || '3' }}
         run: |
           # Schedule always writes; a manual dispatch writes ONLY when
           # write=true was explicitly ticked (dry-run otherwise).

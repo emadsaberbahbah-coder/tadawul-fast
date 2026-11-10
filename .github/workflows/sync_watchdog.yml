@@ -1,0 +1,55 @@
+# ============================================================================
+# TFB Sync Watchdog -- start a full sync only when none has started for too long
+# ============================================================================
+# 2026-11-10 (v1.0.0): daily_sync.yml 1.0.13 dropped its own cron because
+# GitHub delivers it 3-9 hours late (the 04:17 UTC slot started 15:59 Riyadh on
+# 9 Nov and darkened the board through the US open; on 10 Nov a late slot and
+# the 06:22 Riyadh dispatch ran back to back). The Apps Script dispatcher
+# (24_Sync_Dispatch, on the minute) is the clock now; this workflow is the
+# safety net for a dispatcher that stops. scripts/sync_watchdog.py dispatches
+# ONE full sync when no production sync is queued or running and the newest
+# one was created more than TFB_SYNC_WATCHDOG_MAX_GAP_H hours ago (default 10;
+# the dispatcher's slots are 8 hours apart). It writes nothing to the workbook.
+# This cron is late too; that only delays the safety net.
+# Rollback: set the repository variable TFB_SYNC_WATCHDOG=off.
+name: 🐕 Sync Watchdog
+
+on:
+  schedule:
+    - cron: "37 */2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tfb-sync-watchdog
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync_watchdog:
+    name: 🐕 Dispatch a sync only when one is overdue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: 🐕 Check the newest sync run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TFB_SYNC_WATCHDOG: ${{ vars.TFB_SYNC_WATCHDOG || 'on' }}
+          TFB_SYNC_WATCHDOG_MAX_GAP_H: ${{ vars.TFB_SYNC_WATCHDOG_MAX_GAP_H || '10' }}
+        run: |
+          set -euo pipefail
+          python scripts/sync_watchdog.py
