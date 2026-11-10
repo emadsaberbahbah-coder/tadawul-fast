@@ -57,14 +57,14 @@ column, which is as of the calendar sync (10 Nov: ZTO.US read 8 days from the
 9 Nov sync while 17 Nov was 7 days away, so the 7-day gate passed it). A pick
 without an engine 12-month ROI carries the label 'no 12-month target'.
 
-1.1.0 (2026-11-11): THE EVIDENCE RULE (TFB_PLAN_EVIDENCE = off default |
+1.1.0 (2026-11-10): THE EVIDENCE RULE (TFB_PLAN_EVIDENCE = off default |
 observe | on). Measured on matured INVESTABLE records outside Tadawul, 1W-1M
 horizons, one row per symbol and week (v_outcome_excess joined to
 v_signal_history, entries 31 Aug - 10 Nov 2026): a name whose Risk Score was
 under 30 AND whose analyst target stood 15% or more above its price finished
 up in 72.2% of 72 symbol-weeks (34 names; beat its benchmark in 83.3%); the
 other INVESTABLE names finished up in 43.6% of 110. By half: 77.2% and 66.4%
-of records. The first 11 November records read 36.4%. This is an in-sample
+of records. The 11 records entered in November read 36.4%. This is an in-sample
 reading over ten weeks, so the rule ships as a LABEL first:
   observe  every qualified name carries 'evidence rule PASS / FAIL / n/a' with
            its two numbers; picks are chosen exactly as before.
