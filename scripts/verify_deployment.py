@@ -291,7 +291,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # default strict; workflow-scoped, never on Render).
     ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
-    ("run_shadow_scorer", "1.9.4", "shadow scorer"),
+    ("run_shadow_scorer", "1.9.5", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
