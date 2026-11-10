@@ -51,6 +51,12 @@ Calendar_Events, Dividend_Events, _Portfolio_CostBasis. Writes only its own
 two tabs: _Daily_Plan (the ledger) and Daily_Plan (the page). Never calls the
 backend, never calls a broker, places no order.
 
+1.0.1 (2026-11-10): the earnings and ex-dividend gates count days from the
+DATE on the calendar row to the Riyadh plan date, not from the stored 'Days To'
+column, which is as of the calendar sync (10 Nov: ZTO.US read 8 days from the
+9 Nov sync while 17 Nov was 7 days away, so the 7-day gate passed it). A pick
+without an engine 12-month ROI carries the label 'no 12-month target'.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -64,7 +70,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -285,23 +291,36 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
     return out
 
 
-def read_calendar(cal: Sequence[Sequence[Any]], div: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
-    """{SYMBOL: {earn_days, exdiv_days, div_amount}} from Calendar_Events and Dividend_Events."""
+def _days_until(date_cell: Any, days_cell: Any, today: Optional[_dt.date]) -> Optional[float]:
+    """1.0.1: days from `today` to the date in `date_cell` when it parses; else the stored day count."""
+    d = parse_date(date_cell)
+    if d is not None and today is not None:
+        return float((d - today).days)
+    return num(days_cell)
+
+
+def read_calendar(cal: Sequence[Sequence[Any]], div: Sequence[Sequence[Any]],
+                  today: Optional[_dt.date] = None) -> Dict[str, Dict[str, Any]]:
+    """{SYMBOL: {earn_days, exdiv_days, div_amount}} from Calendar_Events and Dividend_Events.
+    With `today`, days are counted from the event DATE (the stored count is as of the calendar sync)."""
     out: Dict[str, Dict[str, Any]] = {}
     h, col = table_index(cal, ("Symbol", "Days To Earnings"))
     if h is not None:
         for r in list(cal)[h + 1:]:
             sym = text(cell(r, col.get("Symbol"))).upper()
             if sym:
-                out[sym] = {"earn_days": num(cell(r, col.get("Days To Earnings"))),
-                            "exdiv_days": num(cell(r, col.get("Days To ExDiv"))), "div_amount": None}
+                out[sym] = {"earn_days": _days_until(cell(r, col.get("Next Earnings Date")),
+                                                     cell(r, col.get("Days To Earnings")), today),
+                            "exdiv_days": _days_until(cell(r, col.get("Next Ex-Div Date")),
+                                                      cell(r, col.get("Days To ExDiv")), today),
+                            "div_amount": None}
     h, col = table_index(div, ("Symbol", "Days To ExDiv", "Amount"))
     if h is not None:
         for r in list(div)[h + 1:]:
             sym = text(cell(r, col.get("Symbol"))).upper()
             if sym:
                 e = out.setdefault(sym, {"earn_days": None, "exdiv_days": None, "div_amount": None})
-                e["exdiv_days"] = num(cell(r, col.get("Days To ExDiv")))
+                e["exdiv_days"] = _days_until(cell(r, col.get("Ex-Div Date")), cell(r, col.get("Days To ExDiv")), today)
                 e["div_amount"] = num(cell(r, col.get("Amount")))
     return out
 
@@ -443,6 +462,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         entry = p["price"]
         stop = round(entry * (1 - k["stop_pct"] / 100.0), 4)
         roi = (p.get("roi12") or 0.0) / 100.0
+        if roi <= 0:
+            p["labels"].append("no 12-month target")
         p.update({"entry": entry, "zone_low": round(entry * 0.97, 4), "zone_high": round(entry * 1.01, 4),
                   "qty": qty, "alloc_sar": round(qty * entry * fx, 2), "stop": stop,
                   "tp1": round(entry * (1 + roi / 2.0), 4) if roi > 0 else None,
@@ -669,7 +690,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
             board = book.worksheet(PAGE).get("A1:AZ120")
             grids = [read_source_page(book, t) for t in SOURCE_PAGES]
             cal = read_calendar(_read(book, "Calendar_Events", "A1:J4000"),
-                                _read(book, "Dividend_Events", "A1:J4000"))
+                                _read(book, "Dividend_Events", "A1:J4000"), today)
             lots = read_ledger_lots(_read(book, "_Portfolio_CostBasis", "A1:Z400"), today, k["cooldown"])
             ledger = parse_ledger(_read(book, LEDGER_TAB,
                                         "A1:%s%d" % (_col(len(LEDGER_HEADERS)), MAX_LEDGER_ROWS + 1)))
