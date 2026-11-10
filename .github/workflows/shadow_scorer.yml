@@ -80,6 +80,9 @@ jobs:
       # (9 Nov: DAY_EXCLUDED_INFRA fresh=0/5 under legacy; lastscored 3/3).
       # Rollback: set the repository variable TFB_S1_BASE_POLICY=legacy.
       TFB_S1_BASE_POLICY: ${{ vars.TFB_S1_BASE_POLICY || 'lastscored' }}
+      # A last-scored base older than this many calendar days makes the run
+      # fall back to legacy pairing (recovery path; scorer 1.9.5).
+      TFB_S1_BASE_MAX_AGE_D: ${{ vars.TFB_S1_BASE_MAX_AGE_D || '7' }}
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is

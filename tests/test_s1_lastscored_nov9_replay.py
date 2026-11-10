@@ -222,6 +222,53 @@ def test_l3_next_session_pairs_against_monday():
     assert "chal fresh=5/5" in verdict(sh) and "@2026-11-09" in verdict(sh)
 
 
+def test_l5_empty_board_on_a_trading_day_never_becomes_the_base():
+    """Codex P1 on PR #952: an empty Monday board must not be scored into an empty base."""
+    sh = sheet(history_as_recorded(), [])
+    assert run_at("2026-11-09T15:30:00Z", sh, P_MON, MON, "lastscored")[0] == 0
+    r = rows_for(sh, "2026-11-09")
+    assert r["CHALLENGER"][4] == "" and "reason=no-challenger" in r["CHALLENGER"][8], r["CHALLENGER"]
+    sh.tabs[s1.sb.TAB_OUT] = WS(board_rows(CHAL_MON))                 # board back on Tuesday
+    assert run_at("2026-11-10T15:40:00Z", sh, P_TUE, TUE, "lastscored")[0] == 0
+    t = rows_for(sh, "2026-11-10")
+    asof = {x: TUE for x in P_TUE}
+    want = s1.basket_return_fresh({x: P_FRI[x] for x in ("ZTO.US", "ANIP.US", "SNDA.US")}, P_TUE, asof, FRI)[0]
+    assert t["CHALLENGER"][4] != "" and abs(float(t["CHALLENGER"][4]) - round(want, 4)) < 1e-6, t["CHALLENGER"]
+    assert "@2026-11-06" in verdict(sh)
+    wed = dict(P_TUE, **{x: P_TUE[x] * 1.01 for x in CHAL_MON + BENCH})
+    assert run_at("2026-11-11T15:40:00Z", sh, wed, date(2026, 11, 11), "lastscored")[0] == 0
+    w = rows_for(sh, "2026-11-11")
+    assert w["CHALLENGER"][4] != "" and "chal fresh=5/5" in verdict(sh) and "@2026-11-10" in verdict(sh)
+
+
+def test_l5b_no_seat_priced_today_is_excluded_not_scored():
+    sh = sheet(history_as_recorded(), ["NOPRICE.US"])
+    assert run_at("2026-11-09T15:30:00Z", sh, P_MON, MON, "lastscored")[0] == 0
+    r = rows_for(sh, "2026-11-09")
+    assert r["CHALLENGER"][4] == "" and "reason=no-snapshot" in r["CHALLENGER"][8], r["CHALLENGER"]
+
+
+def test_l6_a_base_older_than_the_limit_falls_back_to_legacy():
+    old = [list(r) for r in history_as_recorded()]
+    for r in old[1:4]:
+        r[0] = "2026-10-20"                                            # the last scored rows: 20 days old
+    sh = sheet(old, CHAL_MON)
+    assert run_at("2026-11-09T15:30:00Z", sh, P_MON, MON, "lastscored")[0] == 0
+    v = verdict(sh)
+    assert "fallback=legacy(" in v and "mode=observe" in v, v
+    r = rows_for(sh, "2026-11-09")
+    assert "reason=fresh-floor" in r["CHALLENGER"][8]                  # legacy result: the Sunday row held no price
+    assert run_at("2026-11-10T15:40:00Z", sh, P_TUE, TUE, "lastscored")[0] == 0     # recovers: legacy pairs vs Monday
+    assert rows_for(sh, "2026-11-10")["CHALLENGER"][4] != "" and "fallback=legacy(" in verdict(sh)
+    wed = dict(P_TUE, **{x: P_TUE[x] * 1.01 for x in CHAL_MON + BENCH})
+    assert run_at("2026-11-11T15:40:00Z", sh, wed, date(2026, 11, 11), "lastscored")[0] == 0
+    v3 = verdict(sh)
+    assert "mode=lastscored" in v3 and "fallback" not in v3 and "@2026-11-10" in v3, v3   # back on lastscored
+    assert s1.base_too_old({"CHALLENGER": {"date": "2026-11-06"}}, MON, 7) == ""
+    assert s1.base_too_old({"CHALLENGER": {"date": "2026-10-20"}, "BENCHMARK": None}, MON, 7) == "challenger:2026-10-20"
+    assert s1.base_too_old({"BENCHMARK": {"date": ""}}, MON, 7) == "benchmark:"
+
+
 def test_l4_workflow_maps_lastscored():
     wf = yaml.safe_load((ROOT / ".github/workflows/shadow_scorer.yml").read_text(encoding="utf-8"))
     envs = {}

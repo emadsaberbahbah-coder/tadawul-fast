@@ -10,8 +10,22 @@ inline pass-1 measurement, which never carries that key, so every lastscored
 run printed `readback_error=KeyError` instead of its pairing (observe was
 unaffected: there the lastscored side comes from _measure_one). The line now
 falls back to the base row's pairable count (_bp_pairable, the same number
-the floor divides by). Scoring, pairing, rows and gate are unchanged; only
-the informational read-back text changes. Changed: 1 line in main().
+the floor divides by).
+Review on PR #952 (Codex P1): under lastscored an empty challenger board on a
+trading day could still be SCORED (the floor divides by the base row's legs),
+storing an empty snapshot that then became every later day's base: each
+later day failed the floor and, being excluded, could never become a base -
+a permanent stall that legacy would have recovered from. Two guards:
+  * a lastscored day whose challenger snapshot would store no price (empty
+    board, or no seat priced today) is EXCLUDED (reason=no-snapshot or
+    no-challenger), so the base stays the last row that holds prices;
+  * recovery: when any basket's last-scored base is older than
+    TFB_S1_BASE_MAX_AGE_D calendar days (default 7), that run behaves as
+    observe (legacy rows written, both pairings printed, '| fallback=legacy
+    (<basket>:<date>)' on the [S1-BASE] line), so the window resumes as
+    legacy would.
+Functions added: 2 (_base_max_age_d, base_too_old). Legacy and observe are
+byte-identical to 1.9.4 apart from the read-back fix.
 
 VERSION 1.9.4 (2026-11-10) — A SEAT THAT ENTERS ON A NON-TRADING DAY GETS ITS BASE
 WHY: S-1 stayed at 26/28. The board rotated over the weekend (7-8 Nov) to five
@@ -1717,6 +1731,31 @@ def last_scored_row_for(history: List[Dict[str, Any]], basket: str
     return None
 
 
+def _base_max_age_d() -> int:
+    """v1.9.5: TFB_S1_BASE_MAX_AGE_D (default 7, clamp 1..60) - the oldest a
+    last-scored base may be before the run falls back to legacy pairing."""
+    try:
+        v = int(float(os.getenv("TFB_S1_BASE_MAX_AGE_D") or 7))
+    except Exception:  # noqa: BLE001
+        return 7
+    return v if 1 <= v <= 60 else 7
+
+
+def base_too_old(base_map: Dict[str, Optional[Dict[str, Any]]], today: date,
+                 max_age_d: int) -> str:
+    """v1.9.5 PURE: '<basket>:<date>' of the first base older than max_age_d
+    calendar days before `today` (or with no date), else ''. A missing base
+    (first-ever run) is not 'too old'."""
+    for b in sorted(base_map):
+        row = base_map[b]
+        if not row:
+            continue
+        d = _parse_iso_date(row.get("date"))
+        if d is None or (today - d).days > max_age_d:
+            return f"{b.lower()}:{row.get('date')}"
+    return ""
+
+
 def _sg_filter_prev(prev_map: Dict[str, Optional[Dict[str, Any]]]
                     ) -> Dict[str, Optional[Dict[str, Any]]]:
     """v1.9.1 [P-186] PURE: the v1.7.2 shape-guard filter applied to a base
@@ -2054,10 +2093,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bp_mode = _base_policy()
     _prev_legacy = prev
     _prev_ls: Dict[str, Optional[Dict[str, Any]]] = {}
+    _bp_fallback = ""
     if _bp_mode != "legacy":
         _prev_ls = {b: last_scored_row_for(history, b) for b in prev}
         if _sg_on:
             _prev_ls = _sg_filter_prev(_prev_ls)
+        # v1.9.5: recovery path. A base older than TFB_S1_BASE_MAX_AGE_D calendar
+        # days (a basket whose names stopped pricing, a long gap) would keep every
+        # later day excluded, because excluded rows never become a base. Past the
+        # limit this run behaves as observe: legacy rows (pairing against the last
+        # row) are written, so the window resumes the way legacy would.
+        if _bp_mode == "lastscored":
+            _stale_b = base_too_old(_prev_ls, today, _base_max_age_d())
+            if _stale_b:
+                _bp_fallback = f"fallback=legacy({_stale_b})"
+                _bp_mode = "observe"
         if _bp_mode == "lastscored":
             prev = _prev_ls
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
@@ -2160,7 +2210,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                           f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "
                           f"alpha legacy={_f(_a_leg)} lastscored={_f(_a_ls)} "
                           f"delta={'n/a' if _a_delta is None else f'{_a_delta:+.4f}pp'} | "
-                          f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}")
+                          f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}"
+                          + (f" | {_bp_fallback}" if _bp_fallback else ""))
         except Exception as _bp_exc:  # noqa: BLE001 - read-back is additive, never fatal
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"readback_error={type(_bp_exc).__name__}")
@@ -2171,11 +2222,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         _price_honesty_enabled() and _day_class_venue_enabled()
         and _chal_m["p"] is not None
         and day_is_non_trading(chal_syms, _chal_p_date, today))
+    # v1.9.5: under lastscored the scored row becomes tomorrow's base, so a day
+    # whose challenger snapshot would store no price (an empty board, or no
+    # seat priced today) is never scored: it would leave an empty base and
+    # stall every later day (Codex P1 on PR #952). Excluded instead; the base
+    # stays the last row that holds prices.
+    _snap_empty = False
+    if _bp_mode == "lastscored" and not day_non_trading and _chal_m["p"] is not None:
+        _snap_empty = not stored_prices_today(
+            chal_syms, spot, spot_asof, _chal_m["p"], _chal_p_date, False, row_day=today)[0]
     day_excluded = bool(
         (not day_non_trading)
         and _price_honesty_enabled()
         and _chal_m["p"] is not None
         and (_chal_frac < _min_fresh_frac()
+             or _snap_empty
              or (measured[BENCHMARK]["p"] is not None
                  and measured[BENCHMARK]["ret"] is None)))
     total_stale = sum(m["n_stale"] for m in measured.values())
@@ -2188,6 +2249,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _excl_reason = "no-challenger"
         elif _chal_frac < _min_fresh_frac():
             _excl_reason = "fresh-floor"
+        elif _snap_empty:
+            _excl_reason = "no-snapshot"
         else:
             _excl_reason = "benchmark-leg"
 
