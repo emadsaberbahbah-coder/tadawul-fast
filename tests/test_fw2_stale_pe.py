@@ -595,7 +595,8 @@ def base(tmp_path_factory):
 def fresh(tmp_path_factory):
     src = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")
     mod = _load_copy("rds_fresh_v6_71_0", src, tmp_path_factory)
-    assert mod.SCRIPT_VERSION == "6.71.0"
+    # 6.72.0 (2026-11-10): STAMP-REPAIR (default off); FW2-STALE-PE unchanged.
+    assert mod.SCRIPT_VERSION == "6.72.0"
     return mod
 
 
@@ -793,7 +794,10 @@ def test_a1_guards_untouched_and_nothing_removed(base):
     new_defs = _defs((_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8"))
     base_defs = _defs(_base_source())
     assert base_defs <= new_defs
-    assert new_defs - base_defs == NEW_HELPERS
+    # 6.72.0 (2026-11-10) STAMP-REPAIR adds its own four helpers; the FW2 set is unchanged.
+    stamp_repair = {"_stamp_repair_enabled", "_stamp_repair_budget_s", "_stamp_repair_enqueue",
+                    "_repair_failed_stamps"}
+    assert new_defs - base_defs - stamp_repair == NEW_HELPERS
 
 
 def test_a1b_added_lines_are_ascii():
@@ -806,7 +810,7 @@ def test_a1b_added_lines_are_ascii():
     added = [ln for ln in diff.stdout.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
     # The title line keeps the em dash it has carried since v6.0 (only the version changes).
     bad = [ln for ln in added if any(ord(c) > 127 for c in ln)
-           and "DASHBOARD SYNC RUNNER (v6.71.0)" not in ln]
+           and "DASHBOARD SYNC RUNNER (v6.72.0)" not in ln]
     assert bad == []
     assert all(ord(c) < 128 for c in Path(__file__).read_text(encoding="utf-8"))
 
@@ -861,9 +865,10 @@ def test_w1c_ci_runs_this_file_in_the_lean_lane():
 
 # ---------------------------------------------------------------- V1 -------
 def test_v1_version_pins():
-    assert sync.SCRIPT_VERSION == "6.71.0"
+    # 6.72.0 (2026-11-10): STAMP-REPAIR moved the pins; the 6.71.0 section stays in the head.
+    assert sync.SCRIPT_VERSION == "6.72.0"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.71.0", "dashboard sync")' in src
+    assert '("run_dashboard_sync", "6.72.0", "dashboard sync")' in src
     head = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")[:4000]
     assert "v6.71.0 - FW-2 keeps a witnessed row whose P/E is only stale (2026-10-29)" in head
 

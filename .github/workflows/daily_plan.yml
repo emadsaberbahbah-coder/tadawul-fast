@@ -1,0 +1,115 @@
+# =============================================================================
+# 🗓️ Daily Plan - one decision a day, frozen
+# -----------------------------------------------------------------------------
+# VERSION 1.0.0 (2026-11-10)
+#
+# WHY: a ticket on the main page existed only while six conditions held at the
+# same moment, each re-tested on every render (6-9 Nov: 32 board versions in
+# 77 hours, 4 of 319 seat-slots carried a ticket; the funded render timed out
+# at the Apps Script 6-minute limit on all 7 logged attempts of 9-10 Nov).
+# scripts/daily_plan.py 1.0.0 cuts one plan per Riyadh day from the first
+# finished, verified render of the main page and freezes it: later runs only
+# refresh each pick's status. It reads the workbook and writes its own two
+# tabs (_Daily_Plan, Daily_Plan); it calls no backend and no broker.
+#
+# WHEN: after every production sync finishes (workflow_run fires on the
+# event, so GitHub's late cron does not delay it), waiting up to 45 minutes
+# for the main page's verified render; three scheduled runs a day refresh the
+# status (a late start only delays that refresh); dispatch by hand.
+#
+# Rollback: set the repository variable TFB_DAILY_PLAN=off.
+# =============================================================================
+name: 🗓️ Daily Plan
+
+on:
+  workflow_run:
+    workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
+    types: [completed]
+  schedule:
+    - cron: "40 5,9,13 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and print only (write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tfb-daily-plan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  daily_plan:
+    name: 🗓️ Cut or refresh the frozen plan
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.event == 'schedule' ||
+      github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 google-auth
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 🗓️ Run the daily plan
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_DAILY_PLAN: ${{ vars.TFB_DAILY_PLAN || 'on' }}
+          TFB_PLAN_PICKS: ${{ vars.TFB_PLAN_PICKS || '3' }}
+          TFB_PLAN_FUNDABLE_CCY: ${{ vars.TFB_PLAN_FUNDABLE_CCY || 'USD,SAR' }}
+          TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
+          TFB_PLAN_EXDIV_DAYS: ${{ vars.TFB_PLAN_EXDIV_DAYS || '3' }}
+          TFB_PLAN_EXDIV_PCT: ${{ vars.TFB_PLAN_EXDIV_PCT || '2.0' }}
+          TFB_PLAN_HELD_TARGET_MAX_H: ${{ vars.TFB_PLAN_HELD_TARGET_MAX_H || '48' }}
+          TFB_PLAN_STOP_PCT: ${{ vars.TFB_PLAN_STOP_PCT || '8' }}
+          TFB_PLAN_RISK_PCT_NAV: ${{ vars.TFB_PLAN_RISK_PCT_NAV || '1.0' }}
+          TFB_PLAN_MAX_WEIGHT_PCT: ${{ vars.TFB_PLAN_MAX_WEIGHT_PCT || '15' }}
+          TFB_PLAN_CASH_FLOOR_PCT: ${{ vars.TFB_PLAN_CASH_FLOOR_PCT || '10' }}
+          TFB_PLAN_MIN_TICKET_SAR: ${{ vars.TFB_PLAN_MIN_TICKET_SAR || '2000' }}
+          TFB_PLAN_KEEP_RANK: ${{ vars.TFB_PLAN_KEEP_RANK || '8' }}
+          TFB_PLAN_COOLDOWN_DAYS: ${{ vars.TFB_PLAN_COOLDOWN_DAYS || '10' }}
+          TFB_PLAN_UNVERIFIED_AFTER_H: ${{ vars.TFB_PLAN_UNVERIFIED_AFTER_H || '15' }}
+        run: |
+          EXTRA=""
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            EXTRA="--wait-min 45"
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            EXTRA="--dry-run"
+          fi
+          python scripts/daily_plan.py $EXTRA
