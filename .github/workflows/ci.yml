@@ -2,7 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.75 (2026-11-10) -- SYNC WATCHDOG SUITE
+# VERSION 1.1.76 (2026-11-10) -- DAILY PLAN SUITE
+#
+# v1.1.76: run tests/test_daily_plan.py (scripts/daily_plan.py 1.0.0 and
+# daily_plan.yml 1.0.0: one plan per Riyadh day cut from the main page's
+# first finished, verified render and frozen; later runs refresh only the
+# status) in the blocking lean lane.
 #
 # v1.1.75: run tests/test_sync_watchdog.py (scripts/sync_watchdog.py 1.0.0 and
 # daily_sync.yml 1.0.13: no cron in the sync workflow, the Apps Script
@@ -1154,6 +1159,7 @@ jobs:
             tests/test_sync_status_stamp_retry.py \
             tests/test_sync_stamp_repair.py \
             tests/test_sync_watchdog.py \
+            tests/test_daily_plan.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
