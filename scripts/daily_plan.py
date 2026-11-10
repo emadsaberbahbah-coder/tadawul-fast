@@ -19,16 +19,19 @@ dropped'; the dropped name is the one the owner bought.
 
 WHAT (TFB_PLAN_SETTLE_PREV=on), in run_once before the previous-plan list is
 built: each PICK row of the newest previous plan date P whose Status is not
-EXECUTED or INVALIDATED, and whose symbol is an active lot bought on or after
-P, becomes EXECUTED 'bought <date> (settled <today>)', Status At = this run.
-Skipped: a name bought today that today's plan also picks (today's own row
-records that purchase). Nothing else changes: no WAIT / INVALIDATED / CHECK
-on a past day, no price, level or quantity, and rows older than P are
-untouched. The Stability line then counts against every PICK of P and ends
-', N executed': kept = today's picks that were P's picks; new = the rest of
-today's picks; dropped = P's picks neither picked today nor executed;
-executed = P's executed picks not picked today (kept + dropped + executed =
-P's picks). One 'SETTLE-PREV' log line per run names what was settled.
+EXECUTED or INVALIDATED becomes EXECUTED 'bought <date> (settled <today>)',
+Status At = this run, when its symbol is an active lot bought on or after the
+first day of the name's unbroken run of PICK days ending at P (usually P
+itself; a pick carried forward because its lot was entered after the next
+cut still settles). Skipped: a name bought today or later that today's plan
+also picks (today's own row records that purchase). Nothing else changes: no
+WAIT / INVALIDATED / CHECK on a past day, no price, level or quantity, and
+rows older than P are untouched. The Stability line then counts against every
+PICK of P and ends ', N executed': kept = today's picks that were P's picks;
+new = the rest of today's picks; dropped = P's picks neither picked today nor
+executed; executed = P's executed picks not picked today (kept + dropped +
+executed = P's picks). One 'SETTLE-PREV' log line per run names what was
+settled.
 SITES: settle_prev_on, settle_prev and stability_counts (new); run_once (the
 settle before prev_picks; the counts into info); page_rows (uses the counts
 only when info carries them).
@@ -160,7 +163,7 @@ def settle_prev_on() -> bool:
 
 
 def knobs() -> Dict[str, Any]:
-    ccy =[c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
+    ccy = [c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
     return {
         "picks": int(_env_num("TFB_PLAN_PICKS", 3, 1, 5)),
         "ccy": [c for c in ccy if c in FX_TO_SAR] or ["USD", "SAR"],
@@ -595,13 +598,19 @@ def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt
     """1.0.2 [SETTLE-PREV]: mark EXECUTED the previous plan's open picks that were bought since that plan.
 
     Only the PICK rows of `prev_date` whose Status is not terminal; a row is settled when its symbol is an
-    active lot bought on or after `prev_date`, unless it was bought today and today's plan also picks it
-    (today's own row records that purchase). Sets Status, Status Reason and Status At only. Returns
-    [(symbol, buy date)] in ledger order."""
+    active lot bought on or after the first plan date of the symbol's unbroken run of PICK days ending at
+    `prev_date` (a pick carried from day to day because its lot was entered late still settles), unless it
+    was bought today or later and today's plan also picks it (today's own row records that purchase). Sets
+    Status, Status Reason and Status At only. Returns [(symbol, buy date)] in ledger order."""
     pd = parse_date(prev_date)
     if pd is None:
         return []
     now = {text(s).upper() for s in today_picks}
+    picked: Dict[str, set] = {}
+    for d in older:
+        if text(d["Kind"]) == "PICK":
+            picked.setdefault(text(d["Plan Date"]), set()).add(text(d["Symbol"]).upper())
+    earlier = sorted((p for p in picked if p < prev_date), reverse=True)
     out: List[Tuple[str, _dt.date]] = []
     for d in older:
         if text(d["Plan Date"]) != prev_date or text(d["Kind"]) != "PICK":
@@ -609,8 +618,13 @@ def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt
         if text(d["Status"]) in ("EXECUTED", "INVALIDATED"):
             continue
         sym = text(d["Symbol"]).upper()
+        start = prev_date
+        for p in earlier:
+            if sym not in picked[p]:
+                break
+            start = p
         bd = held.get(sym)
-        if bd is None or bd < pd or (bd >= today and sym in now):
+        if bd is None or bd < (parse_date(start) or pd) or (bd >= today and sym in now):
             continue
         d["Status"] = "EXECUTED"
         d["Status Reason"] = "bought %s (settled %s)" % (bd.isoformat(), today.isoformat())

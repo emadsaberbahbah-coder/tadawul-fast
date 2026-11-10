@@ -32,15 +32,24 @@ instead of skipping them; set in CI).
   S6  bought today and picked again today: the previous row is not settled,
       today's row records the purchase, the name stays 'kept'
   S7  lot entered after today's cut (bought on the plan day, picked again
-      today): the previous row is settled and the name stays 'kept'
+      today): the previous row is settled and the name stays 'kept'; the
+      next day the carried pick settles too (its run of PICK days starts on
+      the buy date) and the page reads 0 dropped, 1 executed
   S8  bought today, not picked today: settled 'bought <today>'
   S9  a run after Riyadh midnight cuts the next day and settles
   S10 observe and --dry-run settle in memory, print the line, write nothing
   S11 the counts: kept + dropped + executed = the previous plan's picks and
       kept + new = today's picks, in every on scenario
+  S11b the counts read only the previous plan's rows
   S12 no previous plan: on equals off (ledger, page, log)
   S13 the workflow maps the gate (default 'off'), the manifest pins the
       version, ci.yml runs this file with the base fetched by SHA
+  S14 two names settle in one run: ledger order and the exact log line
+  S15 a bought pick left at CHECK (an unverified cut, as on 10 Nov) or at
+      WAIT settles; the settle writes the three status cells and nothing else
+  S16 the run of PICK days, directly on settle_prev: a three-day run reaches
+      back to its first day; a day the name was not picked (absent, or only
+      in the pipeline) ends the run; the walk goes newest first
 
 Run: python tests/test_daily_plan_settle_prev.py  |  pytest -q tests/test_daily_plan_settle_prev.py
 """
@@ -188,14 +197,16 @@ LOTS = [["_Portfolio_CostBasis"], ["Status:"], ["legend"],
         ["FRST.US", "Primis", "USD", "Inactive", "2026-10-26", "2026-11-04", ""]]
 
 
-def line(day, hhmm="09:38"):
+def line(day, hhmm="09:38", verified=True):
+    if not verified:
+        return "Last run %s %s:18 | status: ok | output: WITHHELD | source readiness: partial (run 1)" % (day, hhmm)
     return ("Last run %s %s:18 | status: ok | output: QUALIFIED_UNFUNDED | source readiness VERIFIED (run 1)"
             % (day, hhmm))
 
 
-def board(day, qual=None, cash="33,125 SAR", hhmm="09:38"):
+def board(day, qual=None, cash="33,125 SAR", hhmm="09:38", verified=True):
     qual = QUAL if qual is None else qual
-    return ([["TOP 10 INVESTMENTS - DECISION"], ["Status:", line(day, hhmm)], ["CONTROL PANEL"],
+    return ([["TOP 10 INVESTMENTS - DECISION"], ["Status:", line(day, hhmm, verified)], ["CONTROL PANEL"],
              ["T10: Universe Scope", "All Main Sheets", "", "T10: Max Selected", 10],
              ["T10: Allow Negative Sector", "No", "", "T10: Max Per Sector", 2],
              ["T10: Include Portfolio Holdings", "No", "", "T10: Base Currency", "SAR", "",
@@ -255,8 +266,8 @@ def _lots(*extra):
     return _set("_Portfolio_CostBasis", LOTS + [list(r) for r in extra])
 
 
-def _board(day, qual=None, hhmm="08:20"):
-    return _set("Top_10_Investments", board(day, qual, hhmm=hhmm))
+def _board(day, qual=None, hhmm="08:20", verified=True):
+    return _set("Top_10_Investments", board(day, qual, hhmm=hhmm, verified=verified))
 
 
 def _src(**prices):
@@ -313,6 +324,23 @@ SCENARIOS = {
     "s10_observe_and_dry_run": DAY1 + [
         ("2026-11-11", "08:40", [_lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11")], (), "observe"),
         ("2026-11-11", "08:45", [], ("--dry-run",), "on")],
+    # S7b: S7, then the 12 Nov 08:40 run: the 11 Nov pick (carried because the lot came late) settles
+    "s7b_late_lot_next_day": DAY1 + [
+        ("2026-11-11", "08:40", [_board("2026-11-11")], (), "on"),
+        ("2026-11-11", "12:40", [_lots(lot("NMM.US", "2026-11-10"))], (), "on"),
+        ("2026-11-12", "08:40", [_board("2026-11-12")], (), "on")],
+    # S14: TEN.US and NMM.US both bought on 10 Nov
+    "s14_two_settled": DAY1 + [
+        ("2026-11-11", "08:40", [_lots(lot("NMM.US", "2026-11-10"), lot("TEN.US", "2026-11-10")),
+                                 _board("2026-11-11")], (), "on")],
+    # S15: the 10 Nov cut is unverified (15:30, every pick CHECK, as the first live plan); NMM.US bought
+    "s15_check_bought": [
+        ("2026-11-10", "15:30", [_board("2026-11-10", hhmm="15:20", verified=False)], (), "on"),
+        ("2026-11-11", "08:40", [_lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11")], (), "on")],
+    # S15: NMM.US above its entry zone at the 16:40 refresh (WAIT), then bought
+    "s15_wait_bought": DAY1[:2] + [
+        ("2026-11-10", "16:40", [_src(**{"NMM.US": "65.00"})], (), "on"),
+        ("2026-11-11", "08:40", [_src(), _lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11")], (), "on")],
     # S12: a single day, no previous plan
     "s12_no_previous_plan": DAY1[:1] + [("2026-11-10", "16:40", [_lots(lot("NMM.US", "2026-11-10"))], (), "on")],
 }
@@ -449,7 +477,10 @@ def test_s5_rows_older_than_the_previous_plan_are_untouched():
     prev = by_sym(led, "2026-11-10")
     assert prev["TEN.US"]["Status"] == "EXECUTED"
     assert prev["TEN.US"]["Status Reason"] == "bought 2026-11-10 (settled 2026-11-11)"
-    assert "settled TEN.US (bought 2026-11-10)" in log
+    assert rows(led, "2026-11-10", kind="PIPELINE") == rows(on[1][2], "2026-11-10", kind="PIPELINE")
+    assert [x for x in log.splitlines() if "SETTLE-PREV" in x] == [
+        "SETTLE-PREV previous plan 2026-11-10: settled TEN.US (bought 2026-11-10) | kept 2, new 1, dropped 0, "
+        "executed 1"]
 
 
 # ----------------------------------------------------------------------------- S6
@@ -475,6 +506,23 @@ def test_s7_lot_entered_after_todays_cut_settles_and_stays_kept():
     assert "settled NMM.US (bought 2026-11-10)" in log
 
 
+def test_s7b_carried_pick_settles_the_next_day():
+    on = play(dp, "s7b_late_lot_next_day", "on")
+    assert by_sym(on[4][2], "2026-11-11")["NMM.US"]["Status"] == "OPEN"      # bought before its own plan day
+    _, log, led, page = on[5]
+    nov11 = by_sym(led, "2026-11-11")["NMM.US"]
+    assert (nov11["Status"], nov11["Status Reason"], nov11["Status At (Riyadh)"]) == (
+        "EXECUTED", "bought 2026-11-10 (settled 2026-11-12)", "2026-11-12 08:40")
+    assert by_sym(led, "2026-11-10")["NMM.US"]["Status Reason"] == "bought 2026-11-10 (settled 2026-11-11)"
+    assert {d["Symbol"]: d["Waiting For"] for d in rows(led, "2026-11-12", kind=None)}["NMM.US"] == "already held"
+    assert counts(page) == (2, 1, 0, 1)
+    assert [x for x in log.splitlines() if "SETTLE-PREV" in x] == [
+        "SETTLE-PREV previous plan 2026-11-11: settled NMM.US (bought 2026-11-10) | kept 2, new 1, dropped 0, "
+        "executed 1"]
+    off = play(dp, "s7b_late_lot_next_day", None)
+    assert counts(off[5][3]) == (2, 1, 1)                                   # 1.0.1: the bought name is dropped
+
+
 # ----------------------------------------------------------------------------- S8
 def test_s8_bought_today_not_picked_today_is_settled():
     on = play(dp, "s8_bought_today_not_picked", "on")
@@ -483,6 +531,9 @@ def test_s8_bought_today_not_picked_today_is_settled():
     prev = by_sym(led, "2026-11-10")["NMM.US"]
     assert (prev["Status"], prev["Status Reason"]) == ("EXECUTED", "bought 2026-11-11 (settled 2026-11-11)")
     assert counts(page) == (2, 1, 0, 1)
+    assert [x for x in log.splitlines() if "SETTLE-PREV" in x] == [
+        "SETTLE-PREV previous plan 2026-11-10: settled NMM.US (bought 2026-11-11) | kept 2, new 1, dropped 0, "
+        "executed 1"]
 
 
 # ----------------------------------------------------------------------------- S9
@@ -511,19 +562,46 @@ def test_s10_observe_and_dry_run_write_nothing():
 # ----------------------------------------------------------------------------- S11
 def test_s11_counts_add_up():
     seen = 0
+    status = ("Status", "Status Reason", "Status At (Riyadh)")
     for name in sorted(SCENARIOS):
-        for i, (rc, log, led, page) in enumerate(play(dp, name, "on")):
+        steps = play(dp, name, "on")
+        for i, (rc, log, led, page) in enumerate(steps):
             m = re.search(r"SETTLE-PREV previous plan (\S+): .* \| kept (\d+), new (\d+), dropped (\d+), "
                           r"executed (\d+)", log)
             if not m or "nothing written" in log:
                 continue
             prev_day, k, n, d, e = m.group(1), *(int(x) for x in m.groups()[1:])
             assert counts(page) == (k, n, d, e), (name, i)
+            if i and steps[i - 1][2]:
+                # the settle writes the three status cells of a settled PICK row and nothing else
+                was = {(r0["Kind"], r0["Symbol"]): r0 for r0 in rows(steps[i - 1][2], None, kind=None)
+                       if r0["Plan Date"] <= prev_day}
+                now = {(r1["Kind"], r1["Symbol"]): r1 for r1 in rows(led, None, kind=None) if r1["Plan Date"] <= prev_day}
+                assert set(was) == set(now), (name, i)
+                for key, r1 in now.items():
+                    r0 = was[key]
+                    assert {h: r1[h] for h in r1 if h not in status} == {h: r0[h] for h in r0 if h not in status}
+                    if any(r1[h] != r0[h] for h in status):
+                        assert key[0] == "PICK" and r1["Plan Date"] == prev_day and r1["Status"] == "EXECUTED"
+                        assert "(settled " in r1["Status Reason"], (name, i, key)
             last = max(r[0] for r in led[1:])
             assert k + d + e == len(rows(led, prev_day)), (name, i)
             assert k + n == len(rows(led, last)), (name, i)
             seen += 1
     assert seen >= 9
+
+
+def test_s11b_counts_read_only_the_previous_plan():
+    def r(day, sym, st):
+        return {"Plan Date": day, "Kind": "PICK", "Symbol": sym, "Status": st}
+    # ITRN bought on 20 Oct (EXECUTED then), sold, picked again on 9 Nov and not bought: 9 Nov counts it dropped
+    older = [r("2026-10-20", "ITRN.US", "EXECUTED"), r("2026-11-09", "ITRN.US", "OPEN"),
+             r("2026-11-09", "TEN.US", "EXECUTED"), r("2026-11-09", "NMM.US", "OPEN"),
+             dict(r("2026-11-09", "LADR.US", ""), Kind="PIPELINE")]
+    today = [r("2026-11-10", "NMM.US", "OPEN"), r("2026-11-10", "AX.US", "OPEN")]
+    assert dp.stability_counts(older, "2026-11-09", today) == (1, 1, 1, 1)
+    assert dp.stability_counts(older, "2026-10-20", today) == (0, 2, 0, 1)
+    assert dp.stability_counts([], "2026-11-09", today) == (0, 2, 0, 0)
 
 
 # ----------------------------------------------------------------------------- S12
@@ -548,6 +626,62 @@ def test_s13_workflow_manifest_ci():
     s = hits[0][1]
     assert str((s.get("env") or {}).get("TFB_TEST_REQUIRE_BASE")) == "1" and BASE_SHA in s["run"]
     assert not re.search(r"create_order|place_order|requests\.post|urlopen", src)
+
+
+# ----------------------------------------------------------------------------- S14
+def test_s14_two_names_settle_in_ledger_order():
+    on = play(dp, "s14_two_settled", "on")
+    _, log, led, page = on[3]
+    prev = by_sym(led, "2026-11-10")
+    for s in ("TEN.US", "NMM.US"):
+        assert (prev[s]["Status"], prev[s]["Status Reason"]) == ("EXECUTED", "bought 2026-11-10 (settled 2026-11-11)")
+    assert prev["ITRN.US"]["Status"] == "OPEN"
+    assert [x for x in log.splitlines() if "SETTLE-PREV" in x] == [
+        "SETTLE-PREV previous plan 2026-11-10: settled TEN.US (bought 2026-11-10), NMM.US (bought 2026-11-10) | "
+        "kept 1, new 2, dropped 0, executed 2"]
+    assert counts(page) == (1, 2, 0, 2)
+
+
+# ----------------------------------------------------------------------------- S15
+def test_s15_check_and_wait_rows_settle():
+    chk = play(dp, "s15_check_bought", "on")
+    assert all(d["Status"] == "CHECK" and d["Cut Quality"] == "UNVERIFIED" for d in rows(chk[0][2], "2026-11-10"))
+    wait = play(dp, "s15_wait_bought", "on")
+    assert by_sym(wait[2][2], "2026-11-10")["NMM.US"]["Status"] == "WAIT"
+    for steps in (chk, wait):
+        _, log, led, page = steps[-1]
+        before = by_sym(steps[-2][2], "2026-11-10")["NMM.US"]
+        after = by_sym(led, "2026-11-10")["NMM.US"]
+        assert (after["Status"], after["Status Reason"], after["Status At (Riyadh)"]) == (
+            "EXECUTED", "bought 2026-11-10 (settled 2026-11-11)", "2026-11-11 08:40")
+        status = ("Status", "Status Reason", "Status At (Riyadh)")
+        assert {h: after[h] for h in after if h not in status} == {h: before[h] for h in before if h not in status}
+        assert counts(page) == (2, 1, 0, 1)
+
+
+# ----------------------------------------------------------------------------- S16
+def test_s16_the_run_of_pick_days():
+    def r(day, sym, kind="PICK", st="OPEN"):
+        return {"Plan Date": day, "Kind": kind, "Symbol": sym, "Status": st, "Status Reason": "x",
+                "Status At (Riyadh)": "y"}
+    d9, d10, d11, d12 = (dt.date(2026, 11, x) for x in (9, 10, 11, 12))
+
+    def settle(older, bd):
+        got = dp.settle_prev(older, "2026-11-11", {"NMM.US": bd}, [], d12, "2026-11-12 08:40")
+        row = [o for o in older if o["Plan Date"] == "2026-11-11" and o["Symbol"] == "NMM.US"][0]
+        return got, row["Status"]
+    run3 = [r("2026-11-09", "NMM.US"), r("2026-11-10", "NMM.US"), r("2026-11-11", "NMM.US")]
+    assert settle(copy.deepcopy(run3), d9) == ([("NMM.US", d9)], "EXECUTED")       # back to the run's first day
+    assert settle(copy.deepcopy(run3), dt.date(2026, 11, 8)) == ([], "OPEN")      # bought before the run
+    gap = [r("2026-11-09", "NMM.US"), r("2026-11-10", "ITRN.US"), r("2026-11-11", "NMM.US")]
+    assert settle(gap, d9) == ([], "OPEN")                                         # 10 Nov did not pick it
+    pipe = [r("2026-11-10", "NMM.US", kind="PIPELINE"), r("2026-11-11", "NMM.US")]
+    assert settle(pipe, d10) == ([], "OPEN")                                       # a pipeline day is no pick
+    order = [r("2026-11-09", "ITRN.US"), r("2026-11-10", "NMM.US"), r("2026-11-11", "NMM.US")]
+    assert settle(order, d10) == ([("NMM.US", d10)], "EXECUTED")                   # newest first: run = 10-11 Nov
+    assert order[2]["Status Reason"] == "bought 2026-11-10 (settled 2026-11-12)"
+    assert order[2]["Status At (Riyadh)"] == "2026-11-12 08:40" and order[1]["Status"] == "OPEN"
+    assert dp.settle_prev(copy.deepcopy(run3), "not a date", {"NMM.US": d9}, [], d12, "s") == []
 
 
 if __name__ == "__main__":
