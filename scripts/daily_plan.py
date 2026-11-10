@@ -2,6 +2,40 @@
 """
 scripts/daily_plan.py - TFB Daily Plan
 ======================================
+VERSION 1.0.2 (2026-11-10) - SETTLE-PREV
+
+WHY: a pick the owner buys in the US session is never marked EXECUTED, and
+the next day's Stability line counts it as 'dropped'. run_once re-statuses
+only today's rows; older rows are written back as they are. The three
+scheduled refreshes (cron 40 5,9,13 UTC = 08:40 / 12:40 / 16:40 Riyadh) all
+run before the US open (17:30 Riyadh since 1 Nov), so a US pick bought on its
+plan day is seen only by a sync-triggered run that starts after the purchase
+and after the lot is entered, and before Riyadh midnight. The first plan (10
+Nov, cut 15:24 Riyadh, run 42815393625) holds three US picks: TEN.US, ZTO.US
+and NMM.US. Offline replay (tests/test_daily_plan_settle_prev.py S1): NMM.US
+bought on 10 Nov, next run 11 Nov 08:40 -> its 10 Nov row still reads OPEN
+'price 60.00 is inside the entry zone' and the page reads '2 kept, 1 new, 1
+dropped'; the dropped name is the one the owner bought.
+
+WHAT (TFB_PLAN_SETTLE_PREV=on), in run_once before the previous-plan list is
+built: each PICK row of the newest previous plan date P whose Status is not
+EXECUTED or INVALIDATED, and whose symbol is an active lot bought on or after
+P, becomes EXECUTED 'bought <date> (settled <today>)', Status At = this run.
+Skipped: a name bought today that today's plan also picks (today's own row
+records that purchase). Nothing else changes: no WAIT / INVALIDATED / CHECK
+on a past day, no price, level or quantity, and rows older than P are
+untouched. The Stability line then counts against every PICK of P and ends
+', N executed': kept = today's picks that were P's picks; new = the rest of
+today's picks; dropped = P's picks neither picked today nor executed;
+executed = P's executed picks not picked today (kept + dropped + executed =
+P's picks). One 'SETTLE-PREV' log line per run names what was settled.
+SITES: settle_prev_on, settle_prev and stability_counts (new); run_once (the
+settle before prev_picks; the counts into info); page_rows (uses the counts
+only when info carries them).
+GATE: TFB_PLAN_SETTLE_PREV = off (default; 1.0.1 byte-identical: ledger,
+page and log) | on (also 1 / true / yes). daily_plan.yml maps it, default
+'off'. Rollback: unset the repository variable or set it to off.
+
 VERSION 1.0.0 (2026-11-10) - NEW SCRIPT
 
 WHY (owner review, Tue 10 Nov 2026 13:05 Riyadh, verbatim: "my concern is
@@ -70,7 +104,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -120,8 +154,13 @@ def mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def settle_prev_on() -> bool:
+    """1.0.2 [SETTLE-PREV]: TFB_PLAN_SETTLE_PREV on / 1 / true / yes; anything else (and unset) is off."""
+    return _env("TFB_PLAN_SETTLE_PREV", "off").lower() in ("on", "1", "true", "yes")
+
+
 def knobs() -> Dict[str, Any]:
-    ccy = [c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
+    ccy =[c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
     return {
         "picks": int(_env_num("TFB_PLAN_PICKS", 3, 1, 5)),
         "ccy": [c for c in ccy if c in FX_TO_SAR] or ["USD", "SAR"],
@@ -551,6 +590,47 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
         d["Last Price"] = price if price is not None else ""
 
 
+def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt.date],
+                today_picks: Sequence[str], today: _dt.date, stamp: str) -> List[Tuple[str, _dt.date]]:
+    """1.0.2 [SETTLE-PREV]: mark EXECUTED the previous plan's open picks that were bought since that plan.
+
+    Only the PICK rows of `prev_date` whose Status is not terminal; a row is settled when its symbol is an
+    active lot bought on or after `prev_date`, unless it was bought today and today's plan also picks it
+    (today's own row records that purchase). Sets Status, Status Reason and Status At only. Returns
+    [(symbol, buy date)] in ledger order."""
+    pd = parse_date(prev_date)
+    if pd is None:
+        return []
+    now = {text(s).upper() for s in today_picks}
+    out: List[Tuple[str, _dt.date]] = []
+    for d in older:
+        if text(d["Plan Date"]) != prev_date or text(d["Kind"]) != "PICK":
+            continue
+        if text(d["Status"]) in ("EXECUTED", "INVALIDATED"):
+            continue
+        sym = text(d["Symbol"]).upper()
+        bd = held.get(sym)
+        if bd is None or bd < pd or (bd >= today and sym in now):
+            continue
+        d["Status"] = "EXECUTED"
+        d["Status Reason"] = "bought %s (settled %s)" % (bd.isoformat(), today.isoformat())
+        d["Status At (Riyadh)"] = stamp
+        out.append((sym, bd))
+    return out
+
+
+def stability_counts(older: List[Dict[str, Any]], prev_date: str,
+                     today_rows: List[Dict[str, Any]]) -> Tuple[int, int, int, int]:
+    """1.0.2 [SETTLE-PREV]: (kept, new, dropped, executed) of today's picks against every PICK of `prev_date`."""
+    prev = [text(d["Symbol"]) for d in older if text(d["Plan Date"]) == prev_date and text(d["Kind"]) == "PICK"]
+    done = {text(d["Symbol"]) for d in older if text(d["Plan Date"]) == prev_date and text(d["Kind"]) == "PICK"
+            and text(d["Status"]) == "EXECUTED"}
+    now = [text(d["Symbol"]) for d in today_rows if text(d["Kind"]) == "PICK"]
+    kept = len([s for s in now if s in prev])
+    rest = [s for s in prev if s not in now]
+    return kept, len(now) - kept, len([s for s in rest if s not in done]), len([s for s in rest if s in done])
+
+
 def page_rows(today_rows: List[Dict[str, Any]], prev_picks: Sequence[str], info: Dict[str, Any]) -> List[List[Any]]:
     """The Daily_Plan page as plain rows of PAGE_WIDTH cells."""
     def pad(r: List[Any]) -> List[Any]:
@@ -566,6 +646,9 @@ def page_rows(today_rows: List[Dict[str, Any]], prev_picks: Sequence[str], info:
     out.append(pad(["Stability: picks changed today after the cut: 0 (frozen) · versus the previous plan: "
                     "%d kept, %d new, %d dropped" % (len(kept), len(now_syms) - len(kept),
                                                     len([s for s in prev_picks if s not in now_syms]))]))
+    if "stability" in info:   # 1.0.2 [SETTLE-PREV]: counted against every pick of the previous plan
+        head = text(out[-1][0]).rsplit(": ", 1)[0]
+        out[-1] = pad([head + ": %d kept, %d new, %d dropped, %d executed" % tuple(info["stability"])])
     out.append(pad([]))
     out.append(pad(["TODAY'S PICKS (%d)" % len(picks)]))
     out.append(pad(["#", "Symbol", "Name", "Sector", "Entry", "Entry zone", "Qty", "Amount SAR", "Stop", "TP1",
@@ -709,6 +792,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
     older = [d for d in ledger if text(d["Plan Date"]) != day and parse_date(d["Plan Date"]) is not None
              and (today - parse_date(d["Plan Date"])).days <= LEDGER_KEEP_DAYS]
     prev_dates = sorted({text(d["Plan Date"]) for d in older})
+    settle = settle_prev_on() and bool(prev_dates)   # 1.0.2 [SETTLE-PREV]
+    settled: List[Tuple[str, _dt.date]] = []
+    if settle:
+        settled = settle_prev(older, prev_dates[-1], lots["held"],
+                              [text(d["Symbol"]) for d in today_rows if text(d["Kind"]) == "PICK"], today, stamp)
     prev_picks = [text(d["Symbol"]) for d in older if prev_dates and text(d["Plan Date"]) == prev_dates[-1]
                   and text(d["Kind"]) == "PICK" and text(d["Status"]) != "EXECUTED"]
     info: Dict[str, Any] = {}
@@ -755,6 +843,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
             _out("  PICK %s qty %s entry %s stop %s -> %s (%s)" % (
                 text(d["Symbol"]), fmt(d["Qty"], 0), fmt(d["Entry"]), fmt(d["Stop"]), text(d["Status"]),
                 text(d["Status Reason"])))
+    if settle:
+        info["stability"] = stability_counts(older, prev_dates[-1], today_rows)
+        _out("SETTLE-PREV previous plan %s: settled %s | kept %d, new %d, dropped %d, executed %d" % (
+            (prev_dates[-1], ", ".join("%s (bought %s)" % (s, bd.isoformat()) for s, bd in settled) or "none")
+            + tuple(info["stability"])))
     page = page_rows(today_rows, prev_picks, info)
     if not write:
         _out("%s - nothing written" % ("dry run" if dry_run else "observe"))

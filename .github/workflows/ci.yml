@@ -2,6 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.85 (2026-11-10) -- DAILY PLAN SETTLE-PREV HARNESS (daily_plan 1.0.2)
+# (Main holds every number up to 1.1.77; its 1.1.75 is a line inside its
+# 1.1.76 block. Open claims: 1.1.78 #938, 1.1.79 #915, 1.1.80 #946,
+# 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926.)
+#
+# v1.1.85: run tests/test_daily_plan_settle_prev.py (scripts/daily_plan.py
+# 1.0.2 [SETTLE-PREV], TFB_PLAN_SETTLE_PREV default off: the previous plan's
+# open picks bought since that plan read EXECUTED, and the Stability line
+# stops counting a bought pick as dropped) in the blocking lean lane; the
+# off-identity legs read daily_plan 1.0.1 at main 50f55740, fetched by SHA.
+#
 # VERSION 1.1.77 (2026-11-10) -- S-1 LASTSCORED REPLAY SUITE
 #
 # v1.1.77: run tests/test_s1_lastscored_nov9_replay.py (run_shadow_scorer
@@ -1292,6 +1303,17 @@ jobs:
           git fetch --no-tags --depth=1 origin 0c3d3e21a523c0a275b0f9b9c33951d695afc4bb \
             || echo "::notice::portfolio_actions v1.17.0 base not fetched - the v1.17.0 identity cases will SKIP"
           python -m pytest -q tests/test_pf_add_guards_d1.py
+
+      - name: Daily plan SETTLE-PREV harness (daily_plan 1.0.2, golden base fetched by SHA)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
+        run: |
+          # v1.1.85: the off-identity legs read daily_plan 1.0.1 at main
+          # 50f55740; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them
+          # instead of skipping them.
+          git fetch --no-tags --depth=1 origin 50f55740b993254b5e77d395ae12c18e543ff1b4 \
+            || echo "::warning::50f55740 base not fetched - the golden legs will FAIL"
+          python -m pytest -q tests/test_daily_plan_settle_prev.py
 
       - name: 📋 Board scorecard harness (golden bases fetched by SHA)
         run: |

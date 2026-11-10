@@ -358,7 +358,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.0.1", "daily plan"),
+    # 2026-11-10 (pin only): 1.0.1 -> 1.0.2 [SETTLE-PREV] (the previous plan's
+    # picks bought since that plan read EXECUTED; vars.TFB_PLAN_SETTLE_PREV,
+    # default off; workflow-scoped, never on Render).
+    ("daily_plan", "1.0.2", "daily plan"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]

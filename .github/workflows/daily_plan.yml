@@ -1,6 +1,14 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
+# VERSION 1.0.1 (2026-11-10)
+#
+# 1.0.1: maps TFB_PLAN_SETTLE_PREV (scripts/daily_plan.py 1.0.2 [SETTLE-PREV],
+# default 'off' = 1.0.1 byte-identical). When on, each run marks EXECUTED the
+# previous plan's open picks that were bought since that plan, so a US pick
+# bought after the last refresh of its day is not counted 'dropped' next
+# day. No schedule, trigger or concurrency change. Rollback: unset or off.
+#
 # VERSION 1.0.0 (2026-11-10)
 #
 # WHY: a ticket on the main page existed only while six conditions held at the
@@ -104,6 +112,7 @@ jobs:
           TFB_PLAN_KEEP_RANK: ${{ vars.TFB_PLAN_KEEP_RANK || '8' }}
           TFB_PLAN_COOLDOWN_DAYS: ${{ vars.TFB_PLAN_COOLDOWN_DAYS || '10' }}
           TFB_PLAN_UNVERIFIED_AFTER_H: ${{ vars.TFB_PLAN_UNVERIFIED_AFTER_H || '15' }}
+          TFB_PLAN_SETTLE_PREV: ${{ vars.TFB_PLAN_SETTLE_PREV || 'off' }}
         run: |
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
