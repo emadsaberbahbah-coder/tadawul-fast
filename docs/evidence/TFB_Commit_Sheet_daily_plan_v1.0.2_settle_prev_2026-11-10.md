@@ -88,7 +88,7 @@
 
 The first review round's 52 mutants left 8 non-equivalent survivors (only OPEN settles, PIPELINE rows settle, Last Price written in two variants, the plan date logged as the buy date, executed read from every date, two log-join variants). Each now has a killing leg.
 
-**Lanes** on an export of the final tree: see the PR body. compileall and ruff (CI rules) are clean. No added line is non-ASCII.
+**Lanes** on an export of the final tree (`cf8f73d1` plus this line): the lean emulation gives LEAN FAILS 0 with all 14 steps exiting 0. The decision-layer suites give 4,548 passed / 36 skipped, and the new step gives 32 passed with the base fetched by SHA. The contract lane gives rc 0 (426 passed, 13 skipped, as on main). compileall and ruff (CI rules) are clean. No added line is non-ASCII.
 
 ## S4 - Off identity
 
