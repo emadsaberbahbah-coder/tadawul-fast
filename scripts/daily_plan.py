@@ -57,6 +57,24 @@ column, which is as of the calendar sync (10 Nov: ZTO.US read 8 days from the
 9 Nov sync while 17 Nov was 7 days away, so the 7-day gate passed it). A pick
 without an engine 12-month ROI carries the label 'no 12-month target'.
 
+1.1.0 (2026-11-11): THE EVIDENCE RULE (TFB_PLAN_EVIDENCE = off default |
+observe | on). Measured on matured INVESTABLE records outside Tadawul, 1W-1M
+horizons, one row per symbol and week (v_outcome_excess joined to
+v_signal_history, entries 31 Aug - 10 Nov 2026): a name whose Risk Score was
+under 30 AND whose analyst target stood 15% or more above its price finished
+up in 72.2% of 72 symbol-weeks (34 names; beat its benchmark in 83.3%); the
+other INVESTABLE names finished up in 43.6% of 110. By half: 77.2% and 66.4%
+of records. The first 11 November records read 36.4%. This is an in-sample
+reading over ten weeks, so the rule ships as a LABEL first:
+  observe  every qualified name carries 'evidence rule PASS / FAIL / n/a' with
+           its two numbers; picks are chosen exactly as before.
+  on       a name that is not PASS is not picked (pipeline: 'evidence rule not
+           met'); every other gate is unchanged.
+Tadawul names read n/a: the rule was not measured as a pass there. Two more
+columns are read from the source pages (Risk Score, Target Price); nothing new
+is written outside the two tabs. Knobs: TFB_PLAN_EV_RISK_MAX (30),
+TFB_PLAN_EV_UPSIDE_MIN (15).
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -70,7 +88,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -120,6 +138,11 @@ def mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def ev_mode() -> str:
+    v = _env("TFB_PLAN_EVIDENCE", "off").lower()
+    return v if v in ("off", "observe", "on") else "off"
+
+
 def knobs() -> Dict[str, Any]:
     ccy = [c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
     return {
@@ -137,6 +160,9 @@ def knobs() -> Dict[str, Any]:
         "keep_rank": int(_env_num("TFB_PLAN_KEEP_RANK", 8, 0, 50)),
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
+        "ev_mode": ev_mode(),
+        "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
+        "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
     }
 
 
@@ -274,7 +300,8 @@ def table_index(values: Sequence[Sequence[Any]], need: Sequence[str]) -> Tuple[O
 
 
 def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, Any]]:
-    """{SYMBOL: {price, ccy, sector, warnings}} from the source pages; the first page that lists a symbol wins."""
+    """{SYMBOL: {price, ccy, sector, warnings, risk, target}} from the source pages; the first page that lists a
+    symbol wins."""
     out: Dict[str, Dict[str, Any]] = {}
     for g in grids:
         h, col = table_index(g, ("Symbol", "Current Price", "Currency"))
@@ -287,8 +314,31 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
             out[sym] = {"price": num(cell(r, col.get("Current Price"))),
                         "ccy": text(cell(r, col.get("Currency"))).upper(),
                         "sector": text(cell(r, col.get("Sector"))),
-                        "warnings": text(cell(r, col.get("Warnings")))}
+                        "warnings": text(cell(r, col.get("Warnings"))),
+                        "risk": num(cell(r, col.get("Risk Score"))),
+                        "target": num(cell(r, col.get("Target Price")))}
     return out
+
+
+def evidence_rule(symbol: str, src: Dict[str, Any], risk_max: float, upside_min: float) -> Tuple[str, str]:
+    """1.1.0 PURE: (PASS | FAIL | NA, label). PASS = Risk Score under risk_max AND the analyst target
+    upside_min % or more above the price. Tadawul and a name without both numbers read NA."""
+    if symbol.upper().endswith(".SR"):
+        return "NA", "evidence rule n/a (not measured for Tadawul)"
+    price, risk, target = src.get("price"), src.get("risk"), src.get("target")
+    if risk is None or target is None or target <= 0 or not price or price <= 0:
+        missing = "risk score" if risk is None else "analyst target"
+        return "NA", "evidence rule n/a (no %s)" % missing
+    upside = round((target / price - 1.0) * 100.0, 4)      # 4 places, as v_signal_history.target_upside_pp
+    facts = "risk %.1f, analyst upside %+.0f%%" % (risk, upside)
+    if risk < risk_max and upside >= upside_min:
+        return "PASS", "evidence rule PASS (%s)" % facts
+    need = []
+    if risk >= risk_max:
+        need.append("risk under %g" % risk_max)
+    if upside < upside_min:
+        need.append("upside %+g%% or more" % upside_min)
+    return "FAIL", "evidence rule FAIL (%s; needs %s)" % (facts, " and ".join(need))
 
 
 def _days_until(date_cell: Any, days_cell: Any, today: Optional[_dt.date]) -> Optional[float]:
@@ -412,6 +462,11 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             reason = "ex-dividend %.1f%% in %d day(s)" % (amt / c["price"] * 100.0, xd)
         if ed is None:
             c["labels"].append("earnings date not on the calendar")
+        if k.get("ev_mode", "off") != "off":
+            c["ev"], ev_label = evidence_rule(q["symbol"], src, k["ev_risk_max"], k["ev_upside_min"])
+            c["labels"].append(ev_label)
+            if k["ev_mode"] == "on" and c["ev"] != "PASS" and not reason:
+                reason = "evidence rule not met"
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -620,7 +675,8 @@ def read_source_page(book, tab: str) -> List[List[Any]]:
     h, col = table_index(head, ("Symbol", "Current Price", "Currency"))
     if h is None:
         return []
-    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings") if n in col]
+    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price")
+             if n in col]
     ranges = ["%s%d:%s" % (_col(col[n] + 1), h + 1, _col(col[n] + 1)) for n in names]
     cols = ws.batch_get(ranges)
     height = max((len(c) for c in cols), default=0)
