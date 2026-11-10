@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""tests/test_daily_plan.py - scripts/daily_plan.py 1.0.0: one plan a day, frozen.
+
+  D1  parsers: numbers, the main page's status line (finished / today /
+      verified), the control panel, the ALL QUALIFIED table, the engine's
+      deferral reasons (soft: held target inside the limit, awaiting
+      confirmation; anything else blocks)
+  D2  the decision on a board shaped like 10 Nov 2026: three picks in the
+      engine's order, sizing (cash floor, equal split, risk cap), levels
+  D3  execution gates: held, cool-down, currency, no price, earnings,
+      ex-dividend, held target past the limit, unknown engine reason, sector
+  D4  sizing edges: the minimum ticket and a share dearer than the allocation
+      move a pick to the pipeline; the risk cap binds when cash is ample
+  D5  FREEZE: a second run on the same day with a different merit list and
+      different prices changes no pick, entry, quantity, stop or target;
+      only the status moves (WAIT, INVALIDATED, EXECUTED; terminal stays)
+  D6  no cut from an unfinished page, yesterday's render, or an unverified
+      page before the fallback hour; an unverified cut after it reads CHECK
+  D7  the next day: yesterday's unexecuted pick keeps its place inside the
+      keep-rank; the stability line counts kept / new / dropped
+  D8  the gate: off touches nothing; observe and --dry-run write nothing
+  D9  --wait-min looks again after 5 minutes and cuts when the page is ready
+  D10 the workflow, the manifest pin and the CI lane
+
+Run: pytest -q tests/test_daily_plan.py
+"""
+from __future__ import annotations
+
+import datetime as dt
+import re
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts import daily_plan as dp  # noqa: E402
+
+UTC = dt.timezone.utc
+NOW = dt.datetime(2026, 11, 10, 7, 0, tzinfo=UTC)          # 10:00 Riyadh
+OK_LINE = "Last run 2026-11-10 09:38:18 | status: ok | output: QUALIFIED_UNFUNDED | source readiness VERIFIED (run 42749059415)"
+QH = ["Rank", "Symbol", "Name", "Market", "Sector", "ROI % (TP1)", "Engine ROI % (12M)", "Ann ROI %", "R/R (TP2)",
+      "Rel", "DQ", "Risk", "Score", "Selected", "Why Not Selected"]
+HELD1 = "Held target (analyst_lkg:1h) — no new money until the provider leg returns"
+CONF2 = "stability: awaiting confirmation (2/3 days) — qualified on merit, seat withheld until confirmed"
+
+
+class WorksheetNotFound(Exception):
+    pass
+
+
+def _colnum(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+class Sheet:
+    def __init__(self, rows, row_count=200, col_count=30):
+        self.values = deepcopy(rows)
+        self.row_count, self.col_count = row_count, col_count
+        self.updates = []
+
+    def get(self, range_name):
+        return deepcopy(self.values)
+
+    def batch_get(self, ranges):
+        out = []
+        for r in ranges:
+            m = re.match(r"([A-Z]+)(\d+):([A-Z]+)$", r)
+            c, start = _colnum(m.group(1)) - 1, int(m.group(2)) - 1
+            out.append([[row[c] if c < len(row) else ""] for row in self.values[start:]])
+        return out
+
+    def resize(self, rows=None, cols=None):
+        self.row_count = rows or self.row_count
+        self.col_count = cols or self.col_count
+
+    def update(self, values=None, range_name=None, value_input_option=None):
+        self.updates.append(range_name)
+        self.values = [list(r) for r in values if any(str(c) != "" for c in r)]
+
+
+class Book:
+    def __init__(self, tabs):
+        self.tabs = dict(tabs)
+        self.reads = 0
+
+    def worksheet(self, name):
+        self.reads += 1
+        if name not in self.tabs:
+            raise WorksheetNotFound(name)
+        return self.tabs[name]
+
+    def add_worksheet(self, title, rows, cols):
+        self.tabs[title] = Sheet([], rows, cols)
+        return self.tabs[title]
+
+
+def qrow(rank, sym, sector, roi, why, name=None):
+    return [rank, sym, name or sym + " Inc", "NYSE/NASDAQ", sector, "", "%s%%" % roi, "", "", 71.5, 100, "Low",
+            80 - rank, "No", why]
+
+
+def board(line=OK_LINE, qual=None, cash="33,125 SAR"):
+    qual = QUAL if qual is None else qual
+    rows = [["TOP 10 INVESTMENTS — DECISION"], ["Status:", line], ["CONTROL PANEL"],
+            ["T10: Universe Scope", "All Main Sheets", "", "T10: Max Selected", 10],
+            ["T10: Allow Negative Sector", "No", "", "T10: Max Per Sector", 2],
+            ["T10: Include Portfolio Holdings", "No", "", "T10: Base Currency", "SAR", "", "Cash Available (SAR)", cash],
+            [], ["Rank", "Symbol", "Name"], ["—", "ZTO.US", "ZTO Express"], [],
+            ["ALL QUALIFIED — INVEST opportunity set (%d)" % len(qual)], QH] + qual + [[], ["NEAR MISS"]]
+    return rows
+
+
+QUAL = [qrow(1, "ITRN.US", "Technology", 34.7, HELD1), qrow(2, "TEN.US", "Energy", 34.3, CONF2),
+        qrow(3, "ZTO.US", "Industrials", 32.4, HELD1), qrow(4, "NMM.US", "Industrials", 29.9, HELD1),
+        qrow(5, "SBLK.US", "Industrials", 27.2, HELD1), qrow(6, "LADR.US", "Real Estate", 29.5, CONF2),
+        qrow(7, "BBOX.L", "Real Estate", 31.2, ""), qrow(8, "AX.US", "Financials", 25.3, CONF2)]
+SRC = [["Symbol", "Name", "Currency", "Sector", "Current Price", "Warnings"],
+       ["ITRN.US", "Ituran", "USD", "Technology", "51.82", "analyst_lkg:1h"],
+       ["TEN.US", "Tsakos", "USD", "Energy", "25.00", ""], ["ZTO.US", "ZTO", "USD", "Industrials", "20.66", ""],
+       ["NMM.US", "Navios", "USD", "Industrials", "60.00", ""], ["SBLK.US", "Star Bulk", "USD", "Industrials", "27.07", ""],
+       ["LADR.US", "Ladder", "USD", "Real Estate", "11.00", ""], ["BBOX.L", "Tritax", "GBX", "Real Estate", "147.70", ""],
+       ["AX.US", "Axos", "USD", "Financials", "80.00", ""]]
+CAL = [["Symbol", "Next Earnings Date", "Days To Earnings", "Next Ex-Div Date", "Days To ExDiv"],
+       ["ITRN.US", "2026-11-24", 14, "", ""], ["TEN.US", "2026-12-01", 21, "", ""], ["ZTO.US", "2026-11-17", 7, "", ""],
+       ["NMM.US", "2026-12-10", 30, "", ""], ["SBLK.US", "2026-11-12", 2, "", ""], ["LADR.US", "2027-01-20", 71, "", ""],
+       ["AX.US", "2027-01-28", 79, "", ""]]
+LOTS = [["_Portfolio_CostBasis"], ["Status:"], ["legend"],
+        ["Symbol", "Name", "Ccy", "Status", "Buy Date", "Sell Date", "Market Value SAR"],
+        ["5023.SR", "Sukuk", "SAR", "Active", "2025-11-23", "", "9,900"],
+        ["DDI.US", "DoubleDown", "USD", "Active", "2026-11-02", "", "12,256"],
+        ["GLPI.US", "GLPI", "USD", "Active", "2026-11-02", "", "34,117"],
+        ["FRST.US", "Primis", "USD", "Inactive", "2026-10-26", "2026-11-04", ""]]
+
+
+def book(**over):
+    tabs = {"Top_10_Investments": Sheet(board()), "Global_Markets": Sheet(SRC), "Market_Leaders": Sheet([["x"]]),
+            "Calendar_Events": Sheet(CAL), "_Portfolio_CostBasis": Sheet(LOTS)}
+    tabs.update(over)
+    return Book(tabs)
+
+
+def K(**over):
+    k = dp.knobs()
+    k.update(over)
+    return k
+
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    for name in list(__import__("os").environ):
+        if name.startswith("TFB_PLAN_") or name == "TFB_DAILY_PLAN":
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TFB_DAILY_PLAN", "on")
+
+
+def lots():
+    return dp.read_ledger_lots(LOTS, dt.date(2026, 11, 10), 10)
+
+
+def plan(qual=QUAL, cash=33125.0, k=None, prior=(), src=SRC, cal=CAL, mps=2):
+    return dp.decide(dp.read_qualified(board(qual=qual)), dp.read_sources([src]), dp.read_calendar(cal, []), lots(),
+                     cash, mps, k or K(), prior_picks=prior)
+
+
+# ----------------------------------------------------------------------------- D1
+def test_d1_parsers():
+    assert dp.num("33,125 SAR") == 33125.0 and dp.num("31.2%") == 31.2 and dp.num("▲ 5.62%") == 5.62
+    assert dp.num("(100)") == -100.0 and dp.num("—") is None and dp.num(True) is None and dp.num(None) is None
+    s = dp.board_state(board(), NOW)
+    assert s["finished"] and s["today"] and s["verified"] and s["output"] == "QUALIFIED_UNFUNDED"
+    assert s["run_at"] == "2026-11-10 09:38"
+    r = dp.board_state(board(line="Last run 2026-11-10 12:09:13 | status: running…"), NOW)
+    assert not r["finished"] and "no finished render" in r["reason"]
+    y = dp.board_state(board(line=OK_LINE.replace("2026-11-10", "2026-11-09")), NOW)
+    assert y["finished"] and not y["today"] and "2026-11-09" in y["reason"]
+    w = dp.board_state(board(line="Last run 2026-11-10 09:08:00 | status: ok | output: WITHHELD | source readiness: unverified"), NOW)
+    assert w["finished"] and w["today"] and not w["verified"]
+    assert dp.board_state([["nothing"]], NOW)["reason"] == "no status line"
+    assert dp.num(dp.panel_value(board(), "Cash Available (SAR)")) == 33125.0
+    assert dp.num(dp.panel_value(board(), "T10: Max Per Sector")) == 2
+    q = dp.read_qualified(board())
+    assert [x["symbol"] for x in q] == [r[1] for r in QUAL] and q[0]["roi12"] == 34.7 and q[0]["rank"] == 1
+    assert dp.read_qualified([["no table"]]) == []
+    assert dp.engine_deferral(HELD1, 48) == ("", "analyst target held 1h")
+    assert dp.engine_deferral(HELD1.replace("1h", "60h"), 48)[0].startswith("analyst target held 60h")
+    assert dp.engine_deferral(CONF2, 48) == ("", "confirmation 2/3")
+    assert dp.engine_deferral("", 48) == ("", "") and dp.engine_deferral("Qualified (INVEST) — deferred by diversification cap", 48) == ("", "")
+    assert dp.engine_deferral("venue not tradable", 48) == ("venue not tradable", "")
+    for soft in ("\u2014 selected", "not selected \u2014 no seat was taken this run; see Status line",
+                 "not selected \u2014 qualified, but absent from this run's ticket set (2 seat(s) taken); see Status line",
+                 "ranked below the Max Selected cut"):
+        assert dp.engine_deferral(soft, 48) == ("", ""), soft
+    held = "Held research seat \u2014 GRACE-HELD; stability: GRACE (0/3 missed); no executable allocation today"
+    assert dp.engine_deferral(held, 48) == ("", "main page seat: grace-held")
+    assert dp.engine_deferral("structural: Eligibility (Venue)", 48)[0] == "structural: Eligibility (Venue)"
+
+
+def test_d1b_the_main_pages_selected_rows_are_picks():
+    """Codex P1 on PR #951: a row the main page selected reads '\u2014 selected' and must lead the plan."""
+    sel = qrow(1, "ITRN.US", "Technology", 34.7, "\u2014 selected")
+    sel[13] = "Yes"
+    odd = qrow(2, "TEN.US", "Energy", 34.3, "anything the cockpit writes beside a Yes")
+    odd[13] = "Yes"
+    q = [sel, odd, qrow(3, "NMM.US", "Industrials", 29.9, "not selected \u2014 no seat was taken this run; see Status line"),
+         qrow(4, "LADR.US", "Real Estate", 29.5, "structural: Eligibility (Venue)")]
+    p = plan(qual=q)
+    assert [c["symbol"] for c in p["picks"]] == ["ITRN.US", "TEN.US", "NMM.US"]
+    assert [c["waiting"] for c in p["pipeline"]] == ["structural: Eligibility (Venue)"]
+
+
+# ----------------------------------------------------------------------------- D2
+def test_d2_decision_on_the_10_nov_shape():
+    p = plan()
+    assert [c["symbol"] for c in p["picks"]] == ["ITRN.US", "TEN.US", "NMM.US"]
+    nav = 9900 + 12256 + 34117 + 33125
+    assert p["nav"] == nav and abs(p["deployable"] - (33125 - 0.10 * nav)) < 1e-6
+    per = min(0.15 * nav, 0.01 * nav / 0.08, p["deployable"] / 3)
+    assert abs(p["per_pick"] - per) < 1e-6
+    it = p["picks"][0]
+    assert it["qty"] == int(per // (51.82 * 3.75)) and it["stop"] == round(51.82 * 0.92, 4)
+    assert it["zone_low"] == round(51.82 * 0.97, 4) and it["zone_high"] == round(51.82 * 1.01, 4)
+    assert it["tp2"] == round(51.82 * 1.347, 4) and it["tp1"] == round(51.82 * (1 + 0.347 / 2), 4)
+    assert abs(it["risk_sar"] - it["qty"] * 51.82 * 0.08 * 3.75) < 0.5 and it["risk_sar"] / nav < 0.0101
+    assert "analyst target held 1h" in it["labels"] and "confirmation 2/3" in p["picks"][1]["labels"]
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["ZTO.US"] == "earnings in 7 day(s)" and wait["SBLK.US"] == "earnings in 2 day(s)"
+    assert wait["BBOX.L"].startswith("currency GBX is not fundable") and wait["LADR.US"] == "next in line (rank 6)"
+    assert [c["rank"] for c in p["pipeline"]] == sorted(c["rank"] for c in p["pipeline"])
+
+
+# ----------------------------------------------------------------------------- D3
+def test_d3_execution_gates():
+    q = [qrow(1, "DDI.US", "Technology", 30, ""), qrow(2, "FRST.US", "Financials", 30, ""),
+         qrow(3, "NOPX.US", "Energy", 30, ""), qrow(4, "OLD.US", "Energy", 30, HELD1.replace("1h", "60h")),
+         qrow(5, "ODD.US", "Energy", 30, "venue not tradable"), qrow(6, "DIV.US", "Utilities", 30, ""),
+         qrow(7, "A.US", "Energy", 30, ""), qrow(8, "B.US", "Energy", 30, ""), qrow(9, "C.US", "Energy", 30, "")]
+    src = [SRC[0], ["DDI.US", "", "USD", "", "15.7", ""], ["FRST.US", "", "USD", "", "10", ""],
+           ["OLD.US", "", "USD", "", "10", ""], ["ODD.US", "", "USD", "", "10", ""], ["DIV.US", "", "USD", "", "100", ""],
+           ["A.US", "", "USD", "", "10", ""], ["B.US", "", "USD", "", "10", ""], ["C.US", "", "USD", "", "10", ""]]
+    div = [["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"], ["DIV.US", "2026-11-12", 2, 8.13, "USD"],
+           ["A.US", "2026-11-12", 2, 0.05, "USD"]]
+    p = dp.decide(dp.read_qualified(board(qual=q)), dp.read_sources([src]), dp.read_calendar([], div), lots(), 33125.0,
+                  2, K())
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["DDI.US"] == "already held" and wait["FRST.US"] == "sold 6 day(s) ago (cool-down 10 days)"
+    assert wait["NOPX.US"] == "no price on its source page" and wait["OLD.US"].startswith("analyst target held 60h")
+    assert wait["ODD.US"] == "venue not tradable" and wait["DIV.US"] == "ex-dividend 8.1% in 2 day(s)"
+    assert [c["symbol"] for c in p["picks"]] == ["A.US", "B.US"]          # 0.5% dividend does not block A
+    assert wait["C.US"] == "sector cap (Energy already has 2)"
+    assert all("earnings date not on the calendar" in c["labels"] for c in p["picks"])
+
+
+# ----------------------------------------------------------------------------- D4
+def test_d4_sizing_edges():
+    small = plan(cash=12000.0)                    # NAV 68,273: deployable 5,173 = 1,724 a pick for three
+    assert [c["symbol"] for c in small["picks"]] == ["ITRN.US", "TEN.US"]
+    edge = plan(cash=13000.0)                     # 2,024 a pick, but whole shares give 1,943 / 1,969 / 1,800
+    assert [c["symbol"] for c in edge["picks"]] == ["ITRN.US", "TEN.US"]
+    assert all(c["alloc_sar"] >= 2000 for c in edge["picks"])
+    assert [c["waiting"] for c in edge["pipeline"] if c["symbol"] == "NMM.US"][0].endswith("minimum ticket in whole shares")
+    assert all(c["alloc_sar"] >= 2000 for c in small["picks"])
+    assert any(c["waiting"].startswith("cash:") and "minimum ticket" in c["waiting"] for c in small["pipeline"])
+    dear = [list(r) for r in SRC]
+    dear[2][4] = "9000"                                                  # TEN.US: one share = 33,750 SAR
+    p = plan(src=dear)
+    assert "TEN.US" not in [c["symbol"] for c in p["picks"]]
+    assert [c["waiting"] for c in p["pipeline"] if c["symbol"] == "TEN.US"][0].endswith("is below one share")
+    rich = plan(cash=900000.0)
+    nav = rich["nav"]
+    assert abs(rich["per_pick"] - 0.01 * nav / 0.08) < 1e-6 and rich["per_pick"] < 0.15 * nav
+    assert all(c["risk_sar"] <= 0.01 * nav + 1 for c in rich["picks"])
+    assert plan(cash=0.0)["picks"] == []
+
+
+# ----------------------------------------------------------------------------- D5
+def frozen(b):
+    return [[r[i] for i in (6, 11, 12, 13, 14, 15, 16, 17, 18)] for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"]
+
+
+def test_d5_freeze_and_status():
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0
+    led = b.tabs["_Daily_Plan"].values
+    assert led[0] == dp.LEDGER_HEADERS and [r[6] for r in led[1:] if r[4] == "PICK"] == ["ITRN.US", "TEN.US", "NMM.US"]
+    assert all(r[24] == "OPEN" for r in led[1:] if r[4] == "PICK") and led[1][3] == "VERIFIED"
+    before = frozen(b)
+    page = b.tabs["Daily_Plan"].values
+    assert page[0][0].startswith("DAILY PLAN") and any(r[0] == "TODAY'S PICKS (3)" for r in page)
+    assert any(str(r[0]).startswith("PIPELINE (5)") for r in page)
+    # second run: another merit list (new leader, ITRN gone), prices moved, NMM bought, TEN through its stop
+    q2 = [qrow(1, "NEW.US", "Utilities", 40, "")] + [list(r) for r in QUAL[1:]]
+    src2 = [list(r) for r in SRC] + [["NEW.US", "", "USD", "Utilities", "10", ""]]
+    src2[1][4] = "55.00"                                                 # ITRN above its zone (52.34)
+    src2[2][4] = "22.00"                                                 # TEN at/below its stop (23.00)
+    lots2 = [list(r) for r in LOTS] + [["NMM.US", "Navios", "USD", "Active", "2026-11-10", "", "8,000"]]
+    b.tabs["Top_10_Investments"] = Sheet(board(qual=q2, cash="1,000 SAR"))
+    b.tabs["Global_Markets"] = Sheet(src2)
+    b.tabs["_Portfolio_CostBasis"] = Sheet(lots2)
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=7)) == 0
+    assert frozen(b) == before                       # symbol, entry, zone, qty, amount, stop, TP1, TP2
+    st = {r[6]: (r[24], r[25]) for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"}
+    assert st["ITRN.US"][0] == "WAIT" and "above the entry zone" in st["ITRN.US"][1]
+    assert st["TEN.US"][0] == "INVALIDATED" and "at or below the stop" in st["TEN.US"][1]
+    assert st["NMM.US"] == ("EXECUTED", "bought 2026-11-10")
+    assert "NEW.US" not in [r[6] for r in b.tabs["_Daily_Plan"].values[1:]]
+    b.tabs["_Daily_Plan"].values = [[str(c) for c in r] for r in b.tabs["_Daily_Plan"].values]
+    # third run: TEN recovers, NMM lot disappears from the ledger - terminal statuses stay
+    b.tabs["Global_Markets"] = Sheet(SRC)
+    b.tabs["_Portfolio_CostBasis"] = Sheet(LOTS)
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=8)) == 0
+    st = {r[6]: r[24] for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"}
+    assert st == {"ITRN.US": "OPEN", "TEN.US": "INVALIDATED", "NMM.US": "EXECUTED"}
+    assert [[r[0]] + [dp.num(c) for c in r[1:]] for r in frozen(b)] == [[r[0]] + [dp.num(c) for c in r[1:]] for r in before]
+
+
+# ----------------------------------------------------------------------------- D6
+@pytest.mark.parametrize("line,frag", [
+    ("Last run 2026-11-10 12:09:13 | status: running…", "no finished render"),
+    (OK_LINE.replace("2026-11-10", "2026-11-09"), "is from 2026-11-09"),
+    ("Last run 2026-11-10 09:08:00 | status: ok | output: WITHHELD | source readiness: x", "not verified"),
+])
+def test_d6_no_cut(line, frag):
+    b = book(**{"Top_10_Investments": Sheet(board(line=line))})
+    assert dp.main([], book=b, now=NOW) == 0
+    assert b.tabs["_Daily_Plan"].values == [dp.LEDGER_HEADERS]
+    assert any(frag in str(c) for r in b.tabs["Daily_Plan"].values for c in r)
+    assert any(r[0] == "TODAY'S PICKS (0)" for r in b.tabs["Daily_Plan"].values)
+
+
+def test_d6_unverified_cut_after_the_fallback_hour_reads_check():
+    line = "Last run 2026-11-10 15:20:00 | status: ok | output: WITHHELD | source readiness: x"
+    b = book(**{"Top_10_Investments": Sheet(board(line=line))})
+    assert dp.main([], book=b, now=dt.datetime(2026, 11, 10, 12, 30, tzinfo=UTC)) == 0     # 15:30 Riyadh
+    picks = [r for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"]
+    assert len(picks) == 3 and all(r[3] == "UNVERIFIED" and r[24] == "CHECK" for r in picks)
+    assert all("not verified at the cut" in r[25] for r in picks)
+
+
+# ----------------------------------------------------------------------------- D7
+def test_d7_next_day_keeps_an_unexecuted_pick():
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0
+    day2 = NOW + dt.timedelta(days=1)
+    # ITRN falls to rank 6 (inside keep-rank 8); three other names lead
+    q2 = [qrow(1, "AX.US", "Financials", 25.3, ""), qrow(2, "LADR.US", "Real Estate", 29.5, ""),
+          qrow(3, "TEN.US", "Energy", 34.3, ""), qrow(6, "ITRN.US", "Technology", 34.7, "")]
+    line2 = OK_LINE.replace("2026-11-10", "2026-11-11")
+    b.tabs["Top_10_Investments"] = Sheet(board(line=line2, qual=q2))
+    assert dp.main([], book=b, now=day2) == 0
+    today = [r for r in b.tabs["_Daily_Plan"].values[1:] if r[0] == "2026-11-11" and r[4] == "PICK"]
+    assert [r[6] for r in today] == ["TEN.US", "ITRN.US", "AX.US"]            # kept first (by rank), then new
+    assert all("kept from the previous plan" in r[22] for r in today[:2]) and "kept" not in today[2][22]
+    assert [r[0] for r in b.tabs["_Daily_Plan"].values[1:]].count("2026-11-10") > 0   # history kept
+    line = [r[0] for r in b.tabs["Daily_Plan"].values if str(r[0]).startswith("Stability:")][0]
+    assert "2 kept, 1 new, 1 dropped" in line
+
+
+def test_d7_keep_rank_limit():
+    p = plan(qual=[qrow(1, "AX.US", "Financials", 25, ""), qrow(2, "LADR.US", "Real Estate", 29, ""),
+                   qrow(3, "TEN.US", "Energy", 34, ""), qrow(9, "ITRN.US", "Technology", 34, "")], prior=["ITRN.US"])
+    assert [c["symbol"] for c in p["picks"]] == ["AX.US", "LADR.US", "TEN.US"]
+
+
+# ----------------------------------------------------------------------------- D8
+def test_d8_gate(monkeypatch):
+    monkeypatch.setenv("TFB_DAILY_PLAN", "off")
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0 and b.reads == 0 and "_Daily_Plan" not in b.tabs
+    monkeypatch.delenv("TFB_DAILY_PLAN")
+    assert dp.mode() == "off"
+    monkeypatch.setenv("TFB_DAILY_PLAN", "observe")
+    assert dp.main([], book=b, now=NOW) == 0 and b.reads > 0 and "_Daily_Plan" not in b.tabs
+    monkeypatch.setenv("TFB_DAILY_PLAN", "on")
+    assert dp.main(["--dry-run"], book=b, now=NOW) == 0 and "Daily_Plan" not in b.tabs
+    monkeypatch.setenv("TFB_PLAN_PICKS", "99")
+    monkeypatch.setenv("TFB_PLAN_FUNDABLE_CCY", "GBP, usd")
+    k = dp.knobs()
+    assert k["picks"] == 3 and k["ccy"] == ["USD"]
+
+
+def test_d8_unreadable_workbook_writes_nothing():
+    b = book()
+    del b.tabs["Top_10_Investments"]
+    assert dp.main([], book=b, now=NOW) == 2 and "_Daily_Plan" not in b.tabs
+
+
+def test_d8_a_transient_read_error_is_retried(monkeypatch):
+    class Flaky(Sheet):
+        fails = 2
+
+        def get(self, range_name):
+            if Flaky.fails:
+                Flaky.fails -= 1
+                raise TimeoutError("read timed out")
+            return super().get(range_name)
+    naps = []
+    monkeypatch.setattr(dp, "_SLEEP", naps.append)
+    b = book(**{"Top_10_Investments": Flaky(board())})
+    assert dp.main([], book=b, now=NOW) == 0 and naps == [20, 20]
+    assert len([r for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"]) == 3
+    Flaky.fails = 3
+    b2 = book(**{"Top_10_Investments": Flaky(board())})
+    assert dp.main([], book=b2, now=NOW) == 2 and "_Daily_Plan" not in b2.tabs
+
+
+# ----------------------------------------------------------------------------- D9
+def test_d9_wait_looks_again():
+    b = book(**{"Top_10_Investments": Sheet(board(line="Last run 2026-11-10 09:50:00 | status: running…"))})
+    naps = []
+
+    def nap(s):
+        naps.append(s)
+        b.tabs["Top_10_Investments"] = Sheet(board())
+    assert dp.main(["--wait-min", "45"], book=b, now=NOW, sleep=nap) == 0
+    assert naps == [300] and len([r for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"]) == 3
+    b2 = book(**{"Top_10_Investments": Sheet(board(line="Last run 2026-11-10 09:50:00 | status: running…"))})
+    naps2 = []
+    assert dp.main(["--wait-min", "10"], book=b2, now=NOW, sleep=naps2.append) == 0
+    assert naps2 == [300, 300] and b2.tabs["_Daily_Plan"].values == [dp.LEDGER_HEADERS]
+
+
+# ----------------------------------------------------------------------------- D10
+def test_d10_workflow_manifest_ci():
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    on = wf[True] if True in wf else wf["on"]
+    assert on["workflow_run"]["workflows"] == ["\U0001F3E6 Tadawul Dashboard Advanced Sync"]
+    assert on["workflow_run"]["types"] == ["completed"] and "workflow_dispatch" in on and on["schedule"]
+    assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is False
+    job = wf["jobs"]["daily_plan"]
+    assert "github.event.workflow_run.event == 'schedule'" in job["if"] and "'workflow_dispatch'" in job["if"]
+    step = [s for s in job["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]
+    assert step["env"]["TFB_DAILY_PLAN"] == "${{ vars.TFB_DAILY_PLAN || 'on' }}"
+    assert "--wait-min 45" in step["run"] and "--dry-run" in step["run"]
+    src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
+    for name in re.findall(r"(TFB_PLAN_[A-Z_]+): \$\{\{", (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")):
+        assert '"%s"' % name in src, name
+    manifest = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert '("daily_plan", "%s", "daily plan")' % dp.__version__ in manifest
+    assert "tests/test_daily_plan.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert not re.search(r"create_order|place_order|requests\.post|urlopen", src)
