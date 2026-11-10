@@ -1,5 +1,27 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.13 (2026-11-10) -- THE DISPATCHER IS THE CLOCK (no cron here)
+# WHY (runs of 7-10 Nov 2026): GitHub delivered this workflow's cron 3-9 hours
+# late (04:17 UTC slot started 11:09, 11:21, 12:59 UTC; 20:17 slot 23:40, 23:46,
+# 02:46 UTC; one 12:17 slot never started). A sync takes the decision feed
+# down at its first minute and restores it 62-133 minutes later, so a random
+# start darkens the board at a random hour: 9 Nov 15:59 Riyadh, through the US
+# open; 10 Nov 05:46 Riyadh, with the 06:22 dispatch queued behind it, so the
+# first run verified at 07:59:47 and was superseded two seconds later.
+# WHAT: the schedule trigger is removed. Apps Script 24_Sync_Dispatch starts
+# every sync on the minute (TFB_SYNC_DISPATCH_HOURS, Riyadh), and
+# sync_watchdog.yml dispatches one when none has started for 10 hours. Every
+# 'schedule' condition below is kept: it is inert without the trigger and makes
+# the rollback a one-line restore of the cron.
+# ROLLBACK: restore the schedule block ('17 4,12,20 * * *').
+#
+# VERSION 1.0.12 (2026-11-10) -- _Status STAMP REPAIR MAPPING (run_dashboard_sync 6.72.0)
+# WHY (run 42621566901, 9 Nov 2026): Global_Markets was written, its _Status
+# stamp lost four reads to timeouts, and the cockpit withheld every render
+# that evening. Both page-writing jobs map TFB_SYNC_STAMP_REPAIR (default
+# '0': no queue, byte-identical) and TFB_SYNC_STAMP_REPAIR_BUDGET_S (default
+# '480'). Arming: set the repository variable TFB_SYNC_STAMP_REPAIR=1.
+#
 # VERSION 1.0.11 (2026-11-05) -- THE RENDER HANDSHAKE COVERS ONE RETRY
 # WHY (5 Nov 2026): run 41901407829 failed its final check because both early
 # Top_10 renders were stopped at the Apps Script 6-minute limit (01:04 and
@@ -98,8 +120,11 @@ on:
   # Three slots retain the existing provider-quota budget. Cron does not know
   # venue holidays or DST, and a scheduled start does not prove a completed
   # refresh. Check the source run, recovery and coverage-audit results.
-  schedule:
-    - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
+  # v1.0.13 (2026-11-10): NO schedule trigger. GitHub delivered the cron 3-9 hours
+  # late; 24_Sync_Dispatch (Apps Script) starts the syncs on the minute and
+  # sync_watchdog.yml covers a missed start. Removed line, for the rollback:
+  #   schedule:
+  #     - cron: "17 4,12,20 * * *"  # P-163b (2026-09-24): three slots; six were over-subscribing the EODHD day
                                  # P-170 (2026-09-26): minute 00 is GitHub's most-delayed schedule minute -
                                  # the 20Z slot fired 22:59Z and the 04Z slot 09:00Z; :17 keeps the slots off the hour.
 
@@ -520,6 +545,11 @@ jobs:
       # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
       # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
       TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
+      # v1.0.12 (2026-11-10): run_dashboard_sync 6.72.0 STAMP-REPAIR. 1 retries a
+      # _Status stamp that failed on a timeout once the page tasks are done
+      # (budget below, seconds, clamped 60..900). Rollback: 0.
+      TFB_SYNC_STAMP_REPAIR: ${{ vars.TFB_SYNC_STAMP_REPAIR || '0' }}
+      TFB_SYNC_STAMP_REPAIR_BUDGET_S: ${{ vars.TFB_SYNC_STAMP_REPAIR_BUDGET_S || '480' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
@@ -1848,6 +1878,11 @@ jobs:
       # FW-2 byte-identical; observe logs the rows it would keep; enforce keeps
       # a witnessed mild P/E mismatch with P/E and EPS cleared. Rollback: off.
       TFB_SYNC_FW2_STALE_PE: ${{ vars.TFB_SYNC_FW2_STALE_PE || 'off' }}
+      # v1.0.12 (2026-11-10): run_dashboard_sync 6.72.0 STAMP-REPAIR. 1 retries a
+      # _Status stamp that failed on a timeout once the page tasks are done
+      # (budget below, seconds, clamped 60..900). Rollback: 0.
+      TFB_SYNC_STAMP_REPAIR: ${{ vars.TFB_SYNC_STAMP_REPAIR || '0' }}
+      TFB_SYNC_STAMP_REPAIR_BUDGET_S: ${{ vars.TFB_SYNC_STAMP_REPAIR_BUDGET_S || '480' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}

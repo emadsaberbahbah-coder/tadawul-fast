@@ -163,3 +163,12 @@ The reviewers confirmed:
   - Its `tfbSetupNov9` checks for exactly `1.2.36`. Once 1.2.37 is pasted it prints "PASTE 27_Decision_Pages_v2 1.2.36 FROM GITHUB MAIN"; ignore that line.
   - Its check can move to 1.2.37 in the owner's next edit of that file.
 - No workbook read or write and no provider call; everything is offline.
+
+## Addendum 2026-11-10 - merge of main `e008a514`
+
+Main `e008a514` (#947-#952) was merged in with a merge commit. Main took ci.yml 1.1.74, 1.1.76 and 1.1.77; it now holds every number up to 1.1.77 except 1.1.75.
+
+- ci.yml: this release keeps 1.1.80 (still above main).
+- The claim note now reads: 1.1.78 #938, 1.1.79 #915, 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926. Every open claim sits above main's newest block: the three numbers main took moved, and so did #923's 1.1.75, which would otherwise sit below main's 1.1.76 and 1.1.77.
+- Main's 1.1.77 / 1.1.76 / 1.1.74 blocks follow verbatim. Against main, the ci.yml diff adds lines only.
+- No other file conflicted.

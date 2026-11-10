@@ -3,9 +3,18 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.71.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.72.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.72.0 - a _Status stamp that times out is written again at the end of the
+run (2026-11-10)
+================================================================================
+Run 42621566901 wrote Global_Markets, then lost its _Status stamp to four read
+timeouts while the workbook was busy; the cockpit withheld every render that
+evening. TFB_SYNC_STAMP_REPAIR = 0 (default, byte-identical) | 1: the failed
+stamp's own payload is queued and retried once the page tasks are done
+(waits 20/40/60/90/120 s inside TFB_SYNC_STAMP_REPAIR_BUDGET_S, default 480).
 
 v6.71.0 - FW-2 keeps a witnessed row whose P/E is only stale (2026-10-29)
 ================================================================================
@@ -2172,7 +2181,25 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.71.0"
+SCRIPT_VERSION = "6.72.0"
+# v6.72.0 (2026-11-10) - STAMP-REPAIR [_Status stamp, sustained Sheets timeouts]:
+#   WHY: run 42621566901 (9 Nov, 15:59 Riyadh) wrote all 6,601 Global_Markets
+#   rows, but its _Status stamp read timed out on all 4 v6.70.2 attempts
+#   (17:01-17:05 Riyadh, the workbook busy with Apps Script triggers). _Status
+#   kept the morning run 42556077749, so the Top_10 cockpit withheld every
+#   render for the rest of the day (cohort mismatch), wrote no receipt, the
+#   final publication audit failed and the feed was never promoted. Reads of
+#   the same workbook succeeded again from about 17:11. FIX: a stamp that
+#   fails on a transient error queues the payload it would have written
+#   (same row, same timestamp, same message); _repair_failed_stamps retries
+#   the queue once at the end of the run, after the escalation pass and
+#   before the upstream verdict, waiting 20/40/60/90/120 s between attempts
+#   inside TFB_SYNC_STAMP_REPAIR_BUDGET_S (default 480 s, clamped 60..900;
+#   the leg timeout is 115 min against a measured 65 min). Each attempt
+#   re-reads column A, exactly as the v6.70.2 path. Result: ::notice::
+#   "stamp written" or ::warning:: "still NOT written"; fail-open, the sync
+#   exit code is unchanged. GATE: TFB_SYNC_STAMP_REPAIR = 0 (default: no
+#   queue, no end-of-run call, byte-identical behaviour) | 1.
 # v6.71.0 (2026-10-29) - FW2-STALE-PE [FW-2, stale EODHD P/E]:
 #   WHY: FW-2 strips rows whose P/E is a few percent stale against the live
 #   quote (the Yahoo fundamentals 429 breaker hands P/E to EODHD, priced at
@@ -9504,6 +9531,11 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
                              _what, type(_se).__name__, _se, _STATUS_SHEET_NAME))
                     logger.warning("%s stamp NOT written for %s after %d attempt(s): %s",
                                    _STATUS_STAMP_TAG, page, attempt + 1, _se)
+                    # v6.72.0 [STAMP-REPAIR]: a transient failure queues this
+                    # exact payload for one more try at the end of the run.
+                    if _is_transient_write_error(_se) and _stamp_repair_enqueue(page, payload):
+                        print("::notice::%s %s stamp queued for the end-of-run repair "
+                              "pass (TFB_SYNC_STAMP_REPAIR)." % (_STAMP_REPAIR_TAG, page))
                     return
                 print("::warning::%s %s for %s (attempt %d/%d) — %s: %s; retrying in %.0fs"
                       % (_STATUS_STAMP_TAG, _what, page, attempt + 1, attempts,
@@ -9516,6 +9548,144 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
         print("::warning::%s stamp FAILED for %s — %s: %s"
               % (_STATUS_STAMP_TAG, page, type(_e).__name__, _e))
         logger.warning("%s stamp skipped for %s: %s", _STATUS_STAMP_TAG, page, _e)
+
+
+# =============================================================================
+# v6.72.0 [STAMP-REPAIR] - end-of-run retry of a _Status stamp that failed on a
+# transient Sheets error (see header changelog). DEFAULT OFF.
+# =============================================================================
+_STAMP_REPAIR_TAG = f"[STAMP-REPAIR v{SCRIPT_VERSION}]"
+# (page, payload) pairs, in failure order; one entry per page (latest wins).
+_STAMP_REPAIR_QUEUE: List[Tuple[str, list]] = []
+# Seconds to wait before repair attempts 1, 2, 3 ... (the last value repeats).
+_STAMP_REPAIR_BACKOFF_SEC = (20.0, 40.0, 60.0, 90.0, 120.0)
+
+
+def _stamp_repair_enabled() -> bool:
+    """v6.72.0: TFB_SYNC_STAMP_REPAIR=1/true/yes/on arms the end-of-run repair;
+    anything else (default) keeps the v6.71.0 behaviour byte-identical."""
+    return (os.getenv("TFB_SYNC_STAMP_REPAIR") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _stamp_repair_budget_s() -> float:
+    """v6.72.0: total wait budget of the repair pass, default 480 s, clamped
+    60..900. No attempt starts once the elapsed time plus the next wait would
+    pass it; a call in flight keeps its 60 s socket timeout."""
+    try:
+        v = float((os.getenv("TFB_SYNC_STAMP_REPAIR_BUDGET_S") or "480").strip())
+    except Exception:
+        v = 480.0
+    if v != v:  # NaN
+        v = 480.0
+    return max(60.0, min(900.0, v))
+
+
+def _stamp_repair_enqueue(page: str, payload: list) -> bool:
+    """v6.72.0: queue the payload a failed stamp would have written. Returns
+    False (and queues nothing) while the gate is off."""
+    if not _stamp_repair_enabled():
+        return False
+    for i, (p, _pl) in enumerate(_STAMP_REPAIR_QUEUE):
+        if p == page:
+            _STAMP_REPAIR_QUEUE[i] = (page, list(payload))
+            return True
+    _STAMP_REPAIR_QUEUE.append((page, list(payload)))
+    return True
+
+
+def _repair_failed_stamps(sheets: Any, spreadsheet_id: str) -> Dict[str, Dict[str, Any]]:
+    """v6.72.0: write every queued stamp once more, at the end of the run.
+
+    The payload is the one the page's own stamp built right after its write
+    (same Last Updated time, status, message and run ID), so a repaired row is
+    exactly what the in-place stamp would have written. Each attempt re-reads
+    column A and updates the page's row (append only when the page has none),
+    as _stamp_page_status does. A non-transient error ends that page's repair.
+    The queue is emptied whatever happens. Fail-open: never raises."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not _STAMP_REPAIR_QUEUE:
+        return out
+    pending = list(_STAMP_REPAIR_QUEUE)
+    del _STAMP_REPAIR_QUEUE[:]
+    if not _stamp_repair_enabled():
+        return out
+    svc = None
+    try:
+        svc = sheets._get_service() if sheets is not None else None
+    except Exception:
+        svc = None
+    if not svc:
+        for page, _pl in pending:
+            print("::warning::%s %s _Status stamp still NOT written (no Sheets "
+                  "service for the repair pass)." % (_STAMP_REPAIR_TAG, page))
+            out[page] = {"repaired": False, "attempts": 0, "waited_s": 0.0,
+                         "where": "", "last_error": "no_service"}
+        return out
+    budget = _stamp_repair_budget_s()
+    t0 = time.monotonic()
+    for page, payload in pending:
+        attempts = 0
+        repaired = False
+        where = ""
+        last_err = ""
+        while True:
+            delay = _STAMP_REPAIR_BACKOFF_SEC[min(attempts, len(_STAMP_REPAIR_BACKOFF_SEC) - 1)]
+            if (time.monotonic() - t0) + delay > budget:
+                break
+            time.sleep(delay)
+            attempts += 1
+            stage = "read"
+            try:
+                _resp = svc.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{_STATUS_SHEET_NAME}'!A:A",
+                ).execute()
+                grid = _resp.get("values", []) or []
+                row_i = _status_find_page_row(grid, page)
+                stage = "write"
+                if row_i > 0:
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!A{row_i}:J{row_i}",
+                        valueInputOption="RAW",
+                        body={"values": [payload]},
+                    ).execute()
+                    where = f"row {row_i}"
+                else:
+                    svc.spreadsheets().values().append(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!A1:J1",
+                        valueInputOption="RAW",
+                        insertDataOption="INSERT_ROWS",
+                        body={"values": [payload]},
+                    ).execute()
+                    where = "appended"
+                repaired = True
+                break
+            except Exception as _re:
+                last_err = "%s: %s: %s" % (stage, type(_re).__name__, _re)
+                if not _is_transient_write_error(_re):
+                    break
+        waited = round(time.monotonic() - t0, 1)
+        if repaired:
+            print("::notice::%s %s _Status stamp written (%s) after %d repair "
+                  "attempt(s), %.0f s into the repair pass; the cockpit now sees "
+                  "this run's ID." % (_STAMP_REPAIR_TAG, page, where, attempts, waited))
+            logger.info("%s %s repaired | %s | attempts=%d waited_s=%.1f",
+                        _STAMP_REPAIR_TAG, page, where, attempts, waited)
+        else:
+            print("::warning::%s %s _Status stamp still NOT written after %d repair "
+                  "attempt(s) (%s). %s keeps this page's previous run ID, so the "
+                  "decision cockpit will see a cohort mismatch until a later stamp "
+                  "succeeds." % (_STAMP_REPAIR_TAG, page, attempts,
+                                 last_err[:200] or "repair budget reached",
+                                 _STATUS_SHEET_NAME))
+            logger.warning("%s %s NOT repaired | attempts=%d waited_s=%.1f | %s",
+                           _STAMP_REPAIR_TAG, page, attempts, waited, last_err[:200])
+        out[page] = {"repaired": repaired, "attempts": attempts, "waited_s": waited,
+                     "where": where, "last_error": last_err[:200]}
+    return out
 
 
 # =============================================================================
@@ -15515,6 +15685,15 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as _sse:
             logger.warning("%s escalation pass skipped (error: %s)",
                            _STALE_SKIP_TAG, _sse)
+
+        # v6.72.0 [STAMP-REPAIR]: write any _Status stamp that failed on a
+        # transient error once more, now that every page task has finished.
+        # Inert (no call, no sleep) unless TFB_SYNC_STAMP_REPAIR is on and a
+        # stamp was queued; a crash here must never sink the run.
+        try:
+            _repair_failed_stamps(sheets, spreadsheet_id)
+        except Exception as _sre:
+            logger.warning("%s pass skipped (error: %s)", _STAMP_REPAIR_TAG, _sre)
 
         # --- v6.40.0 (W1A-4a) UPSTREAM DECISION-FEED VERDICT -----------------
         # Publishes the cross-page EXECUTABLE / NOT_ACTIONABLE token the
