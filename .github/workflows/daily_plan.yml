@@ -1,7 +1,11 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.0.0 (2026-11-10)
+# VERSION 1.0.1 (2026-11-10)
+#
+# 1.0.1: daily_plan 1.1.0's evidence rule is mapped in OBSERVE (a label on every
+# qualified name; picks are chosen as before). on = a name that is not PASS is
+# not picked. Rollback: repository variable TFB_PLAN_EVIDENCE=off.
 #
 # WHY: a ticket on the main page existed only while six conditions held at the
 # same moment, each re-tested on every render (6-9 Nov: 32 board versions in
@@ -104,6 +108,9 @@ jobs:
           TFB_PLAN_KEEP_RANK: ${{ vars.TFB_PLAN_KEEP_RANK || '8' }}
           TFB_PLAN_COOLDOWN_DAYS: ${{ vars.TFB_PLAN_COOLDOWN_DAYS || '10' }}
           TFB_PLAN_UNVERIFIED_AFTER_H: ${{ vars.TFB_PLAN_UNVERIFIED_AFTER_H || '15' }}
+          TFB_PLAN_EVIDENCE: ${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}
+          TFB_PLAN_EV_RISK_MAX: ${{ vars.TFB_PLAN_EV_RISK_MAX || '30' }}
+          TFB_PLAN_EV_UPSIDE_MIN: ${{ vars.TFB_PLAN_EV_UPSIDE_MIN || '15' }}
         run: |
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
