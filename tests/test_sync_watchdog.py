@@ -76,7 +76,8 @@ class Api:
         if method == "GET":
             if self.fail_get:
                 raise TimeoutError("read timed out")
-            return 200, {"workflow_runs": self.runs}
+            ev = path.split("event=")[1].split("&")[0]
+            return 200, {"workflow_runs": [r for r in self.runs if r["event"] == ev]}
         if self.fail_post:
             raise OSError("boom")
         return 204, None
@@ -101,20 +102,27 @@ def test_w4_main_modes(env, capsys):
     env.setenv("TFB_SYNC_WATCHDOG", "observe")
     api = Api(OLD)
     assert wd.main([], api=api, now=NOW) == 0
-    assert [c[0] for c in api.calls] == ["GET"] and "would dispatch" in capsys.readouterr().out
+    assert [c[0] for c in api.calls] == ["GET", "GET"] and "would dispatch" in capsys.readouterr().out
+    assert [c[1].split("?")[1] for c in api.calls] == ["event=schedule&per_page=10", "event=workflow_dispatch&per_page=10"]
     env.setenv("TFB_SYNC_WATCHDOG", "on")
     api = Api(OLD)
     assert wd.main([], api=api, now=NOW) == 0
-    assert [c[0] for c in api.calls] == ["GET", "POST"]
-    assert api.calls[1][1] == "/repos/owner/repo/actions/workflows/daily_sync.yml/dispatches"
-    assert api.calls[1][2] == {"ref": "main", "inputs": {"run_mode": "full_sync", "include_portfolio": "true"}}
+    assert [c[0] for c in api.calls] == ["GET", "GET", "POST"]
+    assert api.calls[2][1] == "/repos/owner/repo/actions/workflows/daily_sync.yml/dispatches"
+    assert api.calls[2][2] == {"ref": "main", "inputs": {"run_mode": "full_sync", "include_portfolio": "true"}}
     api = Api(NEW)
-    assert wd.main([], api=api, now=NOW) == 0 and [c[0] for c in api.calls] == ["GET"]
+    assert wd.main([], api=api, now=NOW) == 0 and [c[0] for c in api.calls] == ["GET", "GET"]
+    # 30 newer CI runs do not hide the sync (review on PR #950): the reads are filtered by event
+    flood = NEW + [run(100 + i, "pull_request", "completed", "2026-11-10T11:%02d:00Z" % i) for i in range(30)]
+    api = Api(flood)
+    assert wd.main([], api=api, now=NOW) == 0 and [c[0] for c in api.calls] == ["GET", "GET"]
+    api = Api(OLD + flood[1:])
+    assert wd.main([], api=api, now=NOW) == 0 and [c[0] for c in api.calls] == ["GET", "GET", "POST"]
     # faults: never a post, exit 1
     api = Api(OLD, fail_get=True)
     assert wd.main([], api=api, now=NOW) == 1 and [c[0] for c in api.calls] == ["GET"]
     api = Api([])
-    assert wd.main([], api=api, now=NOW) == 1 and [c[0] for c in api.calls] == ["GET"]
+    assert wd.main([], api=api, now=NOW) == 1 and [c[0] for c in api.calls] == ["GET", "GET"]
     api = Api(OLD, fail_post=True)
     assert wd.main([], api=api, now=NOW) == 1
     env.delenv("GITHUB_TOKEN")

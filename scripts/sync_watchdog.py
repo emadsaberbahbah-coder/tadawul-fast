@@ -20,8 +20,8 @@ WHY: daily_sync's own cron ("17 4,12,20" UTC) is delivered 3-9 hours late by
   daily_sync 1.0.13 therefore drops its cron: the Apps Script dispatcher
   (24_Sync_Dispatch, on the minute) is the clock. This watchdog is the safety
   net for a dispatcher that stops (an expired token, a removed trigger).
-WHAT: lists the newest production runs of daily_sync.yml (events schedule and
-  workflow_dispatch). When one is queued or running, or the newest one was
+WHAT: lists the newest production runs of daily_sync.yml (one filtered read
+  per event: schedule and workflow_dispatch, so CI runs never crowd them out). When one is queued or running, or the newest one was
   created at most TFB_SYNC_WATCHDOG_MAX_GAP_H hours ago (default 10, clamped
   4..48; the dispatcher's slots are 8 hours apart), it does nothing. Otherwise
   it dispatches one full sync (run_mode=full_sync, include_portfolio=true),
@@ -126,9 +126,15 @@ def main(argv: Optional[Sequence[str]] = None, *, api=_api, now: Optional[_dt.da
     if not repo or not token:
         _out("ERROR: GITHUB_REPOSITORY or GITHUB_TOKEN missing - nothing dispatched")
         return 1
+    # One filtered read per production event: daily_sync.yml also runs on every
+    # push and pull request, so an unfiltered first page can hold CI runs only
+    # (review on PR #950) and the watchdog would then never see a sync.
+    runs: List[Dict[str, Any]] = []
     try:
-        _code, payload = api("GET", f"/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs?per_page=30", token)
-        runs: List[Dict[str, Any]] = list((payload or {}).get("workflow_runs") or [])
+        for ev in PRODUCTION_EVENTS:
+            _code, payload = api(
+                "GET", f"/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs?event={ev}&per_page=10", token)
+            runs.extend(list((payload or {}).get("workflow_runs") or []))
     except Exception as e:  # noqa: BLE001
         _out(f"ERROR: cannot list the sync runs ({type(e).__name__}) - nothing dispatched")
         return 1
