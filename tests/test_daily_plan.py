@@ -195,6 +195,26 @@ def test_d1_parsers():
     assert dp.engine_deferral(CONF2, 48) == ("", "confirmation 2/3")
     assert dp.engine_deferral("", 48) == ("", "") and dp.engine_deferral("Qualified (INVEST) — deferred by diversification cap", 48) == ("", "")
     assert dp.engine_deferral("venue not tradable", 48) == ("venue not tradable", "")
+    for soft in ("\u2014 selected", "not selected \u2014 no seat was taken this run; see Status line",
+                 "not selected \u2014 qualified, but absent from this run's ticket set (2 seat(s) taken); see Status line",
+                 "ranked below the Max Selected cut"):
+        assert dp.engine_deferral(soft, 48) == ("", ""), soft
+    held = "Held research seat \u2014 GRACE-HELD; stability: GRACE (0/3 missed); no executable allocation today"
+    assert dp.engine_deferral(held, 48) == ("", "main page seat: grace-held")
+    assert dp.engine_deferral("structural: Eligibility (Venue)", 48)[0] == "structural: Eligibility (Venue)"
+
+
+def test_d1b_the_main_pages_selected_rows_are_picks():
+    """Codex P1 on PR #951: a row the main page selected reads '\u2014 selected' and must lead the plan."""
+    sel = qrow(1, "ITRN.US", "Technology", 34.7, "\u2014 selected")
+    sel[13] = "Yes"
+    odd = qrow(2, "TEN.US", "Energy", 34.3, "anything the cockpit writes beside a Yes")
+    odd[13] = "Yes"
+    q = [sel, odd, qrow(3, "NMM.US", "Industrials", 29.9, "not selected \u2014 no seat was taken this run; see Status line"),
+         qrow(4, "LADR.US", "Real Estate", 29.5, "structural: Eligibility (Venue)")]
+    p = plan(qual=q)
+    assert [c["symbol"] for c in p["picks"]] == ["ITRN.US", "TEN.US", "NMM.US"]
+    assert [c["waiting"] for c in p["pipeline"]] == ["structural: Eligibility (Venue)"]
 
 
 # ----------------------------------------------------------------------------- D2
@@ -243,7 +263,10 @@ def test_d3_execution_gates():
 def test_d4_sizing_edges():
     small = plan(cash=12000.0)                    # NAV 68,273: deployable 5,173 = 1,724 a pick for three
     assert [c["symbol"] for c in small["picks"]] == ["ITRN.US", "TEN.US"]
-    assert len(plan(cash=13000.0)["picks"]) == 3  # 2,024 a pick clears the 2,000 minimum
+    edge = plan(cash=13000.0)                     # 2,024 a pick, but whole shares give 1,943 / 1,969 / 1,800
+    assert [c["symbol"] for c in edge["picks"]] == ["ITRN.US", "TEN.US"]
+    assert all(c["alloc_sar"] >= 2000 for c in edge["picks"])
+    assert [c["waiting"] for c in edge["pipeline"] if c["symbol"] == "NMM.US"][0].endswith("minimum ticket in whole shares")
     assert all(c["alloc_sar"] >= 2000 for c in small["picks"])
     assert any(c["waiting"].startswith("cash:") and "minimum ticket" in c["waiting"] for c in small["pipeline"])
     dear = [list(r) for r in SRC]

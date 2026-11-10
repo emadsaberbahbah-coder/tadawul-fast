@@ -339,8 +339,14 @@ def engine_deferral(why: str, held_max_h: float) -> Tuple[str, str]:
     """('', label) when the engine's reason does not block a pick, else (reason, '')."""
     w = text(why)
     lw = w.lower()
-    if not w or "max selected" in lw or lw.startswith("ranked") or "diversification cap" in lw:
+    # The cockpit's own non-reasons (16_Decision_Top10 dt10QualToRow_): a selected row reads '\u2014 selected';
+    # a qualified row with no seat reads 'not selected \u2014 ...' or 'ranked below the Max Selected cut'.
+    if (not w or lw.lstrip("\u2014- ").startswith("selected") or lw.startswith("not selected")
+            or "max selected" in lw or lw.startswith("ranked") or "diversification cap" in lw):
         return "", ""
+    if lw.startswith("held research seat"):
+        m = re.search(r"\u2014\s*([A-Z][A-Z \-()]+?)\s*(?:;|$)", w)
+        return "", "main page seat: %s" % (m.group(1).strip().lower() if m else "held")
     if lw.startswith("held target"):
         h = held_target_hours(w)
         if h is not None and h <= held_max_h:
@@ -368,7 +374,7 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         if not c["sector"]:
             c["sector"] = src.get("sector") or ""
         ev = cal.get(q["symbol"]) or {}
-        reason, label = engine_deferral(q.get("why", ""), k["held_h"])
+        reason, label = ("", "") if q.get("selected") else engine_deferral(q.get("why", ""), k["held_h"])
         if label:
             c["labels"].append(label)
         ed, xd, amt = ev.get("earn_days"), ev.get("exdiv_days"), ev.get("div_amount")
@@ -411,13 +417,20 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             picks.append(c)
     deployable = max(0.0, cash_sar - k["floor_pct"] / 100.0 * nav)
     cap = min(k["weight_pct"] / 100.0 * nav, k["risk_pct"] / 100.0 * nav / (k["stop_pct"] / 100.0))
+    def whole(p: Dict[str, Any], a: float) -> float:
+        """What `a` SAR buys of p in whole shares, in SAR."""
+        px = p["price"] * FX_TO_SAR[p["ccy"]]
+        return (a // px) * px
+
     while picks:
         alloc = min(cap, deployable / len(picks))
-        short = [p for p in picks if alloc < p["price"] * FX_TO_SAR[p["ccy"]]]
+        # the ticket that is published is whole shares, so the minimum is tested on that amount
+        under = [p for p in picks if whole(p, alloc) <= 0 or whole(p, alloc) < k["min_ticket"]]
         if alloc < k["min_ticket"]:
             drop, what = picks[-1], "the minimum ticket"
-        elif short:
-            drop, what = short[-1], "one share"
+        elif under:
+            drop = under[-1]
+            what = "one share" if whole(drop, alloc) <= 0 else "the minimum ticket in whole shares"
         else:
             break
         drop["waiting"] = "cash: %s SAR per pick is below %s" % ("{:,.0f}".format(alloc), what)
