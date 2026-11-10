@@ -3,9 +3,10 @@
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
 # VERSION 1.1.81 (2026-11-05) -- SPECIAL SESSIONS ON THEIR REAL HOURS (track_performance 6.57.0)
-# (Main holds every number up to 1.1.77 except 1.1.75. Open claims,
-# re-numbered 2026-11-10 so each sits above main's newest block: 1.1.78 #938,
-# 1.1.79 #915, 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926.
+# (Main holds every number up to 1.1.77; its 1.1.75 is a line inside its
+# 1.1.76 block. Open claims, re-numbered 2026-11-10 so each sits above main's
+# newest block: 1.1.78 #938, 1.1.79 #915, 1.1.80 #946, 1.1.81 #922, 1.1.82 #923,
+# 1.1.83 #909, 1.1.84 #926.
 # This release first claimed 1.1.69, then 1.1.74.)
 #
 # v1.1.81: run tests/test_track_session_overrides.py (track_performance v6.57.0
