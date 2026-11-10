@@ -259,6 +259,32 @@ def test_d3_execution_gates():
     assert all("earnings date not on the calendar" in c["labels"] for c in p["picks"])
 
 
+def test_d3b_event_days_count_from_the_date_not_the_stored_count():
+    """1.0.1: 10 Nov plan; Calendar_Events synced 9 Nov read ZTO.US '2026-11-17 | 8' - 7 days away by date."""
+    stale = [list(r) for r in CAL]
+    for r in stale[1:]:
+        r[2] = r[2] + 1                                   # every stored count is one day old
+    cal = dp.read_calendar(stale, [], dt.date(2026, 11, 10))
+    assert cal["ZTO.US"]["earn_days"] == 7.0 and cal["SBLK.US"]["earn_days"] == 2.0
+    assert dp.read_calendar(stale, [])["ZTO.US"]["earn_days"] == 8.0          # no date context: stored count
+    no_date = [list(r) for r in stale]
+    no_date[3][1] = ""                                    # ZTO row without a date
+    assert dp.read_calendar(no_date, [], dt.date(2026, 11, 10))["ZTO.US"]["earn_days"] == 8.0
+    div = [["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"], ["DIV.US", "2026-11-12", 3, 8.13, "USD"]]
+    assert dp.read_calendar([], div, dt.date(2026, 11, 10))["DIV.US"]["exdiv_days"] == 2.0
+    b = book(**{"Calendar_Events": Sheet(stale)})
+    assert dp.main([], book=b, now=NOW) == 0
+    led = b.tabs["_Daily_Plan"].values[1:]
+    assert "ZTO.US" not in [r[6] for r in led if r[4] == "PICK"]
+    assert [r[23] for r in led if r[6] == "ZTO.US"] == ["earnings in 7 day(s)"]
+
+
+def test_d3c_a_pick_without_a_12_month_roi_is_labelled():
+    q = [qrow(1, "ITRN.US", "Technology", "\u2014", "")]
+    p = plan(qual=q)
+    assert p["picks"][0]["tp1"] is None and "no 12-month target" in p["picks"][0]["labels"]
+
+
 # ----------------------------------------------------------------------------- D4
 def test_d4_sizing_edges():
     small = plan(cash=12000.0)                    # NAV 68,273: deployable 5,173 = 1,724 a pick for three
