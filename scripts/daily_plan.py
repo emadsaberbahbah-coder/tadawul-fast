@@ -607,9 +607,10 @@ def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt
         return []
     now = {text(s).upper() for s in today_picks}
     picked: Dict[str, set] = {}
-    for d in older:
+    for d in older:   # every recorded plan date; a day with only PIPELINE rows has no pick and ends a run
+        day_picks = picked.setdefault(text(d["Plan Date"]), set())
         if text(d["Kind"]) == "PICK":
-            picked.setdefault(text(d["Plan Date"]), set()).add(text(d["Symbol"]).upper())
+            day_picks.add(text(d["Symbol"]).upper())
     earlier = sorted((p for p in picked if p < prev_date), reverse=True)
     out: List[Tuple[str, _dt.date]] = []
     for d in older:

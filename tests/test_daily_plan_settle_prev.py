@@ -48,8 +48,9 @@ instead of skipping them; set in CI).
   S15 a bought pick left at CHECK (an unverified cut, as on 10 Nov) or at
       WAIT settles; the settle writes the three status cells and nothing else
   S16 the run of PICK days, directly on settle_prev: a three-day run reaches
-      back to its first day; a day the name was not picked (absent, or only
-      in the pipeline) ends the run; the walk goes newest first
+      back to its first day; a day the name was not picked (absent, only in
+      the pipeline, or a plan day with no pick at all) ends the run; the walk
+      goes newest first
 
 Run: python tests/test_daily_plan_settle_prev.py  |  pytest -q tests/test_daily_plan_settle_prev.py
 """
@@ -677,6 +678,10 @@ def test_s16_the_run_of_pick_days():
     assert settle(gap, d9) == ([], "OPEN")                                         # 10 Nov did not pick it
     pipe = [r("2026-11-10", "NMM.US", kind="PIPELINE"), r("2026-11-11", "NMM.US")]
     assert settle(pipe, d10) == ([], "OPEN")                                       # a pipeline day is no pick
+    # a plan day with no pick at all (only PIPELINE rows, e.g. no cash) also ends the run (Codex P2 on #954)
+    no_pick_day = [r("2026-11-09", "NMM.US"), r("2026-11-10", "NMM.US", kind="PIPELINE"),
+                   r("2026-11-10", "TEN.US", kind="PIPELINE"), r("2026-11-11", "NMM.US")]
+    assert settle(no_pick_day, d10) == ([], "OPEN")
     order = [r("2026-11-09", "ITRN.US"), r("2026-11-10", "NMM.US"), r("2026-11-11", "NMM.US")]
     assert settle(order, d10) == ([("NMM.US", d10)], "EXECUTED")                   # newest first: run = 10-11 Nov
     assert order[2]["Status Reason"] == "bought 2026-11-10 (settled 2026-11-12)"

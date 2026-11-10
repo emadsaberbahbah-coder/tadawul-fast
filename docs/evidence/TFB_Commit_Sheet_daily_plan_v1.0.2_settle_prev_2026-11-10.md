@@ -73,7 +73,7 @@
 - **S13:** workflow mapping, manifest pin and the CI step.
 - **S14:** two names settle in one run, in ledger order, on the exact log line.
 - **S15:** a CHECK pick from an unverified cut (as on 10 Nov) and a WAIT pick settle.
-- **S16:** the run of PICK days, tested directly: a day without the pick, or with the name only in the pipeline, ends the run, and the walk goes newest first.
+- **S16:** the run of PICK days, tested directly: a day without the pick, a day with the name only in the pipeline, or a plan day with no pick at all ends the run, and the walk goes newest first.
 
 **Golden negative on the untouched main copy** (`TFB_TEST_SETTLE_TARGET` = `git show 50f55740:scripts/daily_plan.py`): PASS 15/32, 17 failed. The 15 that pass are the 14 off-identity scenarios and S12, which describe main. S1 fails on its first assertion: the row reads OPEN where EXECUTED is expected.
 
@@ -112,6 +112,12 @@ The first review round's 52 mutants left 8 non-equivalent survivors (only OPEN s
   - a pick that the next plan drops, bought after its own last run, is outside P;
   - an unreadable Buy Date.
 - **Integration.** The ci.yml header block conflicts with each open daily PR (header lines only). Whoever lands later keeps both VERSION blocks, the higher number on top. The step and the manifest pin merge cleanly.
+
+**Round 2 (Codex P2 on #954, `83926e22`).** A plan day with only PIPELINE rows (no pick at all, e.g. no deployable cash) was left out of the run walk, so the walk bridged it:
+- NMM.US was picked on 9 Nov, pipeline-only on 10 Nov, picked again on 11 Nov and bought on 10 Nov.
+- The 12 Nov run settled the 11 Nov row for a purchase made before that run of picks.
+- Reproduced and fixed: every recorded plan date now enters the walk, with an empty pick set when the day has no pick. The S16 leg covers it; it fails on `83926e22` and passes now.
+- A day with no ledger rows at all (no plan cut) still does not break a run: the previous plan stood that day.
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
