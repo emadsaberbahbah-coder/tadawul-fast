@@ -42,6 +42,19 @@ GATES: the job runs only from .github/workflows/pre_open_check.yml
   (default Top_10_Investments), TFB_PREOPEN_ES_WAIT_PCT (0.25..5),
   TFB_PREOPEN_GAP_PCT (0.5..10), TFB_PREOPEN_TIMEOUT_S (5..60).
 ROLLBACK: disable the workflow. Nothing else reads the tab yet.
+v1.1.0 (2026-11-10) -- BOARD-GUARD: A TICKET IS AN ORDER ONLY ON AN EXECUTABLE BOARD
+WHY: read_tickets took any row with Ticket SAR > 0 and Shares > 0 as an order
+  and never read the board's own status line. On 9 Nov every render after
+  17:05 was WITHHELD, and with DT10_CLEAR_LATE=on a render stopped at the
+  6-minute limit keeps the previous board on purpose, so an earlier ticket
+  could still read GO (external review of 10 Nov, confirmed in this file).
+WHAT: board_state reads 'Last run <Riyadh time> | status: S | output: O'
+  from the first rows of the page. The board is executable only when O is
+  EXECUTABLE and the last run is no older than TFB_PREOPEN_BOARD_MAX_AGE_H
+  (default 3, clamped 0.5..24). TFB_PREOPEN_BOARD_GUARD = off (default:
+  1.0.0 rows, byte-identical) | observe (rows unchanged, one log line) |
+  enforce (every non-SKIP ticket row reads CHECK with the board's reason,
+  never GO or WAIT). The workflow maps enforce.
 --------------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -56,7 +69,7 @@ import time
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -168,6 +181,67 @@ def read_tickets(values: List[List[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+_STATUS_LINE = re.compile(r"Last run (\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2}))? \| status: ([^|]*?)"
+                          r"(?: \| output: ([A-Z_]+))?(?: \||$)")
+
+
+def board_guard_mode() -> str:
+    """v1.1.0: off (default) | observe | enforce; anything else is off."""
+    v = _env("TFB_PREOPEN_BOARD_GUARD", "off").lower()
+    return v if v in ("off", "observe", "enforce") else "off"
+
+
+def board_max_age_h() -> float:
+    """v1.1.0: the oldest board (hours since its last run) whose tickets count."""
+    return _env_float("TFB_PREOPEN_BOARD_MAX_AGE_H", 3.0, 0.5, 24.0)
+
+
+def board_state(values: List[List[Any]], now: _dt.datetime, max_age_h: float) -> Dict[str, Any]:
+    """v1.1.0 PURE: is the board an order surface right now? Its own status line
+    ('Last run yyyy-MM-dd HH:mm:ss | status: S | output: O | ...', Riyadh time,
+    written by 16_Decision_Top10 in the first rows) must read output EXECUTABLE
+    and be no older than max_age_h. WITHHELD, HELD, QUALIFIED_UNFUNDED, EMPTY,
+    a render still running, a missing or unreadable line and a stale or future
+    stamp are all not executable; reason says which."""
+    out: Dict[str, Any] = {"ok": False, "reason": "", "output": "", "status": "", "age_h": None, "line": ""}
+    line = ""
+    for row in (values or [])[:8]:
+        for c in row or []:
+            s = str(c if c is not None else "").strip()
+            if s.startswith("Last run "):
+                line = s
+                break
+        if line:
+            break
+    if not line:
+        out["reason"] = "board status line not found"
+        return out
+    out["line"] = line[:160]
+    m = _STATUS_LINE.match(line)
+    if not m:
+        out["reason"] = "board status line unreadable"
+        return out
+    day, hh, mm, ss, status, output = m.groups()
+    out["status"], out["output"] = (status or "").strip(), (output or "").strip()
+    try:
+        stamp = _dt.datetime.strptime("%s %s:%s:%s" % (day, hh, mm, ss or "00"),
+                                      "%Y-%m-%d %H:%M:%S").replace(tzinfo=RIYADH)
+    except ValueError:
+        out["reason"] = "board run time unreadable"
+        return out
+    age_h = (now - stamp).total_seconds() / 3600.0
+    out["age_h"] = round(age_h, 2)
+    if out["output"] != "EXECUTABLE":
+        out["reason"] = "board output %s (status %s)" % (out["output"] or "none", out["status"] or "?")
+    elif age_h < -0.1:
+        out["reason"] = "board run time is in the future"
+    elif age_h > max_age_h:
+        out["reason"] = "board last run %.1f h ago (limit %.1f h)" % (age_h, max_age_h)
+    else:
+        out["ok"] = True
+    return out
+
+
 def parse_prepost(payload: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     """From a Yahoo v8 chart (range=1d, includePrePost): the last printed
     price, which session printed it (pre / regular / post / none) and the
@@ -274,7 +348,8 @@ def ticket_verdict(t: Dict[str, Any], q: Optional[Dict[str, Any]], market: str,
 
 def build_rows(now: _dt.datetime, us_open: Optional[_dt.datetime], tickets: List[Dict[str, Any]],
                quotes: Dict[str, Dict[str, Any]], es: Dict[str, Any], wait_pct: float,
-               band_pct: float) -> List[List[str]]:
+               band_pct: float, board: Optional[Dict[str, Any]] = None,
+               guard: str = "off") -> List[List[str]]:
     mv, mreason, es_chg = market_verdict(es, wait_pct)
     stamp, open_s = riyadh(now), riyadh(us_open) if us_open else ""
     es_s = "" if es_chg is None else "{:+.2f}".format(es_chg)
@@ -285,6 +360,10 @@ def build_rows(now: _dt.datetime, us_open: Optional[_dt.datetime], tickets: List
              es_s, es_s, es.get("session") or "none", "Yahoo chart"]]
     for t in tickets:
         r = ticket_verdict(t, quotes.get(t["symbol"]), mv, band_pct)
+        if guard == "enforce" and board is not None and not board.get("ok") and r["verdict"] != "SKIP":
+            # v1.1.0 BOARD-GUARD: a ticket on a non-executable board is not an order
+            r = dict(r, verdict="CHECK", reason="board not executable (%s) - not an order; %s"
+                     % (board.get("reason") or "unknown", r["reason"] or "-"))
         rows.append([stamp, open_s, t["symbol"], r["verdict"], r["reason"], f(t.get("price")),
                      f(r["last"]), "" if r["gap"] is None else "{:+.2f}".format(r["gap"]), es_s,
                      r["session"], "Yahoo chart" if r["last"] is not None else ""])
@@ -449,11 +528,19 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, quotes: Optional[Qu
     _out(f"page {page}: {len(tickets)} ticket row(s), {len(execs)} executable, "
          f"{sum(1 for t in execs if us_yahoo_symbol(t['symbol']))} US")
 
+    guard = board_guard_mode()
+    board = board_state(vals, now, board_max_age_h())
+    _out("board: output %s, last run %s h ago -> %s | guard %s" % (
+        board["output"] or "-", "-" if board["age_h"] is None else board["age_h"],
+        "executable" if board["ok"] else "NOT executable (%s)" % board["reason"], guard))
+    if guard == "observe" and not board["ok"]:
+        _out("observe: %d US ticket row(s) would read CHECK" % sum(1 for t in execs if us_yahoo_symbol(t["symbol"])))
+
     quotes = quotes or Quotes(timeout_s())
     now_ts = int(now.timestamp())
     es = quotes.fetch(ES_SYMBOL, "5m", now_ts)
     qmap = quotes.collect(tickets, now_ts)
-    rows = build_rows(now, us_open, tickets, qmap, es, es_wait_pct(), gap_pct())
+    rows = build_rows(now, us_open, tickets, qmap, es, es_wait_pct(), gap_pct(), board=board, guard=guard)
     for r in rows:
         _out("  " + " | ".join(r[2:9]))
     if quotes.failures or quotes.skipped:
