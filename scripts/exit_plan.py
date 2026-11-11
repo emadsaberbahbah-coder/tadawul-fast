@@ -66,6 +66,13 @@ changes or cancels no order.
 against the stop (first live dry run: SUPN read 18.5% for a stop 15.7% under
 28.75); it is now measured against the last close.
 
+1.2.0 (2026-11-11): DIVIDEND TAX (owner, 17:01 Riyadh). A holding whose
+ex-dividend falls within TFB_EXIT_DIV_WARN_DAYS days (10) gets a note: the
+dividend a share and as a percent of the price, that the price falls by the
+full amount, and - on a US listing - the withholding a Saudi resident pays
+(TFB_EXIT_WHT_PCT, 30) on the lot: selling before the ex-date avoids it when a
+sale is planned anyway. A note only: no stop, target or action changes.
+
 1.1.0 (2026-11-11): HOURLY (owner, 12:52 Riyadh: "the outcome pages should be
 updated and refreshed to capture the new data at least each hour and that
 should be automatic"). The workflow now runs every hour; the e-mail still goes
@@ -96,6 +103,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -105,10 +113,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.daily_plan import (  # noqa: E402
-    _col, _read, cell, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
+    _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -165,6 +173,8 @@ def knobs() -> Dict[str, Any]:
         "news_days": int(_env_num("TFB_EXIT_NEWS_DAYS", 3, 0, 30)),
         "fc_rel_min": _env_num("TFB_EXIT_FC_REL_MIN", 70, 0, 100),
         "earn_warn_days": int(_env_num("TFB_EXIT_EARN_WARN_DAYS", 5, 0, 30)),
+        "div_warn_days": int(_env_num("TFB_EXIT_DIV_WARN_DAYS", 10, 0, 60)),
+        "wht": _env_num("TFB_EXIT_WHT_PCT", 30.0, 0.0, 100.0),
         "mail": _env("TFB_EXIT_MAIL", "0") in ("1", "true", "on", "yes"),
     }
     k["min_pct"] = min(k["min_pct"], k["max_pct"])
@@ -379,6 +389,25 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     return res
 
 
+def dividend_note(symbol: str, shares: Any, last: Any, ev: Dict[str, Any], k: Dict[str, Any]) -> str:
+    """1.2.0 [DIV-TAX]: a holding with an ex-dividend inside TFB_EXIT_DIV_WARN_DAYS days. The price falls by the full
+    dividend on the ex-date; a Saudi resident keeps it less the US withholding (TFB_EXIT_WHT_PCT on a US listing).
+    '' when there is no known dividend in the window."""
+    dt = dividend_tax(symbol, "", last, ev, k["div_warn_days"], k["wht"])   # the listing decides the withholding
+    if not dt:
+        return ""
+    qty = num(shares) or 0.0
+    when = "today" if dt["days"] == 0 else "in %d day(s)" % dt["days"]
+    msg = "ex-dividend %s: %s a share (%.1f%% of the price) - the price falls by the full dividend" % (
+        when, fmt(dt["amount"]), dt["yield_pct"])
+    if dt["wht_pct"] > 0:
+        msg += ("; you keep %g%% after the %g%% US withholding (%s withheld on %d shares) - if you plan to sell "
+                "within weeks, selling before the ex-date avoids it" % (100 - dt["wht_pct"], dt["wht_pct"],
+                                                                         fmt(qty * dt["amount"] * dt["wht_pct"] / 100.0),
+                                                                         int(qty)))
+    return msg
+
+
 def pick_levels(symbol: str, entry: float, bars: Sequence[Bar], k: Dict[str, Any]) -> Dict[str, Any]:
     """Initial stop and first target for a new pick, from its own ATR."""
     if not bars or entry <= 0:
@@ -410,7 +439,8 @@ def read_lots(values: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
         if not px or not sh or px <= 0 or sh <= 0 or bd is None:
             continue
         o = out.setdefault(sym, {"symbol": sym, "name": text(cell(r, col.get("Name"))), "shares": 0.0,
-                                 "cost": 0.0, "date": bd, "ccy": text(cell(r, col.get("Ccy")))})
+                                 "cost": 0.0, "date": bd, "ccy": text(cell(r, col.get("Ccy"))), "lots": 0})
+        o["lots"] += 1
         o["shares"] += sh
         o["cost"] += px * sh
         o["date"] = max(o["date"], bd)
@@ -439,8 +469,28 @@ def read_info(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, A
     return out
 
 
+NEWS_NOISE_RE = re.compile(
+    r"shareholder (alert|update|notice|investigation)|notif(ying|ies) investors|investors? who lost|"
+    r"investigations? on behalf|law (firm|offices?)|"
+    r"class action (lawsuit has been filed|deadline|reminder|notice|alert)|"
+    r"securities (litigation|fraud) (alert|investigation|class action|notice|reminder|deadline)|"
+    r"deadline (alert|reminder)|brodsky|rosen law|pomerantz|levi & korsinsky|bragar eagel|bronstein|faruqi|"
+    r"hagens berman|glancy|kessler topaz|robbins geller|schall law|johnson fistel", re.I)
+
+
+def news_is_noise(event_type: Any, headline: Any, grade: Any) -> bool:
+    """1.3.0 [NEWS-NOISE]: a law-firm solicitation (they go out on tier-A wires and read 'negative'), or a cluster
+    that is rumour-only, denied or social-only (information grade 4-6), never tightens a stop. The legal terms match
+    solicitation wording only: 'SEC charges X with securities fraud' or 'X hit with class action' still counts."""
+    if text(event_type).lower() == "law_firm_noise" or NEWS_NOISE_RE.search(text(headline)):
+        return True
+    g = num(grade)
+    return g is not None and g >= 4
+
+
 def read_news(values: Sequence[Sequence[Any]], now: _dt.datetime, days: int) -> Dict[str, Dict[str, Any]]:
-    """Negative symbol news (direction -1, severity H or M) published in the last `days` days."""
+    """Negative symbol news (direction -1, severity H or M) published in the last `days` days. 1.3.0: items that
+    news_is_noise() are counted under 'ignored' and never under 'n'."""
     h, col = table_index(values, ("Scope", "Direction", "Severity"))
     out: Dict[str, Dict[str, Any]] = {}
     if h is None or days <= 0:
@@ -455,7 +505,10 @@ def read_news(values: Sequence[Sequence[Any]], now: _dt.datetime, days: int) -> 
         pub = _parse_ts(cell(r, col.get("Published (UTC)")))
         if pub is None or pub < since:
             continue
-        o = out.setdefault(scope, {"n": 0, "headline": "", "at": None})
+        o = out.setdefault(scope, {"n": 0, "headline": "", "at": None, "ignored": 0})
+        if news_is_noise(cell(r, col.get("Event Type")), cell(r, col.get("Headline")), cell(r, col.get("Cluster Grade"))):
+            o["ignored"] += 1
+            continue
         o["n"] += 1
         if o["at"] is None or pub > o["at"]:
             o["at"], o["headline"] = pub, text(cell(r, col.get("Headline")))[:90]
@@ -818,6 +871,14 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
                     "broker_stop": stops.get(sym), "prev": prev})
         if (news.get(sym) or {}).get("headline"):
             res["why"].append("latest negative item: %s" % news[sym]["headline"])
+        if (news.get(sym) or {}).get("ignored"):                                       # 1.3.0 [NEWS-NOISE]
+            res["why"].append("%d news item(s) ignored: law-firm notice or unconfirmed" % news[sym]["ignored"])
+        if lot.get("lots", 1) > 1:                                                     # 1.3.0: the merged basis, stated
+            res["why"].append("entry is the weighted price of %d buys; days are counted from the latest buy"
+                              % lot["lots"])
+        note = dividend_note(sym, lot["shares"], res.get("last"), cal.get(sym) or {}, k)   # 1.2.0 [DIV-TAX]
+        if note:
+            res["why"].append(note)
         results.append(res)
     for p in picks:
         p["levels"] = pick_levels(p["symbol"], p["entry"] or 0.0, bars_for(p["symbol"]), k) if p.get("entry") else {}

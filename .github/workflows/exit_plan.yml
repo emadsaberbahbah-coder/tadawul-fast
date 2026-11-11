@@ -1,7 +1,10 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.2.0 (2026-11-11)
+# VERSION 1.3.0 (2026-11-11)
+#
+# 1.3.0: DIVIDEND TAX note on a holding with an ex-dividend inside 10 days
+# (exit_plan 1.2.0; TFB_EXIT_DIV_WARN_DAYS, TFB_EXIT_WHT_PCT).
 #
 # 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). 07:30 (with the e-mail), then
 # minute 35 from 08:35 to 00:35 Riyadh: 18 runs; the 00:35 run reads the US
@@ -117,6 +120,8 @@ jobs:
           TFB_EXIT_NEWS_DAYS: ${{ vars.TFB_EXIT_NEWS_DAYS || '3' }}
           TFB_EXIT_FC_REL_MIN: ${{ vars.TFB_EXIT_FC_REL_MIN || '70' }}
           TFB_EXIT_EARN_WARN_DAYS: ${{ vars.TFB_EXIT_EARN_WARN_DAYS || '5' }}
+          TFB_EXIT_DIV_WARN_DAYS: ${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}
+          TFB_EXIT_WHT_PCT: ${{ vars.TFB_EXIT_WHT_PCT || '30' }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_CRON: ${{ github.event.schedule }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
