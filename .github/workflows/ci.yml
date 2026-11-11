@@ -1292,6 +1292,17 @@ jobs:
             tests/test_render_env_contract.py \
             tests/test_validation_embargo_properties.py
 
+      - name: Exit plan LOT-CARRY harness (exit_plan 1.2.0, golden base fetched by SHA)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
+        run: |
+          # v1.1.88: the off-identity legs read exit_plan 1.1.0 at main
+          # 53f2abdc; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them
+          # instead of skipping them.
+          git fetch --no-tags --depth=1 origin 53f2abdc5be5c13294f4009b3b1bc3d1964907d5 \
+            || echo "::warning::53f2abdc base not fetched - the golden legs will FAIL"
+          python -m pytest -q tests/test_exit_plan_lot_carry.py
+
       - name: 🧮 Run model and display basis regressions (lean)
         run: |
           python -m pytest -q \
@@ -1317,17 +1328,6 @@ jobs:
           git fetch --no-tags --depth=1 origin 0c3d3e21a523c0a275b0f9b9c33951d695afc4bb \
             || echo "::notice::portfolio_actions v1.17.0 base not fetched - the v1.17.0 identity cases will SKIP"
           python -m pytest -q tests/test_pf_add_guards_d1.py
-
-      - name: Exit plan LOT-CARRY harness (exit_plan 1.2.0, golden base fetched by SHA)
-        env:
-          TFB_TEST_REQUIRE_BASE: "1"
-        run: |
-          # v1.1.88: the off-identity legs read exit_plan 1.1.0 at main
-          # 53f2abdc; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them
-          # instead of skipping them.
-          git fetch --no-tags --depth=1 origin 53f2abdc5be5c13294f4009b3b1bc3d1964907d5 \
-            || echo "::warning::53f2abdc base not fetched - the golden legs will FAIL"
-          python -m pytest -q tests/test_exit_plan_lot_carry.py
 
       - name: 📋 Board scorecard harness (golden bases fetched by SHA)
         run: |

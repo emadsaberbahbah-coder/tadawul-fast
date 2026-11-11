@@ -39,14 +39,16 @@ With two fills a few cents apart on one day (harness L2):
 
 ## S2 - Change
 
-**`scripts/exit_plan.py` 1.1.0 -> 1.2.0.** Dated WHY block prepended; every prior WHY line verbatim. 2 functions added, 0 removed; the only removed line is `__version__`. Every added line is ASCII.
+**`scripts/exit_plan.py` 1.1.0 -> 1.2.0.** Dated WHY block prepended; every prior WHY line verbatim. 4 functions added, 0 removed; the only removed line is `__version__`. Every added line is ASCII.
 - `lot_carry_on()`: reads the gate.
 - `read_lots`: adds `first`, the earliest active buy date of the holding. This is additive; no caller of 1.1.0 reads it.
-- `carry_rows(ledger, symbol, key, lot_date, first)`: the ledger rows of the same symbol under another key whose buy date is on or after `first`, relabelled to the current key, with a `Carried From` field naming the old key. The ledger itself is not changed.
-  - Nothing is carried when the current key's buy date is later than every earlier key's date. That is a lot bought since: a top-up stays a new position, as before.
-  - Nothing is carried from an older holding that was sold out and bought again (its key's date is before `first`).
-  - A malformed key, or a key of another symbol, is skipped.
-- `run()`: when on and `carry_rows` returns rows, `prior_row` reads those rows together with the current key's own rows. The entry, R, ATR and target are computed from the current lots, as before. While the current key has no row on an earlier close, the holding's note says "the lots changed (a sale or a closed lot): the stop and the first-target state carry over from <old key>".
+- `carry_rows(ledger, symbol, key, lot_date, first, bars=None)`: the ledger rows of the same symbol under another key that belong to the same position, relabelled to the current key, each with a `Carried From` field naming its old key. The ledger itself is not changed. A row belongs to the same position when:
+  - every lot active now was already bought on the close the row was computed on: `lot_date` (the latest active buy date) is on or before the row's `Bars To`. A lot bought since - a top-up, or a holding sold out and bought again, the same day included - starts a new position, as in 1.1.0, and the rows from before it are not carried, also after a later sale;
+  - its key's buy date is not before `first` (an older holding, e.g. an after-hours round trip on the day of the last row, is not carried);
+  - its Lot is a well-formed `SYMBOL|date|price` and its `Bars To` is readable.
+  With this run's bars, each copy's `Basis` (the dividend factor the row's stop was computed on) is moved from its own key's buy date to `lot_date` (`_factor_at`, the factor exit_levels reads for an entry date). So a dividend paid between the two buy dates does not rescale the carried stop; a dividend paid since the row still rebases it, as in 1.1.0.
+- `carry_was(rows, today, bars_to)`: the stop before this close for a holding read across its keys = the highest stop recorded on the holding's latest earlier close. prior_row's "highest stop on any earlier close" can be an older key's stop, above what the current key last published; with this, a carried stop above the last published one reads RAISE STOP, not HOLD.
+- `run()`: when on and `carry_rows` returns rows, `prior_row` reads those rows with the current key's own rows, and `Was` comes from `carry_was`. The entry, R, ATR and target are computed from the current lots, as before. The holding's note says "the lots changed (a sale or a closed lot): the stop and the first-target state carry over from <the latest earlier key>" while the current key has no row of its own on an earlier close, or when the carried stop is more than 0.25% above the current key's own.
 - The ledger's Lot column, the page layout, the e-mail format and every other holding are unchanged.
 
 **`.github/workflows/exit_plan.yml` 1.2.0 -> 1.3.0.** Maps `TFB_EXIT_LOT_CARRY: ${{ vars.TFB_EXIT_LOT_CARRY || 'off' }}`. No trigger, schedule or concurrency change.
@@ -61,29 +63,43 @@ With two fills a few cents apart on one day (harness L2):
 
 ## S3 - Measured
 
-**`tests/test_exit_plan_lot_carry.py`:** PASS 18/18 as a script (three runs, identical), and 43 passed under pytest together with main's `tests/test_exit_plan.py` (25), with `TFB_TEST_REQUIRE_BASE=1`. Zero network. The legs:
-- **L0:** the version floor (1, 2, 0) and the gate words.
-- **L1:** the sale above. On: the next close reads HOLD, TP1 kept, the stop not lower (100.47 -> 100.63), one note naming the earlier key, the e-mail "hold all". Off: TAKE PROFIT again. The other holding is the same on and off.
-- **L2:** the close fills above. On: HOLD at 105.90 with TP1 kept. Off: RAISE STOP to 104.06 and TP1 lost.
+**`tests/test_exit_plan_lot_carry.py`:** PASS 45/45 as a script, and 73 passed under pytest together with main's `tests/test_exit_plan.py` (25) and `tests/test_verify_manifest_pins.py` (3), with `TFB_TEST_REQUIRE_BASE=1`. Zero network: the real `run()` reads an in-memory workbook and a fake chart feed (with an optional adjusted close). The legs:
+- **L0:** the version floor (1, 2, 0) and the gate words ("observe", the TFB_EXIT_PLAN mode word, reads off).
+- **L1:** the sale in S1. On: the next close reads HOLD, TP1 kept, the stop not lower (100.47 -> 100.63), one note naming the earlier key, the e-mail "hold all". Off: TAKE PROFIT again. The other holding is the same on and off.
+- **L2:** two fills on one day. On: HOLD at 105.90 with TP1 kept. Off: RAISE STOP to 104.06 and TP1 lost.
 - **L3:** the newest lot closed (the key's date moves earlier): carried.
 - **L4 / L5 / L6:** a top-up, a holding sold out and bought again, and a single lot sold down: on equals off, with no note.
 - **L7:** a second run on the same close after the change: the same action and stop, no RAISE STOP of its own.
-- **L8 off identity:** all 7 scenarios against the untouched main copy, with the gate unset, off, "OFF ", no, 0, enforce and empty. Ledger, page, e-mail and every log line are equal (the version tokens folded).
-- **L9:** `carry_rows` directly: the symbol, the window, the top-up guard, malformed keys, the relabel, no mutation of the ledger; `read_lots`' `first`.
+- **L8 off identity:** all 22 scenarios against the untouched main copy, with the gate unset, off, "OFF ", no, 0, enforce and empty. Ledger, page, e-mail and every log line are equal, any version token folded.
+- **L9:** `carry_rows`, `_factor_at`, `carry_was` and `read_lots`' `first` directly: the symbol, malformed keys and dates, the Bars To rule at its boundary, the older-holding rule, ledger order, the basis move, no mutation of the ledger, any sheet order.
 - **L10:** the workflow mapping, the manifest pin and the CI step.
+- **L11:** one lot, TAKE PROFIT, half sold, a top-up, then 10 shares of the old lot sold. On a close of 100: RAISE STOP 94.82 -> 95.43 (the first commit: SELL at 100.30, a stop not published since the top-up). On a close of 117: TAKE PROFIT, as without the sale.
+- **L12:** two lots with an ex-dividend date on the newest lot's buy day; the newest lot closed. On: HOLD at 105.29 with "was 105.29" (the first commit: RAISE STOP to 103.41). Off: TAKE PROFIT at 103.41.
+- **L13:** sold out and bought again on the same day: on equals off, HOLD at the new position's own stop on a close of 99 (the first commit: SELL at the old 99.45).
+- **L14:** TAKE PROFIT under the new key, then the next close: HOLD, no second "sell half", the note gone.
+- **L15:** two runs on one Riyadh date, the second on a newer close: the stop holds, HOLD.
+- **L16:** a weekend re-run on the same close: TAKE PROFIT stays, as on the one-key path.
+- **L17:** sold out, bought again in two lots, then a sale: the old holding's stop and TP1 do not come back.
+- **L18:** a lot closed, then re-activated with a sale: carried, HOLD with TP1, the note names the key just before.
+- **L19:** two sales on consecutive closes: each note names the key just before, and it is gone on the next close (log, page and e-mail).
+- **L20:** a carried holding without price history (CHECK): no note.
+- **L21:** the gate switched on after a change made while off: the carried 105.90 comes back as RAISE STOP 104.06 -> 105.90 with the note, and the e-mail says "raise stop" (the first commit: a silent HOLD).
 
-**Golden negative on the untouched main copy** (`TFB_TEST_CARRY_TARGET` = `git show 53f2abdc:scripts/exit_plan.py`): PASS 11/18, 7 failed. The 11 that pass are the off-identity and nothing-to-carry legs, which describe main. L1, L2 and L3 fail on their substantive assertions (TAKE PROFIT repeated, the lower stop); L0, L7, L9 and L10 fail on the missing version, function or wiring.
+**Golden negatives.**
+- Main's untouched 1.1.0 (`TFB_TEST_CARRY_TARGET` = `git show 53f2abdc:scripts/exit_plan.py`): PASS 29/45, 16 failed. The 29 that pass are the 22 off-identity legs and the legs whose answer is "nothing to carry" (L4-L6, the L4 top-up, L13, L16, L20), which describe main. L1-L3, L7, L11, L12, L14, L15 and L17-L21 fail on their substantive assertions; L0, L9 and L10 on the missing version, functions or wiring.
+- The first 1.2.0 commit (`ef0e70fa`): PASS 39/45. L11, L12, L13 and L21 fail: they encode the round-1 findings. Both L9 legs fail too.
 
-**Lanes:** pending (the lean and contract emulations on an export of this tree are running).
+MUTATION_AND_LANES_PLACEHOLDER
 
 ## S4 - Off identity
 
-- **Structure.** With the gate off, `carry` is False, so `carry_rows` never runs, `prior_row` is called once as in 1.1.0, and no note is added. The extra work is one `os.environ` read that cannot raise, and the additive `first` field in `read_lots`, which nothing reads when off.
-- **Harness.** L8 pins this for all 7 scenarios and 7 off words against the untouched main copy: ledger, page, e-mail and every log line.
+- **Structure.** With the gate off, `carry` is False, so `carry_rows`, `carry_was` and the note are never reached, and `prior_row` is called once as in 1.1.0. The extra work is one `os.environ` read that cannot raise, and the additive `first` field in `read_lots`, which nothing reads when off.
+- **Harness.** L8 pins this for all 22 scenarios and 7 off words against the untouched main copy: ledger, page, e-mail and every log line, apart from the version string.
+- **Fuzz.** ROUND2_FUZZ_PLACEHOLDER
 
 ## S5 - Review
 
-Pending: an independent multi-lens review (semantics, off identity and house rules, mutation, CI and merge integration) is running.
+ROUND_REVIEW_PLACEHOLDER
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
@@ -95,8 +111,11 @@ Rollback: unset the Variable.
 
 ## S7 - Known limits and not done
 
-- **A top-up stays a new position.** A lot bought since the last row gives a new key with a later date, and nothing is carried: the stop and target restart from the merged entry, as in 1.1.0. Whether a top-up should keep the ratchet is a judgement for the owner, not a defect fix.
+- **A lot bought since starts a new position.** A top-up, or a holding sold out and bought again, gives a key whose latest buy date is after the earlier rows' closes, and nothing from before it is carried: the stop and the target restart from the merged entry, as in 1.1.0. Whether a top-up should keep the ratchet is a judgement for the owner, not a defect fix.
+- **A run inside the purchase session.** A row computed before the session of the newest lot closed (its `Bars To` is the day before) is not carried after a sale on that day. Such a row holds only the initial stop of a position with no close yet, so nothing is lost.
+- **After-hours.** A lot bought after the close of the day the last row was computed on counts as bought on that close. A sell-out and re-buy after hours on that day is caught only when the old key's buy date is before the new lot's (the older-holding rule).
 - **Only the stop ratchet and the first-target state carry.** The entry, R, ATR and target are always computed from the current lots.
+- **The note.** It names the latest earlier key in ledger order. On a third run of the same close after a sale, when the earlier key's only row was that close's own (the same-day overwrite removes it), nothing is carried and the note is not shown; the current key's own row already holds the carried stop and flag, so the action and the stop are the same.
 - **The live book.** Whether the owner's live holdings have several lots at different prices cannot be checked offline.
 - **Not done.**
   - No Variable set and no gate armed.
