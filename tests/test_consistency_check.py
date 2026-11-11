@@ -213,7 +213,7 @@ def test_k5_workflow_manifest_ci():
     raw = (ROOT / ".github/workflows/consistency_check.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["schedule"] == [{"cron": "50 * * * *"}] and "workflow_run" not in on                 # 1.1.0: hourly
+    assert on["schedule"] == [{"cron": "50 4-21 * * *"}] and "workflow_run" not in on              # 1.2.0: active hours
     assert wf["permissions"] == {"contents": "read"}
     step = [s for s in wf["jobs"]["consistency"]["steps"] if "consistency_check.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_CONSISTENCY"] == "${{ vars.TFB_CONSISTENCY || 'on' }}"

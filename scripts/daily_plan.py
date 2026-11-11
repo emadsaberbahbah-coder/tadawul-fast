@@ -84,6 +84,13 @@ which moves only when a sync lands (three times a day); the reason carries
 '(live HH:MM Riyadh)'. A name with no live price keeps the page price. The cut
 itself still uses the source pages, as before.
 
+1.3.0 (2026-11-11): ACTIVE HOURS AND THE EARLIEST CUT (owner, 14:16 Riyadh:
+one schedule for the outcome pages, every hour while a market is open). The
+workflow runs at minute 20 from 07:20 to 23:20 Riyadh, plus after every sync.
+No plan is cut before TFB_PLAN_CUT_FROM_H o'clock Riyadh (7): an after-sync
+run that lands after midnight, or a manual run at night, waits for the morning
+sync instead of cutting the new day's plan from a midnight render.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -97,7 +104,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -169,6 +176,7 @@ def knobs() -> Dict[str, Any]:
         "keep_rank": int(_env_num("TFB_PLAN_KEEP_RANK", 8, 0, 50)),
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
+        "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "ev_mode": ev_mode(),
         "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
@@ -808,7 +816,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
     else:
         hour = now.astimezone(RIYADH).hour + now.astimezone(RIYADH).minute / 60.0
         quality = "VERIFIED" if state["verified"] else "UNVERIFIED"
-        if not (state["finished"] and state["today"]):
+        if hour < k["cut_h"]:                                   # 1.3.0: wait for the morning sync
+            info["no_picks"] = ("No plan yet today: the plan is cut from %02d:00 Riyadh, after the morning sync."
+                                % int(k["cut_h"]))
+        elif not (state["finished"] and state["today"]):
             info["no_picks"] = "No plan yet today: %s." % state["reason"]
         elif quality != "VERIFIED" and hour < k["unverified_h"]:
             info["no_picks"] = ("No plan yet today: the main page's source pages are not verified (%s); an "
