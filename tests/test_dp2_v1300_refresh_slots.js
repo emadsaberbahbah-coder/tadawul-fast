@@ -471,7 +471,9 @@ function scenarios(src) {
   const l1 = tick(wl, at(8, 55), { DateCls: steppingDate(at(8, 55), 20000) });
   const kept = { ret: l1.ret, sentinel: String(wl.book.getSheetByName(PDV)._cells.get('1:1').v), clears: clears(l1.calls, PDV), st: state(wl), claim: wl.props.DP2_SLOT_CLAIM, b: built(wl) };
   const l2 = tick(wl, at(8, 56));
-  const second = { act: l2.ret.act, page: l2.ret.page, gone: !wl.book.getSheetByName(PDV)._cells.get('1:1') || String(wl.book.getSheetByName(PDV)._cells.get('1:1').v) !== kept.sentinel, st: state(wl) };
+  const other = { act: l2.ret.act, page: l2.ret.page, sentinel: String(wl.book.getSheetByName(PDV)._cells.get('1:1').v), st: state(wl) };
+  const l3 = tick(wl, at(8, 57));
+  const second = { act: l3.ret.act, page: l3.ret.page, gone: !wl.book.getSheetByName(PDV)._cells.get('1:1') || String(wl.book.getSheetByName(PDV)._cells.get('1:1').v) !== kept.sentinel, st: state(wl), other };
   const wt = world(src, Object.assign({ DP2_SLOT_DONE: JSON.stringify({ slot: '2026-11-02 08', pd: 0, t10: 0, tries: { pd: 1, t10: 2 } }) }, HOURS));
   wt.book.load(PDV, [['SENTINEL']]);
   const t1 = tick(wt, at(8, 55), { DateCls: steppingDate(at(8, 55), 20000) });
@@ -548,7 +550,7 @@ function checkPure(sc, parts) {
   deq(p.slice(18, 26), [150000, 150000, 90000, 30000, 330000, 150000, 150000, 150000], 'the drawing limit');
   eq(p[26], true, 'dp2SlotCoreOk_');
   const acts = sc.plan.map(x => x.act + ':' + x.page);
-  deq(acts, ['build:pd', 'build:t10', 'build:t10', 'idle:', 'idle:', 'build:t10', 'build:pd', 'wait:pd', 'wait:pd', 'build:pd', 'build:pd', 'wait:pd', 'build:pd', 'wait:pd', 'idle:', 'idle:', 'build:pd'], 'the plan matrix');
+  deq(acts, ['build:pd', 'build:t10', 'build:t10', 'idle:', 'idle:', 'build:t10', 'build:t10', 'wait:pd', 'wait:pd', 'build:pd', 'build:pd', 'wait:pd', 'build:pd', 'wait:pd', 'idle:', 'idle:', 'build:pd'], 'the plan matrix');
   eq(sc.plan[3].why, 'both pages built in this slot'); eq(sc.plan[4].why, 'the tries of this slot are used up');
   eq(sc.plan[7].why, 'a Top_10 / Portfolio_Decision render is running'); eq(sc.plan[8].why, 'a v2 build started 6 min ago');
   eq(sc.plan[11].why, 'waiting for the main-page render of this hour (until minute 40)');
@@ -599,8 +601,10 @@ function checkLate(sc, parts) {
   eq(kept.sentinel, 'SENTINEL page of the previous build', 'the previous page stays'); eq(kept.clears, 0, 'nothing cleared');
   deq(kept.st, { slot: '2026-11-02 08', pd: 0, t10: 0, tries: { pd: 1, t10: 0 } }, 'the try is counted, the page not done');
   eq(kept.claim, '', 'the claim is cleared'); eq(kept.b, null, 'no stamp');
-  deq([second.act, second.page, second.gone], ['built', 'pd', true], 'the next tick builds it');
-  deq(second.st, { slot: '2026-11-02 08', pd: 1, t10: 0, tries: { pd: 2, t10: 0 } }, 'second try');
+  deq([second.other.act, second.other.page, second.other.sentinel], ['built', 't10', 'SENTINEL page of the previous build'], 'the page not yet tried goes before the retry (Codex P2 on #961)');
+  deq(second.other.st, { slot: '2026-11-02 08', pd: 0, t10: 1, tries: { pd: 1, t10: 1 } }, 'the other page built');
+  deq([second.act, second.page, second.gone], ['built', 'pd', true], 'then the retry builds it');
+  deq(second.st, { slot: '2026-11-02 08', pd: 1, t10: 1, tries: { pd: 2, t10: 1 } }, 'second try');
   eq(t1, 'kept', 'the last try kept the page');
   deq([t2.act, t2.why], ['idle', 'the tries of this slot are used up'], 'two tries at most');
   deq(tst, { slot: '2026-11-02 08', pd: 0, t10: 0, tries: { pd: 2, t10: 2 } }, 'tries used up');
@@ -665,7 +669,7 @@ function checkLint() {
 const MUTANTS = [
   ['the fallback minute', 'if (mainKey !== key && minute < DP2_SLOT_FALLBACK_MIN_)', 'if (mainKey !== key && minute < 0)'],
   ['the main render ignored', 'if (mainKey !== key && minute < DP2_SLOT_FALLBACK_MIN_)', 'if (minute < DP2_SLOT_FALLBACK_MIN_)'],
-  ['one more try', 'st.tries[order[i]] < DP2_SLOT_MAX_TRIES_) due.push', 'st.tries[order[i]] <= DP2_SLOT_MAX_TRIES_) due.push'],
+  ['one more try', 'if (!st[pg] && st.tries[pg] < DP2_SLOT_MAX_TRIES_)', 'if (!st[pg] && st.tries[pg] <= DP2_SLOT_MAX_TRIES_)'],
   ['the claim window', 'claimAgeMin >= 0 && claimAgeMin < DP2_RP_BUSY_MIN_', 'claimAgeMin >= 0 && claimAgeMin < 1'],
   ['a decision render ignored', "  if (busy) return { act: 'wait'", "  if (false) return { act: 'wait'"],
   ['never late', 'function dp2SlotTooLate_() { return DP2_SLOT_RUN_ && dp2RunElapsed_() > DP2_SLOT_DRAW_MS_; }', 'function dp2SlotTooLate_() { return false; }'],
@@ -681,6 +685,7 @@ const MUTANTS = [
   ['any status finished', "return (m && st && st[1].toLowerCase() === 'ok') ? m[1] + ' ' + m[2] : '';", "return (m && st) ? m[1] + ' ' + m[2] : '';"],
   ['no guard on Portfolio_Decision_v2', "  if (dp2SlotTooLate_()) return { rows: 0, late: true, ms: dp2RunElapsed_() };   // v1.3.0 [REFRESH-SLOTS]\n  var sh = dp2Sheet_(DP2.SHEET_PD, true);", '  var sh = dp2Sheet_(DP2.SHEET_PD, true);'],
   ['the error swallowed', '  if (err) throw err;\n  return out;', '  return out;'],
+  ['a retry before an untried page', '  var due = fresh.concat(retry);', '  var due = retry.concat(fresh);'],
   ['a wider drawing limit', 'if (!isFinite(n) || n < 30 || n > 330) n = DP2_SLOT_DRAW_DEFAULT_S_;', 'if (!isFinite(n) || n < 30 || n > 600) n = DP2_SLOT_DRAW_DEFAULT_S_;']
 ];
 
@@ -692,7 +697,7 @@ function battery() {
   test('P2 pure: hours, state, the main-page key, the drawing limit, the plan matrix, dp2SlotCoreOk_', () => { sc = scenarios(NEW); checkPure(sc, parts); });
   test('P3 ticks: the older page first, one page per execution, stamped, claim cleared, the same page as the menu build, then idle; the next slot waits for its render', () => checkTicks(sc, parts));
   test('P4 waits: outside the hours (only the hours read), a decision render, a fresh claim (a stale one builds), a running render until minute 40, off, the default hours', () => checkWaits(sc, parts));
-  test('P5 a late drawing step keeps the previous page (nothing cleared, try counted); the next tick builds it; two tries at most', () => checkLate(sc, parts));
+  test('P5 a late drawing step keeps the previous page (nothing cleared, try counted); the untried page goes next, then the retry builds it; two tries at most', () => checkLate(sc, parts));
   test('P6 a failing build: the try counted, the claim cleared, no stamp, the error logged and rethrown', () => checkFail(sc, parts));
   test('P7 the slot installer (removes the hourly trigger), the hourly installer (removes the slot trigger), the remover, the status', () => checkInstall(sc, parts));
   test('P7b a menu build on a moving clock is never late (the guard is for slot builds only)', () => checkManual(sc, parts));

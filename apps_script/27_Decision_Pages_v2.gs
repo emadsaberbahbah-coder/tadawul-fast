@@ -720,8 +720,12 @@ function dp2SlotDrawMaxMsCore_(raw) {
 function dp2SlotPlanCore_(hours, key, minute, stateRaw, mainKey, busy, claimAgeMin, builtRaw) {
   var hour = +String(key).slice(11, 13);
   if (hours.indexOf(hour) < 0) return { act: 'idle', page: '', why: 'not a refresh hour (' + (hours.length ? hours.join(',') : 'off') + ')' };
-  var st = dp2SlotStateCore_(stateRaw, key), order = dp2RpOrderCore_(builtRaw), due = [];
-  for (var i = 0; i < order.length; i++) if (!st[order[i]] && st.tries[order[i]] < DP2_SLOT_MAX_TRIES_) due.push(order[i]);
+  var st = dp2SlotStateCore_(stateRaw, key), order = dp2RpOrderCore_(builtRaw), fresh = [], retry = [];
+  for (var i = 0; i < order.length; i++) {
+    var pg = order[i];
+    if (!st[pg] && st.tries[pg] < DP2_SLOT_MAX_TRIES_) (st.tries[pg] ? retry : fresh).push(pg);
+  }
+  var due = fresh.concat(retry);   // a page not yet tried in this slot goes before a retry (Codex P2 on #961)
   if (!due.length) return { act: 'idle', page: '', why: (st.pd && st.t10) ? 'both pages built in this slot' : 'the tries of this slot are used up' };
   if (claimAgeMin !== null && claimAgeMin >= 0 && claimAgeMin < DP2_RP_BUSY_MIN_) return { act: 'wait', page: due[0], why: 'a v2 build started ' + Math.floor(claimAgeMin) + ' min ago' };
   if (busy) return { act: 'wait', page: due[0], why: 'a Top_10 / Portfolio_Decision render is running' };
@@ -829,7 +833,8 @@ function dp2SlotCoreOk_() {
              plan(10, '', k, true, null).act === 'wait' && plan(10, '', k, false, 3).act === 'wait' && plan(10, '', k, false, 8).act === 'build' &&
              dp2SlotPlanCore_([16], k, 10, '', k, false, null, '').act === 'idle' &&
              plan(10, JSON.stringify({ slot: k, pd: 1, t10: 1, tries: { pd: 1, t10: 1 } }), k, false, null).act === 'idle' &&
-             plan(10, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 2, t10: 2 } }), k, false, null).act === 'idle';
+             plan(10, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 2, t10: 2 } }), k, false, null).act === 'idle' &&
+             plan(41, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 1, t10: 0 } }), '', false, null).page === 't10';
     var dr = dp2SlotDrawMaxMsCore_('') === 150000 && dp2SlotDrawMaxMsCore_('90') === 90000 && dp2SlotDrawMaxMsCore_('5') === 150000;
     return hrs && pl && dr;
   } catch (e) { return false; }
