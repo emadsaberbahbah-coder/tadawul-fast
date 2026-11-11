@@ -1,7 +1,11 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.1.0 (2026-11-11)
+# VERSION 1.2.0 (2026-11-11)
+#
+# 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). 07:30 (with the e-mail), then
+# minute 35 from 08:35 to 00:35 Riyadh: 18 runs; the 00:35 run reads the US
+# close. Nothing runs from 01:00 to 07:00, when both markets are shut.
 #
 # 1.1.0: HOURLY (owner, 11 Nov 12:52: the outcome pages refresh at least every
 # hour, automatically). The page and the ledger are refreshed every hour on
@@ -28,7 +32,7 @@ name: 🎯 Exit Plan
 on:
   schedule:
     - cron: "30 4 * * *"            # 07:30 Riyadh: the morning run, with the e-mail
-    - cron: "35 0-3,5-23 * * *"     # every other hour of the day at minute 35: page and ledger, no e-mail
+    - cron: "35 5-21 * * *"         # 08:35-00:35 Riyadh at minute 35: page and ledger, no e-mail
   workflow_dispatch:
     inputs:
       dry_run:
