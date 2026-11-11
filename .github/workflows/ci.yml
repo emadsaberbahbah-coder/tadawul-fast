@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.78 (2026-11-11) -- EXIT PLAN SUITE
+#
+# v1.1.78: run tests/test_exit_plan.py (scripts/exit_plan.py 1.0.0 and
+# exit_plan.yml 1.0.0: a stop and a target per holding from its own ATR,
+# reviewed every morning, the stop never moves down) in the blocking lean lane.
+#
 # VERSION 1.1.77 (2026-11-10) -- S-1 LASTSCORED REPLAY SUITE
 #
 # v1.1.77: run tests/test_s1_lastscored_nov9_replay.py (run_shadow_scorer
@@ -1166,6 +1172,7 @@ jobs:
             tests/test_sync_stamp_repair.py \
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
+            tests/test_exit_plan.py \
             tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
