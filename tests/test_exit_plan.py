@@ -614,3 +614,41 @@ def test_x16_bought_in_a_session_that_has_not_closed():
     done = mk([100.0] * 40 + [120.0], 0.015)
     after = ep.exit_levels("NEW.US", 120.0, done[-1][0], done, {}, {}, K(), TODAY)
     assert not after["fresh"] and after["action"] in ("HOLD", "RAISE STOP")
+
+
+def test_x17_dividend_note():
+    """1.2.0 [DIV-TAX]: the price falls by the full dividend; a Saudi resident keeps 70% of a US one."""
+    k = K()
+    n = ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, k)
+    assert n == ("ex-dividend in 4 day(s): 0.50 a share (1.2% of the price) - the price falls by the full dividend; "
+                 "you keep 70% after the 30% US withholding (11.85 withheld on 79 shares) - if you plan to sell within "
+                 "weeks, selling before the ex-date avoids it")
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 0.0, "div_amount": 0.5}, k).startswith("ex-dividend today:")
+    sr = ep.dividend_note("2222.SR", 100, 25.0, {"exdiv_days": 2.0, "div_amount": 0.5}, k)
+    assert sr == "ex-dividend in 2 day(s): 0.50 a share (2.0% of the price) - the price falls by the full dividend"
+    assert "withholding" not in ep.dividend_note("BBOX.L", 100, 140.0, {"exdiv_days": 2.0, "div_amount": 1.8}, k)
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 11.0, "div_amount": 0.5}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": None}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, None, {"exdiv_days": 4.0, "div_amount": 0.5}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, K(wht=15.0)).endswith(
+        "you keep 85% after the 15% US withholding (5.92 withheld on 79 shares) - if you plan to sell within weeks, "
+        "selling before the ex-date avoids it")
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, K(div_warn_days=3)) == ""
+    assert k["div_warn_days"] == 10 and k["wht"] == 30.0
+
+
+def test_x17_run_carries_the_dividend_note(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    b = wbook()
+    b.tabs["Dividend_Events"] = Sheet([["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"],
+                                       ["DDI.US", "", 3, 1.10, "USD"]])
+    assert ep.run(False, False, book=b, now=NOW, opener=opener) == 0
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "ex-dividend in 3 day(s): 1.10 a share (1.0% of the price)" in page
+    assert "(79.20 withheld on 240 shares)" in page
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "exit_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"][list(wf["jobs"])[0]]["steps"] if "TFB_EXIT_WHT_PCT" in (s.get("env") or {})][0]["env"]
+    assert env["TFB_EXIT_WHT_PCT"] == "${{ vars.TFB_EXIT_WHT_PCT || '30' }}"
+    assert env["TFB_EXIT_DIV_WARN_DAYS"] == "${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}"

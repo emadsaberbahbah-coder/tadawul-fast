@@ -651,3 +651,54 @@ def test_h3_no_cut_before_the_morning_hour(monkeypatch):
     assert [r for r in b2.tabs["_Daily_Plan"].values[1:] if r[0] == "2026-11-10" and r[4] == "PICK"]
     monkeypatch.setenv("TFB_PLAN_CUT_FROM_H", "99")
     assert dp.knobs()["cut_h"] == 7                                               # out of range: the default
+
+
+# ----------------------------------------------------------------------------- H4 (1.4.0)
+def test_h4_dividend_tax_waits_for_the_ex_date(monkeypatch):
+    """1.4.0 [DIV-TAX]: a Saudi resident keeps 70% of a US dividend while the price falls by all of it."""
+    q = [qrow(1, "X.US", "Energy", 30, ""), qrow(2, "Y.US", "Financials", 30, ""), qrow(3, "Z.SR", "Materials", 30, ""),
+         qrow(4, "W.US", "Utilities", 30, ""), qrow(5, "V.US", "Industrials", 30, "")]
+    src = [SRC[0], ["X.US", "", "USD", "", "50", ""], ["Y.US", "", "USD", "", "10", ""], ["Z.SR", "", "SAR", "", "100", ""],
+           ["W.US", "", "USD", "", "20", ""], ["V.US", "", "USD", "", "50", ""]]
+    div = [["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"],
+           ["X.US", "", 6, 1.00, "USD"],      # 2.0% in 6 days: 30% withheld = 0.60% of the price -> wait
+           ["Y.US", "", 5, 0.02, "USD"],      # 0.2%: 0.06% -> a label only
+           ["Z.SR", "", 6, 3.00, "SAR"],      # Tadawul: no US withholding
+           ["W.US", "", 12, 1.00, "USD"],     # outside the 10-day window
+           ["V.US", "", 0, 1.00, "USD"]]      # the 3-day gate answers first
+    run = lambda k: dp.decide(dp.read_qualified(board(qual=q)), dp.read_sources([src]), dp.read_calendar([], div), lots(),
+                              33125.0, 5, k)
+    p = run(K(picks=5))
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["X.US"] == ("ex-dividend in 6 day(s): 1.00 a share (2.0%); bought before it, 30% is withheld = 0.60% "
+                            "of the price - buy after the ex-date")
+    assert wait["V.US"] == "ex-dividend 2.0% in 0 day(s)"
+    picks = {c["symbol"]: c for c in p["picks"]}
+    assert set(picks) == {"Y.US", "Z.SR", "W.US"}
+    assert "ex-dividend in 5 day(s): 30% withholding costs 0.06%" in picks["Y.US"]["labels"]
+    assert not [x for x in picks["Z.SR"]["labels"] + picks["W.US"]["labels"] if x.startswith("ex-dividend")]
+    assert "X.US" in [c["symbol"] for c in run(K(picks=5, div_tax=False))["picks"]]           # the switch
+    assert "X.US" in [c["symbol"] for c in run(K(picks=5, div_tax_min=0.7))["picks"]]         # the threshold
+    assert "X.US" in [c["symbol"] for c in run(K(picks=5, div_tax_days=5))["picks"]]         # the window
+    assert "X.US" in [c["symbol"] for c in run(K(picks=5, wht=0.0))["picks"]]                 # no withholding
+    assert dp.withholding_pct("ABC.US", "", 30) == 30 and dp.withholding_pct("2222.SR", "SAR", 30) == 0
+    assert dp.withholding_pct("2222.SR", "USD", 30) == 0                     # a Tadawul listing, whatever the currency
+    assert dp.withholding_pct("BBOX.L", "GBX", 30) == 0 and dp.withholding_pct("ABC", "USD", 15) == 15
+    assert dp.dividend_tax("X.US", "USD", 50, {"exdiv_days": 6, "div_amount": None}, 10, 30) is None
+    assert dp.dividend_tax("X.US", "USD", 0, {"exdiv_days": 6, "div_amount": 1}, 10, 30) is None
+    assert dp.dividend_tax("X.US", "USD", 50, {"exdiv_days": -1, "div_amount": 1}, 10, 30) is None
+    assert dp.dividend_tax("X.US", "USD", 50, {"exdiv_days": 10, "div_amount": 1}, 10, 30)["cost_pct"] == pytest.approx(0.6)
+    monkeypatch.setenv("TFB_PLAN_DIV_TAX", "off")
+    assert dp.knobs()["div_tax"] is False
+    monkeypatch.delenv("TFB_PLAN_DIV_TAX", raising=False)
+    k = dp.knobs()
+    assert k["div_tax"] is True and k["div_tax_days"] == 10 and k["div_tax_min"] == 0.25 and k["wht"] == 30.0
+
+
+def test_h4_workflow_maps_the_dividend_knobs():
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"][list(wf["jobs"])[0]]["steps"] if "TFB_PLAN_DIV_TAX" in (s.get("env") or {})][0]["env"]
+    assert env["TFB_PLAN_DIV_TAX"] == "${{ vars.TFB_PLAN_DIV_TAX || 'on' }}"
+    assert env["TFB_PLAN_WHT_PCT"] == "${{ vars.TFB_PLAN_WHT_PCT || '30' }}"
+    assert env["TFB_PLAN_DIV_TAX_DAYS"] == "${{ vars.TFB_PLAN_DIV_TAX_DAYS || '10' }}"
+    assert env["TFB_PLAN_DIV_TAX_MIN_PCT"] == "${{ vars.TFB_PLAN_DIV_TAX_MIN_PCT || '0.25' }}"

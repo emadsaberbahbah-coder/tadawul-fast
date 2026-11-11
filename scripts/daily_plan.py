@@ -91,6 +91,18 @@ No plan is cut before TFB_PLAN_CUT_FROM_H o'clock Riyadh (7): an after-sync
 run that lands after midnight, or a manual run at night, waits for the morning
 sync instead of cutting the new day's plan from a midnight render.
 
+1.4.0 (2026-11-11): DIVIDEND TAX (owner, 17:01 Riyadh, on buying after the
+ex-dividend drop: "need to consider that as well"). A Saudi resident keeps 70%
+of a US dividend (30% withholding) while the price falls by the full amount
+on the ex-date, so buying in the days before it costs 30% of that dividend
+(SUPN, 2 Nov: 95 x 8.13 = 772 USD, about 232 withheld). With TFB_PLAN_DIV_TAX
+= on (default), a US-listed name (.US / USD) whose ex-dividend falls within
+TFB_PLAN_DIV_TAX_DAYS days (10) waits in the pipeline when the withholding
+cost (TFB_PLAN_WHT_PCT, 30, of the dividend over the price) reaches
+TFB_PLAN_DIV_TAX_MIN_PCT % of the price (0.25); it can be picked after the
+ex-date. A smaller cost is a label on the pick. Tadawul names carry no US
+withholding. The 3-day ex-dividend gate above is unchanged.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -104,7 +116,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -177,6 +189,10 @@ def knobs() -> Dict[str, Any]:
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
+        "div_tax": _env("TFB_PLAN_DIV_TAX", "on").lower() in ("on", "1", "true", "yes"),
+        "div_tax_days": int(_env_num("TFB_PLAN_DIV_TAX_DAYS", 10, 0, 60)),
+        "div_tax_min": _env_num("TFB_PLAN_DIV_TAX_MIN_PCT", 0.25, 0.0, 100.0),
+        "wht": _env_num("TFB_PLAN_WHT_PCT", 30.0, 0.0, 100.0),
         "ev_mode": ev_mode(),
         "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
@@ -445,6 +461,25 @@ def engine_deferral(why: str, held_max_h: float) -> Tuple[str, str]:
     return w[:120], ""
 
 
+def withholding_pct(symbol: str, ccy: str, wht: float) -> float:
+    """1.4.0: the dividend withholding a Saudi-resident holder pays - the US rate for a US listing, none for Tadawul."""
+    s, c = text(symbol).upper(), text(ccy).upper()
+    if s.endswith(".SR") or c == "SAR":
+        return 0.0
+    return wht if (s.endswith(".US") or c == "USD") else 0.0
+
+
+def dividend_tax(symbol: str, ccy: str, price: Any, ev: Dict[str, Any], days: int, wht: float) -> Optional[Dict[str, float]]:
+    """1.4.0 [DIV-TAX]: the next ex-dividend within `days` days and what buying before it costs in withholding, as a
+    percent of the price. None when there is no known dividend in the window."""
+    xd, amt, px = ev.get("exdiv_days"), ev.get("div_amount"), num(price)
+    if xd is None or amt is None or amt <= 0 or not px or px <= 0 or xd < 0 or xd > days:
+        return None
+    w = withholding_pct(symbol, ccy, wht)
+    return {"days": float(xd), "amount": float(amt), "yield_pct": amt / px * 100.0, "wht_pct": w,
+            "cost_pct": amt / px * w}
+
+
 # ----------------------------------------------------------------------------- #
 # The decision (pure)
 # ----------------------------------------------------------------------------- #
@@ -465,6 +500,7 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         if label:
             c["labels"].append(label)
         ed, xd, amt = ev.get("earn_days"), ev.get("exdiv_days"), ev.get("div_amount")
+        dt = dividend_tax(q["symbol"], c["ccy"], c["price"], ev, k["div_tax_days"], k["wht"]) if k.get("div_tax") else None
         if q["symbol"] in lots.get("held", {}):
             reason = "already held"
         elif q["symbol"] in lots.get("recent", {}):
@@ -478,6 +514,13 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         elif (xd is not None and amt is not None and 0 <= xd <= k["exdiv_days"]
               and amt / c["price"] * 100.0 >= k["exdiv_pct"]):
             reason = "ex-dividend %.1f%% in %d day(s)" % (amt / c["price"] * 100.0, xd)
+        elif dt and dt["wht_pct"] > 0 and dt["cost_pct"] >= k["div_tax_min"]:
+            reason = ("ex-dividend in %d day(s): %s a share (%.1f%%); bought before it, %g%% is withheld = %.2f%% of the "
+                      "price - buy after the ex-date" % (dt["days"], fmt(dt["amount"]), dt["yield_pct"], dt["wht_pct"],
+                                                          dt["cost_pct"]))
+        if dt and not reason and dt["wht_pct"] > 0:
+            c["labels"].append("ex-dividend in %d day(s): %g%% withholding costs %.2f%%" % (dt["days"], dt["wht_pct"],
+                                                                                         dt["cost_pct"]))
         if ed is None:
             c["labels"].append("earnings date not on the calendar")
         if k.get("ev_mode", "off") != "off":
