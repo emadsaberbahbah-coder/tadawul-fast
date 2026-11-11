@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""tests/test_daily_plan.py - scripts/daily_plan.py 1.0.0: one plan a day, frozen.
+"""tests/test_daily_plan.py - scripts/daily_plan.py 1.2.0: one plan a day, frozen.
+
+  H1-H2 (1.2.0) hourly status on live prices: the live price decides OPEN / WAIT / INVALIDATED and is named;
+      a pick without a live price keeps the page price; the cut and the frozen levels never use it
+  E1-E6 (1.1.0) the evidence rule: off adds nothing; observe labels every
+      qualified name and changes no pick; on keeps a name that is not PASS in
+      the pipeline; the two thresholds at their edge; Tadawul and a missing
+      number read n/a; the two columns are read from the source page
 
   D1  parsers: numbers, the main page's status line (finished / today /
       verified), the control panel, the ALL QUALIFIED table, the engine's
@@ -171,6 +178,107 @@ def plan(qual=QUAL, cash=33125.0, k=None, prior=(), src=SRC, cal=CAL, mps=2):
                      cash, mps, k or K(), prior_picks=prior)
 
 
+# ----------------------------------------------------------------------------- E (1.1.0)
+SRC_EV = [["Symbol", "Name", "Currency", "Sector", "Current Price", "Warnings", "Risk Score", "Target Price"],
+          ["ITRN.US", "Ituran", "USD", "Technology", "51.82", "", "29.36", "74.5"],        # PASS (cool-down none here)
+          ["TEN.US", "Tsakos", "USD", "Energy", "25.00", "", "41.09", "35.0"],             # FAIL: risk
+          ["ZTO.US", "ZTO", "USD", "Industrials", "20.66", "", "29.8", "22.00"],           # FAIL: upside +6%
+          ["NMM.US", "Navios", "USD", "Industrials", "60.00", "", "29.4", "77.0"],         # PASS
+          ["SBLK.US", "Star Bulk", "USD", "Industrials", "27.07", "", "", "34.44"],        # n/a: no risk score
+          ["LADR.US", "Ladder", "USD", "Real Estate", "11.00", "", "25.0", ""],            # n/a: no target
+          ["BBOX.L", "Tritax", "GBX", "Real Estate", "147.70", "", "35.0", "190"],            # FAIL, and not fundable
+          ["AX.US", "Axos", "USD", "Financials", "80.00", "", "26.36", "101.5"]]           # PASS
+CAL_EV = [["Symbol", "Next Earnings Date", "Days To Earnings", "Next Ex-Div Date", "Days To ExDiv"]] + [
+    [sym, "2027-01-20", 71, "", ""] for sym in ("ITRN.US", "TEN.US", "ZTO.US", "NMM.US", "SBLK.US", "LADR.US", "AX.US")]
+
+
+def _ev(p):
+    return {c["symbol"]: [x for x in c["labels"] if x.startswith("evidence rule")] for c in p["picks"] + p["pipeline"]}
+
+
+def test_e1_off_adds_no_label_and_reads_as_before():
+    assert dp.ev_mode() == "off" and K()["ev_mode"] == "off"
+    p = plan(src=SRC_EV, cal=CAL_EV)
+    assert all(v == [] for v in _ev(p).values())
+    assert all("ev" not in c for c in p["picks"] + p["pipeline"])
+
+
+def test_e2_observe_labels_every_name_and_changes_no_pick(monkeypatch):
+    off = plan(src=SRC_EV, cal=CAL_EV)
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "observe")
+    obs = plan(src=SRC_EV, cal=CAL_EV)
+    assert [c["symbol"] for c in obs["picks"]] == [c["symbol"] for c in off["picks"]] == ["ITRN.US", "TEN.US", "ZTO.US"]
+    for key in ("qty", "entry", "stop", "tp1", "tp2", "alloc_sar"):
+        assert [c[key] for c in obs["picks"]] == [c[key] for c in off["picks"]], key
+    ev = _ev(obs)
+    assert ev["ITRN.US"] == ["evidence rule PASS (risk 29.4, analyst upside +44%)"]
+    assert ev["TEN.US"] == ["evidence rule FAIL (risk 41.1, analyst upside +40%; needs risk under 30)"]
+    assert ev["ZTO.US"] == ["evidence rule FAIL (risk 29.8, analyst upside +6%; needs upside +15% or more)"]
+    assert ev["SBLK.US"] == ["evidence rule n/a (no risk score)"] and ev["LADR.US"] == ["evidence rule n/a (no analyst target)"]
+    assert len(ev) == len(QUAL) and all(len(v) == 1 for v in ev.values())      # blocked names are labelled too
+    assert {c["symbol"]: c["ev"] for c in obs["picks"]} == {"ITRN.US": "PASS", "TEN.US": "FAIL", "ZTO.US": "FAIL"}
+
+
+def test_e3_on_picks_only_names_that_pass(monkeypatch):
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "on")
+    p = plan(src=SRC_EV, cal=CAL_EV)
+    assert [c["symbol"] for c in p["picks"]] == ["ITRN.US", "NMM.US", "AX.US"]
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    for sym in ("TEN.US", "ZTO.US", "SBLK.US", "LADR.US"):
+        assert wait[sym] == "evidence rule not met", sym
+    assert wait["BBOX.L"].startswith("currency GBX")                           # an earlier gate keeps its own reason
+    assert all(c["qty"] > 0 and c["stop"] < c["entry"] for c in p["picks"])
+
+
+def test_e4_thresholds_at_the_edge(monkeypatch):
+    rule = dp.evidence_rule
+    assert rule("A.US", {"price": 100.0, "risk": 29.99, "target": 115.0}, 30, 15)[0] == "PASS"
+    assert rule("A.US", {"price": 100.0, "risk": 30.0, "target": 115.0}, 30, 15)[0] == "FAIL"     # under, not up to
+    assert rule("A.US", {"price": 100.0, "risk": 29.99, "target": 114.99}, 30, 15)[0] == "FAIL"
+    both = rule("A.US", {"price": 100.0, "risk": 45.0, "target": 105.0}, 30, 15)
+    assert both == ("FAIL", "evidence rule FAIL (risk 45.0, analyst upside +5%; needs risk under 30 and upside +15% or more)")
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "on")
+    monkeypatch.setenv("TFB_PLAN_EV_RISK_MAX", "45")
+    monkeypatch.setenv("TFB_PLAN_EV_UPSIDE_MIN", "5")
+    assert (K()["ev_risk_max"], K()["ev_upside_min"]) == (45, 5)
+    assert [c["symbol"] for c in plan(src=SRC_EV, cal=CAL_EV)["picks"]] == ["ITRN.US", "TEN.US", "ZTO.US"]
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "ON ")                              # trimmed, any case
+    assert dp.ev_mode() == "on"
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "enforce")                          # unknown value = off
+    assert dp.ev_mode() == "off"
+
+
+def test_e5_tadawul_and_missing_numbers_read_na():
+    rule = dp.evidence_rule
+    assert rule("2222.SR", {"price": 25.0, "risk": 10.0, "target": 40.0}, 30, 15) == (
+        "NA", "evidence rule n/a (not measured for Tadawul)")
+    assert rule("A.US", {"price": 25.0, "risk": None, "target": 40.0}, 30, 15)[1] == "evidence rule n/a (no risk score)"
+    for bad in ({"price": 25.0, "risk": 10.0, "target": None}, {"price": 25.0, "risk": 10.0, "target": 0.0},
+                {"price": None, "risk": 10.0, "target": 40.0}, {"price": 0.0, "risk": 10.0, "target": 40.0}, {}):
+        assert rule("A.US", bad, 30, 15)[0] == "NA", bad
+
+
+def test_e6_the_two_columns_are_read_and_the_run_writes_the_label(monkeypatch):
+    wide = [["Symbol", "Name", "Currency", "Sector", "Current Price", "Warnings", "Other", "Risk Score", "Target Price"]] + [
+        r[:6] + ["x"] + r[6:] for r in SRC_EV[1:]]
+    grid = dp.read_source_page(Book({"Global_Markets": Sheet(wide)}), "Global_Markets")
+    assert grid[0] == ["Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price"]
+    got = dp.read_sources([grid])
+    assert (got["NMM.US"]["risk"], got["NMM.US"]["target"]) == (29.4, 77.0)
+    assert got["SBLK.US"]["risk"] is None and got["LADR.US"]["target"] is None
+    assert dp.read_sources([SRC])["NMM.US"]["risk"] is None                    # a page without the columns still reads
+    monkeypatch.setenv("TFB_PLAN_EVIDENCE", "observe")
+    b = book(Global_Markets=Sheet(SRC_EV), Calendar_Events=Sheet(CAL_EV))
+    assert dp.main([], book=b, now=NOW) == 0
+    led = b.tabs["_Daily_Plan"].values
+    lab = dp.LEDGER_HEADERS.index("Labels")
+    by = {r[6]: r[lab] for r in led[1:]}
+    assert "evidence rule PASS (risk 29.4, analyst upside +44%)" in by["ITRN.US"]
+    assert "evidence rule FAIL" in by["TEN.US"] and "evidence rule n/a" in by["SBLK.US"]
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Daily_Plan"].values)
+    assert "evidence rule PASS (risk 29.4, analyst upside +44%)" in page
+
+
 # ----------------------------------------------------------------------------- D1
 def test_d1_parsers():
     assert dp.num("33,125 SAR") == 33125.0 and dp.num("31.2%") == 31.2 and dp.num("▲ 5.62%") == 5.62
@@ -257,6 +365,32 @@ def test_d3_execution_gates():
     assert [c["symbol"] for c in p["picks"]] == ["A.US", "B.US"]          # 0.5% dividend does not block A
     assert wait["C.US"] == "sector cap (Energy already has 2)"
     assert all("earnings date not on the calendar" in c["labels"] for c in p["picks"])
+
+
+def test_d3b_event_days_count_from_the_date_not_the_stored_count():
+    """1.0.1: 10 Nov plan; Calendar_Events synced 9 Nov read ZTO.US '2026-11-17 | 8' - 7 days away by date."""
+    stale = [list(r) for r in CAL]
+    for r in stale[1:]:
+        r[2] = r[2] + 1                                   # every stored count is one day old
+    cal = dp.read_calendar(stale, [], dt.date(2026, 11, 10))
+    assert cal["ZTO.US"]["earn_days"] == 7.0 and cal["SBLK.US"]["earn_days"] == 2.0
+    assert dp.read_calendar(stale, [])["ZTO.US"]["earn_days"] == 8.0          # no date context: stored count
+    no_date = [list(r) for r in stale]
+    no_date[3][1] = ""                                    # ZTO row without a date
+    assert dp.read_calendar(no_date, [], dt.date(2026, 11, 10))["ZTO.US"]["earn_days"] == 8.0
+    div = [["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"], ["DIV.US", "2026-11-12", 3, 8.13, "USD"]]
+    assert dp.read_calendar([], div, dt.date(2026, 11, 10))["DIV.US"]["exdiv_days"] == 2.0
+    b = book(**{"Calendar_Events": Sheet(stale)})
+    assert dp.main([], book=b, now=NOW) == 0
+    led = b.tabs["_Daily_Plan"].values[1:]
+    assert "ZTO.US" not in [r[6] for r in led if r[4] == "PICK"]
+    assert [r[23] for r in led if r[6] == "ZTO.US"] == ["earnings in 7 day(s)"]
+
+
+def test_d3c_a_pick_without_a_12_month_roi_is_labelled():
+    q = [qrow(1, "ITRN.US", "Technology", "\u2014", "")]
+    p = plan(qual=q)
+    assert p["picks"][0]["tp1"] is None and "no 12-month target" in p["picks"][0]["labels"]
 
 
 # ----------------------------------------------------------------------------- D4
@@ -439,6 +573,9 @@ def test_d10_workflow_manifest_ci():
     assert "github.event.workflow_run.event == 'schedule'" in job["if"] and "'workflow_dispatch'" in job["if"]
     step = [s for s in job["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_DAILY_PLAN"] == "${{ vars.TFB_DAILY_PLAN || 'on' }}"
+    assert step["env"]["TFB_PLAN_EVIDENCE"] == "${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}"   # 1.1.0: a label, not a gate
+    assert step["env"]["TFB_PLAN_LIVE_PRICE"] == "${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}"    # 1.2.0
+    assert on["schedule"] == [{"cron": "20 * * * *"}]                                         # 1.2.0: hourly
     assert "--wait-min 45" in step["run"] and "--dry-run" in step["run"]
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_PLAN_[A-Z_]+): \$\{\{", (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")):
@@ -447,3 +584,50 @@ def test_d10_workflow_manifest_ci():
     assert '("daily_plan", "%s", "daily plan")' % dp.__version__ in manifest
     assert "tests/test_daily_plan.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert not re.search(r"create_order|place_order|requests\.post|urlopen", src)
+
+
+# ----------------------------------------------------------------------------- H (1.2.0)
+def test_h1_hourly_status_uses_the_live_price(monkeypatch):
+    import scripts.exit_plan as ep
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0                                       # the cut, live price off
+    before = frozen(b)
+    calls = []
+    at = dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC)                              # 15:00 Riyadh
+    quotes = {"ITRN.US": 55.00, "TEN.US": 22.00}                                   # NMM.US: no live price
+
+    def fake(sym):
+        calls.append(sym)
+        return (quotes[sym], at) if sym in quotes else None
+    monkeypatch.setattr(ep, "live_quote", fake)
+    monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "on")
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=1)) == 0
+    assert frozen(b) == before                                                     # levels never move
+    rows = {r[6]: r for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"}
+    st = {s: (r[24], r[25], r[26]) for s, r in rows.items()}
+    assert st["ITRN.US"][0] == "WAIT" and st["ITRN.US"][1].endswith("(live 15:00 Riyadh)") and st["ITRN.US"][2] == 55.0
+    assert st["TEN.US"][0] == "INVALIDATED" and "(live 15:00 Riyadh)" in st["TEN.US"][1]
+    assert st["NMM.US"][0] == "OPEN" and "live" not in st["NMM.US"][1] and st["NMM.US"][2] == 60.0   # page price
+    assert sorted(calls) == ["ITRN.US", "NMM.US", "TEN.US"]
+    calls.clear()
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=2)) == 0
+    assert "TEN.US" not in calls                                                   # terminal: no quote asked
+
+
+def test_h2_live_overlay_edges(monkeypatch):
+    rows = [{"Kind": "PICK", "Symbol": "a.us", "Status": "OPEN"}, {"Kind": "PIPELINE", "Symbol": "B.US", "Status": ""},
+            {"Kind": "PICK", "Symbol": "C.US", "Status": "EXECUTED"}, {"Kind": "PICK", "Symbol": "D.US", "Status": "CHECK"},
+            {"Kind": "PICK", "Symbol": "E.US", "Status": "WAIT"}]
+    src = {"A.US": {"price": 1.0, "ccy": "USD"}}
+    at = dt.datetime(2026, 11, 10, 20, 5, tzinfo=UTC)
+
+    def q(sym):
+        if sym == "D.US":
+            raise OSError("network")
+        return {"A.US": (2.5, at), "E.US": (0.0, at)}.get(sym)
+    got = dp.live_overlay(rows, src, q)
+    assert got == {"A.US": "23:05"} and src["A.US"] == {"price": 2.5, "ccy": "USD"} and "E.US" not in src
+    monkeypatch.delenv("TFB_PLAN_LIVE_PRICE", raising=False)
+    assert dp.knobs()["live"] is False
+    monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "ON")
+    assert dp.knobs()["live"] is True
