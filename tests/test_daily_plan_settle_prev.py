@@ -12,7 +12,7 @@ Stability line counts against every pick of that plan (', N executed').
 Runs as a script ("PASS k/k") and under pytest. Zero network: run_once reads
 and writes an in-memory fake workbook. Controls: TFB_TEST_SETTLE_TARGET (the
 daily_plan.py under test; the untouched main copy there is the golden
-negative), TFB_TEST_PLAN_BASE (a path to the main 58910afa copy instead of
+negative), TFB_TEST_PLAN_BASE (a path to the main 53f2abdc copy instead of
 `git show`), TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs
 instead of skipping them; set in CI).
 
@@ -22,7 +22,7 @@ instead of skipping them; set in CI).
       2026-11-11)', the page '2 kept, 1 new, 0 dropped, 1 executed', one
       SETTLE-PREV log line; today's picks and levels equal the off run
   S2  OFF IDENTITY: every scenario below, gate unset / off / junk, against the
-      untouched main module (1.2.0): ledger, page, return codes and every log line
+      untouched main module (1.3.0): ledger, page, return codes and every log line
   S3  an unbought previous pick keeps its status, reason, stamp and last
       price even through its stop (no past-day INVALIDATED); a lot bought
       before the plan date is not settled; a sold lot is not settled
@@ -36,7 +36,8 @@ instead of skipping them; set in CI).
       next day the carried pick settles too (its run of PICK days starts on
       the buy date) and the page reads 0 dropped, 1 executed
   S8  bought today, not picked today: settled 'bought <today>'
-  S9  a run after Riyadh midnight cuts the next day and settles
+  S9  a run after Riyadh midnight settles (main cuts no plan before 07:00
+      since 1.3.0); the 07:30 run cuts and counts the settled pick as executed
   S10 observe and --dry-run settle in memory, print the line, write nothing
   S11 the counts: kept + dropped + executed = the previous plan's picks and
       kept + new = today's picks, in every on scenario
@@ -75,7 +76,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BASE_SHA = "58910afacd1c0c5476b609bab37759d632301ec8"     # main: daily_plan 1.2.0 (#955, #959)
+BASE_SHA = "53f2abdc5be5c13294f4009b3b1bc3d1964907d5"     # main: daily_plan 1.3.0 (#955, #959, #960)
 GATE = "TFB_PLAN_SETTLE_PREV"
 DELIVERED = os.getenv("TFB_TEST_SETTLE_TARGET", "").strip() or str(ROOT / "scripts" / "daily_plan.py")
 UTC = dt.timezone.utc
@@ -94,7 +95,7 @@ _BASE = {}
 
 
 def base():
-    """The untouched main copy (58910afa, daily_plan 1.2.0), or skip (or fail when TFB_TEST_REQUIRE_BASE=1)."""
+    """The untouched main copy (53f2abdc, daily_plan 1.3.0), or skip (or fail when TFB_TEST_REQUIRE_BASE=1)."""
     if "mod" not in _BASE:
         path = os.getenv("TFB_TEST_PLAN_BASE", "").strip()
         if not path:
@@ -104,7 +105,7 @@ def base():
             except Exception:
                 text = ""
             if text:
-                tmp = Path(tempfile.mkdtemp()) / "daily_plan_v120_main.py"
+                tmp = Path(tempfile.mkdtemp()) / "daily_plan_v130_main.py"
                 tmp.write_text(text, encoding="utf-8")
                 path = str(tmp)
         _BASE["mod"] = _load("dp_settle_prev_base", path) if path else None
@@ -318,9 +319,10 @@ SCENARIOS = {
     "s8_bought_today_not_picked": DAY1 + [
         ("2026-11-11", "08:40", [_board("2026-11-11", Q2_NMM9)], (), "on"),
         ("2026-11-11", "12:40", [_lots(lot("NMM.US", "2026-11-11"))], (), "on")],
-    # S9: the sync-triggered run after Riyadh midnight cuts 11 Nov from a fresh render
+    # S9: a sync-triggered run after Riyadh midnight (no cut before 07:00 since 1.3.0), then the 07:30 run
     "s9_after_midnight": DAY1 + [
-        ("2026-11-11", "00:30", [_lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11", hhmm="00:20")], (), "on")],
+        ("2026-11-11", "00:30", [_lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11", hhmm="00:20")], (), "on"),
+        ("2026-11-11", "07:30", [], (), "on")],
     # S10: the next-day run in observe mode, then as a dry run
     "s10_observe_and_dry_run": DAY1 + [
         ("2026-11-11", "08:40", [_lots(lot("NMM.US", "2026-11-10")), _board("2026-11-11")], (), "observe"),
@@ -541,12 +543,15 @@ def test_s8_bought_today_not_picked_today_is_settled():
 def test_s9_after_midnight():
     on = play(dp, "s9_after_midnight", "on")
     rc, log, led, page = on[3]
-    assert rc == 0 and "CUT 2026-11-11" in log
+    assert rc == 0 and "CUT 2026-11-11" not in log and rows(led, "2026-11-11") == []
     prev = by_sym(led, "2026-11-10")["NMM.US"]
     assert (prev["Status"], prev["Status At (Riyadh)"]) == ("EXECUTED", "2026-11-11 00:30")
+    assert "SETTLE-PREV previous plan 2026-11-10: settled NMM.US (bought 2026-11-10)" in log
+    rc, log, led, page = on[4]
+    assert rc == 0 and "CUT 2026-11-11" in log and "settled none" in log
     assert counts(page) == (2, 1, 0, 1)
     off = play(dp, "s9_after_midnight", None)
-    assert by_sym(off[3][2], "2026-11-10")["NMM.US"]["Status"] == "OPEN" and counts(off[3][3]) == (2, 1, 1)
+    assert by_sym(off[4][2], "2026-11-10")["NMM.US"]["Status"] == "OPEN" and counts(off[4][3]) == (2, 1, 1)
 
 
 # ----------------------------------------------------------------------------- S10
@@ -585,9 +590,8 @@ def test_s11_counts_add_up():
                     if any(r1[h] != r0[h] for h in status):
                         assert key[0] == "PICK" and r1["Plan Date"] == prev_day and r1["Status"] == "EXECUTED"
                         assert "(settled " in r1["Status Reason"], (name, i, key)
-            last = max(r[0] for r in led[1:])
             assert k + d + e == len(rows(led, prev_day)), (name, i)
-            assert k + n == len(rows(led, last)), (name, i)
+            assert k + n == len([r for r in rows(led, None) if r["Plan Date"] > prev_day]), (name, i)
             seen += 1
     assert seen >= 9
 

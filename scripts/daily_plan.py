@@ -3,25 +3,25 @@
 scripts/daily_plan.py - TFB Daily Plan
 ======================================
 VERSION 1.4.0 (2026-11-10; re-numbered 2026-11-11) - SETTLE-PREV
-(First 1.0.2 on 1.0.1. Re-based on main's 1.2.0 when main took 1.1.0 and
-1.2.0; open #960 claims 1.3.0.)
+(First 1.0.2 on 1.0.1. Re-based on main's 1.3.0 after main took 1.1.0,
+1.2.0 and 1.3.0 on 10-11 Nov.)
 
 WHY: run_once re-statuses only today's rows; older rows are written back as
 they are. A pick is marked EXECUTED only by a run on its own plan day that
 already sees the lot, so a pick whose lot reaches _Portfolio_CostBasis after
-the plan day's last run stays OPEN for good, and the next day's Stability
-line counts the bought name as 'dropped'. That is a pick bought late in the
-US session (17:30-24:00 Riyadh since 1 Nov), or one whose lot is entered the
-next morning. At 1.0.1 the three scheduled refreshes (cron 40 5,9,13 UTC =
-08:40 / 12:40 / 16:40 Riyadh) all ran before the US open, so every US pick
-was exposed. Since daily_plan.yml 1.1.0 (11 Nov) the plan is refreshed every
-hour at minute 20, so the last plan-day run is 23:20 Riyadh and the exposure
-is a lot entered after it. The first plan (10 Nov, cut 15:24 Riyadh, run
-42815393625) holds three US picks: TEN.US, ZTO.US and NMM.US. Offline replay
-(tests/test_daily_plan_settle_prev.py S1): NMM.US bought on 10 Nov, its lot
-seen first by the 11 Nov 08:40 run -> its 10 Nov row still reads OPEN 'price
-60.00 is inside the entry zone' and the page reads '2 kept, 1 new, 1
-dropped'; the dropped name is the one the owner bought.
+the plan day's last run stays OPEN for good, and the next day's Stability line
+counts the bought name as 'dropped'. That is a pick bought late in the US
+session (17:30-24:00 Riyadh since 1 Nov), or one whose lot is entered the next
+morning. At 1.0.1 the three scheduled refreshes (cron 40 5,9,13 UTC = 08:40 /
+12:40 / 16:40 Riyadh) all ran before the US open, so every US pick was
+exposed. Since daily_plan.yml 1.1.0 (11 Nov) the plan is refreshed every hour
+at minute 20 (07:20-23:20 Riyadh since 1.2.0), so the last plan-day run is
+23:20 Riyadh and the exposure is a lot entered after it. The first plan (10
+Nov, cut 15:24 Riyadh, run 42815393625) holds three US picks: TEN.US, ZTO.US
+and NMM.US. Offline replay (tests/test_daily_plan_settle_prev.py S1): NMM.US
+bought on 10 Nov, its lot seen first by the 11 Nov 08:40 run -> its 10 Nov row
+still reads OPEN 'price 60.00 is inside the entry zone' and the page reads '2
+kept, 1 new, 1 dropped'; the dropped name is the one the owner bought.
 
 WHAT (TFB_PLAN_SETTLE_PREV=on), in run_once before the previous-plan list is
 built: each PICK row of the newest previous plan date P whose Status is not
@@ -42,7 +42,7 @@ SITES: settle_prev_on, settle_prev and stability_counts (new); run_once (the
 settle before prev_picks; the counts into info); page_rows (uses the counts
 only when info carries them).
 GATE: TFB_PLAN_SETTLE_PREV = off (default; byte-identical to the version
-without it, 1.2.0: ledger, page and log) | on (also 1 / true / yes).
+without it, 1.3.0: ledger, page and log) | on (also 1 / true / yes).
 daily_plan.yml maps it, default 'off'. Rollback: unset the repository
 variable or set it to off.
 
@@ -127,6 +127,13 @@ Yahoo chart (TFB_PLAN_LIVE_PRICE = on) instead of the source pages' price,
 which moves only when a sync lands (three times a day); the reason carries
 '(live HH:MM Riyadh)'. A name with no live price keeps the page price. The cut
 itself still uses the source pages, as before.
+
+1.3.0 (2026-11-11): ACTIVE HOURS AND THE EARLIEST CUT (owner, 14:16 Riyadh:
+one schedule for the outcome pages, every hour while a market is open). The
+workflow runs at minute 20 from 07:20 to 23:20 Riyadh, plus after every sync.
+No plan is cut before TFB_PLAN_CUT_FROM_H o'clock Riyadh (7): an after-sync
+run that lands after midnight, or a manual run at night, waits for the morning
+sync instead of cutting the new day's plan from a midnight render.
 
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
@@ -218,6 +225,7 @@ def knobs() -> Dict[str, Any]:
         "keep_rank": int(_env_num("TFB_PLAN_KEEP_RANK", 8, 0, 50)),
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
+        "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "ev_mode": ev_mode(),
         "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
@@ -918,7 +926,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
     else:
         hour = now.astimezone(RIYADH).hour + now.astimezone(RIYADH).minute / 60.0
         quality = "VERIFIED" if state["verified"] else "UNVERIFIED"
-        if not (state["finished"] and state["today"]):
+        if hour < k["cut_h"]:                                   # 1.3.0: wait for the morning sync
+            info["no_picks"] = ("No plan yet today: the plan is cut from %02d:00 Riyadh, after the morning sync."
+                                % int(k["cut_h"]))
+        elif not (state["finished"] and state["today"]):
             info["no_picks"] = "No plan yet today: %s." % state["reason"]
         elif quality != "VERIFIED" and hour < k["unverified_h"]:
             info["no_picks"] = ("No plan yet today: the main page's source pages are not verified (%s); an "

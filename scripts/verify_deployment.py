@@ -361,7 +361,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-10 (pin only): [SETTLE-PREV] (the previous plan's picks bought
     # since that plan read EXECUTED; vars.TFB_PLAN_SETTLE_PREV, default off;
     # workflow-scoped, never on Render). First 1.0.1 -> 1.0.2; re-numbered
-    # 2026-11-11 to 1.2.0 -> 1.4.0 on top of main's 1.2.0 (open #960 claims 1.3.0).
+    # 2026-11-11 to 1.3.0 -> 1.4.0 on top of main's 1.3.0 (#960).
     ("daily_plan", "1.4.0", "daily plan"),
     ("exit_plan", "1.1.0", "exit plan"),
     ("consistency_check", "1.1.0", "consistency check"),

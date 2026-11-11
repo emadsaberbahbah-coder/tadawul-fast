@@ -12,7 +12,7 @@
 # 1.4.0 [SETTLE-PREV], TFB_PLAN_SETTLE_PREV default off: the previous plan's
 # open picks bought since that plan read EXECUTED, and the Stability line
 # stops counting a bought pick as dropped) in the blocking lean lane; the
-# off-identity legs read daily_plan 1.2.0 at main 58910afa, fetched by SHA
+# off-identity legs read daily_plan 1.3.0 at main 53f2abdc, fetched by SHA
 # (re-based 2026-11-11 from 1.0.2 on 1.0.1 at 50f55740).
 #
 # VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
@@ -1324,11 +1324,11 @@ jobs:
         env:
           TFB_TEST_REQUIRE_BASE: "1"
         run: |
-          # v1.1.85: the off-identity legs read daily_plan 1.2.0 at main
-          # 58910afa; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them
+          # v1.1.85: the off-identity legs read daily_plan 1.3.0 at main
+          # 53f2abdc; with TFB_TEST_REQUIRE_BASE=1 a failed fetch FAILS them
           # instead of skipping them.
-          git fetch --no-tags --depth=1 origin 58910afacd1c0c5476b609bab37759d632301ec8 \
-            || echo "::warning::58910afa base not fetched - the golden legs will FAIL"
+          git fetch --no-tags --depth=1 origin 53f2abdc5be5c13294f4009b3b1bc3d1964907d5 \
+            || echo "::warning::53f2abdc base not fetched - the golden legs will FAIL"
           python -m pytest -q tests/test_daily_plan_settle_prev.py
 
       - name: 📋 Board scorecard harness (golden bases fetched by SHA)

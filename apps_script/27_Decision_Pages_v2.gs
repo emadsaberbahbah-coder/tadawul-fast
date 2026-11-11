@@ -1,7 +1,22 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.2.36 (2026-11-09)
+ * Version: 1.3.0 (2026-11-11)
+ *   1.3.0: THE V2 PAGES ON A DAILY SCHEDULE, ONE PAGE PER EXECUTION (owner, Wed 11 Nov 2026 14:15 Riyadh: both v2 pages
+ *          10 times a day or more). Until 10 Nov the hourly buildDecisionPagesV2 built both pages in one execution: 15
+ *          of its runs stopped at the 6-minute limit (7-10 Nov), a run stopped while drawing left its page blank, and it
+ *          ran beside the cockpit render. [REFRESH-SLOTS]: dp2InstallSlotTrigger (menu 'Install v2 refresh slots')
+ *          installs ONE time trigger, dp2SlotTick every 10 minutes, and removes the hourly one. In each slot hour (Script
+ *          Property DP2_REFRESH_HOURS, Riyadh hours; default 7,9,11,13,15,17,19,21,23,0 = 10 a day; 'off' = none) each
+ *          page is built once, ONE page per execution, the page built longest ago first: after the main page's render of
+ *          that hour has finished (its status line 'Last run <that hour> | status: ok'), or from minute 40 when there is
+ *          none; never while a Top_10 / Portfolio_Decision render runs (the 1.2.34 marker or claim) or another slot build
+ *          is under 7 minutes old (DP2_SLOT_CLAIM); at most 2 tries per page and slot (DP2_SLOT_DONE). A slot build that
+ *          reaches its drawing step after DP2_SLOT_DRAW_START_MAX_S seconds (150; 30-330) clears nothing: the previous
+ *          page stays and the next tick tries again. dp2SlotStatus reports the schedule; dp2InstallTrigger removes the
+ *          slot trigger. Without the slot trigger nothing changes: every page, cell, call and return value of 1.2.36
+ *          (dp2SelfTest adds one line while the slot trigger is installed). Rollback: menu 'Remove v2 refresh slots', or
+ *          Project History -> 1.2.36.
  *   1.2.36: THE EVIDENCE TILE SHOWS WHAT THE RULE CHANGE DID (owner, Mon 9 Nov 2026 11:44 Riyadh: 'MODEL EVIDENCE 48.70%
  *           INVESTABLE hit rate, matured records - still our system is less than 49% I need to improve it between 60% -55%
  *           at least'). The tile pools every matured Performance_Log WIN / LOSS record since June, so the engine rule that
@@ -393,7 +408,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.2.36';   // lockstep with the header
+var DP2_VERSION = '1.3.0';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -644,6 +659,186 @@ function dp2RpCoreOk_() {
     return busy && ord && note;
   } catch (e) { return false; }
 }
+/* v1.3.0 [REFRESH-SLOTS]: the v2 pages on a daily schedule, one page per execution. Runs only from the time trigger
+ * dp2InstallSlotTrigger installs; without it nothing below runs. */
+var DP2_SLOT_HOURS_PROP_ = 'DP2_REFRESH_HOURS';         // Riyadh hours, e.g. '7,9,11,13,15,17,19,21,23,0'; 'off' = none
+var DP2_SLOT_DONE_PROP_ = 'DP2_SLOT_DONE';              // {slot: 'yyyy-MM-dd HH', pd: 0|1, t10: 0|1, tries: {pd, t10}}
+var DP2_SLOT_CLAIM_PROP_ = 'DP2_SLOT_CLAIM';            // epoch ms while a slot build runs ('' = none)
+var DP2_SLOT_DRAW_PROP_ = 'DP2_SLOT_DRAW_START_MAX_S';  // seconds; a later drawing step keeps the previous page
+var DP2_SLOT_HANDLER_ = 'dp2SlotTick';
+var DP2_SLOT_EVERY_MIN_ = 10;
+var DP2_SLOT_DEFAULT_ = [0, 7, 9, 11, 13, 15, 17, 19, 21, 23];
+var DP2_SLOT_FALLBACK_MIN_ = 40;    // without a finished main-page render in the slot hour, build from this minute on
+var DP2_SLOT_MAX_TRIES_ = 2;        // per page and slot
+var DP2_SLOT_DRAW_DEFAULT_S_ = 150;
+var DP2_SLOT_RUN_ = false, DP2_SLOT_DRAW_MS_ = 0;
+/* PURE: the slot hours, sorted and unique. Blank or nothing readable -> the default ten; 'off' / 'none' -> none. */
+function dp2SlotHoursCore_(raw) {
+  var s = String(raw === null || raw === undefined ? '' : raw).replace(/^\s+|\s+$/g, '').toLowerCase();
+  if (s === 'off' || s === 'none') return [];
+  var out = [], parts = s.split(/[\s,;]+/);
+  for (var i = 0; i < parts.length; i++) {
+    if (!/^\d{1,2}$/.test(parts[i])) continue;
+    var h = +parts[i];
+    if (h >= 0 && h <= 23 && out.indexOf(h) < 0) out.push(h);
+  }
+  return (out.length ? out : DP2_SLOT_DEFAULT_.slice()).sort(function (a, b) { return a - b; });
+}
+/* PURE: the state of slot `key` ('yyyy-MM-dd HH', Riyadh); a state of another slot, or an unreadable one, starts empty. */
+function dp2SlotStateCore_(raw, key) {
+  var st = null;
+  try { st = JSON.parse(String(raw || '')); } catch (e) { st = null; }
+  if (!st || typeof st !== 'object' || st.slot !== key) st = { slot: key, pd: 0, t10: 0, tries: { pd: 0, t10: 0 } };
+  if (!st.tries || typeof st.tries !== 'object') st.tries = { pd: 0, t10: 0 };
+  st.pd = st.pd ? 1 : 0; st.t10 = st.t10 ? 1 : 0;
+  st.tries.pd = +st.tries.pd || 0; st.tries.t10 = +st.tries.t10 || 0;
+  return st;
+}
+/* PURE: the hour ('yyyy-MM-dd HH') of the main page's last FINISHED render, from its status line in the first six rows
+ * ('Last run yyyy-MM-dd HH:mm:ss | status: ok ...'); '' when there is none or that render is running or failed. */
+function dp2SlotMainKeyCore_(values) {
+  for (var r = 0; r < values.length && r < 6; r++) {
+    for (var c = 0; c < values[r].length; c++) {
+      var s = String(values[r][c] === null || values[r][c] === undefined ? '' : values[r][c]);
+      if (s.indexOf('Last run ') !== 0) continue;
+      var m = /^Last run (\d{4}-\d{2}-\d{2}) (\d{2}):\d{2}/.exec(s), st = /\|\s*status:\s*([A-Za-z_]+)/.exec(s);
+      return (m && st && st[1].toLowerCase() === 'ok') ? m[1] + ' ' + m[2] : '';
+    }
+  }
+  return '';
+}
+/* PURE: the drawing-step limit in ms (DP2_SLOT_DRAW_START_MAX_S; 30-330 s, otherwise the default 150 s). */
+function dp2SlotDrawMaxMsCore_(raw) {
+  var t = String(raw === null || raw === undefined ? '' : raw).replace(/^\s+|\s+$/g, '');
+  var n = t === '' ? NaN : Number(t);
+  if (!isFinite(n) || n < 30 || n > 330) n = DP2_SLOT_DRAW_DEFAULT_S_;
+  return Math.round(n * 1000);
+}
+/* PURE: what one tick does. key / minute = the Riyadh hour ('yyyy-MM-dd HH') and minute now; mainKey = dp2SlotMainKeyCore_;
+ * busy = a Top_10 / Portfolio_Decision render runs; claimAgeMin = minutes since a slot build claimed the run (null = no
+ * claim); builtRaw = DP2_LAST_BUILT. Returns {act: 'idle' | 'wait' | 'build', page: 'pd' | 't10' | '', why}. */
+function dp2SlotPlanCore_(hours, key, minute, stateRaw, mainKey, busy, claimAgeMin, builtRaw) {
+  var hour = +String(key).slice(11, 13);
+  if (hours.indexOf(hour) < 0) return { act: 'idle', page: '', why: 'not a refresh hour (' + (hours.length ? hours.join(',') : 'off') + ')' };
+  var st = dp2SlotStateCore_(stateRaw, key), order = dp2RpOrderCore_(builtRaw), fresh = [], retry = [];
+  for (var i = 0; i < order.length; i++) {
+    var pg = order[i];
+    if (!st[pg] && st.tries[pg] < DP2_SLOT_MAX_TRIES_) (st.tries[pg] ? retry : fresh).push(pg);
+  }
+  var due = fresh.concat(retry);   // a page not yet tried in this slot goes before a retry (Codex P2 on #961)
+  if (!due.length) return { act: 'idle', page: '', why: (st.pd && st.t10) ? 'both pages built in this slot' : 'the tries of this slot are used up' };
+  if (claimAgeMin !== null && claimAgeMin >= 0 && claimAgeMin < DP2_RP_BUSY_MIN_) return { act: 'wait', page: due[0], why: 'a v2 build started ' + Math.floor(claimAgeMin) + ' min ago' };
+  if (busy) return { act: 'wait', page: due[0], why: 'a Top_10 / Portfolio_Decision render is running' };
+  if (mainKey !== key && minute < DP2_SLOT_FALLBACK_MIN_) return { act: 'wait', page: due[0], why: 'waiting for the main-page render of this hour (until minute ' + DP2_SLOT_FALLBACK_MIN_ + ')' };
+  return { act: 'build', page: due[0], why: mainKey === key ? 'after the main-page render of this hour' : 'no finished main-page render this hour; built from minute ' + DP2_SLOT_FALLBACK_MIN_ };
+}
+/* (v1.3.0) a slot build that reaches the drawing step late keeps the page it would clear. False outside a slot build. */
+function dp2SlotTooLate_() { return DP2_SLOT_RUN_ && dp2RunElapsed_() > DP2_SLOT_DRAW_MS_; }
+/* The time trigger: at most ONE page per execution. */
+function dp2SlotTick() {
+  dp2RunStart_();
+  var now = new Date(), nowMs = now.getTime(), p = null;
+  try { p = PropertiesService.getScriptProperties(); } catch (eP) { return { act: 'idle', page: '', why: 'Script Properties unreadable' }; }
+  var key = Utilities.formatDate(now, DP2.TZ, 'yyyy-MM-dd HH'), minute = +Utilities.formatDate(now, DP2.TZ, 'mm');
+  var hours = dp2SlotHoursCore_(p.getProperty(DP2_SLOT_HOURS_PROP_));
+  if (hours.indexOf(+key.slice(11, 13)) < 0) return { act: 'idle', page: '', why: 'not a refresh hour' };
+  var mainKey = '';
+  try { var src = dp2Sheet_(DP2.SRC_T10, false); if (src) mainKey = dp2SlotMainKeyCore_(src.getRange(1, 1, 6, Math.min(26, Math.max(1, src.getMaxColumns()))).getValues()); } catch (eM) { mainKey = ''; }
+  var claimRaw = String(p.getProperty(DP2_SLOT_CLAIM_PROP_) || ''), claimMs = Number(claimRaw);
+  var claimAge = (claimRaw !== '' && isFinite(claimMs)) ? (nowMs - claimMs) / 60000 : null;
+  var plan = dp2SlotPlanCore_(hours, key, minute, p.getProperty(DP2_SLOT_DONE_PROP_), mainKey, dp2RpBusy_(nowMs), claimAge, p.getProperty(DP2_RP_BUILT_PROP_));
+  plan.slot = key;
+  if (plan.act !== 'build') { try { Logger.log('v2 refresh slot ' + key + ': ' + plan.act + ' - ' + plan.why); } catch (eL) {} return plan; }
+  // the try is recorded first: Apps Script stops an execution at 6 minutes and runs nothing after that
+  var st = dp2SlotStateCore_(p.getProperty(DP2_SLOT_DONE_PROP_), key);
+  st.tries[plan.page]++;
+  p.setProperty(DP2_SLOT_DONE_PROP_, JSON.stringify(st));
+  p.setProperty(DP2_SLOT_CLAIM_PROP_, String(nowMs));
+  DP2_SLOT_DRAW_MS_ = dp2SlotDrawMaxMsCore_(p.getProperty(DP2_SLOT_DRAW_PROP_));
+  DP2_SLOT_RUN_ = true;
+  DP2X_MEMO_ = {};
+  var res = null, err = null;
+  try { res = plan.page === 'pd' ? buildPortfolioDecisionV2() : buildTop10V2(); }
+  catch (eB) { err = eB; }
+  DP2_SLOT_RUN_ = false;
+  try { p.setProperty(DP2_SLOT_CLAIM_PROP_, ''); } catch (eC) {}
+  var name = plan.page === 'pd' ? DP2.SHEET_PD : DP2.SHEET_T10, out = { act: 'built', page: plan.page, why: plan.why, slot: key };
+  if (err) {
+    out.act = 'failed'; out.why = String(err && err.message || err);
+  } else if (res && res.late) {
+    out.act = 'kept'; out.why = 'its drawing step would have started at ' + Math.round(res.ms / 1000) + ' s (limit ' + Math.round(DP2_SLOT_DRAW_MS_ / 1000) + ' s); the previous page stays and the next tick tries again';
+  } else {
+    st = dp2SlotStateCore_(p.getProperty(DP2_SLOT_DONE_PROP_), key);
+    st[plan.page] = 1;
+    p.setProperty(DP2_SLOT_DONE_PROP_, JSON.stringify(st));
+    dp2RpStamp_(plan.page, new Date().getTime());
+    out.rows = res && res.rows;
+    try { dp2EnsureStaleFlags_(); } catch (eF) { Logger.log('stale-row flags skipped: ' + eF); }
+  }
+  try { Logger.log('v2 refresh slot ' + key + ': ' + name + ' ' + out.act + ' - ' + out.why); } catch (eL2) {}
+  if (err) throw err;
+  return out;
+}
+function dp2RemoveSlotTrigger_() {
+  var trs = ScriptApp.getProjectTriggers(), n = 0;
+  for (var i = 0; i < trs.length; i++) if (trs[i].getHandlerFunction() === DP2_SLOT_HANDLER_) { ScriptApp.deleteTrigger(trs[i]); n++; }
+  return n;
+}
+function dp2InstallSlotTrigger() {
+  var hourly = dp2RemoveTrigger(), old = dp2RemoveSlotTrigger_();
+  ScriptApp.newTrigger(DP2_SLOT_HANDLER_).timeBased().everyMinutes(DP2_SLOT_EVERY_MIN_).create();
+  var hours = dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_));
+  var msg = 'v2 refresh slots installed: ' + DP2_SLOT_HANDLER_ + ' checks every ' + DP2_SLOT_EVERY_MIN_ + ' min and builds each v2 page once in each slot hour, one page per execution, after the main-page render of that hour.\n' +
+    'Slot hours (Riyadh, Script Property ' + DP2_SLOT_HOURS_PROP_ + '): ' + (hours.length ? hours.join(', ') + ' = ' + hours.length + ' a day per page' : 'off') + '.' +
+    (hourly ? '\nRemoved the hourly buildDecisionPagesV2 trigger (' + hourly + ').' : '') + (old ? '\nReplaced ' + old + ' earlier slot trigger(s).' : '');
+  dp2Notify_(msg, 'Decision Pages v2 ' + DP2_VERSION);
+  return msg;
+}
+function dp2RemoveSlotTrigger() {
+  var n = dp2RemoveSlotTrigger_();
+  var msg = n ? 'Removed ' + n + ' v2 refresh-slot trigger(s). The pages stay; they refresh only from the menu until a trigger is installed again.' : 'No v2 refresh-slot trigger was installed.';
+  dp2Notify_(msg, 'Decision Pages v2 ' + DP2_VERSION);
+  return n;
+}
+/* read-only: the schedule, this slot's state and the last builds. */
+function dp2SlotStatus() {
+  var props = {}, n = 0;
+  try { props = PropertiesService.getScriptProperties().getProperties() || {}; } catch (eP) { props = {}; }
+  try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) n++; }); } catch (eT) {}
+  var hours = dp2SlotHoursCore_(props[DP2_SLOT_HOURS_PROP_]), built = null;
+  try { built = JSON.parse(String(props[DP2_RP_BUILT_PROP_] || '')); } catch (eB) { built = null; }
+  var at = function (ms) { return typeof ms === 'number' ? Utilities.formatDate(new Date(ms), DP2.TZ, 'yyyy-MM-dd HH:mm') : 'never'; };
+  var lines = [
+    (n ? 'ON' : 'OFF') + ': ' + n + ' ' + DP2_SLOT_HANDLER_ + ' trigger(s), every ' + DP2_SLOT_EVERY_MIN_ + ' min',
+    'Slot hours (Riyadh): ' + (hours.length ? hours.join(', ') + ' = ' + hours.length + ' a day per page' : 'off') + (props[DP2_SLOT_HOURS_PROP_] ? '' : ' (default)'),
+    'Last slot: ' + String(props[DP2_SLOT_DONE_PROP_] || 'none'),
+    'Last builds: ' + DP2.SHEET_PD + ' ' + at(built && built.pd) + ' \u00b7 ' + DP2.SHEET_T10 + ' ' + at(built && built.t10),
+    'Drawing-step limit: ' + Math.round(dp2SlotDrawMaxMsCore_(props[DP2_SLOT_DRAW_PROP_]) / 1000) + ' s'
+  ];
+  var msg = lines.join('\n');
+  dp2Notify_(msg, 'Decision Pages v2 ' + DP2_VERSION + ' - refresh slots');
+  return msg;
+}
+/* v1.3.0: the dp2SelfTest line while the slot trigger is installed - the PURE rules on fixed inputs. */
+function dp2SlotCoreOk_() {
+  try {
+    var hrs = dp2SlotHoursCore_('').join(',') === DP2_SLOT_DEFAULT_.join(',') && dp2SlotHoursCore_('off').length === 0 &&
+              dp2SlotHoursCore_(' 23, 7;7 x 25 ').join(',') === '7,23';
+    var k = '2026-11-11 15', mk = dp2SlotMainKeyCore_([['TOP'], ['Status', 'Last run 2026-11-11 15:07:09 | status: ok | output: EXECUTABLE']]);
+    var plan = function (min, st, mkey, busy, claim) { return dp2SlotPlanCore_([15], k, min, st, mkey, busy, claim, ''); };
+    var done = JSON.stringify({ slot: k, pd: 1, t10: 0, tries: { pd: 1, t10: 0 } });
+    var pl = mk === k && dp2SlotMainKeyCore_([['Status', 'Last run 2026-11-11 15:07:09 | status: running']]) === '' &&
+             plan(10, '', k, false, null).page === 'pd' && plan(10, done, k, false, null).page === 't10' &&
+             plan(10, '', '2026-11-11 14', false, null).act === 'wait' && plan(41, '', '', false, null).act === 'build' &&
+             plan(10, '', k, true, null).act === 'wait' && plan(10, '', k, false, 3).act === 'wait' && plan(10, '', k, false, 8).act === 'build' &&
+             dp2SlotPlanCore_([16], k, 10, '', k, false, null, '').act === 'idle' &&
+             plan(10, JSON.stringify({ slot: k, pd: 1, t10: 1, tries: { pd: 1, t10: 1 } }), k, false, null).act === 'idle' &&
+             plan(10, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 2, t10: 2 } }), k, false, null).act === 'idle' &&
+             plan(41, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 1, t10: 0 } }), '', false, null).page === 't10';
+    var dr = dp2SlotDrawMaxMsCore_('') === 150000 && dp2SlotDrawMaxMsCore_('90') === 90000 && dp2SlotDrawMaxMsCore_('5') === 150000;
+    return hrs && pl && dr;
+  } catch (e) { return false; }
+}
 /* v1.2.23: NON-BLOCKING notices. Ui.alert waits for OK — run from the script editor, the box opens in the spreadsheet
  * tab and the execution sits there until the 6-minute limit. A modeless dialog returns at once; without a UI (time
  * trigger) the notice goes to a toast, and always to the execution log. */
@@ -697,6 +892,7 @@ function dp2SeedIbkrTabs() {
 
 function dp2InstallTrigger() {
   dp2RemoveTrigger();
+  dp2RemoveSlotTrigger_();   // v1.3.0: one schedule at a time
   ScriptApp.newTrigger('buildDecisionPagesV2').timeBased().everyHours(1).create();
   var msg = 'Hourly trigger installed: buildDecisionPagesV2 rebuilds both v2 pages every hour and sends the dynamic-exit alerts (' + (dp2ExitAlertsEnabled_() ? 'alerts ON → ' + (dp2ExitAlertTo_() || 'no recipient') : 'alerts OFF') + ').';
   dp2Notify_(msg);
@@ -752,6 +948,9 @@ function dp2_addTopMenu(ui) {
     .addSeparator()
     .addItem('⏱ Install hourly refresh + alerts', 'dp2InstallTrigger')
     .addItem('⏹ Remove hourly refresh', 'dp2RemoveTriggerUi')
+    .addItem('\u23F1 Install v2 refresh slots (DP2_REFRESH_HOURS)', 'dp2InstallSlotTrigger')
+    .addItem('\u23F9 Remove v2 refresh slots', 'dp2RemoveSlotTrigger')
+    .addItem('\u2139 v2 refresh slots - status', 'dp2SlotStatus')
     .addItem('🌱 Seed IBKR Tabs (first run)', 'dp2SeedIbkrTabs')
     .addItem('🧪 Self-Test: Decision Pages v2', 'dp2SelfTest')
     .addSeparator()
@@ -3319,6 +3518,7 @@ function buildPortfolioDecisionV2() {
   var stopOuts = 0; for (i = 0; i < losses.length; i++) if (/stop/i.test(losses[i].exit)) stopOuts++;
 
   // ---------------------------------------------------------------- render
+  if (dp2SlotTooLate_()) return { rows: 0, late: true, ms: dp2RunElapsed_() };   // v1.3.0 [REFRESH-SLOTS]
   var sh = dp2Sheet_(DP2.SHEET_PD, true);
   dp2ResetSheet_(sh);
   dp2ChartsBegin_(DP2.SHEET_CHARTS_PD);
@@ -3687,6 +3887,7 @@ function buildTop10V2() {
   var state = feed.state ? fv.label : (t.output || 'n/a');
   var chipKind = feed.state ? fv.kind : 'amber';
 
+  if (dp2SlotTooLate_()) return { rows: 0, late: true, ms: dp2RunElapsed_() };   // v1.3.0 [REFRESH-SLOTS]
   var sh = dp2Sheet_(DP2.SHEET_T10, true);
   dp2ResetSheet_(sh);
   dp2ChartsBegin_(DP2.SHEET_CHARTS_T10);
@@ -4023,6 +4224,8 @@ function dp2SelfTest() {
   if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
   if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
+  var slotN = 0; try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) slotN++; }); } catch (eSl) { slotN = 0; }
+  if (slotN) { var slOk = dp2SlotCoreOk_(); checks.push({ name: 'refresh slots (' + DP2_SLOT_HANDLER_ + ' every ' + DP2_SLOT_EVERY_MIN_ + ' min): ' + dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_)).join(',') + ' \u00b7 core ' + (slOk ? 'ok' : 'FAIL') + ' (one page per execution, after the main-page render of the hour)', ok: slOk }); }   // v1.3.0
   var probe = null;
   var probeSym = 'SPY';
   for (var li = 0; li < led.lots.length; li++) { if (/\.US$/i.test(led.lots[li].symbol)) { probeSym = led.lots[li].symbol; break; } }

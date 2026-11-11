@@ -575,7 +575,7 @@ def test_d10_workflow_manifest_ci():
     assert step["env"]["TFB_DAILY_PLAN"] == "${{ vars.TFB_DAILY_PLAN || 'on' }}"
     assert step["env"]["TFB_PLAN_EVIDENCE"] == "${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}"   # 1.1.0: a label, not a gate
     assert step["env"]["TFB_PLAN_LIVE_PRICE"] == "${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}"    # 1.2.0
-    assert on["schedule"] == [{"cron": "20 * * * *"}]                                         # 1.2.0: hourly
+    assert on["schedule"] == [{"cron": "20 4-20 * * *"}]                                      # 1.3.0: active hours
     assert "--wait-min 45" in step["run"] and "--dry-run" in step["run"]
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_PLAN_[A-Z_]+): \$\{\{", (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")):
@@ -631,3 +631,23 @@ def test_h2_live_overlay_edges(monkeypatch):
     assert dp.knobs()["live"] is False
     monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "ON")
     assert dp.knobs()["live"] is True
+
+
+# ----------------------------------------------------------------------------- H3
+def test_h3_no_cut_before_the_morning_hour(monkeypatch):
+    # 1.3.0: a verified render made at 00:12 Riyadh must not cut the new day's plan; the 07:20 run cuts it
+    line = OK_LINE.replace("2026-11-10 09:", "2026-11-10 00:")
+    b = book(**{"Top_10_Investments": Sheet(board(line=line))})
+    night = dt.datetime(2026, 11, 9, 21, 20, tzinfo=UTC)                         # 00:20 Riyadh on 10 Nov
+    assert dp.main([], book=b, now=night) == 0
+    assert not [r for r in b.tabs["_Daily_Plan"].values[1:] if r[0] == "2026-11-10"]
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Daily_Plan"].values)
+    assert "the plan is cut from 07:00 Riyadh, after the morning sync" in page
+    assert dp.main([], book=b, now=dt.datetime(2026, 11, 10, 4, 20, tzinfo=UTC)) == 0   # 07:20 Riyadh
+    assert [r for r in b.tabs["_Daily_Plan"].values[1:] if r[0] == "2026-11-10" and r[4] == "PICK"]
+    monkeypatch.setenv("TFB_PLAN_CUT_FROM_H", "0")
+    b2 = book(**{"Top_10_Investments": Sheet(board(line=line))})
+    assert dp.main([], book=b2, now=night) == 0                                   # the knob turns it off
+    assert [r for r in b2.tabs["_Daily_Plan"].values[1:] if r[0] == "2026-11-10" and r[4] == "PICK"]
+    monkeypatch.setenv("TFB_PLAN_CUT_FROM_H", "99")
+    assert dp.knobs()["cut_h"] == 7                                               # out of range: the default

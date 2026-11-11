@@ -176,3 +176,13 @@ The WHY block says so. No count of such picks is claimed: the plan is one day ol
 - With main's `tests/test_daily_plan.py` (now 27 cases): 59 passed.
 - Golden negative against main's 1.2.0 copy: 15/32, as before.
 - compileall and ruff (CI rules) are clean, and no added line is non-ASCII.
+
+## Addendum 2026-11-11 (later) - merge of main `53f2abdc`
+
+Main `53f2abdc` (#960, #961) was merged in with a second merge commit. #960 took daily_plan 1.3.0 (no cut before 07:00 Riyadh, `TFB_PLAN_CUT_FROM_H`) and daily_plan.yml 1.2.0 (cron `20 4-20 * * *`, 07:20-23:20 Riyadh).
+
+- **Versions.** This release keeps daily_plan 1.4.0 and daily_plan.yml 1.3.0, still above main.
+- **Conflicts resolved.** The version line; the workflow header (this block above main's 1.2.0 block, verbatim); the env (`TFB_PLAN_SETTLE_PREV` after main's `TFB_PLAN_CUT_FROM_H`); the manifest pin. The WHY header and gate line now name 1.3.0 as the base.
+- **Golden base moved.** It is now main `53f2abdc` (daily_plan 1.3.0).
+- **Harness.** S9 is adapted to 1.3.0's earliest cut: the 00:30 run settles the 10 Nov pick but cuts no plan, and the 07:30 run cuts and counts it as executed. S11's count of today's picks now reads the rows after the previous plan date.
+- **Measured.** PASS 32/32. 60 passed with main's `tests/test_daily_plan.py` (28). Golden negative against main's 1.3.0: 15/32. compileall, ruff and the ASCII check are clean.
