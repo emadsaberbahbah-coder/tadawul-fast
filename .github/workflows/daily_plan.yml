@@ -1,15 +1,24 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.0.1 (2026-11-10)
+# VERSION 1.3.0 (2026-11-10; re-numbered 2026-11-11)
 #
-# 1.0.1: maps TFB_PLAN_SETTLE_PREV (scripts/daily_plan.py 1.0.2 [SETTLE-PREV],
-# default 'off' = 1.0.1 byte-identical). When on, each run marks EXECUTED the
-# previous plan's open picks that were bought since that plan, so a US pick
-# bought after the last refresh of its day is not counted 'dropped' next
+# 1.3.0: maps TFB_PLAN_SETTLE_PREV (scripts/daily_plan.py 1.4.0 [SETTLE-PREV],
+# default 'off' = byte-identical). When on, each run marks EXECUTED the
+# previous plan's open picks that were bought since that plan, so a pick whose
+# lot is entered after its plan day's last run is not counted 'dropped' next
 # day. No schedule, trigger or concurrency change. Rollback: unset or off.
+# (First claimed 1.0.1; main took 1.0.1 and 1.1.0, and open #960 claims 1.2.0.)
 #
-# VERSION 1.0.0 (2026-11-10)
+# VERSION 1.1.0 (2026-11-11)
+#
+# 1.1.0: HOURLY (owner, 11 Nov 12:52). The plan is checked every hour at
+# minute 20; the picks stay frozen and their status uses live prices
+# (daily_plan 1.2.0, TFB_PLAN_LIVE_PRICE=on). The after-sync trigger stays.
+#
+# 1.0.1: daily_plan 1.1.0's evidence rule is mapped in OBSERVE (a label on every
+# qualified name; picks are chosen as before). on = a name that is not PASS is
+# not picked. Rollback: repository variable TFB_PLAN_EVIDENCE=off.
 #
 # WHY: a ticket on the main page existed only while six conditions held at the
 # same moment, each re-tested on every render (6-9 Nov: 32 board versions in
@@ -34,7 +43,7 @@ on:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
     types: [completed]
   schedule:
-    - cron: "40 5,9,13 * * *"
+    - cron: "20 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -112,6 +121,10 @@ jobs:
           TFB_PLAN_KEEP_RANK: ${{ vars.TFB_PLAN_KEEP_RANK || '8' }}
           TFB_PLAN_COOLDOWN_DAYS: ${{ vars.TFB_PLAN_COOLDOWN_DAYS || '10' }}
           TFB_PLAN_UNVERIFIED_AFTER_H: ${{ vars.TFB_PLAN_UNVERIFIED_AFTER_H || '15' }}
+          TFB_PLAN_EVIDENCE: ${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}
+          TFB_PLAN_EV_RISK_MAX: ${{ vars.TFB_PLAN_EV_RISK_MAX || '30' }}
+          TFB_PLAN_EV_UPSIDE_MIN: ${{ vars.TFB_PLAN_EV_UPSIDE_MIN || '15' }}
+          TFB_PLAN_LIVE_PRICE: ${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}
           TFB_PLAN_SETTLE_PREV: ${{ vars.TFB_PLAN_SETTLE_PREV || 'off' }}
         run: |
           EXTRA=""

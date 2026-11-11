@@ -142,3 +142,37 @@ Rollback: unset the Variable.
   - No Variable set and no gate armed.
   - No change to the cut, the picks, the sizing, the keep rule or `pick_status`.
   - No live workbook read or write, and no provider or broker call.
+
+## Addendum 2026-11-11 - merge of main `58910afa`, re-based on daily_plan 1.2.0
+
+Main `58910afa` (#955-#959) was merged in with a merge commit. Main took daily_plan 1.1.0 (the evidence rule, observe) and 1.2.0 (hourly status on live prices), daily_plan.yml 1.0.1 and 1.1.0 (hourly cron `20 * * * *`), and ci.yml 1.1.78 / 1.1.79. Open #960 claims daily_plan 1.3.0 and daily_plan.yml 1.2.0.
+
+**Re-numbered.**
+- daily_plan 1.0.2 -> **1.4.0**: the version constant, the WHY header and the four `[SETTLE-PREV]` tags.
+- daily_plan.yml 1.0.1 -> **1.3.0**.
+- The verify_deployment pin is 1.4.0, next to main's new exit_plan and consistency_check pins.
+- ci.yml keeps 1.1.85; its claim note now lists the claims after today's re-numbering.
+- The file name of this sheet keeps its first number.
+
+**Conflicts resolved.**
+- The version line; `settle_prev_on` beside main's new `ev_mode` (both kept).
+- The workflow header: this block above main's 1.1.0 block, verbatim.
+- The workflow env: this mapping after main's four new lines.
+- The manifest pin.
+
+Main's daily_plan text and functions are untouched. Against main, `scripts/daily_plan.py` removes only the version line.
+
+**Golden base moved.** The harness and the ci.yml step now read main `58910afa` (daily_plan 1.2.0) instead of `50f55740` (1.0.1).
+
+**The premise, restated.** At 1.0.1 every scheduled refresh ran before the US open, so every US pick was exposed. Since daily_plan.yml 1.1.0 the plan is refreshed every hour at minute 20 (open #960 proposes 07:20-23:20 Riyadh), so the last run on a plan day is 23:20 Riyadh. The defect is now narrower. What still reads 'dropped' the next day:
+- a pick whose lot reaches `_Portfolio_CostBasis` after that run (bought in the last 40 minutes of the US session, or entered the next morning);
+- a scheduled run that GitHub delivers late or drops;
+- the carried pick of S7b.
+
+The WHY block says so. No count of such picks is claimed: the plan is one day old.
+
+**Measured on the merged tree** (with `TFB_TEST_REQUIRE_BASE=1`):
+- `tests/test_daily_plan_settle_prev.py` PASS 32/32. All 14 off-identity scenarios equal main's 1.2.0 (ledger, page, return codes, log).
+- With main's `tests/test_daily_plan.py` (now 27 cases): 59 passed.
+- Golden negative against main's 1.2.0 copy: 15/32, as before.
+- compileall and ruff (CI rules) are clean, and no added line is non-ASCII.

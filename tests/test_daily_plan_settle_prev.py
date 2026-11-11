@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_daily_plan_settle_prev.py - scripts/daily_plan.py 1.0.2 [SETTLE-PREV].
+"""tests/test_daily_plan_settle_prev.py - scripts/daily_plan.py 1.4.0 [SETTLE-PREV] (first 1.0.2).
 
 A pick the owner buys in the US session (17:30-24:00 Riyadh) is bought after
 the last scheduled refresh of its plan day (08:40 / 12:40 / 16:40 Riyadh), and
@@ -12,7 +12,7 @@ Stability line counts against every pick of that plan (', N executed').
 Runs as a script ("PASS k/k") and under pytest. Zero network: run_once reads
 and writes an in-memory fake workbook. Controls: TFB_TEST_SETTLE_TARGET (the
 daily_plan.py under test; the untouched main copy there is the golden
-negative), TFB_TEST_PLAN_BASE (a path to the main 50f55740 copy instead of
+negative), TFB_TEST_PLAN_BASE (a path to the main 58910afa copy instead of
 `git show`), TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs
 instead of skipping them; set in CI).
 
@@ -22,7 +22,7 @@ instead of skipping them; set in CI).
       2026-11-11)', the page '2 kept, 1 new, 0 dropped, 1 executed', one
       SETTLE-PREV log line; today's picks and levels equal the off run
   S2  OFF IDENTITY: every scenario below, gate unset / off / junk, against the
-      untouched 1.0.1 module: ledger, page, return codes and every log line
+      untouched main module (1.2.0): ledger, page, return codes and every log line
   S3  an unbought previous pick keeps its status, reason, stamp and last
       price even through its stop (no past-day INVALIDATED); a lot bought
       before the plan date is not settled; a sold lot is not settled
@@ -75,7 +75,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BASE_SHA = "50f55740b993254b5e77d395ae12c18e543ff1b4"     # main: daily_plan 1.0.1 (#953)
+BASE_SHA = "58910afacd1c0c5476b609bab37759d632301ec8"     # main: daily_plan 1.2.0 (#955, #959)
 GATE = "TFB_PLAN_SETTLE_PREV"
 DELIVERED = os.getenv("TFB_TEST_SETTLE_TARGET", "").strip() or str(ROOT / "scripts" / "daily_plan.py")
 UTC = dt.timezone.utc
@@ -94,7 +94,7 @@ _BASE = {}
 
 
 def base():
-    """The untouched main copy (50f55740, daily_plan 1.0.1), or skip (or fail when TFB_TEST_REQUIRE_BASE=1)."""
+    """The untouched main copy (58910afa, daily_plan 1.2.0), or skip (or fail when TFB_TEST_REQUIRE_BASE=1)."""
     if "mod" not in _BASE:
         path = os.getenv("TFB_TEST_PLAN_BASE", "").strip()
         if not path:
@@ -104,7 +104,7 @@ def base():
             except Exception:
                 text = ""
             if text:
-                tmp = Path(tempfile.mkdtemp()) / "daily_plan_v101_main.py"
+                tmp = Path(tempfile.mkdtemp()) / "daily_plan_v120_main.py"
                 tmp.write_text(text, encoding="utf-8")
                 path = str(tmp)
         _BASE["mod"] = _load("dp_settle_prev_base", path) if path else None
@@ -387,7 +387,7 @@ def frozen_cols(led, day):
 
 # ----------------------------------------------------------------------------- S0
 def test_s0_version_floor_and_gate_words():
-    assert tuple(int(x) for x in dp.__version__.split(".")) >= (1, 0, 2)
+    assert tuple(int(x) for x in dp.__version__.split(".")) >= (1, 4, 0)
     for word, want in ((None, False), ("off", False), ("", False), ("no", False), ("0", False), ("enforce", False),
                        ("on", True), ("ON", True), (" on ", True), ("1", True), ("true", True), ("Yes", True)):
         with env(word):

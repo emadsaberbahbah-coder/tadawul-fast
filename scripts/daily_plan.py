@@ -2,19 +2,25 @@
 """
 scripts/daily_plan.py - TFB Daily Plan
 ======================================
-VERSION 1.0.2 (2026-11-10) - SETTLE-PREV
+VERSION 1.4.0 (2026-11-10; re-numbered 2026-11-11) - SETTLE-PREV
+(First 1.0.2 on 1.0.1. Re-based on main's 1.2.0 when main took 1.1.0 and
+1.2.0; open #960 claims 1.3.0.)
 
-WHY: a pick the owner buys in the US session is never marked EXECUTED, and
-the next day's Stability line counts it as 'dropped'. run_once re-statuses
-only today's rows; older rows are written back as they are. The three
-scheduled refreshes (cron 40 5,9,13 UTC = 08:40 / 12:40 / 16:40 Riyadh) all
-run before the US open (17:30 Riyadh since 1 Nov), so a US pick bought on its
-plan day is seen only by a sync-triggered run that starts after the purchase
-and after the lot is entered, and before Riyadh midnight. The first plan (10
-Nov, cut 15:24 Riyadh, run 42815393625) holds three US picks: TEN.US, ZTO.US
-and NMM.US. Offline replay (tests/test_daily_plan_settle_prev.py S1): NMM.US
-bought on 10 Nov, next run 11 Nov 08:40 -> its 10 Nov row still reads OPEN
-'price 60.00 is inside the entry zone' and the page reads '2 kept, 1 new, 1
+WHY: run_once re-statuses only today's rows; older rows are written back as
+they are. A pick is marked EXECUTED only by a run on its own plan day that
+already sees the lot, so a pick whose lot reaches _Portfolio_CostBasis after
+the plan day's last run stays OPEN for good, and the next day's Stability
+line counts the bought name as 'dropped'. That is a pick bought late in the
+US session (17:30-24:00 Riyadh since 1 Nov), or one whose lot is entered the
+next morning. At 1.0.1 the three scheduled refreshes (cron 40 5,9,13 UTC =
+08:40 / 12:40 / 16:40 Riyadh) all ran before the US open, so every US pick
+was exposed. Since daily_plan.yml 1.1.0 (11 Nov) the plan is refreshed every
+hour at minute 20, so the last plan-day run is 23:20 Riyadh and the exposure
+is a lot entered after it. The first plan (10 Nov, cut 15:24 Riyadh, run
+42815393625) holds three US picks: TEN.US, ZTO.US and NMM.US. Offline replay
+(tests/test_daily_plan_settle_prev.py S1): NMM.US bought on 10 Nov, its lot
+seen first by the 11 Nov 08:40 run -> its 10 Nov row still reads OPEN 'price
+60.00 is inside the entry zone' and the page reads '2 kept, 1 new, 1
 dropped'; the dropped name is the one the owner bought.
 
 WHAT (TFB_PLAN_SETTLE_PREV=on), in run_once before the previous-plan list is
@@ -35,9 +41,10 @@ settled.
 SITES: settle_prev_on, settle_prev and stability_counts (new); run_once (the
 settle before prev_picks; the counts into info); page_rows (uses the counts
 only when info carries them).
-GATE: TFB_PLAN_SETTLE_PREV = off (default; 1.0.1 byte-identical: ledger,
-page and log) | on (also 1 / true / yes). daily_plan.yml maps it, default
-'off'. Rollback: unset the repository variable or set it to off.
+GATE: TFB_PLAN_SETTLE_PREV = off (default; byte-identical to the version
+without it, 1.2.0: ledger, page and log) | on (also 1 / true / yes).
+daily_plan.yml maps it, default 'off'. Rollback: unset the repository
+variable or set it to off.
 
 VERSION 1.0.0 (2026-11-10) - NEW SCRIPT
 
@@ -94,6 +101,33 @@ column, which is as of the calendar sync (10 Nov: ZTO.US read 8 days from the
 9 Nov sync while 17 Nov was 7 days away, so the 7-day gate passed it). A pick
 without an engine 12-month ROI carries the label 'no 12-month target'.
 
+1.1.0 (2026-11-10): THE EVIDENCE RULE (TFB_PLAN_EVIDENCE = off default |
+observe | on). Measured on matured INVESTABLE records outside Tadawul, 1W-1M
+horizons, one row per symbol and week (v_outcome_excess joined to
+v_signal_history, entries 31 Aug - 10 Nov 2026): a name whose Risk Score was
+under 30 AND whose analyst target stood 15% or more above its price finished
+up in 72.2% of 72 symbol-weeks (34 names; beat its benchmark in 83.3%); the
+other INVESTABLE names finished up in 43.6% of 110. By half: 77.2% and 66.4%
+of records. The 11 records entered in November read 36.4%. This is an in-sample
+reading over ten weeks, so the rule ships as a LABEL first:
+  observe  every qualified name carries 'evidence rule PASS / FAIL / n/a' with
+           its two numbers; picks are chosen exactly as before.
+  on       a name that is not PASS is not picked (pipeline: 'evidence rule not
+           met'); every other gate is unchanged.
+Tadawul names read n/a: the rule was not measured as a pass there. Two more
+columns are read from the source pages (Risk Score, Target Price); nothing new
+is written outside the two tabs. Knobs: TFB_PLAN_EV_RISK_MAX (30),
+TFB_PLAN_EV_UPSIDE_MIN (15).
+
+1.2.0 (2026-11-11): HOURLY STATUS ON LIVE PRICES (owner, 12:52 Riyadh: the
+outcome pages refresh at least every hour, automatically, with the new data).
+The workflow runs every hour. The picks stay frozen; their status (OPEN /
+WAIT / CHECK / INVALIDATED) is checked against the last traded price from the
+Yahoo chart (TFB_PLAN_LIVE_PRICE = on) instead of the source pages' price,
+which moves only when a sync lands (three times a day); the reason carries
+'(live HH:MM Riyadh)'. A name with no live price keeps the page price. The cut
+itself still uses the source pages, as before.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -107,7 +141,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.2"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -158,8 +192,13 @@ def mode() -> str:
 
 
 def settle_prev_on() -> bool:
-    """1.0.2 [SETTLE-PREV]: TFB_PLAN_SETTLE_PREV on / 1 / true / yes; anything else (and unset) is off."""
+    """1.4.0 [SETTLE-PREV]: TFB_PLAN_SETTLE_PREV on / 1 / true / yes; anything else (and unset) is off."""
     return _env("TFB_PLAN_SETTLE_PREV", "off").lower() in ("on", "1", "true", "yes")
+
+
+def ev_mode() -> str:
+    v = _env("TFB_PLAN_EVIDENCE", "off").lower()
+    return v if v in ("off", "observe", "on") else "off"
 
 
 def knobs() -> Dict[str, Any]:
@@ -179,6 +218,10 @@ def knobs() -> Dict[str, Any]:
         "keep_rank": int(_env_num("TFB_PLAN_KEEP_RANK", 8, 0, 50)),
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
+        "ev_mode": ev_mode(),
+        "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
+        "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
+        "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
     }
 
 
@@ -316,7 +359,8 @@ def table_index(values: Sequence[Sequence[Any]], need: Sequence[str]) -> Tuple[O
 
 
 def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, Any]]:
-    """{SYMBOL: {price, ccy, sector, warnings}} from the source pages; the first page that lists a symbol wins."""
+    """{SYMBOL: {price, ccy, sector, warnings, risk, target}} from the source pages; the first page that lists a
+    symbol wins."""
     out: Dict[str, Dict[str, Any]] = {}
     for g in grids:
         h, col = table_index(g, ("Symbol", "Current Price", "Currency"))
@@ -329,8 +373,31 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
             out[sym] = {"price": num(cell(r, col.get("Current Price"))),
                         "ccy": text(cell(r, col.get("Currency"))).upper(),
                         "sector": text(cell(r, col.get("Sector"))),
-                        "warnings": text(cell(r, col.get("Warnings")))}
+                        "warnings": text(cell(r, col.get("Warnings"))),
+                        "risk": num(cell(r, col.get("Risk Score"))),
+                        "target": num(cell(r, col.get("Target Price")))}
     return out
+
+
+def evidence_rule(symbol: str, src: Dict[str, Any], risk_max: float, upside_min: float) -> Tuple[str, str]:
+    """1.1.0 PURE: (PASS | FAIL | NA, label). PASS = Risk Score under risk_max AND the analyst target
+    upside_min % or more above the price. Tadawul and a name without both numbers read NA."""
+    if symbol.upper().endswith(".SR"):
+        return "NA", "evidence rule n/a (not measured for Tadawul)"
+    price, risk, target = src.get("price"), src.get("risk"), src.get("target")
+    if risk is None or target is None or target <= 0 or not price or price <= 0:
+        missing = "risk score" if risk is None else "analyst target"
+        return "NA", "evidence rule n/a (no %s)" % missing
+    upside = round((target / price - 1.0) * 100.0, 4)      # 4 places, as v_signal_history.target_upside_pp
+    facts = "risk %.1f, analyst upside %+.0f%%" % (risk, upside)
+    if risk < risk_max and upside >= upside_min:
+        return "PASS", "evidence rule PASS (%s)" % facts
+    need = []
+    if risk >= risk_max:
+        need.append("risk under %g" % risk_max)
+    if upside < upside_min:
+        need.append("upside %+g%% or more" % upside_min)
+    return "FAIL", "evidence rule FAIL (%s; needs %s)" % (facts, " and ".join(need))
 
 
 def _days_until(date_cell: Any, days_cell: Any, today: Optional[_dt.date]) -> Optional[float]:
@@ -454,6 +521,11 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             reason = "ex-dividend %.1f%% in %d day(s)" % (amt / c["price"] * 100.0, xd)
         if ed is None:
             c["labels"].append("earnings date not on the calendar")
+        if k.get("ev_mode", "off") != "off":
+            c["ev"], ev_label = evidence_rule(q["symbol"], src, k["ev_risk_max"], k["ev_upside_min"])
+            c["labels"].append(ev_label)
+            if k["ev_mode"] == "on" and c["ev"] != "PASS" and not reason:
+                reason = "evidence rule not met"
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -575,9 +647,31 @@ def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def live_overlay(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
+                 quote=None) -> Dict[str, str]:
+    """1.2.0: the last traded price for each open pick, laid over its source-page price. Returns {SYMBOL: 'HH:MM'}
+    (Riyadh) for the names that got one. `quote(symbol) -> (price, utc datetime) | None`."""
+    if quote is None:
+        from scripts.exit_plan import live_quote as quote  # noqa: PLC0415 - exit_plan imports this module
+    out: Dict[str, str] = {}
+    for d in day_rows:
+        if text(d["Kind"]) != "PICK" or text(d["Status"]) in ("EXECUTED", "INVALIDATED"):
+            continue
+        sym = text(d["Symbol"]).upper()
+        try:
+            q = quote(sym)
+        except Exception:  # noqa: BLE001 - a quote that fails keeps the page price
+            q = None
+        if not q or not q[0] or q[0] <= 0:
+            continue
+        sources[sym] = dict(sources.get(sym) or {}, price=float(q[0]))
+        out[sym] = q[1].astimezone(RIYADH).strftime("%H:%M")
+    return out
+
+
 def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
                    cal: Dict[str, Dict[str, Any]], held: Dict[str, _dt.date], plan_date: _dt.date,
-                   earn_guard: int, stamp: str) -> None:
+                   earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None) -> None:
     for d in day_rows:
         if text(d["Kind"]) != "PICK":
             continue
@@ -589,13 +683,15 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
                "zone_high": num(d["Zone High"]) or 0.0}
         st, why = pick_status(row, price, held, plan_date, (cal.get(sym) or {}).get("earn_days"), earn_guard,
                               text(d["Cut Quality"]))
+        if live and sym in live and price is not None:
+            why += " (live %s Riyadh)" % live[sym]
         d["Status"], d["Status Reason"], d["Status At (Riyadh)"] = st, why, stamp
         d["Last Price"] = price if price is not None else ""
 
 
 def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt.date],
                 today_picks: Sequence[str], today: _dt.date, stamp: str) -> List[Tuple[str, _dt.date]]:
-    """1.0.2 [SETTLE-PREV]: mark EXECUTED the previous plan's open picks that were bought since that plan.
+    """1.4.0 [SETTLE-PREV]: mark EXECUTED the previous plan's open picks that were bought since that plan.
 
     Only the PICK rows of `prev_date` whose Status is not terminal; a row is settled when its symbol is an
     active lot bought on or after the first plan date of the symbol's unbroken run of PICK days ending at
@@ -636,7 +732,7 @@ def settle_prev(older: List[Dict[str, Any]], prev_date: str, held: Dict[str, _dt
 
 def stability_counts(older: List[Dict[str, Any]], prev_date: str,
                      today_rows: List[Dict[str, Any]]) -> Tuple[int, int, int, int]:
-    """1.0.2 [SETTLE-PREV]: (kept, new, dropped, executed) of today's picks against every PICK of `prev_date`."""
+    """1.4.0 [SETTLE-PREV]: (kept, new, dropped, executed) of today's picks against every PICK of `prev_date`."""
     prev = [text(d["Symbol"]) for d in older if text(d["Plan Date"]) == prev_date and text(d["Kind"]) == "PICK"]
     done = {text(d["Symbol"]) for d in older if text(d["Plan Date"]) == prev_date and text(d["Kind"]) == "PICK"
             and text(d["Status"]) == "EXECUTED"}
@@ -661,7 +757,7 @@ def page_rows(today_rows: List[Dict[str, Any]], prev_picks: Sequence[str], info:
     out.append(pad(["Stability: picks changed today after the cut: 0 (frozen) · versus the previous plan: "
                     "%d kept, %d new, %d dropped" % (len(kept), len(now_syms) - len(kept),
                                                     len([s for s in prev_picks if s not in now_syms]))]))
-    if "stability" in info:   # 1.0.2 [SETTLE-PREV]: counted against every pick of the previous plan
+    if "stability" in info:   # 1.4.0 [SETTLE-PREV]: counted against every pick of the previous plan
         head = text(out[-1][0]).rsplit(": ", 1)[0]
         out[-1] = pad([head + ": %d kept, %d new, %d dropped, %d executed" % tuple(info["stability"])])
     out.append(pad([]))
@@ -718,7 +814,8 @@ def read_source_page(book, tab: str) -> List[List[Any]]:
     h, col = table_index(head, ("Symbol", "Current Price", "Currency"))
     if h is None:
         return []
-    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings") if n in col]
+    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price")
+             if n in col]
     ranges = ["%s%d:%s" % (_col(col[n] + 1), h + 1, _col(col[n] + 1)) for n in names]
     cols = ws.batch_get(ranges)
     height = max((len(c) for c in cols), default=0)
@@ -807,7 +904,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
     older = [d for d in ledger if text(d["Plan Date"]) != day and parse_date(d["Plan Date"]) is not None
              and (today - parse_date(d["Plan Date"])).days <= LEDGER_KEEP_DAYS]
     prev_dates = sorted({text(d["Plan Date"]) for d in older})
-    settle = settle_prev_on() and bool(prev_dates)   # 1.0.2 [SETTLE-PREV]
+    settle = settle_prev_on() and bool(prev_dates)   # 1.4.0 [SETTLE-PREV]
     settled: List[Tuple[str, _dt.date]] = []
     if settle:
         settled = settle_prev(older, prev_dates[-1], lots["held"],
@@ -841,7 +938,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
                                                     len(plan["pipeline"]), fmt(plan["nav"], 0), fmt(cash, 0),
                                                     fmt(plan["deployable"], 0), fmt(plan["per_pick"], 0)))
     if today_rows:
-        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp)
+        live = live_overlay(today_rows, sources) if k["live"] else {}
+        if live:
+            _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
+                                                  for s in sorted(live)))
+        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live)
         first = today_rows[0]
         info["headline"] = "Plan of %s · cut %s Riyadh from the main page's render of %s (%s) · status " \
                            "checked %s" % (day, text(first["Cut At (Riyadh)"]), text(first["Source Render"]),
