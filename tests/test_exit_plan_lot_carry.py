@@ -14,13 +14,14 @@ TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs instead of skipping 
   L0  version floor; the gate words (unset and anything else read off)
   L1  two lots (230 @ 100.00, 10 @ 104.00): TAKE PROFIT on the 110 close, 120 shares of the first lot sold; the next
       close: on -> no second TAKE PROFIT, TP1 kept, the stop not lower, the note names the earlier key, the e-mail
-      says 'hold all'; off (= 1.1.0) -> TAKE PROFIT again and 'take profit' in the e-mail subject
+      says 'hold all'; off (= 1.1.0) -> TAKE PROFIT again and 'take profit' in the e-mail subject; a one-share and
+      a fractional sale also carry
   L2  two fills a few cents apart on one day, a sale after the stop was raised: off publishes a LOWER stop with
       'RAISE STOP' and loses the TP1 flag; on keeps the stop and the flag and reads HOLD
   L3  the newest lot closed entirely (the key's date moves earlier): carried
   L4  a top-up (a lot bought since): nothing carried - on equals off
   L5  sold out, bought again later: nothing carried - on equals off
-  L6  a single lot sold down (the key does not change), and a second holding beside a carried one: on equals off
+  L6  a single lot sold down (the key does not change): on equals off
   L7  a second run on the same close after the change: the same action, the same stop, no RAISE STOP of its own
   L8  OFF IDENTITY: every scenario, gate unset / off / junk, against the untouched 1.1.0 module: ledger, page,
       e-mail and every log line (the version tokens folded)
@@ -36,19 +37,21 @@ TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs instead of skipping 
   L15 two runs on one Riyadh date, the second on a newer close: the stop holds, no RAISE STOP to a lower stop
   L16 a weekend re-run on the same close: TAKE PROFIT stays, as on the one-key path
   L17 sold out, bought again in two lots, then a sale: nothing of the old holding comes back
-  L18 a lot closed, then re-activated with a sale: the history carries, the note names the latest earlier key
+  L18 a lot closed (carried), then re-activated with a sale: the lot reads like one bought since (as 1.1.0)
   L19 two sales on consecutive closes, then a close: the note names the key just before, then goes away
   L20 a carried holding without price history (CHECK): no note
-  L21 the gate switched on after a lot change made while it was off: the carried stop comes back as RAISE STOP
-      (not a silent HOLD), with the note
+  L21 the gate switched on after a lot change made while it was off: the first-target state comes back; the stop
+      stays at what was published last (a carried stop is never above it)
   L22 a top-up typed in after its own close was computed (or bought after hours), also one dated on the newest
       lot's day: a new position, as on time (round 2 of the review)
   L23 a same-day sell-out and re-buy typed in after that close was computed: the new position starts fresh
-  L24 a top-up lot closed again: the position before the top-up comes back, the note names the key that held it
-  L25 L21 over a weekend (two Riyadh dates on one close): the stop published last is the 'was' of the RAISE STOP
+  L24 a top-up lot and one fill closed: the topped-up position's state carries; only the top-up lot closed: the key
+      returns exactly and its own rows apply (on equals off)
+  L25 L21 over a weekend (two Riyadh dates on one close): the stop published last holds, 'was' is that stop
   L26 a re-run on the same close keeps the stop the first run published (a tightening input gone)
-  L27 the 0.25% thresholds of the note and of the published 'was', at their boundary
-  L28 L21 with a dividend factor on every bar: the note and RAISE STOP compare like with like
+  L27 the cap on a seeded ledger: an earlier key's higher stop never comes back above the stop published last; the
+      0.25% 'was' threshold at its boundary on a re-run; a dividend between the two stops
+  L28 L21 with a dividend factor on every bar: the cap compares normalised stops
   L29 a single lot on a dividend factor not exact at 4 decimals: on equals off
   L30 a sale recorded between two runs on one close: TAKE PROFIT stays for the close, then HOLD (round 3)
   L31 a price typo corrected, a 2:1 split and a Tadawul bonus issue typed into the lots, each followed by sales:
@@ -56,6 +59,9 @@ TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs instead of skipping 
   L32 a lot typed by mistake, then deleted or closed: on equals off (the key returns exactly)
   L33 a sale typed with too many shares and corrected: the count goes up, nothing carries (on equals off)
   L34 a raise close after carried sales, run twice: no note on either run
+  L35 edits and sales on one Riyadh date (each run overwrites that date's rows): a typo corrected then a sale, a
+      split typed in then a sale, an exact return then a sale; and a previous key computed only inside its newest
+      lot's session, that lot then removed: never a stop that was not published last (round 4)
 
 Run: python tests/test_exit_plan_lot_carry.py  |  pytest -q tests/test_exit_plan_lot_carry.py
 """
@@ -477,6 +483,31 @@ SCENARIOS.update({
                            (33, 0, [lot("AAA.US", 28, "100.00", 80), lot("AAA.US", 30, "104.00", 40)],
                             {"AAA": FLAT + [104.0, 115.0, 116.0, 117.0]})],
 })
+# L35 (round 4): edits and sales on one Riyadh date; each run overwrites that date's rows of the ledger
+S35 = [c / 2 for c in S31]
+R35 = FLAT + [104.0, 110.0, 118.0, 119.0, 120.0, 121.0]
+SCENARIOS.update({
+    "l35_typo_then_sale_same_date": [(31, 0, [lot("AAA.US", 30, "1000.00", 100)], {"AAA": P31[:32]}),
+                                     (32, 0, [lot("AAA.US", 30, "100.00", 100)], {"AAA": P31[:33]}),
+                                     (32, 5, [lot("AAA.US", 30, "100.00", 50)], {"AAA": P31[:33]}),
+                                     (33, 0, [lot("AAA.US", 30, "100.00", 50)], {"AAA": P31[:34]})],
+    "l35_split_then_sale_same_date": [
+        (31, 0, [lot("AAA.US", 28, "200.00", 50), lot("AAA.US", 30, "208.00", 50)], {"AAA": S31}),
+        (32, 0, [lot("AAA.US", 28, "100.00", 100), lot("AAA.US", 30, "104.00", 100)], {"AAA": S35 + [112.0]}),
+        (32, 3, [lot("AAA.US", 28, "100.00", 40), lot("AAA.US", 30, "104.00", 20)], {"AAA": S35 + [112.0]}),
+        (32, 4, [lot("AAA.US", 28, "100.00", 40), lot("AAA.US", 30, "104.00", 20)], {"AAA": S35 + [112.0]}),
+        (33, 0, [lot("AAA.US", 28, "100.00", 40), lot("AAA.US", 30, "104.00", 20)], {"AAA": S35 + [112.0, 113.0]})],
+    "l35_exact_return_then_sale": [(31, 0, A0, {"AAA": R35[:32]}), (32, 0, A0, {"AAA": R35[:33]}),
+                                   (33, 0, A0 + [lot("AAA.US", 33, "1040.00", 10)], {"AAA": R35[:34]}),
+                                   (34, 0, A0, {"AAA": R35[:35]}), (34, 3, A_SOLD, {"AAA": R35[:35]}),
+                                   (35, 0, A_SOLD, {"AAA": R35[:36]})],
+    "l35_control_no_typo": [(31, 0, A0, {"AAA": R35[:32]}), (32, 0, A0, {"AAA": R35[:33]}),
+                            (33, 0, A0, {"AAA": R35[:34]}), (34, 0, A0, {"AAA": R35[:35]}),
+                            (34, 3, A_SOLD, {"AAA": R35[:35]}), (35, 0, A_SOLD, {"AAA": R35[:36]})],
+    "l35_fresh_key_lot_removed": [(29, 0, [lot("AAA.US", 28, "100.00", 230), lot("AAA.US", 30, "1040.00", 10)],
+                                   {"AAA": FLAT}),
+                                  (30, 0, [lot("AAA.US", 28, "100.00", 230)], {"AAA": FLAT + [101.0]})],
+})
 # L34: L19, then a raise close run twice (00:30 and 07:30 Riyadh)
 SCENARIOS["l34_raise_close_two_runs"] = SCENARIOS["l19_two_sales_then_close"] + [
     (35, -7, [lot("AAA.US", 28, "100.00", 60), lot("AAA.US", 30, "104.00", 10)],
@@ -619,6 +650,13 @@ def test_l1_no_second_take_profit_after_selling_half():
     assert "the lots changed" not in off[1][1]
     # the other holding is untouched by the carry
     assert last_row(led, "BBB.US") == last_row(off[1][2], "BBB.US")
+    # a one-share and a fractional sale: the smallest drops of the count still carry
+    first, after = SCENARIOS["l1_sell_half_from_one_lot"]
+    for left in ("229", "229.5"):
+        one = play(ep, [first, (32, 0, [lot("AAA.US", 28, "100.00", left)] + after[2][1:], after[3])], "on")[1]
+        r1 = last_row(one[2], "AAA.US")
+        assert r1["Action"] != "TAKE PROFIT" and r1["TP1 Reached"] == "yes" and NOTE in ln(one[1]), left
+        assert one[4][0][0].endswith("hold all"), left
 
 
 # ----------------------------------------------------------------------------- L2
@@ -707,6 +745,10 @@ def test_l9_carry_rows():
     assert ep.carry_rows(led, "AAA.US", k1, d31, 120.0) == []                     # a lot newer than the key's
     assert ep.carry_rows([r(k0, bars_to=DAYS[29])], "AAA.US", k1, d30, 120.0) == []   # computed before it was bought
     assert ep.carry_rows([r(k0, bars_to=d30)], "AAA.US", k1, d30, 120.0) != []
+    # inside its own newest lot's session, also when that lot is the one removed (the key date moves earlier)
+    cur28 = "AAA.US|%s|100.0000" % d28.isoformat()
+    assert ep.carry_rows([r(k0, bars_to=DAYS[29])], "AAA.US", cur28, d28, 230.0) == []
+    assert ep.carry_rows([r(k0, bars_to=d30)], "AAA.US", cur28, d28, 230.0) != []
     assert ep.carry_rows([a0, dict(a1, Shares="")], "AAA.US", k1, d30, 120.0) == []
     assert ep.carry_rows([a0, dict(a1, **{"Bars To": ""})], "AAA.US", k1, d30, 120.0) == []
     # the shares right after the change: the current key's first trailing row, not the shares now
@@ -722,6 +764,7 @@ def test_l9_carry_rows():
         == k0
     # the lots returned to an earlier key exactly: its own rows apply, nothing carries
     assert ep.carry_rows([r(k1, shares="240"), a0], "AAA.US", k1, d30, 120.0) == []
+    assert ep.carry_rows([r(k1, shares="240"), b0, a0], "AAA.US", k1, d30, 120.0) == []     # two keys back
     assert ep.carry_rows([], "AAA.US", k1, d30, 120.0) == [] == ep.carry_rows([r(k1)], "AAA.US", k1, d30, 120.0)
     assert ep.carry_rows(led, "CCC.US", k1, d30, 120.0) == []
     # with bars: the basis moves from the previous key's buy date to the current one (an ex-date on bar 30)
@@ -734,6 +777,15 @@ def test_l9_carry_rows():
     assert ep._factor_at(bars, DAYS[0] - dt.timedelta(days=1)) == 1.0 and ep._factor_at(bars, d28) == 0.95
     assert ep._factor_at(bars, d30) == 1.0 and ep._factor_at([], d30) == 1.0
     assert ep._factor_at([(d28, 1.0, 1.0, 1.0, 1.0)], d30) == 1.0
+    # carry_last: the last run up to today (the latest Date, the last row on a tie), dividend-normalised
+    t = DAYS[34]
+    rl = [r(k0, bars_to=d31, Stop="100", Date=d31.isoformat()), r(k1, bars_to=d31, Stop="98", Basis="0.98",
+                                                                   Date=DAYS[32].isoformat()),
+          r(k0, bars_to=d31, Stop="120", Date=(t + dt.timedelta(days=1)).isoformat())]
+    assert ep.carry_last(rl, t) == (98.0, 100.0) and ep.carry_last(rl[:1], t) == (100.0, 100.0)
+    assert ep.carry_last(rl[:2] + [dict(rl[1], Stop="97")], t) == (97.0, 97.0 / 0.98)
+    assert ep.carry_last([dict(rl[0], Stop="")], t) == (None, None) and ep.carry_last([], t) == (None, None)
+    assert ep.carry_last(rl[2:], t) == (None, None)
     # read_lots is 1.1.0's
     assert "first" not in ep.read_lots([LOT_HDR, lot("AAA.US", 30, "104", 10), lot("AAA.US", 28, "100", 230)])["AAA.US"]
 
@@ -884,12 +936,11 @@ def test_l21_gate_switched_on_after_a_change_made_while_off():
     low, high = num(last_row(on[2][2], "AAA.US")["Stop"]), num(last_row(on[1][2], "AAA.US")["Stop"])
     assert low < high and last_row(on[2][2], "AAA.US")["TP1 Reached"] == "no"         # 1.1.0 on step 3
     r = last_row(on[3][2], "AAA.US")
-    assert num(r["Stop"]) == high and r["TP1 Reached"] == "yes" and r["Action"] == "RAISE STOP"
-    assert "raise the stop %s -> %s" % (ep.fmt(low), ep.fmt(high)) in ln(on[3][1])
-    assert ln(on[3][1]).endswith("carry over from %s" % last_row(on[1][2], "AAA.US")["Lot"])
-    assert on[3][4][0][0].endswith("1 action: AAA.US raise stop")
+    assert num(r["Stop"]) == low and r["TP1 Reached"] == "yes" and r["Action"] == "HOLD"
+    assert "stop %s (was %s)" % (ep.fmt(low), ep.fmt(low)) in ln(on[3][1]) and NOTE not in ln(on[3][1])
+    assert on[3][4][0][0].endswith("hold all")
     stay = play(ep, steps, None, (None, None, None, None))
-    assert last_row(stay[3][2], "AAA.US")["Action"] == "HOLD" and num(last_row(stay[3][2], "AAA.US")["Stop"]) == low
+    assert num(last_row(stay[3][2], "AAA.US")["Stop"]) == low and last_row(stay[3][2], "AAA.US")["TP1 Reached"] == "no"
 
 
 # ----------------------------------------------------------------------------- L22
@@ -931,15 +982,14 @@ def test_l24_top_up_lot_closed_keeps_the_top_up_position():
 
 
 # ----------------------------------------------------------------------------- L25
-def test_l25_weekend_rollout_raises_from_the_stop_published_last():
+def test_l25_weekend_rollout_holds_the_stop_published_last():
     steps, gates = WEEKEND
     on = play(ep, steps, None, gates)
     sat, sun = last_row(on[2][2], "AAA.US"), last_row(on[3][2], "AAA.US")
     assert sat["Bars To"] == sun["Bars To"] and num(sun["Stop"]) < num(sat["Stop"])
     r = last_row(on[4][2], "AAA.US")
-    assert r["Action"] == "RAISE STOP" and num(r["Stop"]) == num(sat["Stop"]) and r["TP1 Reached"] == "yes"
-    assert "raise the stop %s -> %s" % (ep.fmt(num(sun["Stop"])), ep.fmt(num(sat["Stop"]))) in ln(on[4][1])
-    assert NOTE in ln(on[4][1]) and on[4][4][0][0].endswith("1 action: AAA.US raise stop")
+    assert r["Action"] == "HOLD" and num(r["Stop"]) == num(sun["Stop"]) and r["TP1 Reached"] == "yes"
+    assert "(was %s)" % ep.fmt(num(sun["Stop"])) in ln(on[4][1])
 
 
 # ----------------------------------------------------------------------------- L26
@@ -969,32 +1019,32 @@ def _seeded(old_stop, new_stop="100.0", new_basis="1.0", same=None, adj=None,
                 ledger=led)[0]
 
 
-def test_l27_thresholds_at_the_boundary():
-    for old, act, note in (("100.20", "HOLD", False), ("100.25", "HOLD", False), ("100.255", "RAISE STOP", True),
-                           ("100.30", "RAISE STOP", True)):
+def test_l27_cap_and_threshold():
+    # an earlier key's higher stop never comes back above the 100.00 published last; 'was' is not above the stop
+    for old in ("100.20", "100.25", "100.30", "105.00"):
         st = _seeded(old)
         r = last_row(st[2], "AAA.US")
-        assert (r["Action"], NOTE in ln(st[1])) == (act, note), old
-        assert num(r["Stop"]) == float(old)
-        assert ("(was %s)" % ("100.00" if note else ep.fmt(float(old)))) in ln(st[1]), old
-    assert "raise the stop 100.00 -> 100.30" in ln(_seeded("100.30")[1])
-    # a re-run of the close keeps the first run's 'was' (the earlier close's, not this close's 100.40)
-    st = _seeded("100.20", same="100.40")
-    assert last_row(st[2], "AAA.US")["Action"] == "HOLD" and "(was 100.20)" in ln(st[1])
+        assert (r["Action"], num(r["Stop"])) == ("HOLD", 100.0), old
+        assert "stop 100.00 (was 100.00)" in ln(st[1]) and NOTE not in ln(st[1]), old
+    # a re-run of the close: the stop this close already published holds; 'was' is the earlier close's own stop when
+    # that is within 0.25% of the earlier key's, else the stop published on the last earlier run
+    for old, was in (("100.20", "100.20"), ("100.25", "100.25"), ("100.255", "100.00"), ("100.30", "100.00")):
+        st = _seeded(old, same="100.40")
+        r = last_row(st[2], "AAA.US")
+        assert num(r["Stop"]) == 100.4 and "(was %s)" % was in ln(st[1]), old
     # a dividend between the earlier key's stop (basis 1.0) and the stop published last (95.00 on basis 0.95 =
-    # 100.00): the 0.25% compares the normalised stops, not the raw ones
+    # 100.00): the cap compares the normalised stops
     st = _seeded("100.20", new_stop="95.0", new_basis="0.95", adj=[0.95] * 34)
-    assert last_row(st[2], "AAA.US")["Action"] == "HOLD" and "(was 95.19)" in ln(st[1]) and NOTE not in ln(st[1])
+    assert last_row(st[2], "AAA.US")["Action"] == "HOLD" and "stop 95.00 (was 95.00)" in ln(st[1])
 
 
 # ----------------------------------------------------------------------------- L28
 def test_l28_rollout_with_a_dividend_factor():
     steps, gates = ROLLOUT
     on = play(ep, [st[:4] + ({"adj": {"AAA": [0.95] * 40}},) for st in steps], None, gates)
-    low, high = num(last_row(on[2][2], "AAA.US")["Stop"]), num(last_row(on[1][2], "AAA.US")["Stop"])
+    low = num(last_row(on[2][2], "AAA.US")["Stop"])
     r = last_row(on[3][2], "AAA.US")
-    assert r["Action"] == "RAISE STOP" and num(r["Stop"]) == high and NOTE in ln(on[3][1])
-    assert "raise the stop %s -> %s" % (ep.fmt(low), ep.fmt(high)) in ln(on[3][1])
+    assert r["Action"] == "HOLD" and num(r["Stop"]) == low and r["TP1 Reached"] == "yes"
     # L19 on a factor not exact at 4 decimals: the note still goes on the close after the change
     nxt = play(ep, [st[:4] + ({"adj": {"AAA": [F29] * 40}},) for st in SCENARIOS["l19_two_sales_then_close"]], "on")
     assert NOTE in ln(nxt[2][1]) and NOTE not in nxt[3][1]
@@ -1054,6 +1104,24 @@ def test_l34_raise_close_after_carried_sales_has_no_note():
     assert all(NOTE not in st[1] for st in on[3:])
     a, b = last_row(on[4][2], "AAA.US"), last_row(on[5][2], "AAA.US")
     assert a["Action"] == b["Action"] == "RAISE STOP" and a["Stop"] == b["Stop"] and a["Bars To"] == b["Bars To"]
+
+
+# ----------------------------------------------------------------------------- L35
+def test_l35_same_date_edits_never_publish_an_unpublished_stop():
+    for name in ("l35_typo_then_sale_same_date", "l35_fresh_key_lot_removed"):
+        on, off = play(ep, name, "on"), play(ep, name, None)
+        assert fold(on[-1][1]) == fold(off[-1][1]) and fold(on[-1][2]) == fold(off[-1][2]), name
+        assert last_row(on[-1][2], "AAA.US")["Action"] != "SELL", name
+    on = play(ep, "l35_split_then_sale_same_date", "on")
+    post = num(last_row(on[1][2], "AAA.US")["Stop"])
+    assert all(last_row(st[2], "AAA.US")["Action"] != "SELL" for st in on[1:])
+    assert all(num(last_row(st[2], "AAA.US")["Stop"]) == post for st in on[1:])          # the post-split key's
+    on, ref = play(ep, "l35_exact_return_then_sale", "on"), play(ep, "l35_control_no_typo", "on")
+    assert last_row(on[2][2], "AAA.US")["Action"] == "SELL"                              # the typo's own run
+    for a, b in zip(on[3:], ref[3:]):
+        ra, rb = last_row(a[2], "AAA.US"), last_row(b[2], "AAA.US")
+        assert (ra["Action"], ra["Stop"], ra["TP1 Reached"]) == (rb["Action"], rb["Stop"], rb["TP1 Reached"])
+    assert on[-1][4][0][0] == ref[-1][4][0][0]
 
 
 # ----------------------------------------------------------------------------- L10

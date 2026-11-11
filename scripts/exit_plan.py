@@ -27,27 +27,28 @@ the holding was under just before (relabelled to the current key) with the
 current key's own rows. The change was a sale or a closed lot only when, on
 the previous key's last row, the share count is above the count right after
 the change, its key's buy date is on or after the latest active buy date
-now, and its 'Bars To' (the close it was computed on) is too. So a top-up or
-a re-buy (also typed in after its close was computed), a split or a bonus
+now, and its 'Bars To' (the close it was computed on) is on or after its own
+key's buy date (not inside its newest lot's session). So a top-up or a
+re-buy (also typed in after its close was computed), a split or a bonus
 issue typed into the lots, and a corrected price or date all start a new
 position, as before 1.2.0; the state follows the holding through a chain of
 sales, because each key's rows hold what it carried itself. When the lots
 return to an earlier key exactly (a lot deleted or closed again), that key's
 own rows apply and nothing is carried, as before 1.2.0. The carried state is
-the stop ratchet ('Stop', 'StopNorm', 'Was'), 'TP1 Reached' / 'TP1 Before' /
-'TP1 Today'; the entry, R, ATR and target are computed from the current lots
-as before. A carried row's dividend basis is moved from the previous key's
-buy date to the current key's, so a dividend paid between the two buy dates
-does not rescale the carried stop. 'Was' (the stop before this close)
-becomes the stop of the last run on an earlier close when that is more than
-0.25% under the highest earlier stop, so a carried stop above what was
-published last reads RAISE STOP, not HOLD. The holding's note names the
-previous key while the current key has no row of its own on an earlier
-close, or when the carried stop is more than 0.25% above the current key's
-own stop before this close. The ledger's Lot column, the page layout, the
-e-mail format and every other holding are unchanged.
-SITES: lot_carry_on, carry_rows, _factor_at and carry_was (new); run (the
-gated second prior_row, 'Was' and the note).
+the stop ratchet and 'TP1 Reached' / 'TP1 Before' / 'TP1 Today'; the entry,
+R, ATR and target are computed from the current lots as before. The carried
+stop is never above the stop published on the holding's last run (the
+latest Date, dividend-normalised), so a key read as the previous one by
+mistake cannot raise the stop; 'Was' is capped the same way, and becomes the
+stop of the last run on an earlier close when that is more than 0.25% under
+the highest earlier stop. A carried row's dividend basis is moved from the
+previous key's buy date to the current key's, so a dividend paid between the
+two buy dates does not rescale the carried stop. The holding's note names
+the previous key while the current key has no row of its own on an earlier
+close. The ledger's Lot column, the page layout, the e-mail format and every
+other holding are unchanged.
+SITES: lot_carry_on, carry_rows, _factor_at, carry_was and carry_last (new);
+run (the gated second prior_row, the cap, 'Was' and the note).
 GATE: TFB_EXIT_LOT_CARRY = off (default; byte-identical to 1.1.0 apart from
 the version string: ledger, page, e-mail and log) | on (also 1 / true / yes).
 exit_plan.yml maps it, default 'off'. Rollback: unset the repository variable
@@ -614,7 +615,8 @@ def carry_rows(ledger: Sequence[Dict[str, Any]], symbol: str, key: str, lot_date
         `shares` when the current key has no row yet): a lot bought since (a top-up, a re-buy), a split or
         bonus-share edit, or a corrected price or date does not lower the count;
       - its key's buy date is on or after `lot_date` (the latest active buy date now): no active lot is newer;
-      - its 'Bars To' (the close it was computed on) is on or after `lot_date`: every active lot was bought by then.
+      - its 'Bars To' (the close it was computed on) is on or after its key's own buy date: it was computed on a
+        close after its newest lot was bought (so after every active lot was bought), not inside that session.
     Nothing is carried when the current key also has rows from before the previous key's (the lots returned to an
     earlier key exactly - a lot deleted or closed again): its own rows apply, as before 1.2.0. The previous key's
     rows already hold what it carried itself, so a chain of sales keeps the whole state. Rows whose Lot is not
@@ -643,7 +645,7 @@ def carry_rows(ledger: Sequence[Dict[str, Any]], symbol: str, key: str, lot_date
     last, kd = hist[j - 1], kdate(hist[j - 1])
     after = num(hist[j].get("Shares")) if j < len(hist) else shares
     sh, bt = num(last.get("Shares")), parse_date(last.get("Bars To"))
-    if sh is None or after is None or bt is None or kd is None or sh <= after or kd < lot_date or bt < lot_date:
+    if sh is None or after is None or bt is None or kd is None or sh <= after or kd < lot_date or bt < kd:
         return []
     rows = [dict(d, Lot=key, **{"Carried From": prev_key}) for d in hist[i:j]]
     if bars:
@@ -677,6 +679,19 @@ def carry_was(rows: Sequence[Dict[str, Any]], today: _dt.date,
     st = [(num(d["Stop"]), num(d.get("Basis")) or 1.0) for d in older
           if (parse_date(d["Date"]) or _dt.date.min) == last_run]
     return max(a for a, _ in st), max(a / b for a, b in st)
+
+
+def carry_last(rows: Sequence[Dict[str, Any]], today: _dt.date) -> Tuple[Optional[float], Optional[float]]:
+    """1.2.0 [LOT-CARRY] PURE: (Stop, StopNorm) of the holding's last run up to today (the latest Date, the last
+    row in ledger order on a tie) = the stop published last. A carried stop is never set above it, so a key read
+    as the previous one by mistake cannot raise the stop. (None, None) when that row has no stop."""
+    rs = [d for d in rows if (parse_date(d["Date"]) or today) <= today]
+    if not rs:
+        return None, None
+    top = max(parse_date(d["Date"]) or _dt.date.min for d in rs)
+    d = [d for d in rs if (parse_date(d["Date"]) or _dt.date.min) == top][-1]
+    st = num(d["Stop"])
+    return (st, st / (num(d.get("Basis")) or 1.0)) if st is not None else (None, None)
 
 
 def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date,
@@ -952,12 +967,17 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             own = [d for d in ledger if text(d["Lot"]) == lot_key(sym, lot)]
             mine = prev
             prev = prior_row(carried + own, lot_key(sym, lot), today, sym_bars[-1][0] if sym_bars else None)
+            last = carry_last(carried + own, today)
+            if last[1] is not None and prev.get("StopNorm") is not None:
+                floor = max(last[1], num(mine.get("StopNorm")) or 0.0)
+                if floor < num(prev["StopNorm"]):          # never above what was published on the last run
+                    prev["Stop"], prev["StopNorm"] = max(last[0], num(mine.get("Stop")) or 0.0), floor
+                    if (num(prev.get("WasNorm")) or 0.0) > floor:
+                        prev["Was"], prev["WasNorm"] = prev["Stop"], floor
             was = carry_was(carried + own, today, sym_bars[-1][0] if sym_bars else None)
             if was[1] is not None and was[1] * 1.0025 < (num(prev.get("WasNorm")) or 0.0):
                 prev["Was"], prev["WasNorm"] = was         # what was published last is materially lower
-            top = max((num(d["Stop"]) / (num(d.get("Basis")) or 1.0) for d in carried
-                       if num(d.get("Stop")) is not None), default=0.0)
-            note = mine.get("Was") is None or top > (num(mine.get("WasNorm")) or 0.0) * 1.0025
+            note = mine.get("Was") is None
         res = exit_levels(sym, lot["entry"], lot["date"], sym_bars, inf, prev, k, today)
         if carried and note and res.get("ok"):
             res["why"].append("the lots changed (a sale or a closed lot): the stop and the first-target state carry "
