@@ -62,6 +62,10 @@ API. Writes only its own two tabs: _Exit_Plan (the ledger) and Exit_Plan (the
 page). Sends one e-mail when TFB_EXIT_MAIL=1. Never calls a broker, places,
 changes or cancels no order.
 
+1.0.1 (2026-11-11): the HOLD note 'stop X% under the last close' measured the gap
+against the stop (first live dry run: SUPN read 18.5% for a stop 15.7% under
+28.75); it is now measured against the last close.
+
 GATE: TFB_EXIT_PLAN = off (default) | observe (compute and print, write and
 send nothing) | on. Rollback: repository variable TFB_EXIT_PLAN=off.
 """
@@ -85,7 +89,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -275,7 +279,7 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
                 "r_high": r_high, "stop": stop, "prev_stop": prev_stop, "target": target, "tp1": tp1,
                 "trail_k": trail_k, "sessions": sessions, "pl_pct": (last[4] / entry - 1) * 100.0,
-                "stop_gap_pct": (last[4] / stop - 1) * 100.0})
+                "stop_gap_pct": (1 - stop / last[4]) * 100.0})
     tp1_before = text(prev.get("TP1 Reached")).lower() == "yes" if prev else False
     if last[4] <= stop:
         res["action"] = "SELL"
