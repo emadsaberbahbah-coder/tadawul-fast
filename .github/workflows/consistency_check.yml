@@ -1,7 +1,10 @@
 # =============================================================================
 # 🧮 Consistency Check - the same figure on every page
 # -----------------------------------------------------------------------------
-# VERSION 1.1.0 (2026-11-11)
+# VERSION 1.2.0 (2026-11-11)
+#
+# 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). Minute 50 from 07:50 to 00:50
+# Riyadh: 18 runs, each after that hour's Daily Plan and Exit Plan.
 #
 # 1.1.0: HOURLY at minute 50 (after the Daily Plan at :20 and the Exit Plan at
 # :35); the after-run triggers are dropped (the hourly run covers them). C11
@@ -19,7 +22,7 @@ name: 🧮 Consistency Check
 
 on:
   schedule:
-    - cron: "50 * * * *"
+    - cron: "50 4-21 * * *"         # 07:50-00:50 Riyadh
   workflow_dispatch:
     inputs:
       dry_run:
