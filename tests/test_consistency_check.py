@@ -49,7 +49,8 @@ def wb(**over):
                                ["Portfolio (SAR)", "Holdings (SAR)", "Cash (SAR)"], ["58,880 SAR", "25,755 SAR", "33,125 SAR"],
                                [], PH, ["TRIM", "DDI.US", 240, 15.70, 58.88, 54.15], ["HOLD", "GLPI.US", 79, 39.24, 147.15, 134.63],
                                [], ["SECTOR SUMMARY"]],
-        "Portfolio_Decision_v2": [["PORTFOLIO DECISION — v2", "UNCERTIFIED", "page built 2026-11-10 16:05"]],
+        "Portfolio_Decision_v2": [["PORTFOLIO DECISION — v2"] + [""] * 11 + ["UNCERTIFIED · page built 2026-11-10 16:05"],
+                                  ["x"], ["Sources: ledger 2026-11-10 13:33:57"]],          # the stamp sits in column M
         "_Portfolio_CostBasis": [["ledger"], ["Symbol", "Ccy", "Status", "Shares", "Current Price", "FX→SAR", "Market Value SAR"],
                                  ["DDI.US", "USD", "Active", 240, 15.70, 3.757, "14,156"], ["GLPI.US", "USD", "Active", 79, 39.24, 3.757, "11,647"],
                                  ["5023.SR", "SAR", "Active", 100, 99.0, 1.0, "9,900"], ["OLD.US", "USD", "Inactive", 5, 1, 3.757, ""]],
@@ -105,7 +106,7 @@ def test_k2_an_aligned_workbook_matches():
     g["Top_10_Investments"][5] = [1, "TEN.US", "Tsakos", "7,900 SAR", 47, "Cash"]
     g["Top_10_Investments"][6] = [2, "NMM.US", "Navios", "7,900 SAR", 24, "Cash"]
     g["Top_10_Investments_v2"][2] = ["Status: Last run 2026-11-11 11:11:14"]
-    g["Portfolio_Decision_v2"][0] = ["v2", "", "page built 2026-11-11 11:20"]
+    g["Portfolio_Decision_v2"][0][12] = "page built 2026-11-11 11:20"
     for r in g["_Portfolio_CostBasis"][2:4]:
         r[5] = 3.75
     g["_Portfolio_CostBasis"][2][6], g["_Portfolio_CostBasis"][3][6] = "14,130", "11,625"
@@ -119,6 +120,14 @@ def test_k3_edges():
     g = wb(_Daily_Plan=[["Plan Date", "Kind", "Symbol", "Status"]], _Exit_Plan=[])
     assert by(g, "C1 decision")[0][1] == "INFO" and "main page tickets: ZTO.US" in by(g, "C1 decision")[0][2]
     assert by(g, "C9 stops")[0][1] == "INFO" and not by(g, "C10 actions")
+    assert cc.RANGES["Portfolio_Decision_v2"] == "A1:Z4"                          # Codex P2 on #958: column M is read
+    g = wb(Portfolio_Decision_v2=[["v2"], ["x"], ["Sources: ledger 2026-11-10 13:33:57"]])
+    assert by(g, "C3 v2 freshness")[1][1] == "INFO"                               # another time on the page is not the build time
+    g = wb(My_Portfolio=[])                                                       # Codex P2 on #958: unread is not agreement
+    assert by(g, "C4 prices")[0][1] == "INFO" and "no rows read from My_Portfolio" in by(g, "C4 prices")[0][2]
+    assert "one price only for 5023.SR" in by(g, "C4 prices")[0][2]
+    g = wb(_Portfolio_CostBasis=[])
+    assert by(g, "C4 prices")[0][1] == "INFO" and "the ledger" in by(g, "C4 prices")[0][2]
     g = wb()
     g["My_Portfolio"][1][2] = 15.80                                               # 0.64% apart
     assert by(g, "C4 prices")[0][1] == "MISMATCH" and by(g, "C4 prices", price_tol=1.0)[0][1] == "MATCH"

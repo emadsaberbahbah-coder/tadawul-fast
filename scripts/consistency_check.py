@@ -192,7 +192,7 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
                    pages="Top_10_Investments / Calendar_Events"))
     # C3
     for main, v2, mark in (("Top_10_Investments", "Top_10_Investments_v2", "Last run"),
-                           ("Portfolio_Decision", "Portfolio_Decision_v2", "")):
+                           ("Portfolio_Decision", "Portfolio_Decision_v2", "page built")):
         a, b = stamp_in(g.get(main) or [], after="Last run"), stamp_in(g.get(v2) or [], after=mark)
         if a is None or b is None:
             out.append(row("C3 v2 freshness", "INFO", "%s: a render time is not readable" % v2, pages=main + " / " + v2))
@@ -215,18 +215,29 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
         g.get("My_Portfolio") or [], ("Symbol", "Current Price"), "Symbol")}
     pdr = {text(d["Symbol"]).upper(): d for d in table_rows(pd, ("Action", "Symbol", "Qty", "Price"), "Symbol")}
     # C4 / C5
-    bad_px, bad_qty = [], []
+    bad_px, bad_qty, alone = [], [], []
     for s, lot in sorted(lots.items()):
         prices = {"ledger": lot["px"], "My_Portfolio": mp.get(s), "Portfolio_Decision": num((pdr.get(s) or {}).get("Price"))}
         have = {n: p for n, p in prices.items() if p}
+        if len(have) < 2:
+            alone.append(s)
         if len(have) >= 2 and _pct(max(have.values()), min(have.values())) > k["price_tol"]:
             bad_px.append("%s %s" % (s, ", ".join("%s %s" % (n, fmt(p)) for n, p in have.items())))
         q = num((pdr.get(s) or {}).get("Qty"))
         if q is not None and abs(q - lot["shares"]) > 1e-6:
             bad_qty.append("%s ledger %s vs Portfolio_Decision %s" % (s, fmt(lot["shares"], 0), fmt(q, 0)))
     pages3 = "My_Portfolio / _Portfolio_CostBasis / Portfolio_Decision"
-    out.append(row("C4 prices", "MISMATCH" if bad_px else "MATCH", "; ".join(bad_px) or
-                   "%d holding(s) priced within %.1f%% on every page" % (len(lots), k["price_tol"]), pages=pages3))
+    missing = [n for n, v in (("the ledger", lots), ("My_Portfolio", mp), ("Portfolio_Decision", pdr)) if not v]
+    if bad_px:
+        out.append(row("C4 prices", "MISMATCH", "; ".join(bad_px), pages=pages3))
+    elif missing or alone:
+        # a page that could not be read is not agreement
+        out.append(row("C4 prices", "INFO", "not compared: " + "; ".join(
+            (["no rows read from " + ", ".join(missing)] if missing else []) +
+            (["one price only for " + ", ".join(alone)] if alone else [])), pages=pages3))
+    else:
+        out.append(row("C4 prices", "MATCH", "%d holding(s) priced within %.1f%% on every page that lists them" % (
+            len(lots), k["price_tol"]), pages=pages3))
     out.append(row("C5 quantities", "MISMATCH" if bad_qty else "MATCH", "; ".join(bad_qty) or
                    "quantities agree for %d holding(s)" % len([s for s in lots if s in pdr]),
                    pages="_Portfolio_CostBasis / Portfolio_Decision"))
@@ -304,8 +315,8 @@ def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
 # ----------------------------------------------------------------------------- #
 # IO
 # ----------------------------------------------------------------------------- #
-RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:X60", "Top_10_Investments_v2": "A1:H4",
-          "Portfolio_Decision_v2": "A1:H4", "_Portfolio_CostBasis": "A1:Z600", "My_Portfolio": "A1:K60",
+RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:X60", "Top_10_Investments_v2": "A1:Z4",
+          "Portfolio_Decision_v2": "A1:Z4", "_Portfolio_CostBasis": "A1:Z600", "My_Portfolio": "A1:K60",
           "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Calendar_Events": "A1:J4000",
           "Dividend_Events": "A1:J4000"}
 
