@@ -591,3 +591,26 @@ def test_x16_the_action_belongs_to_the_close():
                 "Bars To": "2026-11-11"}]
     c = ep.prior_row(carried, "L", TODAY, c11)
     assert c["TP1 Today"] == "no" and c["TP1 Before"] == "yes"
+
+
+def test_x16_bought_in_a_session_that_has_not_closed():
+    # Codex P2 on #959: closes of 100, bought today at 120, live 120 - the completed closes predate the purchase,
+    # so no close rule may act on them (it read SELL: 100 is under the 110.40 stop)
+    bars = mk([100.0] * 40, 0.015)
+    bought = bars[-1][0] + dt.timedelta(days=1)
+    r = ep.exit_levels("NEW.US", 120.0, bought, bars, {"live": 120.0}, {}, K(), TODAY)
+    assert r["action"] == "HOLD" and r["fresh"] and r["stop"] == pytest.approx(110.4)
+    assert r["why"][0].startswith("bought on %s: no close since the purchase yet" % bought.isoformat())
+    assert "110.40" in r["why"][0] and "129.60" in r["why"][0] and r["pl_pct"] == pytest.approx(0.0)
+    assert r["r_high"] == 0.0 and r["hc"] == 120.0
+    slid = ep.exit_levels("NEW.US", 120.0, bought, bars, {"live": 108.0}, {}, K(), TODAY)
+    assert slid["action"] == "HOLD" and any("live price 108.00 is at or under the stop 110.40" in w for w in slid["why"])
+    none = ep.exit_levels("NEW.US", 120.0, bought, bars, {}, {}, K(), TODAY)
+    assert none["pl_pct"] is None
+    page = ep.page_rows([dict(none, name="New", shares=10, lot="L", broker_stop=None, prev={})], [],
+                        {"headline": "As of", "summary": "Today: HOLD 1"}, K())
+    assert any(row[0] == "NEW.US" and row[6] == "—" for row in page)
+    # once the purchase day has closed, the rules act on that close
+    done = mk([100.0] * 40 + [120.0], 0.015)
+    after = ep.exit_levels("NEW.US", 120.0, done[-1][0], done, {}, {}, K(), TODAY)
+    assert not after["fresh"] and after["action"] in ("HOLD", "RAISE STOP")

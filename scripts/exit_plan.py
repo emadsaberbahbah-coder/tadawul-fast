@@ -80,7 +80,10 @@ once, after the 07:30 run. Three changes make an hourly run safe:
     'Bars To'), not to the hour of the run: every run on the same close shows
     the same RAISE STOP (with the stop it was before that close) and the same
     TAKE PROFIT, so the 07:30 e-mail carries what the 23:35 run issued on the
-    US close; TAKE PROFIT is not repeated on a later close.
+    US close; TAKE PROFIT is not repeated on a later close;
+  - a lot bought in a session that has not closed yet has no close to judge:
+    it reads HOLD with its initial stop and first target until the first
+    close after the purchase (Codex P2 on #959).
 
 GATE: TFB_EXIT_PLAN = off (default) | observe (compute and print, write and
 send nothing) | on. Rollback: repository variable TFB_EXIT_PLAN=off.
@@ -280,6 +283,9 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     last = bars[-1]
     closes = [b[4] for b in bars[-20:]]
     sma20 = sum(closes) / len(closes)
+    fresh = last[0] < entry_date                         # 1.1.0: bought in a session that has not closed yet
+    if fresh:
+        hc = entry
     r_high = (hc - entry) / r
     news_neg = int(info.get("news_neg") or 0)
     if news_neg:
@@ -316,10 +322,18 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
                 "r_high": r_high, "stop": stop, "prev_stop": was_stop, "target": target, "tp1": tp1,
                 "trail_k": trail_k, "sessions": sessions, "pl_pct": (last[4] / entry - 1) * 100.0,
-                "stop_gap_pct": (1 - stop / last[4]) * 100.0})
+                "stop_gap_pct": (1 - stop / last[4]) * 100.0, "fresh": fresh})
+    if fresh:
+        live_px = info.get("live")
+        res["pl_pct"] = (live_px / entry - 1) * 100.0 if live_px else None
     tp1_before = text(prev.get("TP1 Before", prev.get("TP1 Reached"))).lower() == "yes" if prev else False
     tp1_today = text(prev.get("TP1 Today")).lower() == "yes" if prev else False
-    if last[4] <= stop:
+    if fresh:                                             # Codex P2 on #959: no close since the purchase yet
+        res["action"] = "HOLD"
+        res["why"].append("bought on %s: no close since the purchase yet, so the close rules wait for the first one; "
+                          "the initial stop %s and the first target %s apply" % (entry_date.isoformat(), fmt(stop),
+                                                                                 fmt(entry + r)))
+    elif last[4] <= stop:
         res["action"] = "SELL"
         res["why"].append("last close %s is at or below the stop %s" % (fmt(last[4]), fmt(stop)))
     elif tp1_today:                                       # issued on this close by an earlier run: it stays
@@ -597,7 +611,7 @@ def page_rows(results: List[Dict[str, Any]], picks: List[Dict[str, Any]], info: 
                          "", "", "", "", "", r["action"], "; ".join(r["why"]), ""])
             continue
         rows.append([r["symbol"], r.get("name", ""), fmt(r.get("shares"), 0), fmt(r["entry"]), fmt(r["last"]),
-                     fmt(r.get("live")) if r.get("live") is not None else "—", "%+.1f" % r["pl_pct"], fmt(r["hc"]), "%.1f" % r["atr_pct"], "%+.1f" % r["r_high"],
+                     fmt(r.get("live")) if r.get("live") is not None else "—", "%+.1f" % r["pl_pct"] if r.get("pl_pct") is not None else "—", fmt(r["hc"]), "%.1f" % r["atr_pct"], "%+.1f" % r["r_high"],
                      fmt(r["stop"]), fmt(r["prev_stop"]) if r["prev_stop"] is not None else "—",
                      fmt(r["target"]), r["action"], "; ".join(r["why"]),
                      fmt(r.get("broker_stop")) if r.get("broker_stop") is not None else "unknown"])
