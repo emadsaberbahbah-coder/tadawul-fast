@@ -116,7 +116,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -171,6 +171,26 @@ def ev_mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def stable_mode() -> str:
+    """1.5.0 [TWO-LEVEL]: off | prefer (default: names at or above the entry level are picked first) | strict (a new
+    name under the entry level waits in the pipeline)."""
+    v = _env("TFB_PLAN_STABLE", "prefer").lower()
+    return v if v in ("off", "prefer", "strict") else "prefer"
+
+
+def parse_utc(v: Any) -> Optional[_dt.datetime]:
+    """'2026-11-11 19:22:31' / '2026-11-11T19:22:31Z' / a datetime, as UTC; None when it is not a time."""
+    if isinstance(v, _dt.datetime):
+        return v if v.tzinfo else v.replace(tzinfo=UTC)
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?", text(v))
+    if not m:
+        return None
+    try:
+        return _dt.datetime(*[int(x or 0) for x in m.groups()], tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def knobs() -> Dict[str, Any]:
     ccy = [c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
     return {
@@ -189,6 +209,10 @@ def knobs() -> Dict[str, Any]:
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
+        "quote_max_h": _env_num("TFB_PLAN_QUOTE_MAX_AGE_H", 96, 0, 720),          # 1.5.0: 0 = no age check
+        "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
+        "stable_enter": _env_num("TFB_PLAN_STABLE_ENTER", 72, 0, 100),
+        "stable_exit": _env_num("TFB_PLAN_STABLE_EXIT", 67, 0, 100),
         "div_tax": _env("TFB_PLAN_DIV_TAX", "on").lower() in ("on", "1", "true", "yes"),
         "div_tax_days": int(_env_num("TFB_PLAN_DIV_TAX_DAYS", 10, 0, 60)),
         "div_tax_min": _env_num("TFB_PLAN_DIV_TAX_MIN_PCT", 0.25, 0.0, 100.0),
@@ -350,7 +374,8 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
                         "sector": text(cell(r, col.get("Sector"))),
                         "warnings": text(cell(r, col.get("Warnings"))),
                         "risk": num(cell(r, col.get("Risk Score"))),
-                        "target": num(cell(r, col.get("Target Price")))}
+                        "target": num(cell(r, col.get("Target Price"))),
+                        "quote_at": parse_utc(cell(r, col.get("Last Updated (UTC)")))}   # 1.5.0: the row's sync time
     return out
 
 
@@ -534,7 +559,25 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         else:
             cands.append(c)
     keep = [s for s in prior_picks if s]
-    cands.sort(key=lambda c: (0 if (c["symbol"] in keep and c["rank"] <= k["keep_rank"]) else 1, c["rank"]))
+    smode, s_in, s_out = k.get("stable", "off"), k.get("stable_enter", 72.0), k.get("stable_exit", 67.0)
+
+    def kept(c: Dict[str, Any]) -> bool:
+        """A previous pick keeps its place while its rank holds and (1.5.0) its score is at or above the exit level."""
+        return (c["symbol"] in keep and c["rank"] <= k["keep_rank"]
+                and (smode == "off" or c.get("score") is None or c["score"] >= s_out))
+
+    def low(c: Dict[str, Any]) -> bool:
+        """1.5.0 [TWO-LEVEL]: a new name enters at s_in; a kept pick stays down to s_out. Measured 1 Sep-11 Nov
+        outside Tadawul: the label held the next day 91.0% of the time under this rule against 79.4%."""
+        return smode != "off" and not kept(c) and c.get("score") is not None and c["score"] < s_in
+
+    if smode == "strict":
+        for c in [c for c in cands if low(c)]:
+            c["waiting"] = "score %s is under the entry level %s (a pick stays down to %s)" % (
+                fmt(c["score"], 1), fmt(s_in, 0), fmt(s_out, 0))
+            pipeline.append(c)
+        cands = [c for c in cands if not low(c)]
+    cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
     picks: List[Dict[str, Any]] = []
     per_sector: Dict[str, int] = {}
     for c in cands:
@@ -546,8 +589,10 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             c["waiting"] = "sector cap (%s already has %d)" % (sec, per_sector[sec])
             pipeline.append(c)
         else:
-            if c["symbol"] in keep and c["rank"] <= k["keep_rank"]:
+            if kept(c):
                 c["labels"].append("kept from the previous plan")
+            elif low(c):
+                c["labels"].append("score %s is under the entry level %s" % (fmt(c["score"], 1), fmt(s_in, 0)))
             per_sector[sec] = per_sector.get(sec, 0) + 1
             picks.append(c)
     deployable = max(0.0, cash_sar - k["floor_pct"] / 100.0 * nav)
@@ -591,8 +636,11 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
 
 
 def pick_status(row: Dict[str, Any], price: Optional[float], held: Dict[str, _dt.date], plan_date: _dt.date,
-                earn_days: Optional[float], earn_guard: int, quality: str) -> Tuple[str, str]:
-    """Status of a frozen pick now. Order: EXECUTED, INVALIDATED, WAIT, CHECK, OPEN."""
+                earn_days: Optional[float], earn_guard: int, quality: str,
+                quote_at: Optional[_dt.datetime] = None, now: Optional[_dt.datetime] = None,
+                max_age_h: float = 0.0) -> Tuple[str, str]:
+    """Status of a frozen pick now. Order: EXECUTED, INVALIDATED, WAIT, CHECK, OPEN.
+    1.5.0 [QUOTE-AGE]: a price older than max_age_h reads CHECK - it can neither open nor invalidate a pick."""
     bd = held.get(row["symbol"])
     if bd is not None and bd >= plan_date:
         return "EXECUTED", "bought %s" % bd.isoformat()
@@ -600,6 +648,11 @@ def pick_status(row: Dict[str, Any], price: Optional[float], held: Dict[str, _dt
         return "INVALIDATED", "earnings in %d day(s)" % earn_days
     if price is None or price <= 0:
         return "CHECK", "no current price"
+    if max_age_h > 0 and quote_at is not None and now is not None:
+        age = (now - quote_at).total_seconds() / 3600.0
+        if age > max_age_h:
+            return "CHECK", "the price %s is %s old (limit %d h): not a current quote" % (
+                fmt(price), ("%d days" % (age // 24)) if age >= 48 else ("%d h" % age), max_age_h)
     if price <= row["stop"]:
         return "INVALIDATED", "price %s is at or below the stop %s" % (fmt(price), fmt(row["stop"]))
     if price > row["zone_high"]:
@@ -666,14 +719,15 @@ def live_overlay(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, An
             q = None
         if not q or not q[0] or q[0] <= 0:
             continue
-        sources[sym] = dict(sources.get(sym) or {}, price=float(q[0]))
+        sources[sym] = dict(sources.get(sym) or {}, price=float(q[0]), quote_at=q[1])
         out[sym] = q[1].astimezone(RIYADH).strftime("%H:%M")
     return out
 
 
 def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
                    cal: Dict[str, Dict[str, Any]], held: Dict[str, _dt.date], plan_date: _dt.date,
-                   earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None) -> None:
+                   earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None,
+                   now: Optional[_dt.datetime] = None, max_age_h: float = 0.0) -> None:
     for d in day_rows:
         if text(d["Kind"]) != "PICK":
             continue
@@ -684,7 +738,7 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
         row = {"symbol": sym, "stop": num(d["Stop"]) or 0.0, "zone_low": num(d["Zone Low"]) or 0.0,
                "zone_high": num(d["Zone High"]) or 0.0}
         st, why = pick_status(row, price, held, plan_date, (cal.get(sym) or {}).get("earn_days"), earn_guard,
-                              text(d["Cut Quality"]))
+                              text(d["Cut Quality"]), (sources.get(sym) or {}).get("quote_at"), now, max_age_h)
         if live and sym in live and price is not None:
             why += " (live %s Riyadh)" % live[sym]
         d["Status"], d["Status Reason"], d["Status At (Riyadh)"] = st, why, stamp
@@ -886,7 +940,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
         if live:
             _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
                                                   for s in sorted(live)))
-        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live)
+        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live,
+                       now=now, max_age_h=k["quote_max_h"])
         first = today_rows[0]
         info["headline"] = "Plan of %s · cut %s Riyadh from the main page's render of %s (%s) · status " \
                            "checked %s" % (day, text(first["Cut At (Riyadh)"]), text(first["Source Render"]),

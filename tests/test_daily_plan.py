@@ -626,7 +626,7 @@ def test_h2_live_overlay_edges(monkeypatch):
             raise OSError("network")
         return {"A.US": (2.5, at), "E.US": (0.0, at)}.get(sym)
     got = dp.live_overlay(rows, src, q)
-    assert got == {"A.US": "23:05"} and src["A.US"] == {"price": 2.5, "ccy": "USD"} and "E.US" not in src
+    assert got == {"A.US": "23:05"} and src["A.US"] == {"price": 2.5, "ccy": "USD", "quote_at": at} and "E.US" not in src
     monkeypatch.delenv("TFB_PLAN_LIVE_PRICE", raising=False)
     assert dp.knobs()["live"] is False
     monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "ON")
@@ -702,3 +702,84 @@ def test_h4_workflow_maps_the_dividend_knobs():
     assert env["TFB_PLAN_WHT_PCT"] == "${{ vars.TFB_PLAN_WHT_PCT || '30' }}"
     assert env["TFB_PLAN_DIV_TAX_DAYS"] == "${{ vars.TFB_PLAN_DIV_TAX_DAYS || '10' }}"
     assert env["TFB_PLAN_DIV_TAX_MIN_PCT"] == "${{ vars.TFB_PLAN_DIV_TAX_MIN_PCT || '0.25' }}"
+
+
+# ----------------------------------------------------------------------------- H5 (1.5.0)
+def test_h5_an_old_price_reads_check_and_never_opens_or_invalidates():
+    """ChatGPT review, 12 Nov: a quote dated 2020 returned OPEN in 2026. A price past the age limit reads CHECK."""
+    row = {"symbol": "A.US", "stop": 9.0, "zone_low": 9.7, "zone_high": 10.1}
+    now = dt.datetime(2026, 11, 12, 9, 0, tzinfo=UTC)
+    old, fresh = dt.datetime(2020, 1, 2, tzinfo=UTC), now - dt.timedelta(hours=20)
+    base = (row, 10.0, {}, dt.date(2026, 11, 12), None, 7, "VERIFIED")
+    assert dp.pick_status(*base)[0] == "OPEN"                                       # no time known: as before
+    assert dp.pick_status(*base, old, now, 96)[0] == "CHECK"
+    assert "days old (limit 96 h)" in dp.pick_status(*base, old, now, 96)[1]
+    assert dp.pick_status(*base, fresh, now, 96)[0] == "OPEN"
+    assert dp.pick_status(*base, old, now, 0)[0] == "OPEN"                          # 0 switches the check off
+    assert dp.pick_status(row, 8.0, {}, dt.date(2026, 11, 12), None, 7, "VERIFIED", old, now, 96)[0] == "CHECK"
+    assert dp.pick_status(row, 8.0, {}, dt.date(2026, 11, 12), None, 7, "VERIFIED", fresh, now, 96)[0] == "INVALIDATED"
+    edge = now - dt.timedelta(hours=96)
+    assert dp.pick_status(*base, edge, now, 96)[0] == "OPEN"                        # exactly at the limit passes
+    assert dp.pick_status(*base, now - dt.timedelta(hours=50), now, 48)[1].startswith("the price 10.00 is 2 days old")
+    assert dp.pick_status(*base, now - dt.timedelta(hours=30), now, 24)[1].startswith("the price 10.00 is 30 h old")
+    assert dp.parse_utc("2026-11-11 19:22:31") == dt.datetime(2026, 11, 11, 19, 22, 31, tzinfo=UTC)
+    assert dp.parse_utc("2026-11-11T19:22Z") == dt.datetime(2026, 11, 11, 19, 22, tzinfo=UTC)
+    assert dp.parse_utc("") is None and dp.parse_utc("n/a") is None and dp.parse_utc("2026-13-40 99:99") is None
+    grid = [["Symbol", "Current Price", "Currency", "Last Updated (UTC)"], ["A.US", 10, "USD", "2026-11-11 19:22:31"],
+            ["B.US", 5, "USD", ""]]
+    src = dp.read_sources([grid])
+    assert src["A.US"]["quote_at"] == dt.datetime(2026, 11, 11, 19, 22, 31, tzinfo=UTC) and src["B.US"]["quote_at"] is None
+    rows = [{"Kind": "PICK", "Symbol": "A.US", "Status": "OPEN", "Stop": 9, "Zone Low": 9.7, "Zone High": 10.1,
+             "Cut Quality": "VERIFIED", "Status Reason": "", "Status At (Riyadh)": "", "Last Price": ""}]
+    dp.refresh_status(rows, src, {}, {}, dt.date(2026, 11, 12), 7, "s", None, now=now + dt.timedelta(days=30), max_age_h=96)
+    assert rows[0]["Status"] == "CHECK"
+    dp.refresh_status(rows, src, {}, {}, dt.date(2026, 11, 12), 7, "s", None, now=now, max_age_h=96)
+    assert rows[0]["Status"] == "OPEN"
+    assert dp.knobs()["quote_max_h"] == 96
+
+
+def _cand(sym, rank, score, sector):
+    return {"rank": rank, "symbol": sym, "name": sym, "market": "US", "sector": sector, "roi12": 20.0, "risk": "Low",
+            "score": score, "rel": 80.0, "selected": True, "why": ""}
+
+
+def test_h5_two_level_rule_prefers_names_at_the_entry_level(monkeypatch):
+    """Claude review, 12 Nov: a new name enters at 72; a previous pick stays down to 67."""
+    q = [_cand("A.US", 1, 70.5, "S1"), _cand("B.US", 2, 73.0, "S2"), _cand("C.US", 3, 68.0, "S3"),
+         _cand("D.US", 4, 75.0, "S4"), _cand("E.US", 5, 66.0, "S5")]
+    src = {c["symbol"]: {"price": 10.0, "ccy": "USD"} for c in q}
+    lots = {"held": {}, "recent": {}, "mv_sar": 0.0}
+
+    def picks(k, prior=()):
+        plan = dp.decide([dict(c) for c in q], dict(src), {}, lots, 100000.0, 3, k, prior_picks=prior)
+        return [p["symbol"] for p in plan["picks"]], plan
+    assert dp.knobs()["stable"] == "prefer" and dp.knobs()["stable_enter"] == 72 and dp.knobs()["stable_exit"] == 67
+    got, plan = picks(K(picks=3))
+    assert got == ["B.US", "D.US", "A.US"]                                          # 72+ first, then by rank
+    assert any("score 70.5 is under the entry level 72" in x for x in plan["picks"][2]["labels"])
+    assert picks(K(picks=3, stable="off"))[0] == ["A.US", "B.US", "C.US"]           # the old order
+    got, plan = picks(K(picks=3, stable="strict"))
+    assert got == ["B.US", "D.US"]
+    waits = {c["symbol"]: c["waiting"] for c in plan["pipeline"]}
+    assert waits["A.US"] == "score 70.5 is under the entry level 72 (a pick stays down to 67)" and "E.US" in waits
+    got, plan = picks(K(picks=3), prior=("C.US", "E.US"))                           # C kept at 68; E fell under 67
+    assert got == ["C.US", "B.US", "D.US"] and "kept from the previous plan" in plan["picks"][0]["labels"]
+    assert picks(K(picks=3, stable="strict"), prior=("C.US", "E.US"))[0] == ["C.US", "B.US", "D.US"]
+    assert picks(K(picks=3, stable="off"), prior=("E.US",))[0] == ["E.US", "A.US", "B.US"]   # off: rank only
+    assert picks(K(picks=3, stable_enter=70.5))[0] == ["A.US", "B.US", "D.US"]      # exactly at the level enters
+    none = [dict(c, score=None) for c in q]
+    plan = dp.decide(none, dict(src), {}, lots, 100000.0, 3, K(picks=3), prior_picks=())
+    assert [p["symbol"] for p in plan["picks"]] == ["A.US", "B.US", "C.US"]         # no score: never held back
+    monkeypatch.setenv("TFB_PLAN_STABLE", "junk")
+    assert dp.stable_mode() == "prefer"
+    monkeypatch.setenv("TFB_PLAN_STABLE", "STRICT")
+    assert dp.stable_mode() == "strict"
+
+
+def test_h5_workflow_maps_the_new_knobs():
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"][list(wf["jobs"])[0]]["steps"] if "TFB_PLAN_STABLE" in (s.get("env") or {})][0]["env"]
+    assert env["TFB_PLAN_STABLE"] == "${{ vars.TFB_PLAN_STABLE || 'prefer' }}"
+    assert env["TFB_PLAN_STABLE_ENTER"] == "${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}"
+    assert env["TFB_PLAN_STABLE_EXIT"] == "${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}"
+    assert env["TFB_PLAN_QUOTE_MAX_AGE_H"] == "${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}"

@@ -103,6 +103,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -115,7 +116,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -438,7 +439,8 @@ def read_lots(values: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
         if not px or not sh or px <= 0 or sh <= 0 or bd is None:
             continue
         o = out.setdefault(sym, {"symbol": sym, "name": text(cell(r, col.get("Name"))), "shares": 0.0,
-                                 "cost": 0.0, "date": bd, "ccy": text(cell(r, col.get("Ccy")))})
+                                 "cost": 0.0, "date": bd, "ccy": text(cell(r, col.get("Ccy"))), "lots": 0})
+        o["lots"] += 1
         o["shares"] += sh
         o["cost"] += px * sh
         o["date"] = max(o["date"], bd)
@@ -467,8 +469,25 @@ def read_info(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, A
     return out
 
 
+NEWS_NOISE_RE = re.compile(
+    r"shareholder (alert|update|notice|investigation)|notif(ying|ies) investors|investors? who lost|"
+    r"investigations? on behalf|class action|law (firm|offices?)|securities (litigation|fraud)|"
+    r"deadline (alert|reminder)|brodsky|rosen law|pomerantz|levi & korsinsky|bragar eagel|bronstein|faruqi|"
+    r"hagens berman|glancy|kessler topaz|robbins geller|schall law|johnson fistel", re.I)
+
+
+def news_is_noise(event_type: Any, headline: Any, grade: Any) -> bool:
+    """1.3.0 [NEWS-NOISE]: a law-firm solicitation (they go out on tier-A wires and read 'negative'), or a cluster
+    that is rumour-only, denied or social-only (information grade 4-6), never tightens a stop."""
+    if text(event_type).lower() == "law_firm_noise" or NEWS_NOISE_RE.search(text(headline)):
+        return True
+    g = num(grade)
+    return g is not None and g >= 4
+
+
 def read_news(values: Sequence[Sequence[Any]], now: _dt.datetime, days: int) -> Dict[str, Dict[str, Any]]:
-    """Negative symbol news (direction -1, severity H or M) published in the last `days` days."""
+    """Negative symbol news (direction -1, severity H or M) published in the last `days` days. 1.3.0: items that
+    news_is_noise() are counted under 'ignored' and never under 'n'."""
     h, col = table_index(values, ("Scope", "Direction", "Severity"))
     out: Dict[str, Dict[str, Any]] = {}
     if h is None or days <= 0:
@@ -483,7 +502,10 @@ def read_news(values: Sequence[Sequence[Any]], now: _dt.datetime, days: int) -> 
         pub = _parse_ts(cell(r, col.get("Published (UTC)")))
         if pub is None or pub < since:
             continue
-        o = out.setdefault(scope, {"n": 0, "headline": "", "at": None})
+        o = out.setdefault(scope, {"n": 0, "headline": "", "at": None, "ignored": 0})
+        if news_is_noise(cell(r, col.get("Event Type")), cell(r, col.get("Headline")), cell(r, col.get("Cluster Grade"))):
+            o["ignored"] += 1
+            continue
         o["n"] += 1
         if o["at"] is None or pub > o["at"]:
             o["at"], o["headline"] = pub, text(cell(r, col.get("Headline")))[:90]
@@ -846,6 +868,11 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
                     "broker_stop": stops.get(sym), "prev": prev})
         if (news.get(sym) or {}).get("headline"):
             res["why"].append("latest negative item: %s" % news[sym]["headline"])
+        if (news.get(sym) or {}).get("ignored"):                                       # 1.3.0 [NEWS-NOISE]
+            res["why"].append("%d news item(s) ignored: law-firm notice or unconfirmed" % news[sym]["ignored"])
+        if lot.get("lots", 1) > 1:                                                     # 1.3.0: the merged basis, stated
+            res["why"].append("entry is the weighted price of %d buys; days are counted from the latest buy"
+                              % lot["lots"])
         note = dividend_note(sym, lot["shares"], res.get("last"), cal.get(sym) or {}, k)   # 1.2.0 [DIV-TAX]
         if note:
             res["why"].append(note)

@@ -264,7 +264,8 @@ def test_x12_parsers():
             ["5", "2026-11-10 12:00", "GLPI.US", "1", "H", "up"],
             ["6", "2026-11-10 12:00", "MACRO", "-1", "H", "war"]]
     got = ep.read_news(news, NOW, 3)
-    assert got == {"DDI.US": {"n": 2, "headline": "DDI misses", "at": dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC)}}
+    assert got == {"DDI.US": {"n": 2, "headline": "DDI misses", "at": dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC),
+                              "ignored": 0}}
     assert ep.read_news(news, NOW, 0) == {}
     acct = [["key", "value"], ["as_of", "2026-11-11 06:00 Riyadh"]]
     orders = [["symbol", "side", "type", "qty", "price", "status"], ["DDI", "SELL", "STOP", 240, 12.9, "NEW"],
@@ -681,3 +682,37 @@ def test_x17_run_carries_the_dividend_note(monkeypatch):
     env = [s for s in wf["jobs"][list(wf["jobs"])[0]]["steps"] if "TFB_EXIT_WHT_PCT" in (s.get("env") or {})][0]["env"]
     assert env["TFB_EXIT_WHT_PCT"] == "${{ vars.TFB_EXIT_WHT_PCT || '30' }}"
     assert env["TFB_EXIT_DIV_WARN_DAYS"] == "${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}"
+
+
+# ----------------------------------------------------------------------------- X18 (1.3.0)
+def test_x18_law_firm_notices_and_unconfirmed_items_never_tighten_a_stop():
+    """ChatGPT review, 12 Nov: DDI's trail was tightened by 'BRODSKY & SMITH SHAREHOLDER UPDATE: Notifying Investors
+    of the Following Investigations' - an advertisement carried on a tier-A wire."""
+    hdr = ["Item ID", "Published (UTC)", "Scope", "Event Type", "Direction", "Severity", "Tier", "Cluster Grade", "Headline"]
+    rows = [hdr,
+            ["1", "2026-11-10 12:00", "DDI.US", "legal_regulatory", "-1", "M", "A", "1",
+             "BRODSKY & SMITH SHAREHOLDER UPDATE: Notifying Investors of the Following Investigations: DoubleDown"],
+            ["2", "2026-11-10 13:00", "DDI.US", "law_firm_noise", "-1", "H", "A", "1", "anything"],
+            ["3", "2026-11-10 14:00", "DDI.US", "earnings", "-1", "H", "C", "4", "rumour only"],
+            ["4", "2026-11-10 15:00", "DDI.US", "earnings", "-1", "H", "E", "6", "social only"],
+            ["5", "2026-11-10 11:00", "GLPI.US", "earnings", "-1", "H", "B", "2", "GLPI cuts guidance"],
+            ["6", "2026-11-10 11:30", "GLPI.US", "legal_regulatory", "-1", "M", "A", "",
+             "Pomerantz Law Firm announces a class action against GLPI"],
+            ["7", "2026-11-10 10:00", "IBOC.US", "earnings", "-1", "M", "B", "3", "IBOC misses"]]
+    got = ep.read_news(rows, NOW, 3)
+    assert got["DDI.US"] == {"n": 0, "headline": "", "at": None, "ignored": 4}
+    assert got["GLPI.US"]["n"] == 1 and got["GLPI.US"]["ignored"] == 1 and got["GLPI.US"]["headline"] == "GLPI cuts guidance"
+    assert got["IBOC.US"]["n"] == 1 and got["IBOC.US"]["ignored"] == 0            # grade 3 still counts
+    assert ep.news_is_noise("earnings", "Company misses estimates", "") is False   # no grade: counted, as before
+    assert ep.news_is_noise("earnings", "Company misses estimates", 3.0) is False
+    assert ep.news_is_noise("earnings", "Company misses estimates", 4) is True
+    for h in ("SHAREHOLDER ALERT: act now", "Rosen Law Firm reminds investors", "Investigation on behalf of holders",
+              "Levi & Korsinsky notifies investors", "DEADLINE ALERT for XYZ", "Investors who lost money in XYZ"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is True, h
+    lots = ep.read_lots(LOTS)
+    assert lots["DDI.US"]["lots"] == 2 and lots["5023.SR"]["lots"] == 1
+    tax = json.loads((ROOT / "data" / "news_gate_taxonomy.json").read_text(encoding="utf-8"))
+    flat = json.dumps(tax).lower()
+    assert "brodsky & smith" in flat and "shareholder update" in flat and "notifying investors" in flat
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
+        encoding="utf-8")
