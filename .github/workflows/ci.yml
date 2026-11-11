@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
+#
+# v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
+# 1.0.0 and consistency_check.yml 1.0.0: the same figure on every decision
+# page, one result page) in the blocking lean lane.
+#
 # VERSION 1.1.78 (2026-11-11) -- EXIT PLAN SUITE
 #
 # v1.1.78: run tests/test_exit_plan.py (scripts/exit_plan.py 1.0.0 and
@@ -1173,6 +1179,7 @@ jobs:
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
             tests/test_exit_plan.py \
+            tests/test_consistency_check.py \
             tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
