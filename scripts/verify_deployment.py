@@ -361,7 +361,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("daily_plan", "1.5.0", "daily plan"),
     ("exit_plan", "1.3.0", "exit plan"),
     ("consistency_check", "1.1.0", "consistency check"),
-    ("evidence_board", "1.0.0", "evidence board"),
+    ("evidence_board", "1.1.0", "evidence board"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]

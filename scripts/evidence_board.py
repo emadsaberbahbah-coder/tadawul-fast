@@ -4,7 +4,17 @@ scripts/evidence_board.py
 ================================================================================
 TFB Evidence Board - what the archive says works, measured again every day
 --------------------------------------------------------------------------------
-v1.0.0 (2026-11-12)
+v1.1.0 (2026-11-12)
+  1.1.0: THE FORWARD RECORD STARTS (owner, 12 Nov 02:05: "go with the best option"). Decisions recorded in the
+         project doc TFB_Decisions_Learning_Gate_and_Tadawul_2026-11-12:
+         - the shadow score and the chance figures can only be judged on records made BEFORE the outcome, so every
+           run now appends its names to _Evidence_Log (one row per symbol and day; a re-run replaces the day);
+         - Tadawul stays closed to new entries while the engine lists no INVESTABLE Saudi name; the board shows the
+           ten Saudi names with the strongest price trend as a SHADOW LIST and logs them, so the trend rule has a
+           forward record when the question of reopening comes up;
+         - the learning gate's own page (S1_Gate, first rows) is copied onto the board, so its verdict is read next
+           to the picks.
+  1.0.0: the board (market state, names, factor edge, label stability).
 
 WHY
     Reviews of 12 Nov 2026 (Claude and ChatGPT, consolidated plan in the project
@@ -14,7 +24,7 @@ WHY
     now, not in a document. This script re-runs the measurements of that review
     on the BigQuery archive on every run and publishes them on one page.
 
-WHAT IT WRITES (one tab, Evidence_Board; nothing else)
+WHAT IT WRITES (its page Evidence_Board and its ledger _Evidence_Log; nothing else)
     1. MARKET STATE per market (US, Tadawul): the share of names above their
        50-day average, the state (WASHED OUT < 40% / MIXED / BROAD >= 60%) and
        what followed that state in the last year of weekly dates.
@@ -57,11 +67,16 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 TAB = "Evidence_Board"
+LOG_TAB = "_Evidence_Log"
+LOG_HEADERS = ["Date", "Symbol", "Market", "Kind", "Engine Label", "Engine Score", "Shadow Score", "Chance Up 21",
+               "Basis", "Close", "Range Low", "Range High", "Market State", "Trend Rank", "Version"]
+LOG_MAX_ROWS = 6000
+GATE_TAB = "S1_Gate"
 PLAN_LEDGER_TAB = "_Daily_Plan"
 WIDTH = 12
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
@@ -280,6 +295,17 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
             pad(["Rule", "Name-days", "Kept the label next day", "Drops", "Names a day"])]
     for s in data["stability"]:
         out.append(pad([s["rule"], fmt(s["name_days"], 0), pct(s["kept"]), fmt(s["drops"], 0), fmt(s["per_day"], 1)]))
+    out += [pad([]), pad(["5. TADAWUL SHADOW LIST - the ten Saudi names with the strongest price trend. Tadawul is closed to "
+                          "new entries; this list is recorded so the trend rule has a forward record"]),
+            pad(["Symbol", "Name", "Trend rank", "Chance up, 21 bars", "Based on", "Close", "Range low (10%)", "Range high (90%)"])]
+    for d in data.get("sr_shadow") or []:
+        out.append(pad([d["symbol"], d["name"], pct(d["trend"], 0), pct(d["chance"]), d["basis"], fmt(d["close"]),
+                        fmt(d["lo"]), fmt(d["hi"])]))
+    if not data.get("sr_shadow"):
+        out.append(pad(["", "No Saudi name with enough price history on a recent bar."]))
+    out += [pad([]), pad(["6. LEARNING GATE - copied from the %s page; while it reads FAIL no new scoring is promoted" % GATE_TAB])]
+    for r in data.get("gate") or [["", "The %s page could not be read." % GATE_TAB]]:
+        out.append(pad(r))
     out += [pad([]), pad(["How to read: 'Chance up' is how often names in the same market, market state and trend bucket "
                           "finished higher 21 bars later in the past year. The range assumes no drift. The shadow score "
                           "is an equal-weight challenger (analyst-target upside, price trend, low risk; Tadawul: trend "
@@ -371,6 +397,19 @@ def sql_names(ds: str, symbols: Sequence[Any]) -> str:
     ).replace("{DS}", ds).replace("{LIST}", lst)
 
 
+def sql_sr_shadow(ds: str, top: int = 10) -> str:
+    """The `top` Tadawul names by price trend (the mean of three ranks) on their latest bar."""
+    return (
+        "WITH " + _base(ds, "AND symbol LIKE '%.SR'") + ", "
+        "r AS (SELECT *, STDDEV(SAFE_DIVIDE(close,c1)-1) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) vol60 FROM b), "
+        "f AS (SELECT symbol, close, vol60, PERCENT_RANK() OVER (ORDER BY c21/c252) pmom, PERCENT_RANK() OVER (ORDER BY close/hi252) phi, "
+        "PERCENT_RANK() OVER (ORDER BY close/sma200) p200 FROM r WHERE rn=nb AND rn>=253 AND date>=DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)), "
+        "u AS (SELECT symbol, ANY_VALUE(name) name FROM `{DS}.v_universe_latest` WHERE symbol LIKE '%.SR' GROUP BY 1) "
+        "SELECT f.symbol, u.name, f.close, f.vol60, f.pmom, f.phi, f.p200 FROM f LEFT JOIN u USING (symbol) "
+        "ORDER BY (f.pmom+f.phi+f.p200) DESC, f.symbol LIMIT {TOP}"
+    ).replace("{DS}", ds).replace("{TOP}", str(max(1, min(50, int(top)))))
+
+
 def sql_stability(ds: str, enter: float, leave: float) -> str:
     return (
         "WITH s AS (SELECT symbol, signal_date d, MAX(IF(investability='INVESTABLE',1,0)) inv, "
@@ -449,7 +488,18 @@ def collect(session: Any, project: str, dataset: str, location: str, picks: Sequ
     stability = [{"rule": text(r.get("rule")), "name_days": num(r.get("name_days")), "kept": num(r.get("kept")),
                   "drops": num(r.get("drops")), "per_day": num(r.get("per_day"))}
                  for r in query(session, project, location, sql_stability(ds, k["enter"], k["leave"]))]
-    return {"states": states, "names": names, "factors": factors, "stability": stability}
+    sr_state = now_state.get("SR", "")
+    sr_shadow: List[Dict[str, Any]] = []
+    for r in query(session, project, location, sql_sr_shadow(ds)):
+        tr = trend_rank(r)
+        chance, basis = chance_up(cells, "SR", sr_state, bucket_of(num(r.get("pmom")), num(r.get("phi"))), k["min_weeks"]) \
+            if sr_state else (None, "no market state for this market")
+        lo, hi = price_range(num(r.get("close")), num(r.get("vol60")))
+        sr_shadow.append({"symbol": text(r.get("symbol")).upper(), "name": text(r.get("name")), "trend": tr,
+                          "shadow": round(tr * 100.0, 1) if tr is not None else None, "chance": chance, "basis": basis,
+                          "close": num(r.get("close")), "lo": lo, "hi": hi})
+    return {"states": states, "names": names, "factors": factors, "stability": stability, "sr_shadow": sr_shadow,
+            "now_state": now_state}
 
 
 def plan_picks(values: Sequence[Sequence[Any]], today: _dt.date) -> List[str]:
@@ -471,6 +521,47 @@ def plan_picks(values: Sequence[Sequence[Any]], today: _dt.date) -> List[str]:
     except ValueError:
         return []
     return clean_symbols(r[si] for r in rows[1:] if len(r) > max(di, ki, si) and text(r[di]) == last and text(r[ki]) == "PICK")
+
+
+def gate_rows(values: Sequence[Sequence[Any]], limit: int = 8, width: int = 8) -> List[List[str]]:
+    """The first `limit` non-empty rows of the learning-gate page, as text, `width` cells each (a copy, not a reading)."""
+    out: List[List[str]] = []
+    for r in values or []:
+        cells = [text(c)[:160] for c in list(r)[:width]]
+        if any(cells):
+            out.append(cells)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def log_rows(data: Dict[str, Any], day: str) -> List[List[Any]]:
+    """Today's ledger rows: every name of section 2 (PICK / INVESTABLE) and every row of the Tadawul shadow list."""
+    state = data.get("now_state") or {}
+    out: List[List[Any]] = []
+
+    def row(d: Dict[str, Any], kind: str, label: str, score: Any) -> List[Any]:
+        m = market_of(d["symbol"])
+        v = lambda x, nd=4: "" if x is None else round(float(x), nd)   # noqa: E731
+        return [day, d["symbol"], m, kind, label, v(score, 1), v(d.get("shadow"), 1), v(d.get("chance")), d.get("basis", ""),
+                v(d.get("close")), v(d.get("lo")), v(d.get("hi")), state.get(m, ""), v(d.get("trend")), __version__]
+    for d in data.get("names") or []:
+        out.append(row(d, "PICK" if d["pick"] else "INVESTABLE", d["label"], d.get("score")))
+    seen = {r[1] for r in out}
+    for d in data.get("sr_shadow") or []:
+        if d["symbol"] not in seen:
+            out.append(row(d, "SR_SHADOW", "", None))
+    return out
+
+
+def merge_log(existing: Sequence[Sequence[Any]], new_rows: Sequence[Sequence[Any]], day: str) -> List[List[Any]]:
+    """The ledger with `day` replaced by new_rows: header first, oldest rows dropped past LOG_MAX_ROWS."""
+    keep: List[List[Any]] = []
+    for r in list(existing)[1:] if existing and [text(c) for c in existing[0]][:2] == LOG_HEADERS[:2] else []:
+        if r and text(r[0]) and text(r[0]) != day:
+            keep.append((list(r) + [""] * len(LOG_HEADERS))[:len(LOG_HEADERS)])
+    body = (keep + [list(r) for r in new_rows])[-LOG_MAX_ROWS:]
+    return [list(LOG_HEADERS)] + body
 
 
 # ----------------------------------------------------------------------------- #
@@ -495,6 +586,9 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         from scripts.daily_plan import _read, write_grid  # noqa: PLC0415
         picks = plan_picks(_read(book, PLAN_LEDGER_TAB, "A1:Z2100"), now.astimezone(RIYADH).date())
         data = collect(session, project, dataset, _env("TFB_BQ_LOCATION", "US"), picks, k, query=query)
+        data["gate"] = gate_rows(_read(book, GATE_TAB, "A1:H40"))
+        day = now.astimezone(RIYADH).strftime("%Y-%m-%d")
+        ledger = merge_log(_read(book, LOG_TAB, "A1:O%d" % (LOG_MAX_ROWS + 50)), log_rows(data, day), day)
     except Exception as e:  # noqa: BLE001 - one page; a failed read leaves the previous page in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
@@ -512,13 +606,18 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
                                                    fmt(f["ic"], 3), fmt(f["t"], 2)))
     for s in data["stability"]:
         _out("STABILITY %-40s kept %s drops %s names/day %s" % (s["rule"], pct(s["kept"]), fmt(s["drops"], 0), fmt(s["per_day"], 1)))
+    for d in data["sr_shadow"]:
+        _out("SR-SHADOW %-8s trend %s chance-up %s close %s" % (d["symbol"], pct(d["trend"], 0), pct(d["chance"]) or "-",
+                                                             fmt(d["close"]) or "-"))
     rows = page_rows(data, now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M"))
     if dry_run:
         _out("dry run: %d page row(s) computed, nothing written" % len(rows))
         return 0
     write_grid(book, TAB, rows, WIDTH, 120)
-    _out("wrote the %s page (%d rows: %d market(s), %d name(s), %d factor row(s))" % (
-        TAB, len(rows), len(data["states"]), len(data["names"]), len(data["factors"])))
+    write_grid(book, LOG_TAB, ledger, len(LOG_HEADERS), 200)
+    _out("wrote the %s page (%d rows: %d market(s), %d name(s), %d factor row(s), %d Saudi shadow name(s)) and %d "
+         "ledger row(s) in %s" % (TAB, len(rows), len(data["states"]), len(data["names"]), len(data["factors"]),
+                                  len(data["sr_shadow"]), len(ledger) - 1, LOG_TAB))
     return 0
 
 
