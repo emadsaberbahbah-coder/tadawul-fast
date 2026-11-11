@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""tests/test_consistency_check.py - scripts/consistency_check.py 1.0.0: the same figure on every page.
+"""tests/test_consistency_check.py - scripts/consistency_check.py 1.1.0: the same figure on every page.
 
   K1  a workbook shaped like 11 Nov 2026 11:30: every mismatch of that morning is reported
   K2  an aligned workbook reads MATCH on every check (NAV as a named INFO)
   K3  edges: no plan / no exit rows are INFO; tolerances; unreadable v2 stamp
   K4  the gate, the page, read failure
-  K5  the workflow, the manifest pin and the CI lane
+  K5  the workflow (1.1.0: hourly), the manifest pin and the CI lane
+  K6  (1.1.0) C11: how old each output page is; STALE past the limit; a page without a build time is INFO
 
 Run: pytest -q tests/test_consistency_check.py
 """
@@ -121,6 +122,7 @@ def test_k3_edges():
     assert by(g, "C1 decision")[0][1] == "INFO" and "main page tickets: ZTO.US" in by(g, "C1 decision")[0][2]
     assert by(g, "C9 stops")[0][1] == "INFO" and not by(g, "C10 actions")
     assert cc.RANGES["Portfolio_Decision_v2"] == "A1:Z4"                          # Codex P2 on #958: column M is read
+    assert all(p in cc.RANGES for p, _ in cc.FRESHNESS)                           # 1.1.0: every C11 page is read
     g = wb(Portfolio_Decision_v2=[["v2"], ["x"], ["Sources: ledger 2026-11-10 13:33:57"]])
     assert by(g, "C3 v2 freshness")[1][1] == "INFO"                               # another time on the page is not the build time
     g = wb(My_Portfolio=[])                                                       # Codex P2 on #958: unread is not agreement
@@ -189,9 +191,11 @@ def test_k4_gate_page_and_read_failure(monkeypatch, capsys):
     assert cc.run(True, book=b, now=NOW) == 0 and "Consistency_Check" not in b.tabs
     assert cc.run(False, book=b, now=NOW) == 0
     page = b.tabs["Consistency_Check"].values
-    assert page[1][0].startswith("As of 2026-11-11 11:30 Riyadh · 4 mismatch(es) · 2 stale · 4 match · 1 note(s)")
+    # C11 adds six rows: Top_10 11:11 and Portfolio_Decision 11:07 MATCH; Portfolio_Decision_v2 STALE;
+    # Daily_Plan, Exit_Plan (not in this workbook) and Top_10_v2 (no 'page built') INFO
+    assert page[1][0].startswith("As of 2026-11-11 11:30 Riyadh · 4 mismatch(es) · 3 stale · 6 match · 4 note(s)")
     assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared"]
-    assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 2 + ["INFO"] + ["MATCH"] * 4
+    assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 3 + ["INFO"] * 4 + ["MATCH"] * 6
     assert set(b.tabs) - set(wb()) == {"Consistency_Check"}                       # no other page is touched
     monkeypatch.setenv("TFB_CONSISTENCY", "off")
     assert cc.main(["--dry-run"]) == 0 and "nothing to do" in capsys.readouterr().out
@@ -209,7 +213,7 @@ def test_k5_workflow_manifest_ci():
     raw = (ROOT / ".github/workflows/consistency_check.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["workflow_run"]["workflows"] == ["\U0001F5D3️ Daily Plan", "\U0001F3AF Exit Plan"] and on["schedule"]
+    assert on["schedule"] == [{"cron": "50 * * * *"}] and "workflow_run" not in on                 # 1.1.0: hourly
     assert wf["permissions"] == {"contents": "read"}
     step = [s for s in wf["jobs"]["consistency"]["steps"] if "consistency_check.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_CONSISTENCY"] == "${{ vars.TFB_CONSISTENCY || 'on' }}"
@@ -220,3 +224,24 @@ def test_k5_workflow_manifest_ci():
         ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert "tests/test_consistency_check.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "ws.update" not in src and "batch_update" not in src
+
+
+def test_k6_page_freshness():
+    now = dt.datetime(2026, 11, 11, 10, 0, tzinfo=dt.timezone.utc)                # 13:00 Riyadh
+    g = wb(Daily_Plan=[["DAILY PLAN"], ["Plan of 2026-11-11 · cut 2026-11-11 07:39 Riyadh from the main page's render of "
+                                        "2026-11-11 07:39 (VERIFIED) · status checked 2026-11-11 12:20"]],
+           Exit_Plan=[["EXIT PLAN"], ["As of 2026-11-11 07:30 Riyadh · daily bars to 2026-11-10 · broker orders unknown"]])
+    g["Top_10_Investments_v2"][0] = ["TOP 10 v2", "EXECUTABLE", "run 1 · cockpit 2026-11-10 16:03:23 · page built 2026-11-10 16:06"]
+    rows = cc.freshness(g, now, 2.0)
+    got = {r[2].split(":")[0]: r for r in rows}
+    assert [r[0] for r in rows] == ["C11 freshness"] * 6
+    assert got["Daily_Plan"][1] == "MATCH" and "built 2026-11-11 12:20 Riyadh, 0.7 h ago" in got["Daily_Plan"][2]
+    assert got["Exit_Plan"][1] == "STALE" and "5.5 h ago (limit 2 h)" in got["Exit_Plan"][2]
+    assert got["Top_10_Investments"][1] == "MATCH" and "1.8 h ago" in got["Top_10_Investments"][2]
+    assert got["Portfolio_Decision"][1] == "MATCH"
+    assert got["Top_10_Investments_v2"][1] == "STALE" and got["Top_10_Investments_v2"][3] == "2026-11-10 16:06"
+    assert got["Portfolio_Decision_v2"][1] == "STALE" and got["Portfolio_Decision_v2"][3] == "2026-11-10 16:05"
+    assert cc.freshness(g, now, 24.0)[4][1] == "MATCH"
+    blank = cc.freshness({}, now, 2.0)
+    assert {r[1] for r in blank} == {"INFO"} and "Daily_Plan: no build time found" in blank[2][2]
+    assert not [r for r in cc.run_checks(g, TODAY, cc.knobs()) if r[0] == "C11 freshness"]   # needs the time

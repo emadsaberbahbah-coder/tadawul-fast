@@ -1,24 +1,25 @@
 # =============================================================================
 # 🧮 Consistency Check - the same figure on every page
 # -----------------------------------------------------------------------------
-# VERSION 1.0.0 (2026-11-11)
+# VERSION 1.1.0 (2026-11-11)
+#
+# 1.1.0: HOURLY at minute 50 (after the Daily Plan at :20 and the Exit Plan at
+# :35); the after-run triggers are dropped (the hourly run covers them). C11
+# reports how old each output page is (owner, 11 Nov 12:52).
 #
 # WHY: on 11 Nov the main page, the Daily Plan, the v2 pages, the portfolio
 # pages and the Exit Plan disagreed on the day's tickets, on stops, on the USD
 # rate and on freshness, and nothing compared them (owner request 11:24).
 # WHAT: scripts/consistency_check.py reads the decision pages and writes one
 # page, Consistency_Check. It changes no other page and decides nothing.
-# WHEN: after every Daily Plan and Exit Plan run, and five times a day.
+# WHEN: every hour (1.1.0).
 # Rollback: repository variable TFB_CONSISTENCY=off.
 # =============================================================================
 name: 🧮 Consistency Check
 
 on:
-  workflow_run:
-    workflows: ["🗓️ Daily Plan", "🎯 Exit Plan"]
-    types: [completed]
   schedule:
-    - cron: "50 4,8,12,16,20 * * *"
+    - cron: "50 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -46,9 +47,6 @@ env:
 jobs:
   consistency:
     name: 🧮 Compare the pages
-    if: >-
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -86,6 +84,7 @@ jobs:
           TFB_CONS_FX_TOL_PCT: ${{ vars.TFB_CONS_FX_TOL_PCT || '0.05' }}
           TFB_CONS_STOP_TOL_PCT: ${{ vars.TFB_CONS_STOP_TOL_PCT || '1' }}
           TFB_CONS_SAR_TOL: ${{ vars.TFB_CONS_SAR_TOL || '50' }}
+          TFB_CONS_PAGE_MAX_AGE_H: ${{ vars.TFB_CONS_PAGE_MAX_AGE_H || '2' }}
           TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}

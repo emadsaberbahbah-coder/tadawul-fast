@@ -66,6 +66,22 @@ changes or cancels no order.
 against the stop (first live dry run: SUPN read 18.5% for a stop 15.7% under
 28.75); it is now measured against the last close.
 
+1.1.0 (2026-11-11): HOURLY (owner, 12:52 Riyadh: "the outcome pages should be
+updated and refreshed to capture the new data at least each hour and that
+should be automatic"). The workflow now runs every hour; the e-mail still goes
+once, after the 07:30 run. Three changes make an hourly run safe:
+  - completed bars only: while a market is open, Yahoo's last daily bar is the
+    session so far; it is set aside (its price shows as Live) and the stop, the
+    target and the action are computed on completed closes, so an intraday
+    spike cannot ratchet a stop that never moves down;
+  - a live price at or under the stop is noted (a broker stop fills intraday;
+    the rule acts on the close);
+  - an action belongs to the completed close it was computed on (ledger
+    'Bars To'), not to the hour of the run: every run on the same close shows
+    the same RAISE STOP (with the stop it was before that close) and the same
+    TAKE PROFIT, so the 07:30 e-mail carries what the 23:35 run issued on the
+    US close; TAKE PROFIT is not repeated on a later close.
+
 GATE: TFB_EXIT_PLAN = off (default) | observe (compute and print, write and
 send nothing) | on. Rollback: repository variable TFB_EXIT_PLAN=off.
 """
@@ -89,13 +105,13 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 LEDGER_TAB = "_Exit_Plan"
 PAGE_TAB = "Exit_Plan"
-PAGE_WIDTH = 15
+PAGE_WIDTH = 16
 MAX_LEDGER_ROWS = 3000
 LEDGER_HEADERS = [
     "Date", "Run At (Riyadh)", "Symbol", "Lot", "Entry", "Shares", "Last", "Highest Close", "ATR", "R",
@@ -196,6 +212,22 @@ def parse_chart(payload: Dict[str, Any]) -> List[Bar]:
     return [out[d] for d in sorted(out)]
 
 
+def split_open_session(payload: Dict[str, Any], bars: List[Bar], now_ts: float) -> Tuple[List[Bar], Optional[float]]:
+    """(completed bars, live price). While the venue's regular session is open (Yahoo's currentTradingPeriod), the
+    last daily bar is the session so far: it is set aside and its close is the live price."""
+    try:
+        r = payload["chart"]["result"][0]
+        meta = r.get("meta") or {}
+        reg = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+        start, end = int(reg["start"]), int(reg["end"])
+        off = int(meta.get("gmtoffset") or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return bars, None
+    if bars and start <= now_ts < end and bars[-1][0] == _dt.datetime.fromtimestamp(start + off, UTC).date():
+        return bars[:-1], bars[-1][4]
+    return bars, None
+
+
 def atr(bars: Sequence[Bar], end: int, n: int = 14) -> Optional[float]:
     """Average true range of the n bars ending at index `end` (inclusive); None with fewer than n/2."""
     trs = []
@@ -262,11 +294,16 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     stop = init_stop
     if r_high >= 1:
         stop = max(stop, entry * (1 + k["be_pct"] / 100.0), hc - trail_k * a_now)
-    prev_stop = None
+    prev_stop = was_stop = None
     if prev:
         # a dividend paid since the last run re-adjusts the history (and the entry); the stop is rebased with it
         norm = num(prev.get("StopNorm"))
         prev_stop = norm * f_e if norm is not None else num(prev.get("Stop"))
+        if "Was" in prev:                                  # 1.1.0: the stop before this close (prior_row)
+            wnorm = num(prev.get("WasNorm"))
+            was_stop = wnorm * f_e if wnorm is not None else num(prev.get("Was"))
+        else:
+            was_stop = prev_stop
     if prev_stop is not None and prev_stop > stop:
         stop = prev_stop                                   # the stop never moves down
     step = max(1, int(math.floor(r_high)) + 1)
@@ -277,21 +314,26 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     sessions = sum(1 for b in bars if b[0] > entry_date)
     res.update({"ok": True, "basis": f_e, "atr": a_now, "atr_entry": a_e, "atr_pct": a_now / last[4] * 100.0, "r": r,
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
-                "r_high": r_high, "stop": stop, "prev_stop": prev_stop, "target": target, "tp1": tp1,
+                "r_high": r_high, "stop": stop, "prev_stop": was_stop, "target": target, "tp1": tp1,
                 "trail_k": trail_k, "sessions": sessions, "pl_pct": (last[4] / entry - 1) * 100.0,
                 "stop_gap_pct": (1 - stop / last[4]) * 100.0})
-    tp1_before = text(prev.get("TP1 Reached")).lower() == "yes" if prev else False
+    tp1_before = text(prev.get("TP1 Before", prev.get("TP1 Reached"))).lower() == "yes" if prev else False
+    tp1_today = text(prev.get("TP1 Today")).lower() == "yes" if prev else False
     if last[4] <= stop:
         res["action"] = "SELL"
         res["why"].append("last close %s is at or below the stop %s" % (fmt(last[4]), fmt(stop)))
+    elif tp1_today:                                       # issued on this close by an earlier run: it stays
+        res["action"] = "TAKE PROFIT"
+        res["why"].append("first target %s reached (+1R): sell half (issued on the close of %s); the stop rises to "
+                          "at least the entry" % (fmt(entry + r), last[0].isoformat()))
     elif tp1 and not tp1_before and tp1_now:
         res["action"] = "TAKE PROFIT"
         res["why"].append("first target %s reached (+1R): sell half; the stop rises to at least the entry"
                           % fmt(entry + r))
-    elif prev_stop is not None and stop > prev_stop * 1.0025:
+    elif was_stop is not None and stop > was_stop * 1.0025:
         res["action"] = "RAISE STOP"
-        res["why"].append("raise the stop %s -> %s" % (fmt(prev_stop), fmt(stop)))
-    elif prev_stop is None and r_high >= 1:
+        res["why"].append("raise the stop %s -> %s" % (fmt(was_stop), fmt(stop)))
+    elif was_stop is None and r_high >= 1:
         res["action"] = "RAISE STOP"
         res["why"].append("the stop belongs at %s (+%.1fR at the high)" % (fmt(stop), r_high))
     elif sessions >= k["time_sessions"] and r_high < 1:
@@ -312,6 +354,11 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     if ed is not None and 0 <= ed <= k["earn_warn_days"]:
         res["why"].append("earnings %s: a gap can jump the stop - decide to hold through or sell half" % (
             "today" if ed == 0 else "in %d day(s)" % ed))
+    live = info.get("live")
+    res["live"] = live
+    if live is not None and live <= stop:
+        res["why"].append("live price %s is at or under the stop %s (a broker stop fills intraday; the rule acts on "
+                          "the close)" % (fmt(live), fmt(stop)))
     bs = info.get("broker_stop")
     if bs is not None and bs < stop * 0.9975:
         res["why"].append("broker stop %s is under the plan's %s" % (fmt(bs), fmt(stop)))
@@ -485,21 +532,39 @@ def lot_key(symbol: str, lot: Dict[str, Any]) -> str:
     return "%s|%s|%.4f" % (symbol, lot["date"].isoformat(), lot["buy"])
 
 
-def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date) -> Dict[str, Any]:
+def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date,
+              bars_to: Optional[_dt.date] = None) -> Dict[str, Any]:
     """The lot's last ledger row up to today (a same-day re-run keeps what was already published), carrying the
     highest stop ever recommended for it. StopNorm = that stop divided by the dividend basis it was computed on,
-    so a later dividend adjustment can rebase it."""
+    so a later dividend adjustment can rebase it.
+    1.1.0: `bars_to` = the last completed close of this run. 'Was'/'WasNorm' = the highest stop recorded on an
+    earlier close (the RAISE STOP of this close compares with it, on every run of the close); 'TP1 Today' = TAKE
+    PROFIT was issued on this close; 'TP1 Before' = it was issued on an earlier one. Without `bars_to` the
+    calendar day of the run stands in for the close."""
     rows = [d for d in ledger if text(d["Lot"]) == key and (parse_date(d["Date"]) or today) <= today]
     if not rows:
         return {}
+
+    def close_of(d: Dict[str, Any]) -> Optional[_dt.date]:
+        return parse_date(d.get("Bars To")) if bars_to is not None else (parse_date(d["Date"]) or today)
+    mark = bars_to if bars_to is not None else today
+    same = [d for d in rows if close_of(d) == mark]
+    older = [d for d in rows if (close_of(d) or _dt.date.min) < mark]
+
+    def high(rs: Sequence[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+        st = [(num(d["Stop"]), num(d.get("Basis")) or 1.0) for d in rs if num(d["Stop"]) is not None]
+        return (max(a for a, _ in st), max(a / b for a, b in st)) if st else (None, None)
     last = dict(rows[-1])
-    stops = [num(d["Stop"]) for d in rows if num(d["Stop"]) is not None]
-    if stops:
-        last["Stop"] = max(stops)
-        last["StopNorm"] = max(num(d["Stop"]) / (num(d.get("Basis")) or 1.0) for d in rows
-                               if num(d["Stop"]) is not None)
+    stop, norm = high(rows)
+    if stop is not None:
+        last["Stop"], last["StopNorm"] = stop, norm
+    last["Was"], last["WasNorm"] = high(older)
     if any(text(d["TP1 Reached"]).lower() == "yes" for d in rows):
         last["TP1 Reached"] = "yes"
+    issued = [d for d in same if text(d.get("Action")).upper() == "TAKE PROFIT"]
+    last["TP1 Today"] = "yes" if issued else "no"
+    last["TP1 Before"] = "yes" if any(text(d["TP1 Reached"]).lower() == "yes" for d in rows
+                                      if not any(d is i for i in issued)) else "no"
     return last
 
 
@@ -523,16 +588,16 @@ def page_rows(results: List[Dict[str, Any]], picks: List[Dict[str, Any]], info: 
         [info["summary"]],
         [],
         ["HOLDINGS (%d)" % len(results)],
-        ["Symbol", "Name", "Qty", "Entry", "Last", "P/L %", "Highest close", "ATR %", "Gain at high (R)", "Stop",
-         "Was", "Target", "Action", "Why", "Broker stop"],
+        ["Symbol", "Name", "Qty", "Entry", "Last close", "Live", "P/L %", "Highest close", "ATR %",
+         "Gain at high (R)", "Stop", "Was", "Target", "Action", "Why", "Broker stop"],
     ]
     for r in sorted(results, key=lambda x: (ORDER.get(x["action"], 9), x["symbol"])):
         if not r.get("ok"):
             rows.append([r["symbol"], r.get("name", ""), fmt(r.get("shares"), 0), fmt(r.get("entry")), "", "", "", "",
-                         "", "", "", "", r["action"], "; ".join(r["why"]), ""])
+                         "", "", "", "", "", r["action"], "; ".join(r["why"]), ""])
             continue
         rows.append([r["symbol"], r.get("name", ""), fmt(r.get("shares"), 0), fmt(r["entry"]), fmt(r["last"]),
-                     "%+.1f" % r["pl_pct"], fmt(r["hc"]), "%.1f" % r["atr_pct"], "%+.1f" % r["r_high"],
+                     fmt(r.get("live")) if r.get("live") is not None else "—", "%+.1f" % r["pl_pct"], fmt(r["hc"]), "%.1f" % r["atr_pct"], "%+.1f" % r["r_high"],
                      fmt(r["stop"]), fmt(r["prev_stop"]) if r["prev_stop"] is not None else "—",
                      fmt(r["target"]), r["action"], "; ".join(r["why"]),
                      fmt(r.get("broker_stop")) if r.get("broker_stop") is not None else "unknown"])
@@ -606,20 +671,44 @@ def _default_opener(req: urllib.request.Request, timeout: float):  # pragma: no 
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def fetch_bars(ysym: str, opener: Callable[..., Any], timeout: float = 20.0) -> List[Bar]:
+def fetch_chart(ysym: str, opener: Callable[..., Any], timeout: float = 20.0) -> Dict[str, Any]:
+    """The Yahoo v8 chart payload ({} when no host answers with bars; a 404 is final)."""
     for host in YAHOO_HOSTS:
         req = urllib.request.Request("https://" + host + YAHOO_PATH.format(sym=ysym),
                                      headers={"User-Agent": YAHOO_UA, "Accept": "application/json"})
         try:
             with opener(req, timeout) as resp:
-                bars = parse_chart(json.loads(resp.read().decode("utf-8", "replace")))
-            if bars:
-                return bars
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+            if parse_chart(payload):
+                return payload
         except Exception as exc:  # noqa: BLE001
             if getattr(exc, "code", None) == 404:
-                return []
+                return {}
         _SLEEP(1.0)
-    return []
+    return {}
+
+
+def fetch_bars(ysym: str, opener: Callable[..., Any], now_ts: Optional[float] = None,
+               timeout: float = 20.0) -> Tuple[List[Bar], Optional[float]]:
+    """(completed bars, live price) - see split_open_session."""
+    payload = fetch_chart(ysym, opener, timeout)
+    bars = parse_chart(payload)
+    if now_ts is None:
+        return bars, None
+    return split_open_session(payload, bars, now_ts)
+
+
+def live_quote(symbol: str, opener: Optional[Callable[..., Any]] = None) -> Optional[Tuple[float, _dt.datetime]]:
+    """(last traded price, its time UTC) from the chart's meta, for the Daily Plan's hourly status; None when absent."""
+    payload = fetch_chart(yahoo_symbol(symbol), opener or _default_opener)
+    try:
+        meta = payload["chart"]["result"][0]["meta"]
+        px, ts = float(meta["regularMarketPrice"]), int(meta["regularMarketTime"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(px) and px > 0):
+        return None
+    return px, _dt.datetime.fromtimestamp(ts, UTC)
 
 
 def read_columns(book, tab: str, names: Sequence[str]) -> List[List[Any]]:
@@ -685,12 +774,16 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
                                                                           READ_ATTEMPTS, READ_RETRY_S))
             _SLEEP(READ_RETRY_S)
     info_map = read_info(grids)
-    bars_cache: Dict[str, List[Bar]] = {}
+    bars_cache: Dict[str, Tuple[List[Bar], Optional[float]]] = {}
+    now_ts = now.timestamp()
+
+    def fetched(sym: str) -> Tuple[List[Bar], Optional[float]]:
+        if sym not in bars_cache:
+            bars_cache[sym] = fetch_bars(yahoo_symbol(sym), opener, now_ts)
+        return bars_cache[sym]
 
     def bars_for(sym: str) -> List[Bar]:
-        if sym not in bars_cache:
-            bars_cache[sym] = fetch_bars(yahoo_symbol(sym), opener)
-        return bars_cache[sym]
+        return fetched(sym)[0]
 
     results: List[Dict[str, Any]] = []
     for sym, lot in sorted(lots.items()):
@@ -703,8 +796,10 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         inf["news_neg"] = (news.get(sym) or {}).get("n", 0)
         inf["earn_days"] = (cal.get(sym) or {}).get("earn_days")
         inf["broker_stop"] = stops.get(sym)
-        prev = prior_row(ledger, lot_key(sym, lot), today)
-        res = exit_levels(sym, lot["entry"], lot["date"], bars_for(sym), inf, prev, k, today)
+        inf["live"] = fetched(sym)[1]
+        sym_bars = bars_for(sym)
+        prev = prior_row(ledger, lot_key(sym, lot), today, sym_bars[-1][0] if sym_bars else None)
+        res = exit_levels(sym, lot["entry"], lot["date"], sym_bars, inf, prev, k, today)
         res.update({"name": inf.get("name") or lot["name"], "shares": lot["shares"], "lot": lot_key(sym, lot),
                     "broker_stop": stops.get(sym), "prev": prev})
         if (news.get(sym) or {}).get("headline"):

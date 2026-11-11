@@ -1,7 +1,11 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.0.1 (2026-11-10)
+# VERSION 1.1.0 (2026-11-11)
+#
+# 1.1.0: HOURLY (owner, 11 Nov 12:52). The plan is checked every hour at
+# minute 20; the picks stay frozen and their status uses live prices
+# (daily_plan 1.2.0, TFB_PLAN_LIVE_PRICE=on). The after-sync trigger stays.
 #
 # 1.0.1: daily_plan 1.1.0's evidence rule is mapped in OBSERVE (a label on every
 # qualified name; picks are chosen as before). on = a name that is not PASS is
@@ -30,7 +34,7 @@ on:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
     types: [completed]
   schedule:
-    - cron: "40 5,9,13 * * *"
+    - cron: "20 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -111,6 +115,7 @@ jobs:
           TFB_PLAN_EVIDENCE: ${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}
           TFB_PLAN_EV_RISK_MAX: ${{ vars.TFB_PLAN_EV_RISK_MAX || '30' }}
           TFB_PLAN_EV_UPSIDE_MIN: ${{ vars.TFB_PLAN_EV_UPSIDE_MIN || '15' }}
+          TFB_PLAN_LIVE_PRICE: ${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}
         run: |
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
