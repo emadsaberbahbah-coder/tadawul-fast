@@ -51,6 +51,39 @@ Calendar_Events, Dividend_Events, _Portfolio_CostBasis. Writes only its own
 two tabs: _Daily_Plan (the ledger) and Daily_Plan (the page). Never calls the
 backend, never calls a broker, places no order.
 
+1.0.1 (2026-11-10): the earnings and ex-dividend gates count days from the
+DATE on the calendar row to the Riyadh plan date, not from the stored 'Days To'
+column, which is as of the calendar sync (10 Nov: ZTO.US read 8 days from the
+9 Nov sync while 17 Nov was 7 days away, so the 7-day gate passed it). A pick
+without an engine 12-month ROI carries the label 'no 12-month target'.
+
+1.1.0 (2026-11-10): THE EVIDENCE RULE (TFB_PLAN_EVIDENCE = off default |
+observe | on). Measured on matured INVESTABLE records outside Tadawul, 1W-1M
+horizons, one row per symbol and week (v_outcome_excess joined to
+v_signal_history, entries 31 Aug - 10 Nov 2026): a name whose Risk Score was
+under 30 AND whose analyst target stood 15% or more above its price finished
+up in 72.2% of 72 symbol-weeks (34 names; beat its benchmark in 83.3%); the
+other INVESTABLE names finished up in 43.6% of 110. By half: 77.2% and 66.4%
+of records. The 11 records entered in November read 36.4%. This is an in-sample
+reading over ten weeks, so the rule ships as a LABEL first:
+  observe  every qualified name carries 'evidence rule PASS / FAIL / n/a' with
+           its two numbers; picks are chosen exactly as before.
+  on       a name that is not PASS is not picked (pipeline: 'evidence rule not
+           met'); every other gate is unchanged.
+Tadawul names read n/a: the rule was not measured as a pass there. Two more
+columns are read from the source pages (Risk Score, Target Price); nothing new
+is written outside the two tabs. Knobs: TFB_PLAN_EV_RISK_MAX (30),
+TFB_PLAN_EV_UPSIDE_MIN (15).
+
+1.2.0 (2026-11-11): HOURLY STATUS ON LIVE PRICES (owner, 12:52 Riyadh: the
+outcome pages refresh at least every hour, automatically, with the new data).
+The workflow runs every hour. The picks stay frozen; their status (OPEN /
+WAIT / CHECK / INVALIDATED) is checked against the last traded price from the
+Yahoo chart (TFB_PLAN_LIVE_PRICE = on) instead of the source pages' price,
+which moves only when a sync lands (three times a day); the reason carries
+'(live HH:MM Riyadh)'. A name with no live price keeps the page price. The cut
+itself still uses the source pages, as before.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -64,7 +97,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -114,6 +147,11 @@ def mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def ev_mode() -> str:
+    v = _env("TFB_PLAN_EVIDENCE", "off").lower()
+    return v if v in ("off", "observe", "on") else "off"
+
+
 def knobs() -> Dict[str, Any]:
     ccy = [c.strip().upper() for c in _env("TFB_PLAN_FUNDABLE_CCY", "USD,SAR").split(",") if c.strip()]
     return {
@@ -131,6 +169,10 @@ def knobs() -> Dict[str, Any]:
         "keep_rank": int(_env_num("TFB_PLAN_KEEP_RANK", 8, 0, 50)),
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
+        "ev_mode": ev_mode(),
+        "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
+        "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
+        "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
     }
 
 
@@ -268,7 +310,8 @@ def table_index(values: Sequence[Sequence[Any]], need: Sequence[str]) -> Tuple[O
 
 
 def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, Any]]:
-    """{SYMBOL: {price, ccy, sector, warnings}} from the source pages; the first page that lists a symbol wins."""
+    """{SYMBOL: {price, ccy, sector, warnings, risk, target}} from the source pages; the first page that lists a
+    symbol wins."""
     out: Dict[str, Dict[str, Any]] = {}
     for g in grids:
         h, col = table_index(g, ("Symbol", "Current Price", "Currency"))
@@ -281,27 +324,63 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
             out[sym] = {"price": num(cell(r, col.get("Current Price"))),
                         "ccy": text(cell(r, col.get("Currency"))).upper(),
                         "sector": text(cell(r, col.get("Sector"))),
-                        "warnings": text(cell(r, col.get("Warnings")))}
+                        "warnings": text(cell(r, col.get("Warnings"))),
+                        "risk": num(cell(r, col.get("Risk Score"))),
+                        "target": num(cell(r, col.get("Target Price")))}
     return out
 
 
-def read_calendar(cal: Sequence[Sequence[Any]], div: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
-    """{SYMBOL: {earn_days, exdiv_days, div_amount}} from Calendar_Events and Dividend_Events."""
+def evidence_rule(symbol: str, src: Dict[str, Any], risk_max: float, upside_min: float) -> Tuple[str, str]:
+    """1.1.0 PURE: (PASS | FAIL | NA, label). PASS = Risk Score under risk_max AND the analyst target
+    upside_min % or more above the price. Tadawul and a name without both numbers read NA."""
+    if symbol.upper().endswith(".SR"):
+        return "NA", "evidence rule n/a (not measured for Tadawul)"
+    price, risk, target = src.get("price"), src.get("risk"), src.get("target")
+    if risk is None or target is None or target <= 0 or not price or price <= 0:
+        missing = "risk score" if risk is None else "analyst target"
+        return "NA", "evidence rule n/a (no %s)" % missing
+    upside = round((target / price - 1.0) * 100.0, 4)      # 4 places, as v_signal_history.target_upside_pp
+    facts = "risk %.1f, analyst upside %+.0f%%" % (risk, upside)
+    if risk < risk_max and upside >= upside_min:
+        return "PASS", "evidence rule PASS (%s)" % facts
+    need = []
+    if risk >= risk_max:
+        need.append("risk under %g" % risk_max)
+    if upside < upside_min:
+        need.append("upside %+g%% or more" % upside_min)
+    return "FAIL", "evidence rule FAIL (%s; needs %s)" % (facts, " and ".join(need))
+
+
+def _days_until(date_cell: Any, days_cell: Any, today: Optional[_dt.date]) -> Optional[float]:
+    """1.0.1: days from `today` to the date in `date_cell` when it parses; else the stored day count."""
+    d = parse_date(date_cell)
+    if d is not None and today is not None:
+        return float((d - today).days)
+    return num(days_cell)
+
+
+def read_calendar(cal: Sequence[Sequence[Any]], div: Sequence[Sequence[Any]],
+                  today: Optional[_dt.date] = None) -> Dict[str, Dict[str, Any]]:
+    """{SYMBOL: {earn_days, exdiv_days, div_amount}} from Calendar_Events and Dividend_Events.
+    With `today`, days are counted from the event DATE (the stored count is as of the calendar sync)."""
     out: Dict[str, Dict[str, Any]] = {}
     h, col = table_index(cal, ("Symbol", "Days To Earnings"))
     if h is not None:
         for r in list(cal)[h + 1:]:
             sym = text(cell(r, col.get("Symbol"))).upper()
             if sym:
-                out[sym] = {"earn_days": num(cell(r, col.get("Days To Earnings"))),
-                            "exdiv_days": num(cell(r, col.get("Days To ExDiv"))), "div_amount": None}
+                out[sym] = {"earn_days": _days_until(cell(r, col.get("Next Earnings Date")),
+                                                     cell(r, col.get("Days To Earnings")), today),
+                            "exdiv_days": _days_until(cell(r, col.get("Next Ex-Div Date")),
+                                                      cell(r, col.get("Days To ExDiv")), today),
+                            "div_amount": None}
     h, col = table_index(div, ("Symbol", "Days To ExDiv", "Amount"))
     if h is not None:
         for r in list(div)[h + 1:]:
             sym = text(cell(r, col.get("Symbol"))).upper()
             if sym:
                 e = out.setdefault(sym, {"earn_days": None, "exdiv_days": None, "div_amount": None})
-                e["exdiv_days"] = num(cell(r, col.get("Days To ExDiv")))
+                e["exdiv_days"] = _days_until(cell(r, col.get("Ex-Div Date")), cell(r, col.get("Days To ExDiv")), today)
                 e["div_amount"] = num(cell(r, col.get("Amount")))
     return out
 
@@ -393,6 +472,11 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             reason = "ex-dividend %.1f%% in %d day(s)" % (amt / c["price"] * 100.0, xd)
         if ed is None:
             c["labels"].append("earnings date not on the calendar")
+        if k.get("ev_mode", "off") != "off":
+            c["ev"], ev_label = evidence_rule(q["symbol"], src, k["ev_risk_max"], k["ev_upside_min"])
+            c["labels"].append(ev_label)
+            if k["ev_mode"] == "on" and c["ev"] != "PASS" and not reason:
+                reason = "evidence rule not met"
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -443,6 +527,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         entry = p["price"]
         stop = round(entry * (1 - k["stop_pct"] / 100.0), 4)
         roi = (p.get("roi12") or 0.0) / 100.0
+        if roi <= 0:
+            p["labels"].append("no 12-month target")
         p.update({"entry": entry, "zone_low": round(entry * 0.97, 4), "zone_high": round(entry * 1.01, 4),
                   "qty": qty, "alloc_sar": round(qty * entry * fx, 2), "stop": stop,
                   "tp1": round(entry * (1 + roi / 2.0), 4) if roi > 0 else None,
@@ -512,9 +598,31 @@ def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def live_overlay(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
+                 quote=None) -> Dict[str, str]:
+    """1.2.0: the last traded price for each open pick, laid over its source-page price. Returns {SYMBOL: 'HH:MM'}
+    (Riyadh) for the names that got one. `quote(symbol) -> (price, utc datetime) | None`."""
+    if quote is None:
+        from scripts.exit_plan import live_quote as quote  # noqa: PLC0415 - exit_plan imports this module
+    out: Dict[str, str] = {}
+    for d in day_rows:
+        if text(d["Kind"]) != "PICK" or text(d["Status"]) in ("EXECUTED", "INVALIDATED"):
+            continue
+        sym = text(d["Symbol"]).upper()
+        try:
+            q = quote(sym)
+        except Exception:  # noqa: BLE001 - a quote that fails keeps the page price
+            q = None
+        if not q or not q[0] or q[0] <= 0:
+            continue
+        sources[sym] = dict(sources.get(sym) or {}, price=float(q[0]))
+        out[sym] = q[1].astimezone(RIYADH).strftime("%H:%M")
+    return out
+
+
 def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
                    cal: Dict[str, Dict[str, Any]], held: Dict[str, _dt.date], plan_date: _dt.date,
-                   earn_guard: int, stamp: str) -> None:
+                   earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None) -> None:
     for d in day_rows:
         if text(d["Kind"]) != "PICK":
             continue
@@ -526,6 +634,8 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
                "zone_high": num(d["Zone High"]) or 0.0}
         st, why = pick_status(row, price, held, plan_date, (cal.get(sym) or {}).get("earn_days"), earn_guard,
                               text(d["Cut Quality"]))
+        if live and sym in live and price is not None:
+            why += " (live %s Riyadh)" % live[sym]
         d["Status"], d["Status Reason"], d["Status At (Riyadh)"] = st, why, stamp
         d["Last Price"] = price if price is not None else ""
 
@@ -599,7 +709,8 @@ def read_source_page(book, tab: str) -> List[List[Any]]:
     h, col = table_index(head, ("Symbol", "Current Price", "Currency"))
     if h is None:
         return []
-    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings") if n in col]
+    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price")
+             if n in col]
     ranges = ["%s%d:%s" % (_col(col[n] + 1), h + 1, _col(col[n] + 1)) for n in names]
     cols = ws.batch_get(ranges)
     height = max((len(c) for c in cols), default=0)
@@ -669,7 +780,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
             board = book.worksheet(PAGE).get("A1:AZ120")
             grids = [read_source_page(book, t) for t in SOURCE_PAGES]
             cal = read_calendar(_read(book, "Calendar_Events", "A1:J4000"),
-                                _read(book, "Dividend_Events", "A1:J4000"))
+                                _read(book, "Dividend_Events", "A1:J4000"), today)
             lots = read_ledger_lots(_read(book, "_Portfolio_CostBasis", "A1:Z400"), today, k["cooldown"])
             ledger = parse_ledger(_read(book, LEDGER_TAB,
                                         "A1:%s%d" % (_col(len(LEDGER_HEADERS)), MAX_LEDGER_ROWS + 1)))
@@ -717,7 +828,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
                                                     len(plan["pipeline"]), fmt(plan["nav"], 0), fmt(cash, 0),
                                                     fmt(plan["deployable"], 0), fmt(plan["per_pick"], 0)))
     if today_rows:
-        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp)
+        live = live_overlay(today_rows, sources) if k["live"] else {}
+        if live:
+            _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
+                                                  for s in sorted(live)))
+        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live)
         first = today_rows[0]
         info["headline"] = "Plan of %s · cut %s Riyadh from the main page's render of %s (%s) · status " \
                            "checked %s" % (day, text(first["Cut At (Riyadh)"]), text(first["Source Render"]),
