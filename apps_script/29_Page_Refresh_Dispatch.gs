@@ -9,7 +9,8 @@
  *          prdTick (ONE time trigger every 10 minutes, installed by prdInstallTrigger) starts each lane once per Riyadh
  *          hour, from its minute on:
  *            plan  daily_plan.yml         :20  07-23           inputs dry_run false
- *            mail  exit_plan.yml          :30  07              inputs dry_run false, send_mail true (the morning e-mail)
+ *            mail  exit_plan.yml          :30  07              inputs dry_run false, send_mail true (the morning e-mail;
+ *                                                               the only automatic sender: exit_plan.yml's schedule sends none)
  *            exit  exit_plan.yml          :35  08-23 and 00    inputs dry_run false, send_mail false
  *            cons  consistency_check.yml  :50  07-23 and 00    inputs dry_run false
  *          It uses the GitHub token of 24_Sync_Dispatch (Script Property TFB_GH_DISPATCH_TOKEN; repository

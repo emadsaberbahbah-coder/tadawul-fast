@@ -471,6 +471,35 @@ def test_x14_workflow_manifest_ci():
     assert not re.search(r"create_order|place_order|requests\.post|cancel_order", src)
 
 
+def test_x14b_only_a_send_mail_start_sends_the_email(tmp_path):
+    """PR #963 (Codex P2): the Apps Script 07:30 lane is the one automatic sender; a schedule (on time, late or doubled)
+    never e-mails. Runs the workflow's own bash with the python call replaced by an echo of its arguments."""
+    import os
+    import subprocess
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
+    step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
+    script = step["run"].replace('python scripts/exit_plan.py "${ARGS[@]}"', 'echo "ARGS=${ARGS[*]}"')
+    assert script != step["run"]
+
+    def run(event, cron="", dry="", send=""):
+        env = {"PATH": os.environ.get("PATH", ""), "EVENT_NAME": event, "EVENT_CRON": cron, "IN_DRY_RUN": dry, "IN_SEND": send}
+        out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        return [ln for ln in out.stdout.splitlines() if ln.startswith(("ARGS=", "::notice::"))]
+
+    assert run("schedule", "30 4 * * *")[-1] == "ARGS="
+    assert run("schedule", "30 4 * * *")[0].startswith("::notice::no e-mail from the schedule")
+    assert run("schedule", "35 5-21 * * *") == ["ARGS="]
+    assert run("workflow_dispatch", dry="false", send="true") == ["ARGS=--send"]
+    assert run("workflow_dispatch", dry="false", send="false") == ["ARGS="]
+    assert run("workflow_dispatch", dry="true", send="false") == ["ARGS=--dry-run"]
+    assert run("workflow_dispatch", dry="true", send="true") == ["ARGS=--dry-run --send"]
+    gs = (ROOT / "apps_script/29_Page_Refresh_Dispatch.gs").read_text(encoding="utf-8")
+    assert "{ id: 'mail', workflow: 'exit_plan.yml', minute: 30, hours: [7], inputs: { dry_run: 'false', send_mail: 'true' } }" in gs
+    assert gs.count("send_mail: 'true'") == 1
+
+
 # ----------------------------------------------------------------------------- X15
 def _open_payload(bars, start, end, off=0, price=None, ts=None):
     t = [int(dt.datetime(b[0].year, b[0].month, b[0].day, 14, 30, tzinfo=UTC).timestamp()) for b in bars]
