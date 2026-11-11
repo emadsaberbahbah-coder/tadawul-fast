@@ -1,7 +1,11 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.1.0 (2026-11-11)
+# VERSION 1.2.0 (2026-11-11)
+#
+# 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). Minute 20 from 07:20 to 23:20
+# Riyadh (17 runs) plus after every sync; no plan is cut before 07:00 Riyadh
+# (daily_plan 1.3.0, TFB_PLAN_CUT_FROM_H).
 #
 # 1.1.0: HOURLY (owner, 11 Nov 12:52). The plan is checked every hour at
 # minute 20; the picks stay frozen and their status uses live prices
@@ -34,7 +38,7 @@ on:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
     types: [completed]
   schedule:
-    - cron: "20 * * * *"
+    - cron: "20 4-20 * * *"         # 07:20-23:20 Riyadh
   workflow_dispatch:
     inputs:
       dry_run:
@@ -116,6 +120,7 @@ jobs:
           TFB_PLAN_EV_RISK_MAX: ${{ vars.TFB_PLAN_EV_RISK_MAX || '30' }}
           TFB_PLAN_EV_UPSIDE_MIN: ${{ vars.TFB_PLAN_EV_UPSIDE_MIN || '15' }}
           TFB_PLAN_LIVE_PRICE: ${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}
+          TFB_PLAN_CUT_FROM_H: ${{ vars.TFB_PLAN_CUT_FROM_H || '7' }}
         run: |
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then

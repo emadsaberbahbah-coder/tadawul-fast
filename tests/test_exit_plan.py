@@ -453,7 +453,7 @@ def test_x14_workflow_manifest_ci():
     raw = (ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["schedule"] == [{"cron": "30 4 * * *"}, {"cron": "35 0-3,5-23 * * *"}] and "workflow_dispatch" in on
+    assert on["schedule"] == [{"cron": "30 4 * * *"}, {"cron": "35 5-21 * * *"}] and "workflow_dispatch" in on
     hours = set(range(0, 4)) | set(range(5, 24))
     assert len(hours) == 23                                                         # every hour, 04 is the 04:30 run
     assert '"$EVENT_CRON" == "30 4 * * *"' in raw and "EVENT_CRON: ${{ github.event.schedule }}" in raw

@@ -180,3 +180,26 @@ Main `58910afa` (#955-#959) was merged in with a merge commit. Main took ci.yml 
 - ci.yml: this release keeps 1.1.80 (still above main).
 - The claim note now reads: 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926, 1.1.85 #954, 1.1.86 #938, 1.1.87 #915. Only the two claims main took moved.
 - Main's 1.1.79 / 1.1.78 blocks follow verbatim. Against main, the ci.yml diff adds lines only. No other file conflicted.
+
+## Addendum 2026-11-11 (later) - merge of main `53f2abdc`, re-based on 27_Decision_Pages_v2 1.3.0
+
+Main `53f2abdc` (#960, #961) was merged in with a second merge commit. #961 took 27_Decision_Pages_v2 **1.3.0** [REFRESH-SLOTS] (the v2 pages on a daily schedule of slot builds, one page per execution, from a slot trigger installed in the menu). Without that trigger, 1.3.0 builds every page as 1.2.36 does.
+
+**Re-numbered: 1.2.37 -> 1.3.1.**
+- The header block becomes the 1.3.1 entry above main's 1.3.0 entry. Its text is unchanged except "default OFF = the 1.3.0 pages" and the note "(First 1.2.37 on 1.2.36; re-based 2026-11-11 on 1.3.0.)".
+- `DP2_VERSION` is '1.3.1', and the three in-code tags read v1.3.1.
+- Git merged the three code hunks with 1.3.0 without a conflict: the gate functions, the tile loop and the dp2SelfTest line.
+
+**History chain.**
+- `tests/js/dp2_edits_v1301.json` (5 hunks) replaces `dp2_edits_v1237.json`. Reversing it on the delivered file reproduces main's 1.3.0 file byte for byte (SHA-256 `f670ad1c`).
+- `tests/js/dp2_history.js` is main's version plus `v1300Source` (pinned `f670ad1c`). `v1236Source` now reverses the v1.3.0 hunks from `v1300Source`, so v1.2.34-v1.2.36 chain through it.
+- Main's own v1.3.0 harness (`tests/test_dp2_v1300_refresh_slots.js`) now reads the v1.3.0 file rebuilt by `v1300Source`, as the v1.2.36 harness did for v1.2.35. `tests/test_dp2_v1236_evidence_since.js` is main's version plus one comment line.
+
+**Harness.** `tests/test_dp2_v1237_exec_tile_feed.js` keeps its name (the CI step and its `.py` wrapper call it). Its golden base is now v1.3.0 (`BASE_SHA256` `f670ad1c` = main `53f2abdc`), and its version checks, titles and header checks read 1.3.1 / 1.3.0.
+
+**Measured on the merged tree.**
+- `tests/test_dp2_v1237_exec_tile_feed.js` PASS 10/10, both runs digest `507c60fd...`. That is the same digest as on the 1.2.36 base: the pages are identical.
+- Every DP2 harness passes on the delivered 1.3.1 file: v1.2.31 11/11, v1.2.32 10/10, v1.2.33 10/10, v1.2.34 11/11, v1.2.35 9/9, v1.2.36 9/9, v1.3.0 12/12.
+- Golden negative with main's 1.3.0 as NEW and OLD: 3/10. P1, P2 and P4 describe the base; P3 (the defect) fails.
+
+**Owner step change.** Paste 1.3.1 over 1.3.0. `zz_Property_Tool` `tfbSetupNov9`'s exact '1.2.36' check is unrelated to this file's version now; do not run it.

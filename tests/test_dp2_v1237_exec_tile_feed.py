@@ -1,6 +1,6 @@
-"""27_Decision_Pages_v2 v1.2.37 (the Executable tile follows the feed; Script Property DP2_EXEC_TILE_FEED, default off):
-run the native harness (the REAL Apps Script source in a vm; the v1.2.36 file rebuilt from tests/js/dp2_edits_v1237.json,
-SHA-256 pinned) so the whole-suite CI job collects it too (the blocking lane runs it with node). Mirrors
+"""27_Decision_Pages_v2 v1.3.1, first v1.2.37 (the Executable tile follows the feed; Script Property DP2_EXEC_TILE_FEED,
+default off): run the native harness (the REAL Apps Script source in a vm; the v1.3.0 file rebuilt from
+tests/js/dp2_edits_v1301.json, SHA-256 pinned) so the whole-suite CI job collects it too (the blocking lane runs it with node). Mirrors
 tests/test_dp2_v1236_evidence_since.py; the count is a k == k check of the harness's own last line."""
 from __future__ import annotations
 

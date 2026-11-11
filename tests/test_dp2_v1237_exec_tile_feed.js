@@ -1,29 +1,29 @@
 #!/usr/bin/env node
 /* tests/test_dp2_v1237_exec_tile_feed.js
- * Harness for apps_script/27_Decision_Pages_v2.gs v1.2.37 [EXEC-TILE-FEED] (the v1.2.31 follow-up: Top_10_Investments_v2's
+ * Harness for apps_script/27_Decision_Pages_v2.gs v1.3.1 [EXEC-TILE-FEED] (first v1.2.37 on v1.2.36) (the v1.2.31 follow-up: Top_10_Investments_v2's
  * Executable tile counted the seats with a Ticket SAR and was green whatever the decision feed said; Mon 2 Nov the
  * 10:42 release expired, and a build before the 17:32 render reads 'Executable 6' green under an EXPIRED / SYNC RUNNING
- * chip, replayed on that board). Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the v1.2.36 pages byte for
+ * chip, replayed on that board). Script Property DP2_EXEC_TILE_FEED = 1 / on / true / yes (default OFF = the v1.3.0 pages byte for
  * byte): when the board carries an engine ticket and the feed has a state that is not live, the tile is grey and its sub
  * reads 'feed <state> - not executable now - of N . <output>'; the label and the count stay.
  *
- * Two trees over the REAL file, each in its own vm context: the delivered source (NEW) and the v1.2.36 file (OLD,
- * SHA-256 pinned 487c0778 = origin/main 86edd72), by default rebuilt from NEW by reversing the enumerated v1.2.37 hunks
- * (tests/js/dp2_edits_v1237.json). The GAS shim, the fixture and the boards are those of
- * tests/test_dp2_v1236_evidence_since.js, copied verbatim (norm folds 1.2.37; build() takes an optional dp2Tiles_ hook,
- * used to build the EXPECTED armed page from the v1.2.36 source with only the Executable tile changed by the harness).
+ * Two trees over the REAL file, each in its own vm context: the delivered source (NEW) and the v1.3.0 file (OLD,
+ * SHA-256 pinned f670ad1c = origin/main 53f2abdc), by default rebuilt from NEW by reversing the enumerated v1.3.1 hunks
+ * (tests/js/dp2_edits_v1301.json). The GAS shim, the fixture and the boards are those of
+ * tests/test_dp2_v1236_evidence_since.js, copied verbatim (norm folds 1.3.1 and 1.3.0; build() takes an optional dp2Tiles_ hook,
+ * used to build the EXPECTED armed page from the v1.3.0 source with only the Executable tile changed by the harness).
  *   P0 oracle, version lockstep, inventory (+3 functions, +2 line-start vars, 0 removed), 5 hunks reverse to the base
- *   P1 GOLDEN NEGATIVE / KILL: absent, blank, off words, near misses, a fault -> the v1.2.36 build on every board
- *   P2 armed, nothing to correct (live, no ticket, research under a live feed, no feed key) -> the v1.2.36 build
+ *   P1 GOLDEN NEGATIVE / KILL: absent, blank, off words, near misses, a fault -> the v1.3.0 build on every board
+ *   P2 armed, nothing to correct (live, no ticket, research under a live feed, no feed key) -> the v1.3.0 build
  *   P3 armed, release not live (EXPIRED, SYNC RUNNING, NOT ACTIONABLE; DP2_COHORT_LEGACY) -> only the tile changes
  *   P4 the export audit's view of the tile (label cell, numeric value) is unchanged
  *   P5 pure: the tile rule and the core check
  *   P6 the gate: one property read per Top-10 build; Portfolio_Decision_v2 alone never reads it; a fault reads off
- *   P7 dp2SelfTest: the v1.2.36 report while off; one line while on
+ *   P7 dp2SelfTest: the v1.3.0 report while off; one line while on
  *   P8 lint: ES5; no non-ASCII character in a hunk; LF; WHY newest-first; every prior WHY kept
  *   P9 mutants
  * The battery runs twice and the two digests must match; the last line is 'PASS k/k' (exit 1 on any failure).
- * Usage: node tests/test_dp2_v1237_exec_tile_feed.js [new.gs] [v1.2.36.gs]
+ * Usage: node tests/test_dp2_v1237_exec_tile_feed.js [new.gs] [v1.3.0.gs]
  */
 'use strict';
 const fs = require('fs');
@@ -35,8 +35,8 @@ const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_
 const OLD_PATH = process.argv[3] || '';
 const NEW = fs.readFileSync(NEW_PATH, 'utf8');
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
-const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1237.json'), 'utf8'));
-const V1236_SHA256 = '487c0778e1f509eb9ee60e91d4603ed884367719af1b065e6231b723bb1f10f3';   // v1.2.36 (origin/main 86edd72)
+const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1301.json'), 'utf8'));
+const BASE_SHA256 = 'f670ad1cd2ccadfbd4a4b60028ceaeacf0939f51a6ea4407d0bbe4a03330c4c9';   // v1.3.0 (origin/main 53f2abdc)
 const NOW = Date.parse(FIX.frozen_now);   // 2026-11-02T06:24:00Z = 09:24 Riyadh (the release is live until 10:42)
 const GATE = 'DP2_EXEC_TILE_FEED';
 const DOT = '\u00b7', DASH = '\u2014', ARROW = '\u2192', NDASH = '\u2013';
@@ -64,16 +64,16 @@ function deq(a, b, m) {
 function reverseEdits(src) {
   let s = src;
   for (const [cur, prev] of EDITS) {
-    eq(s.split(cur).length - 1, 1, 'exactly one approved v1.2.37 hunk: ' + cur.split('\n')[0].slice(0, 90));
+    eq(s.split(cur).length - 1, 1, 'exactly one approved v1.3.1 hunk: ' + cur.split('\n')[0].slice(0, 90));
     s = s.replace(cur, () => prev);
   }
-  eq(sha256(s), V1236_SHA256, 'v1.2.37 changes only its enumerated hunks (their reversal = the v1.2.36 file)');
+  eq(sha256(s), BASE_SHA256, 'v1.3.1 changes only its enumerated hunks (their reversal = the v1.3.0 file)');
   return s;
 }
 let OLD = null, oldErr = '';
 try {
   OLD = OLD_PATH ? fs.readFileSync(OLD_PATH, 'utf8') : reverseEdits(NEW);
-  eq(sha256(OLD), V1236_SHA256, 'v1.2.36 SHA-256');
+  eq(sha256(OLD), BASE_SHA256, 'v1.3.0 SHA-256');
 } catch (e) { oldErr = String(e && e.message || e); OLD = null; }
 if (!OLD) { console.log('FAIL P0 oracle: ' + oldErr); console.log('FAIL 0/1'); process.exit(1); }
 
@@ -352,7 +352,7 @@ function build(source, which, opts) {
 function norm(b) {   // the only bytes the pages may differ in while the gate is off: the version printed on both footers / the toast title
   const strip = o => { const x = Object.assign({}, o); delete x.env; return x; };
   let s = JSON.stringify(strip(b));
-  for (const v of ['1.2.37', '1.2.36', '1.2.35', '1.2.34', '1.2.33', '1.2.32', '1.2.31']) s = s.split('Decision Pages v2 ' + v).join('Decision Pages v2 1.2.30');
+  for (const v of ['1.3.1', '1.3.0', '1.2.37', '1.2.36', '1.2.35', '1.2.34', '1.2.33', '1.2.32', '1.2.31']) s = s.split('Decision Pages v2 ' + v).join('Decision Pages v2 1.2.30');
   return JSON.parse(s);
 }
 function sheet(b, name) { return b.env.book.getSheetByName(name); }
@@ -399,7 +399,7 @@ function pdView(b) {
 
 
 
-/* ============================================================ v1.2.37 [EXEC-TILE-FEED] */
+/* ============================================================ v1.3.1 [EXEC-TILE-FEED] */
 const T10 = 'Top_10_Investments_v2', PDV = 'Portfolio_Decision_v2';
 const NO_NET = { fetch() { return { getResponseCode: () => 404, getContentText: () => '{}' }; } };
 const AT_1100 = Date.parse('2026-11-02T08:00:00Z');   // 11:00 Riyadh: the 10:42 release has expired, no re-render since
@@ -418,7 +418,7 @@ const SCEN = {
   noFeed: ['noFeed', BOARDS.noFeed, AT_1100, '']
 };
 const SUB_PREFIX = lbl => 'feed ' + lbl + ' - not executable now - ';
-/* the expected page: the v1.2.36 build with ONLY the Executable tile changed, computed by the harness (not by the code under test) */
+/* the expected page: the v1.3.0 build with ONLY the Executable tile changed, computed by the harness (not by the code under test) */
 const expectHook = lbl => (sh, tiles) => tiles.map(t => (t.label === 'Executable' ? { label: t.label, value: t.value, sub: SUB_PREFIX(lbl) + t.sub, color: GREY } : t));
 function tileOf(b, label) { const t = t10View(b).tile(label); ok(t, 'the ' + label + ' tile'); return t; }
 const OFF_RAW = [undefined, '', 'off', '0', 'false', 'no', 'enable', 'enabled', 'onn', 'y', '2', 'on;', 'yes please'];
@@ -454,7 +454,7 @@ function checkArmedUnchanged(src, parts) {
       const props = Object.assign({}, ON, extra);
       const [, bd, now] = SCEN[k];
       const n = build(src, 'both', { board: bd, now, props, fetch: NO_NET }), o = build(OLD, 'both', { board: bd, now, props, fetch: NO_NET });
-      deq(norm(n), norm(o), 'armed ' + JSON.stringify(extra) + ', ' + k + ' = v1.2.36');
+      deq(norm(n), norm(o), 'armed ' + JSON.stringify(extra) + ', ' + k + ' = v1.3.0');
     }
   }
   const lv = tileOf(build(src, 't10', { board: BOARDS.today, props: ON, fetch: NO_NET }), 'EXECUTABLE');
@@ -474,8 +474,8 @@ function checkArmedGrey(src, parts) {
         const e = build(OLD, 'both', { board: bd, now, props, fetch: NO_NET, tileHook: expectHook(lbl) });
         deq(norm(n), norm(e), 'armed ' + JSON.stringify(raw) + ' ' + JSON.stringify(extra) + ', ' + k + ': only the Executable tile changes');
         const t = tileOf(n, 'EXECUTABLE'), o = tileOf(build(OLD, 'both', { board: bd, now, props, fetch: NO_NET }), 'EXECUTABLE');
-        eq(t.value, '6', 'the count stays'); eq(t.value, o.value, 'the count = v1.2.36');
-        eq(t.color, GREY, 'grey'); eq(o.color, GREEN, 'v1.2.36 painted it green');
+        eq(t.value, '6', 'the count stays'); eq(t.value, o.value, 'the count = v1.3.0');
+        eq(t.color, GREY, 'grey'); eq(o.color, GREEN, 'v1.3.0 painted it green');
         eq(t.sub, SUB_PREFIX(lbl) + 'of 10 ' + DOT + ' EXECUTABLE', 'the sub names the feed');
         eq(t.row, o.row, 'same row'); eq(t.col, o.col, 'same column');
       }
@@ -494,7 +494,7 @@ function checkExportAudit(src, parts) {
     const tn = tileOf(n, 'EXECUTABLE'), to = tileOf(o, 'EXECUTABLE');
     eq(val(sheet(n, T10), tn.row, tn.col), 'EXECUTABLE', 'the label cell (' + k + ')');
     ok(/^\d[\d,]*$/.test(String(tn.value)), 'a numeric value (' + k + '): ' + tn.value);
-    eq(tn.value, to.value, 'the value = v1.2.36 (' + k + ')');
+    eq(tn.value, to.value, 'the value = v1.3.0 (' + k + ')');
   }
   parts.push('audit ok');
 }
@@ -530,13 +530,13 @@ function checkGate(src) {
   eq(makeEnv(src, { props: ON, propsThrow: true }).ctx.dp2ExecTileFeedOn_(), false, 'a fault reads off');
   for (const raw of OFF_RAW) eq(makeEnv(src, { props: raw === undefined ? {} : { [GATE]: raw } }).ctx.dp2ExecTileFeedOn_(), false, 'off word ' + JSON.stringify(raw));
   for (const raw of ON_RAW) eq(makeEnv(src, { props: { [GATE]: raw } }).ctx.dp2ExecTileFeedOn_(), true, 'on word ' + JSON.stringify(raw));
-  eq(OLD.indexOf(GATE), -1, 'v1.2.36 never names the property');
+  eq(OLD.indexOf(GATE), -1, 'v1.3.0 never names the property');
 }
 function checkSelfTest(src, parts) {
   const run = (s, opts) => { const env = makeEnv(s, Object.assign({ fetch: NO_NET }, opts)); return plain(env.ctx.dp2SelfTest()); };
-  const fold = x => x.name.split('1.2.37').join('v').split('1.2.36').join('v');
+  const fold = x => x.name.split('1.3.1').join('v').split('1.3.0').join('v').split('1.2.37').join('v').split('1.2.36').join('v');
   const n0 = run(src, {}), o0 = run(OLD, {});
-  deq(n0.checks.map(x => [fold(x), x.ok]), o0.checks.map(x => [fold(x), x.ok]), 'off: the v1.2.36 report');
+  deq(n0.checks.map(x => [fold(x), x.ok]), o0.checks.map(x => [fold(x), x.ok]), 'off: the v1.3.0 report');
   const n1 = run(src, { props: ON }), o1 = run(OLD, { props: ON });
   eq(n1.checks.length, o1.checks.length + 1, 'on: one more line');
   const at = n1.checks.findIndex(x => /^executable tile follows the feed/.test(x.name));
@@ -544,7 +544,7 @@ function checkSelfTest(src, parts) {
   eq(n1.checks[at].name, 'executable tile follows the feed (DP2_EXEC_TILE_FEED): on ' + DOT + ' core ok (grey and "feed <state> - not executable now" once the release is not live)', 'the text');
   eq(n1.checks[at].ok, true, 'ok');
   eq(n1.checks[at - 1].name, 'symbol keys (GOOGLEFINANCE / chart API)', 'after the symbol-key line (the other optional lines are off)');
-  deq(n1.checks.filter((x, i) => i !== at).map(x => [fold(x), x.ok]), o1.checks.map(x => [fold(x), x.ok]), 'every other line = v1.2.36');
+  deq(n1.checks.filter((x, i) => i !== at).map(x => [fold(x), x.ok]), o1.checks.map(x => [fold(x), x.ok]), 'every other line = v1.3.0');
   const n2 = run(src, { props: Object.assign({ DP2_EVIDENCE_SINCE: '2026-10-20' }, ON) });
   const i2 = n2.checks.findIndex(x => /^executable tile follows the feed/.test(x.name));
   ok(/^evidence since/.test(n2.checks[i2 - 1].name), 'after the v1.2.36 evidence since line when that is on');
@@ -560,11 +560,11 @@ function checkLint() {
   }
   const hdr = s => s.slice(0, s.indexOf(' */') + 3);
   const vs = hdr(NEW).split('\n').map(l => (/^ \*   (\d+\.\d+\.\d+)[ :(]/.exec(l) || [])[1]).filter(Boolean);
-  eq(vs[0], '1.2.37', 'the newest WHY first');
-  eq(vs[1], '1.2.36', 'then 1.2.36');
+  eq(vs[0], '1.3.1', 'the newest WHY first');
+  eq(vs[1], '1.3.0', 'then 1.3.0');
   const oldLines = hdr(OLD).split('\n').filter(l => !/^ \* Version: /.test(l));
   for (const l of oldLines) ok(hdr(NEW).indexOf(l) >= 0, 'prior WHY kept: ' + l.slice(0, 90));
-  eq(hdr(NEW).split('\n')[3], ' * Version: 1.2.37 (2026-11-09)', 'the version line');
+  eq(hdr(NEW).split('\n')[3], ' * Version: 1.3.1 (2026-11-11)', 'the version line');
 }
 /* one scenario signature for the mutants */
 function signature(src) {
@@ -598,9 +598,9 @@ const MUTANTS = [
 
 function battery() {
   const parts = [];
-  test('P0 oracle: v1.2.36 rebuilt from the delivered file (SHA-256 pinned 487c0778 = origin/main 86edd72); version lockstep 1.2.37; both compile; inventory +3 functions +2 line-start vars, 0 removed; 5 hunks reverse to the base', () => {
-    eq(sha256(OLD), V1236_SHA256, 'base SHA-256');
-    ok(NEW.indexOf("var DP2_VERSION = '1.2.37';   // lockstep with the header") > 0 && /^ \* Version: 1\.2\.37 \(2026-11-09\)$/.test(NEW.split('\n')[3]), 'version lockstep');
+  test('P0 oracle: v1.3.0 rebuilt from the delivered file (SHA-256 pinned f670ad1c = origin/main 53f2abdc); version lockstep 1.3.1; both compile; inventory +3 functions +2 line-start vars, 0 removed; 5 hunks reverse to the base', () => {
+    eq(sha256(OLD), BASE_SHA256, 'base SHA-256');
+    ok(NEW.indexOf("var DP2_VERSION = '1.3.1';   // lockstep with the header") > 0 && /^ \* Version: 1\.3\.1 \(2026-11-11\)$/.test(NEW.split('\n')[3]), 'version lockstep');
     new vm.Script(NEW); new vm.Script(OLD);
     const names = (s, re) => { const o = {}; let m; while ((m = re.exec(s)) !== null) o[m[1]] = true; return o; };
     const fb = names(OLD, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg), fn = names(NEW, /^function\s+([A-Za-z_$][\w$]*)\s*\(/mg);
@@ -612,15 +612,15 @@ function battery() {
     ok(NEW.indexOf('var DP2_ETF_READ_ = false, DP2_ETF_ = false;') > 0 && OLD.indexOf('DP2_ETF_') < 0, 'DP2_ETF_ shares a line');
     eq(EDITS.length, 5, 'hunk count');
     for (const [cur] of EDITS) eq(NEW.split(cur).length - 1, 1, 'each current is unique: ' + cur.split('\n')[0].slice(0, 80));
-    eq(sha256(reverseEdits(NEW)), V1236_SHA256, 'reversal of the delivered file');
+    eq(sha256(reverseEdits(NEW)), BASE_SHA256, 'reversal of the delivered file');
   });
-  test('P1 GOLDEN NEGATIVE / KILL: the gate absent, blank, off words, near misses or a property fault -> the v1.2.36 build on a live, expired, sync-running and not-actionable board (cells, formats, charts, calls, logs, mails, returns); DP2_COHORT_LEGACY too; armed, Portfolio_Decision_v2 alone is unchanged', () => checkGoldenNegative(NEW, parts));
-  test('P2 armed, nothing to correct: a live release, a board with no ticket, a live release over a research board and a feed with no state build the v1.2.36 pages (with and without DP2_COHORT_LEGACY)', () => checkArmedUnchanged(NEW, parts));
-  test('P3 armed, release not live (EXPIRED at 11:00, SYNC RUNNING, NOT ACTIONABLE; every on-spelling; DP2_COHORT_LEGACY): only the Executable tile changes - grey, "feed <state> - not executable now - of 10 . EXECUTABLE", the count 6 stays - against an expected page the harness builds from v1.2.36', () => checkArmedGrey(NEW, parts));
-  test('P4 export audit: the EXECUTABLE label cell and a numeric value below it on every board, equal to v1.2.36 (scripts/tfb_export_audit.py check_top10_v2_presentation)', () => checkExportAudit(NEW, parts));
+  test('P1 GOLDEN NEGATIVE / KILL: the gate absent, blank, off words, near misses or a property fault -> the v1.3.0 build on a live, expired, sync-running and not-actionable board (cells, formats, charts, calls, logs, mails, returns); DP2_COHORT_LEGACY too; armed, Portfolio_Decision_v2 alone is unchanged', () => checkGoldenNegative(NEW, parts));
+  test('P2 armed, nothing to correct: a live release, a board with no ticket, a live release over a research board and a feed with no state build the v1.3.0 pages (with and without DP2_COHORT_LEGACY)', () => checkArmedUnchanged(NEW, parts));
+  test('P3 armed, release not live (EXPIRED at 11:00, SYNC RUNNING, NOT ACTIONABLE; every on-spelling; DP2_COHORT_LEGACY): only the Executable tile changes - grey, "feed <state> - not executable now - of 10 . EXECUTABLE", the count 6 stays - against an expected page the harness builds from v1.3.0', () => checkArmedGrey(NEW, parts));
+  test('P4 export audit: the EXECUTABLE label cell and a numeric value below it on every board, equal to v1.3.0 (scripts/tfb_export_audit.py check_top10_v2_presentation)', () => checkExportAudit(NEW, parts));
   test('P5 pure: the tile rule (expired, sync running, no label, live, legacy ACTIONABLE, no ticket, no feed state, no view, no mutation) and the core check', () => checkPure(NEW, parts));
   test('P6 the gate: one property read per Top-10 build (live or not); Portfolio_Decision_v2 alone never reads it; memoised; a fault reads off; off and on spellings', () => checkGate(NEW));
-  test('P7 dp2SelfTest: off = the v1.2.36 report; on = one line after the optional lines before it', () => checkSelfTest(NEW, parts));
+  test('P7 dp2SelfTest: off = the v1.3.0 report; on = one line after the optional lines before it', () => checkSelfTest(NEW, parts));
   test('P8 lint: LF; ASCII and ES5 in every hunk; the WHY newest-first; every prior WHY line kept', () => checkLint());
   test('P9 mutants: ' + MUTANTS.length + ' single-line mutants of the delivered file are each caught', () => {
     const want = signature(NEW);
@@ -647,5 +647,5 @@ for (let run = 1; run <= 2; run++) {
   if (failed) { console.log('FAIL ' + passed + '/' + total); process.exit(1); }
 }
 if (digests[0] !== digests[1]) { console.log('FAIL x2 digest mismatch ' + digests.join(' ')); process.exit(1); }
-console.log('DP2 V1237 P0-P9 x2 identical digest ' + digests[0].slice(0, 16) + ' | new SHA256 ' + sha256(NEW).slice(0, 12) + ' | v1.2.36 SHA256 ' + sha256(OLD).slice(0, 12));
+console.log('DP2 V1301 P0-P9 x2 identical digest ' + digests[0].slice(0, 16) + ' | new SHA256 ' + sha256(NEW).slice(0, 12) + ' | v1.3.0 SHA256 ' + sha256(OLD).slice(0, 12));
 console.log('PASS ' + passed + '/' + total);

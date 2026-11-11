@@ -32,8 +32,9 @@ const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
 const OLD_PATH = process.argv[3] || '';
-// 2026-11-09: v1.2.37 [EXEC-TILE-FEED] is delivered; this harness proves the v1.2.36 diff, so it reads the v1.2.36 file
-// rebuilt from the delivered one (tests/js/dp2_history.js: the v1.2.37 hunks reversed, SHA-256 pinned).
+// 2026-11-11: v1.3.1 is delivered on top of v1.3.0; v1236Source chains through the v1.3.0 file (dp2_history).
+// 2026-11-11: v1.3.0 is delivered; this harness proves the v1.2.36 diff, so NEW is the v1.2.36 file rebuilt from the
+// delivered one (tests/js/dp2_history.js: the v1.3.0 hunks reversed, SHA-256 pinned).
 const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1236Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1236.json'), 'utf8'));
