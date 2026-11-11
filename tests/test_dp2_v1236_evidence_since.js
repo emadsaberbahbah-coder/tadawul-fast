@@ -32,6 +32,7 @@ const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
 const OLD_PATH = process.argv[3] || '';
+// 2026-11-11: v1.3.1 is delivered on top of v1.3.0; v1236Source chains through the v1.3.0 file (dp2_history).
 // 2026-11-11: v1.3.0 is delivered; this harness proves the v1.2.36 diff, so NEW is the v1.2.36 file rebuilt from the
 // delivered one (tests/js/dp2_history.js: the v1.3.0 hunks reversed, SHA-256 pinned).
 const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1236Source(fs.readFileSync(NEW_PATH, 'utf8'));
