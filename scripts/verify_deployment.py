@@ -360,6 +360,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.1.0", "daily plan"),
     ("exit_plan", "1.0.1", "exit plan"),
+    ("consistency_check", "1.0.0", "consistency check"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
