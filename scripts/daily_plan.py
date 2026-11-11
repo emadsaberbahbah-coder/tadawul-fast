@@ -75,6 +75,15 @@ columns are read from the source pages (Risk Score, Target Price); nothing new
 is written outside the two tabs. Knobs: TFB_PLAN_EV_RISK_MAX (30),
 TFB_PLAN_EV_UPSIDE_MIN (15).
 
+1.2.0 (2026-11-11): HOURLY STATUS ON LIVE PRICES (owner, 12:52 Riyadh: the
+outcome pages refresh at least every hour, automatically, with the new data).
+The workflow runs every hour. The picks stay frozen; their status (OPEN /
+WAIT / CHECK / INVALIDATED) is checked against the last traded price from the
+Yahoo chart (TFB_PLAN_LIVE_PRICE = on) instead of the source pages' price,
+which moves only when a sync lands (three times a day); the reason carries
+'(live HH:MM Riyadh)'. A name with no live price keeps the page price. The cut
+itself still uses the source pages, as before.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -88,7 +97,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -161,6 +170,7 @@ def knobs() -> Dict[str, Any]:
         "cooldown": int(_env_num("TFB_PLAN_COOLDOWN_DAYS", 10, 0, 90)),
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
         "ev_mode": ev_mode(),
+        "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
         "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
     }
@@ -588,9 +598,31 @@ def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def live_overlay(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
+                 quote=None) -> Dict[str, str]:
+    """1.2.0: the last traded price for each open pick, laid over its source-page price. Returns {SYMBOL: 'HH:MM'}
+    (Riyadh) for the names that got one. `quote(symbol) -> (price, utc datetime) | None`."""
+    if quote is None:
+        from scripts.exit_plan import live_quote as quote  # noqa: PLC0415 - exit_plan imports this module
+    out: Dict[str, str] = {}
+    for d in day_rows:
+        if text(d["Kind"]) != "PICK" or text(d["Status"]) in ("EXECUTED", "INVALIDATED"):
+            continue
+        sym = text(d["Symbol"]).upper()
+        try:
+            q = quote(sym)
+        except Exception:  # noqa: BLE001 - a quote that fails keeps the page price
+            q = None
+        if not q or not q[0] or q[0] <= 0:
+            continue
+        sources[sym] = dict(sources.get(sym) or {}, price=float(q[0]))
+        out[sym] = q[1].astimezone(RIYADH).strftime("%H:%M")
+    return out
+
+
 def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
                    cal: Dict[str, Dict[str, Any]], held: Dict[str, _dt.date], plan_date: _dt.date,
-                   earn_guard: int, stamp: str) -> None:
+                   earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None) -> None:
     for d in day_rows:
         if text(d["Kind"]) != "PICK":
             continue
@@ -602,6 +634,8 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
                "zone_high": num(d["Zone High"]) or 0.0}
         st, why = pick_status(row, price, held, plan_date, (cal.get(sym) or {}).get("earn_days"), earn_guard,
                               text(d["Cut Quality"]))
+        if live and sym in live and price is not None:
+            why += " (live %s Riyadh)" % live[sym]
         d["Status"], d["Status Reason"], d["Status At (Riyadh)"] = st, why, stamp
         d["Last Price"] = price if price is not None else ""
 
@@ -794,7 +828,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
                                                     len(plan["pipeline"]), fmt(plan["nav"], 0), fmt(cash, 0),
                                                     fmt(plan["deployable"], 0), fmt(plan["per_pick"], 0)))
     if today_rows:
-        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp)
+        live = live_overlay(today_rows, sources) if k["live"] else {}
+        if live:
+            _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
+                                                  for s in sorted(live)))
+        refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live)
         first = today_rows[0]
         info["headline"] = "Plan of %s · cut %s Riyadh from the main page's render of %s (%s) · status " \
                            "checked %s" % (day, text(first["Cut At (Riyadh)"]), text(first["Source Render"]),

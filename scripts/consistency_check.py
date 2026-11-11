@@ -32,6 +32,14 @@ and the pages they come from. It changes no other page and decides nothing.
   C9 stops         Portfolio_Decision stop vs the Exit Plan's stop per holding
   C10 actions      Portfolio_Decision action vs the Exit Plan's action
 
+1.1.0 (2026-11-11): HOURLY, AND C11 PAGE FRESHNESS (owner, 12:52 Riyadh: the
+outcome pages refresh at least every hour, automatically). The workflow runs
+every hour at minute 50. C11 reads the time each output page was last built -
+Top_10_Investments and Portfolio_Decision ('Last run'), Daily_Plan ('checked'),
+Exit_Plan ('As of'), both v2 pages ('page built') - and reads STALE when it is
+older than TFB_CONS_PAGE_MAX_AGE_H hours (2), so a page that stopped refreshing
+shows within the hour.
+
 GATE: TFB_CONSISTENCY = off (default) | observe (print only) | on.
 Rollback: repository variable TFB_CONSISTENCY=off.
 """
@@ -50,7 +58,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -90,7 +98,8 @@ def knobs() -> Dict[str, float]:
             "fx_tol": _env_num("TFB_CONS_FX_TOL_PCT", 0.05, 0.0, 5.0),
             "stop_tol": _env_num("TFB_CONS_STOP_TOL_PCT", 1.0, 0.0, 50.0),
             "earn_days": _env_num("TFB_PLAN_EARN_DAYS", 7, 0, 30),
-            "sar_tol": _env_num("TFB_CONS_SAR_TOL", 50.0, 0.0, 1e6)}
+            "sar_tol": _env_num("TFB_CONS_SAR_TOL", 50.0, 0.0, 1e6),
+            "page_h": _env_num("TFB_CONS_PAGE_MAX_AGE_H", 2.0, 0.25, 240.0)}
 
 
 # ----------------------------------------------------------------------------- #
@@ -154,7 +163,29 @@ def _pct(a: float, b: float) -> float:
 # ----------------------------------------------------------------------------- #
 # The checks (pure)
 # ----------------------------------------------------------------------------- #
-def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float]) -> List[List[str]]:
+FRESHNESS = (("Top_10_Investments", "Last run"), ("Portfolio_Decision", "Last run"), ("Daily_Plan", "checked"),
+             ("Exit_Plan", "As of"), ("Top_10_Investments_v2", "page built"), ("Portfolio_Decision_v2", "page built"))
+
+
+def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float) -> List[List[str]]:
+    """C11: one row per output page - when it was last built, and STALE past max_h hours."""
+    out: List[List[str]] = []
+    for page, mark in FRESHNESS:
+        at = stamp_in(g.get(page) or [], after=mark)
+        if at is None:
+            out.append(row("C11 freshness", "INFO", "%s: no build time found (page missing or not built)" % page,
+                           pages=page))
+            continue
+        age = (now - at).total_seconds() / 3600.0
+        out.append(row("C11 freshness", "STALE" if age > max_h else "MATCH",
+                       "%s: built %s Riyadh, %.1f h ago%s" % (page, at.strftime("%Y-%m-%d %H:%M"), max(0.0, age),
+                                                               " (limit %g h)" % max_h if age > max_h else ""),
+                       at.strftime("%Y-%m-%d %H:%M"), "", page))
+    return out
+
+
+def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float],
+               now: Optional[_dt.datetime] = None) -> List[List[str]]:
     out: List[List[str]] = []
     t10, pd = g.get("Top_10_Investments") or [], g.get("Portfolio_Decision") or []
     seats = table_rows(t10, ("Rank", "Symbol", "Ticket SAR", "Shares"), "Symbol")
@@ -297,6 +328,8 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
                        "stops agree within %.1f%%" % k["stop_tol"], pages="Portfolio_Decision / Exit_Plan"))
         out.append(row("C10 actions", "MISMATCH" if bad_act else "MATCH", "; ".join(bad_act) or
                        "sell-side actions agree", pages="Portfolio_Decision / Exit_Plan"))
+    if now is not None:
+        out += freshness(g, now, k["page_h"])
     return out
 
 
@@ -317,7 +350,7 @@ def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
 # ----------------------------------------------------------------------------- #
 RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:X60", "Top_10_Investments_v2": "A1:Z4",
           "Portfolio_Decision_v2": "A1:Z4", "_Portfolio_CostBasis": "A1:Z600", "My_Portfolio": "A1:K60",
-          "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Calendar_Events": "A1:J4000",
+          "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Daily_Plan": "A1:B4", "Exit_Plan": "A1:B4", "Calendar_Events": "A1:J4000",
           "Dividend_Events": "A1:J4000"}
 
 
@@ -343,7 +376,7 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> int:
                 return 2
             _out("read failed (%s) - attempt %d of %d" % (type(e).__name__, attempt, READ_ATTEMPTS))
             _SLEEP(READ_RETRY_S)
-    results = run_checks(grids, today, knobs())
+    results = run_checks(grids, today, knobs(), now)
     for r in results:
         _out("%-16s %-8s %s" % (r[0], r[1], r[2]))
     if not write:

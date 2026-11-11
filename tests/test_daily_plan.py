@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""tests/test_daily_plan.py - scripts/daily_plan.py 1.1.0: one plan a day, frozen.
+"""tests/test_daily_plan.py - scripts/daily_plan.py 1.2.0: one plan a day, frozen.
 
+  H1-H2 (1.2.0) hourly status on live prices: the live price decides OPEN / WAIT / INVALIDATED and is named;
+      a pick without a live price keeps the page price; the cut and the frozen levels never use it
   E1-E6 (1.1.0) the evidence rule: off adds nothing; observe labels every
       qualified name and changes no pick; on keeps a name that is not PASS in
       the pipeline; the two thresholds at their edge; Tadawul and a missing
@@ -572,6 +574,8 @@ def test_d10_workflow_manifest_ci():
     step = [s for s in job["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_DAILY_PLAN"] == "${{ vars.TFB_DAILY_PLAN || 'on' }}"
     assert step["env"]["TFB_PLAN_EVIDENCE"] == "${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}"   # 1.1.0: a label, not a gate
+    assert step["env"]["TFB_PLAN_LIVE_PRICE"] == "${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}"    # 1.2.0
+    assert on["schedule"] == [{"cron": "20 * * * *"}]                                         # 1.2.0: hourly
     assert "--wait-min 45" in step["run"] and "--dry-run" in step["run"]
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_PLAN_[A-Z_]+): \$\{\{", (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")):
@@ -580,3 +584,50 @@ def test_d10_workflow_manifest_ci():
     assert '("daily_plan", "%s", "daily plan")' % dp.__version__ in manifest
     assert "tests/test_daily_plan.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert not re.search(r"create_order|place_order|requests\.post|urlopen", src)
+
+
+# ----------------------------------------------------------------------------- H (1.2.0)
+def test_h1_hourly_status_uses_the_live_price(monkeypatch):
+    import scripts.exit_plan as ep
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0                                       # the cut, live price off
+    before = frozen(b)
+    calls = []
+    at = dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC)                              # 15:00 Riyadh
+    quotes = {"ITRN.US": 55.00, "TEN.US": 22.00}                                   # NMM.US: no live price
+
+    def fake(sym):
+        calls.append(sym)
+        return (quotes[sym], at) if sym in quotes else None
+    monkeypatch.setattr(ep, "live_quote", fake)
+    monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "on")
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=1)) == 0
+    assert frozen(b) == before                                                     # levels never move
+    rows = {r[6]: r for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK"}
+    st = {s: (r[24], r[25], r[26]) for s, r in rows.items()}
+    assert st["ITRN.US"][0] == "WAIT" and st["ITRN.US"][1].endswith("(live 15:00 Riyadh)") and st["ITRN.US"][2] == 55.0
+    assert st["TEN.US"][0] == "INVALIDATED" and "(live 15:00 Riyadh)" in st["TEN.US"][1]
+    assert st["NMM.US"][0] == "OPEN" and "live" not in st["NMM.US"][1] and st["NMM.US"][2] == 60.0   # page price
+    assert sorted(calls) == ["ITRN.US", "NMM.US", "TEN.US"]
+    calls.clear()
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=2)) == 0
+    assert "TEN.US" not in calls                                                   # terminal: no quote asked
+
+
+def test_h2_live_overlay_edges(monkeypatch):
+    rows = [{"Kind": "PICK", "Symbol": "a.us", "Status": "OPEN"}, {"Kind": "PIPELINE", "Symbol": "B.US", "Status": ""},
+            {"Kind": "PICK", "Symbol": "C.US", "Status": "EXECUTED"}, {"Kind": "PICK", "Symbol": "D.US", "Status": "CHECK"},
+            {"Kind": "PICK", "Symbol": "E.US", "Status": "WAIT"}]
+    src = {"A.US": {"price": 1.0, "ccy": "USD"}}
+    at = dt.datetime(2026, 11, 10, 20, 5, tzinfo=UTC)
+
+    def q(sym):
+        if sym == "D.US":
+            raise OSError("network")
+        return {"A.US": (2.5, at), "E.US": (0.0, at)}.get(sym)
+    got = dp.live_overlay(rows, src, q)
+    assert got == {"A.US": "23:05"} and src["A.US"] == {"price": 2.5, "ccy": "USD"} and "E.US" not in src
+    monkeypatch.delenv("TFB_PLAN_LIVE_PRICE", raising=False)
+    assert dp.knobs()["live"] is False
+    monkeypatch.setenv("TFB_PLAN_LIVE_PRICE", "ON")
+    assert dp.knobs()["live"] is True

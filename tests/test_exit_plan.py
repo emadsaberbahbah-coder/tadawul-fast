@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_exit_plan.py - scripts/exit_plan.py 1.0.1: stop and target per holding, reviewed after every close.
+"""tests/test_exit_plan.py - scripts/exit_plan.py 1.1.0: stop and target per holding, reviewed after every close.
 
   X1  Yahoo chart parsing: incomplete bars dropped, dividend factor applied (an implausible one ignored)
   X2  ATR of the last 14 true ranges
@@ -16,7 +16,9 @@
   X12 workbook parsers: lots, news window, broker stops freshness, plan picks, prior row
   X13 run(): the gate, the two tabs, a same-day re-run keeps the published state (Codex P2 on #956), the
       e-mail, fixed income, no price history
-  X14 the workflow, the manifest pin and the CI lane
+  X14 the workflow, the manifest pin and the CI lane (1.1.0: hourly, the e-mail only after the 07:30 run)
+  X15 (1.1.0) an open session's bar is set aside: levels on completed closes, its price shown as Live;
+      TAKE PROFIT stays for the day it was issued; live_quote for the Daily Plan
 
 Run: pytest -q tests/test_exit_plan.py
 """
@@ -409,8 +411,8 @@ def test_x13_run(monkeypatch):
     assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a)) == 0
     led = b.tabs["_Exit_Plan"].values
     assert len(led) == 2 and led[1][12] == "yes" and led[1][10] >= first[1][10]   # the same day keeps its state
-    assert led[1][13] != "TAKE PROFIT"                                             # issued once, even on a re-run
-    assert len(sent) == 1 and sent[0][0] == "TFB Exit Plan 2026-11-11 - 1 action: GONE.US check"
+    assert led[1][13] == "TAKE PROFIT"                                             # 1.1.0: it stays for the day
+    assert len(sent) == 1 and sent[0][0] == "TFB Exit Plan 2026-11-11 - 2 actions: DDI.US take profit, GONE.US check"
     assert "<b>DDI.US</b>" in sent[0][2] and "Today's plan picks" in sent[0][2]
     fresh = wbook()
     assert ep.run(False, True, book=fresh, now=NOW, opener=opener, mailer=lambda *a: sent.append(a)) == 0
@@ -418,7 +420,11 @@ def test_x13_run(monkeypatch):
     later = NOW + dt.timedelta(days=1)
     assert ep.run(False, False, book=b, now=later, opener=opener, mailer=lambda *a: sent.append(a)) == 0
     led = b.tabs["_Exit_Plan"].values
-    assert len(led) == 3 and led[2][13] != "TAKE PROFIT" and len(sent) == 2        # issued once; no --send
+    assert len(led) == 3 and led[2][13] == "TAKE PROFIT" and len(sent) == 2        # 1.1.0: no new close yet
+    monkeypatch.setitem(SERIES, "DDI", SERIES["DDI"] + [110.5])                   # the next close
+    assert ep.run(False, False, book=b, now=later, opener=opener, mailer=lambda *a: sent.append(a)) == 0
+    led = b.tabs["_Exit_Plan"].values
+    assert len(led) == 3 and led[2][13] != "TAKE PROFIT" and led[2][12] == "yes"   # issued once; no --send
     def boom(*a):
         raise OSError("smtp down")
     assert ep.run(False, True, book=b, now=later, opener=opener, mailer=boom) == 4
@@ -447,7 +453,10 @@ def test_x14_workflow_manifest_ci():
     raw = (ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["schedule"] == [{"cron": "30 4 * * *"}] and "workflow_dispatch" in on
+    assert on["schedule"] == [{"cron": "30 4 * * *"}, {"cron": "35 0-3,5-23 * * *"}] and "workflow_dispatch" in on
+    hours = set(range(0, 4)) | set(range(5, 24))
+    assert len(hours) == 23                                                         # every hour, 04 is the 04:30 run
+    assert '"$EVENT_CRON" == "30 4 * * *"' in raw and "EVENT_CRON: ${{ github.event.schedule }}" in raw
     assert wf["permissions"] == {"contents": "read"}
     step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_PLAN"] == "${{ vars.TFB_EXIT_PLAN || 'on' }}"
@@ -460,3 +469,148 @@ def test_x14_workflow_manifest_ci():
         encoding="utf-8")
     assert "tests/test_exit_plan.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert not re.search(r"create_order|place_order|requests\.post|cancel_order", src)
+
+
+# ----------------------------------------------------------------------------- X15
+def _open_payload(bars, start, end, off=0, price=None, ts=None):
+    t = [int(dt.datetime(b[0].year, b[0].month, b[0].day, 14, 30, tzinfo=UTC).timestamp()) for b in bars]
+    p = chart(t, [b[1] for b in bars], [b[2] for b in bars], [b[3] for b in bars], [b[4] for b in bars], off=off)
+    meta = p["chart"]["result"][0]["meta"]
+    meta["currentTradingPeriod"] = {"regular": {"start": start, "end": end}}
+    if price is not None:
+        meta["regularMarketPrice"], meta["regularMarketTime"] = price, ts
+    return p
+
+
+def test_x15_open_session_bar_is_set_aside():
+    bars = mk([100.0] * 30 + [104.0, 110.0], 0.015)
+    last_day = bars[-1][0]
+    start = int(dt.datetime(last_day.year, last_day.month, last_day.day, 14, 30, tzinfo=UTC).timestamp())
+    end = start + int(6.5 * 3600)
+    p = _open_payload(bars, start, end)
+    parsed = ep.parse_chart(p)
+    done, live = ep.split_open_session(p, parsed, start + 3600)                  # an hour into the session
+    assert len(done) == len(parsed) - 1 and live == pytest.approx(110.0)
+    assert ep.split_open_session(p, parsed, end + 60) == (parsed, None)           # after the close: completed
+    assert ep.split_open_session(p, parsed, start - 60) == (parsed, None)         # before the open
+    prev_day = _open_payload(bars, start + 86400, end + 86400)                    # session open, no bar for it yet
+    assert ep.split_open_session(prev_day, parsed, start + 86400 + 60) == (parsed, None)
+    assert ep.split_open_session({}, parsed, start) == (parsed, None)
+    # the levels: the spike to 110 is not a completed close, so no TAKE PROFIT and no ratchet on it
+    r = ep.exit_levels("AAA.US", 100.0, done[29][0], done, {"live": live}, {}, K(), TODAY)
+    assert r["last"] == 104.0 and r["action"] == "HOLD" and r["live"] == 110.0
+    under = ep.exit_levels("AAA.US", 100.0, done[29][0], done, {"live": 90.0}, {}, K(), TODAY)
+    assert any("live price 90.00 is at or under the stop 91.00" in w for w in under["why"])
+    assert under["action"] == "HOLD"                                              # the rule acts on the close
+
+
+def test_x15_take_profit_stays_for_the_day_and_not_after():
+    closes = [100.0] * 30 + [104.0, 110.0]
+    led = [{"Date": "2026-11-11", "Lot": "L", "Stop": 100.3, "TP1 Reached": "yes", "Action": "TAKE PROFIT"}]
+    today = ep.prior_row(led, "L", TODAY)
+    assert today["TP1 Today"] == "yes" and today["TP1 Before"] == "no"
+    r = lv(mk(closes, 0.015), prev=today)
+    assert r["action"] == "TAKE PROFIT" and "(issued on the close of" in r["why"][0]
+    tomorrow = ep.prior_row(led, "L", TODAY + dt.timedelta(days=1))
+    assert tomorrow["TP1 Today"] == "no" and tomorrow["TP1 Before"] == "yes"
+    assert lv(mk(closes, 0.015), prev=tomorrow)["action"] != "TAKE PROFIT"
+    sold = lv(mk(closes[:30] + [104.0, 110.0, 90.0], 0.015), prev=dict(today, Stop=100.3))
+    assert sold["action"] == "SELL"                                               # a stop hit outranks it
+
+
+def test_x15_live_quote(monkeypatch):
+    bars = mk([100.0] * 30, 0.015)
+    t = int(dt.datetime(2026, 11, 11, 15, 0, tzinfo=UTC).timestamp())
+    p = _open_payload(bars, t - 3600, t + 3600, price=101.25, ts=t)
+
+    def op(req, timeout):
+        assert "/chart/TEN?" in req.full_url
+        return Resp(json.dumps(p).encode())
+    got = ep.live_quote("TEN.US", op)
+    assert got == (101.25, dt.datetime(2026, 11, 11, 15, 0, tzinfo=UTC))
+    p2 = _open_payload(bars, t - 3600, t + 3600)
+    assert ep.live_quote("TEN.US", lambda req, timeout: Resp(json.dumps(p2).encode())) is None
+    p0 = _open_payload(bars, t - 3600, t + 3600, price=0.0, ts=t)                  # a zero price is no quote
+    assert ep.live_quote("TEN.US", lambda req, timeout: Resp(json.dumps(p0).encode())) is None
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+
+    def gone(req, timeout):
+        e = Exception("404")
+        e.code = 404
+        raise e
+    assert ep.live_quote("TEN.US", gone) is None
+
+
+def test_x15_run_shows_the_live_column(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    bars = mk(SERIES["DDI"], 0.015)
+    last_day = bars[-1][0]
+    start = int(dt.datetime(last_day.year, last_day.month, last_day.day, 14, 30, tzinfo=UTC).timestamp())
+
+    def op(req, timeout):
+        sym = req.full_url.split("/chart/")[1].split("?")[0]
+        if sym != "DDI":
+            return opener(req, timeout)
+        return Resp(json.dumps(_open_payload(bars, start, start + 23400)).encode())
+    now = dt.datetime.fromtimestamp(start + 3600, UTC)
+    b = wbook()
+    assert ep.run(False, False, book=b, now=now, opener=op) == 0
+    page = b.tabs["Exit_Plan"].values
+    hdr = next(r for r in page if r and r[0] == "Symbol" and "Live" in r)
+    ddi = next(r for r in page if r and r[0] == "DDI.US")
+    assert ddi[hdr.index("Last close")] == "104.00" and ddi[hdr.index("Live")] == "110.00"
+    assert ddi[hdr.index("Action")] == "HOLD"                                     # 110 is not a completed close yet
+
+
+def test_x16_the_action_belongs_to_the_close():
+    # 23:35 Riyadh on 10 Nov saw the US close of 10 Nov and raised the stop; the 07:30 e-mail run on 11 Nov is on the
+    # same close, so it must show the same RAISE STOP, not HOLD
+    c9, c10, c11 = dt.date(2026, 11, 9), dt.date(2026, 11, 10), dt.date(2026, 11, 11)
+    led = [{"Date": "2026-11-09", "Lot": "L", "Stop": 95.0, "TP1 Reached": "no", "Action": "HOLD", "Bars To": "2026-11-09"},
+           {"Date": "2026-11-10", "Lot": "L", "Stop": 98.0, "TP1 Reached": "no", "Action": "RAISE STOP",
+            "Bars To": "2026-11-10"}]
+    same = ep.prior_row(led, "L", TODAY, c10)
+    assert same["Stop"] == 98.0 and same["Was"] == 95.0 and same["WasNorm"] == 95.0
+    assert same["TP1 Today"] == "no" and same["TP1 Before"] == "no"
+    r = lv(mk([100.0] * 40, 0.015), prev=same)
+    assert r["action"] == "RAISE STOP" and r["why"][0] == "raise the stop 95.00 -> 98.00" and r["prev_stop"] == 95.0
+    nxt = ep.prior_row(led, "L", TODAY, c11)                                      # the next close: it was done
+    assert nxt["Was"] == 98.0 and lv(mk([100.0] * 40, 0.015), prev=nxt)["action"] == "HOLD"
+    assert ep.prior_row(led[1:], "L", TODAY, c10)["Was"] is None                  # first seen on this close
+    assert ep.prior_row(led, "L", TODAY, c9)["Was"] is None
+    assert ep.prior_row(led, "L", TODAY)["Was"] == 98.0                           # no close given: the run's day
+    # TAKE PROFIT issued at 23:35 stays for the 07:30 run on the same close and is not repeated on the next close
+    tp = led + [{"Date": "2026-11-10", "Lot": "L", "Stop": 100.3, "TP1 Reached": "yes", "Action": "TAKE PROFIT",
+                 "Bars To": "2026-11-10"}]
+    on = ep.prior_row(tp, "L", TODAY, c10)
+    assert on["TP1 Today"] == "yes" and on["TP1 Before"] == "no"
+    after = ep.prior_row(tp, "L", TODAY, c11)
+    assert after["TP1 Today"] == "no" and after["TP1 Before"] == "yes"
+    # a same-close row that only carries the flag (TAKE PROFIT came on an earlier close whose row was replaced)
+    carried = [{"Date": "2026-11-11", "Lot": "L", "Stop": 101.0, "TP1 Reached": "yes", "Action": "HOLD",
+                "Bars To": "2026-11-11"}]
+    c = ep.prior_row(carried, "L", TODAY, c11)
+    assert c["TP1 Today"] == "no" and c["TP1 Before"] == "yes"
+
+
+def test_x16_bought_in_a_session_that_has_not_closed():
+    # Codex P2 on #959: closes of 100, bought today at 120, live 120 - the completed closes predate the purchase,
+    # so no close rule may act on them (it read SELL: 100 is under the 110.40 stop)
+    bars = mk([100.0] * 40, 0.015)
+    bought = bars[-1][0] + dt.timedelta(days=1)
+    r = ep.exit_levels("NEW.US", 120.0, bought, bars, {"live": 120.0}, {}, K(), TODAY)
+    assert r["action"] == "HOLD" and r["fresh"] and r["stop"] == pytest.approx(110.4)
+    assert r["why"][0].startswith("bought on %s: no close since the purchase yet" % bought.isoformat())
+    assert "110.40" in r["why"][0] and "129.60" in r["why"][0] and r["pl_pct"] == pytest.approx(0.0)
+    assert r["r_high"] == 0.0 and r["hc"] == 120.0
+    slid = ep.exit_levels("NEW.US", 120.0, bought, bars, {"live": 108.0}, {}, K(), TODAY)
+    assert slid["action"] == "HOLD" and any("live price 108.00 is at or under the stop 110.40" in w for w in slid["why"])
+    none = ep.exit_levels("NEW.US", 120.0, bought, bars, {}, {}, K(), TODAY)
+    assert none["pl_pct"] is None
+    page = ep.page_rows([dict(none, name="New", shares=10, lot="L", broker_stop=None, prev={})], [],
+                        {"headline": "As of", "summary": "Today: HOLD 1"}, K())
+    assert any(row[0] == "NEW.US" and row[6] == "—" for row in page)
+    # once the purchase day has closed, the rules act on that close
+    done = mk([100.0] * 40 + [120.0], 0.015)
+    after = ep.exit_levels("NEW.US", 120.0, done[-1][0], done, {}, {}, K(), TODAY)
+    assert not after["fresh"] and after["action"] in ("HOLD", "RAISE STOP")
