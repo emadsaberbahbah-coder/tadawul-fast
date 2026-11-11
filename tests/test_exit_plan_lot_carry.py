@@ -27,6 +27,19 @@ TFB_TEST_REQUIRE_BASE=1 (a missing base FAILS the base legs instead of skipping 
   L9  carry_rows, directly: symbol, the earliest-buy-date window, the top-up guard, malformed keys, relabel
   L10 the workflow maps the gate (default 'off'), the manifest pins the version, ci.yml runs this file with the
       base fetched by SHA
+  L11 a top-up after TAKE PROFIT, then a small sale from the old lot: the state from before the top-up does not come
+      back (1.2.0's first commit gave SELL at the old stop on a close of 100, and hid TAKE PROFIT at 117)
+  L12 the newest lot closed across an ex-dividend date between the two buy dates: the carried stop is not rescaled
+  L13 sold out and bought again on the same day: the new position starts fresh (no SELL at the old stop)
+  L14 TAKE PROFIT under the new key, then the next close: no second 'sell half'
+  L15 two runs on one Riyadh date, the second on a newer close: the stop holds, no RAISE STOP to a lower stop
+  L16 a weekend re-run on the same close: TAKE PROFIT stays, as on the one-key path
+  L17 sold out, bought again in two lots, then a sale: nothing of the old holding comes back
+  L18 a lot closed, then re-activated with a sale: the history carries, the note names the latest earlier key
+  L19 two sales on consecutive closes, then a close: the note names the key just before, then goes away
+  L20 a carried holding without price history (CHECK): no note
+  L21 the gate switched on after a lot change made while it was off: the carried stop comes back as RAISE STOP
+      (not a silent HOLD), with the note
 
 Run: python tests/test_exit_plan_lot_carry.py  |  pytest -q tests/test_exit_plan_lot_carry.py
 """
@@ -172,8 +185,9 @@ def days(n, start=D0):
 DAYS = days(60)
 
 
-def opener_for(series):
-    """A Yahoo chart opener serving `series` {YAHOO_SYMBOL: [closes]}: a 1.5% high-low spread around each close."""
+def opener_for(series, adj=None):
+    """A Yahoo chart opener serving `series` {YAHOO_SYMBOL: [closes]}: a 1.5% high-low spread around each close.
+    `adj` {YAHOO_SYMBOL: [dividend factors]} adds the adjusted close (close x factor)."""
     def opener(req, timeout):
         sym = req.full_url.split("/chart/")[1].split("?")[0]
         if sym not in series:
@@ -184,6 +198,8 @@ def opener_for(series):
         ts = [int(dt.datetime(d.year, d.month, d.day, 14, 30, tzinfo=UTC).timestamp()) for d in DAYS[:len(closes)]]
         ind = {"quote": [{"open": list(closes), "high": [c * 1.015 for c in closes],
                           "low": [c * 0.985 for c in closes], "close": list(closes)}]}
+        if adj and sym in adj:
+            ind["adjclose"] = [{"adjclose": [c * f for c, f in zip(closes, adj[sym])]}]
         return Resp(json.dumps({"chart": {"result": [{"meta": {"gmtoffset": 0}, "timestamp": ts,
                                                        "indicators": ind}]}}).encode())
     return opener
@@ -261,6 +277,103 @@ SCENARIOS = {
 }
 
 
+# L11-L21 (the review of 1.2.0's first commit). A step may carry a 5th element {"adj": {SYM: [factors]}}.
+A0 = [lot("AAA.US", 28, "100.00", 230), lot("AAA.US", 30, "104.00", 10)]
+A_SOLD = [lot("AAA.US", 28, "100.00", 110), lot("AAA.US", 30, "104.00", 10)]
+P11 = FLAT + [104.0, 110.0, 110.5, 111.0, 112.0, 113.0]
+B33 = lot("AAA.US", 33, "111.00", 50)
+
+
+def _a100(shares):
+    return lot("AAA.US", 28, "100.00", shares)
+
+
+def _top_up_then_sale(last_close, sale=True):
+    """One lot; TAKE PROFIT on the 110 close; half sold (the key holds); a top-up (a new position); then 10 shares of
+    the old lot sold (a new key again)."""
+    return [(31, 0, [_a100(100)], {"AAA": P11[:32]}), (32, 0, [_a100(50)], {"AAA": P11[:33]}),
+            (33, 0, [_a100(50), B33], {"AAA": P11[:34]}), (34, 0, [_a100(50), B33], {"AAA": P11[:35]}),
+            (35, 0, [_a100(50), B33], {"AAA": P11[:36]}),
+            (36, 0, [_a100(40) if sale else _a100(50), B33], {"AAA": P11 + [last_close]})]
+
+
+P12 = FLAT + [104.0, 110.0, 118.0, 108.0]
+ADJ12 = {"AAA": [0.95] * 30 + [1.0] * 10}                 # an ex-dividend date on bar 30, the newest lot's buy day
+
+
+def _dividend(closed):
+    a, b = lot("AAA.US", 28, "100.00", 230), lot("AAA.US", 30, "104.00", 10, "Closed" if closed else "Active")
+    return [(31, 0, [a, lot("AAA.US", 30, "104.00", 10)], {"AAA": P12[:32]}, {"adj": ADJ12}),
+            (32, 0, [a, lot("AAA.US", 30, "104.00", 10)], {"AAA": P12[:33]}, {"adj": ADJ12}),
+            (33, 0, [a, b], {"AAA": P12[:34]}, {"adj": ADJ12})]
+
+
+P13 = FLAT + [104.0, 110.0]
+OLD13, NEW13 = lot("AAA.US", 32, "110.00", 100), lot("AAA.US", 32, "100.00", 100)
+OLD13C = lot("AAA.US", 32, "110.00", 100, "Closed")
+P14 = [lot("AAA.US", 26, "100.00", 110), lot("AAA.US", 28, "104.00", 10)]
+P17 = [lot("AAA.US", 28, "100.00", 230, "Closed"), lot("AAA.US", 30, "104.00", 10, "Closed")]
+SCENARIOS.update({
+    "l11_top_up_then_sale_100": _top_up_then_sale(100.0),
+    "l11_top_up_then_sale_117": _top_up_then_sale(117.0),
+    "l11_top_up_no_sale_117": _top_up_then_sale(117.0, sale=False),
+    "l12_dividend_newest_closed": _dividend(True),
+    "l12_dividend_newest_kept": _dividend(False),
+    # L13: the morning run sees the first lot; it is sold and a new one bought the same day; the next close is 99
+    "l13_same_day_round_trip": [(31, 0, [OLD13], {"AAA": P13}), (31, 3, [OLD13C, NEW13], {"AAA": P13}),
+                                (32, 0, [OLD13C, NEW13], {"AAA": P13 + [99.0]})],
+    "l13_fresh_reference": [(31, 3, [NEW13], {"AAA": P13}), (32, 0, [NEW13], {"AAA": P13 + [99.0]})],
+    # L14: a sale before the first target; TAKE PROFIT under the new key; the next close
+    "l14_tp_after_change_next_close": [
+        (29, 0, [lot("AAA.US", 26, "100.00", 230), lot("AAA.US", 28, "104.00", 10)], {"AAA": FLAT}),
+        (30, 0, P14, {"AAA": FLAT + [101.0]}), (31, 0, P14, {"AAA": FLAT + [101.0, 110.0]}),
+        (32, 0, P14, {"AAA": FLAT + [101.0, 110.0, 110.5]})],
+    # L15: the same Riyadh date, a later run on a newer close
+    "l15_same_date_new_close": [(31, 0, A0, {"AAA": FLAT + [104.0, 110.0]}),
+                                (32, 0, A_SOLD, {"AAA": FLAT + [104.0, 110.0, 118.0]}),
+                                (32, 12, A_SOLD, {"AAA": FLAT + [104.0, 110.0, 118.0, 108.0]})],
+    # L16: TAKE PROFIT on Friday's close at the Saturday run after the change; the Sunday run on the same close
+    "l16_weekend_same_close": [(32, 0, A0, {"AAA": FLAT + [100.0, 101.0, 102.0]}),
+                               (33, 0, A_SOLD, {"AAA": FLAT + [100.0, 101.0, 102.0, 110.0]}),
+                               (33, 24, A_SOLD, {"AAA": FLAT + [100.0, 101.0, 102.0, 110.0]})],
+    "l16_weekend_one_key": [(32, 0, A_SOLD, {"AAA": FLAT + [100.0, 101.0, 102.0]}),
+                            (33, 0, A_SOLD, {"AAA": FLAT + [100.0, 101.0, 102.0, 110.0]}),
+                            (33, 24, A_SOLD, {"AAA": FLAT + [100.0, 101.0, 102.0, 110.0]})],
+    # L17: sold out (the closed lots listed first), bought again in two lots, then a sale from one of them
+    "l17_rebought_two_lots_then_sale": [
+        (31, 0, A0, {"AAA": FLAT + [104.0, 110.0]}),
+        (34, 0, P17 + [lot("AAA.US", 33, "105.00", 50), lot("AAA.US", 33, "105.20", 10)],
+         {"AAA": FLAT + [104.0, 110.0, 108.0, 105.0, 106.0]}),
+        (35, 0, P17 + [lot("AAA.US", 33, "105.00", 30), lot("AAA.US", 33, "105.20", 10)],
+         {"AAA": FLAT + [104.0, 110.0, 108.0, 105.0, 106.0, 106.5]})],
+    # L18: a lot closed, then re-activated (a corrected status) while part of the first lot is sold
+    "l18_closed_reactivated_sale": [
+        (31, 0, A0, {"AAA": FLAT + [104.0, 110.0]}),
+        (32, 0, [lot("AAA.US", 28, "100.00", 230), lot("AAA.US", 30, "104.00", 10, "Closed")],
+         {"AAA": FLAT + [104.0, 110.0, 110.5]}),
+        (33, 0, A_SOLD, {"AAA": FLAT + [104.0, 110.0, 110.5, 111.0]})],
+    # L19: L1, then a second sale, then one more close
+    "l19_two_sales_then_close": [
+        (31, 0, A0, {"AAA": FLAT + [104.0, 110.0]}),
+        (32, 0, A_SOLD, {"AAA": FLAT + [104.0, 110.0, 110.5]}),
+        (33, 0, [lot("AAA.US", 28, "100.00", 60), lot("AAA.US", 30, "104.00", 10)],
+         {"AAA": FLAT + [104.0, 110.0, 110.5, 111.0]}),
+        (34, 0, [lot("AAA.US", 28, "100.00", 60), lot("AAA.US", 30, "104.00", 10)],
+         {"AAA": FLAT + [104.0, 110.0, 110.5, 111.0, 111.5]})],
+    # L20: L1 whose second run has no price history for AAA
+    "l20_carried_check": [(31, 0, A0, {"AAA": FLAT + [104.0, 110.0]}), (32, 0, A_SOLD, {})],
+})
+# L21: L2 played with the gate off (1.1.0 lowers the stop and drops TP1), then the gate switched on: (steps, gates)
+ROLLOUT = ([(31, 0, [lot("AAA.US", 30, "100.00", 230), lot("AAA.US", 30, "100.30", 10)],
+             {"AAA": FLAT + [101.0, 110.0]}),
+            (32, 0, [lot("AAA.US", 30, "100.00", 230), lot("AAA.US", 30, "100.30", 10)],
+             {"AAA": FLAT + [101.0, 110.0, 118.0]}),
+            (33, 0, [lot("AAA.US", 30, "100.00", 110), lot("AAA.US", 30, "100.30", 10)],
+             {"AAA": FLAT + [101.0, 110.0, 118.0, 108.0]}),
+            (34, 0, [lot("AAA.US", 30, "100.00", 110), lot("AAA.US", 30, "100.30", 10)],
+             {"AAA": FLAT + [101.0, 110.0, 118.0, 108.0, 107.5]})], (None, None, None, "on"))
+
+
 @contextlib.contextmanager
 def env(gate):
     saved = {k: v for k, v in os.environ.items() if k.startswith("TFB_EXIT_")}
@@ -278,17 +391,21 @@ def env(gate):
         os.environ.update(saved)
 
 
-def play(mod, name, gate):
-    """Run a scenario; return [(rc, stdout, ledger, page, mails)] after each step."""
+def play(mod, name, gate, gates=None):
+    """Run a scenario (a SCENARIOS name, or a list of steps); return [(rc, stdout, ledger, page, mails)] after each
+    step. `gates` = one gate value per step instead of `gate`."""
     book = Book({})
     out = []
-    for i, hours, lots, series, in SCENARIOS[name]:
+    steps = SCENARIOS[name] if isinstance(name, str) else name
+    for n, st in enumerate(steps):
+        i, hours, lots, series = st[:4]
+        extra = st[4] if len(st) > 4 else {}
         book.tabs["_Portfolio_CostBasis"] = Sheet([LOT_HDR] + lots)
         mails = []
         buf = io.StringIO()
-        with env(gate), contextlib.redirect_stdout(buf):
-            rc = mod.run(False, True, book=book, now=morning_after(i, hours), opener=opener_for(series),
-                         mailer=lambda *a: mails.append(a))
+        with env(gates[n] if gates is not None else gate), contextlib.redirect_stdout(buf):
+            rc = mod.run(False, True, book=book, now=morning_after(i, hours), opener=opener_for(series, extra.get(
+                "adj")), mailer=lambda *a: mails.append(a))
         led = copy.deepcopy(book.tabs["_Exit_Plan"].values) if "_Exit_Plan" in book.tabs else None
         page = copy.deepcopy(book.tabs["Exit_Plan"].values) if "Exit_Plan" in book.tabs else None
         out.append((rc, buf.getvalue(), led, page, mails))
@@ -313,17 +430,28 @@ def page_line(page, sym):
 
 
 def fold(x):
-    """The only bytes 1.2.0 may differ in while the gate is off: its version token."""
-    s = json.dumps(x, sort_keys=True, default=str)
-    for v in ("1.2.0", "1.1.0"):
-        s = s.replace("exit_plan %s" % v, "exit_plan V").replace("[exit_plan %s]" % v, "[exit_plan V]")
-    return s
+    """The only bytes this exit_plan may differ in from main while the gate is off: its version token (any
+    version, so a later gated release keeps this check)."""
+    return re.sub(r"exit_plan \d+\.\d+\.\d+", "exit_plan V", json.dumps(x, sort_keys=True, default=str))
+
+
+NOTE = "the lots changed (a sale or a closed lot)"
+
+
+def ln(log, sym="AAA.US"):
+    """The holding's log line."""
+    return [x for x in log.splitlines() if "] %s " % sym in x and " last " in x][0]
+
+
+def key_of(day_i, price):
+    return "AAA.US|%s|%.4f" % (DAYS[day_i].isoformat(), price)
 
 
 # ----------------------------------------------------------------------------- L0
 def test_l0_version_floor_and_gate_words():
     assert tuple(int(x) for x in ep.__version__.split(".")) >= (1, 2, 0)
     for word, want in ((None, False), ("off", False), ("", False), ("no", False), ("0", False), ("enforce", False),
+                       ("observe", False),
                        ("on", True), ("ON", True), (" on ", True), ("1", True), ("true", True), ("Yes", True)):
         with env(word):
             assert ep.lot_carry_on() is want, word
@@ -418,27 +546,199 @@ def test_l8_off_identity_against_main(name):
 
 # ----------------------------------------------------------------------------- L9
 def test_l9_carry_rows():
-    d28, d30, d33 = DAYS[28], DAYS[30], DAYS[33]
+    d28, d30, d31, d33 = DAYS[28], DAYS[30], DAYS[31], DAYS[33]
 
-    def r(sym, key_day, price, extra=None):
-        d = {"Symbol": sym, "Lot": "%s|%s|%.4f" % (sym, key_day.isoformat(), price), "Stop": 100.0}
-        d.update(extra or {})
+    def r(sym, key_day, price, bars_to=d31, **extra):
+        d = {"Symbol": sym, "Lot": "%s|%s|%.4f" % (sym, key_day.isoformat(), price), "Stop": 100.0,
+             "Bars To": bars_to.isoformat(), "Basis": 1.0, "Date": bars_to.isoformat()}
+        d.update(extra)
         return d
     old = r("AAA.US", d30, 100.1667)
     cur = "AAA.US|%s|100.3333" % d30.isoformat()
-    led = [old, r("BBB.US", d30, 50.0), {"Symbol": "AAA.US", "Lot": "garbage", "Stop": 1.0},
-           {"Symbol": "AAA.US", "Lot": "BBB.US|%s|1.0000" % d30.isoformat(), "Stop": 1.0}, dict(old, Lot=cur)]
+    led = [old, r("BBB.US", d30, 50.0), dict(old, Lot="garbage"), dict(old, Lot="BBB.US|%s|1.0000" % d30.isoformat()),
+           dict(old, Lot="AAA.US|%s|abc" % d30.isoformat()), dict(old, Lot="AAA.US|%s|1.0|x" % d30.isoformat()),
+           dict(old, Lot="AAA.US|2026-13-45|1.0000"), dict(old, **{"Bars To": ""}), dict(old, Lot=cur)]
+    snapshot = copy.deepcopy(led)
     got = ep.carry_rows(led, "AAA.US", cur, d30, d28)
-    assert got == [dict(old, Lot=cur, **{"Carried From": old["Lot"]})]
-    assert led[0]["Lot"] == old["Lot"]                                             # the ledger is not mutated
-    assert ep.carry_rows(led, "aaa.us", cur, d30, d28)[0]["Lot"] == cur           # symbol case
-    assert ep.carry_rows(led, "AAA.US", cur, d33, d28) == []                       # a lot bought since: top-up
-    assert ep.carry_rows(led, "AAA.US", cur, d30, d33) == []                       # an older holding
+    assert got == [dict(old, Lot=cur, **{"Carried From": old["Lot"]})]          # no bars: Basis as written
+    assert led == snapshot                                                        # the ledger is not mutated
+    assert ep.carry_rows(led, "aaa.us", cur, d30, d28)[0]["Lot"] == cur          # symbol case
+    assert ep.carry_rows([dict(old, Symbol="aaa.us")], "AAA.US", cur, d30, d28)[0]["Lot"] == cur
     assert ep.carry_rows(led, "AAA.US", cur, d28, d28)[0]["Carried From"] == old["Lot"]   # newest lot closed
+    # a lot bought after the row's close (a top-up, a same-day round trip): a new position
+    assert ep.carry_rows(led, "AAA.US", cur, d33, d28) == []
+    assert ep.carry_rows([r("AAA.US", d30, 100.1667, bars_to=d30)], "AAA.US", cur, d30, d28) != []   # bought that day
+    assert ep.carry_rows([r("AAA.US", d30, 100.1667, bars_to=DAYS[29])], "AAA.US", cur, d30, d28) == []
+    # an older holding: its key's buy date is before the earliest active buy date (an after-hours round trip)
+    late = r("AAA.US", d28, 90.0, bars_to=d33)
+    cur33 = "AAA.US|%s|95.0000" % d33.isoformat()
+    assert ep.carry_rows([late], "AAA.US", cur33, d33, d33) == []
+    assert ep.carry_rows([late], "AAA.US", cur33, d33, d28)[0]["Carried From"] == late["Lot"]
+    # the newest-dated key need not come last in ledger order
+    k_new, k_old = r("AAA.US", d30, 100.1667), r("AAA.US", d28, 100.0, bars_to=d33)
+    assert [c["Carried From"] for c in ep.carry_rows([k_new, k_old], "AAA.US", cur, d30, d28)] == [
+        k_new["Lot"], k_old["Lot"]]
     assert ep.carry_rows(led, "CCC.US", cur, d30, d28) == [] and ep.carry_rows([], "AAA.US", cur, d30, d28) == []
-    lots = ep.read_lots([LOT_HDR, lot("AAA.US", 30, "104", 10), lot("AAA.US", 28, "100", 230),
-                         lot("AAA.US", 25, "90", 5, "Closed")])
-    assert lots["AAA.US"]["first"] == d28 and lots["AAA.US"]["date"] == d30
+    # with bars: the basis moves from the key's buy date to the current one (an ex-date on bar 30)
+    bars = [(DAYS[i], 1.0, 1.0, 1.0, 1.0, 0.95 if i < 30 else 1.0) for i in range(34)]
+    cur28 = "AAA.US|%s|100.0000" % d28.isoformat()
+    c = ep.carry_rows([r("AAA.US", d30, 104.0, Basis="1.0")], "AAA.US", cur28, d28, d28, bars)
+    assert abs(c[0]["Basis"] - 0.95) < 1e-12
+    c = ep.carry_rows([r("AAA.US", d30, 104.0, Basis="")], "AAA.US", cur28, d28, d28, bars)
+    assert abs(c[0]["Basis"] - 0.95) < 1e-12
+    c = ep.carry_rows([r("AAA.US", d28, 104.0, Basis="0.95")], "AAA.US", cur, d30, d28, bars)
+    assert abs(c[0]["Basis"] - 0.95 / 0.95) < 1e-12
+    assert ep._factor_at(bars, DAYS[0] - dt.timedelta(days=1)) == 1.0 and ep._factor_at(bars, d28) == 0.95
+    assert ep._factor_at(bars, d30) == 1.0 and ep._factor_at([], d30) == 1.0
+    assert ep._factor_at([(d28, 1.0, 1.0, 1.0, 1.0)], d30) == 1.0
+    # read_lots: the earliest ACTIVE buy date, whatever the sheet order
+    for order in ((0, 1, 2), (2, 1, 0), (1, 0, 2)):
+        rs = [lot("AAA.US", 25, "90", 5, "Closed"), lot("AAA.US", 30, "104", 10), lot("AAA.US", 28, "100", 230)]
+        lots = ep.read_lots([LOT_HDR] + [rs[k] for k in order])
+        assert lots["AAA.US"]["first"] == d28 and lots["AAA.US"]["date"] == d30
+
+
+def test_l9_carry_was():
+    c31, c32, c33, c34 = (DAYS[i].isoformat() for i in (31, 32, 33, 34))
+    today = DAYS[34] + dt.timedelta(days=1)
+
+    def r(close, stop, basis="1.0", date=None):
+        return {"Date": date or close, "Bars To": close, "Stop": stop, "Basis": basis}
+    rows_ = [r(c31, "100.31"), r(c32, "105.9036"), r(c33, "104.0564"), r(c34, "110")]
+    assert ep.carry_was(rows_, today, DAYS[34]) == (104.0564, 104.0564)          # the latest earlier close
+    assert ep.carry_was(rows_[:2], today, DAYS[34]) == (105.9036, 105.9036)
+    assert ep.carry_was([r(c33, "104", "0.5"), r(c33, "103", "0.25")], today, DAYS[34]) == (104.0, 412.0)
+    assert ep.carry_was([r(c34, "110")], today, DAYS[34]) == (None, None)        # only this close
+    assert ep.carry_was([], today, DAYS[34]) == (None, None)
+    assert ep.carry_was([r(c33, "")], today, DAYS[34]) == (None, None)          # no stop
+    future = r(c33, "120", date=(today + dt.timedelta(days=1)).isoformat())
+    assert ep.carry_was([r(c32, "100"), future], today, DAYS[34]) == (100.0, 100.0)
+    # without bars_to the calendar day of the run stands in for the close
+    assert ep.carry_was([r(c32, "100", date=c32), r(c33, "101", date=c33)], DAYS[34], None) == (101.0, 101.0)
+
+
+# ----------------------------------------------------------------------------- L11
+def test_l11_top_up_then_sale():
+    on, off = play(ep, "l11_top_up_then_sale_100", "on"), play(ep, "l11_top_up_then_sale_100", None)
+    k1, k2 = key_of(33, 105.5), key_of(33, 106.1111)
+    r_on, r_off = last_row(on[-1][2], "AAA.US"), last_row(off[-1][2], "AAA.US")
+    assert last_row(on[-2][2], "AAA.US")["Lot"] == k1 and r_on["Lot"] == k2
+    assert r_on["Action"] == "RAISE STOP" and r_off["Action"] == "HOLD"     # first commit: SELL at the old 100.30
+    assert num(r_on["Stop"]) == num(r_off["Stop"]) and r_on["TP1 Reached"] == "no"
+    stop_k1 = num(last_row(on[-2][2], "AAA.US")["Stop"])
+    assert num(r_on["Stop"]) > stop_k1 and ("raise the stop %s -> %s" % (ep.fmt(stop_k1), ep.fmt(num(r_on["Stop"])))
+                                            in ln(on[-1][1]))
+    assert ln(on[-1][1]).endswith(NOTE + ": the stop and the first-target state carry over from %s" % k1)
+    tp = play(ep, "l11_top_up_then_sale_117", "on")
+    ref = play(ep, "l11_top_up_no_sale_117", "on")
+    assert last_row(tp[-1][2], "AAA.US")["Action"] == last_row(ref[-1][2], "AAA.US")["Action"] == "TAKE PROFIT"
+    assert tp[-1][4][0][0].endswith("1 action: AAA.US take profit")
+
+
+# ----------------------------------------------------------------------------- L12
+def test_l12_dividend_between_the_buy_dates():
+    on, off = play(ep, "l12_dividend_newest_closed", "on"), play(ep, "l12_dividend_newest_closed", None)
+    kept = play(ep, "l12_dividend_newest_kept", "on")
+    before = num(last_row(on[1][2], "AAA.US")["Stop"])
+    r_on = last_row(on[2][2], "AAA.US")
+    assert r_on["Lot"] == key_of(28, 100.0) and num(r_on["Basis"]) == 0.95
+    assert num(r_on["Stop"]) == before == num(last_row(kept[2][2], "AAA.US")["Stop"])
+    assert r_on["Action"] == "HOLD" and r_on["TP1 Reached"] == "yes"
+    assert "stop %s (was %s)" % (ep.fmt(before), ep.fmt(before)) in ln(on[2][1])
+    page = page_line(on[2][3], "AAA.US")
+    assert ep.fmt(before) in [str(c) for c in page]
+    r_off = last_row(off[2][2], "AAA.US")
+    assert num(r_off["Stop"]) < before and r_off["Action"] == "TAKE PROFIT"      # 1.1.0: history lost
+
+
+# ----------------------------------------------------------------------------- L13
+def test_l13_same_day_round_trip_starts_fresh():
+    on, off = play(ep, "l13_same_day_round_trip", "on"), play(ep, "l13_same_day_round_trip", None)
+    ref = play(ep, "l13_fresh_reference", "on")
+    assert fold(on) == fold(off) and all(NOTE not in s[1] for s in on)
+    r = last_row(on[-1][2], "AAA.US")
+    assert r["Action"] == "HOLD" and num(r["Stop"]) == num(last_row(ref[-1][2], "AAA.US")["Stop"])
+    assert num(r["Stop"]) < num(last_row(on[0][2], "AAA.US")["Stop"])                  # not the old 99.45
+
+
+# ----------------------------------------------------------------------------- L14
+def test_l14_take_profit_under_the_new_key_then_the_next_close():
+    on = play(ep, "l14_tp_after_change_next_close", "on")
+    acts = [last_row(s[2], "AAA.US")["Action"] for s in on]
+    assert acts[2] == "TAKE PROFIT" and acts[3] == "HOLD"
+    assert NOTE in ln(on[1][1]) and NOTE not in ln(on[3][1])
+    assert num(last_row(on[3][2], "AAA.US")["Stop"]) >= num(last_row(on[2][2], "AAA.US")["Stop"])
+    assert on[3][4][0][0].endswith("hold all")
+
+
+# ----------------------------------------------------------------------------- L15
+def test_l15_same_date_newer_close_keeps_the_stop():
+    on = play(ep, "l15_same_date_new_close", "on")
+    first, second = last_row(on[1][2], "AAA.US"), last_row(on[2][2], "AAA.US")
+    assert first["Action"] == "RAISE STOP" and second["Bars To"] > first["Bars To"]
+    assert num(second["Stop"]) == num(first["Stop"]) and second["Action"] == "HOLD"
+    assert len(rows(on[2][2], "AAA.US", first["Date"])) == 1
+
+
+# ----------------------------------------------------------------------------- L16
+def test_l16_weekend_rerun_keeps_take_profit():
+    on, ref = play(ep, "l16_weekend_same_close", "on"), play(ep, "l16_weekend_one_key", "on")
+    assert [last_row(s[2], "AAA.US")["Action"] for s in on[1:]] == ["TAKE PROFIT", "TAKE PROFIT"]
+    assert [last_row(s[2], "AAA.US")["Action"] for s in ref[1:]] == ["TAKE PROFIT", "TAKE PROFIT"]
+    assert all(s[4][0][0].endswith("1 action: AAA.US take profit") for s in on[1:])
+
+
+# ----------------------------------------------------------------------------- L17
+def test_l17_rebought_in_two_lots_then_sale():
+    on, off = play(ep, "l17_rebought_two_lots_then_sale", "on"), play(ep, "l17_rebought_two_lots_then_sale", None)
+    r_on, r_off = last_row(on[-1][2], "AAA.US"), last_row(off[-1][2], "AAA.US")
+    assert (r_on["Stop"], r_on["TP1 Reached"]) == (r_off["Stop"], "no")
+    assert num(r_on["Stop"]) < num(last_row(on[0][2], "AAA.US")["Stop"])            # not the old 100.47
+    assert ln(on[-1][1]).endswith("carry over from %s" % last_row(on[1][2], "AAA.US")["Lot"])
+
+
+# ----------------------------------------------------------------------------- L18
+def test_l18_closed_then_reactivated_with_a_sale():
+    on, off = play(ep, "l18_closed_reactivated_sale", "on"), play(ep, "l18_closed_reactivated_sale", None)
+    r = last_row(on[-1][2], "AAA.US")
+    assert r["Action"] == "HOLD" and r["TP1 Reached"] == "yes"
+    assert last_row(off[-1][2], "AAA.US")["Action"] == "TAKE PROFIT"
+    assert num(r["Stop"]) >= max(num(last_row(s[2], "AAA.US")["Stop"]) for s in on[:2])
+    assert ln(on[-1][1]).endswith("carry over from %s" % key_of(28, 100.0))         # the key just before
+
+
+# ----------------------------------------------------------------------------- L19
+def test_l19_note_names_the_key_just_before_then_goes():
+    on = play(ep, "l19_two_sales_then_close", "on")
+    keys = [last_row(s[2], "AAA.US")["Lot"] for s in on]
+    assert len(set(keys[:3])) == 3 and keys[3] == keys[2]
+    assert ln(on[1][1]).endswith("carry over from %s" % keys[0])
+    assert ln(on[2][1]).endswith("carry over from %s" % keys[1])
+    assert NOTE not in on[3][1] and NOTE not in json.dumps(on[3][3]) and NOTE not in json.dumps(on[3][4])
+    assert NOTE in json.dumps(on[2][3]) and NOTE in json.dumps(on[2][4])                 # page and e-mail
+    assert [last_row(s[2], "AAA.US")["Action"] for s in on] == ["TAKE PROFIT", "HOLD", "HOLD", "HOLD"]
+
+
+# ----------------------------------------------------------------------------- L20
+def test_l20_carried_check_has_no_note():
+    on = play(ep, "l20_carried_check", "on")
+    line = ln(on[1][1])
+    assert "CHECK" in line and "no daily price history" in line and NOTE not in on[1][1]
+
+
+# ----------------------------------------------------------------------------- L21
+def test_l21_gate_switched_on_after_a_change_made_while_off():
+    steps, gates = ROLLOUT
+    on = play(ep, steps, None, gates)
+    low, high = num(last_row(on[2][2], "AAA.US")["Stop"]), num(last_row(on[1][2], "AAA.US")["Stop"])
+    assert low < high and last_row(on[2][2], "AAA.US")["TP1 Reached"] == "no"         # 1.1.0 on step 3
+    r = last_row(on[3][2], "AAA.US")
+    assert num(r["Stop"]) == high and r["TP1 Reached"] == "yes" and r["Action"] == "RAISE STOP"
+    assert "raise the stop %s -> %s" % (ep.fmt(low), ep.fmt(high)) in ln(on[3][1])
+    assert ln(on[3][1]).endswith("carry over from %s" % last_row(on[1][2], "AAA.US")["Lot"])
+    assert on[3][4][0][0].endswith("1 action: AAA.US raise stop")
+    stay = play(ep, steps, None, (None, None, None, None))
+    assert last_row(stay[3][2], "AAA.US")["Action"] == "HOLD" and num(last_row(stay[3][2], "AAA.US")["Stop"]) == low
 
 
 # ----------------------------------------------------------------------------- L10

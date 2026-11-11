@@ -4,10 +4,11 @@
 # VERSION 1.3.0 (2026-11-11)
 #
 # 1.3.0: maps TFB_EXIT_LOT_CARRY (scripts/exit_plan.py 1.2.0 [LOT-CARRY],
-# default 'off' = byte-identical). When on, a holding whose lots change (part
-# of one lot sold, or a lot closed) keeps its stop ratchet and its once-only
-# TAKE PROFIT flag. No schedule, trigger or concurrency change. Rollback:
-# unset or off.
+# default 'off' = byte-identical apart from the version string). When on, a
+# holding whose lots change (part of one lot sold, or a lot closed) keeps its
+# stop ratchet and its once-only TAKE PROFIT flag; a lot bought since still
+# starts a new position. No schedule, trigger or concurrency change.
+# Rollback: unset or off.
 #
 # VERSION 1.2.0 (2026-11-11)
 #
