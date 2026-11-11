@@ -471,14 +471,17 @@ def read_info(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str, A
 
 NEWS_NOISE_RE = re.compile(
     r"shareholder (alert|update|notice|investigation)|notif(ying|ies) investors|investors? who lost|"
-    r"investigations? on behalf|class action|law (firm|offices?)|securities (litigation|fraud)|"
+    r"investigations? on behalf|law (firm|offices?)|"
+    r"class action (lawsuit has been filed|deadline|reminder|notice|alert)|"
+    r"securities (litigation|fraud) (alert|investigation|class action|notice|reminder|deadline)|"
     r"deadline (alert|reminder)|brodsky|rosen law|pomerantz|levi & korsinsky|bragar eagel|bronstein|faruqi|"
     r"hagens berman|glancy|kessler topaz|robbins geller|schall law|johnson fistel", re.I)
 
 
 def news_is_noise(event_type: Any, headline: Any, grade: Any) -> bool:
     """1.3.0 [NEWS-NOISE]: a law-firm solicitation (they go out on tier-A wires and read 'negative'), or a cluster
-    that is rumour-only, denied or social-only (information grade 4-6), never tightens a stop."""
+    that is rumour-only, denied or social-only (information grade 4-6), never tightens a stop. The legal terms match
+    solicitation wording only: 'SEC charges X with securities fraud' or 'X hit with class action' still counts."""
     if text(event_type).lower() == "law_firm_noise" or NEWS_NOISE_RE.search(text(headline)):
         return True
     g = num(grade)

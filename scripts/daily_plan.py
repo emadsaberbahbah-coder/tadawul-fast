@@ -814,7 +814,8 @@ def read_source_page(book, tab: str) -> List[List[Any]]:
     h, col = table_index(head, ("Symbol", "Current Price", "Currency"))
     if h is None:
         return []
-    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price")
+    names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price",
+                         "Last Updated (UTC)")       # 1.5.0: the row's sync time feeds the quote-age check
              if n in col]
     ranges = ["%s%d:%s" % (_col(col[n] + 1), h + 1, _col(col[n] + 1)) for n in names]
     cols = ws.batch_get(ranges)

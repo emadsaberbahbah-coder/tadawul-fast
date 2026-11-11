@@ -736,6 +736,14 @@ def test_h5_an_old_price_reads_check_and_never_opens_or_invalidates():
     dp.refresh_status(rows, src, {}, {}, dt.date(2026, 11, 12), 7, "s", None, now=now, max_age_h=96)
     assert rows[0]["Status"] == "OPEN"
     assert dp.knobs()["quote_max_h"] == 96
+    # Codex P2, #964: the production read path fetches the timestamp column, so the check has a time to use
+    ws = Sheet([["Global_Markets"], ["Symbol", "Name", "Current Price", "Currency", "Last Updated (UTC)"],
+                ["A.US", "A", 10, "USD", "2020-01-02 10:00:00"]])
+    got = dp.read_sources([dp.read_source_page(Book({"Global_Markets": ws}), "Global_Markets")])
+    assert got["A.US"]["quote_at"] == dt.datetime(2020, 1, 2, 10, 0, tzinfo=UTC)
+    rows[0]["Status"] = "OPEN"
+    dp.refresh_status(rows, got, {}, {}, dt.date(2026, 11, 12), 7, "s", None, now=now, max_age_h=96)
+    assert rows[0]["Status"] == "CHECK" and "days old" in rows[0]["Status Reason"]
 
 
 def _cand(sym, rank, score, sector):

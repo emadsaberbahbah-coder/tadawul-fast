@@ -709,6 +709,11 @@ def test_x18_law_firm_notices_and_unconfirmed_items_never_tighten_a_stop():
     for h in ("SHAREHOLDER ALERT: act now", "Rosen Law Firm reminds investors", "Investigation on behalf of holders",
               "Levi & Korsinsky notifies investors", "DEADLINE ALERT for XYZ", "Investors who lost money in XYZ"):
         assert ep.news_is_noise("legal_regulatory", h, 1) is True, h
+    for h in ("SEC charges ABC with securities fraud", "ABC hit with class action over data breach",          # Codex P2, #964
+              "Court approves securities litigation settlement with ABC", "Regulator opens investigation into ABC"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is False, h
+    for h in ("Class action lawsuit has been filed against ABC", "ABC SECURITIES FRAUD ALERT", "CLASS ACTION DEADLINE: ABC"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is True, h
     lots = ep.read_lots(LOTS)
     assert lots["DDI.US"]["lots"] == 2 and lots["5023.SR"]["lots"] == 1
     tax = json.loads((ROOT / "data" / "news_gate_taxonomy.json").read_text(encoding="utf-8"))
