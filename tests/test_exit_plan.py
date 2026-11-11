@@ -9,11 +9,13 @@
   X6  the tightening triggers (news, forecast with reliability, a lost 20-day average after +2R) raise the stop
   X7  the stop never moves down; RAISE STOP when it rises
   X8  SELL when the last close is at or below the stop
-  X9  TAKE PROFIT once, only while the price is at the target; a touch the price left is a note
+  X9  TAKE PROFIT once, only while the close is at the target; a touch the price left is a note
+      (Codex P2 on #956: an intraday touch on the last bar is not actionable after the close)
   X10 REVIEW after the time stop without +1R; earnings and broker-stop notes
-  X11 dividend-adjusted entry
+  X11 dividend-adjusted entry; a dividend paid after a stop was recorded rebases that stop (Codex P1 on #956)
   X12 workbook parsers: lots, news window, broker stops freshness, plan picks, prior row
-  X13 run(): the gate, the two tabs, same-day re-run, the e-mail, fixed income, no price history
+  X13 run(): the gate, the two tabs, a same-day re-run keeps the published state (Codex P2 on #956), the
+      e-mail, fixed income, no price history
   X14 the workflow, the manifest pin and the CI lane
 
 Run: pytest -q tests/test_exit_plan.py
@@ -191,6 +193,11 @@ def test_x9_take_profit_once_and_only_while_at_the_target():
     assert left["tp1"] and left["action"] == "HOLD"
     assert any("touched on %s (high 112.00)" % bars[30][0].isoformat() in w for w in left["why"])
     assert ep.tp1_flag(dict(left, prev={})) == "no"                                # it can still come back
+    lastbar = mk(closes[:30] + [104.0, 105.0], 0.015)
+    lastbar[-1] = (lastbar[-1][0], 105.0, 112.0, 103.0, 104.0, 1.0)              # today's high touched, close under
+    lb = ep.exit_levels("AAA.US", 100.0, lastbar[29][0], lastbar, {}, {}, K(), TODAY)
+    assert lb["tp1"] and lb["action"] == "HOLD" and ep.tp1_flag(dict(lb, prev={})) == "no"
+    assert any("touched on %s" % lastbar[-1][0].isoformat() in w for w in lb["why"])
     buy_day = mk(closes[:30] + [101.0], 0.015)
     buy_day[29] = (buy_day[29][0], 100.0, 115.0, 99.0, 100.0, 1.0)                 # the buy day's high is ignored
     assert not ep.exit_levels("AAA.US", 100.0, buy_day[29][0], buy_day, {}, {}, K(), TODAY)["tp1"]
@@ -220,6 +227,15 @@ def test_x11_dividend_adjusted_entry():
     assert r["entry"] == pytest.approx(35.43 * 0.77)
     assert r["action"] == "HOLD" and r["stop"] < 27.6
     assert any("adjusted for the dividends" in w for w in r["why"])
+    # a stop recorded at 91 on basis 1.0; a dividend then re-adjusts the history by 0.77
+    before = mk([100.0] * 30 + [104.0, 110.0], 0.015)
+    led = [{"Date": "2026-11-10", "Lot": "L", "Stop": 91.0, "TP1 Reached": "yes", "Basis": 1.0}]
+    adj = [(b[0], b[1] * 0.77, b[2] * 0.77, b[3] * 0.77, b[4] * 0.77, 0.77) for b in before[:-1]]
+    adj.append((days(33)[32], 85.0, 86.0, 84.0, 85.0, 1.0))                     # unchanged economics after the ex-date
+    reb = ep.exit_levels("AAA.US", 100.0, adj[29][0], adj, {}, ep.prior_row(led, "L", TODAY), K(), TODAY)
+    assert reb["prev_stop"] == pytest.approx(91.0 * 0.77) and reb["action"] != "SELL"
+    old = ep.exit_levels("AAA.US", 100.0, adj[29][0], adj, {}, {"Stop": 91.0, "TP1 Reached": "yes"}, K(), TODAY)
+    assert old["prev_stop"] == 91.0 and old["action"] == "SELL"                  # without the basis it would sell
 
 
 # ----------------------------------------------------------------------------- X12
@@ -262,12 +278,15 @@ def test_x12_parsers():
             ["2026-11-10", "PIPELINE", "EFC.US", 11.4, "", "", "", "USD"],
             ["2026-11-09", "PICK", "OLD.US", 10, 1, 9, "OPEN", "USD"]]
     assert [p["symbol"] for p in ep.read_plan_picks(plan)] == ["TEN.US"]
-    led = [{"Date": "2026-11-09", "Lot": "L", "Stop": 10.0, "TP1 Reached": "yes"},
-           {"Date": "2026-11-10", "Lot": "L", "Stop": 9.5, "TP1 Reached": "no"},
-           {"Date": "2026-11-11", "Lot": "L", "Stop": 12.0, "TP1 Reached": "no"},
+    led = [{"Date": "2026-11-09", "Lot": "L", "Stop": 10.0, "TP1 Reached": "yes", "Basis": 0.5},
+           {"Date": "2026-11-10", "Lot": "L", "Stop": 9.5, "TP1 Reached": "no", "Basis": 1.0},
+           {"Date": "2026-11-11", "Lot": "L", "Stop": 12.0, "TP1 Reached": "no", "Basis": 1.0},
+           {"Date": "2026-11-12", "Lot": "L", "Stop": 50.0, "TP1 Reached": "no", "Basis": 1.0},
            {"Date": "2026-11-10", "Lot": "M", "Stop": 5.0, "TP1 Reached": "no"}]
     pr = ep.prior_row(led, "L", TODAY)
-    assert pr["Stop"] == 10.0 and pr["TP1 Reached"] == "yes" and pr["Date"] == "2026-11-10"
+    assert pr["Stop"] == 12.0 and pr["TP1 Reached"] == "yes" and pr["Date"] == "2026-11-11"   # today counts
+    assert pr["StopNorm"] == 20.0                                                 # 10 on basis 0.5
+    assert ep.prior_row(led, "M", TODAY)["StopNorm"] == 5.0                       # no basis = 1
     assert ep.prior_row(led, "Z", TODAY) == {}
 
 
@@ -384,15 +403,21 @@ def test_x13_run(monkeypatch):
     assert "5023.SR" in page and "no stop rule for fixed income" in page
     assert "GONE.US" in page and "no daily price history" in page
     assert "TEN.US | 100.00 | 92.00 | 91.00 | -9.0 | 109.00" in page
+    first = deepcopy(b.tabs["_Exit_Plan"].values)
     monkeypatch.setenv("TFB_EXIT_MAIL", "1")
     assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a)) == 0
-    assert len(b.tabs["_Exit_Plan"].values) == 2                                   # the same day is replaced
-    assert len(sent) == 1 and sent[0][0] == "TFB Exit Plan 2026-11-11 - 2 actions: DDI.US take profit, GONE.US check"
+    led = b.tabs["_Exit_Plan"].values
+    assert len(led) == 2 and led[1][12] == "yes" and led[1][10] >= first[1][10]   # the same day keeps its state
+    assert led[1][13] != "TAKE PROFIT"                                             # issued once, even on a re-run
+    assert len(sent) == 1 and sent[0][0] == "TFB Exit Plan 2026-11-11 - 1 action: GONE.US check"
     assert "<b>DDI.US</b>" in sent[0][2] and "Today's plan picks" in sent[0][2]
+    fresh = wbook()
+    assert ep.run(False, True, book=fresh, now=NOW, opener=opener, mailer=lambda *a: sent.append(a)) == 0
+    assert sent[-1][0] == "TFB Exit Plan 2026-11-11 - 2 actions: DDI.US take profit, GONE.US check"
     later = NOW + dt.timedelta(days=1)
     assert ep.run(False, False, book=b, now=later, opener=opener, mailer=lambda *a: sent.append(a)) == 0
     led = b.tabs["_Exit_Plan"].values
-    assert len(led) == 3 and led[2][13] != "TAKE PROFIT" and len(sent) == 1        # issued once; no --send
+    assert len(led) == 3 and led[2][13] != "TAKE PROFIT" and len(sent) == 2        # issued once; no --send
     def boom(*a):
         raise OSError("smtp down")
     assert ep.run(False, True, book=b, now=later, opener=opener, mailer=boom) == 4

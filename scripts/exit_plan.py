@@ -95,7 +95,7 @@ PAGE_WIDTH = 15
 MAX_LEDGER_ROWS = 3000
 LEDGER_HEADERS = [
     "Date", "Run At (Riyadh)", "Symbol", "Lot", "Entry", "Shares", "Last", "Highest Close", "ATR", "R",
-    "Stop", "Target", "TP1 Reached", "Action", "Tighten", "Bars To",
+    "Stop", "Target", "TP1 Reached", "Action", "Tighten", "Bars To", "Basis",
 ]
 INFO_COLS = ("Symbol", "Name", "Asset Class", "Current Price", "Forecast Price (1M)", "Forecast Reliability Score",
              "Confidence Score", "Target Price")
@@ -258,16 +258,20 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     stop = init_stop
     if r_high >= 1:
         stop = max(stop, entry * (1 + k["be_pct"] / 100.0), hc - trail_k * a_now)
-    prev_stop = num(prev.get("Stop")) if prev else None
+    prev_stop = None
+    if prev:
+        # a dividend paid since the last run re-adjusts the history (and the entry); the stop is rebased with it
+        norm = num(prev.get("StopNorm"))
+        prev_stop = norm * f_e if norm is not None else num(prev.get("Stop"))
     if prev_stop is not None and prev_stop > stop:
         stop = prev_stop                                   # the stop never moves down
     step = max(1, int(math.floor(r_high)) + 1)
     target = entry + step * r
     tp1 = hh >= entry + r
     touch = next((b for b in after if b[2] >= entry + r), None)
-    tp1_now = last[4] >= entry + r or (after and last[0] == after[-1][0] and last[2] >= entry + r)
+    tp1_now = last[4] >= entry + r                      # the report runs after the close: the close decides
     sessions = sum(1 for b in bars if b[0] > entry_date)
-    res.update({"ok": True, "atr": a_now, "atr_entry": a_e, "atr_pct": a_now / last[4] * 100.0, "r": r,
+    res.update({"ok": True, "basis": f_e, "atr": a_now, "atr_entry": a_e, "atr_pct": a_now / last[4] * 100.0, "r": r,
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
                 "r_high": r_high, "stop": stop, "prev_stop": prev_stop, "target": target, "tp1": tp1,
                 "trail_k": trail_k, "sessions": sessions, "pl_pct": (last[4] / entry - 1) * 100.0,
@@ -478,14 +482,18 @@ def lot_key(symbol: str, lot: Dict[str, Any]) -> str:
 
 
 def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date) -> Dict[str, Any]:
-    """The lot's last ledger row before today, carrying the highest stop ever recommended for it."""
-    rows = [d for d in ledger if text(d["Lot"]) == key and (parse_date(d["Date"]) or today) < today]
+    """The lot's last ledger row up to today (a same-day re-run keeps what was already published), carrying the
+    highest stop ever recommended for it. StopNorm = that stop divided by the dividend basis it was computed on,
+    so a later dividend adjustment can rebase it."""
+    rows = [d for d in ledger if text(d["Lot"]) == key and (parse_date(d["Date"]) or today) <= today]
     if not rows:
         return {}
     last = dict(rows[-1])
     stops = [num(d["Stop"]) for d in rows if num(d["Stop"]) is not None]
     if stops:
         last["Stop"] = max(stops)
+        last["StopNorm"] = max(num(d["Stop"]) / (num(d.get("Basis")) or 1.0) for d in rows
+                               if num(d["Stop"]) is not None)
     if any(text(d["TP1 Reached"]).lower() == "yes" for d in rows):
         last["TP1 Reached"] = "yes"
     return last
@@ -727,7 +735,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
     new = [[day, stamp, r["symbol"], r.get("lot", ""), _round(r.get("entry")), r.get("shares"), _round(r.get("last")),
             _round(r.get("hc")), _round(r.get("atr")), _round(r.get("r")), _round(r.get("stop")),
             _round(r.get("target")), tp1_flag(r), r["action"], "; ".join(r.get("tighten") or []),
-            r["bars_to"].isoformat() if r.get("bars_to") else ""] for r in results if r.get("ok")]
+            r["bars_to"].isoformat() if r.get("bars_to") else "", _round(r.get("basis"))] for r in results if r.get("ok")]
     grid = [list(LEDGER_HEADERS)] + ([[d[h] for h in LEDGER_HEADERS] for d in keep] + new)[-MAX_LEDGER_ROWS:]
     try:
         write_grid(book, LEDGER_TAB, grid, len(LEDGER_HEADERS), 200)
