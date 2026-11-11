@@ -33,7 +33,9 @@ const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
 const OLD_PATH = process.argv[3] || '';
-const NEW = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-11: v1.3.1 is delivered; this harness proves the v1.3.0 diff, so NEW is the v1.3.0 file rebuilt from the
+// delivered one (tests/js/dp2_history.js: the v1.3.1 hunks reversed, SHA-256 pinned).
+const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1300Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1300.json'), 'utf8'));
 const V1236_SHA256 = '487c0778e1f509eb9ee60e91d4603ed884367719af1b065e6231b723bb1f10f3';   // v1.2.36 (origin/main 58910af)
