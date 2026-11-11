@@ -1,7 +1,15 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.3.0 (2026-11-11)
+ * Version: 1.3.1 (2026-11-11)
+ *   1.3.1: A SLOT LEFT UNFINISHED GOES ON IN THE NEXT HOUR (first slot, Wed 11 Nov 2026 17:00 Riyadh): the main page did
+ *          not render in the 17:00 hour (its last render 15:31), so the slot waited for minute 40 and its ticks had room
+ *          for one page: Portfolio_Decision_v2 was built at 17:50, Top_10_Investments_v2 not at all. [SLOT-CARRY]: in an
+ *          hour that is not a slot hour, dp2SlotTick goes on with the slot of the hour before when that slot still has a
+ *          page to build with tries left (DP2_SLOT_DONE); the build waits for no main-page render, and the rules on a
+ *          running decision render, a fresh slot claim and the 2 tries per page stand. Its log reads 'carried over from
+ *          the HH:00 slot'. Without the slot trigger nothing changes; inside a slot hour every tick is that of 1.3.0.
+ *          dp2SelfTest's refresh-slots line also checks the carry rule. Rollback: Project History -> 1.3.0.
  *   1.3.0: THE V2 PAGES ON A DAILY SCHEDULE, ONE PAGE PER EXECUTION (owner, Wed 11 Nov 2026 14:15 Riyadh: both v2 pages
  *          10 times a day or more). Until 10 Nov the hourly buildDecisionPagesV2 built both pages in one execution: 15
  *          of its runs stopped at the 6-minute limit (7-10 Nov), a run stopped while drawing left its page blank, and it
@@ -408,7 +416,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.3.0';   // lockstep with the header
+var DP2_VERSION = '1.3.1';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -732,6 +740,17 @@ function dp2SlotPlanCore_(hours, key, minute, stateRaw, mainKey, busy, claimAgeM
   if (mainKey !== key && minute < DP2_SLOT_FALLBACK_MIN_) return { act: 'wait', page: due[0], why: 'waiting for the main-page render of this hour (until minute ' + DP2_SLOT_FALLBACK_MIN_ + ')' };
   return { act: 'build', page: due[0], why: mainKey === key ? 'after the main-page render of this hour' : 'no finished main-page render this hour; built from minute ' + DP2_SLOT_FALLBACK_MIN_ };
 }
+/* PURE (v1.3.1): the slot to go on with in an hour that is not a slot hour - prevKey ('yyyy-MM-dd HH', the hour before)
+ * when that hour is a slot hour whose state still has a page to build with tries left; '' otherwise. */
+function dp2SlotCarryCore_(hours, key, prevKey, stateRaw) {
+  if (hours.indexOf(+String(key).slice(11, 13)) >= 0 || hours.indexOf(+String(prevKey).slice(11, 13)) < 0) return '';
+  var st = dp2SlotStateCore_(stateRaw, prevKey);
+  for (var i = 0; i < 2; i++) {
+    var pg = i ? 't10' : 'pd';
+    if (!st[pg] && st.tries[pg] < DP2_SLOT_MAX_TRIES_) return prevKey;
+  }
+  return '';
+}
 /* (v1.3.0) a slot build that reaches the drawing step late keeps the page it would clear. False outside a slot build. */
 function dp2SlotTooLate_() { return DP2_SLOT_RUN_ && dp2RunElapsed_() > DP2_SLOT_DRAW_MS_; }
 /* The time trigger: at most ONE page per execution. */
@@ -740,14 +759,19 @@ function dp2SlotTick() {
   var now = new Date(), nowMs = now.getTime(), p = null;
   try { p = PropertiesService.getScriptProperties(); } catch (eP) { return { act: 'idle', page: '', why: 'Script Properties unreadable' }; }
   var key = Utilities.formatDate(now, DP2.TZ, 'yyyy-MM-dd HH'), minute = +Utilities.formatDate(now, DP2.TZ, 'mm');
-  var hours = dp2SlotHoursCore_(p.getProperty(DP2_SLOT_HOURS_PROP_));
-  if (hours.indexOf(+key.slice(11, 13)) < 0) return { act: 'idle', page: '', why: 'not a refresh hour' };
+  var hours = dp2SlotHoursCore_(p.getProperty(DP2_SLOT_HOURS_PROP_)), carry = '';
+  if (hours.indexOf(+key.slice(11, 13)) < 0) {   // v1.3.1 [SLOT-CARRY]: a slot left unfinished goes on in the next hour
+    carry = dp2SlotCarryCore_(hours, key, Utilities.formatDate(new Date(nowMs - 3600000), DP2.TZ, 'yyyy-MM-dd HH'), p.getProperty(DP2_SLOT_DONE_PROP_));
+    if (!carry) return { act: 'idle', page: '', why: 'not a refresh hour' };
+    key = carry; minute = 60;
+  }
   var mainKey = '';
   try { var src = dp2Sheet_(DP2.SRC_T10, false); if (src) mainKey = dp2SlotMainKeyCore_(src.getRange(1, 1, 6, Math.min(26, Math.max(1, src.getMaxColumns()))).getValues()); } catch (eM) { mainKey = ''; }
   var claimRaw = String(p.getProperty(DP2_SLOT_CLAIM_PROP_) || ''), claimMs = Number(claimRaw);
   var claimAge = (claimRaw !== '' && isFinite(claimMs)) ? (nowMs - claimMs) / 60000 : null;
   var plan = dp2SlotPlanCore_(hours, key, minute, p.getProperty(DP2_SLOT_DONE_PROP_), mainKey, dp2RpBusy_(nowMs), claimAge, p.getProperty(DP2_RP_BUILT_PROP_));
   plan.slot = key;
+  if (carry && plan.act === 'build') plan.why = 'carried over from the ' + carry.slice(11, 13) + ':00 slot';   // v1.3.1
   if (plan.act !== 'build') { try { Logger.log('v2 refresh slot ' + key + ': ' + plan.act + ' - ' + plan.why); } catch (eL) {} return plan; }
   // the try is recorded first: Apps Script stops an execution at 6 minutes and runs nothing after that
   var st = dp2SlotStateCore_(p.getProperty(DP2_SLOT_DONE_PROP_), key);
@@ -836,7 +860,10 @@ function dp2SlotCoreOk_() {
              plan(10, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 2, t10: 2 } }), k, false, null).act === 'idle' &&
              plan(41, JSON.stringify({ slot: k, pd: 0, t10: 0, tries: { pd: 1, t10: 0 } }), '', false, null).page === 't10';
     var dr = dp2SlotDrawMaxMsCore_('') === 150000 && dp2SlotDrawMaxMsCore_('90') === 90000 && dp2SlotDrawMaxMsCore_('5') === 150000;
-    return hrs && pl && dr;
+    var cy = dp2SlotCarryCore_([15], '2026-11-11 16', k, done) === k && dp2SlotCarryCore_([15], '2026-11-11 16', k, '') === k &&
+             dp2SlotCarryCore_([15, 16], '2026-11-11 16', k, done) === '' && dp2SlotCarryCore_([14], '2026-11-11 16', '2026-11-11 15', done) === '' &&
+             dp2SlotCarryCore_([15], '2026-11-11 16', k, JSON.stringify({ slot: k, pd: 1, t10: 1, tries: { pd: 1, t10: 1 } })) === '';   // v1.3.1
+    return hrs && pl && dr && cy;
   } catch (e) { return false; }
 }
 /* v1.2.23: NON-BLOCKING notices. Ui.alert waits for OK — run from the script editor, the box opens in the spreadsheet

@@ -1,7 +1,10 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.2.0 (2026-11-11)
+# VERSION 1.3.0 (2026-11-11)
+#
+# 1.3.0: DIVIDEND TAX note on a holding with an ex-dividend inside 10 days
+# (exit_plan 1.2.0; TFB_EXIT_DIV_WARN_DAYS, TFB_EXIT_WHT_PCT).
 #
 # 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). 07:30 (with the e-mail), then
 # minute 35 from 08:35 to 00:35 Riyadh: 18 runs; the 00:35 run reads the US
@@ -22,6 +25,12 @@
 # and before the Tadawul open. GitHub may start a scheduled run late; the
 # result reads "daily bars to <date>" so a late start is visible.
 #
+# THE E-MAIL (11 Nov 2026, PR #963): only a run started with send_mail sends
+# it - the 07:30 lane of apps_script/29_Page_Refresh_Dispatch.gs, or the owner
+# by hand. A scheduled run never sends it: GitHub did not start these crons on
+# 11 Nov, and a late or second scheduled copy next to the Apps Script start
+# would mean two e-mails, or one hours late.
+#
 # WRITES: only its own two tabs (_Exit_Plan, Exit_Plan) and one e-mail.
 # Advisory only - no order is placed, changed or cancelled.
 # Rollback: repository variable TFB_EXIT_PLAN=off (TFB_EXIT_MAIL=0 stops the
@@ -31,7 +40,7 @@ name: 🎯 Exit Plan
 
 on:
   schedule:
-    - cron: "30 4 * * *"            # 07:30 Riyadh: the morning run, with the e-mail
+    - cron: "30 4 * * *"            # 07:30 Riyadh: the morning run (the e-mail comes from the send_mail start)
     - cron: "35 5-21 * * *"         # 08:35-00:35 Riyadh at minute 35: page and ledger, no e-mail
   workflow_dispatch:
     inputs:
@@ -111,6 +120,8 @@ jobs:
           TFB_EXIT_NEWS_DAYS: ${{ vars.TFB_EXIT_NEWS_DAYS || '3' }}
           TFB_EXIT_FC_REL_MIN: ${{ vars.TFB_EXIT_FC_REL_MIN || '70' }}
           TFB_EXIT_EARN_WARN_DAYS: ${{ vars.TFB_EXIT_EARN_WARN_DAYS || '5' }}
+          TFB_EXIT_DIV_WARN_DAYS: ${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}
+          TFB_EXIT_WHT_PCT: ${{ vars.TFB_EXIT_WHT_PCT || '30' }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_CRON: ${{ github.event.schedule }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
@@ -120,8 +131,10 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_DRY_RUN" == "true" ]]; then
             ARGS+=(--dry-run)
           fi
-          # the e-mail: the 07:30 run only (or a manual run that asks for it); the hourly runs refresh the page
-          if [[ ( "$EVENT_NAME" == "schedule" && "$EVENT_CRON" == "30 4 * * *" ) || "$IN_SEND" == "true" ]]; then
+          # the e-mail: only a start with send_mail (the Apps Script 07:30 lane, or by hand); never a schedule
+          if [[ "$IN_SEND" == "true" ]]; then
             ARGS+=(--send)
+          elif [[ "$EVENT_NAME" == "schedule" && "$EVENT_CRON" == "30 4 * * *" ]]; then
+            echo "::notice::no e-mail from the schedule: the 07:30 e-mail comes from the send_mail start (29_Page_Refresh_Dispatch)"
           fi
           python scripts/exit_plan.py "${ARGS[@]}"

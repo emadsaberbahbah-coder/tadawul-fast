@@ -1,5 +1,14 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.14 (2026-11-12) -- A LOG UPLOAD IS TRIED TWICE
+# WHY (run 43086606380, 11 Nov 22:22 Riyadh): the global-markets job wrote its
+# page, then its "Upload Logs" step failed. The run went red, the outcome audit
+# read "Missing required page verdicts: Global_Markets", the release stopped and
+# the night's Top 10 stayed WITHHELD - on a log file, not on data.
+# WHAT: the upload may fail once without failing the job; a second upload step
+# runs only then. Two failures still fail the job, so a missing verdict is never
+# hidden. No data step changes.
+#
 # VERSION 1.0.13 (2026-11-10) -- THE DISPATCHER IS THE CLOCK (no cron here)
 # WHY (runs of 7-10 Nov 2026): GitHub delivered this workflow's cron 3-9 hours
 # late (04:17 UTC slot started 11:09, 11:21, 12:59 UTC; 20:17 slot 23:40, 23:46,
@@ -1685,7 +1694,10 @@ jobs:
       # 📤 Upload Logs + Summary Artifact
       # -------------------------------------------------------------------------
       - name: 📤 Upload Logs
+        id: upload_logs
         if: always()
+        # 1.0.14: one failed upload must not fail a sync whose data is written; the second try below decides.
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: tadawul-sync-logs-${{ github.run_id }}-${{ matrix.group }}
@@ -1699,6 +1711,23 @@ jobs:
             sync_row_telemetry_*.jsonl
           retention-days: 7
           compression-level: 6
+
+      - name: 📤 Upload Logs (second try)
+        if: always() && steps.upload_logs.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tadawul-sync-logs-${{ github.run_id }}-${{ matrix.group }}
+          path: |
+            sync_*.log
+            sync_execution.log
+            sync_summary.json
+            sync_runner_*.json
+            rollout_modes.json
+            validate_dashboard.json
+            sync_row_telemetry_*.jsonl
+          retention-days: 7
+          compression-level: 6
+          overwrite: true
           if-no-files-found: warn
 
       # -------------------------------------------------------------------------

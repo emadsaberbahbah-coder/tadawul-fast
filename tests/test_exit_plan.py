@@ -264,7 +264,8 @@ def test_x12_parsers():
             ["5", "2026-11-10 12:00", "GLPI.US", "1", "H", "up"],
             ["6", "2026-11-10 12:00", "MACRO", "-1", "H", "war"]]
     got = ep.read_news(news, NOW, 3)
-    assert got == {"DDI.US": {"n": 2, "headline": "DDI misses", "at": dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC)}}
+    assert got == {"DDI.US": {"n": 2, "headline": "DDI misses", "at": dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC),
+                              "ignored": 0}}
     assert ep.read_news(news, NOW, 0) == {}
     acct = [["key", "value"], ["as_of", "2026-11-11 06:00 Riyadh"]]
     orders = [["symbol", "side", "type", "qty", "price", "status"], ["DDI", "SELL", "STOP", 240, 12.9, "NEW"],
@@ -471,6 +472,35 @@ def test_x14_workflow_manifest_ci():
     assert not re.search(r"create_order|place_order|requests\.post|cancel_order", src)
 
 
+def test_x14b_only_a_send_mail_start_sends_the_email(tmp_path):
+    """PR #963 (Codex P2): the Apps Script 07:30 lane is the one automatic sender; a schedule (on time, late or doubled)
+    never e-mails. Runs the workflow's own bash with the python call replaced by an echo of its arguments."""
+    import os
+    import subprocess
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
+    step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
+    script = step["run"].replace('python scripts/exit_plan.py "${ARGS[@]}"', 'echo "ARGS=${ARGS[*]}"')
+    assert script != step["run"]
+
+    def run(event, cron="", dry="", send=""):
+        env = {"PATH": os.environ.get("PATH", ""), "EVENT_NAME": event, "EVENT_CRON": cron, "IN_DRY_RUN": dry, "IN_SEND": send}
+        out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        return [ln for ln in out.stdout.splitlines() if ln.startswith(("ARGS=", "::notice::"))]
+
+    assert run("schedule", "30 4 * * *")[-1] == "ARGS="
+    assert run("schedule", "30 4 * * *")[0].startswith("::notice::no e-mail from the schedule")
+    assert run("schedule", "35 5-21 * * *") == ["ARGS="]
+    assert run("workflow_dispatch", dry="false", send="true") == ["ARGS=--send"]
+    assert run("workflow_dispatch", dry="false", send="false") == ["ARGS="]
+    assert run("workflow_dispatch", dry="true", send="false") == ["ARGS=--dry-run"]
+    assert run("workflow_dispatch", dry="true", send="true") == ["ARGS=--dry-run --send"]
+    gs = (ROOT / "apps_script/29_Page_Refresh_Dispatch.gs").read_text(encoding="utf-8")
+    assert "{ id: 'mail', workflow: 'exit_plan.yml', minute: 30, hours: [7], inputs: { dry_run: 'false', send_mail: 'true' } }" in gs
+    assert gs.count("send_mail: 'true'") == 1
+
+
 # ----------------------------------------------------------------------------- X15
 def _open_payload(bars, start, end, off=0, price=None, ts=None):
     t = [int(dt.datetime(b[0].year, b[0].month, b[0].day, 14, 30, tzinfo=UTC).timestamp()) for b in bars]
@@ -614,3 +644,80 @@ def test_x16_bought_in_a_session_that_has_not_closed():
     done = mk([100.0] * 40 + [120.0], 0.015)
     after = ep.exit_levels("NEW.US", 120.0, done[-1][0], done, {}, {}, K(), TODAY)
     assert not after["fresh"] and after["action"] in ("HOLD", "RAISE STOP")
+
+
+def test_x17_dividend_note():
+    """1.2.0 [DIV-TAX]: the price falls by the full dividend; a Saudi resident keeps 70% of a US one."""
+    k = K()
+    n = ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, k)
+    assert n == ("ex-dividend in 4 day(s): 0.50 a share (1.2% of the price) - the price falls by the full dividend; "
+                 "you keep 70% after the 30% US withholding (11.85 withheld on 79 shares) - if you plan to sell within "
+                 "weeks, selling before the ex-date avoids it")
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 0.0, "div_amount": 0.5}, k).startswith("ex-dividend today:")
+    sr = ep.dividend_note("2222.SR", 100, 25.0, {"exdiv_days": 2.0, "div_amount": 0.5}, k)
+    assert sr == "ex-dividend in 2 day(s): 0.50 a share (2.0% of the price) - the price falls by the full dividend"
+    assert "withholding" not in ep.dividend_note("BBOX.L", 100, 140.0, {"exdiv_days": 2.0, "div_amount": 1.8}, k)
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 11.0, "div_amount": 0.5}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": None}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, None, {"exdiv_days": 4.0, "div_amount": 0.5}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {}, k) == ""
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, K(wht=15.0)).endswith(
+        "you keep 85% after the 15% US withholding (5.92 withheld on 79 shares) - if you plan to sell within weeks, "
+        "selling before the ex-date avoids it")
+    assert ep.dividend_note("GLPI.US", 79, 40.0, {"exdiv_days": 4.0, "div_amount": 0.5}, K(div_warn_days=3)) == ""
+    assert k["div_warn_days"] == 10 and k["wht"] == 30.0
+
+
+def test_x17_run_carries_the_dividend_note(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    b = wbook()
+    b.tabs["Dividend_Events"] = Sheet([["Symbol", "Ex-Div Date", "Days To ExDiv", "Amount", "Currency"],
+                                       ["DDI.US", "", 3, 1.10, "USD"]])
+    assert ep.run(False, False, book=b, now=NOW, opener=opener) == 0
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "ex-dividend in 3 day(s): 1.10 a share (1.0% of the price)" in page
+    assert "(79.20 withheld on 240 shares)" in page
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "exit_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"][list(wf["jobs"])[0]]["steps"] if "TFB_EXIT_WHT_PCT" in (s.get("env") or {})][0]["env"]
+    assert env["TFB_EXIT_WHT_PCT"] == "${{ vars.TFB_EXIT_WHT_PCT || '30' }}"
+    assert env["TFB_EXIT_DIV_WARN_DAYS"] == "${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}"
+
+
+# ----------------------------------------------------------------------------- X18 (1.3.0)
+def test_x18_law_firm_notices_and_unconfirmed_items_never_tighten_a_stop():
+    """ChatGPT review, 12 Nov: DDI's trail was tightened by 'BRODSKY & SMITH SHAREHOLDER UPDATE: Notifying Investors
+    of the Following Investigations' - an advertisement carried on a tier-A wire."""
+    hdr = ["Item ID", "Published (UTC)", "Scope", "Event Type", "Direction", "Severity", "Tier", "Cluster Grade", "Headline"]
+    rows = [hdr,
+            ["1", "2026-11-10 12:00", "DDI.US", "legal_regulatory", "-1", "M", "A", "1",
+             "BRODSKY & SMITH SHAREHOLDER UPDATE: Notifying Investors of the Following Investigations: DoubleDown"],
+            ["2", "2026-11-10 13:00", "DDI.US", "law_firm_noise", "-1", "H", "A", "1", "anything"],
+            ["3", "2026-11-10 14:00", "DDI.US", "earnings", "-1", "H", "C", "4", "rumour only"],
+            ["4", "2026-11-10 15:00", "DDI.US", "earnings", "-1", "H", "E", "6", "social only"],
+            ["5", "2026-11-10 11:00", "GLPI.US", "earnings", "-1", "H", "B", "2", "GLPI cuts guidance"],
+            ["6", "2026-11-10 11:30", "GLPI.US", "legal_regulatory", "-1", "M", "A", "",
+             "Pomerantz Law Firm announces a class action against GLPI"],
+            ["7", "2026-11-10 10:00", "IBOC.US", "earnings", "-1", "M", "B", "3", "IBOC misses"]]
+    got = ep.read_news(rows, NOW, 3)
+    assert got["DDI.US"] == {"n": 0, "headline": "", "at": None, "ignored": 4}
+    assert got["GLPI.US"]["n"] == 1 and got["GLPI.US"]["ignored"] == 1 and got["GLPI.US"]["headline"] == "GLPI cuts guidance"
+    assert got["IBOC.US"]["n"] == 1 and got["IBOC.US"]["ignored"] == 0            # grade 3 still counts
+    assert ep.news_is_noise("earnings", "Company misses estimates", "") is False   # no grade: counted, as before
+    assert ep.news_is_noise("earnings", "Company misses estimates", 3.0) is False
+    assert ep.news_is_noise("earnings", "Company misses estimates", 4) is True
+    for h in ("SHAREHOLDER ALERT: act now", "Rosen Law Firm reminds investors", "Investigation on behalf of holders",
+              "Levi & Korsinsky notifies investors", "DEADLINE ALERT for XYZ", "Investors who lost money in XYZ"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is True, h
+    for h in ("SEC charges ABC with securities fraud", "ABC hit with class action over data breach",          # Codex P2, #964
+              "Court approves securities litigation settlement with ABC", "Regulator opens investigation into ABC"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is False, h
+    for h in ("Class action lawsuit has been filed against ABC", "ABC SECURITIES FRAUD ALERT", "CLASS ACTION DEADLINE: ABC"):
+        assert ep.news_is_noise("legal_regulatory", h, 1) is True, h
+    lots = ep.read_lots(LOTS)
+    assert lots["DDI.US"]["lots"] == 2 and lots["5023.SR"]["lots"] == 1
+    tax = json.loads((ROOT / "data" / "news_gate_taxonomy.json").read_text(encoding="utf-8"))
+    flat = json.dumps(tax).lower()
+    assert "brodsky & smith" in flat and "shareholder update" in flat and "notifying investors" in flat
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
+        encoding="utf-8")
