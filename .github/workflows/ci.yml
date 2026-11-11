@@ -3,10 +3,10 @@
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
 # VERSION 1.1.81 (2026-11-05) -- SPECIAL SESSIONS ON THEIR REAL HOURS (track_performance 6.57.0)
-# (Main holds every number up to 1.1.77; its 1.1.75 is a line inside its
-# 1.1.76 block. Open claims, re-numbered 2026-11-10 so each sits above main's
-# newest block: 1.1.78 #938, 1.1.79 #915, 1.1.80 #946, 1.1.81 #922, 1.1.82 #923,
-# 1.1.83 #909, 1.1.84 #926.
+# (Main holds every number up to 1.1.79; its 1.1.75 is a line inside its
+# 1.1.76 block. Open claims, re-numbered 2026-11-11 so each sits above main's
+# newest block: 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926,
+# 1.1.85 #954, 1.1.86 #938, 1.1.87 #915.
 # This release first claimed 1.1.69, then 1.1.74.)
 #
 # v1.1.81: run tests/test_track_session_overrides.py (track_performance v6.57.0
@@ -18,6 +18,18 @@
 # show`, and the step sets TFB_TEST_REQUIRE_BASE=1 so a missing base copy
 # FAILS those legs instead of skipping them. Nothing is removed and no
 # existing entry moves.
+#
+# VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
+#
+# v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
+# 1.0.0 and consistency_check.yml 1.0.0: the same figure on every decision
+# page, one result page) in the blocking lean lane.
+#
+# VERSION 1.1.78 (2026-11-11) -- EXIT PLAN SUITE
+#
+# v1.1.78: run tests/test_exit_plan.py (scripts/exit_plan.py 1.0.0 and
+# exit_plan.yml 1.0.0: a stop and a target per holding from its own ATR,
+# reviewed every morning, the stop never moves down) in the blocking lean lane.
 #
 # VERSION 1.1.77 (2026-11-10) -- S-1 LASTSCORED REPLAY SUITE
 #
@@ -1183,6 +1195,8 @@ jobs:
             tests/test_sync_stamp_repair.py \
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
+            tests/test_exit_plan.py \
+            tests/test_consistency_check.py \
             tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
