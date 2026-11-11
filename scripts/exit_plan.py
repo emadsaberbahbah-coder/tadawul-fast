@@ -2,6 +2,44 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
+VERSION 1.2.0 (2026-11-11) - LOT-CARRY
+
+WHY: read_lots merges a symbol's active lots into one weighted buy price and
+the latest buy date, and the ledger keys a holding by both (lot_key =
+'SYMBOL|latest buy date|weighted buy'). prior_row matches that exact key.
+So when the set of active lots changes - part of one lot sold, or one lot
+closed - the key changes, prior_row finds no row, and the holding loses its
+history: the highest stop ever recommended (the stop that never moves down)
+and the once-only TAKE PROFIT flag. Offline replay (tests/
+test_exit_plan_lot_carry.py L1, the real run() on a fake workbook): two lots,
+230 @ 100.00 and 10 @ 104.00; the close of 110.00 issues TAKE PROFIT 'sell
+half'; the owner sells 120 shares of the first lot; on the next close the
+plan reads TAKE PROFIT 'sell half' again (following it would leave a quarter
+of the position) and the e-mail subject repeats 'take profit'. With two
+fills a few cents apart on one day (L2) the same sale also lowers the
+published stop. The test fixture's DDI.US is such a holding (230 @ 13.42 on
+2 Nov and 10 @ 14.00 on 3 Nov); whether the live book holds lots at
+different prices cannot be read offline.
+
+WHAT (TFB_EXIT_LOT_CARRY=on), in run(): when the holding's current key has
+earlier ledger rows under another key of the same holding, prior_row reads
+those rows (relabelled to the current key) with the current key's own rows.
+A row belongs to the holding when its key's buy date is on or after the
+earliest active buy date now (an old holding that was sold out and bought
+again does not carry). Nothing is carried when the current key's buy date is
+later than every earlier key's (a lot bought since: a top-up stays a new
+position, as before 1.2.0). The carried state is the stop ratchet ('Stop',
+'StopNorm', 'Was'), 'TP1 Reached' / 'TP1 Before' / 'TP1 Today'; the entry,
+R, ATR and target are computed from the current lots as before. While the
+current key has no row on an earlier close, the holding's note says that its
+state was carried and from which key. The ledger's Lot column, the page
+layout, the e-mail format and every other holding are unchanged.
+SITES: lot_carry_on and carry_rows (new); read_lots (an additive 'first' =
+the earliest active buy date); run (the gated second prior_row and the note).
+GATE: TFB_EXIT_LOT_CARRY = off (default; byte-identical to 1.1.0: ledger,
+page, e-mail and log) | on (also 1 / true / yes). exit_plan.yml maps it,
+default 'off'. Rollback: unset the repository variable or set it to off.
+
 VERSION 1.0.0 (2026-11-11) - NEW SCRIPT
 
 WHY (owner, Wed 11 Nov 2026 09:30 Riyadh): fixed stop-loss and take-profit
@@ -108,7 +146,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -150,6 +188,11 @@ def _env_num(name: str, default: float, lo: float, hi: float) -> float:
 def mode() -> str:
     v = _env("TFB_EXIT_PLAN", "off").lower()
     return v if v in ("off", "observe", "on") else "off"
+
+
+def lot_carry_on() -> bool:
+    """1.2.0 [LOT-CARRY]: TFB_EXIT_LOT_CARRY on / 1 / true / yes; anything else (and unset) is off."""
+    return _env("TFB_EXIT_LOT_CARRY", "off").lower() in ("on", "1", "true", "yes")
 
 
 def knobs() -> Dict[str, Any]:
@@ -414,6 +457,7 @@ def read_lots(values: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
         o["shares"] += sh
         o["cost"] += px * sh
         o["date"] = max(o["date"], bd)
+        o["first"] = min(o.get("first", bd), bd)          # 1.2.0 [LOT-CARRY]: the earliest active buy date
     for o in out.values():
         o["buy"] = o["entry"] = o["cost"] / o["shares"]
     return out
@@ -544,6 +588,33 @@ def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
 
 def lot_key(symbol: str, lot: Dict[str, Any]) -> str:
     return "%s|%s|%.4f" % (symbol, lot["date"].isoformat(), lot["buy"])
+
+
+def carry_rows(ledger: Sequence[Dict[str, Any]], symbol: str, key: str, lot_date: _dt.date,
+               first: _dt.date) -> List[Dict[str, Any]]:
+    """1.2.0 [LOT-CARRY] PURE: the ledger rows of the same holding under an earlier lot key, relabelled to `key`.
+
+    A sale from one of several lots, or a closed lot, changes the weighted buy price or the latest buy date and so
+    the key. A row belongs to the holding when its key's buy date is on or after `first` (the earliest active buy
+    date now). Nothing is carried when `lot_date` (the current key's date) is later than every such key's date: a
+    lot bought since is a new position, as before 1.2.0. Rows whose Lot is not 'SYMBOL|date|price' are skipped.
+    Each copy keeps its own key in 'Carried From'."""
+    sym = symbol.upper()
+    rows: List[Dict[str, Any]] = []
+    newest: Optional[_dt.date] = None
+    for d in ledger:
+        lot = text(d.get("Lot"))
+        if lot == key or text(d.get("Symbol")).upper() != sym:
+            continue
+        parts = lot.split("|")
+        kd = parse_date(parts[1]) if len(parts) == 3 and parts[0].upper() == sym else None
+        if kd is None or kd < first:
+            continue
+        rows.append(d)
+        newest = kd if newest is None or kd > newest else newest
+    if not rows or newest is None or lot_date > newest:
+        return []
+    return [dict(d, Lot=key, **{"Carried From": text(d.get("Lot"))}) for d in rows]
 
 
 def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date,
@@ -800,6 +871,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         return fetched(sym)[0]
 
     results: List[Dict[str, Any]] = []
+    carry = lot_carry_on()                                 # 1.2.0 [LOT-CARRY]
     for sym, lot in sorted(lots.items()):
         inf = dict(info_map.get(sym) or {})
         if any(c in inf.get("asset", "").lower() for c in NO_STOP_CLASSES):
@@ -813,7 +885,15 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         inf["live"] = fetched(sym)[1]
         sym_bars = bars_for(sym)
         prev = prior_row(ledger, lot_key(sym, lot), today, sym_bars[-1][0] if sym_bars else None)
+        carried = carry_rows(ledger, sym, lot_key(sym, lot), lot["date"], lot["first"]) if carry else []
+        if carried:                                        # 1.2.0 [LOT-CARRY]: the holding's earlier lot keys
+            own = [d for d in ledger if text(d["Lot"]) == lot_key(sym, lot)]
+            note = prev.get("Was") is None
+            prev = prior_row(carried + own, lot_key(sym, lot), today, sym_bars[-1][0] if sym_bars else None)
         res = exit_levels(sym, lot["entry"], lot["date"], sym_bars, inf, prev, k, today)
+        if carried and note and res.get("ok"):
+            res["why"].append("the lots changed (a sale or a closed lot): the stop and the first-target state carry "
+                              "over from %s" % carried[-1]["Carried From"])
         res.update({"name": inf.get("name") or lot["name"], "shares": lot["shares"], "lot": lot_key(sym, lot),
                     "broker_stop": stops.get(sym), "prev": prev})
         if (news.get(sym) or {}).get("headline"):

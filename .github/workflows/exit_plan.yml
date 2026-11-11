@@ -1,6 +1,14 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
+# VERSION 1.3.0 (2026-11-11)
+#
+# 1.3.0: maps TFB_EXIT_LOT_CARRY (scripts/exit_plan.py 1.2.0 [LOT-CARRY],
+# default 'off' = byte-identical). When on, a holding whose lots change (part
+# of one lot sold, or a lot closed) keeps its stop ratchet and its once-only
+# TAKE PROFIT flag. No schedule, trigger or concurrency change. Rollback:
+# unset or off.
+#
 # VERSION 1.2.0 (2026-11-11)
 #
 # 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). 07:30 (with the e-mail), then
@@ -111,6 +119,7 @@ jobs:
           TFB_EXIT_NEWS_DAYS: ${{ vars.TFB_EXIT_NEWS_DAYS || '3' }}
           TFB_EXIT_FC_REL_MIN: ${{ vars.TFB_EXIT_FC_REL_MIN || '70' }}
           TFB_EXIT_EARN_WARN_DAYS: ${{ vars.TFB_EXIT_EARN_WARN_DAYS || '5' }}
+          TFB_EXIT_LOT_CARRY: ${{ vars.TFB_EXIT_LOT_CARRY || 'off' }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_CRON: ${{ github.event.schedule }}
           IN_DRY_RUN: ${{ inputs.dry_run }}

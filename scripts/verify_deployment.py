@@ -359,7 +359,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.3.0", "daily plan"),
-    ("exit_plan", "1.1.0", "exit plan"),
+    # 2026-11-11 (pin only): 1.1.0 -> 1.2.0 [LOT-CARRY] (a holding whose lots
+    # change keeps its stop ratchet and TAKE PROFIT flag; vars.TFB_EXIT_LOT_CARRY,
+    # default off; workflow-scoped, never on Render).
+    ("exit_plan", "1.2.0", "exit plan"),
     ("consistency_check", "1.1.0", "consistency check"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
