@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_exit_plan.py - scripts/exit_plan.py 1.0.0: stop and target per holding, reviewed after every close.
+"""tests/test_exit_plan.py - scripts/exit_plan.py 1.0.1: stop and target per holding, reviewed after every close.
 
   X1  Yahoo chart parsing: incomplete bars dropped, dividend factor applied (an implausible one ignored)
   X2  ATR of the last 14 true ranges
@@ -125,6 +125,7 @@ def test_x4_before_one_r_the_initial_stop_holds():
     r = lv(mk([100.0] * 30 + [103.0, 105.0, 104.0], 0.015))
     assert r["r"] == pytest.approx(9.0) and r["stop"] == pytest.approx(91.0)
     assert r["target"] == pytest.approx(109.0) and r["action"] == "HOLD" and not r["tp1"]
+    assert r["stop_gap_pct"] == pytest.approx((1 - 91.0 / 104.0) * 100) and "12.5% under the last close" in r["why"][0]
 
 
 def test_x5_after_one_r_the_stop_trails_and_the_target_steps_up():
