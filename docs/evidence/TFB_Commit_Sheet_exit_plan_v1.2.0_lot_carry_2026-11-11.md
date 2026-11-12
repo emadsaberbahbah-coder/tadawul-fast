@@ -109,7 +109,7 @@ With two fills a few cents apart on one day (harness L2):
 - 2 differ by one 4-decimal Basis unit only.
 - 7 are open test gaps or edges, listed in S5. None changes an action in the replays except V13, which changes a label only.
 
-Earlier rounds measured 27/40 non-equivalent mutants killed (round 1, `ef0e70fa`) and 86/107 (round 3, `a73983a9`).
+Earlier rounds measured 27/40 non-equivalent mutants killed (round 1, `ef0e70fa`), 86/107 mutants (round 3, `a73983a9`) and 87/109 (round 4, `e2b94da4`); each round's non-equivalent survivors got a leg.
 
 **Lanes** on an export of `bcda09cf`:
 - The lean emulation gives LEAN FAILS 0, with every step exiting 0. The decision-layer suites give 4,588 passed / 36 skipped. The new step gives 81 passed, with the base fetched by SHA.
@@ -149,7 +149,7 @@ Five review rounds. Each ran independent lenses (semantics or adversarial replay
   - A key left by a split, bonus or price edit came back on a later sale and gave SELL at a stop wrong by the split ratio (major).
   - A mistyped lot's stop stayed after the lot was deleted (major).
   - The note came back on re-runs of raise closes.
-  - 7 harness gaps among 21 survivors.
+  - 8 harness gaps (10 mutants) among 21 survivors.
   - Fixed in `e2b94da4`: the transition rule.
 - **Round 4** (`e2b94da4`):
   - Edits and sales on one Riyadh date: the same-date overwrite erased the transition and brought back a typo's or pre-split stop (major).
