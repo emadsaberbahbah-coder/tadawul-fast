@@ -4,7 +4,27 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.0.2 (2026-11-12)
+v1.1.0 (2026-11-12)
+  1.1.0: THE PAGE'S DESIGN (owner, 12 Nov 12:07: "this page need to improve formatting ... to get better design").
+         Until now the page was a plain grid: one font, no colour, ten equal columns, text running under its
+         neighbours. Now:
+           - section A shows each step as a card of two rows: a coloured number with the kind of step under it (SELL,
+             TAKE PROFIT, RAISE STOP, CONFIRM, REVIEW, BUY), the instruction in bold across the page, and under it
+             the levels and the reason;
+           - a title bar, a summary band (red when a source is old or was not read), section bands, table headers,
+             right-aligned figures, coloured actions / statuses / P-L, sized columns, wrapped text, row lines,
+             no gridlines, the title frozen, and the sheet cut to the page's own size;
+           - section E in four small tables; a learning-gate row reads as a label and its figures.
+         The values are the same copies as before; only their cells in sections A and E moved.
+         ONE WRITE: values, looks, merges and sizes go out as a single Sheets batch, applied whole or not at all.
+         If Sheets refuses the styled batch for any reason but its quota, the page is written as the plain grid
+         (and the run says so) - a formatting fault never costs the day's instructions. TFB_TAP_STYLE=off writes the
+         plain grid on purpose.
+         PREVIEW: TFB_TAP_PREVIEW=true writes the tab Today_Action_Plan_Preview and leaves the live page alone; the
+         next normal run hides that tab.
+         EVIDENCE BOARD AGE: the board is rebuilt at most every 6 hours and not overnight, so the 3-hour limit made
+         the live page read "OLD SOURCE: Evidence_Board" at 3.1 hours. It now has its own limit,
+         TFB_TAP_STALE_EVIDENCE_H (18).
   1.0.2: WAIT AND TRY AGAIN WHEN GOOGLE SHEETS REPORTS ITS PER-MINUTE QUOTA. On 12 Nov 11:04 the Daily Plan and the
          Exit Plan were started together from the workbook menu; both finished in the same second and the two runs
          of this page that followed stopped with "APIError [429]: Quota exceeded for quota metric 'Read requests'"
@@ -51,7 +71,9 @@ ENV
     DEFAULT_SPREADSHEET_ID, GOOGLE_SHEETS_CREDENTIALS, TFB_TODAY_PLAN,
     TFB_TAP_STALE_H (3), TFB_TAP_STOP_TOL_PCT (1), TFB_TAP_PIPELINE (5),
     TFB_TAP_HIDE_TABS (_Daily_Plan,_Exit_Plan,_Evidence_Log; "none" = hide none),
-    TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none).
+    TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none),
+    TFB_TAP_STYLE (on | off = plain grid), TFB_TAP_PREVIEW (false | true = write the preview tab),
+    TFB_TAP_STALE_EVIDENCE_H (18).
 ================================================================================
 """
 from __future__ import annotations
@@ -65,7 +87,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -449,7 +471,17 @@ def text_px(value: Any, width_px: float, pt: float = 10, bold: bool = False) -> 
     """Row height (px) that shows `value` wrapped in a cell `width_px` wide. Merged cells get no automatic height in
     Sheets, so the height is estimated - on the generous side: a little white space, never clipped text."""
     per_line = max(8, int((width_px - 14) / (pt * (0.70 if bold else 0.64))))
-    lines = sum(max(1, int(math.ceil(len(part) / float(per_line)))) for part in (text(value).split("\n") or [""]))
+    lines = 0
+    for part in (text(value).split("\n") or [""]):
+        used, n = 0, 1
+        for word in part.split(" "):                                # greedy word wrap, as the sheet does it
+            w = len(word)
+            if used and used + 1 + w > per_line:
+                n, used = n + 1, 0
+            if w > per_line:                                        # a word longer than the line is broken
+                n, w = n + (w - 1) // per_line, ((w - 1) % per_line) + 1
+            used = used + (1 if used else 0) + w
+        lines += n
     return int(max(21, round(lines * pt * 1.55 + 9)))
 
 
@@ -471,19 +503,24 @@ class _Page(object):
             for c in range(c0 + 1, c1):
                 st[c] = st[c0]                                      # the merged area takes the anchor's look
         self.styles.append(st)
-        if height:
-            self.heights[r] = int(height)
+        need = int(height or 0)
+        if spans:
+            # Sheets sizes a row from its unmerged cells only, so a row that has a merge gets its height here:
+            # the tallest of its cells, each wrapped in its own (merged) width
+            anchors = dict((c0, c1) for c0, c1 in spans)
+            covered = set(c for c0, c1 in spans for c in range(c0 + 1, c1))
+            for c, v in enumerate(self.rows[r]):
+                if c in covered or not text(v):
+                    continue
+                sp = STYLES.get(st[c]) or {}
+                need = max(need, text_px(v, sum(COL_PX[c:anchors.get(c, c + 1)]), sp.get("size", 10), bool(sp.get("bold"))))
+        if need:
+            self.heights[r] = need
         return r
 
-    def full(self, value: Any, style: str, height: Optional[int] = None, wrap_pt: float = 0, bold: bool = False) -> int:
-        """One value across the whole width."""
-        if wrap_pt:
-            height = max(height or 0, text_px(value, sum(COL_PX), wrap_pt, bold))
+    def full(self, value: Any, style: str, height: Optional[int] = None) -> int:
+        """One value across the whole width (the height given is a floor)."""
         return self.add([value], style, [(0, WIDTH)], height)
-
-
-def _span_px(c0: int, c1: int) -> int:
-    return sum(COL_PX[c0:c1])
 
 
 def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:
@@ -497,12 +534,12 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.full("TODAY ACTION PLAN - %s" % day, "title", 44)
     pg.full("Built %s Riyadh · today_action_plan %s · copied from Exit_Plan, Daily_Plan, Evidence_Board and "
             "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__),
-            "sub", wrap_pt=9)
+            "sub")
     pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
             "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
                               (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
                               (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")),
-            "alert" if (d["stale"] or miss) else "summary", 30, wrap_pt=11, bold=True)
+            "alert" if (d["stale"] or miss) else "summary", 30)
     pg.add(height=10)
 
     # ---- A. the day's steps: two rows each - the instruction, then its levels and reason
@@ -510,18 +547,16 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.add(["Step", "Symbol · from", "What to do, with its levels and reason underneath"], "head", [(2, WIDTH)])
     for i, s in enumerate(d["steps"], 1):
         kind = step_kind(s)
-        pg.add([i, s["symbol"], s["do"]], ["chip_" + kind, "card_sym", "card_do"], [(2, WIDTH)],
-               max(32, text_px(s["do"], _span_px(2, WIDTH), 11, True)))
+        pg.add([i, s["symbol"], s["do"]], ["chip_" + kind, "card_sym", "card_do"], [(2, WIDTH)], 34)
         pg.add([CHIP[kind][1], s["source"], s["levels"], "", "", "", s["why"]],
-               ["chiplabel_" + kind, "card_src", "card_note", "", "", "", "card_note"], [(2, 6), (6, WIDTH)],
-               max(28, text_px(s["levels"], _span_px(2, 6)), text_px(s["why"], _span_px(6, WIDTH))))
+               ["chiplabel_" + kind, "card_src", "card_note", "", "", "", "card_note"], [(2, 6), (6, WIDTH)], 28)
     if not d["steps"]:
         # a source that could not be read is never an all-clear (Codex P2, #966)
         unread = "Exit_Plan" in miss or "_Daily_Plan" in miss
         msg = ("No step can be given: %s could not be read. Refresh the plan pages, then this page." % ", ".join(miss)
                if unread else "Nothing to do today: every holding reads HOLD with its broker stop in place, and no new "
                               "buy is open.")
-        pg.add(["", "", msg], ["", "", "msg_alert" if unread else "msg"], [(2, WIDTH)], text_px(msg, _span_px(2, WIDTH)))
+        pg.add(["", "", msg], ["", "", "msg_alert" if unread else "msg"], [(2, WIDTH)])
     elif "Exit_Plan" in miss or "_Daily_Plan" in miss:
         pg.add(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
             m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))], ["", "", "msg_alert"], [(2, WIDTH)])
@@ -569,7 +604,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.add(["Symbol", "Name", "Rank", "Score", "Waiting for"], ["head", "head", "head_num", "head_num", "head"], [(4, WIDTH)])
     for p in d["pipeline"][:int(k["pipeline"])]:
         pg.add([p["symbol"], p["name"], fmt(p.get("rank"), 0), fmt(p.get("score"), 1), p.get("waiting", "")],
-               ["cell_b", "cell", "num", "num", "cell"], [(4, WIDTH)], text_px(p.get("waiting", ""), _span_px(4, WIDTH)))
+               ["cell_b", "cell", "num", "num", "cell"], [(4, WIDTH)])
 
     # ---- E. context
     pg.add(height=10)
@@ -590,12 +625,11 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         if not cells:
             continue
         if len(cells) == 1:
-            pg.add([cells[0]], "cell_b" if text(g[0]) else "msg", [(0, WIDTH)], text_px(cells[0], sum(COL_PX), 10, True))
+            pg.add([cells[0]], "cell_b" if text(g[0]) else "msg", [(0, WIDTH)])
             continue
         rest = " · ".join(cells[1:])
         verdict = "bad" if re.search(r"\bFAIL\b", rest) else ("ok" if re.search(r"\bPASS\b", rest) else "cell")
-        pg.add([cells[0], "", rest], ["cell_b", "", verdict], [(0, 2), (2, WIDTH)],
-               max(text_px(cells[0], _span_px(0, 2), 10, True), text_px(rest, _span_px(2, WIDTH), 10, True)))
+        pg.add([cells[0], "", rest], ["cell_b", "", verdict], [(0, 2), (2, WIDTH)])
     pg.full("Page differences (Consistency_Check)", "subhead")
     pg.add(["Check", "", "Status", "Detail"], "head", [(0, 2), (3, WIDTH)])
     issues = [[x["check"], "", x["status"], x["detail"]] for x in d["issues"]]
@@ -603,8 +637,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         issues = [["", "", "not read", "The Consistency_Check page could not be read."] if "Consistency_Check" in miss else
                   ["", "", "none", "The pages agree on every checked figure."]]
     for x in issues:
-        pg.add(x, ["cell_b", "", STATUS_STYLE.get(x[2], "st_info"), "cell"], [(0, 2), (3, WIDTH)],
-               text_px(x[3], _span_px(3, WIDTH)))
+        pg.add(x, ["cell_b", "", STATUS_STYLE.get(x[2], "st_info"), "cell"], [(0, 2), (3, WIDTH)])
     pg.full("Source pages", "subhead")
     pg.add(["Source page", "", "Age (hours)", "Reading"], ["head", "", "head_num", "head"], [(0, 2), (3, WIDTH)])
     for name in sorted(d["ages"]):
@@ -617,7 +650,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.add(height=10)
     pg.full("How to read: section A is the whole instruction; B to E show where each step comes from. A level on "
             "this page is always the level on its source page. Trading decisions and every order are the "
-            "owner's; this page is information, not investment advice.", "foot", wrap_pt=9)
+            "owner's; this page is information, not investment advice.", "foot")
     return pg
 
 
