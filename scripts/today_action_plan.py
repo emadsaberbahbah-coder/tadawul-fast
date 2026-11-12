@@ -4,7 +4,12 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.0.0 (2026-11-12)
+v1.0.1 (2026-11-12)
+  1.0.1: ONE LINE WHEN THE BROKER ORDERS WERE NOT READ. The first live run (12 Nov 10:42) gave three steps
+         "Check the broker stop on X: none was read for it" - the Exit Plan's broker read was stale ("broker orders
+         unknown"), while the stops were in place at the broker. When the Exit_Plan page says its broker orders are
+         unknown, the page now gives ONE step ("confirm the stops in IBKR against section B") instead of one per
+         holding, and section B says "broker orders not read" instead of "no broker stop read".
 
 WHY (owner, 12 Nov 2026 08:59 Riyadh)
     The Daily Plan (new buys) and the Exit Plan (holdings) are two pages, and
@@ -52,7 +57,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -158,6 +163,16 @@ def read_holdings(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def broker_unknown(values: Sequence[Sequence[Any]]) -> str:
+    """The Exit_Plan page's own words when it could not read the broker orders ('broker orders unknown (...)'), else ''."""
+    for r in list(values)[:6]:
+        for c in r:
+            m = re.search(r"broker orders unknown(?: \([^)]*\))?", text(c))
+            if m:
+                return m.group(0)
+    return ""
+
+
 def read_plan(values: Sequence[Sequence[Any]], today: _dt.date) -> Dict[str, Any]:
     """Today's rows of the Daily Plan ledger: {"date", "cut_at", "quality", "picks", "pipeline", "is_today"}."""
     rows = [list(r) for r in values if r]
@@ -242,7 +257,7 @@ def read_consistency(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
 # ----------------------------------------------------------------------------- #
 # The plan (pure)
 # ----------------------------------------------------------------------------- #
-def holding_steps(h: Dict[str, Any], tol_pct: float) -> List[Dict[str, Any]]:
+def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) -> List[Dict[str, Any]]:
     """The steps one holding asks for today, each {urgency, symbol, do, levels, why, source}."""
     sym, qty, stop, bs, act = h["symbol"], h.get("qty") or 0, h.get("stop"), h.get("broker_stop"), h["action"]
     steps: List[Dict[str, Any]] = []
@@ -265,12 +280,15 @@ def holding_steps(h: Dict[str, Any], tol_pct: float) -> List[Dict[str, Any]]:
         step(1, do, "last %s · next target %s" % (fmt(h.get("last")), fmt(h.get("target"))))
     elif act == "RAISE STOP":
         step(2, "Raise the stop on %s to %s for all %s." % (sym, fmt(stop), shares),
-             "was %s · broker stop %s" % (fmt(h.get("was")) or "-", fmt(bs) or "not read"))
+             "was %s · broker stop %s" % (fmt(h.get("was")) or "-", fmt(bs) or ("not read" if broker_known else
+                                                                                "orders not read")))
     elif act in ("REVIEW", "CHECK"):
         step(3, "Review %s today: the exit rule could not decide on its own." % sym,
              "last %s · stop %s" % (fmt(h.get("last")), fmt(stop)))
     if act in ("HOLD", "REVIEW", "CHECK") and stop:
-        if bs is None:
+        if bs is None and not broker_known:
+            pass                                    # 1.0.1: one step for all holdings, added in build()
+        elif bs is None:
             step(2.5, "Check the broker stop on %s: none was read for it. The plan's stop is %s." % (sym, fmt(stop)),
                  "plan stop %s · broker stop not read" % fmt(stop))
         elif bs < stop * (1 - tol_pct / 100.0):
@@ -299,10 +317,21 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
 
 
 def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[str, Any], issues: List[Dict[str, str]],
-          ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = ()) -> Dict[str, Any]:
+          ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = (),
+          broker_note: str = "") -> Dict[str, Any]:
     steps: List[Dict[str, Any]] = []
     for h in holdings:
-        steps += holding_steps(h, k["stop_tol"])
+        steps += holding_steps(h, k["stop_tol"], not broker_note)
+    # a SELL row is leaving in full: no stop to confirm on it (Codex P2, #967)
+    unread = [h["symbol"] for h in holdings
+              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL")]
+    if broker_note and unread:
+        steps.append({"urgency": 2.6, "symbol": "ALL", "source": "Exit_Plan",
+                      "do": "Confirm in IBKR that each holding's stop matches the plan's stop in section B (%s)."
+                            % ", ".join(unread),
+                      "levels": "broker orders were not read into the workbook",
+                      "why": "The Exit Plan reports: %s. A stop may be in place at the broker; the workbook could not "
+                             "compare it." % broker_note})
     picks = plan["picks"] if plan.get("is_today") else []
     for p in picks:
         s = pick_step(p, evidence.get("names") or {}, plan.get("quality", "").upper() == "VERIFIED")
@@ -312,7 +341,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     stale = sorted(n for n, a in ages.items() if a is not None and a > k["stale_h"])
     return {"steps": steps, "holdings": holdings, "picks": picks, "pipeline": (plan["pipeline"] if plan.get("is_today") else []),
             "plan": plan, "evidence": evidence, "issues": issues, "ages": ages, "stale": stale,
-            "missing": sorted(missing)}
+            "missing": sorted(missing), "broker_note": broker_note}
 
 
 def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> List[List[Any]]:
@@ -349,7 +378,7 @@ def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> L
     for h in d["holdings"]:
         bs = h.get("broker_stop")
         note = "" if h["action"] == "NO RULE" else (
-            "no broker stop read" if bs is None else (
+            ("broker orders not read" if d.get("broker_note") else "no broker stop read") if bs is None else (
                 "broker stop below the plan" if h.get("stop") and bs < h["stop"] * (1 - k["stop_tol"] / 100.0) else "stop in place"))
         out.append(pad([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), h["action"],
                         fmt(h.get("stop")), fmt(bs), fmt(h.get("target")), note]))
@@ -456,7 +485,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> in
     if not plan["date"]:
         missing.append("_Daily_Plan")
     d = build(read_holdings(pages["Exit_Plan"]), plan, read_evidence(pages["Evidence_Board"]),
-              read_consistency(pages["Consistency_Check"]), ages, k, missing)
+              read_consistency(pages["Consistency_Check"]), ages, k, missing, broker_unknown(pages["Exit_Plan"]))
     for i, s in enumerate(d["steps"], 1):
         _out("STEP %d %-9s %s | %s" % (i, s["symbol"], s["do"], s["levels"]))
     if not d["steps"]:
