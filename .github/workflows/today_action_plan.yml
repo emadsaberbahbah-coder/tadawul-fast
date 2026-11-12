@@ -95,6 +95,7 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_TODAY_PLAN: ${{ vars.TFB_TODAY_PLAN || 'on' }}
           TFB_TAP_STALE_H: ${{ vars.TFB_TAP_STALE_H || '3' }}
+          TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}
           TFB_TAP_STOP_TOL_PCT: ${{ vars.TFB_TAP_STOP_TOL_PCT || '1' }}
           TFB_TAP_PIPELINE: ${{ vars.TFB_TAP_PIPELINE || '5' }}
           TFB_TAP_HIDE_TABS: ${{ vars.TFB_TAP_HIDE_TABS || '_Daily_Plan,_Exit_Plan,_Evidence_Log' }}

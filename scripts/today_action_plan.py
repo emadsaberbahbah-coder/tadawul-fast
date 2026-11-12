@@ -350,6 +350,12 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
             "source": "Daily_Plan"}
 
 
+def stale_limit(name: str, k: Dict[str, float]) -> float:
+    """Hours after which a source page reads OLD. The Evidence Board is rebuilt at most every 6 hours, from daily bars,
+    and not overnight - so it has its own, longer limit (1.1.0: it read OLD on the live page at 3.1 hours)."""
+    return max(k["stale_h"], k.get("stale_ev", 0.0)) if name == "Evidence_Board" else k["stale_h"]
+
+
 def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[str, Any], issues: List[Dict[str, str]],
           ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = (),
           broker_note: str = "") -> Dict[str, Any]:
@@ -372,7 +378,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
         if s:
             steps.append(s)
     steps.sort(key=lambda s: (s["urgency"], s["symbol"]))
-    stale = sorted(n for n, a in ages.items() if a is not None and a > k["stale_h"])
+    stale = sorted(n for n, a in ages.items() if a is not None and a > stale_limit(n, k))
     return {"steps": steps, "holdings": holdings, "picks": picks, "pipeline": (plan["pipeline"] if plan.get("is_today") else []),
             "plan": plan, "evidence": evidence, "issues": issues, "ages": ages, "stale": stale,
             "missing": sorted(missing), "broker_note": broker_note}
@@ -394,16 +400,10 @@ STYLES: Dict[str, Dict[str, Any]] = {
     "subhead": {"bg": "F7F9FC", "fg": "1B2A41", "bold": True, "top": True},
     "head": {"bg": "EEF1F5", "fg": "4A5568", "bold": True, "size": 9, "bottom": True},
     "head_num": {"bg": "EEF1F5", "fg": "4A5568", "bold": True, "size": 9, "bottom": True, "align": "RIGHT"},
-    "chip_sell": {"bg": "C62828", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
-    "chip_profit": {"bg": "2E7D32", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
-    "chip_stop": {"bg": "EF6C00", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
-    "chip_broker": {"bg": "B26A00", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
-    "chip_review": {"bg": "6A1B9A", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
-    "chip_buy": {"bg": "1565C0", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
     "card_sym": {"fg": INK, "bold": True, "size": 11, "top": True},
     "card_do": {"fg": INK, "bold": True, "size": 11, "top": True},
     "card_src": {"fg": "8A94A3", "italic": True, "size": 9, "valign": "TOP"},
-    "card_note": {"fg": "4A5568", "size": 9, "valign": "TOP"},
+    "card_note": {"fg": "4A5568", "valign": "TOP"},
     "msg": {"fg": "4A5568", "italic": True},
     "msg_alert": {"bg": _BAD[0], "fg": _BAD[1], "bold": True},
     "cell": {"fg": INK, "bottom": "thin"},
@@ -417,15 +417,20 @@ STYLES: Dict[str, Dict[str, Any]] = {
     "act_review": {"bg": "F3E8FD", "fg": "6A1B9A", "bold": True, "align": "CENTER", "bottom": "thin"},
     "act_hold": {"fg": "4A5568", "align": "CENTER", "bottom": "thin"},
     "act_none": {"fg": "9AA5B1", "align": "CENTER", "bottom": "thin"},
-    "st_good": {"bg": _GOOD[0], "fg": _GOOD[1], "bold": True, "align": "CENTER", "bottom": "thin"},
-    "st_warn": {"bg": _WARN[0], "fg": _WARN[1], "bold": True, "align": "CENTER", "bottom": "thin"},
-    "st_bad": {"bg": _BAD[0], "fg": _BAD[1], "bold": True, "align": "CENTER", "bottom": "thin"},
-    "st_info": {"bg": _INFO[0], "fg": _INFO[1], "align": "CENTER", "bottom": "thin"},
+    "st_good": {"bg": _GOOD[0], "fg": _GOOD[1], "bold": True, "size": 9, "align": "CENTER", "bottom": "thin"},
+    "st_warn": {"bg": _WARN[0], "fg": _WARN[1], "bold": True, "size": 9, "align": "CENTER", "bottom": "thin"},
+    "st_bad": {"bg": _BAD[0], "fg": _BAD[1], "bold": True, "size": 9, "align": "CENTER", "bottom": "thin"},
+    "st_info": {"bg": _INFO[0], "fg": _INFO[1], "size": 9, "align": "CENTER", "bottom": "thin"},
     "ok": {"fg": _GOOD[1], "bottom": "thin"},
     "warn": {"fg": _WARN[1], "bold": True, "bottom": "thin"},
     "bad": {"fg": _BAD[1], "bold": True, "bottom": "thin"},
     "foot": {"fg": MUTE, "italic": True, "size": 9, "valign": "TOP"},
 }
+CHIP = {"sell": ("C62828", "SELL"), "profit": ("2E7D32", "TAKE PROFIT"), "stop": ("EF6C00", "RAISE STOP"),
+        "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY")}
+for _k, (_bg, _label) in CHIP.items():                         # the step number, and the kind's name under it
+    STYLES["chip_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 15, "align": "CENTER", "valign": "BOTTOM"}
+    STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
 ACTION_STYLE = {"SELL": "act_sell", "TAKE PROFIT": "act_profit", "RAISE STOP": "act_stop", "REVIEW": "act_review",
                 "CHECK": "act_review", "HOLD": "act_hold", "NO RULE": "act_none"}
 STATUS_STYLE = {"OPEN": "st_good", "WAIT": "st_warn", "MATCH": "st_good", "MISMATCH": "st_warn", "STALE": "st_warn",
@@ -445,7 +450,7 @@ def text_px(value: Any, width_px: float, pt: float = 10, bold: bool = False) -> 
     Sheets, so the height is estimated - on the generous side: a little white space, never clipped text."""
     per_line = max(8, int((width_px - 14) / (pt * (0.70 if bold else 0.64))))
     lines = sum(max(1, int(math.ceil(len(part) / float(per_line)))) for part in (text(value).split("\n") or [""]))
-    return int(max(21, round(lines * pt * 1.62 + 9)))
+    return int(max(21, round(lines * pt * 1.55 + 9)))
 
 
 class _Page(object):
@@ -504,13 +509,12 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.full("A. DO TODAY - in this order", "band_a", 32)
     pg.add(["Step", "Symbol · from", "What to do, with its levels and reason underneath"], "head", [(2, WIDTH)])
     for i, s in enumerate(d["steps"], 1):
-        chip = "chip_" + step_kind(s)
-        top = pg.add([i, s["symbol"], s["do"]], [chip, "card_sym", "card_do"], [(2, WIDTH)],
-                     max(30, text_px(s["do"], _span_px(2, WIDTH), 11, True)))
-        pg.add(["", s["source"], s["levels"], "", "", "", s["why"]],
-               [chip, "card_src", "card_note", "", "", "", "card_note"], [(2, 6), (6, WIDTH)],
-               max(26, text_px(s["levels"], _span_px(2, 6), 9), text_px(s["why"], _span_px(6, WIDTH), 9)))
-        pg.merges.append((top, top + 2, 0, 1))                      # the step number spans both rows
+        kind = step_kind(s)
+        pg.add([i, s["symbol"], s["do"]], ["chip_" + kind, "card_sym", "card_do"], [(2, WIDTH)],
+               max(32, text_px(s["do"], _span_px(2, WIDTH), 11, True)))
+        pg.add([CHIP[kind][1], s["source"], s["levels"], "", "", "", s["why"]],
+               ["chiplabel_" + kind, "card_src", "card_note", "", "", "", "card_note"], [(2, 6), (6, WIDTH)],
+               max(28, text_px(s["levels"], _span_px(2, 6)), text_px(s["why"], _span_px(6, WIDTH))))
     if not d["steps"]:
         # a source that could not be read is never an all-clear (Codex P2, #966)
         unread = "Exit_Plan" in miss or "_Daily_Plan" in miss
@@ -581,13 +585,17 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         pg.add(["", "The Evidence_Board page has no market state yet."], ["", "msg"], [(1, WIDTH)])
     pg.full("Learning gate (copied from S1_Gate)", "subhead")
     for g in (ev.get("gate") or [["", "not on the Evidence Board yet"]])[:4]:
-        cells = (list(g) + [""] * WIDTH)[:WIDTH]
-        last = max([i for i, c in enumerate(cells) if text(c)] or [0])
-        st = [("cell_b" if i == 0 else STATUS_STYLE.get(text(c), "cell")) for i, c in enumerate(cells)]
-        if last + 1 < WIDTH:                                        # the last value takes the rest of the row
-            pg.add(cells, st, [(last, WIDTH)], text_px(cells[last], _span_px(last, WIDTH)))
-        else:
-            pg.add(cells, st)
+        # a gate row is a label and its figures; its bracketed run-log cells ("[S1-...]") are left on the source page
+        cells = [text(c) for c in g if text(c) and not text(c).startswith("[")]
+        if not cells:
+            continue
+        if len(cells) == 1:
+            pg.add([cells[0]], "cell_b" if text(g[0]) else "msg", [(0, WIDTH)], text_px(cells[0], sum(COL_PX), 10, True))
+            continue
+        rest = " · ".join(cells[1:])
+        verdict = "bad" if re.search(r"\bFAIL\b", rest) else ("ok" if re.search(r"\bPASS\b", rest) else "cell")
+        pg.add([cells[0], "", rest], ["cell_b", "", verdict], [(0, 2), (2, WIDTH)],
+               max(text_px(cells[0], _span_px(0, 2), 10, True), text_px(rest, _span_px(2, WIDTH), 10, True)))
     pg.full("Page differences (Consistency_Check)", "subhead")
     pg.add(["Check", "", "Status", "Detail"], "head", [(0, 2), (3, WIDTH)])
     issues = [[x["check"], "", x["status"], x["detail"]] for x in d["issues"]]
@@ -601,7 +609,8 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.add(["Source page", "", "Age (hours)", "Reading"], ["head", "", "head_num", "head"], [(0, 2), (3, WIDTH)])
     for name in sorted(d["ages"]):
         a = d["ages"][name]
-        reading = "no time found" if a is None else ("OLD - refresh it before acting" if a > k["stale_h"] else "current")
+        reading = "no time found" if a is None else (
+            "OLD - refresh it before acting" if a > stale_limit(name, k) else "current")
         pg.add([name, "", "" if a is None else "%.1f" % a, reading],
                ["cell_b", "", "num", "ok" if reading == "current" else ("bad" if reading.startswith("OLD") else "warn")],
                [(0, 2), (3, WIDTH)])
@@ -753,7 +762,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         _out("TFB_TODAY_PLAN is off: nothing read, nothing written")
         return 0
     k = {"stale_h": _env_num("TFB_TAP_STALE_H", 3, 0.25, 72), "stop_tol": _env_num("TFB_TAP_STOP_TOL_PCT", 1, 0, 20),
-         "pipeline": _env_num("TFB_TAP_PIPELINE", 5, 0, 30)}
+         "pipeline": _env_num("TFB_TAP_PIPELINE", 5, 0, 30),
+         "stale_ev": _env_num("TFB_TAP_STALE_EVIDENCE_H", 18, 0.25, 96)}
     retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep
     held = {"book": book}
 

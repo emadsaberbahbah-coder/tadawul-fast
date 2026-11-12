@@ -278,7 +278,7 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     dd = [i for i, r in enumerate(page) if str(r[0]).startswith("D. PIPELINE - next in line (2 of 2)")][0]
     assert page[dd + 2][:1] == ["MBIN.US"] and page[dd + 3][4] == "next in line (rank 9)"
     assert any(r[:4] == ["Tadawul", "2026-11-09", "14.2%", "WASHED OUT"] for r in page)
-    assert any(r[:3] == ["S-1 GATE", "FAIL", "day 28/28"] for r in page)
+    assert any(r[:3] == ["S-1 GATE", "", "FAIL · day 28/28"] for r in page)        # 1.1.0: label, then its figures
     assert any(r[:4] == ["C9 stops", "", "MISMATCH", "DDI.US Portfolio_Decision 14.44 vs Exit Plan 14.80"] for r in page)
     ages = {r[0]: (r[2], r[3]) for r in page if r[0] in ("Exit_Plan", "Daily_Plan", "Evidence_Board", "Consistency_Check")}
     assert ages == {"Exit_Plan": ("1.5", "current"), "Daily_Plan": ("0.3", "current"), "Evidence_Board": ("1.3", "current"),
@@ -295,8 +295,16 @@ def test_t3_old_sources_empty_pages_dry_run_and_off(monkeypatch, capsys):
     book = full_book()
     assert tap.run_once(False, book=book, now=late) == 0
     page = book.tabs["Today_Action_Plan"].values
-    assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Evidence_Board, Exit_Plan")
+    # 1.1.0: the Evidence Board is rebuilt at most every 6 hours, so it has its own limit (18 h)
+    assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Exit_Plan")
     assert any(r[0] == "Exit_Plan" and r[3] == "OLD - refresh it before acting" for r in page)
+    assert any(r[0] == "Evidence_Board" and r[2:4] == ["7.3", "current"] for r in page)
+    book = full_book()
+    assert tap.run_once(False, book=book, now=NOW + dt.timedelta(hours=17)) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Evidence_Board, Exit_Plan")
+    assert tap.stale_limit("Evidence_Board", {"stale_h": 3.0}) == 3.0 and tap.stale_limit("Exit_Plan", {"stale_h": 3, "stale_ev": 18}) == 3
+    assert tap.stale_limit("Evidence_Board", {"stale_h": 24.0, "stale_ev": 18.0}) == 24.0       # never shorter than the others
     empty = Book({})
     assert tap.run_once(False, book=empty, now=NOW) == 0
     page = empty.tabs["Today_Action_Plan"].values
