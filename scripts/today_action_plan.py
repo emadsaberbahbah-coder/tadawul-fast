@@ -70,6 +70,7 @@ __version__ = "1.0.2"
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 TAB = "Today_Action_Plan"
+PREVIEW_TAB = "Today_Action_Plan_Preview"                    # written instead of TAB when TFB_TAP_PREVIEW is true
 WIDTH = 10
 DEFAULT_HIDE = "_Daily_Plan,_Exit_Plan,_Evidence_Log"
 URGENCY = {"SELL": 0, "TAKE PROFIT": 1, "RAISE STOP": 2, "REVIEW": 3, "CHECK": 4}
@@ -377,85 +378,344 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
             "missing": sorted(missing), "broker_note": broker_note}
 
 
-def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> List[List[Any]]:
-    def pad(r: Sequence[Any]) -> List[Any]:
-        return (list(r) + [""] * WIDTH)[:WIDTH]
+# ----------------------------------------------------------------------------- #
+# The page: values, styles, merges and row heights (pure)
+# ----------------------------------------------------------------------------- #
+COL_PX = (95, 160, 80, 130, 95, 115, 95, 125, 100, 290)        # A..J; sections B and C set the grid
+INK, MUTE, LINE, HAIR = "1F2933", "6B7785", "C5CDD8", "E8ECF1"
+_GOOD, _WARN, _BAD, _INFO = ("E6F4EA", "2E7D32"), ("FFF3E0", "B45309"), ("FDECEA", "B3261E"), ("F1F3F4", "4A5568")
+STYLES: Dict[str, Dict[str, Any]] = {
+    "title": {"bg": "1B2A41", "fg": "FFFFFF", "bold": True, "size": 16},
+    "sub": {"bg": "F7F9FC", "fg": MUTE, "italic": True, "size": 9},
+    "summary": {"bg": "E8F0FE", "fg": "1B2A41", "bold": True, "size": 11},
+    "alert": {"bg": _BAD[0], "fg": _BAD[1], "bold": True, "size": 11},
+    "band_a": {"bg": "0F5C63", "fg": "FFFFFF", "bold": True, "size": 12},
+    "band": {"bg": "3E4C59", "fg": "FFFFFF", "bold": True, "size": 11},
+    "subhead": {"bg": "F7F9FC", "fg": "1B2A41", "bold": True, "top": True},
+    "head": {"bg": "EEF1F5", "fg": "4A5568", "bold": True, "size": 9, "bottom": True},
+    "head_num": {"bg": "EEF1F5", "fg": "4A5568", "bold": True, "size": 9, "bottom": True, "align": "RIGHT"},
+    "chip_sell": {"bg": "C62828", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "chip_profit": {"bg": "2E7D32", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "chip_stop": {"bg": "EF6C00", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "chip_broker": {"bg": "B26A00", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "chip_review": {"bg": "6A1B9A", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "chip_buy": {"bg": "1565C0", "fg": "FFFFFF", "bold": True, "size": 14, "align": "CENTER"},
+    "card_sym": {"fg": INK, "bold": True, "size": 11, "top": True},
+    "card_do": {"fg": INK, "bold": True, "size": 11, "top": True},
+    "card_src": {"fg": "8A94A3", "italic": True, "size": 9, "valign": "TOP"},
+    "card_note": {"fg": "4A5568", "size": 9, "valign": "TOP"},
+    "msg": {"fg": "4A5568", "italic": True},
+    "msg_alert": {"bg": _BAD[0], "fg": _BAD[1], "bold": True},
+    "cell": {"fg": INK, "bottom": "thin"},
+    "cell_b": {"fg": INK, "bold": True, "bottom": "thin"},
+    "num": {"fg": INK, "align": "RIGHT", "bottom": "thin"},
+    "pos": {"fg": _GOOD[1], "align": "RIGHT", "bottom": "thin"},
+    "neg": {"fg": "C62828", "align": "RIGHT", "bottom": "thin"},
+    "act_sell": {"bg": _BAD[0], "fg": "C62828", "bold": True, "align": "CENTER", "bottom": "thin"},
+    "act_profit": {"bg": _GOOD[0], "fg": _GOOD[1], "bold": True, "align": "CENTER", "bottom": "thin"},
+    "act_stop": {"bg": _WARN[0], "fg": _WARN[1], "bold": True, "align": "CENTER", "bottom": "thin"},
+    "act_review": {"bg": "F3E8FD", "fg": "6A1B9A", "bold": True, "align": "CENTER", "bottom": "thin"},
+    "act_hold": {"fg": "4A5568", "align": "CENTER", "bottom": "thin"},
+    "act_none": {"fg": "9AA5B1", "align": "CENTER", "bottom": "thin"},
+    "st_good": {"bg": _GOOD[0], "fg": _GOOD[1], "bold": True, "align": "CENTER", "bottom": "thin"},
+    "st_warn": {"bg": _WARN[0], "fg": _WARN[1], "bold": True, "align": "CENTER", "bottom": "thin"},
+    "st_bad": {"bg": _BAD[0], "fg": _BAD[1], "bold": True, "align": "CENTER", "bottom": "thin"},
+    "st_info": {"bg": _INFO[0], "fg": _INFO[1], "align": "CENTER", "bottom": "thin"},
+    "ok": {"fg": _GOOD[1], "bottom": "thin"},
+    "warn": {"fg": _WARN[1], "bold": True, "bottom": "thin"},
+    "bad": {"fg": _BAD[1], "bold": True, "bottom": "thin"},
+    "foot": {"fg": MUTE, "italic": True, "size": 9, "valign": "TOP"},
+}
+ACTION_STYLE = {"SELL": "act_sell", "TAKE PROFIT": "act_profit", "RAISE STOP": "act_stop", "REVIEW": "act_review",
+                "CHECK": "act_review", "HOLD": "act_hold", "NO RULE": "act_none"}
+STATUS_STYLE = {"OPEN": "st_good", "WAIT": "st_warn", "MATCH": "st_good", "MISMATCH": "st_warn", "STALE": "st_warn",
+                "INFO": "st_info", "none": "st_good", "not read": "st_bad", "PASS": "st_good", "FAIL": "st_bad",
+                "BROAD": "st_good", "MIXED": "st_info", "WASHED OUT": "st_warn", "WASHED_OUT": "st_warn"}
 
+
+def step_kind(s: Dict[str, Any]) -> str:
+    """The colour family of a step, from the urgency its source gave it."""
+    u = float(s.get("urgency") or 0)
+    return ("sell" if u < 1 else "profit" if u < 2 else "stop" if u < 2.5 else "broker" if u < 3 else
+            "review" if u < 5 else "buy")
+
+
+def text_px(value: Any, width_px: float, pt: float = 10, bold: bool = False) -> int:
+    """Row height (px) that shows `value` wrapped in a cell `width_px` wide. Merged cells get no automatic height in
+    Sheets, so the height is estimated - on the generous side: a little white space, never clipped text."""
+    per_line = max(8, int((width_px - 14) / (pt * (0.70 if bold else 0.64))))
+    lines = sum(max(1, int(math.ceil(len(part) / float(per_line)))) for part in (text(value).split("\n") or [""]))
+    return int(max(21, round(lines * pt * 1.62 + 9)))
+
+
+class _Page(object):
+    def __init__(self) -> None:
+        self.rows: List[List[Any]] = []
+        self.styles: List[List[str]] = []
+        self.merges: List[Tuple[int, int, int, int]] = []          # (row0, row1, col0, col1), ends exclusive
+        self.heights: Dict[int, int] = {}
+
+    def add(self, cells: Sequence[Any] = (), style: Any = "", spans: Sequence[Tuple[int, int]] = (),
+            height: Optional[int] = None) -> int:
+        """One row. `style`: one name for every cell, or a list (missing cells: none). `spans`: (col0, col1) merges."""
+        r = len(self.rows)
+        self.rows.append((list(cells) + [""] * WIDTH)[:WIDTH])
+        st = [style] * WIDTH if isinstance(style, str) else (list(style) + [""] * WIDTH)[:WIDTH]
+        for c0, c1 in spans:
+            self.merges.append((r, r + 1, c0, c1))
+            for c in range(c0 + 1, c1):
+                st[c] = st[c0]                                      # the merged area takes the anchor's look
+        self.styles.append(st)
+        if height:
+            self.heights[r] = int(height)
+        return r
+
+    def full(self, value: Any, style: str, height: Optional[int] = None, wrap_pt: float = 0, bold: bool = False) -> int:
+        """One value across the whole width."""
+        if wrap_pt:
+            height = max(height or 0, text_px(value, sum(COL_PX), wrap_pt, bold))
+        return self.add([value], style, [(0, WIDTH)], height)
+
+
+def _span_px(c0: int, c1: int) -> int:
+    return sum(COL_PX[c0:c1])
+
+
+def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:
+    """The whole page: values (every one copied from a source page), a style name per cell, merges, row heights."""
     ev, plan = d["evidence"], d["plan"]
+    miss = d.get("missing") or []
     n_hold = sum(1 for s in d["steps"] if s["source"] == "Exit_Plan")
     n_buy = len(d["steps"]) - n_hold
     waiting = sum(1 for p in d["picks"] if p["status"] == "WAIT")
-    out = [pad(["TODAY ACTION PLAN - %s" % day]),
-           pad(["Built %s Riyadh · today_action_plan %s · copied from Exit_Plan, Daily_Plan, Evidence_Board and "
-                "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__)]),
-           pad(["%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
-                "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
-                                  (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
-                                  (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else ""))]),
-           pad([]), pad(["A. DO TODAY - in this order"]),
-           pad(["Step", "Symbol", "What to do", "Levels", "Why", "From"])]
+    pg = _Page()
+    pg.full("TODAY ACTION PLAN - %s" % day, "title", 44)
+    pg.full("Built %s Riyadh · today_action_plan %s · copied from Exit_Plan, Daily_Plan, Evidence_Board and "
+            "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__),
+            "sub", wrap_pt=9)
+    pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
+            "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
+                              (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
+                              (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")),
+            "alert" if (d["stale"] or miss) else "summary", 30, wrap_pt=11, bold=True)
+    pg.add(height=10)
+
+    # ---- A. the day's steps: two rows each - the instruction, then its levels and reason
+    pg.full("A. DO TODAY - in this order", "band_a", 32)
+    pg.add(["Step", "Symbol · from", "What to do, with its levels and reason underneath"], "head", [(2, WIDTH)])
     for i, s in enumerate(d["steps"], 1):
-        out.append(pad([i, s["symbol"], s["do"], s["levels"], s["why"], s["source"]]))
-    miss = d.get("missing") or []
+        chip = "chip_" + step_kind(s)
+        top = pg.add([i, s["symbol"], s["do"]], [chip, "card_sym", "card_do"], [(2, WIDTH)],
+                     max(30, text_px(s["do"], _span_px(2, WIDTH), 11, True)))
+        pg.add(["", s["source"], s["levels"], "", "", "", s["why"]],
+               [chip, "card_src", "card_note", "", "", "", "card_note"], [(2, 6), (6, WIDTH)],
+               max(26, text_px(s["levels"], _span_px(2, 6), 9), text_px(s["why"], _span_px(6, WIDTH), 9)))
+        pg.merges.append((top, top + 2, 0, 1))                      # the step number spans both rows
     if not d["steps"]:
         # a source that could not be read is never an all-clear (Codex P2, #966)
-        out.append(pad(["", "", ("No step can be given: %s could not be read. Refresh the plan pages, then this page."
-                                 % ", ".join(miss)) if ("Exit_Plan" in miss or "_Daily_Plan" in miss) else
-                        "Nothing to do today: every holding reads HOLD with its broker stop in place, and no new buy "
-                        "is open."]))
+        unread = "Exit_Plan" in miss or "_Daily_Plan" in miss
+        msg = ("No step can be given: %s could not be read. Refresh the plan pages, then this page." % ", ".join(miss)
+               if unread else "Nothing to do today: every holding reads HOLD with its broker stop in place, and no new "
+                              "buy is open.")
+        pg.add(["", "", msg], ["", "", "msg_alert" if unread else "msg"], [(2, WIDTH)], text_px(msg, _span_px(2, WIDTH)))
     elif "Exit_Plan" in miss or "_Daily_Plan" in miss:
-        out.append(pad(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
-            m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))]))
-    out += [pad([]), pad(["B. HOLDINGS (%d)" % len(d["holdings"])]),
-            pad(["Symbol", "Name", "Shares", "Last", "P/L %", "Action", "Plan stop", "Broker stop", "Target", "Note"])]
+        pg.add(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
+            m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))], ["", "", "msg_alert"], [(2, WIDTH)])
+
+    # ---- B. holdings
+    pg.add(height=10)
+    pg.full("B. HOLDINGS (%d)" % len(d["holdings"]), "band", 30)
+    pg.add(["Symbol", "Name", "Shares", "Last", "P/L %", "Action", "Plan stop", "Broker stop", "Target", "Note"],
+           ["head", "head", "head_num", "head_num", "head_num", "head", "head_num", "head_num", "head_num", "head"])
     for h in d["holdings"]:
         bs = h.get("broker_stop")
         note = "" if h["action"] == "NO RULE" else (
             ("broker orders not read" if d.get("broker_note") else "no broker stop read") if bs is None else (
                 "broker stop below the plan" if h.get("stop") and bs < h["stop"] * (1 - k["stop_tol"] / 100.0) else "stop in place"))
-        out.append(pad([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), h["action"],
-                        fmt(h.get("stop")), fmt(bs), fmt(h.get("target")), note]))
+        pl = text(h.get("pl_pct", ""))
+        pg.add([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), h["action"],
+                fmt(h.get("stop")), fmt(bs), fmt(h.get("target")), note],
+               ["cell_b", "cell", "num", "num", "neg" if pl.startswith("-") else ("pos" if pl else "num"),
+                ACTION_STYLE.get(h["action"], "act_hold"), "num", "num", "num",
+                "ok" if note == "stop in place" else ("warn" if note else "cell")])
     if not d["holdings"]:
-        out.append(pad(["", "The Exit_Plan page lists no holding (or could not be read)."]))
+        pg.add(["", "The Exit_Plan page lists no holding (or could not be read)."], ["", "msg"], [(1, WIDTH)])
+
+    # ---- C. new buys
     title = "C. NEW BUYS - plan of %s, cut %s (%s)" % (plan.get("date") or "-", plan.get("cut_at") or "-", plan.get("quality") or "-")
-    out += [pad([]), pad([title]),
-            pad(["Symbol", "Status", "Shares", "Entry zone", "Price now", "Stop", "First target", "Chance up, 21 bars",
-                 "Shadow score", "Reason"])]
+    pg.add(height=10)
+    pg.full(title, "band", 30)
+    pg.add(["Symbol", "Status", "Shares", "Entry zone", "Price now", "Stop", "First target", "Chance up, 21 bars",
+            "Shadow score", "Reason"],
+           ["head", "head", "head_num", "head_num", "head_num", "head_num", "head_num", "head_num", "head_num", "head"])
     for p in d["picks"]:
         e = (ev.get("names") or {}).get(p["symbol"]) or {}
-        out.append(pad([p["symbol"], p["status"], fmt(p.get("qty"), 0),
-                        "%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))), fmt(p.get("price")), fmt(p.get("stop")),
-                        fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("reason", "")]))
+        pg.add([p["symbol"], p["status"], fmt(p.get("qty"), 0),
+                "%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))), fmt(p.get("price")), fmt(p.get("stop")),
+                fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("reason", "")],
+               ["cell_b", STATUS_STYLE.get(p["status"], "st_info"), "num", "num", "num", "num", "num", "num", "num", "cell"])
     if not d["picks"]:
-        out.append(pad(["", "No plan has been cut today yet." if not plan.get("is_today") else
-                        "Today's plan has no pick: no name passed the execution gates."]))
-    out += [pad([]), pad(["D. PIPELINE - next in line (%d of %d)" % (min(len(d["pipeline"]), int(k["pipeline"])), len(d["pipeline"]))]),
-            pad(["Symbol", "Name", "Rank", "Score", "Waiting for"])]
+        pg.add(["", "No plan has been cut today yet." if not plan.get("is_today") else
+                "Today's plan has no pick: no name passed the execution gates."], ["", "msg"], [(1, WIDTH)])
+
+    # ---- D. pipeline
+    pg.add(height=10)
+    pg.full("D. PIPELINE - next in line (%d of %d)" % (min(len(d["pipeline"]), int(k["pipeline"])), len(d["pipeline"])),
+            "band", 30)
+    pg.add(["Symbol", "Name", "Rank", "Score", "Waiting for"], ["head", "head", "head_num", "head_num", "head"], [(4, WIDTH)])
     for p in d["pipeline"][:int(k["pipeline"])]:
-        out.append(pad([p["symbol"], p["name"], fmt(p.get("rank"), 0), fmt(p.get("score"), 1), p.get("waiting", "")]))
-    out += [pad([]), pad(["E. CONTEXT"]), pad(["Market state", "Bars to", "Above 50-day avg", "State", "After this state: names up", "Weeks seen"])]
+        pg.add([p["symbol"], p["name"], fmt(p.get("rank"), 0), fmt(p.get("score"), 1), p.get("waiting", "")],
+               ["cell_b", "cell", "num", "num", "cell"], [(4, WIDTH)], text_px(p.get("waiting", ""), _span_px(4, WIDTH)))
+
+    # ---- E. context
+    pg.add(height=10)
+    pg.full("E. CONTEXT", "band", 30)
+    pg.full("Market state (Evidence_Board)", "subhead")
+    pg.add(["Market", "Bars to", "Above 50-day avg", "State", "After this state: names up", "Weeks seen"],
+           ["head", "head", "head_num", "head", "head_num", "head_num", "head", "head", "head", "head"])
     for s in ev.get("states") or []:
-        out.append(pad([s["market"], s["bars_to"], s["above50"], s["state"], s["all_up"], s["weeks"]]))
+        pg.add([s["market"], s["bars_to"], s["above50"], s["state"], s["all_up"], s["weeks"]],
+               ["cell_b", "cell", "num", STATUS_STYLE.get(text(s["state"]).upper(), "st_info"), "num", "num", "cell",
+                "cell", "cell", "cell"])
     if not ev.get("states"):
-        out.append(pad(["", "The Evidence_Board page has no market state yet."]))
-    out.append(pad(["Learning gate (copied from S1_Gate)"]))
+        pg.add(["", "The Evidence_Board page has no market state yet."], ["", "msg"], [(1, WIDTH)])
+    pg.full("Learning gate (copied from S1_Gate)", "subhead")
     for g in (ev.get("gate") or [["", "not on the Evidence Board yet"]])[:4]:
-        out.append(pad(g))
-    out.append(pad(["Page differences (Consistency_Check)", "Status", "Detail"]))
-    for x in d["issues"]:
-        out.append(pad([x["check"], x["status"], x["detail"]]))
-    if not d["issues"]:
-        out.append(pad(["", "not read", "The Consistency_Check page could not be read."] if "Consistency_Check" in miss else
-                       ["", "none", "The pages agree on every checked figure."]))
-    out.append(pad(["Source page", "Age (hours)", "Reading"]))
+        cells = (list(g) + [""] * WIDTH)[:WIDTH]
+        last = max([i for i, c in enumerate(cells) if text(c)] or [0])
+        st = [("cell_b" if i == 0 else STATUS_STYLE.get(text(c), "cell")) for i, c in enumerate(cells)]
+        if last + 1 < WIDTH:                                        # the last value takes the rest of the row
+            pg.add(cells, st, [(last, WIDTH)], text_px(cells[last], _span_px(last, WIDTH)))
+        else:
+            pg.add(cells, st)
+    pg.full("Page differences (Consistency_Check)", "subhead")
+    pg.add(["Check", "", "Status", "Detail"], "head", [(0, 2), (3, WIDTH)])
+    issues = [[x["check"], "", x["status"], x["detail"]] for x in d["issues"]]
+    if not issues:
+        issues = [["", "", "not read", "The Consistency_Check page could not be read."] if "Consistency_Check" in miss else
+                  ["", "", "none", "The pages agree on every checked figure."]]
+    for x in issues:
+        pg.add(x, ["cell_b", "", STATUS_STYLE.get(x[2], "st_info"), "cell"], [(0, 2), (3, WIDTH)],
+               text_px(x[3], _span_px(3, WIDTH)))
+    pg.full("Source pages", "subhead")
+    pg.add(["Source page", "", "Age (hours)", "Reading"], ["head", "", "head_num", "head"], [(0, 2), (3, WIDTH)])
     for name in sorted(d["ages"]):
         a = d["ages"][name]
-        out.append(pad([name, "" if a is None else "%.1f" % a,
-                        "no time found" if a is None else ("OLD - refresh it before acting" if a > k["stale_h"] else "current")]))
-    out += [pad([]), pad(["How to read: section A is the whole instruction; B to E show where each step comes from. A level on "
-                          "this page is always the level on its source page. Trading decisions and every order are the "
-                          "owner's; this page is information, not investment advice."])]
+        reading = "no time found" if a is None else ("OLD - refresh it before acting" if a > k["stale_h"] else "current")
+        pg.add([name, "", "" if a is None else "%.1f" % a, reading],
+               ["cell_b", "", "num", "ok" if reading == "current" else ("bad" if reading.startswith("OLD") else "warn")],
+               [(0, 2), (3, WIDTH)])
+    pg.add(height=10)
+    pg.full("How to read: section A is the whole instruction; B to E show where each step comes from. A level on "
+            "this page is always the level on its source page. Trading decisions and every order are the "
+            "owner's; this page is information, not investment advice.", "foot", wrap_pt=9)
+    return pg
+
+
+def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> List[List[Any]]:
+    return page_layout(d, stamp, day, k).rows
+
+
+def _rgb(h: str) -> Dict[str, float]:
+    return {"red": int(h[0:2], 16) / 255.0, "green": int(h[2:4], 16) / 255.0, "blue": int(h[4:6], 16) / 255.0}
+
+
+def cell_format(name: str) -> Dict[str, Any]:
+    """The Sheets userEnteredFormat of one style name ("" = a plain cell)."""
+    sp = STYLES.get(name) or {}
+    f: Dict[str, Any] = {"wrapStrategy": "WRAP", "verticalAlignment": sp.get("valign", "MIDDLE"),
+                         "hyperlinkDisplayType": "PLAIN_TEXT",
+                         "padding": {"top": 3, "bottom": 3, "left": 7, "right": 7},
+                         "textFormat": {"fontSize": sp.get("size", 10), "bold": bool(sp.get("bold")),
+                                        "italic": bool(sp.get("italic")), "underline": False,
+                                        "foregroundColor": _rgb(sp.get("fg", INK))}}
+    if sp.get("bg"):
+        f["backgroundColor"] = _rgb(sp["bg"])
+    if sp.get("align"):
+        f["horizontalAlignment"] = sp["align"]
+    borders = {}
+    for side in ("top", "bottom"):
+        if sp.get(side):                                            # "thin" = the hairline between table rows
+            borders[side] = {"style": "SOLID", "color": _rgb(HAIR if sp[side] == "thin" else LINE)}
+    if borders:
+        f["borders"] = borders
+    return f
+
+
+def cell_data(value: Any, style: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"userEnteredFormat": cell_format(style)}
+    if isinstance(value, bool) or value is None or value == "":
+        return out
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        out["userEnteredValue"] = {"numberValue": value}
+    else:
+        out["userEnteredValue"] = {"stringValue": str(value)}       # as typed: never parsed into a date or a formula
     return out
+
+
+def page_requests(sheet_id: int, pg: _Page) -> List[Dict[str, Any]]:
+    """ONE batch for the whole page - values, looks, merges, sizes. Sheets applies a batch whole or not at all, so a
+    reader never meets new values under an old layout."""
+    n = max(len(pg.rows) + 1, 12)
+
+    def rng(r0: int, r1: int, c0: int, c1: int) -> Dict[str, int]:
+        return {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
+
+    def size(dim: str, i: int, px: int) -> Dict[str, Any]:
+        return {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": dim, "startIndex": i,
+                                                        "endIndex": i + 1},
+                                              "properties": {"pixelSize": int(px)}, "fields": "pixelSize"}}
+    reqs: List[Dict[str, Any]] = [
+        {"unmergeCells": {"range": {"sheetId": sheet_id}}},
+        {"updateSheetProperties": {
+            "properties": {"sheetId": sheet_id, "gridProperties": {"rowCount": n, "columnCount": WIDTH,
+                                                                   "frozenRowCount": 1, "hideGridlines": True}},
+            "fields": "gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount,"
+                      "gridProperties.hideGridlines"}},
+        {"updateCells": {"range": rng(0, n, 0, WIDTH), "fields": "userEnteredValue,userEnteredFormat",
+                         "rows": [{"values": [cell_data(v, s) for v, s in zip(row, st)]}
+                                  for row, st in zip(pg.rows, pg.styles)]}}]
+    for r0, r1, c0, c1 in pg.merges:
+        reqs.append({"mergeCells": {"range": rng(r0, r1, c0, c1), "mergeType": "MERGE_ALL"}})
+    for i, px in enumerate(COL_PX):
+        reqs.append(size("COLUMNS", i, px))
+    reqs.append({"autoResizeDimensions": {"dimensions": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0,
+                                                         "endIndex": len(pg.rows)}}})
+    for r in sorted(pg.heights):
+        reqs.append(size("ROWS", r, pg.heights[r]))
+    return reqs
+
+
+def write_page(book: Any, tab: str, pg: _Page, styled: bool, retries: int, sleep: Callable[[float], None]) -> str:
+    """Write the page; return "styled" or "plain". A styled write that Sheets refuses (anything but its quota) falls
+    back to the plain grid, so a formatting fault never costs the day's instructions."""
+    from scripts.daily_plan import write_grid  # noqa: PLC0415
+    try:
+        ws = book.worksheet(tab)
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ != "WorksheetNotFound":
+            raise
+        ws = book.add_worksheet(title=tab, rows=max(80, len(pg.rows) + 5), cols=WIDTH)
+    if styled:
+        try:
+            with_retry(lambda: book.batch_update({"requests": page_requests(ws.id, pg)}), retries, sleep,
+                       "writing the page")
+            return "styled"
+        except Exception as e:  # noqa: BLE001 - the plain page below still carries every instruction
+            if quota_error(e):
+                raise
+            print("::warning::Today Action Plan: the styled write was refused (%s); the page was written plain"
+                  % type(e).__name__, flush=True)
+            _out("styled write refused: %s: %s" % (type(e).__name__, text(e)[:300]))
+    try:                                                            # merges of an earlier styled page would hide values
+        with_retry(lambda: book.batch_update({"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]}),
+                   retries, sleep, "clearing merged cells")
+    except Exception as e:  # noqa: BLE001
+        if quota_error(e):
+            raise
+        _out("could not clear merged cells: %s" % type(e).__name__)
+    with_retry(lambda: write_grid(book, tab, pg.rows, WIDTH, 80), retries, sleep, "writing the page")
+    return "plain"
 
 
 # ----------------------------------------------------------------------------- #
@@ -509,7 +769,6 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         return got, _read(b, "_Daily_Plan", "A1:AB2100")
     try:
         pages, ledger = with_retry(load, retries, sleep, "reading the source pages")
-        from scripts.daily_plan import write_grid  # noqa: PLC0415
     except Exception as e:  # noqa: BLE001 - a failed read leaves the previous page in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
@@ -535,14 +794,18 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s · not read: %s" % (
         len(d["holdings"]), len(d["picks"]), ", ".join("%s %s" % (p["symbol"], p["status"]) for p in d["picks"]) or "-",
         len(d["pipeline"]), len(d["issues"]), ", ".join(d["stale"]) or "none", ", ".join(d["missing"]) or "none"))
-    rows = page_rows(d, local.strftime("%Y-%m-%d %H:%M"), local.strftime("%a %d %b %Y"), k)
+    pg = page_layout(d, local.strftime("%Y-%m-%d %H:%M"), local.strftime("%a %d %b %Y"), k)
+    rows = pg.rows
     if dry_run:
         _out("dry run: %d page row(s) computed, nothing written" % len(rows))
         return 0
-    with_retry(lambda: write_grid(book, TAB, rows, WIDTH, 80), retries, sleep, "writing the page")
-    hidden = hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)))
-    _out("wrote the %s page (%d rows, %d step(s))%s" % (TAB, len(rows), len(d["steps"]),
-                                                        "; hid " + ", ".join(hidden) if hidden else ""))
+    preview = _env("TFB_TAP_PREVIEW").lower() in ("1", "true", "yes", "on")
+    tab = PREVIEW_TAB if preview else TAB                           # a preview never touches the live page
+    how = write_page(book, tab, pg, _env("TFB_TAP_STYLE", "on").lower() not in ("off", "0", "false", "no", "plain"),
+                     retries, sleep)
+    hidden = [] if preview else hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)) + [PREVIEW_TAB])
+    _out("wrote the %s page (%d rows, %d step(s), %s)%s" % (tab, len(rows), len(d["steps"]), how,
+                                                            "; hid " + ", ".join(hidden) if hidden else ""))
     return 0
 
 

@@ -71,9 +71,12 @@ class WorksheetNotFound(Exception):
 
 
 class Sheet:
+    _ids = __import__("itertools").count(100)
+
     def __init__(self, rows=None, hidden=False):
         self.values, self.row_count, self.col_count, self.updates = list(rows or []), 200, 30, 0
         self.isSheetHidden, self.hides = hidden, 0
+        self.id, self.merges, self.formats, self.grid, self.sizes, self.plain_updates = next(Sheet._ids), [], [], {}, {}, 0
 
     def get(self, rng):
         return [list(r) for r in self.values]
@@ -83,6 +86,7 @@ class Sheet:
 
     def update(self, values=None, range_name=None, value_input_option=None):
         self.updates += 1
+        self.plain_updates += 1
         self.values = [list(r) for r in values]
 
     def hide(self):
@@ -93,6 +97,41 @@ class Sheet:
 class Book:
     def __init__(self, tabs):
         self.tabs = dict(tabs)
+        self.batches = []
+
+    def batch_update(self, body):
+        """What Sheets does with one batch, as far as the tests look: whole or not at all."""
+        by_id = dict((ws.id, ws) for ws in self.tabs.values())
+        for rq in body["requests"]:                                 # refuse the whole batch before applying any of it
+            (kind, arg), = rq.items()
+            assert kind in ("unmergeCells", "updateSheetProperties", "updateCells", "mergeCells",
+                            "updateDimensionProperties", "autoResizeDimensions"), kind
+        self.batches.append(body)
+        for rq in body["requests"]:
+            (kind, arg), = rq.items()
+            if kind == "unmergeCells":
+                by_id[arg["range"]["sheetId"]].merges = []
+            elif kind == "updateSheetProperties":
+                by_id[arg["properties"]["sheetId"]].grid = dict(arg["properties"]["gridProperties"])
+            elif kind == "updateCells":
+                ws, rg = by_id[arg["range"]["sheetId"]], arg["range"]
+                vals = [[""] * rg["endColumnIndex"] for _ in range(rg["endRowIndex"])]
+                fmts = [[None] * rg["endColumnIndex"] for _ in range(rg["endRowIndex"])]
+                for i, row in enumerate(arg["rows"]):
+                    for j, cell in enumerate(row["values"]):
+                        v = cell.get("userEnteredValue") or {}
+                        vals[i][j] = v.get("numberValue", v.get("stringValue", ""))
+                        fmts[i][j] = cell.get("userEnteredFormat")
+                ws.values, ws.formats = vals, fmts
+                ws.updates += 1
+            elif kind == "mergeCells":
+                rg = arg["range"]
+                by_id[rg["sheetId"]].merges.append((rg["startRowIndex"], rg["endRowIndex"], rg["startColumnIndex"],
+                                                    rg["endColumnIndex"]))
+            elif kind == "updateDimensionProperties":
+                rg = arg["range"]
+                by_id[rg["sheetId"]].sizes[(rg["dimension"], rg["startIndex"])] = arg["properties"]["pixelSize"]
+
 
     def worksheet(self, name):
         if name not in self.tabs:
@@ -102,6 +141,16 @@ class Book:
     def add_worksheet(self, title, rows, cols):
         self.tabs[title] = Sheet()
         return self.tabs[title]
+
+
+def cards(page):
+    """Section A as (step, symbol, what to do, source, levels, why): each step is two rows."""
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    out, i = [], a + 2
+    while i + 1 < len(page) and isinstance(page[i][0], int):
+        out.append((page[i][0], page[i][1], page[i][2], page[i + 1][1], page[i + 1][2], page[i + 1][6]))
+        i += 2
+    return out
 
 
 def full_book(**over):
@@ -215,8 +264,10 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     assert page[2][0] == "3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
     assert page[a + 2][:2] == [1, "SUPN.US"] and "for the 48 shares that remain" in page[a + 2][2]
-    assert page[a + 3][:3] == [2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares."] and page[a + 3][5] == "Exit_Plan"
-    assert page[a + 5][:2] == [4, "NMM.US"] and page[a + 5][5] == "Daily_Plan"
+    cs = cards(page)                                                # 1.1.0: a step is two rows
+    assert cs[1][:4] == (2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares.", "Exit_Plan")
+    assert cs[1][4] == "was 14.73 · broker stop 14.24" and cs[1][5] == "raise the stop 14.73 -> 14.80"
+    assert cs[3][:2] == (4, "NMM.US") and cs[3][3] == "Daily_Plan" and len(cs) == 4
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS (5)")][0]
     assert page[b + 2] == ["DDI.US", "DoubleDown", "240", "15.72", "+17.0%", "RAISE STOP", "14.80", "14.24", "16.64",
                            "broker stop below the plan"]
@@ -228,8 +279,8 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     assert page[dd + 2][:1] == ["MBIN.US"] and page[dd + 3][4] == "next in line (rank 9)"
     assert any(r[:4] == ["Tadawul", "2026-11-09", "14.2%", "WASHED OUT"] for r in page)
     assert any(r[:3] == ["S-1 GATE", "FAIL", "day 28/28"] for r in page)
-    assert any(r[:2] == ["C9 stops", "MISMATCH"] for r in page)
-    ages = {r[0]: (r[1], r[2]) for r in page if r[0] in ("Exit_Plan", "Daily_Plan", "Evidence_Board", "Consistency_Check")}
+    assert any(r[:4] == ["C9 stops", "", "MISMATCH", "DDI.US Portfolio_Decision 14.44 vs Exit Plan 14.80"] for r in page)
+    ages = {r[0]: (r[2], r[3]) for r in page if r[0] in ("Exit_Plan", "Daily_Plan", "Evidence_Board", "Consistency_Check")}
     assert ages == {"Exit_Plan": ("1.5", "current"), "Daily_Plan": ("0.3", "current"), "Evidence_Board": ("1.3", "current"),
                     "Consistency_Check": ("1.1", "current")}
     assert book.tabs["_Daily_Plan"].hides == 1 and book.tabs["_Exit_Plan"].hides == 1
@@ -245,7 +296,7 @@ def test_t3_old_sources_empty_pages_dry_run_and_off(monkeypatch, capsys):
     assert tap.run_once(False, book=book, now=late) == 0
     page = book.tabs["Today_Action_Plan"].values
     assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Evidence_Board, Exit_Plan")
-    assert any(r[0] == "Exit_Plan" and r[2] == "OLD - refresh it before acting" for r in page)
+    assert any(r[0] == "Exit_Plan" and r[3] == "OLD - refresh it before acting" for r in page)
     empty = Book({})
     assert tap.run_once(False, book=empty, now=NOW) == 0
     page = empty.tabs["Today_Action_Plan"].values
@@ -305,7 +356,8 @@ def test_t4_workflow_manifest_and_single_write():
     src = (ROOT / "scripts/today_action_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_T[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src
+    # 1.1.0: the page goes out as ONE batch; the plain grid is only the fallback when Sheets refuses the styled one
+    assert src.count("book.batch_update(") == 2 and src.count("write_grid(") == 1 and "write_grid(book, tab," in src
     assert ".del_worksheet" not in src and "delete" not in src.lower().replace("never deletes", "").replace("not deleted", "")
     assert '("today_action_plan", "%s", "today action plan")' % tap.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
@@ -324,13 +376,12 @@ def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
     book = full_book(Exit_Plan=Sheet(unk))
     assert tap.run_once(False, book=book, now=NOW) == 0
     page = book.tabs["Today_Action_Plan"].values
-    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
-    steps = [r for r in page[a + 2:a + 8] if isinstance(r[0], int)]
-    assert [r[1] for r in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
-    assert steps[1][3] == "was 14.73 · broker stop orders not read"
+    steps = cards(page)
+    assert [c[1] for c in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
+    assert steps[1][4] == "was 14.73 · broker stop orders not read"
     assert steps[2][2] == ("Confirm in IBKR that each holding's stop matches the plan's stop in section B "
                            "(DDI.US, GLPI.US, IBOC.US, SUPN.US).")
-    assert "622 h old" in steps[2][4] and steps[2][3] == "broker orders were not read into the workbook"
+    assert "622 h old" in steps[2][5] and steps[2][4] == "broker orders were not read into the workbook"
     assert not any("none was read for it" in str(r[2]) for r in page)
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
     assert [page[b + i][9] for i in (2, 3, 4, 5, 6)] == ["broker orders not read"] * 4 + [""]
@@ -363,24 +414,29 @@ QUOTA = ("APIError: [429]: Quota exceeded for quota metric 'Read requests' and l
 
 
 class Flaky(Sheet):
-    """A tab whose first `fail` reads (or writes) raise `err`."""
-    def __init__(self, rows, fail=0, err=None, on="get"):
+    """A tab whose first `fail` reads raise `err`."""
+    def __init__(self, rows, fail=0, err=None):
         Sheet.__init__(self, rows)
-        self.fail, self.err, self.on, self.calls = fail, err or APIError(QUOTA), on, 0
-
-    def _maybe(self, op):
-        if op == self.on:
-            self.calls += 1
-            if self.calls <= self.fail:
-                raise self.err
+        self.fail, self.err, self.calls = fail, err or APIError(QUOTA), 0
 
     def get(self, rng):
-        self._maybe("get")
+        self.calls += 1
+        if self.calls <= self.fail:
+            raise self.err
         return Sheet.get(self, rng)
 
-    def update(self, values=None, range_name=None, value_input_option=None):
-        self._maybe("update")
-        return Sheet.update(self, values=values, range_name=range_name, value_input_option=value_input_option)
+
+class FlakyBook(Book):
+    """A workbook whose first `fail` batch writes raise `err`."""
+    def __init__(self, tabs, fail=0, err=None):
+        Book.__init__(self, tabs)
+        self.fail, self.err, self.calls = fail, err or APIError(QUOTA), 0
+
+    def batch_update(self, body):
+        self.calls += 1
+        if self.calls <= self.fail:
+            raise self.err
+        return Book.batch_update(self, body)
 
 
 def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, capsys):
@@ -410,7 +466,7 @@ def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, cap
     book = full_book(Exit_Plan=Flaky(EXIT, fail=1))
     assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 2 and waits == []   # 0 = as before 1.0.2
     monkeypatch.delenv("TFB_TAP_RETRIES")
-    book = full_book(Today_Action_Plan=Flaky([["old"]], fail=1, on="update"))           # the write meets the quota once
+    book = FlakyBook(full_book(Today_Action_Plan=Sheet([["old"]])).tabs, fail=1)        # the write meets the quota once
     assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 0 and waits == [20.0]
     assert book.tabs["Today_Action_Plan"].values[0][0].startswith("TODAY ACTION PLAN")
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
