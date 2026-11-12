@@ -322,7 +322,9 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     steps: List[Dict[str, Any]] = []
     for h in holdings:
         steps += holding_steps(h, k["stop_tol"], not broker_note)
-    unread = [h["symbol"] for h in holdings if h.get("stop") and h.get("broker_stop") is None and h["action"] != "NO RULE"]
+    # a SELL row is leaving in full: no stop to confirm on it (Codex P2, #967)
+    unread = [h["symbol"] for h in holdings
+              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL")]
     if broker_note and unread:
         steps.append({"urgency": 2.6, "symbol": "ALL", "source": "Exit_Plan",
                       "do": "Confirm in IBKR that each holding's stop matches the plan's stop in section B (%s)."

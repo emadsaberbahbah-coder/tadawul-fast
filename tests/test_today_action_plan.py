@@ -343,3 +343,11 @@ def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
     d = tap.build(tap.read_holdings(part), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(part))
     assert [s["symbol"] for s in d["steps"]] == ["SUPN.US", "DDI.US", "GLPI.US", "ALL"]    # a real low stop still gets its step
     assert "(DDI.US, IBOC.US, SUPN.US)" in d["steps"][3]["do"]
+    sell = [list(r) for r in unk]
+    sell[9][13], sell[9][14] = "SELL", "closed below the stop"                             # IBOC is leaving in full
+    d = tap.build(tap.read_holdings(sell), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(sell))
+    assert [s["symbol"] for s in d["steps"]] == ["IBOC.US", "SUPN.US", "DDI.US", "ALL"]
+    assert "(DDI.US, GLPI.US, SUPN.US)" in d["steps"][3]["do"]                            # no stop to confirm on a sold name
+    only = [r for r in tap.read_holdings(sell) if r["symbol"] == "IBOC.US"]
+    d = tap.build(only, tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(sell))
+    assert [s["symbol"] for s in d["steps"]] == ["IBOC.US"]                                # and no empty "ALL" line
