@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.0.2 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.1.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -71,9 +71,12 @@ class WorksheetNotFound(Exception):
 
 
 class Sheet:
+    _ids = __import__("itertools").count(100)
+
     def __init__(self, rows=None, hidden=False):
         self.values, self.row_count, self.col_count, self.updates = list(rows or []), 200, 30, 0
         self.isSheetHidden, self.hides = hidden, 0
+        self.id, self.merges, self.formats, self.grid, self.sizes, self.plain_updates = next(Sheet._ids), [], [], {}, {}, 0
 
     def get(self, rng):
         return [list(r) for r in self.values]
@@ -83,16 +86,60 @@ class Sheet:
 
     def update(self, values=None, range_name=None, value_input_option=None):
         self.updates += 1
+        self.plain_updates += 1
         self.values = [list(r) for r in values]
 
     def hide(self):
         self.hides += 1
         self.isSheetHidden = True
 
+    def show(self):
+        self.shows = getattr(self, "shows", 0) + 1
+        self.isSheetHidden = False
+
 
 class Book:
     def __init__(self, tabs):
         self.tabs = dict(tabs)
+        self.batches = []
+
+    def batch_update(self, body):
+        """What Sheets does with one batch, as far as the tests look: whole or not at all."""
+        by_id = dict((ws.id, ws) for ws in self.tabs.values())
+        for rq in body["requests"]:                                 # refuse the whole batch before applying any of it
+            (kind, arg), = rq.items()
+            assert kind in ("unmergeCells", "updateSheetProperties", "updateCells", "mergeCells", "repeatCell",
+                            "updateDimensionProperties", "autoResizeDimensions"), kind
+        self.batches.append(body)
+        for rq in body["requests"]:
+            (kind, arg), = rq.items()
+            if kind == "unmergeCells":
+                by_id[arg["range"]["sheetId"]].merges = []
+            elif kind == "updateSheetProperties":
+                by_id[arg["properties"]["sheetId"]].grid = dict(arg["properties"]["gridProperties"])
+            elif kind == "updateCells":
+                ws, rg = by_id[arg["range"]["sheetId"]], arg["range"]
+                vals = [[""] * rg["endColumnIndex"] for _ in range(rg["endRowIndex"])]
+                fmts = [[None] * rg["endColumnIndex"] for _ in range(rg["endRowIndex"])]
+                for i, row in enumerate(arg["rows"]):
+                    for j, cell in enumerate(row["values"]):
+                        v = cell.get("userEnteredValue") or {}
+                        vals[i][j] = v.get("numberValue", v.get("stringValue", ""))
+                        fmts[i][j] = cell.get("userEnteredFormat")
+                ws.values, ws.formats = vals, fmts
+                ws.updates += 1
+            elif kind == "mergeCells":
+                rg = arg["range"]
+                by_id[rg["sheetId"]].merges.append((rg["startRowIndex"], rg["endRowIndex"], rg["startColumnIndex"],
+                                                    rg["endColumnIndex"]))
+            elif kind == "updateDimensionProperties":
+                rg = arg["range"]
+                for i in range(rg["startIndex"], rg["endIndex"]):
+                    by_id[rg["sheetId"]].sizes[(rg["dimension"], i)] = arg["properties"]["pixelSize"]
+            elif kind == "repeatCell":
+                assert arg["cell"] == {} and arg["fields"] == "userEnteredFormat" and list(arg["range"]) == ["sheetId"]
+                by_id[arg["range"]["sheetId"]].formats = []
+
 
     def worksheet(self, name):
         if name not in self.tabs:
@@ -102,6 +149,16 @@ class Book:
     def add_worksheet(self, title, rows, cols):
         self.tabs[title] = Sheet()
         return self.tabs[title]
+
+
+def cards(page):
+    """Section A as (step, symbol, what to do, source, levels, why): each step is two rows."""
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    out, i = [], a + 2
+    while i + 1 < len(page) and isinstance(page[i][0], int):
+        out.append((page[i][0], page[i][1], page[i][2], page[i + 1][1], page[i + 1][2], page[i + 1][6]))
+        i += 2
+    return out
 
 
 def full_book(**over):
@@ -215,8 +272,10 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     assert page[2][0] == "3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
     assert page[a + 2][:2] == [1, "SUPN.US"] and "for the 48 shares that remain" in page[a + 2][2]
-    assert page[a + 3][:3] == [2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares."] and page[a + 3][5] == "Exit_Plan"
-    assert page[a + 5][:2] == [4, "NMM.US"] and page[a + 5][5] == "Daily_Plan"
+    cs = cards(page)                                                # 1.1.0: a step is two rows
+    assert cs[1][:4] == (2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares.", "Exit_Plan")
+    assert cs[1][4] == "was 14.73 · broker stop 14.24" and cs[1][5] == "raise the stop 14.73 -> 14.80"
+    assert cs[3][:2] == (4, "NMM.US") and cs[3][3] == "Daily_Plan" and len(cs) == 4
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS (5)")][0]
     assert page[b + 2] == ["DDI.US", "DoubleDown", "240", "15.72", "+17.0%", "RAISE STOP", "14.80", "14.24", "16.64",
                            "broker stop below the plan"]
@@ -227,9 +286,9 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     dd = [i for i, r in enumerate(page) if str(r[0]).startswith("D. PIPELINE - next in line (2 of 2)")][0]
     assert page[dd + 2][:1] == ["MBIN.US"] and page[dd + 3][4] == "next in line (rank 9)"
     assert any(r[:4] == ["Tadawul", "2026-11-09", "14.2%", "WASHED OUT"] for r in page)
-    assert any(r[:3] == ["S-1 GATE", "FAIL", "day 28/28"] for r in page)
-    assert any(r[:2] == ["C9 stops", "MISMATCH"] for r in page)
-    ages = {r[0]: (r[1], r[2]) for r in page if r[0] in ("Exit_Plan", "Daily_Plan", "Evidence_Board", "Consistency_Check")}
+    assert any(r[:3] == ["S-1 GATE", "", "FAIL · day 28/28"] for r in page)        # 1.1.0: label, then its figures
+    assert any(r[:4] == ["C9 stops", "", "MISMATCH", "DDI.US Portfolio_Decision 14.44 vs Exit Plan 14.80"] for r in page)
+    ages = {r[0]: (r[2], r[3]) for r in page if r[0] in ("Exit_Plan", "Daily_Plan", "Evidence_Board", "Consistency_Check")}
     assert ages == {"Exit_Plan": ("1.5", "current"), "Daily_Plan": ("0.3", "current"), "Evidence_Board": ("1.3", "current"),
                     "Consistency_Check": ("1.1", "current")}
     assert book.tabs["_Daily_Plan"].hides == 1 and book.tabs["_Exit_Plan"].hides == 1
@@ -244,8 +303,16 @@ def test_t3_old_sources_empty_pages_dry_run_and_off(monkeypatch, capsys):
     book = full_book()
     assert tap.run_once(False, book=book, now=late) == 0
     page = book.tabs["Today_Action_Plan"].values
+    # 1.1.0: the Evidence Board is rebuilt at most every 6 hours, so it has its own limit (18 h)
+    assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Exit_Plan")
+    assert any(r[0] == "Exit_Plan" and r[3] == "OLD - refresh it before acting" for r in page)
+    assert any(r[0] == "Evidence_Board" and r[2:4] == ["7.3", "current"] for r in page)
+    book = full_book()
+    assert tap.run_once(False, book=book, now=NOW + dt.timedelta(hours=17)) == 0
+    page = book.tabs["Today_Action_Plan"].values
     assert page[2][0].endswith("· OLD SOURCE: Consistency_Check, Daily_Plan, Evidence_Board, Exit_Plan")
-    assert any(r[0] == "Exit_Plan" and r[2] == "OLD - refresh it before acting" for r in page)
+    assert tap.stale_limit("Evidence_Board", {"stale_h": 3.0}) == 3.0 and tap.stale_limit("Exit_Plan", {"stale_h": 3, "stale_ev": 18}) == 3
+    assert tap.stale_limit("Evidence_Board", {"stale_h": 24.0, "stale_ev": 18.0}) == 24.0       # never shorter than the others
     empty = Book({})
     assert tap.run_once(False, book=empty, now=NOW) == 0
     page = empty.tabs["Today_Action_Plan"].values
@@ -305,7 +372,8 @@ def test_t4_workflow_manifest_and_single_write():
     src = (ROOT / "scripts/today_action_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_T[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src
+    # 1.1.0: the page goes out as ONE batch; the plain grid is only the fallback when Sheets refuses the styled one
+    assert src.count("book.batch_update(") == 2 and src.count("write_grid(") == 1 and "write_grid(book, tab," in src
     assert ".del_worksheet" not in src and "delete" not in src.lower().replace("never deletes", "").replace("not deleted", "")
     assert '("today_action_plan", "%s", "today action plan")' % tap.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
@@ -324,13 +392,12 @@ def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
     book = full_book(Exit_Plan=Sheet(unk))
     assert tap.run_once(False, book=book, now=NOW) == 0
     page = book.tabs["Today_Action_Plan"].values
-    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
-    steps = [r for r in page[a + 2:a + 8] if isinstance(r[0], int)]
-    assert [r[1] for r in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
-    assert steps[1][3] == "was 14.73 · broker stop orders not read"
+    steps = cards(page)
+    assert [c[1] for c in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
+    assert steps[1][4] == "was 14.73 · broker stop orders not read"
     assert steps[2][2] == ("Confirm in IBKR that each holding's stop matches the plan's stop in section B "
                            "(DDI.US, GLPI.US, IBOC.US, SUPN.US).")
-    assert "622 h old" in steps[2][4] and steps[2][3] == "broker orders were not read into the workbook"
+    assert "622 h old" in steps[2][5] and steps[2][4] == "broker orders were not read into the workbook"
     assert not any("none was read for it" in str(r[2]) for r in page)
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
     assert [page[b + i][9] for i in (2, 3, 4, 5, 6)] == ["broker orders not read"] * 4 + [""]
@@ -363,24 +430,29 @@ QUOTA = ("APIError: [429]: Quota exceeded for quota metric 'Read requests' and l
 
 
 class Flaky(Sheet):
-    """A tab whose first `fail` reads (or writes) raise `err`."""
-    def __init__(self, rows, fail=0, err=None, on="get"):
+    """A tab whose first `fail` reads raise `err`."""
+    def __init__(self, rows, fail=0, err=None):
         Sheet.__init__(self, rows)
-        self.fail, self.err, self.on, self.calls = fail, err or APIError(QUOTA), on, 0
-
-    def _maybe(self, op):
-        if op == self.on:
-            self.calls += 1
-            if self.calls <= self.fail:
-                raise self.err
+        self.fail, self.err, self.calls = fail, err or APIError(QUOTA), 0
 
     def get(self, rng):
-        self._maybe("get")
+        self.calls += 1
+        if self.calls <= self.fail:
+            raise self.err
         return Sheet.get(self, rng)
 
-    def update(self, values=None, range_name=None, value_input_option=None):
-        self._maybe("update")
-        return Sheet.update(self, values=values, range_name=range_name, value_input_option=value_input_option)
+
+class FlakyBook(Book):
+    """A workbook whose first `fail` batch writes raise `err`."""
+    def __init__(self, tabs, fail=0, err=None):
+        Book.__init__(self, tabs)
+        self.fail, self.err, self.calls = fail, err or APIError(QUOTA), 0
+
+    def batch_update(self, body):
+        self.calls += 1
+        if self.calls <= self.fail:
+            raise self.err
+        return Book.batch_update(self, body)
 
 
 def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, capsys):
@@ -410,9 +482,170 @@ def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, cap
     book = full_book(Exit_Plan=Flaky(EXIT, fail=1))
     assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 2 and waits == []   # 0 = as before 1.0.2
     monkeypatch.delenv("TFB_TAP_RETRIES")
-    book = full_book(Today_Action_Plan=Flaky([["old"]], fail=1, on="update"))           # the write meets the quota once
+    book = FlakyBook(full_book(Today_Action_Plan=Sheet([["old"]])).tabs, fail=1)        # the write meets the quota once
     assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 0 and waits == [20.0]
     assert book.tabs["Today_Action_Plan"].values[0][0].startswith("TODAY ACTION PLAN")
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}" in raw
     assert sum(tap.QUOTA_WAITS) * 2 < 10 * 60 - 120                                      # inside the job's 10 minutes
+
+
+# ----------------------------------------------------------------------------- T7 (1.1.0) the page's design
+def test_t7_layout_styles_merges_and_heights():
+    book = full_book()
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    ws = book.tabs["Today_Action_Plan"]
+    page, fm = ws.values, ws.formats
+    pg = tap.page_layout(tap.build(tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 12)),
+                                   tap.read_evidence(EVID), tap.read_consistency(CONS), {}, K), "s", "d", K)
+    assert len(pg.rows) == len(pg.styles) and all(len(r) == tap.WIDTH == len(st) for r, st in zip(pg.rows, pg.styles))
+    assert all(name in tap.STYLES or name == "" for st in pg.styles for name in st)       # every style name exists
+    assert len(tap.COL_PX) == tap.WIDTH and tap.page_rows(tap.build([], tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K),
+                                                          "s", "d", K)[0][0] == "TODAY ACTION PLAN - d"
+    # the title bar, the summary band, the section bands - each one cell across the page
+    assert (0, 1, 0, 10) in ws.merges and fm[0][0]["backgroundColor"] == tap._rgb("1B2A41") and fm[0][0]["textFormat"]["fontSize"] == 16
+    assert fm[2][0]["backgroundColor"] == tap._rgb(tap.STYLES["summary"]["bg"])            # nothing old, nothing unread
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    assert (a, a + 1, 0, 10) in ws.merges and fm[a][0]["backgroundColor"] == tap._rgb("0F5C63")
+    # a step is a card: number over the kind's name, instruction across C:J, then levels (C:F) and reason (G:J)
+    r1, r2 = page[a + 2], page[a + 3]
+    assert r1[:3] == [1, "SUPN.US", r1[2]] and r2[0] == "TAKE PROFIT" and r2[1] == "Exit_Plan"
+    assert fm[a + 2][0]["backgroundColor"] == fm[a + 3][0]["backgroundColor"] == tap._rgb(tap.CHIP["profit"][0])
+    assert fm[a + 2][2]["textFormat"]["bold"] and (a + 2, a + 3, 2, 10) in ws.merges
+    assert (a + 3, a + 4, 2, 6) in ws.merges and (a + 3, a + 4, 6, 10) in ws.merges
+    kinds = [page[a + 3 + 2 * i][0] for i in range(4)]
+    assert kinds == ["TAKE PROFIT", "RAISE STOP", "CONFIRM", "BUY"]                       # SUPN, DDI, IBOC's stop, NMM
+    assert [tap.step_kind({"urgency": u}) for u in (0, 1, 2, 2.5, 2.6, 3, 4, 5.002)] == [
+        "sell", "profit", "stop", "broker", "broker", "review", "review", "buy"]
+    # holdings: the action and the P/L carry their colour; figures sit right
+    b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
+    assert fm[b + 2][5]["backgroundColor"] == tap._rgb(tap.STYLES["act_stop"]["bg"]) and page[b + 2][5] == "RAISE STOP"
+    assert fm[b + 2][4]["textFormat"]["foregroundColor"] == tap._rgb(tap.STYLES["pos"]["fg"])      # +17.0%
+    assert fm[b + 4][4]["textFormat"]["foregroundColor"] == tap._rgb(tap.STYLES["neg"]["fg"])      # -1.1%
+    assert fm[b + 2][6]["horizontalAlignment"] == "RIGHT" and fm[b + 1][6]["horizontalAlignment"] == "RIGHT"
+    assert "backgroundColor" not in fm[b + 3][5] and page[b + 3][5] == "HOLD"
+    c = [i for i, r in enumerate(page) if str(r[0]).startswith("C. NEW BUYS")][0]
+    assert fm[c + 2][1]["backgroundColor"] == tap._rgb(tap._GOOD[0]) and fm[c + 3][1]["backgroundColor"] == tap._rgb(tap._WARN[0])
+    # context: the mismatch is marked, a current source reads green
+    m = [i for i, r in enumerate(page) if r[0] == "C9 stops"][0]
+    assert fm[m][2]["backgroundColor"] == tap._rgb(tap._WARN[0]) and (m, m + 1, 0, 2) in ws.merges and (m, m + 1, 3, 10) in ws.merges
+    g = [i for i, r in enumerate(page) if r[0] == "S-1 GATE"][0]
+    assert fm[g][2]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1])              # "FAIL" reads red
+    # no cell shows as a link, every cell wraps, and the plain cells are still formatted (old looks are cleared)
+    assert all(f["hyperlinkDisplayType"] == "PLAIN_TEXT" and f["wrapStrategy"] == "WRAP" for row in fm[:len(pg.rows)] for f in row)
+    # the sheet: gridlines off, title frozen, cut to the page; ten sized columns; a height for every merged row
+    assert ws.grid == {"rowCount": len(page), "columnCount": 10, "frozenRowCount": 1, "hideGridlines": True}
+    assert [ws.sizes[("COLUMNS", i)] for i in range(10)] == list(tap.COL_PX)
+    merged_rows = set(r for r0, r1, _, _ in ws.merges for r in range(r0, r1))
+    assert merged_rows and all(("ROWS", r) in ws.sizes for r in merged_rows)
+    assert ws.sizes[("ROWS", 0)] == 44 and ws.sizes[("ROWS", a + 2)] >= 34
+    body = book.batches[-1]["requests"]
+    kinds = [list(rq)[0] for rq in body]
+    assert kinds[:3] == ["unmergeCells", "updateSheetProperties", "updateCells"] and len(book.batches) == 1
+    assert kinds.index("autoResizeDimensions") < max(i for i, x in enumerate(kinds) if x == "updateDimensionProperties")
+    assert body[2]["updateCells"]["fields"] == "userEnteredValue,userEnteredFormat"
+    assert ws.plain_updates == 0                                                          # the one batch is the only write
+    # values as typed: a number stays a number, text stays text, an empty cell carries no value
+    assert tap.cell_data(3, "")["userEnteredValue"] == {"numberValue": 3}
+    assert tap.cell_data("=1+1", "")["userEnteredValue"] == {"stringValue": "=1+1"} and "userEnteredValue" not in tap.cell_data("", "cell")
+    # heights: wrapped by words, in the cell's own width; a merge takes the tallest of its cells
+    assert tap.text_px("short", 600) == tap.text_px("", 600) and tap.text_px("word " * 60, 600) > tap.text_px("word " * 20, 600)
+    assert tap.text_px("Tsakos Energy Navigation Limited", 160) > tap.text_px("Tsakos", 160)
+    assert tap.text_px("x" * 300, 200) > tap.text_px("x" * 100, 200) and tap.text_px("a\nb\nc", 600) > tap.text_px("a b c", 600)
+    p2 = tap._Page()
+    r = p2.add(["TEN.US", "Tsakos Energy Navigation Limited", "1", "81.0", "earnings in 7 day(s)"],
+               ["cell_b", "cell", "num", "num", "cell"], [(4, 10)])
+    assert p2.heights[r] == tap.text_px("Tsakos Energy Navigation Limited", 160) and p2.styles[r][9] == "cell"
+    assert p2.add(["a", "b"], "cell") == 1 and 1 not in p2.heights                        # no merge: Sheets sizes the row
+
+
+def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
+    class Refusing(Book):                                                                # Sheets refuses the styled batch
+        def batch_update(self, body):
+            if any("updateCells" in rq for rq in body["requests"]):
+                raise APIError("APIError: [400]: Invalid requests[2].updateCells")
+            return Book.batch_update(self, body)
+    book = Refusing(full_book(Today_Action_Plan=Sheet([["old"]])).tabs)
+    book.tabs["Today_Action_Plan"].merges = [(6, 8, 0, 1)]                                # left by an earlier styled page
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    ws = book.tabs["Today_Action_Plan"]
+    out = capsys.readouterr().out
+    assert ws.plain_updates == 1 and ws.merges == [] and ws.values[0][0].startswith("TODAY ACTION PLAN")
+    assert ws.formats == []                                                               # no looks left to hide a value
+    assert "::warning::Today Action Plan: the styled write was refused (APIError)" in out and ", plain)" in out
+    assert cards(ws.values)[0][:2] == (1, "SUPN.US")                                      # every instruction is on the page
+    quota = FlakyBook(full_book().tabs, fail=9)                                           # a quota that never clears is
+    with pytest.raises(APIError):                                                        # not a reason to write plain
+        tap.run_once(False, book=quota, now=NOW, sleep=lambda s: None)
+    assert "Today_Action_Plan" not in quota.tabs or quota.tabs["Today_Action_Plan"].plain_updates == 0
+
+
+    class QuotaOnStyled(Book):                                                           # only the big batch meets the quota
+        def batch_update(self, body):
+            if any("updateCells" in rq for rq in body["requests"]):
+                raise APIError(QUOTA)
+            return Book.batch_update(self, body)
+    q2 = QuotaOnStyled(full_book(Today_Action_Plan=Sheet([["old"]])).tabs)
+    with pytest.raises(APIError):
+        tap.run_once(False, book=q2, now=NOW, sleep=lambda s: None)
+    assert q2.tabs["Today_Action_Plan"].values == [["old"]] and q2.tabs["Today_Action_Plan"].plain_updates == 0
+    # Codex P2, #969: style off AFTER a styled run - the styled page's looks must not stay on the sheet
+    off = full_book()
+    assert tap.run_once(False, book=off, now=NOW) == 0
+    ws = off.tabs["Today_Action_Plan"]
+    ws.row_count = before = len(ws.values)                                                # what the styled run left
+    assert ws.merges and ws.formats and ws.sizes[("ROWS", 3)] == 10                       # e.g. a 10 px spacer row
+    monkeypatch.setenv("TFB_TAP_STYLE", "off")
+    assert tap.run_once(False, book=off, now=NOW) == 0
+    assert ws.plain_updates == 1 and ", plain)" in capsys.readouterr().out
+    assert ws.merges == [] and ws.formats == []
+    assert all(ws.sizes[("ROWS", i)] == 21 for i in range(before)) and len(ws.values) >= 80   # rows added later are new
+    assert [ws.sizes[("COLUMNS", i)] for i in range(10)] == [tap.PLAIN_COL_PX] * 10
+    assert [list(rq)[0] for rq in off.batches[-1]["requests"]] == [
+        "unmergeCells", "repeatCell", "updateDimensionProperties", "updateDimensionProperties"]
+    monkeypatch.delenv("TFB_TAP_STYLE")
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "true")
+    pre = full_book(Today_Action_Plan=Sheet([["live"]]))
+    assert tap.run_once(False, book=pre, now=NOW) == 0
+    assert pre.tabs["Today_Action_Plan"].values == [["live"]] and pre.tabs["Today_Action_Plan"].updates == 0
+    assert pre.tabs[tap.PREVIEW_TAB].values[0][0].startswith("TODAY ACTION PLAN") and pre.tabs["_Daily_Plan"].hides == 0
+    assert "wrote the Today_Action_Plan_Preview page" in capsys.readouterr().out
+    monkeypatch.delenv("TFB_TAP_PREVIEW")
+    assert tap.run_once(False, book=pre, now=NOW) == 0                                    # the next normal run
+    assert pre.tabs[tap.PREVIEW_TAB].hides == 1 and pre.tabs["Today_Action_Plan"].values[0][0].startswith("TODAY ACTION PLAN")
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "true")                                         # Codex P2, #969: a later preview
+    assert pre.tabs[tap.PREVIEW_TAB].isSheetHidden
+    assert tap.run_once(False, book=pre, now=NOW) == 0
+    assert not pre.tabs[tap.PREVIEW_TAB].isSheetHidden and pre.tabs[tap.PREVIEW_TAB].shows == 1   # is shown again
+    monkeypatch.delenv("TFB_TAP_PREVIEW")
+    tucked = full_book(Today_Action_Plan=Sheet([["live"]], hidden=True))                  # the owner hid the live page:
+    assert tap.run_once(False, book=tucked, now=NOW) == 0                                 # a run writes it, never shows it
+    assert tucked.tabs["Today_Action_Plan"].isSheetHidden and not hasattr(tucked.tabs["Today_Action_Plan"], "shows")
+    assert tucked.tabs["Today_Action_Plan"].updates == 1
+
+    class SlowTab(Book):                                                                 # Codex P2, #969: the quota answers
+        def __init__(self, tabs):                                                         # the tab lookup of the write
+            Book.__init__(self, tabs)
+            self.armed, self.failed = False, 0
+
+        def worksheet(self, name):
+            if self.armed and name == "Today_Action_Plan" and self.failed < 2:
+                self.failed += 1
+                raise APIError(QUOTA)
+            return Book.worksheet(self, name)
+
+        def batch_update(self, body):
+            return Book.batch_update(self, body)
+    slow, waits = SlowTab(full_book().tabs), []
+    real_read = tap.read_consistency
+
+    def arm(values):                                                                      # reads are done: arm the lookup
+        slow.armed = True
+        return real_read(values)
+    monkeypatch.setattr(tap, "read_consistency", arm)
+    assert tap.run_once(False, book=slow, now=NOW, sleep=waits.append) == 0
+    assert waits == [20.0, 40.0] and slow.tabs["Today_Action_Plan"].updates == 1
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}" in raw
+    assert ("TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE "
+            "|| 'on' }}") in raw and "TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}" in raw

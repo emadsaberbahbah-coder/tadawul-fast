@@ -1,7 +1,11 @@
 # =============================================================================
 # ✅ Today Action Plan - one page that says what to do today, and why
 # -----------------------------------------------------------------------------
-# VERSION 1.0.1 (2026-11-12)
+# VERSION 1.1.0 (2026-11-12)
+#   1.1.0: the page is written with its design (today_action_plan 1.1.0).
+#          TFB_TAP_STYLE=off writes the plain grid. A run by hand with
+#          "preview" writes the tab Today_Action_Plan_Preview and leaves the
+#          live page alone; with "plain" it writes the plain grid once.
 #   1.0.1: TFB_TAP_RETRIES passed to the script (today_action_plan 1.0.2): a
 #          Sheets per-minute quota answer is waited out and tried again.
 #
@@ -29,6 +33,14 @@ on:
     inputs:
       dry_run:
         description: "Compute and print only (write nothing)"
+        type: boolean
+        default: false
+      preview:
+        description: "Write the tab Today_Action_Plan_Preview instead of the live page"
+        type: boolean
+        default: false
+      plain:
+        description: "Write the plain grid, without the design (this run only)"
         type: boolean
         default: false
 
@@ -87,10 +99,13 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_TODAY_PLAN: ${{ vars.TFB_TODAY_PLAN || 'on' }}
           TFB_TAP_STALE_H: ${{ vars.TFB_TAP_STALE_H || '3' }}
+          TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}
           TFB_TAP_STOP_TOL_PCT: ${{ vars.TFB_TAP_STOP_TOL_PCT || '1' }}
           TFB_TAP_PIPELINE: ${{ vars.TFB_TAP_PIPELINE || '5' }}
           TFB_TAP_HIDE_TABS: ${{ vars.TFB_TAP_HIDE_TABS || '_Daily_Plan,_Exit_Plan,_Evidence_Log' }}
           TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}
+          TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE || 'on' }}
+          TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
         run: |
