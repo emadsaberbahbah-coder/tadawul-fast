@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.0.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.0.2 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -351,3 +351,68 @@ def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
     only = [r for r in tap.read_holdings(sell) if r["symbol"] == "IBOC.US"]
     d = tap.build(only, tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(sell))
     assert [s["symbol"] for s in d["steps"]] == ["IBOC.US"]                                # and no empty "ALL" line
+
+
+# ----------------------------------------------------------------------------- T6 (1.0.2)
+class APIError(Exception):
+    pass
+
+
+QUOTA = ("APIError: [429]: Quota exceeded for quota metric 'Read requests' and limit 'Read requests per minute per user' "
+         "of service 'sheets.googleapis.com'")
+
+
+class Flaky(Sheet):
+    """A tab whose first `fail` reads (or writes) raise `err`."""
+    def __init__(self, rows, fail=0, err=None, on="get"):
+        Sheet.__init__(self, rows)
+        self.fail, self.err, self.on, self.calls = fail, err or APIError(QUOTA), on, 0
+
+    def _maybe(self, op):
+        if op == self.on:
+            self.calls += 1
+            if self.calls <= self.fail:
+                raise self.err
+
+    def get(self, rng):
+        self._maybe("get")
+        return Sheet.get(self, rng)
+
+    def update(self, values=None, range_name=None, value_input_option=None):
+        self._maybe("update")
+        return Sheet.update(self, values=values, range_name=range_name, value_input_option=value_input_option)
+
+
+def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, capsys):
+    """12 Nov 11:04: two runs stopped with [429] right after the Daily Plan and the Exit Plan finished together."""
+    assert tap.quota_error(APIError(QUOTA)) and tap.quota_error(Exception("RESOURCE_EXHAUSTED"))
+    resp = type("R", (), {"status_code": 429})()
+    e429 = Exception("x")
+    e429.response = resp
+    assert tap.quota_error(e429)
+    assert not tap.quota_error(APIError("APIError: [403]: The caller does not have permission"))
+    assert not tap.quota_error(ValueError("row 1429 is short"))
+    waits = []
+    book = full_book(Exit_Plan=Flaky(EXIT, fail=2))                                     # two quota answers, then the page
+    assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 0
+    assert waits == [20.0, 40.0] and book.tabs["Today_Action_Plan"].updates == 1
+    out = capsys.readouterr().out
+    assert "Sheets quota reached while reading the source pages: waiting 20 s, then try 1 of 3" in out
+    waits = []
+    book = full_book(Exit_Plan=Flaky(EXIT, fail=9))                                     # the quota never clears
+    assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 2
+    assert waits == [20.0, 40.0, 65.0] and "Today_Action_Plan" not in book.tabs          # 3 more tries, nothing written
+    assert "nothing written" in capsys.readouterr().out
+    waits = []
+    book = full_book(Exit_Plan=Flaky(EXIT, fail=1, err=APIError("APIError: [403]: The caller does not have permission")))
+    assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 2 and waits == []   # other errors: no wait
+    monkeypatch.setenv("TFB_TAP_RETRIES", "0")
+    book = full_book(Exit_Plan=Flaky(EXIT, fail=1))
+    assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 2 and waits == []   # 0 = as before 1.0.2
+    monkeypatch.delenv("TFB_TAP_RETRIES")
+    book = full_book(Today_Action_Plan=Flaky([["old"]], fail=1, on="update"))           # the write meets the quota once
+    assert tap.run_once(False, book=book, now=NOW, sleep=waits.append) == 0 and waits == [20.0]
+    assert book.tabs["Today_Action_Plan"].values[0][0].startswith("TODAY ACTION PLAN")
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}" in raw
+    assert sum(tap.QUOTA_WAITS) * 2 < 10 * 60 - 120                                      # inside the job's 10 minutes

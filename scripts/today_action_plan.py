@@ -4,7 +4,13 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.0.1 (2026-11-12)
+v1.0.2 (2026-11-12)
+  1.0.2: WAIT AND TRY AGAIN WHEN GOOGLE SHEETS REPORTS ITS PER-MINUTE QUOTA. On 12 Nov 11:04 the Daily Plan and the
+         Exit Plan were started together from the workbook menu; both finished in the same second and the two runs
+         of this page that followed stopped with "APIError [429]: Quota exceeded for quota metric 'Read requests'"
+         (runs 43179925808 and 43179929297; nothing written, the page stayed as it was). A quota answer is now
+         followed by a wait of 20, 40, then 65 seconds and another try (TFB_TAP_RETRIES, default 3, 0 = none);
+         every other error stops the run at once, as before.
   1.0.1: ONE LINE WHEN THE BROKER ORDERS WERE NOT READ. The first live run (12 Nov 10:42) gave three steps
          "Check the broker stop on X: none was read for it" - the Exit Plan's broker read was stale ("broker orders
          unknown"), while the stops were in place at the broker. When the Exit_Plan page says its broker orders are
@@ -44,7 +50,8 @@ SAFETY
 ENV
     DEFAULT_SPREADSHEET_ID, GOOGLE_SHEETS_CREDENTIALS, TFB_TODAY_PLAN,
     TFB_TAP_STALE_H (3), TFB_TAP_STOP_TOL_PCT (1), TFB_TAP_PIPELINE (5),
-    TFB_TAP_HIDE_TABS (_Daily_Plan,_Exit_Plan,_Evidence_Log; "none" = hide none).
+    TFB_TAP_HIDE_TABS (_Daily_Plan,_Exit_Plan,_Evidence_Log; "none" = hide none),
+    TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none).
 ================================================================================
 """
 from __future__ import annotations
@@ -55,9 +62,10 @@ import math
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -83,6 +91,31 @@ def _env_num(name: str, default: float, lo: float, hi: float) -> float:
     except ValueError:
         return default
     return v if lo <= v <= hi else default
+
+
+QUOTA_WAITS = (20.0, 40.0, 65.0)                       # seconds; the Sheets quota is counted per minute
+
+
+def quota_error(e: BaseException) -> bool:
+    """True for the Sheets per-minute quota answer (HTTP 429); every other error is not retried."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    s = "%s %s" % (type(e).__name__, e)
+    return code == 429 or "[429]" in s or "Quota exceeded" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def with_retry(fn: Callable[[], Any], retries: int, sleep: Callable[[float], None], what: str) -> Any:
+    """Run fn; after a quota answer wait and run it again, at most `retries` more times."""
+    n = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - re-raised unless it is the quota answer and tries remain
+            if n >= retries or not quota_error(e):
+                raise
+            wait = QUOTA_WAITS[min(n, len(QUOTA_WAITS) - 1)]
+            n += 1
+            _out("Sheets quota reached while %s: waiting %d s, then try %d of %d" % (what, wait, n, retries))
+            sleep(wait)
 
 
 def enabled() -> bool:
@@ -453,25 +486,34 @@ def hide_tabs(book: Any, names: Sequence[str]) -> List[str]:
     return done
 
 
-def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> int:
+def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
+             sleep: Optional[Callable[[float], None]] = None) -> int:
     now = now or _dt.datetime.now(UTC)
     if not enabled():
         _out("TFB_TODAY_PLAN is off: nothing read, nothing written")
         return 0
     k = {"stale_h": _env_num("TFB_TAP_STALE_H", 3, 0.25, 72), "stop_tol": _env_num("TFB_TAP_STOP_TOL_PCT", 1, 0, 20),
          "pipeline": _env_num("TFB_TAP_PIPELINE", 5, 0, 30)}
-    try:
-        if book is None:
+    retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep
+    held = {"book": book}
+
+    def load() -> Tuple[Dict[str, List[List[Any]]], List[List[Any]]]:
+        if held["book"] is None:
             from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
-            book = _open_book()
-        from scripts.daily_plan import _read, write_grid  # noqa: PLC0415
-        pages = {"Exit_Plan": _read(book, "Exit_Plan", "A1:P80"), "Daily_Plan": _read(book, "Daily_Plan", "A1:N6"),
-                 "Evidence_Board": _read(book, "Evidence_Board", "A1:L120"),
-                 "Consistency_Check": _read(book, "Consistency_Check", "A1:F60")}
-        ledger = _read(book, "_Daily_Plan", "A1:AB2100")
+            held["book"] = _open_book()
+        from scripts.daily_plan import _read  # noqa: PLC0415
+        b = held["book"]
+        got = {"Exit_Plan": _read(b, "Exit_Plan", "A1:P80"), "Daily_Plan": _read(b, "Daily_Plan", "A1:N6"),
+               "Evidence_Board": _read(b, "Evidence_Board", "A1:L120"),
+               "Consistency_Check": _read(b, "Consistency_Check", "A1:F60")}
+        return got, _read(b, "_Daily_Plan", "A1:AB2100")
+    try:
+        pages, ledger = with_retry(load, retries, sleep, "reading the source pages")
+        from scripts.daily_plan import write_grid  # noqa: PLC0415
     except Exception as e:  # noqa: BLE001 - a failed read leaves the previous page in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
+    book = held["book"]
     local = now.astimezone(RIYADH)
     ages: Dict[str, Optional[float]] = {}
     for name, vals in pages.items():
@@ -497,7 +539,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> in
     if dry_run:
         _out("dry run: %d page row(s) computed, nothing written" % len(rows))
         return 0
-    write_grid(book, TAB, rows, WIDTH, 80)
+    with_retry(lambda: write_grid(book, TAB, rows, WIDTH, 80), retries, sleep, "writing the page")
     hidden = hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)))
     _out("wrote the %s page (%d rows, %d step(s))%s" % (TAB, len(rows), len(d["steps"]),
                                                         "; hid " + ", ".join(hidden) if hidden else ""))
