@@ -103,17 +103,67 @@ With two fills a few cents apart on one day (harness L2):
 - Main's untouched 1.1.0 (`TFB_TEST_CARRY_TARGET` = `git show 53f2abdc:scripts/exit_plan.py`): PASS 56/81, 25 failed. The 56 that pass are the 44 off-identity legs and the legs whose answer is "nothing to carry" (L4-L6, the L4 top-up, L13, L16, L20, L22, L23, L29, L32, L34), which describe main. L1-L3, L7, L11, L12, L14, L15, L17-L19, L21, L24-L28, L30, L31, L33 and L35 fail on their substantive assertions; L0, L9 and L10 on the missing version, functions or wiring.
 - Earlier commits of this change: `ef0e70fa` (first) PASS 64/81; `6aa2ddb7` (round 1) 67/81; `a73983a9` (round 2) 68/81; `e2b94da4` (round 3) 75/81, failing L21, L25, L27, L28, L35 and L9: the round-4 findings and the cap.
 
-MUTATION_AND_LANES_PLACEHOLDER
+**Mutation** (round 5, on `bcda09cf`; 117 mutants of the 1.2.0-only code, each run against this harness and `tests/test_exit_plan.py`): 87 killed, 30 survived.
+- 9 are strictly equivalent, by argument. Examples: every carried row shares one `Carried From`; `Was` and `WasNorm` are set together.
+- 12 are equivalent on any ledger `run()` writes. Examples: keys always have three parts and an upper-case symbol; `Shares` and `Bars To` are always written.
+- 2 differ by one 4-decimal Basis unit only.
+- 7 are open test gaps or edges, listed in S5. None changes an action in the replays except V13, which changes a label only.
+
+Earlier rounds measured 27/40 non-equivalent mutants killed (round 1, `ef0e70fa`) and 86/107 (round 3, `a73983a9`).
+
+**Lanes** on an export of `bcda09cf`:
+- The lean emulation gives LEAN FAILS 0, with every step exiting 0. The decision-layer suites give 4,588 passed / 36 skipped. The new step gives 81 passed, with the base fetched by SHA.
+- The contract lane gives rc 0 (426 passed, 13 skipped, as on main).
+- compileall and ruff (CI rules) are clean. No added line is non-ASCII.
 
 ## S4 - Off identity
 
 - **Structure.** With the gate off, `carry` is False, so `carry_rows`, `carry_was` and the note are never reached, and `prior_row` is called once as in 1.1.0. The extra work is one `os.environ` read that cannot raise. `read_lots` is unchanged.
 - **Harness.** L8 pins this for all 39 scenarios and 7 off words against the untouched main copy: ledger, page, e-mail and every log line, apart from the version string.
-- **Fuzz.** ROUND2_FUZZ_PLACEHOLDER
+- **Fuzz.** Independent differential fuzzes through `run()` and `main()` compared every workbook call with its arguments, every Yahoo request, sleep, return code, stdout, mail and final grid, folding only the version token:
+  - round 2 (`6aa2ddb7`): 3,200 seeds x 3 off words, 42,531 step comparisons;
+  - round 3 (`a73983a9`): 3,000 seeds x 3 words x run()/main(), 18,000 comparisons;
+  - round 4 (`e2b94da4`): 3,000 seeds x 3 words, 22,421 steps per word.
+
+  Each found 0 differences with the gate off, and none was vacuous: with the gate on, 33-65% of seeds differ, and planted off-path mutants were caught. `bcda09cf` changes only code that runs when the gate is on (`carry_rows`, `carry_last` and the gated block), and L8 pins the 44 scenarios. The round-5 fuzz did not run (see S5).
 
 ## S5 - Review
 
-ROUND_REVIEW_PLACEHOLDER
+Five review rounds. Each ran independent lenses (semantics or adversarial replays, mutation, off identity and house rules; integration in round 1), and an independent refuter re-checked every finding.
+
+- **Round 1** (`ef0e70fa`), 19 findings:
+  - A later sale after a top-up brought back the pre-top-up state (major).
+  - A dividend between two buy dates rescaled the carried stop (major).
+  - A same-day sell-out and re-buy carried the old stop.
+  - 13 surviving mutants.
+  - The version fold was an exact pin, and the WHY wording was wrong.
+  - The CI step shared an anchor with #954's step; it was moved.
+  - Fixed in `6aa2ddb7` / `abe87afd`.
+- **Round 2** (`6aa2ddb7`):
+  - A top-up typed in late inherited the old stop (major).
+  - A same-day round trip typed in late did the same (major).
+  - A weekend rollout's "was" was wrong, and the note named the wrong key.
+  - 5 harness gaps.
+  - Fixed in `a73983a9`.
+- **Round 3** (`a73983a9`):
+  - A key left by a split, bonus or price edit came back on a later sale and gave SELL at a stop wrong by the split ratio (major).
+  - A mistyped lot's stop stayed after the lot was deleted (major).
+  - The note came back on re-runs of raise closes.
+  - 7 harness gaps among 21 survivors.
+  - Fixed in `e2b94da4`: the transition rule.
+- **Round 4** (`e2b94da4`):
+  - Edits and sales on one Riyadh date: the same-date overwrite erased the transition and brought back a typo's or pre-split stop (major).
+  - A previous key computed inside its own newest lot's session was carried when that lot was removed (major).
+  - A correction typed with a sale, sales that return to an earlier key, and a Tadawul re-run label were documented in S7.
+  - Harness gaps.
+  - Fixed in `bcda09cf`: the cap at the stop published last, the session rule, legs L35, one-share sales and two-keys-back.
+- **Round 5** (`bcda09cf`): only the mutation lens completed. The semantics lens, the off-identity lens and every refuter stopped: Claude Code could not use the account's subscription ("payment is past due"). By the routine's stop rule, nothing more was started. Open items from the mutation lens, none verified by a refuter and none fixed here:
+  - **A3:** an edit, then sales from the same key on several closes.
+  - **L7:** `carry_last`'s latest Date against a stale feed.
+  - **V10:** a dividend between two keys' stops on a re-run.
+  - **Y4 / Y6 / Y11:** a factor not exact at 4 decimals over several closes.
+  - **V13** (label only): when a re-run's stop moved less than 0.25% after a rollout-like history, "was" is capped at the floor before the override, so the line reads HOLD where the WHY's wording gives RAISE STOP. The stop is the same.
+  - **Rounding:** on a factor not exact at 4 decimals, a carried stop can drop by one Basis-rounding unit (about 0.005%) at each carried change. A fix would be to treat normalised stops within one rounding unit as equal in the cap.
 
 ## S6 - Owner steps (proposed; nothing is armed here)
 
