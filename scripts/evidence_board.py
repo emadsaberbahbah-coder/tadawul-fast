@@ -4,7 +4,11 @@ scripts/evidence_board.py
 ================================================================================
 TFB Evidence Board - what the archive says works, measured again every day
 --------------------------------------------------------------------------------
-v1.1.0 (2026-11-12)
+v1.2.0 (2026-11-12)
+  1.2.0: FOLLOWS THE DAILY PLAN. GitHub did not start the 07:40 schedule on 12 Nov, so the morning's new picks had
+         no board row and no ledger row. The workflow now also runs after every successful Daily Plan; with
+         TFB_EVIDENCE_MIN_GAP_H (6 on those runs, 0 by hand) a run that finds a board younger than that returns
+         before any BigQuery query, so the board is rebuilt about four times a day, not eighteen.
   1.1.0: THE FORWARD RECORD STARTS (owner, 12 Nov 02:05: "go with the best option"). Decisions recorded in the
          project doc TFB_Decisions_Learning_Gate_and_Tadawul_2026-11-12:
          - the shadow score and the chance figures can only be judged on records made BEFORE the outcome, so every
@@ -67,7 +71,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -523,6 +527,20 @@ def plan_picks(values: Sequence[Sequence[Any]], today: _dt.date) -> List[str]:
     return clean_symbols(r[si] for r in rows[1:] if len(r) > max(di, ki, si) and text(r[di]) == last and text(r[ki]) == "PICK")
 
 
+def board_age_h(values: Sequence[Sequence[Any]], now: _dt.datetime) -> Optional[float]:
+    """Hours since the 'Built YYYY-MM-DD HH:MM Riyadh' stamp in the board's top rows; None when there is none."""
+    for r in list(values)[:3]:
+        for c in r:
+            m = re.search(r"Built (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) Riyadh", text(c))
+            if m:
+                try:
+                    built = _dt.datetime(*[int(x) for x in m.groups()], tzinfo=RIYADH)
+                except ValueError:
+                    return None
+                return (now - built).total_seconds() / 3600.0
+    return None
+
+
 def gate_rows(values: Sequence[Sequence[Any]], limit: int = 8, width: int = 8) -> List[List[str]]:
     """The first `limit` non-empty rows of the learning-gate page, as text, `width` cells each (a copy, not a reading)."""
     out: List[List[str]] = []
@@ -584,6 +602,11 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
             from scripts.archive_to_bigquery import make_session  # noqa: PLC0415
             session = make_session()
         from scripts.daily_plan import _read, write_grid  # noqa: PLC0415
+        gap = _env_num("TFB_EVIDENCE_MIN_GAP_H", 0, 0, 48)
+        age = board_age_h(_read(book, TAB, "A1:A3"), now) if gap > 0 else None
+        if gap > 0 and age is not None and 0 <= age < gap:
+            _out("the board was built %.1f h ago (under the %g h gap): nothing queried, nothing written" % (age, gap))
+            return 0
         picks = plan_picks(_read(book, PLAN_LEDGER_TAB, "A1:Z2100"), now.astimezone(RIYADH).date())
         data = collect(session, project, dataset, _env("TFB_BQ_LOCATION", "US"), picks, k, query=query)
         data["gate"] = gate_rows(_read(book, GATE_TAB, "A1:H40"))

@@ -344,14 +344,39 @@ def test_e4_workflow_manifest_and_read_only_scope():
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
     assert on["schedule"] == [{"cron": "40 4,13 * * *"}] and "workflow_dispatch" in on
+    assert on["workflow_run"] == {"workflows": ["🗓️ Daily Plan"], "types": ["completed"]}
+    assert wf["jobs"]["evidence"]["if"] == "github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'"
     assert wf["permissions"] == {"contents": "read"}
     step = [s for s in wf["jobs"]["evidence"]["steps"] if "evidence_board.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EVIDENCE"] == "${{ vars.TFB_EVIDENCE || 'on' }}"
     assert step["env"]["TFB_BQ_PROJECT"] == "${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}"
     assert "--dry-run" in step["run"]
+    assert step["env"]["TFB_EVIDENCE_MIN_GAP_H"] == "${{ github.event_name == 'workflow_run' && (vars.TFB_EVIDENCE_MIN_GAP_H || '6') || '0' }}"
     src = (ROOT / "scripts/evidence_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_EVIDENCE[A-Z_]*): \$\{\{", raw):
         assert '"%s"' % name in src, name
     assert '("evidence_board", "%s", "evidence board")' % eb.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
     assert src.count("write_grid(") == 2 and "write_grid(book, TAB," in src and "write_grid(book, LOG_TAB," in src
+
+
+# ----------------------------------------------------------------------------- E5 (1.2.0)
+def test_e5_a_young_board_is_not_rebuilt_on_a_follow_run(monkeypatch, capsys):
+    young = [["EVIDENCE BOARD"], ["Built 2026-11-12 05:40 Riyadh · evidence_board 1.1.0"]]     # 2 h before NOW
+    assert eb.board_age_h(young, NOW) == pytest.approx(2.0) and eb.board_age_h([["x"]], NOW) is None
+    assert eb.board_age_h([["Built 2026-13-99 05:40 Riyadh"]], NOW) is None
+    monkeypatch.setenv("TFB_EVIDENCE_MIN_GAP_H", "6")
+    book, sqls = Book({"Evidence_Board": Sheet(young), "_Daily_Plan": Sheet(LEDGER)}), []
+    assert eb.run_once(False, book=book, session=sqls, now=NOW, query=fake_query) == 0
+    assert sqls == [] and book.tabs["Evidence_Board"].updates == 0 and "_Evidence_Log" not in book.tabs
+    assert "under the 6 h gap" in capsys.readouterr().out
+    old = [["EVIDENCE BOARD"], ["Built 2026-11-12 01:39 Riyadh · evidence_board 1.1.0"]]       # just over 6 h
+    book = Book({"Evidence_Board": Sheet(old)})
+    assert eb.run_once(False, book=book, session=sqls, now=NOW, query=fake_query) == 0 and len(sqls) == 5
+    for spec in ("0", ""):                                                                    # by hand: always rebuilt
+        monkeypatch.setenv("TFB_EVIDENCE_MIN_GAP_H", spec)
+        book, sqls = Book({"Evidence_Board": Sheet(young)}), []
+        assert eb.run_once(False, book=book, session=sqls, now=NOW, query=fake_query) == 0 and len(sqls) == 5
+    monkeypatch.setenv("TFB_EVIDENCE_MIN_GAP_H", "6")
+    book, sqls = Book({}), []                                                                 # no board yet: built
+    assert eb.run_once(False, book=book, session=sqls, now=NOW, query=fake_query) == 0 and len(sqls) == 5
