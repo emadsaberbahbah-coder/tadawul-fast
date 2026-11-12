@@ -255,16 +255,21 @@ def holding_steps(h: Dict[str, Any], tol_pct: float) -> List[Dict[str, Any]]:
         step(0, "Sell all %s of %s." % (shares, sym), "last %s · stop %s" % (fmt(h.get("last")), fmt(stop)))
     elif act == "TAKE PROFIT":
         half = int(qty // 2) if qty else 0
-        step(1, "Sell half of %s (%s) and keep a stop at %s on the rest." % (
-            sym, "%d shares" % half if half else "half the position", fmt(stop)),
-            "last %s · next target %s" % (fmt(h.get("last")), fmt(h.get("target"))))
+        rest = "the %d shares that remain" % (qty - half) if half else "the shares that remain"
+        do = "Sell half of %s (%s) and keep a stop at %s on the rest." % (
+            sym, "%d shares" % half if half else "half the position", fmt(stop))
+        if stop and (bs is None or bs < stop * (1 - tol_pct / 100.0)):
+            # one step, sized for what is left after the sale (Codex P1, #966): never "raise it for all N shares"
+            do = "Sell half of %s (%s); then set the stop at %s for %s (broker stop now: %s)." % (
+                sym, "%d shares" % half if half else "half the position", fmt(stop), rest, fmt(bs) or "none read")
+        step(1, do, "last %s · next target %s" % (fmt(h.get("last")), fmt(h.get("target"))))
     elif act == "RAISE STOP":
         step(2, "Raise the stop on %s to %s for all %s." % (sym, fmt(stop), shares),
              "was %s · broker stop %s" % (fmt(h.get("was")) or "-", fmt(bs) or "not read"))
     elif act in ("REVIEW", "CHECK"):
         step(3, "Review %s today: the exit rule could not decide on its own." % sym,
              "last %s · stop %s" % (fmt(h.get("last")), fmt(stop)))
-    if act in ("HOLD", "TAKE PROFIT", "REVIEW", "CHECK") and stop:
+    if act in ("HOLD", "REVIEW", "CHECK") and stop:
         if bs is None:
             step(2.5, "Check the broker stop on %s: none was read for it. The plan's stop is %s." % (sym, fmt(stop)),
                  "plan stop %s · broker stop not read" % fmt(stop))
@@ -294,7 +299,7 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
 
 
 def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[str, Any], issues: List[Dict[str, str]],
-          ages: Dict[str, Optional[float]], k: Dict[str, float]) -> Dict[str, Any]:
+          ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = ()) -> Dict[str, Any]:
     steps: List[Dict[str, Any]] = []
     for h in holdings:
         steps += holding_steps(h, k["stop_tol"])
@@ -306,7 +311,8 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     steps.sort(key=lambda s: (s["urgency"], s["symbol"]))
     stale = sorted(n for n, a in ages.items() if a is not None and a > k["stale_h"])
     return {"steps": steps, "holdings": holdings, "picks": picks, "pipeline": (plan["pipeline"] if plan.get("is_today") else []),
-            "plan": plan, "evidence": evidence, "issues": issues, "ages": ages, "stale": stale}
+            "plan": plan, "evidence": evidence, "issues": issues, "ages": ages, "stale": stale,
+            "missing": sorted(missing)}
 
 
 def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> List[List[Any]]:
@@ -322,14 +328,22 @@ def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> L
                 "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__)]),
            pad(["%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
                 "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
-                                  " · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "")]),
+                                  (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
+                                  (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else ""))]),
            pad([]), pad(["A. DO TODAY - in this order"]),
            pad(["Step", "Symbol", "What to do", "Levels", "Why", "From"])]
     for i, s in enumerate(d["steps"], 1):
         out.append(pad([i, s["symbol"], s["do"], s["levels"], s["why"], s["source"]]))
+    miss = d.get("missing") or []
     if not d["steps"]:
-        out.append(pad(["", "", "Nothing to do today: every holding reads HOLD with its broker stop in place, and no "
-                                "new buy is open."]))
+        # a source that could not be read is never an all-clear (Codex P2, #966)
+        out.append(pad(["", "", ("No step can be given: %s could not be read. Refresh the plan pages, then this page."
+                                 % ", ".join(miss)) if ("Exit_Plan" in miss or "_Daily_Plan" in miss) else
+                        "Nothing to do today: every holding reads HOLD with its broker stop in place, and no new buy "
+                        "is open."]))
+    elif "Exit_Plan" in miss or "_Daily_Plan" in miss:
+        out.append(pad(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
+            m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))]))
     out += [pad([]), pad(["B. HOLDINGS (%d)" % len(d["holdings"])]),
             pad(["Symbol", "Name", "Shares", "Last", "P/L %", "Action", "Plan stop", "Broker stop", "Target", "Note"])]
     for h in d["holdings"]:
@@ -369,7 +383,8 @@ def page_rows(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> L
     for x in d["issues"]:
         out.append(pad([x["check"], x["status"], x["detail"]]))
     if not d["issues"]:
-        out.append(pad(["", "none", "The pages agree on every checked figure."]))
+        out.append(pad(["", "not read", "The Consistency_Check page could not be read."] if "Consistency_Check" in miss else
+                       ["", "none", "The pages agree on every checked figure."]))
     out.append(pad(["Source page", "Age (hours)", "Reading"]))
     for name in sorted(d["ages"]):
         a = d["ages"][name]
@@ -433,15 +448,22 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> in
     for name, vals in pages.items():
         t = page_time(vals, now)
         ages[name] = None if t is None else max(0.0, (now - t).total_seconds() / 3600.0)
-    d = build(read_holdings(pages["Exit_Plan"]), read_plan(ledger, local.date()), read_evidence(pages["Evidence_Board"]),
-              read_consistency(pages["Consistency_Check"]), ages, k)
+    missing = [n for n, need in (("Exit_Plan", ("Symbol", "Qty", "Stop", "Action", "Why")),
+                                 ("Consistency_Check", ("Check", "Status", "Detail")),
+                                 ("Evidence_Board", ("Market", "Above 50-day avg", "State")))
+               if find_table(pages[n], need)[0] is None]
+    plan = read_plan(ledger, local.date())
+    if not plan["date"]:
+        missing.append("_Daily_Plan")
+    d = build(read_holdings(pages["Exit_Plan"]), plan, read_evidence(pages["Evidence_Board"]),
+              read_consistency(pages["Consistency_Check"]), ages, k, missing)
     for i, s in enumerate(d["steps"], 1):
         _out("STEP %d %-9s %s | %s" % (i, s["symbol"], s["do"], s["levels"]))
     if not d["steps"]:
         _out("no step today")
-    _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s" % (
+    _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s · not read: %s" % (
         len(d["holdings"]), len(d["picks"]), ", ".join("%s %s" % (p["symbol"], p["status"]) for p in d["picks"]) or "-",
-        len(d["pipeline"]), len(d["issues"]), ", ".join(d["stale"]) or "none"))
+        len(d["pipeline"]), len(d["issues"]), ", ".join(d["stale"]) or "none", ", ".join(d["missing"]) or "none"))
     rows = page_rows(d, local.strftime("%Y-%m-%d %H:%M"), local.strftime("%a %d %b %Y"), k)
     if dry_run:
         _out("dry run: %d page row(s) computed, nothing written" % len(rows))

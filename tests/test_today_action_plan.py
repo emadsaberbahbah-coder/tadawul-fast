@@ -164,9 +164,14 @@ def test_t2_holding_steps_by_action_and_broker_stop():
     iboc = tap.holding_steps(hold["IBOC.US"], 1.0)
     assert len(iboc) == 1 and iboc[0]["do"].startswith("Check the broker stop on IBOC.US: none was read")
     supn = tap.holding_steps(hold["SUPN.US"], 1.0)
-    assert [s["urgency"] for s in supn] == [1, 2.5]
-    assert supn[0]["do"] == "Sell half of SUPN.US (47 shares) and keep a stop at 24.25 on the rest."
-    assert supn[1]["do"] == "The broker stop on SUPN.US (23.00) is below the plan's stop (24.25): raise it for all 95 shares."
+    assert [s["urgency"] for s in supn] == [1]                                            # one step, sized for the rest
+    assert supn[0]["do"] == ("Sell half of SUPN.US (47 shares); then set the stop at 24.25 for the 48 shares that remain "
+                             "(broker stop now: 23.00).")
+    assert "all 95" not in supn[0]["do"]
+    ok = tap.holding_steps(dict(hold["SUPN.US"], broker_stop=24.25), 1.0)
+    assert len(ok) == 1 and ok[0]["do"] == "Sell half of SUPN.US (47 shares) and keep a stop at 24.25 on the rest."
+    nob = tap.holding_steps(dict(hold["SUPN.US"], broker_stop=None), 1.0)
+    assert len(nob) == 1 and nob[0]["do"].endswith("for the 48 shares that remain (broker stop now: none read).")
     assert tap.holding_steps(hold["5023.SR"], 1.0) == []                                  # NO RULE: nothing
     near = dict(hold["GLPI.US"], broker_stop=35.50)                                       # 0.67% under: inside the tolerance
     assert tap.holding_steps(near, 1.0) == [] and len(tap.holding_steps(near, 0.5)) == 1
@@ -176,6 +181,9 @@ def test_t2_holding_steps_by_action_and_broker_stop():
     assert rev[0]["urgency"] == 3 and rev[0]["do"].startswith("Review GLPI.US today")
     odd = tap.holding_steps(dict(hold["SUPN.US"], qty=None, broker_stop=24.25), 1.0)
     assert odd[0]["do"] == "Sell half of SUPN.US (half the position) and keep a stop at 24.25 on the rest." and len(odd) == 1
+    odd2 = tap.holding_steps(dict(hold["SUPN.US"], qty=None), 1.0)
+    assert odd2[0]["do"] == ("Sell half of SUPN.US (half the position); then set the stop at 24.25 for the shares that remain "
+                             "(broker stop now: 23.00).")
 
 
 def test_t2_pick_steps_and_the_order_of_the_day():
@@ -191,10 +199,10 @@ def test_t2_pick_steps_and_the_order_of_the_day():
     d = tap.build(tap.read_holdings(EXIT), plan, ev, tap.read_consistency(CONS), {"Exit_Plan": 1.5, "Daily_Plan": 0.3, "X": None,
                                                                                    "Old": 3.1}, K)
     assert [(s["symbol"], s["urgency"]) for s in d["steps"]] == [
-        ("SUPN.US", 1), ("DDI.US", 2), ("IBOC.US", 2.5), ("SUPN.US", 2.5), ("NMM.US", 5.002)]
+        ("SUPN.US", 1), ("DDI.US", 2), ("IBOC.US", 2.5), ("NMM.US", 5.002)]
     assert d["stale"] == ["Old"] and len(d["picks"]) == 3 and len(d["pipeline"]) == 2
     old = tap.build(tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 13)), ev, [], {}, K)
-    assert [s["symbol"] for s in old["steps"]] == ["SUPN.US", "DDI.US", "IBOC.US", "SUPN.US"] and old["picks"] == []
+    assert [s["symbol"] for s in old["steps"]] == ["SUPN.US", "DDI.US", "IBOC.US"] and old["picks"] == []
 
 
 # ----------------------------------------------------------------------------- T3 the run
@@ -204,11 +212,11 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     page = book.tabs["Today_Action_Plan"].values
     assert all(len(r) == tap.WIDTH for r in page)
     assert page[0][0] == "TODAY ACTION PLAN - Thu 12 Nov 2026" and "Built 2026-11-12 09:00 Riyadh" in page[1][0]
-    assert page[2][0] == "4 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
+    assert page[2][0] == "3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
-    assert page[a + 2][:3] == [1, "SUPN.US", "Sell half of SUPN.US (47 shares) and keep a stop at 24.25 on the rest."]
+    assert page[a + 2][:2] == [1, "SUPN.US"] and "for the 48 shares that remain" in page[a + 2][2]
     assert page[a + 3][:3] == [2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares."] and page[a + 3][5] == "Exit_Plan"
-    assert page[a + 6][:2] == [5, "NMM.US"] and page[a + 6][5] == "Daily_Plan"
+    assert page[a + 5][:2] == [4, "NMM.US"] and page[a + 5][5] == "Daily_Plan"
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS (5)")][0]
     assert page[b + 2] == ["DDI.US", "DoubleDown", "240", "15.72", "+17.0%", "RAISE STOP", "14.80", "14.24", "16.64",
                            "broker stop below the plan"]
@@ -242,8 +250,25 @@ def test_t3_old_sources_empty_pages_dry_run_and_off(monkeypatch, capsys):
     assert tap.run_once(False, book=empty, now=NOW) == 0
     page = empty.tabs["Today_Action_Plan"].values
     flat = " | ".join(str(c) for r in page for c in r)
-    assert "Nothing to do today" in flat and "No plan has been cut today yet." in flat and "The pages agree" in flat
+    # Codex P2, #966: a source that could not be read is never reported as an all-clear
+    assert "Nothing to do today" not in flat and "The pages agree" not in flat
+    assert "No step can be given: Consistency_Check, Evidence_Board, Exit_Plan, _Daily_Plan could not be read." in flat
+    assert "NOT READ: Consistency_Check, Evidence_Board, Exit_Plan, _Daily_Plan" in page[2][0]
+    assert "The Consistency_Check page could not be read." in flat and "No plan has been cut today yet." in flat
     assert "lists no holding" in flat and "no time found" in flat and "OLD SOURCE" not in flat
+    calm = [list(r) for r in EXIT]
+    for r in calm[7:12]:
+        r[13], r[15] = ("NO RULE" if r[0] == "5023.SR" else "HOLD"), r[10]                # every holding HOLD, stops in place
+    quiet = full_book(Exit_Plan=Sheet(calm), _Daily_Plan=Sheet([HDR, lrow("2026-11-12", "PICK", 1, "EFC.US", "WAIT")]),
+                      Consistency_Check=Sheet(CONS[:5]))
+    assert tap.run_once(False, book=quiet, now=NOW) == 0
+    qflat = " | ".join(str(c) for r in quiet.tabs["Today_Action_Plan"].values for c in r)
+    assert "Nothing to do today: every holding reads HOLD" in qflat and "The pages agree on every checked figure." in qflat
+    assert "NOT READ" not in qflat
+    part = full_book(Exit_Plan=Sheet([["EXIT PLAN"], ["As of 2026-11-12 07:31 Riyadh"]]))  # holdings table unreadable
+    assert tap.run_once(False, book=part, now=NOW) == 0
+    pflat = " | ".join(str(c) for r in part.tabs["Today_Action_Plan"].values for c in r)
+    assert "INCOMPLETE: Exit_Plan could not be read, so steps may be missing." in pflat and "Buy 24 NMM.US" in pflat
     dry = full_book()
     assert tap.run_once(True, book=dry, now=NOW) == 0 and "Today_Action_Plan" not in dry.tabs and dry.tabs["_Daily_Plan"].hides == 0
     assert "dry run" in capsys.readouterr().out
