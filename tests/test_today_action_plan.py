@@ -309,3 +309,37 @@ def test_t4_workflow_manifest_and_single_write():
     assert ".del_worksheet" not in src and "delete" not in src.lower().replace("never deletes", "").replace("not deleted", "")
     assert '("today_action_plan", "%s", "today action plan")' % tap.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------- T5 (1.0.1)
+def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
+    """First live run, 12 Nov: three 'none was read' steps while the stops were in place at the broker."""
+    unk = [list(r) for r in EXIT]
+    unk[1] = ["As of 2026-11-12 07:31 Riyadh · daily bars to 2026-11-11 · broker orders unknown (last read 2026-10-17 11:20, 622 h old)"]
+    for r in unk[7:11]:
+        r[15] = ""                                                                       # no broker stop on any row
+    assert tap.broker_unknown(unk) == "broker orders unknown (last read 2026-10-17 11:20, 622 h old)"
+    assert tap.broker_unknown(EXIT) == "" and tap.broker_unknown([]) == ""
+    assert tap.broker_unknown([["x"]] * 6 + [["broker orders unknown"]]) == ""            # only the top rows
+    book = full_book(Exit_Plan=Sheet(unk))
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    steps = [r for r in page[a + 2:a + 8] if isinstance(r[0], int)]
+    assert [r[1] for r in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
+    assert steps[1][3] == "was 14.73 · broker stop orders not read"
+    assert steps[2][2] == ("Confirm in IBKR that each holding's stop matches the plan's stop in section B "
+                           "(DDI.US, GLPI.US, IBOC.US, SUPN.US).")
+    assert "622 h old" in steps[2][4] and steps[2][3] == "broker orders were not read into the workbook"
+    assert not any("none was read for it" in str(r[2]) for r in page)
+    b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
+    assert [page[b + i][9] for i in (2, 3, 4, 5, 6)] == ["broker orders not read"] * 4 + [""]
+    known = full_book()                                                                   # the read is fresh: as before
+    assert tap.run_once(False, book=known, now=NOW) == 0
+    assert any("Check the broker stop on IBOC.US: none was read" in str(r[2]) for r in known.tabs["Today_Action_Plan"].values)
+    assert not any(r[1] == "ALL" for r in known.tabs["Today_Action_Plan"].values)
+    part = [list(r) for r in unk]
+    part[8][15] = "35.00"                                                                 # a stop read despite the note
+    d = tap.build(tap.read_holdings(part), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(part))
+    assert [s["symbol"] for s in d["steps"]] == ["SUPN.US", "DDI.US", "GLPI.US", "ALL"]    # a real low stop still gets its step
+    assert "(DDI.US, IBOC.US, SUPN.US)" in d["steps"][3]["do"]
