@@ -410,6 +410,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
 # The page: values, styles, merges and row heights (pure)
 # ----------------------------------------------------------------------------- #
 COL_PX = (95, 160, 80, 130, 95, 115, 95, 125, 100, 290)        # A..J; sections B and C set the grid
+PLAIN_COL_PX = 130                                             # every column, when the page is written plain
 INK, MUTE, LINE, HAIR = "1F2933", "6B7785", "C5CDD8", "E8ECF1"
 _GOOD, _WARN, _BAD, _INFO = ("E6F4EA", "2E7D32"), ("FFF3E0", "B45309"), ("FDECEA", "B3261E"), ("F1F3F4", "4A5568")
 STYLES: Dict[str, Dict[str, Any]] = {
@@ -728,16 +729,41 @@ def page_requests(sheet_id: int, pg: _Page) -> List[Dict[str, Any]]:
     return reqs
 
 
-def write_page(book: Any, tab: str, pg: _Page, styled: bool, retries: int, sleep: Callable[[float], None]) -> str:
+def plain_requests(sheet_id: int, n_rows: int) -> List[Dict[str, Any]]:
+    """Take a styled page's looks off the sheet, so the plain grid that follows is readable: no merges, no formats,
+    every row at the default height (a spacer row was 10 px), even columns (Codex P2, #969)."""
+    whole = {"sheetId": sheet_id}
+    return [{"unmergeCells": {"range": whole}},
+            {"repeatCell": {"range": whole, "cell": {}, "fields": "userEnteredFormat"}},
+            {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0,
+                                                     "endIndex": int(n_rows)},
+                                           "properties": {"pixelSize": 21}, "fields": "pixelSize"}},
+            {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0,
+                                                     "endIndex": WIDTH},
+                                           "properties": {"pixelSize": PLAIN_COL_PX}, "fields": "pixelSize"}}]
+
+
+def write_page(book: Any, tab: str, pg: _Page, styled: bool, retries: int, sleep: Callable[[float], None],
+               show: bool = False) -> str:
     """Write the page; return "styled" or "plain". A styled write that Sheets refuses (anything but its quota) falls
     back to the plain grid, so a formatting fault never costs the day's instructions."""
     from scripts.daily_plan import write_grid  # noqa: PLC0415
-    try:
-        ws = book.worksheet(tab)
-    except Exception as e:  # noqa: BLE001
-        if type(e).__name__ != "WorksheetNotFound":
-            raise
-        ws = book.add_worksheet(title=tab, rows=max(80, len(pg.rows) + 5), cols=WIDTH)
+
+    def target() -> Any:
+        try:
+            return book.worksheet(tab)
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ != "WorksheetNotFound":
+                raise
+            return book.add_worksheet(title=tab, rows=max(80, len(pg.rows) + 5), cols=WIDTH)
+    ws = with_retry(target, retries, sleep, "opening the page's tab")   # the quota can answer here too (Codex P2, #969)
+    if show and (getattr(ws, "isSheetHidden", False) or getattr(ws, "is_hidden", False)):
+        try:                                                        # a preview hidden by a normal run is shown again
+            with_retry(ws.show, retries, sleep, "showing the tab")
+        except Exception as e:  # noqa: BLE001 - the page is still written; only its tab stays hidden
+            if quota_error(e):
+                raise
+            _out("could not show %s: %s" % (tab, type(e).__name__))
     if styled:
         try:
             with_retry(lambda: book.batch_update({"requests": page_requests(ws.id, pg)}), retries, sleep,
@@ -749,13 +775,14 @@ def write_page(book: Any, tab: str, pg: _Page, styled: bool, retries: int, sleep
             print("::warning::Today Action Plan: the styled write was refused (%s); the page was written plain"
                   % type(e).__name__, flush=True)
             _out("styled write refused: %s: %s" % (type(e).__name__, text(e)[:300]))
-    try:                                                            # merges of an earlier styled page would hide values
-        with_retry(lambda: book.batch_update({"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]}),
-                   retries, sleep, "clearing merged cells")
+    try:                                                            # an earlier styled page's looks would hide values
+        rows_now = max(1, min(int(getattr(ws, "row_count", 0) or 0) or len(pg.rows) + 5, 5000))
+        with_retry(lambda: book.batch_update({"requests": plain_requests(ws.id, rows_now)}),
+                   retries, sleep, "clearing the page's looks")
     except Exception as e:  # noqa: BLE001
         if quota_error(e):
             raise
-        _out("could not clear merged cells: %s" % type(e).__name__)
+        _out("could not clear the page's looks: %s" % type(e).__name__)
     with_retry(lambda: write_grid(book, tab, pg.rows, WIDTH, 80), retries, sleep, "writing the page")
     return "plain"
 
@@ -845,7 +872,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     preview = _env("TFB_TAP_PREVIEW").lower() in ("1", "true", "yes", "on")
     tab = PREVIEW_TAB if preview else TAB                           # a preview never touches the live page
     how = write_page(book, tab, pg, _env("TFB_TAP_STYLE", "on").lower() not in ("off", "0", "false", "no", "plain"),
-                     retries, sleep)
+                     retries, sleep, show=preview)
     hidden = [] if preview else hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)) + [PREVIEW_TAB])
     _out("wrote the %s page (%d rows, %d step(s), %s)%s" % (tab, len(rows), len(d["steps"]), how,
                                                             "; hid " + ", ".join(hidden) if hidden else ""))

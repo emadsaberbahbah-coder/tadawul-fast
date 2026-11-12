@@ -93,6 +93,10 @@ class Sheet:
         self.hides += 1
         self.isSheetHidden = True
 
+    def show(self):
+        self.shows = getattr(self, "shows", 0) + 1
+        self.isSheetHidden = False
+
 
 class Book:
     def __init__(self, tabs):
@@ -104,7 +108,7 @@ class Book:
         by_id = dict((ws.id, ws) for ws in self.tabs.values())
         for rq in body["requests"]:                                 # refuse the whole batch before applying any of it
             (kind, arg), = rq.items()
-            assert kind in ("unmergeCells", "updateSheetProperties", "updateCells", "mergeCells",
+            assert kind in ("unmergeCells", "updateSheetProperties", "updateCells", "mergeCells", "repeatCell",
                             "updateDimensionProperties", "autoResizeDimensions"), kind
         self.batches.append(body)
         for rq in body["requests"]:
@@ -130,7 +134,11 @@ class Book:
                                                     rg["endColumnIndex"]))
             elif kind == "updateDimensionProperties":
                 rg = arg["range"]
-                by_id[rg["sheetId"]].sizes[(rg["dimension"], rg["startIndex"])] = arg["properties"]["pixelSize"]
+                for i in range(rg["startIndex"], rg["endIndex"]):
+                    by_id[rg["sheetId"]].sizes[(rg["dimension"], i)] = arg["properties"]["pixelSize"]
+            elif kind == "repeatCell":
+                assert arg["cell"] == {} and arg["fields"] == "userEnteredFormat" and list(arg["range"]) == ["sheetId"]
+                by_id[arg["range"]["sheetId"]].formats = []
 
 
     def worksheet(self, name):
@@ -563,6 +571,7 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     ws = book.tabs["Today_Action_Plan"]
     out = capsys.readouterr().out
     assert ws.plain_updates == 1 and ws.merges == [] and ws.values[0][0].startswith("TODAY ACTION PLAN")
+    assert ws.formats == []                                                               # no looks left to hide a value
     assert "::warning::Today Action Plan: the styled write was refused (APIError)" in out and ", plain)" in out
     assert cards(ws.values)[0][:2] == (1, "SUPN.US")                                      # every instruction is on the page
     quota = FlakyBook(full_book().tabs, fail=9)                                           # a quota that never clears is
@@ -580,12 +589,20 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     with pytest.raises(APIError):
         tap.run_once(False, book=q2, now=NOW, sleep=lambda s: None)
     assert q2.tabs["Today_Action_Plan"].values == [["old"]] and q2.tabs["Today_Action_Plan"].plain_updates == 0
-    monkeypatch.setenv("TFB_TAP_STYLE", "off")
+    # Codex P2, #969: style off AFTER a styled run - the styled page's looks must not stay on the sheet
     off = full_book()
     assert tap.run_once(False, book=off, now=NOW) == 0
     ws = off.tabs["Today_Action_Plan"]
-    assert ws.plain_updates == 1 and ws.formats == [] and ", plain)" in capsys.readouterr().out
-    assert [list(rq)[0] for b in off.batches for rq in b["requests"]] == ["unmergeCells"]
+    ws.row_count = before = len(ws.values)                                                # what the styled run left
+    assert ws.merges and ws.formats and ws.sizes[("ROWS", 3)] == 10                       # e.g. a 10 px spacer row
+    monkeypatch.setenv("TFB_TAP_STYLE", "off")
+    assert tap.run_once(False, book=off, now=NOW) == 0
+    assert ws.plain_updates == 1 and ", plain)" in capsys.readouterr().out
+    assert ws.merges == [] and ws.formats == []
+    assert all(ws.sizes[("ROWS", i)] == 21 for i in range(before)) and len(ws.values) >= 80   # rows added later are new
+    assert [ws.sizes[("COLUMNS", i)] for i in range(10)] == [tap.PLAIN_COL_PX] * 10
+    assert [list(rq)[0] for rq in off.batches[-1]["requests"]] == [
+        "unmergeCells", "repeatCell", "updateDimensionProperties", "updateDimensionProperties"]
     monkeypatch.delenv("TFB_TAP_STYLE")
     monkeypatch.setenv("TFB_TAP_PREVIEW", "true")
     pre = full_book(Today_Action_Plan=Sheet([["live"]]))
@@ -596,6 +613,39 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     monkeypatch.delenv("TFB_TAP_PREVIEW")
     assert tap.run_once(False, book=pre, now=NOW) == 0                                    # the next normal run
     assert pre.tabs[tap.PREVIEW_TAB].hides == 1 and pre.tabs["Today_Action_Plan"].values[0][0].startswith("TODAY ACTION PLAN")
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "true")                                         # Codex P2, #969: a later preview
+    assert pre.tabs[tap.PREVIEW_TAB].isSheetHidden
+    assert tap.run_once(False, book=pre, now=NOW) == 0
+    assert not pre.tabs[tap.PREVIEW_TAB].isSheetHidden and pre.tabs[tap.PREVIEW_TAB].shows == 1   # is shown again
+    monkeypatch.delenv("TFB_TAP_PREVIEW")
+    tucked = full_book(Today_Action_Plan=Sheet([["live"]], hidden=True))                  # the owner hid the live page:
+    assert tap.run_once(False, book=tucked, now=NOW) == 0                                 # a run writes it, never shows it
+    assert tucked.tabs["Today_Action_Plan"].isSheetHidden and not hasattr(tucked.tabs["Today_Action_Plan"], "shows")
+    assert tucked.tabs["Today_Action_Plan"].updates == 1
+
+    class SlowTab(Book):                                                                 # Codex P2, #969: the quota answers
+        def __init__(self, tabs):                                                         # the tab lookup of the write
+            Book.__init__(self, tabs)
+            self.armed, self.failed = False, 0
+
+        def worksheet(self, name):
+            if self.armed and name == "Today_Action_Plan" and self.failed < 2:
+                self.failed += 1
+                raise APIError(QUOTA)
+            return Book.worksheet(self, name)
+
+        def batch_update(self, body):
+            return Book.batch_update(self, body)
+    slow, waits = SlowTab(full_book().tabs), []
+    real_read = tap.read_consistency
+
+    def arm(values):                                                                      # reads are done: arm the lookup
+        slow.armed = True
+        return real_read(values)
+    monkeypatch.setattr(tap, "read_consistency", arm)
+    assert tap.run_once(False, book=slow, now=NOW, sleep=waits.append) == 0
+    assert waits == [20.0, 40.0] and slow.tabs["Today_Action_Plan"].updates == 1
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}" in raw
-    assert "TFB_TAP_STYLE: ${{ vars.TFB_TAP_STYLE || 'on' }}" in raw and "TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}" in raw
+    assert ("TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE "
+            "|| 'on' }}") in raw and "TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}" in raw

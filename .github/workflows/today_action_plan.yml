@@ -5,7 +5,7 @@
 #   1.1.0: the page is written with its design (today_action_plan 1.1.0).
 #          TFB_TAP_STYLE=off writes the plain grid. A run by hand with
 #          "preview" writes the tab Today_Action_Plan_Preview and leaves the
-#          live page alone.
+#          live page alone; with "plain" it writes the plain grid once.
 #   1.0.1: TFB_TAP_RETRIES passed to the script (today_action_plan 1.0.2): a
 #          Sheets per-minute quota answer is waited out and tried again.
 #
@@ -37,6 +37,10 @@ on:
         default: false
       preview:
         description: "Write the tab Today_Action_Plan_Preview instead of the live page"
+        type: boolean
+        default: false
+      plain:
+        description: "Write the plain grid, without the design (this run only)"
         type: boolean
         default: false
 
@@ -100,7 +104,7 @@ jobs:
           TFB_TAP_PIPELINE: ${{ vars.TFB_TAP_PIPELINE || '5' }}
           TFB_TAP_HIDE_TABS: ${{ vars.TFB_TAP_HIDE_TABS || '_Daily_Plan,_Exit_Plan,_Evidence_Log' }}
           TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}
-          TFB_TAP_STYLE: ${{ vars.TFB_TAP_STYLE || 'on' }}
+          TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE || 'on' }}
           TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
