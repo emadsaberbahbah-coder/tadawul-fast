@@ -103,6 +103,15 @@ TFB_PLAN_DIV_TAX_MIN_PCT % of the price (0.25); it can be picked after the
 ex-date. A smaller cost is a label on the pick. Tadawul names carry no US
 withholding. The 3-day ex-dividend gate above is unchanged.
 
+1.6.0 (2026-11-13): CASH FROM THE CASH LEDGER. The plan sized its picks from
+the main page's "Cash Available (SAR)" cell, which the owner types. On 13 Nov
+that cell still read 33,125 SAR the morning after two buys; the _Cash_Snapshot
+tab already read 17,547 SAR (the broker's figure). The plan sized three buys
+for about 21,700 SAR - more than the cash in the account. The cut now reads
+the latest balance on _Cash_Snapshot as well: TFB_PLAN_CASH_SOURCE = lower
+(default: the smaller of the two, so a stale cell can never over-size) |
+snapshot | panel (as before). An unreadable snapshot leaves the panel figure.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -116,7 +125,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -211,6 +220,7 @@ def knobs() -> Dict[str, Any]:
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "quote_max_h": _env_num("TFB_PLAN_QUOTE_MAX_AGE_H", 96, 0, 720),          # 1.5.0: 0 = no age check
         "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
+        "cash_source": cash_source_mode(),                                        # 1.6.0
         "stable_enter": _env_num("TFB_PLAN_STABLE_ENTER", 72, 0, 100),
         "stable_exit": _env_num("TFB_PLAN_STABLE_EXIT", 67, 0, 100),
         "div_tax": _env("TFB_PLAN_DIV_TAX", "on").lower() in ("on", "1", "true", "yes"),
@@ -299,6 +309,44 @@ def board_state(values: Sequence[Sequence[Any]], now: _dt.datetime) -> Dict[str,
     elif not out["today"]:
         out["reason"] = "the main page's last finished render is from " + m.group(1)
     return out
+
+
+def cash_source_mode() -> str:
+    m = _env("TFB_PLAN_CASH_SOURCE", "lower").lower()
+    return m if m in ("lower", "snapshot", "panel") else "lower"
+
+
+def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str]:
+    """The latest balance on the _Cash_Snapshot tab: (SAR, "date · type"). (None, "") when the tab has no dated
+    balance. A row's balance is its "Balance SAR" cell, or its "Amount SAR" cell when that is the only figure."""
+    rows = [list(r) for r in values if r]
+    if not rows:
+        return None, ""
+    hdr = [text(c) for c in rows[0]]
+    if "Date" not in hdr or "Balance SAR" not in hdr:
+        return None, ""
+    di, bi = hdr.index("Date"), hdr.index("Balance SAR")
+    ai = hdr.index("Amount SAR") if "Amount SAR" in hdr else None
+    ti = hdr.index("Type") if "Type" in hdr else None
+    best: Tuple[Optional[float], str] = (None, "")
+    for r in rows[1:]:
+        if parse_date(cell(r, di)) is None:
+            continue
+        bal = num(cell(r, bi))
+        if bal is None and ai is not None and "CALCULATED" not in text(cell(r, ti)).upper():
+            bal = num(cell(r, ai))
+        if bal is not None and bal >= 0:
+            best = (bal, ("%s · %s" % (text(cell(r, di))[:10], text(cell(r, ti)))).strip(" ·"))
+    return best
+
+
+def sizing_cash(panel: float, snap: Optional[float], mode: str) -> Tuple[float, str]:
+    """(cash to size from, which figure it is). Without a snapshot the panel figure stands."""
+    if snap is None or mode == "panel":
+        return panel, "panel"
+    if mode == "snapshot":
+        return snap, "snapshot"
+    return (snap, "snapshot (lower than the panel)") if snap < panel else (panel, "panel (not above the snapshot)")
 
 
 def panel_value(values: Sequence[Sequence[Any]], label: str) -> Any:
@@ -924,7 +972,17 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
                                 "unverified cut is allowed from %02d:00." % (state["output"], int(k["unverified_h"])))
         else:
             qualified = read_qualified(board)
-            cash = num(panel_value(board, "Cash Available (SAR)")) or 0.0
+            panel_cash = num(panel_value(board, "Cash Available (SAR)")) or 0.0
+            snap, snap_at = None, ""
+            if k.get("cash_source", "lower") != "panel":                     # 1.6.0: the cash ledger's own figure
+                try:
+                    snap, snap_at = snapshot_cash(_read(book, "_Cash_Snapshot", "A1:G2000"))
+                except Exception as e:  # noqa: BLE001 - the panel figure stands
+                    _out("cash snapshot not read (%s): sizing from the panel" % type(e).__name__)
+            cash, cash_from = sizing_cash(panel_cash, snap, k.get("cash_source", "lower"))
+            _out("cash for sizing: %s SAR from the %s | panel %s | snapshot %s%s" % (
+                fmt(cash, 0), cash_from, fmt(panel_cash, 0), fmt(snap, 0) if snap is not None else "not read",
+                " (%s)" % snap_at if snap_at else ""))
             mps = int(num(panel_value(board, "T10: Max Per Sector")) or 2)
             plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
             if not qualified:
