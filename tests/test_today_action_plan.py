@@ -691,6 +691,12 @@ def test_t8_readers_of_the_top10_pages_the_news_gate_and_cost():
     assert v["seats"] == {"TEN.US": {"ticket": 5117.0, "shares": 29.0, "seat": "ACTIVE (day 3)"},
                           "NMM.US": {"ticket": 0.0, "shares": 0.0, "seat": "FAST-TRACK (day 2)"}}
     assert not tap.read_top10([])["read"] and not tap.read_top10_v2([["x"]])["read"]
+    broken = [list(r) for r in V2]                                                       # live page, 13 Nov: header cells
+    broken[3] = ["#", "Symbol \u00b7 name", "", "3-month\nclose", "Seat\nstatus", "Price", "Alloc\u00a0SAR", "Buy\n qty", "Flags"]
+    assert tap.read_top10_v2(broken)["seats"] == v["seats"]                               # broken over two lines
+    wrapped = [list(r) for r in T10]
+    wrapped[4] = ["Rank", "Symbol", "Name", "Price", "Ticket\nSAR", "Shares", "Funds\nFrom", "Stability"]
+    assert tap.read_top10(wrapped)["seats"] == t["seats"]
     n = tap.read_news_gate(NEWS, NOW)                                                     # 09:00 Riyadh, 12 Nov
     assert (n["verdict"], n["at"]) == ("NO_NEW_ENTRY", "2026-11-12 03:32") and round(n["age_h"], 2) == 5.47
     assert not tap.read_news_gate([], NOW)["read"] and tap.read_news_gate(NEWS[:2], NOW)["verdict"] == "GO"

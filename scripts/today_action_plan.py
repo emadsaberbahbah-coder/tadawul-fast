@@ -343,16 +343,34 @@ def _stamp(s: str, after: str = "") -> str:
     return "%s-%s-%s %s:%s" % m.groups() if m else ""
 
 
+def _squash(v: Any) -> str:
+    """Cell text with every run of white space (a line break inside a header cell, a no-break space) as one space."""
+    return " ".join(text(v).replace("\u00a0", " ").split())
+
+
+def _header(rows: Sequence[Sequence[Any]], need: Sequence[str]) -> Tuple[Optional[int], Dict[str, int]]:
+    """find_table on squashed header text: the live pages break header cells over two lines."""
+    for i, r in enumerate(rows):
+        cells = [_squash(c) for c in r]
+        if all(n in cells for n in need):
+            col: Dict[str, int] = {}
+            for j, name in enumerate(cells):
+                if name and name not in col:
+                    col[name] = j
+            return i, col
+    return None, {}
+
+
 def read_top10(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     """The main Top 10 page: {"read", "banner", "built", "seats": {SYMBOL: {"ticket", "shares", "seat"}}}.
     A seat is a ticket when both its Ticket SAR and its Shares are above zero."""
     rows = [list(r) for r in values]
     out: Dict[str, Any] = {"read": False, "banner": "", "built": "", "seats": {}}
-    h, col = find_table(rows, ("Rank", "Symbol", "Ticket SAR", "Shares"))
+    h, col = _header(rows, ("Rank", "Symbol", "Ticket SAR", "Shares"))
     if h is None:
         return out
     out["read"] = True
-    out["banner"] = " ".join(text(c) for c in rows[h - 1] if text(c)) if h else ""
+    out["banner"] = " ".join(_squash(c) for c in rows[h - 1] if text(c)) if h else ""
     for r in rows[:4]:
         for c in r:
             out["built"] = out["built"] or _stamp(text(c), "Last run")
@@ -369,7 +387,7 @@ def read_top10_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     """The v2 Top 10 page, in the same shape as read_top10 (its headline is the banner)."""
     rows = [list(r) for r in values]
     out: Dict[str, Any] = {"read": False, "banner": "", "built": "", "seats": {}}
-    h, col = find_table(rows, ("Symbol · name", "Seat status", "Alloc SAR", "Buy qty"))
+    h, col = _header(rows, ("Symbol · name", "Seat status", "Alloc SAR", "Buy qty"))
     if h is None:
         return out
     out["read"] = True
