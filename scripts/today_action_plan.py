@@ -433,11 +433,15 @@ def read_news_gate(values: Sequence[Sequence[Any]], now: _dt.datetime) -> Dict[s
 
 
 def pick_cost(p: Dict[str, Any]) -> Optional[float]:
-    """What a pick costs in SAR: the plan's own allocation, else shares x price at the peg (USD) or at par (SAR)."""
-    if p.get("alloc"):
-        return float(p["alloc"])
+    """What a pick can cost in SAR: its shares at the highest price the step allows (the top of the entry zone, or
+    the last price when that is higher), at the peg (USD) or at par (SAR) - and never less than the plan's own
+    allocation, which was computed at the entry price (Codex P2, #971). Another currency: the allocation alone."""
+    alloc = float(p["alloc"]) if p.get("alloc") else None
     fx = {"USD": PEG, "SAR": 1.0}.get(text(p.get("ccy")).upper())
-    return float(p["qty"]) * float(p["price"]) * fx if fx and p.get("qty") and p.get("price") else None
+    top = max(float(p.get("zone_high") or 0.0), float(p.get("price") or 0.0))
+    if not (fx and p.get("qty") and top > 0):
+        return alloc
+    return max(alloc or 0.0, float(p["qty"]) * top * fx)
 
 
 def fund(picks: Sequence[Dict[str, Any]], cash: Optional[float]) -> Optional[float]:

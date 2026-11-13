@@ -807,6 +807,11 @@ def test_h6_the_cut_sizes_from_the_cash_ledger_when_it_is_lower(monkeypatch, cap
     assert dp.snapshot_cash([]) == (None, "") and dp.snapshot_cash([["x"], ["2026-11-12", "5"]]) == (None, "")
     assert dp.snapshot_cash(SNAP[:1] + [["not a date", "", "X", "", "9"], ["2026-11-12", "", "CALCULATED", "-5", ""]]) == (None, "")
     assert dp.snapshot_cash(SNAP[:1] + [["2026-11-12", "", "CALCULATED SNAPSHOT", "500", ""]]) == (None, "")   # a change, not a balance
+    # Codex P2, #971: the latest balance stands when it is negative - no buying power, never the older figure
+    assert dp.snapshot_cash(SNAP + [["2026-11-13", "", "CALCULATED SNAPSHOT", "-17,646.82", "-100.00"]]) == (
+        0.0, "2026-11-13 · CALCULATED SNAPSHOT")
+    assert dp.snapshot_cash(SNAP[:1] + [["2026-11-12", "", "WITHDRAWAL", "500", ""]]) == (None, "")   # not a broker read
+    assert dp.sizing_cash(33125.0, 0.0, "lower") == (0.0, "snapshot (lower than the panel)")
     assert dp.sizing_cash(33125.0, 17546.82, "lower") == (17546.82, "snapshot (lower than the panel)")
     assert dp.sizing_cash(10000.0, 17546.82, "lower") == (10000.0, "panel (not above the snapshot)")
     assert dp.sizing_cash(33125.0, 17546.82, "snapshot")[0] == 17546.82 and dp.sizing_cash(33125.0, 17546.82, "panel") == (33125.0, "panel")

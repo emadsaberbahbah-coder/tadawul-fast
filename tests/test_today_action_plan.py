@@ -711,6 +711,13 @@ def test_t8_readers_of_the_top10_pages_the_news_gate_and_cost():
     assert tap.pick_cost({"alloc": 7800.0, "qty": 1, "price": 1, "ccy": "USD"}) == 7800.0
     assert tap.pick_cost({"qty": 10, "price": 100.0, "ccy": "usd"}) == 3750.0 and tap.pick_cost({"qty": 10, "price": 5.0, "ccy": "SAR"}) == 50.0
     assert tap.pick_cost({"qty": 10, "price": 5.0, "ccy": "GBX"}) is None and tap.pick_cost({"qty": 0, "price": 5.0, "ccy": "USD"}) is None
+    # Codex P2, #971: the cost is taken at the highest price the buy step allows, not at the entry price
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 100.0, "zone_high": 101.0, "ccy": "USD"}) == 3787.5
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 101.5, "zone_high": 101.0, "ccy": "USD"}) == 3806.25
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 99.0, "zone_high": 99.5, "ccy": "USD"}) == 3750.0   # never under
+    assert tap.pick_cost({"alloc": 900.0, "qty": 10, "price": 5.0, "zone_high": 5.1, "ccy": "GBX"}) == 900.0        # no rate
+    tight = [{"symbol": "T", "status": "OPEN", "qty": 10, "rank": 1, "alloc": 3750.0, "price": 101.0, "zone_high": 101.0, "ccy": "USD"}]
+    assert tap.fund(tight, 3750.0) == 3750.0 and tight[0]["unfunded"] == (3787.5, 3750.0)
     picks = [{"symbol": "B", "status": "OPEN", "qty": 1, "rank": 2, "alloc": 6000.0},
              {"symbol": "A", "status": "OPEN", "qty": 1, "rank": 1, "alloc": 7000.0},
              {"symbol": "C", "status": "OPEN", "qty": 1, "rank": 3, "alloc": 3000.0},
@@ -753,7 +760,7 @@ def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
     assert rows["ZTO.US"][1] == "pipeline: next in line (rank 9)" and rows["ZTO.US"][3] == "ticket: 78 shares, 6,000 SAR"
     assert fm[g + 5 + list(rows).index("TEN.US")][8]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1])
     assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32" for r in page)
-    assert any(r[0] == "17,547 SAR" and r[3] == "open buys cost 7,800 SAR · left after the funded buys 9,747 SAR" for r in page)
+    assert any(r[0] == "17,547 SAR" and r[3] == "open buys cost 7,921 SAR · left after the funded buys 9,626 SAR" for r in page)   # 24 x 88.01 x 3.75
     out = capsys.readouterr().out
     assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash 17,547 SAR" in out
     for name in ("Top_10_Investments", "Top_10_Investments_v2", "_News_Gate", "_Cash_Snapshot"):
@@ -775,7 +782,7 @@ def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
     page = book.tabs["Today_Action_Plan"].values
     cs = cards(page)
     assert [(c[1]) for c in cs] == ["SUPN.US", "DDI.US", "IBOC.US", "NMM.US"]              # no buy left: no READ FIRST step
-    assert cs[3][2] == ("NMM.US is not funded today: its 24 shares need 7,800 SAR and 5,000 SAR of cash is left after "
+    assert cs[3][2] == ("NMM.US is not funded today: its 24 shares need 7,921 SAR and 5,000 SAR of cash is left after "
                         "the buys above.")
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
     assert page[a + 3 + 2 * 3][0] == "NOT FUNDED" and "Buy 24 NMM.US" not in " ".join(str(c) for r in page for c in r)

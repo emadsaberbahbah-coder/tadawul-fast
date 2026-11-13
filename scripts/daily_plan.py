@@ -318,7 +318,9 @@ def cash_source_mode() -> str:
 
 def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str]:
     """The latest balance on the _Cash_Snapshot tab: (SAR, "date · type"). (None, "") when the tab has no dated
-    balance. A row's balance is its "Balance SAR" cell, or its "Amount SAR" cell when that is the only figure."""
+    balance. A row's balance is its "Balance SAR" cell; a broker-read row that carries only an "Amount SAR" figure
+    gives that. The LATEST dated balance stands even when it is negative - it then reads 0, never an older,
+    larger figure (Codex P2, #971)."""
     rows = [list(r) for r in values if r]
     if not rows:
         return None, ""
@@ -333,10 +335,10 @@ def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str
         if parse_date(cell(r, di)) is None:
             continue
         bal = num(cell(r, bi))
-        if bal is None and ai is not None and "CALCULATED" not in text(cell(r, ti)).upper():
+        if bal is None and ai is not None and "BROKER READ" in text(cell(r, ti)).upper():
             bal = num(cell(r, ai))
-        if bal is not None and bal >= 0:
-            best = (bal, ("%s · %s" % (text(cell(r, di))[:10], text(cell(r, ti)))).strip(" ·"))
+        if bal is not None:
+            best = (max(0.0, bal), ("%s · %s" % (text(cell(r, di))[:10], text(cell(r, ti)))).strip(" ·"))
     return best
 
 
