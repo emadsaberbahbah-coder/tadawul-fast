@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.3.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.3.1 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -255,17 +255,18 @@ def test_t2_pick_steps_and_the_order_of_the_day():
     assert unv["do"].startswith("Before buying, check the main page") and "finished up" not in unv["why"]
     d = tap.build(tap.read_holdings(EXIT), plan, ev, tap.read_consistency(CONS), {"Exit_Plan": 1.5, "Daily_Plan": 0.3, "X": None,
                                                                                    "Old": 3.1}, K)
-    assert [(s["symbol"], s["urgency"]) for s in d["steps"]] == [
-        ("SUPN.US", 1), ("DDI.US", 2), ("IBOC.US", 2.5), ("NMM.US", 5.002)]
+    assert [(s["symbol"], tap.step_kind(s)) for s in d["steps"]] == [
+        ("DDI.US", "verify"), ("GLPI.US", "verify"), ("IBOC.US", "verify"), ("SUPN.US", "verify"), ("NMM.US", "verify")]
     assert d["stale"] == ["Old"] and len(d["picks"]) == 3 and len(d["pipeline"]) == 2
     old = tap.build(tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 13)), ev, [], {}, K)
-    assert [s["symbol"] for s in old["steps"]] == ["SUPN.US", "DDI.US", "IBOC.US"] and old["picks"] == []
+    assert [s["symbol"] for s in old["steps"]] == ["DDI.US", "GLPI.US", "IBOC.US", "SUPN.US"] and old["picks"] == []
+    assert all("update time is unknown" in s["do"] for s in old["steps"])
 
 
 # ----------------------------------------------------------------------------- T3 the run
 def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     book = full_book()
-    assert tap.run_once(False, book=book, now=NOW) == 0
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
     page = book.tabs["Today_Action_Plan"].values
     assert all(len(r) == tap.WIDTH for r in page)
     assert page[0][0] == "TODAY ACTION PLAN - Thu 12 Nov 2026" and "Built 2026-11-12 09:00 Riyadh" in page[1][0]
@@ -274,12 +275,12 @@ def test_t3_full_run_writes_one_page_and_hides_the_ledgers():
     assert page[a + 2][:2] == [1, "SUPN.US"] and "for the 48 shares that remain" in page[a + 2][2]
     cs = cards(page)                                                # 1.1.0: a step is two rows
     assert cs[1][:4] == (2, "DDI.US", "Raise the stop on DDI.US to 14.80 for all 240 shares.", "Exit_Plan")
-    assert cs[1][4] == "was 14.73 · broker stop 14.24" and cs[1][5] == "raise the stop 14.73 -> 14.80"
+    assert cs[1][4] == "was 14.73 · broker stop 14.24 on 240 of 240 shares" and cs[1][5] == "raise the stop 14.73 -> 14.80"
     assert cs[3][:2] == (4, "NMM.US") and cs[3][3] == "Daily_Plan" and len(cs) == 4
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS (5)")][0]
     assert page[b + 2] == ["DDI.US", "DoubleDown", "240", "15.72", "+17.0%", "RAISE STOP", "14.80", "14.24", "16.64",
                            "broker stop below the plan"]
-    assert page[b + 3][9] == "stop in place" and page[b + 4][9] == "no broker stop read" and page[b + 6][9] == ""
+    assert page[b + 3][9] == "stop in place" and page[b + 4][9] == "stop price not read" and page[b + 6][9] == ""
     c = [i for i, r in enumerate(page) if str(r[0]).startswith("C. NEW BUYS - plan of 2026-11-12, cut 2026-11-12 08:25 (VERIFIED)")][0]
     assert page[c + 2][:4] == ["NMM.US", "OPEN", "24", "84.50 - 88.01"] and page[c + 2][7:9] == ["56.2%", "86.1"]
     assert page[c + 3][:2] == ["EFC.US", "WAIT"] and page[c + 3][9] == "price 11.60 is above the entry zone"
@@ -330,12 +331,14 @@ def test_t3_old_sources_empty_pages_dry_run_and_off(monkeypatch, capsys):
                       Consistency_Check=Sheet(CONS[:5]))
     assert tap.run_once(False, book=quiet, now=NOW) == 0
     qflat = " | ".join(str(c) for r in quiet.tabs["Today_Action_Plan"].values for c in r)
-    assert "Nothing to do today: every holding reads HOLD" in qflat and "The pages agree on every checked figure." in qflat
+    assert "Nothing to do today" not in qflat and "Verify GLPI.US at IBKR" in qflat
+    assert "The pages agree on every checked figure." in qflat
     assert "NOT READ" not in qflat
     part = full_book(Exit_Plan=Sheet([["EXIT PLAN"], ["As of 2026-11-12 07:31 Riyadh"]]))  # holdings table unreadable
     assert tap.run_once(False, book=part, now=NOW) == 0
     pflat = " | ".join(str(c) for r in part.tabs["Today_Action_Plan"].values for c in r)
-    assert "INCOMPLETE: Exit_Plan could not be read, so steps may be missing." in pflat and "Buy 24 NMM.US" in pflat
+    assert "INCOMPLETE: Exit_Plan could not be read, so steps may be missing." in pflat and "Verify NMM.US" in pflat
+    assert "Buy 24 NMM.US" not in pflat
     dry = full_book()
     assert tap.run_once(True, book=dry, now=NOW) == 0 and "Today_Action_Plan" not in dry.tabs and dry.tabs["_Daily_Plan"].hides == 0
     assert "dry run" in capsys.readouterr().out
@@ -393,31 +396,18 @@ def test_t5_one_step_when_the_exit_plan_could_not_read_the_broker_orders():
     assert tap.run_once(False, book=book, now=NOW) == 0
     page = book.tabs["Today_Action_Plan"].values
     steps = cards(page)
-    assert [c[1] for c in steps] == ["SUPN.US", "DDI.US", "ALL", "NMM.US"]                # one line, not one per holding
-    assert steps[1][4] == "was 14.73 · broker stop orders not read"
-    assert steps[2][2] == ("Confirm in IBKR that each holding's stop matches the plan's stop in section B "
-                           "(DDI.US, GLPI.US, IBOC.US, SUPN.US).")
-    assert "622 h old" in steps[2][5] and steps[2][4] == "broker orders were not read into the workbook"
-    assert not any("none was read for it" in str(r[2]) for r in page)
+    assert [c[1] for c in steps] == ["DDI.US", "GLPI.US", "IBOC.US", "SUPN.US", "NMM.US"]
+    assert all("unverified" in c[2] for c in steps)
+    assert not any(c[1] == "ALL" or c[2].startswith(("Sell ", "Raise ", "Buy ")) for c in steps)
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
-    assert [page[b + i][9] for i in (2, 3, 4, 5, 6)] == ["broker orders not read"] * 4 + [""]
-    known = full_book()                                                                   # the read is fresh: as before
-    assert tap.run_once(False, book=known, now=NOW) == 0
-    assert any("Check the broker stop on IBOC.US: none was read" in str(r[2]) for r in known.tabs["Today_Action_Plan"].values)
-    assert not any(r[1] == "ALL" for r in known.tabs["Today_Action_Plan"].values)
-    part = [list(r) for r in unk]
-    part[8][15] = "35.00"                                                                 # a stop read despite the note
-    d = tap.build(tap.read_holdings(part), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(part))
-    assert [s["symbol"] for s in d["steps"]] == ["SUPN.US", "DDI.US", "GLPI.US", "ALL"]    # a real low stop still gets its step
-    assert "(DDI.US, IBOC.US, SUPN.US)" in d["steps"][3]["do"]
+    assert all(page[b + i][5] == "VERIFY" for i in (2, 3, 4, 5))
+    assert page[b + 6][5] == "NO RULE"
     sell = [list(r) for r in unk]
-    sell[9][13], sell[9][14] = "SELL", "closed below the stop"                             # IBOC is leaving in full
-    d = tap.build(tap.read_holdings(sell), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(sell))
-    assert [s["symbol"] for s in d["steps"]] == ["IBOC.US", "SUPN.US", "DDI.US", "ALL"]
-    assert "(DDI.US, GLPI.US, SUPN.US)" in d["steps"][3]["do"]                            # no stop to confirm on a sold name
-    only = [r for r in tap.read_holdings(sell) if r["symbol"] == "IBOC.US"]
-    d = tap.build(only, tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K, (), tap.broker_unknown(sell))
-    assert [s["symbol"] for s in d["steps"]] == ["IBOC.US"]                                # and no empty "ALL" line
+    sell[9][13], sell[9][14] = "SELL", "closed below the stop"
+    d = tap.build(tap.read_holdings(sell), tap.read_plan([], dt.date(2026, 11, 12)), {}, [], {}, K,
+                  (), tap.broker_unknown(sell))
+    assert all(tap.step_kind(step) == "verify" for step in d["steps"])
+    assert any(step["symbol"] == "IBOC.US" and "update time is unknown" in step["do"] for step in d["steps"])
 
 
 # ----------------------------------------------------------------------------- T6 (1.0.2)
@@ -493,7 +483,7 @@ def test_t6_a_sheets_quota_answer_is_waited_out_and_tried_again(monkeypatch, cap
 # ----------------------------------------------------------------------------- T7 (1.1.0) the page's design
 def test_t7_layout_styles_merges_and_heights():
     book = full_book()
-    assert tap.run_once(False, book=book, now=NOW) == 0
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
     ws = book.tabs["Today_Action_Plan"]
     page, fm = ws.values, ws.formats
     pg = tap.page_layout(tap.build(tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 12)),
@@ -573,7 +563,7 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     assert ws.plain_updates == 1 and ws.merges == [] and ws.values[0][0].startswith("TODAY ACTION PLAN")
     assert ws.formats == []                                                               # no looks left to hide a value
     assert "::warning::Today Action Plan: the styled write was refused (APIError)" in out and ", plain)" in out
-    assert cards(ws.values)[0][:2] == (1, "SUPN.US")                                      # every instruction is on the page
+    assert cards(ws.values)[0][:2] == (1, "DDI.US")                                      # every instruction is on the page
     quota = FlakyBook(full_book().tabs, fail=9)                                           # a quota that never clears is
     with pytest.raises(APIError):                                                        # not a reason to write plain
         tap.run_once(False, book=quota, now=NOW, sleep=lambda s: None)
@@ -730,7 +720,7 @@ def test_t8_readers_of_the_top10_pages_the_news_gate_and_cost():
 def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
     """13 Nov: this page said buy three names, the v2 page sized a fourth, the main page sized none."""
     book = aligned_book()
-    assert tap.run_once(False, book=book, now=NOW) == 0
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
     page = book.tabs["Today_Action_Plan"].values
     cs = cards(page)
     assert [(c[0], c[1]) for c in cs] == [(1, "SUPN.US"), (2, "DDI.US"), (3, "IBOC.US"), (4, "TEN.US"), (5, "ZTO.US"),
@@ -760,16 +750,16 @@ def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
     assert rows["ZTO.US"][1] == "pipeline: next in line (rank 9)" and rows["ZTO.US"][3] == "ticket: 78 shares, 6,000 SAR"
     assert fm[g + 5 + list(rows).index("TEN.US")][8]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1])
     assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32 Riyadh · macro: war_escalation/hormuz grade 1, 17 sources" for r in page)
-    assert any(r[0] == "17,547 SAR" and r[2] == ("2026-11-12 · CALCULATED SNAPSHOT · every open pick costs 7,921 SAR · left after the "
+    assert any(r[0] == "17,547 SAR" and r[2] == ("IBKR capture of 2026-11-12 09:00 Riyadh · every open pick costs 7,921 SAR · left after the "
                                                  "funded buys 9,626 SAR") for r in page)   # 24 x 88.01 x 3.75
     out = capsys.readouterr().out
-    assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash read (2026-11-12 · CALCULATED SNAPSHOT)" in out and "17,547" not in out
+    assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash read (IBKR capture of 2026-11-12 09:00 Riyadh)" in out and "17,547" not in out
     for name in ("Top_10_Investments", "Top_10_Investments_v2", "_News_Gate", "_Cash_Snapshot"):
         assert book.tabs[name].updates == 0 and book.tabs[name].hides == 0                # read only
     both = aligned_book(Top_10_Investments=Sheet(T10[:6] + [["2", "NMM.US", "Navios", "88", "7,800 SAR", "24", "Cash", ""]]),
                         Top_10_Investments_v2=Sheet(V2[:4] + [["4", "NMM.US · Navios", "", "", "ACTIVE", "", "7,800", "24"]]),
                         _News_Gate=Sheet(NEWS[:2]))
-    assert tap.run_once(False, book=both, now=NOW) == 0
+    assert tap.run_once(False, book=both, now=NOW, capture=plan_capture()) == 0
     p2 = both.tabs["Today_Action_Plan"].values
     assert any(r[0] == "NMM.US" and r[8] == "ALIGNED: all three pages size it." for r in p2)
     assert [c[1] for c in cards(p2)] == ["SUPN.US", "DDI.US", "IBOC.US", "ZTO.US", "NMM.US"]   # GO: no READ FIRST step
@@ -779,7 +769,7 @@ def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
 def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
     poor = [list(r) for r in CASH] + [["2026-11-12", "", "CALCULATED SNAPSHOT", "-12,546.82", "5,000.00", "", ""]]
     book = aligned_book(_Cash_Snapshot=Sheet(poor), Top_10_Investments_v2=Sheet(V2[:4]), Top_10_Investments=Sheet(T10[:5]))
-    assert tap.run_once(False, book=book, now=NOW) == 0
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture(cash_sar=5000)) == 0
     page = book.tabs["Today_Action_Plan"].values
     cs = cards(page)
     assert [(c[1]) for c in cs] == ["SUPN.US", "DDI.US", "IBOC.US", "NMM.US"]              # no buy left: no READ FIRST step
@@ -792,16 +782,16 @@ def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
     assert page[2][0].startswith("3 step(s) on holdings · 0 new buy(s) open") and "· NOT FUNDED: NMM.US · NEWS GATE: NO NEW ENTRY" in page[2][0]
     assert any(r[0] == "NMM.US" and r[1] == "OPEN, not funded today" and r[8] == "ALIGNED: no page sizes it." for r in page)
     fresh_go = aligned_book(_News_Gate=Sheet(NEWS + [["2026-11-12 08:00", "3", "GO", ""]]))   # the latest verdict is GO
-    assert tap.run_once(False, book=fresh_go, now=NOW) == 0
+    assert tap.run_once(False, book=fresh_go, now=NOW, capture=plan_capture()) == 0
     gp = fresh_go.tabs["Today_Action_Plan"].values
     assert not any(r[1] == "NEWS" for r in gp) and "NEWS GATE" not in gp[2][0] and any(r[0] == "GO" and r[2] == "2026-11-12 08:00 Riyadh · no driver recorded" for r in gp)
     late = aligned_book()                                                                 # the verdict is 29.5 h old
-    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
+    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24), capture=plan_capture(now=NOW + dt.timedelta(hours=24))) == 0
     lp = late.tabs["Today_Action_Plan"].values
     assert not any(r[1] == "NEWS" for r in lp) and "NEWS GATE" not in lp[2][0]
     assert any(r[0] == "NO NEW ENTRY" and str(r[2]).startswith("2026-11-12 03:32 Riyadh (older than the limit) · macro") for r in lp)
     monkeypatch.setenv("TFB_TAP_NEWS_MAX_H", "48")
-    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
+    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24), capture=plan_capture(now=NOW + dt.timedelta(hours=24))) == 0
     assert "NEWS GATE: NO NEW ENTRY" in late.tabs["Today_Action_Plan"].values[2][0]
     monkeypatch.delenv("TFB_TAP_NEWS_MAX_H")
 
@@ -809,23 +799,25 @@ def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
         def get(self, rng):
             raise RuntimeError("bad range")
     odd = aligned_book(Top_10_Investments=Odd([]), _Cash_Snapshot=Odd([]))
-    assert tap.run_once(False, book=odd, now=NOW) == 0
+    assert tap.run_once(False, book=odd, now=NOW, capture=plan_capture()) == 0
     op = odd.tabs["Today_Action_Plan"].values
     out = capsys.readouterr().out
     assert "Top_10_Investments not read: RuntimeError" in out and "_Cash_Snapshot not read: RuntimeError" in out
     assert any(r[0] == "Top 10 (main)" and r[2] == "page not read" for r in op)
-    assert any("No cash figure was read" in str(r[1]) for r in op)
+    assert tiles_of(op)["CASH AT IBKR"][0] == "17,547 SAR"
     assert [c[1] for c in cards(op)] == ["SUPN.US", "DDI.US", "IBOC.US", "TEN.US", "NEWS", "NMM.US"]   # v2 still read
     waits = []
     slow = aligned_book(_News_Gate=Flaky(NEWS, fail=1))                                   # the quota on an optional tab
-    assert tap.run_once(False, book=slow, now=NOW, sleep=waits.append) == 0 and waits == [20.0]
+    assert tap.run_once(False, book=slow, now=NOW, sleep=waits.append, capture=plan_capture()) == 0 and waits == [20.0]
     assert any(r[1] == "NEWS" for r in slow.tabs["Today_Action_Plan"].values)
     monkeypatch.setenv("TFB_TAP_ALIGN", "off")
     off = aligned_book(Top_10_Investments=Odd([]))
     assert tap.run_once(False, book=off, now=NOW) == 0
     fp = off.tabs["Today_Action_Plan"].values
-    assert not any(str(r[0]).startswith("PAGE ALIGNMENT") for r in fp) and [c[1] for c in cards(fp)] == ["SUPN.US", "DDI.US", "IBOC.US", "NMM.US"]
-    assert fp[2][0] == "3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
+    assert not any(str(r[0]).startswith("PAGE ALIGNMENT") for r in fp)
+    assert [c[1] for c in cards(fp)] == ["DDI.US", "GLPI.US", "IBOC.US", "SUPN.US", "NMM.US"]
+    assert not any(c[2].startswith("Buy ") for c in cards(fp))
+    assert fp[2][0] == "4 step(s) on holdings · 0 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_ALIGN: ${{ vars.TFB_TAP_ALIGN || 'on' }}" in raw and "TFB_TAP_NEWS_MAX_H: ${{ vars.TFB_TAP_NEWS_MAX_H || '24' }}" in raw
 
@@ -855,6 +847,16 @@ def ib_capture(orders=None, positions=None, cash=4679.15, settled=4679.15, at="2
                ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9),
                ib_order("Buy 10 OTHER", "LIMIT", "BUY", "Limit 50.00, GTC", 10, limit=50)]}}
     return ic.parse(raw, None, now, "TFB_IBKR_Capture_20261112-084101.json")
+
+
+def plan_capture(cash_sar=17546.82, now=NOW):
+    """Current custody matching EXIT, with each displayed stop and no working buy."""
+    orders = [ib_order("Sell 240 DDI", "STOP", "SELL", "STP 14.24, GTC", 240),
+              ib_order("Sell 79 GLPI", "STOP", "SELL", "STP 35.74, GTC", 79),
+              ib_order("Sell 52 IBOC", "STOP", "SELL", "STP, GTC", 52),
+              ib_order("Sell 95 SUPN", "STOP", "SELL", "STP 23.00, GTC", 95)]
+    return ib_capture(orders=orders, cash=cash_sar / tap.PEG, settled=cash_sar / tap.PEG,
+                      at=now.astimezone(tap.RIYADH).isoformat(), now=now)
 
 
 def tiles_of(page):
@@ -927,8 +929,8 @@ def test_t9_stop_states_fallbacks_and_a_stop_the_broker_already_carries(capsys):
     away = ib_capture(positions=[("DDI", 240), ("GLPI", 79), ("SUPN", 95)])               # IBOC is held elsewhere
     b2 = full_book()
     assert tap.run_once(False, book=b2, now=NOW, capture=away) == 0
-    assert any(c[2] == "IBOC.US is not in the IBKR account: check its stop (63.20) where it is held." for c in cards(b2.tabs["Today_Action_Plan"].values))
-    assert any(r[0] == "IBOC.US" and r[9] == "not at IBKR" for r in b2.tabs["Today_Action_Plan"].values)
+    assert any(c[2] == "Verify IBOC.US at IBKR before acting: the holding is absent from the broker capture." for c in cards(b2.tabs["Today_Action_Plan"].values))
+    assert any(r[0] == "IBOC.US" and r[9] == "the holding is absent from the broker capture" for r in b2.tabs["Today_Action_Plan"].values)
     capsys.readouterr()
     for cap, why in ((ib_capture(at="2026-11-11T02:00:00+03:00"), "the newest capture is 31 h old (limit 30 h)"),
                      ({"ok": False, "reason": "no capture file visible in the folder (is it shared with the service account?)"},
@@ -939,7 +941,7 @@ def test_t9_stop_states_fallbacks_and_a_stop_the_broker_already_carries(capsys):
         p3 = b3.tabs["Today_Action_Plan"].values
         assert tiles_of(p3)["CASH (LEDGER)"][0] == "17,547 SAR" and any("IBKR capture not used: %s." % why in str(r[1]) for r in p3)
         assert "IBKR capture not used: %s" % why in capsys.readouterr().out
-        assert any(r[0] == "IBOC.US" and r[9] == "no broker stop read" for r in p3)       # the workbook's own column, as before
+        assert any(r[0] == "IBOC.US" and "unverified" in r[9] for r in p3)       # the workbook's own column, as before
     tight = ib_capture(cash=1000.0, settled=1000.0)                                       # the placed order is not covered
     b4 = aligned_book()
     assert tap.run_once(False, book=b4, now=NOW, capture=tight) == 0
@@ -983,6 +985,10 @@ def test_t9_review_fixes_actual_commitments_partial_fills_and_unpriced_reservati
     page = book.tabs["Today_Action_Plan"].values
     assert tiles_of(page)["CASH (LEDGER)"][0] == "17,547 SAR"                               # the established fallback
     assert any("IBKR cash not used: a working buy order on another name has no limit price" in str(r[1]) for r in page)
+    assert not any(c[2].startswith("Buy ") for c in cards(page))
+    assert any(c[1] == "NMM.US" and "reservation has no limit price" in c[2] for c in cards(page))
+    assert any(r[0] == "NMM.US" and r[1] == "VERIFY" for r in page)
+    assert tiles_of(page)["CASH AFTER THE BUYS"][0] == "-"
     assert "IBKR cash not used: a working buy order has no limit price" in capsys.readouterr().out
     assert any(r[0] == "GLPI.US" and r[9] == "stop in place" for r in page)                 # the orders are still used
     assert str([r for r in page if str(r[0]).startswith("B. HOLDINGS")][0][0]).endswith("IBKR capture of 2026-11-12 08:41 Riyadh")
@@ -991,3 +997,89 @@ def test_t9_review_fixes_actual_commitments_partial_fills_and_unpriced_reservati
     b2 = aligned_book()
     assert tap.run_once(False, book=b2, now=NOW, capture=own) == 0                          # is priced at the plan's top
     assert tiles_of(b2.tabs["Today_Action_Plan"].values)["BUYS TODAY"] == ("1 of 1", "7,921 SAR · 1 placed")
+
+
+@pytest.mark.parametrize("capture,reason", [
+    (None, "no capture given"),
+    ({"ok": False, "reason": "capture has no USD balance"}, "capture has no USD balance"),
+    ("stale", "31 h old"),
+])
+def test_t10_custody_missing_or_stale_keeps_calculated_cash_as_research(capture, reason):
+    if capture == "stale":
+        capture = ib_capture(at="2026-11-11T02:00:00+03:00")
+    book = aligned_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=capture) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    steps = cards(page)
+    assert all(not c[2].startswith(("Buy ", "Sell ", "Raise ")) for c in steps)
+    assert any(c[1] == "NMM.US" and reason in c[2] and "research: 24 shares" in c[4] for c in steps)
+    assert tiles_of(page)["CASH (LEDGER)"][0] == "17,547 SAR"
+    assert tiles_of(page)["CASH (LEDGER)"][1].startswith("research only:")
+    assert tiles_of(page)["CASH AFTER THE BUYS"][0] == "-"
+    row = next(i for i, r in enumerate(page) if r[0] == "NMM.US" and r[1] == "VERIFY")
+    assert reason in page[row][9]
+    assert book.tabs["Today_Action_Plan"].formats[row][1]["backgroundColor"] == tap._rgb(tap._WARN[0])
+
+
+def test_t10_partial_fill_quantity_mismatch_reconciles_before_any_exit_or_stop():
+    cap = ib_capture(positions=[("DDI", 40), ("GLPI", 79), ("IBOC", 52), ("SUPN", 95)])
+    book = aligned_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=cap) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    ddi = next(c for c in cards(page) if c[1] == "DDI.US")
+    assert ddi[2] == "Verify DDI.US at IBKR before acting: plan quantity 240 differs from broker quantity 40."
+    assert not any(c[1] == "DDI.US" and c[2].startswith(("Sell ", "Raise ")) for c in cards(page))
+    assert any(r[0] == "DDI.US" and r[5] == "VERIFY" for r in page)
+    assert any(c[1] == "NMM.US" and "working at IBKR" in c[2] for c in cards(page))
+    assert any(c[1] == "SUPN.US" and c[2].startswith("Sell half") for c in cards(page))
+
+
+@pytest.mark.parametrize("tab,rows,reason", [
+    ("Exit_Plan", [[EXIT[0][0]], ["As of 2026-11-11 07:31 Riyadh"]] + EXIT[2:], "Exit_Plan is 25.5 h old"),
+    ("Exit_Plan", [[EXIT[0][0]], ["time unknown"]] + EXIT[2:], "Exit_Plan update time is unknown"),
+    ("Daily_Plan", [["DAILY PLAN"], ["checked 2026-11-11 08:40"]], "Daily_Plan is 24.3 h old"),
+    ("Daily_Plan", [["DAILY PLAN"], ["time unknown"]], "Daily_Plan update time is unknown"),
+])
+def test_t10_source_currentness_applies_before_order_advice(tab, rows, reason):
+    book = aligned_book(**{tab: Sheet(rows)})
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    steps = cards(book.tabs["Today_Action_Plan"].values)
+    source = "Exit_Plan" if tab == "Exit_Plan" else "Daily_Plan"
+    affected = [c for c in steps if c[3] == source]
+    assert affected and all(reason in c[2] for c in affected)
+    assert all(not c[2].startswith(("Buy ", "Sell ", "Raise ")) for c in affected)
+
+
+def test_t10_working_order_stays_visible_when_source_or_funding_needs_verification():
+    orders = [ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9),
+              ib_order("Buy 10 OTHER", "MARKET", "BUY", "Market, Day", 10)]
+    old = [["DAILY PLAN"], ["checked 2026-11-11 08:40"]]
+    book = aligned_book(Daily_Plan=Sheet(old))
+    assert tap.run_once(False, book=book, now=NOW, capture=ib_capture(orders)) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    order = next(c for c in cards(page) if c[1] == "NMM.US")
+    assert "24 shares is already working at IBKR" in order[2]
+    assert "Verify NMM.US" in order[2] and "place the stop" not in order[2]
+    assert any(r[0] == "NMM.US" and r[1] == "PLACED" and "Daily_Plan is 24.3 h old" in r[9] for r in page)
+    assert tiles_of(page)["CASH AFTER THE BUYS"][0] == "-"
+
+
+def test_t10_repeated_build_drops_previous_order_and_funding_annotations():
+    holdings, plan = tap.read_holdings(EXIT), tap.read_plan(LEDGER, NOW.astimezone(tap.RIYADH).date())
+    ages = {"Exit_Plan": 1.5, "Daily_Plan": 0.3}
+    broker = tap.apply_capture(holdings, plan, ib_capture(), 30)
+    first = tap.build(holdings, plan, {}, [], ages, K, extra={"broker": broker, "cash": 0.0})
+    pick = first["picks"][0]
+    assert pick.get("placed") and pick.get("unfunded")
+
+    broker = tap.apply_capture(holdings, plan, None, 30)
+    second = tap.build(holdings, plan, {}, [], ages, K, extra={"broker": broker, "cash": 17546.82})
+    pick = second["picks"][0]
+    assert "placed" not in pick and "unfunded" not in pick and pick.get("review_reason")
+    assert any(s["symbol"] == "NMM.US" and tap.step_kind(s) == "verify" for s in second["steps"])
+
+    broker = tap.apply_capture(holdings, plan, plan_capture(), 30)
+    third = tap.build(holdings, plan, {}, [], ages, K, extra={"broker": broker, "cash": broker["cash"]})
+    pick = third["picks"][0]
+    assert all(k not in pick for k in ("placed", "unfunded", "review_reason"))
+    assert any(s["symbol"] == "NMM.US" and s["do"].startswith("Buy 24") for s in third["steps"])
