@@ -1151,6 +1151,12 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                  "news": read_news_gate(more.get(NEWS_TAB) or [], now), "cash": cash, "cash_at": cash_at}
     d = build(read_holdings(pages["Exit_Plan"]), plan, read_evidence(pages["Evidence_Board"]),
               read_consistency(pages["Consistency_Check"]), ages, k, missing, broker_unknown(pages["Exit_Plan"]), extra)
+    for tab, page in (((T10_TAB, d["t10"]), (V2_TAB, d["v2"])) if aligned else ()):
+        if not page.get("read"):                                    # say what was read, so a moved header is visible
+            got = (held.get("more") or {}).get(tab) or []
+            near = [" | ".join(_squash(c) for c in r if text(c))[:160] for r in got
+                    if any(_squash(c) in ("Seat status", "Ticket SAR") for c in r)]
+            _out("%s: no seats table found in %d row(s)%s" % (tab, len(got), "; nearest header: " + near[0] if near else ""))
     for a in d["align"]:
         _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"], a["main"], a["v2"]))
     if aligned:
