@@ -2,7 +2,7 @@
 """
 scripts/consistency_check.py - TFB cross-page consistency check
 ===============================================================
-VERSION 1.0.0 (2026-11-11) - NEW SCRIPT
+VERSION 1.2.0 (2026-11-13) - first written 2026-11-11 (1.0.0)
 
 WHY (owner, Wed 11 Nov 2026 11:24 Riyadh): "improve and accurate output data
 matching in all pages". Read on the live workbook at 11:30 the same day:
@@ -40,6 +40,33 @@ Exit_Plan ('As of'), both v2 pages ('page built') - and reads STALE when it is
 older than TFB_CONS_PAGE_MAX_AGE_H hours (2), so a page that stopped refreshing
 shows within the hour.
 
+1.2.0 (2026-11-13): THE FIVE DIFFERENCES OF 13 NOV (owner, 12:34 Riyadh, with
+the page's rows: "need to solve it"). Read on the live workbook that hour:
+  C11 Portfolio_Decision read STALE at 3.2 h on a Friday morning. It is rebuilt
+      once per broker capture; no market had been open since its 08:42 build,
+      so nothing it shows could have changed. C11 now counts the hours a market
+      was in session since the build (Tadawul Sun-Thu 10:00-15:00 Riyadh, US
+      Mon-Fri 09:30-16:00 New York; holidays are not known and count as
+      sessions): STALE past TFB_CONS_PAGE_MAX_AGE_H (2) of those, or past
+      TFB_CONS_PAGE_IDLE_MAX_H (26) hours of any kind.
+  C10 two holdings read MISMATCH: Portfolio_Decision TRIM against the Exit
+      Plan's RAISE STOP / HOLD. The TRIM was the position cap, a sizing rule
+      the Exit Plan does not judge. A TRIM on a
+      holding above 'PF: Max Position %' is now its own row, C12 position cap
+      (status OVER CAP), and is no longer a sell-side disagreement.
+  C1  three open picks read MISMATCH because the main page had sized nothing.
+      The Today Action Plan is the order of record (decision of 13 Nov): only a
+      ticket on the main page that is not an open pick is a MISMATCH; an open
+      pick the main page has not sized is INFO.
+  C8  compared one typed cell. It now names each typed cell that differs from
+      Portfolio_Decision's cash (the broker's when a capture is applied).
+  C9  unchanged in logic (two stop engines); the row now says which stop rules.
+Portfolio_Decision is read to column Z (the Advisor Note).
+THE RUN LOG IS PUBLIC (the repository is): since 1.2.0 it prints the detail of
+C1, C2, C3 and C11 only (names and times). Every row that can carry cash, a
+total, a quantity, a weight or a stop prints its status alone; the figures are
+on the Consistency_Check page.
+
 GATE: TFB_CONSISTENCY = off (default) | observe (print only) | on.
 Rollback: repository variable TFB_CONSISTENCY=off.
 """
@@ -58,7 +85,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -69,6 +96,14 @@ READ_ATTEMPTS = 3
 READ_RETRY_S = 20
 _SLEEP = time.sleep
 _TS = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
+try:                                                                # the US session follows New York's clock
+    from zoneinfo import ZoneInfo  # noqa: E402
+    _NEW_YORK: _dt.tzinfo = ZoneInfo("America/New_York")
+except Exception:  # noqa: BLE001 - no tz database: winter time
+    _NEW_YORK = _dt.timezone(_dt.timedelta(hours=-5))
+# (clock, weekdays as date.weekday(), open, close): Tadawul Sun-Thu, the US market Mon-Fri
+SESSIONS = ((RIYADH, (6, 0, 1, 2, 3), (10, 0), (15, 0)), (_NEW_YORK, (0, 1, 2, 3, 4), (9, 30), (16, 0)))
+_CAP_NOTE = re.compile(r"max\s+position|trim\s+to\s+cap", re.I)
 
 
 def _out(msg: str) -> None:
@@ -99,7 +134,8 @@ def knobs() -> Dict[str, float]:
             "stop_tol": _env_num("TFB_CONS_STOP_TOL_PCT", 1.0, 0.0, 50.0),
             "earn_days": _env_num("TFB_PLAN_EARN_DAYS", 7, 0, 30),
             "sar_tol": _env_num("TFB_CONS_SAR_TOL", 50.0, 0.0, 1e6),
-            "page_h": _env_num("TFB_CONS_PAGE_MAX_AGE_H", 2.0, 0.25, 240.0)}
+            "page_h": _env_num("TFB_CONS_PAGE_MAX_AGE_H", 2.0, 0.25, 240.0),
+            "idle_h": _env_num("TFB_CONS_PAGE_IDLE_MAX_H", 26.0, 1.0, 720.0)}
 
 
 # ----------------------------------------------------------------------------- #
@@ -167,8 +203,27 @@ FRESHNESS = (("Top_10_Investments", "Last run"), ("Portfolio_Decision", "Last ru
              ("Exit_Plan", "As of"), ("Top_10_Investments_v2", "page built"), ("Portfolio_Decision_v2", "page built"))
 
 
-def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float) -> List[List[str]]:
-    """C11: one row per output page - when it was last built, and STALE past max_h hours."""
+def open_hours(a: _dt.datetime, b: _dt.datetime) -> float:
+    """Hours between a and b in which Tadawul or the US market was in session. The two sessions never overlap, so
+    their hours add. Holidays are not known here: a holiday counts as a session (the check errs toward STALE)."""
+    if b <= a:
+        return 0.0
+    total = 0.0
+    for tz, days, opens, closes in SESSIONS:
+        d, last = a.astimezone(tz).date(), b.astimezone(tz).date()
+        while d <= last:
+            if d.weekday() in days:
+                lo = max(a, _dt.datetime(d.year, d.month, d.day, opens[0], opens[1], tzinfo=tz))
+                hi = min(b, _dt.datetime(d.year, d.month, d.day, closes[0], closes[1], tzinfo=tz))
+                if hi > lo:
+                    total += (hi - lo).total_seconds() / 3600.0
+            d += _dt.timedelta(days=1)
+    return total
+
+
+def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float, idle_h: float = 26.0) -> List[List[str]]:
+    """C11: one row per output page - when it was last built. STALE when a market was in session for more than
+    max_h hours since the build (1.2.0), or when the page is older than idle_h hours whatever the markets did."""
     out: List[List[str]] = []
     for page, mark in FRESHNESS:
         at = stamp_in(g.get(page) or [], after=mark)
@@ -177,9 +232,17 @@ def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float) ->
                            pages=page))
             continue
         age = (now - at).total_seconds() / 3600.0
-        out.append(row("C11 freshness", "STALE" if age > max_h else "MATCH",
-                       "%s: built %s Riyadh, %.1f h ago%s" % (page, at.strftime("%Y-%m-%d %H:%M"), max(0.0, age),
-                                                               " (limit %g h)" % max_h if age > max_h else ""),
+        live = open_hours(at, now)
+        if live > max_h:
+            tail = ", %.1f h of it with a market open (limit %g h)" % (live, max_h)
+        elif age > idle_h:
+            tail = " (limit %g h with the markets closed)" % idle_h
+        elif age > max_h:
+            tail = ", %.1f h of it with a market open" % live if live > 0 else ", no market open since"
+        else:
+            tail = ""
+        out.append(row("C11 freshness", "STALE" if live > max_h or age > idle_h else "MATCH",
+                       "%s: built %s Riyadh, %.1f h ago%s" % (page, at.strftime("%Y-%m-%d %H:%M"), max(0.0, age), tail),
                        at.strftime("%Y-%m-%d %H:%M"), "", page))
     return out
 
@@ -211,7 +274,11 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
             why = "; ".join(["%s: ticket on the main page, not an open pick" % s for s in only_main] +
                             ["%s: open pick, main page says '%s'" % (s, seat_of.get(s) or "not seated")
                              for s in only_plan])
-            out.append(row("C1 decision", "MISMATCH", why, ", ".join(sorted(tickets)) or "none",
+            # 1.2.0: the plan is the order of record. A main-page ticket the plan does not hold could be bought by
+            # mistake (MISMATCH); a pick the main page has not sized cannot (INFO).
+            if not only_main:
+                why += " - the Today Action Plan is the order of record; the main page ranks and has sized nothing else"
+            out.append(row("C1 decision", "MISMATCH" if only_main else "INFO", why, ", ".join(sorted(tickets)) or "none",
                            ", ".join(sorted(open_picks)) or "none", "Top_10_Investments / Daily_Plan"))
     # C2
     cal = read_calendar(g.get("Calendar_Events") or [], g.get("Dividend_Events") or [], today)
@@ -284,8 +351,9 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
     # C7 / C8
     kp = table_rows(pd, ("Portfolio (SAR)", "Holdings (SAR)", "Cash (SAR)"), "Holdings (SAR)")
     pd_total = num(kp[0].get("Portfolio (SAR)")) if kp else None
-    pd_cash = num(kp[0].get("Cash (SAR)")) if kp else None
-    pd_cash = pd_cash if pd_cash is not None else num(panel(pd, "PF: Cash Available SAR"))
+    pd_kpi = num(kp[0].get("Cash (SAR)")) if kp else None
+    pd_typed = num(panel(pd, "PF: Cash Available SAR"))
+    pd_cash = pd_kpi if pd_kpi is not None else pd_typed
     t10_cash = num(panel(t10, "Cash Available (SAR)"))
     if pd_total is not None and pd_cash is not None and lots:
         ledger_total = sum(lot["mv"] for lot in lots.values()) + pd_cash
@@ -300,10 +368,17 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
                        "explain %s SAR" % (fmt(gap, 0), fmt(named, 0)),
                        fmt(pd_total, 0), fmt(ledger_total, 0), "Portfolio_Decision / _Portfolio_CostBasis"))
     if pd_cash is not None and t10_cash is not None:
-        same = abs(pd_cash - t10_cash) <= k["sar_tol"]
-        out.append(row("C8 cash", "MATCH" if same else "MISMATCH", "cash agrees" if same else "cash differs by %s SAR" %
-                       fmt(abs(pd_cash - t10_cash), 0), fmt(pd_cash, 0), fmt(t10_cash, 0),
-                       "Portfolio_Decision / Top_10_Investments"))
+        # 1.2.0: every typed cash cell against Portfolio_Decision's cash (the broker's when a capture is applied)
+        typed = [("Top_10_Investments 'Cash Available (SAR)'", t10_cash)]
+        if pd_kpi is not None and pd_typed is not None:
+            typed.append(("Portfolio_Decision 'PF: Cash Available SAR'", pd_typed))
+        off = [(n, v) for n, v in typed if abs(v - pd_cash) > k["sar_tol"]]
+        out.append(row("C8 cash", "MISMATCH" if off else "MATCH", "cash agrees" if not off else
+                       "typed cash is not Portfolio_Decision's cash of %s SAR: %s - a page sizes from its typed cell "
+                       "when no fresh broker capture is applied" % (fmt(pd_cash, 0), "; ".join(
+                           "%s reads %s SAR (%s SAR %s)" % (n, fmt(v, 0), fmt(abs(v - pd_cash), 0),
+                                                           "more" if v > pd_cash else "less") for n, v in off)),
+                       fmt(pd_cash, 0), fmt(t10_cash, 0), "Portfolio_Decision / Top_10_Investments"))
     # C9 / C10
     ex = {text(d["Symbol"]).upper(): d for d in table_rows(g.get("_Exit_Plan") or [], ("Date", "Symbol", "Stop", "Action"),
                                                            "Date") if text(d["Date"]) == today.isoformat()}
@@ -311,7 +386,8 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
         out.append(row("C9 stops", "INFO", "no Exit Plan rows for %s yet" % today.isoformat(),
                        pages="Portfolio_Decision / Exit_Plan"))
     else:
-        bad_stop, bad_act = [], []
+        bad_stop, bad_act, over = [], [], []
+        cap = num(panel(pd, "PF: Max Position %"))
         for s, d in sorted(ex.items()):
             p = pdr.get(s) or {}
             ps, px, pxs = num(p.get("Stop SAR")), num(p.get("Price")), num(p.get("Price SAR"))
@@ -322,25 +398,47 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
                     bad_stop.append("%s Portfolio_Decision %s vs Exit Plan %s" % (s, fmt(pstop), fmt(es)))
             act, eact = text(p.get("Action")).upper(), text(d.get("Action")).upper()
             sells = ("TRIM", "EXIT", "SELL")
-            if act and ((act in sells) != (eact in ("SELL", "TAKE PROFIT"))):
+            exits = eact in ("SELL", "TAKE PROFIT")
+            weight = num(p.get("Weight %"))
+            # 1.2.0: a TRIM on a holding above the position cap is a sizing rule, which the Exit Plan does not judge
+            capped = act == "TRIM" and not exits and (
+                (cap is not None and weight is not None and weight > cap) or bool(_CAP_NOTE.search(text(p.get("Advisor Note")))))
+            if capped:
+                over.append("%s%s (Exit Plan: %s)" % (s, " %s%%" % fmt(weight, 1) if weight is not None else "", eact or "no action"))
+            elif act and ((act in sells) != exits):
                 bad_act.append("%s Portfolio_Decision %s vs Exit Plan %s" % (s, act, eact))
-        out.append(row("C9 stops", "MISMATCH" if bad_stop else "MATCH", "; ".join(bad_stop) or
+        out.append(row("C9 stops", "MISMATCH" if bad_stop else "MATCH", ("; ".join(bad_stop) + " - the stop to place is "
+                       "the Exit Plan's (the Today Action Plan shows it)") if bad_stop else
                        "stops agree within %.1f%%" % k["stop_tol"], pages="Portfolio_Decision / Exit_Plan"))
         out.append(row("C10 actions", "MISMATCH" if bad_act else "MATCH", "; ".join(bad_act) or
                        "sell-side actions agree", pages="Portfolio_Decision / Exit_Plan"))
+        if over:
+            out.append(row("C12 position cap", "OVER CAP", "above the position cap%s: %s - Portfolio_Decision says TRIM to "
+                           "the cap; a trim is a sizing decision, not a price exit" % (
+                               " of %s%%" % fmt(cap, 0) if cap is not None else "", "; ".join(over)),
+                           pages="Portfolio_Decision / Exit_Plan"))
     if now is not None:
-        out += freshness(g, now, k["page_h"])
+        out += freshness(g, now, k["page_h"], k.get("idle_h", 26.0))
     return out
 
 
+LOG_DETAIL = ("C1", "C2", "C3", "C11")                             # names and times only; nothing of the account
+
+
+def log_detail(r: Sequence[str]) -> str:
+    """What the public run log may say about a result row."""
+    return r[2] if r[0].split(" ")[0] in LOG_DETAIL else "(figures on the %s page)" % PAGE_TAB
+
+
 def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
-    n = {s: sum(1 for r in results if r[1] == s) for s in ("MISMATCH", "STALE", "MATCH", "INFO")}
+    n = {s: sum(1 for r in results if r[1] == s) for s in ("MISMATCH", "STALE", "OVER CAP", "MATCH", "INFO")}
     rows = [["CONSISTENCY CHECK - the same figure on every page"],
-            ["As of %s Riyadh · %d mismatch(es) · %d stale · %d match · %d note(s) · consistency_check %s" % (
-                stamp, n["MISMATCH"], n["STALE"], n["MATCH"], n["INFO"], __version__)],
+            ["As of %s Riyadh · %d mismatch(es) · %d stale · %s%d match · %d note(s) · consistency_check %s" % (
+                stamp, n["MISMATCH"], n["STALE"], "%d over the position cap · " % n["OVER CAP"] if n["OVER CAP"] else "",
+                n["MATCH"], n["INFO"], __version__)],
             [],
             ["Check", "Status", "Detail", "First page", "Second page", "Pages compared"]]
-    order = {"MISMATCH": 0, "STALE": 1, "INFO": 2, "MATCH": 3}
+    order = {"MISMATCH": 0, "STALE": 1, "OVER CAP": 2, "INFO": 3, "MATCH": 4}
     rows += sorted(results, key=lambda r: (order.get(r[1], 9), r[0]))
     return [(list(r) + [""] * PAGE_WIDTH)[:PAGE_WIDTH] for r in rows]
 
@@ -348,7 +446,7 @@ def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
 # ----------------------------------------------------------------------------- #
 # IO
 # ----------------------------------------------------------------------------- #
-RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:X60", "Top_10_Investments_v2": "A1:Z4",
+RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:Z60", "Top_10_Investments_v2": "A1:Z4",
           "Portfolio_Decision_v2": "A1:Z4", "_Portfolio_CostBasis": "A1:Z600", "My_Portfolio": "A1:K60",
           "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Daily_Plan": "A1:B4", "Exit_Plan": "A1:B4", "Calendar_Events": "A1:J4000",
           "Dividend_Events": "A1:J4000"}
@@ -378,7 +476,7 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> int:
             _SLEEP(READ_RETRY_S)
     results = run_checks(grids, today, knobs(), now)
     for r in results:
-        _out("%-16s %-8s %s" % (r[0], r[1], r[2]))
+        _out("%-16s %-8s %s" % (r[0], r[1], log_detail(r)))
     if not write:
         _out("%s - nothing written" % ("dry run" if dry_run else "observe"))
         return 0

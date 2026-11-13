@@ -1,7 +1,18 @@
 # =============================================================================
 # 🧮 Consistency Check - the same figure on every page
 # -----------------------------------------------------------------------------
-# VERSION 1.2.0 (2026-11-11)
+# VERSION 1.3.0 (2026-11-13)
+#
+# 1.3.0: THE FIVE DIFFERENCES OF 13 NOV (owner, 12:34: "need to solve it").
+# A first step, scripts/cash_cells.py, writes the broker's free cash (the
+# read-only IBKR capture) into the two typed cash cells - Top_10_Investments
+# 'Cash Available (SAR)' and Portfolio_Decision 'PF: Cash Available SAR' -
+# so they cannot stay at a figure from before a purchase. Gate
+# TFB_CASH_CELLS (on here; off stops it). It may fail without stopping the
+# check. consistency_check.py 1.2.0: C11 counts market-open hours
+# (TFB_CONS_PAGE_IDLE_MAX_H 26 for a page nothing rebuilds), C10 no longer
+# reads a position-cap TRIM as a sell-side disagreement (new row C12), C1
+# flags only a main-page ticket the plan does not hold.
 #
 # 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). Minute 50 from 07:50 to 00:50
 # Riyadh: 18 runs, each after that hour's Daily Plan and Exit Plan.
@@ -14,9 +25,10 @@
 # pages and the Exit Plan disagreed on the day's tickets, on stops, on the USD
 # rate and on freshness, and nothing compared them (owner request 11:24).
 # WHAT: scripts/consistency_check.py reads the decision pages and writes one
-# page, Consistency_Check. It changes no other page and decides nothing.
+# page, Consistency_Check. The check changes no other page and decides
+# nothing; since 1.3.0 the step before it writes the two typed cash cells.
 # WHEN: every hour (1.1.0).
-# Rollback: repository variable TFB_CONSISTENCY=off.
+# Rollback: repository variable TFB_CONSISTENCY=off; TFB_CASH_CELLS=off.
 # =============================================================================
 name: 🧮 Consistency Check
 
@@ -76,6 +88,26 @@ jobs:
           fi
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
 
+      - name: 💵 Typed cash cells follow the broker
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_CASH_CELLS: ${{ vars.TFB_CASH_CELLS || 'on' }}
+          TFB_CASH_CELLS_TOL_SAR: ${{ vars.TFB_CASH_CELLS_TOL_SAR || '1' }}
+          TFB_PLAN_IBKR_MAX_AGE_H: ${{ vars.TFB_PLAN_IBKR_MAX_AGE_H || '30' }}
+          TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
+          TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ARGS=()
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          python scripts/cash_cells.py "${ARGS[@]}"
+
       - name: 🧮 Run the consistency check
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -88,6 +120,7 @@ jobs:
           TFB_CONS_STOP_TOL_PCT: ${{ vars.TFB_CONS_STOP_TOL_PCT || '1' }}
           TFB_CONS_SAR_TOL: ${{ vars.TFB_CONS_SAR_TOL || '50' }}
           TFB_CONS_PAGE_MAX_AGE_H: ${{ vars.TFB_CONS_PAGE_MAX_AGE_H || '2' }}
+          TFB_CONS_PAGE_IDLE_MAX_H: ${{ vars.TFB_CONS_PAGE_IDLE_MAX_H || '26' }}
           TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}

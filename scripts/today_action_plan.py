@@ -4,7 +4,11 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.3.1 (2026-11-13)
+v1.3.2 (2026-11-13)
+  1.3.2: A POSITION OVER THE CAP IS SHOWN, AND IS NOT A PAGE DIFFERENCE (owner, 13 Nov 12:34, on the Consistency_Check
+         rows: "need to solve it"). consistency_check 1.2.0 reports a Portfolio_Decision TRIM on a holding above
+         'PF: Max Position %' as C12 position cap (status OVER CAP) instead of a C10 mismatch. The page lists that row
+         with the differences, does not count it as one, and says OVER THE POSITION CAP in the summary line.
   1.3.1: Action advice requires current source pages and a usable broker capture. Missing custody, a position
          quantity mismatch, or an unpriced external buy reservation gives a VERIFY step with the research levels.
          Working orders remain visible. Ledger cash alone does not approve a new buy.
@@ -119,7 +123,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -331,14 +335,14 @@ def read_evidence(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
 
 
 def read_consistency(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
-    """Rows of the Consistency_Check page whose status is MISMATCH or STALE."""
+    """Rows of the Consistency_Check page whose status is MISMATCH, STALE or (1.3.1) OVER CAP."""
     h, col = find_table(values, ("Check", "Status", "Detail"))
     out: List[Dict[str, str]] = []
     if h is None:
         return out
     for r in list(values)[h + 1:]:
         st = text(cell(r, col["Status"])).upper()
-        if st in ("MISMATCH", "STALE"):
+        if st in ("MISMATCH", "STALE", "OVER CAP"):
             out.append({"check": text(cell(r, col["Check"])), "status": st, "detail": text(cell(r, col["Detail"]))})
     return out
 
@@ -875,6 +879,7 @@ for _k, (_bg, _label) in CHIP.items():                         # the step number
 ACTION_STYLE = {"SELL": "act_sell", "TAKE PROFIT": "act_profit", "RAISE STOP": "act_stop", "REVIEW": "act_review",
                 "CHECK": "act_review", "HOLD": "act_hold", "NO RULE": "act_none"}
 STATUS_STYLE = {"OPEN": "st_good", "WAIT": "st_warn", "MATCH": "st_good", "MISMATCH": "st_warn", "STALE": "st_warn",
+                "OVER CAP": "st_warn",
                 "INFO": "st_info", "none": "st_good", "not read": "st_bad", "PASS": "st_good", "FAIL": "st_bad",
                 "BROAD": "st_good", "MIXED": "st_info", "WASHED OUT": "st_warn", "WASHED_OUT": "st_warn"}
 
@@ -993,8 +998,9 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
             "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__),
             "sub")
     pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
-            "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
-                              flags + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
+            "know about%s" % (n_hold, n_buy, waiting, len([x for x in d["issues"] if x["status"] != "OVER CAP"]),
+                              flags + (" · OVER THE POSITION CAP" if any(x["status"] == "OVER CAP" for x in d["issues"])
+                                       else "") + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
                               (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")),
             "alert" if (d["stale"] or miss or flags) else "summary", 30)
     if d.get("aligned"):                                            # 1.3.0: five tiles - the day at a glance

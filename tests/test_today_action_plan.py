@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.3.1 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.3.2 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -1083,3 +1083,24 @@ def test_t10_repeated_build_drops_previous_order_and_funding_annotations():
     pick = third["picks"][0]
     assert all(k not in pick for k in ("placed", "unfunded", "review_reason"))
     assert any(s["symbol"] == "NMM.US" and s["do"].startswith("Buy 24") for s in third["steps"])
+
+
+# ----------------------------------------------------------------------------- T11 (1.3.2) a position over the cap
+def test_t11_a_position_over_the_cap_is_listed_and_not_counted_as_a_difference():
+    cap_row = ["C12 position cap", "OVER CAP", "above the position cap of 15%: AAA.US 18.0% (Exit Plan: RAISE STOP)"]
+    cons = [list(r) for r in CONS] + [cap_row, ["C1 decision", "INFO", "open picks the main page has not sized"]]
+    got = tap.read_consistency(cons)
+    assert [x["status"] for x in got] == ["MISMATCH", "STALE", "OVER CAP"] and got[2]["check"] == "C12 position cap"
+    assert tap.STATUS_STYLE["OVER CAP"] == "st_warn"
+    book = full_book()
+    book.tabs["Consistency_Check"].values = cons
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert "· 2 page difference(s) to know about" in page[2][0] and "· OVER THE POSITION CAP" in page[2][0]
+    at = [i for i, r in enumerate(page) if r[0] == "Page differences (Consistency_Check)"][0]
+    block = page[at + 2:at + 5]
+    assert [r[2] for r in block] == ["MISMATCH", "STALE", "OVER CAP"] and block[2][0] == "C12 position cap"
+    assert block[2][3].startswith("above the position cap of 15%: AAA.US 18.0%")
+    plain = full_book()                                                               # without the row: no flag
+    assert tap.run_once(False, book=plain, now=NOW) == 0
+    assert "OVER THE POSITION CAP" not in plain.tabs["Today_Action_Plan"].values[2][0]
