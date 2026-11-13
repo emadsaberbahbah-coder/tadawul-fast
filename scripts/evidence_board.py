@@ -4,7 +4,10 @@ scripts/evidence_board.py
 ================================================================================
 TFB Evidence Board - what the archive says works, measured again every day
 --------------------------------------------------------------------------------
-v1.2.0 (2026-11-12)
+v1.2.1 (2026-11-13)
+  1.2.1: THE SHEETS QUOTA IS WAITED OUT. The 17:42 Riyadh run of 13 Nov ended red on Sheets HTTP 429 with no retry.
+         Each workbook read now waits 65 s after a quota answer and tries again, twice at most
+         (scripts/sheets_quota.py); the BigQuery queries are not repeated. Every other error ends the run as before.
   1.2.0: FOLLOWS THE DAILY PLAN. GitHub did not start the 07:40 schedule on 12 Nov, so the morning's new picks had
          no board row and no ledger row. The workflow now also runs after every successful Daily Plan; with
          TFB_EVIDENCE_MIN_GAP_H (6 on those runs, 0 by hand) a run that finds a board younger than that returns
@@ -71,7 +74,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
+_SLEEP = time.sleep                                     # 1.2.1: the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -601,7 +605,11 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         if session is None:
             from scripts.archive_to_bigquery import make_session  # noqa: PLC0415
             session = make_session()
-        from scripts.daily_plan import _read, write_grid  # noqa: PLC0415
+        from scripts.daily_plan import _read as _raw_read, write_grid  # noqa: PLC0415
+        from scripts.sheets_quota import call as _quota_call  # noqa: PLC0415
+
+        def _read(b, tab, rng):                                     # 1.2.1: a quota answer is waited out
+            return _quota_call(lambda: _raw_read(b, tab, rng), _SLEEP, _out, "reading %s" % tab)
         gap = _env_num("TFB_EVIDENCE_MIN_GAP_H", 0, 0, 48)
         age = board_age_h(_read(book, TAB, "A1:A3"), now) if gap > 0 else None
         if gap > 0 and age is not None and 0 <= age < gap:

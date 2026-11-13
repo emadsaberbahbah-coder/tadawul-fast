@@ -2,7 +2,13 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.0.0 (2026-11-11) - NEW SCRIPT
+VERSION 1.3.1 (2026-11-13) - first written 2026-11-11 (1.0.0)
+
+1.3.1 (2026-11-13): THE SHEETS QUOTA IS WAITED OUT. Two runs of 13 Nov (16:21
+and 17:41 Riyadh) ended red on Sheets HTTP 429: the read was retried twice,
+20 s apart, inside the same quota minute. After a quota answer the wait is now
+65 s (scripts/sheets_quota.py), so each retry falls in a new quota minute;
+every other read error keeps the 20 s wait. Nothing else changes.
 
 WHY (owner, Wed 11 Nov 2026 09:30 Riyadh): fixed stop-loss and take-profit
 levels do not fit every stock. Each holding needs its own levels from its own
@@ -116,7 +122,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -837,9 +843,11 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             if type(e).__name__ == "WorksheetNotFound" or attempt == READ_ATTEMPTS:
                 _out("ERROR: cannot read the workbook: %s; nothing written" % type(e).__name__)
                 return 2
+            from scripts.sheets_quota import wait_for  # noqa: PLC0415
+            wait = wait_for(e, attempt) or READ_RETRY_S             # 1.3.1: a quota answer waits into a new minute
             _out("read failed (%s) - attempt %d of %d, retrying in %d s" % (type(e).__name__, attempt,
-                                                                          READ_ATTEMPTS, READ_RETRY_S))
-            _SLEEP(READ_RETRY_S)
+                                                                          READ_ATTEMPTS, wait))
+            _SLEEP(wait)
     info_map = read_info(grids)
     bars_cache: Dict[str, Tuple[List[Bar], Optional[float]]] = {}
     now_ts = now.timestamp()
