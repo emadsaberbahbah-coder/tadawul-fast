@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.59.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,83 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# v6.59.0 (2026-11-07) [CALIB-CALL-SPLIT]: the reliability calibration
+# shows each investability bucket's call mix and compares INVESTABLE with
+# WATCHLIST call family by call family. ENV-gated, DEFAULT OFF
+# (TRACK_CALIB_CALL_SPLIT) = v6.53.0 byte-identical apart from the version
+# string. 6.54.0-6.58.0 are claimed by the open PRs #845, #857, #915, #922
+# and #923, so this build takes 6.59.0; whichever lands later re-numbers.
+# EVIDENCE (track_performance run 42352240437, schedule 2026-11-07 07:40Z,
+#   main a85edfc6, 'By investability bucket'):
+#     BLOCKED     n=770   decided=204  win=76.5% roi=-2.14%
+#     INVESTABLE  n=1249  decided=1246 win=48.8% roi=-0.31%
+#     WATCHLIST   n=10978 decided=2410 win=55.9% roi=+0.37%
+#     "WARNING: WATCHLIST outperforms INVESTABLE in this sample -- the gate
+#     is inverted here; investigate before trusting the split."
+#   The 6 Nov audit (docs/reviews/comprehensive-audit-20261106.md on #924)
+#   lists "R11 Investigate BLOCKED bucket: 76.5 % wins with -2.14 % mean
+#   ROI" and makes the inversion a blocker before any promotion (R1).
+#   Both rows read two conventions side by side: win is the CALL's outcome
+#   (v6.46.0 [DIR-OUTCOME]: a buy wins when the price rose, a sell-family
+#   call when it fell, HOLD is neutral and not decided), while roi is the
+#   PRICE return averaged over every matured record, HOLD included
+#   (DELIBERATELY UNCHANGED in v6.46.0). So a bucket of sell calls that
+#   were right reads a high win rate next to a negative roi, and the
+#   inversion warning compares the buckets' pooled win rates although
+#   INVESTABLE is decided on 1,246 of 1,249 records (practically every
+#   call directional) and WATCHLIST on 2,410 of 10,978 (78% not decided:
+#   HOLD or breakeven; neither bucket's buy / sell mix is printed
+#   anywhere). A WATCHLIST win rate carried by sell calls in a falling
+#   sample would raise the same warning with the gate working. The report
+#   cannot tell the two apart today.
+# WHAT: with TRACK_CALIB_CALL_SPLIT=1/on/true/yes, ReliabilityCalibrator.
+#   calibrate attaches report.call_split (_calib_call_split, an instance
+#   attribute, NOT a dataclass field, so to_dict() / the _calibration.json
+#   export are unchanged even when on) and render_calibration_report prints,
+#   after the discrimination note:
+#     a six-line header naming the two conventions and the overlap caveat;
+#     per bucket: buy n / distinct symbols / decided / win / CI, the same
+#       for sell, hold n, call roi (the call-signed edge over the bucket's
+#       buy and sell records with a finite ROI: a buy's price return, a
+#       sell's move avoided = price ROI x -1) and price roi (the same
+#       records unsigned);
+#     "Like-for-like, buy calls only: <note>" and the same for sell calls,
+#       the note being the calibrator's own _discrimination recomputed on
+#       the INVESTABLE and WATCHLIST records of that family alone, or "n/a:
+#       <bucket> holds no <family> calls in this sample" when either side
+#       has none (the engine routes sell-family calls to WATCHLIST, so the
+#       sell line normally reads n/a and the buy line is the gate test).
+#   Every family figure comes from the calibrator's own _bucket (directional
+#   win rate, Wilson CI, min_sample sufficiency), so the numbers use the
+#   definitions the report already prints. Report/stdout only: no factor,
+#   TFB_CALIBRATION_FACTORS value, _S1_Calibration cell, _Run_Log payload,
+#   Performance_Log cell, gate, verdict or recommendation changes, on or
+#   off. Never raises out: with the gate on, an error logs one WARNING
+#   '[v6.59.0 CALIB-CALL-SPLIT] call split unavailable: <class>', sets
+#   call_split {} and prints one 'unavailable' line.
+# GATE: TRACK_CALIB_CALL_SPLIT, DEFAULT OFF. ENV LANE:
+#   .github/workflows/track_performance.yml 'Run performance clock' AND
+#   daily_sync.yml's tracker step (ENV PARITY; both map
+#   ${{ vars.TRACK_CALIB_CALL_SPLIT || 'off' }}). Safe to arm at once: it
+#   only adds report lines.
+# KNOWN LIMITS: the like-for-like note keeps _discrimination's wording and
+#   CI rule (non-overlapping Wilson intervals), which counts every matured
+#   record as an independent trial; a symbol is recorded daily per
+#   horizon, so its records overlap and the intervals are optimistic (the
+#   'sym' count is the effective sample to read them by). It holds the
+#   call family fixed, not the recording date (market regime), and says
+#   nothing about returns net of costs or a benchmark (R1's other asks).
+#   Records whose entry call does not parse (blank, unknown words) count
+#   as hold, as _reco_trade_sign has them.
+# ZERO functions removed. Additions: _calib_call_split_enabled,
+#   _calib_call_split, _fmt_call_family, _calib_call_split_lines
+#   (+ _CALL_SPLIT_TAG). Changed: ReliabilityCalibrator.calibrate builds
+#   the report into _rep and returns it (same object when off; when on it
+#   sets _rep.call_split inside a try); render_calibration_report prints
+#   _calib_call_split_lines(...) after the discrimination note (no line
+#   when the attribute is absent).
+# ROLLBACK: unset TRACK_CALIB_CALL_SPLIT (or set off).
+SCRIPT_VERSION = "6.59.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -8782,7 +8858,7 @@ class ReliabilityCalibrator:
                 f"{len(matured)} matured record(s)."
             )
 
-        return CalibrationReport(
+        _rep = CalibrationReport(
             generated_riyadh=RiyadhTime.format(),
             total_records=total,
             matured_records=len(matured),
@@ -8813,6 +8889,13 @@ class ReliabilityCalibrator:
             regret_n_board=regret_n_board,
             regret_n_alt=regret_n_alt,
         )
+        if _calib_call_split_enabled():   # v6.59.0 [CALIB-CALL-SPLIT], default off
+            try:
+                _rep.call_split = _calib_call_split(self, inv_groups)
+            except Exception as exc:   # never raises out; {} prints 'unavailable'
+                logger.warning("%s call split unavailable: %s", _CALL_SPLIT_TAG, type(exc).__name__)
+                _rep.call_split = {}
+        return _rep
 
 
 def _fmt_cal_bucket(b: CalibrationBucket) -> str:
@@ -8826,6 +8909,139 @@ def _fmt_cal_bucket(b: CalibrationBucket) -> str:
         f"claim~{b.claimed_win_rate:4.0f}% roi={b.mean_realized_roi:+6.2f}% "
         f"factor*{b.calibration_factor_shrunk:.2f}{star}"
     )
+
+
+# v6.59.0 [CALIB-CALL-SPLIT] (default off): see the v6.59.0 WHY block.
+_CALL_SPLIT_TAG = "[v6.59.0 CALIB-CALL-SPLIT]"
+
+
+def _calib_call_split_enabled() -> bool:
+    """v6.59.0: TRACK_CALIB_CALL_SPLIT=1/on/true/yes adds the call-mix block
+    to the reliability calibration. DEFAULT OFF (no attribute, no line)."""
+    return (os.getenv("TRACK_CALIB_CALL_SPLIT") or "off").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _calib_call_split(cal: Any, inv_groups: Dict[str, List[Any]]) -> Dict[str, Any]:
+    """v6.59.0 PURE: each investability bucket's matured records split by the
+    direction of the entry call (_reco_trade_sign: +1 buy family, -1 sell
+    family, 0 HOLD / unknown). Each family is scored by the calibrator's own
+    _bucket (directional win rate, Wilson CI, sufficiency) and carries its
+    distinct-symbol count (records of one symbol overlap, so the symbols are
+    the effective sample). call_roi is the call-signed edge over the
+    bucket's buy and sell records with a finite ROI: the price return for a
+    buy call, the move avoided (price ROI x -1) for a sell call. price_roi
+    is the plain mean over the same records. like_for_like holds the
+    calibrator's own INVESTABLE-vs-WATCHLIST note recomputed within the buy
+    calls and within the sell calls, or an 'n/a' line when either bucket
+    holds no call of that family. Reads the records only; never raises (an
+    error returns {} and logs one warning)."""
+    try:
+        buckets: List[Dict[str, Any]] = []
+        family: Dict[int, Dict[str, List[Any]]] = {1: {}, -1: {}}
+        for name in sorted(inv_groups or {}):
+            grp = list(inv_groups[name] or [])
+            by_sign: Dict[int, List[Any]] = {1: [], -1: []}
+            for r in grp:
+                sign = _reco_trade_sign(getattr(r, "entry_recommendation", None))
+                if sign in by_sign:
+                    by_sign[sign].append(r)
+            edges: List[float] = []
+            prices: List[float] = []
+            for sign, recs in by_sign.items():
+                for r in recs:
+                    roi = getattr(r, "realized_roi", None)
+                    if roi is None:
+                        continue
+                    try:
+                        v = float(roi)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(v):
+                        edges.append(v * sign)
+                        prices.append(v)
+            buckets.append({
+                "name": name,
+                "n": len(grp),
+                "buy": cal._bucket(name, by_sign[1]),
+                "sell": cal._bucket(name, by_sign[-1]),
+                "buy_symbols": len({_safe_str(getattr(r, "symbol", "")) for r in by_sign[1]}),
+                "sell_symbols": len({_safe_str(getattr(r, "symbol", "")) for r in by_sign[-1]}),
+                "hold": len(grp) - len(by_sign[1]) - len(by_sign[-1]),
+                "directional_n": len(edges),
+                # + 0.0 turns a rounded -0.0 into 0.0 (no '-0.00%')
+                "call_roi": round(sum(edges) / len(edges), 2) + 0.0 if edges else None,
+                "price_roi": round(sum(prices) / len(prices), 2) + 0.0 if prices else None,
+            })
+            family[1][name] = by_sign[1]
+            family[-1][name] = by_sign[-1]
+        like_for_like: Dict[str, str] = {}
+        for key, sign in (("buy", 1), ("sell", -1)):
+            inv_f = family[sign].get("INVESTABLE", [])
+            wat_f = family[sign].get("WATCHLIST", [])
+            missing = [nm for nm, lst in (("INVESTABLE", inv_f), ("WATCHLIST", wat_f)) if not lst]
+            if missing:
+                like_for_like[key] = "n/a: %s %s no %s calls in this sample (INVESTABLE n=%d, WATCHLIST n=%d)" % (
+                    " and ".join(missing), "hold" if len(missing) > 1 else "holds", key,
+                    len(inv_f), len(wat_f))
+            else:
+                like_for_like[key] = cal._discrimination(cal._bucket("INVESTABLE", inv_f),
+                                                         cal._bucket("WATCHLIST", wat_f))
+        return {"buckets": buckets, "like_for_like": like_for_like}
+    except Exception as exc:
+        logger.warning("%s call split unavailable: %s", _CALL_SPLIT_TAG, type(exc).__name__)
+        return {}
+
+
+def _fmt_call_family(label: str, b: Any, symbols: Any = None) -> str:
+    """v6.59.0: one call family of a bucket, in _fmt_cal_bucket's notation."""
+    n = getattr(b, "n", 0)
+    sym = "" if symbols is None or not n else f" ({symbols} sym)"
+    if not n:
+        return f"{label} n=0"
+    if not getattr(b, "decided", 0):
+        return f"{label} n={n}{sym} decided=0"
+    point = f"{b.realized_win_rate:.1f}%" if b.sufficient else "(thin)"
+    return (f"{label} n={b.n}{sym} decided={b.decided} win={point} "
+            f"CI[{b.ci_low:.0f},{b.ci_high:.0f}]")
+
+
+def _calib_call_split_lines(split: Any) -> List[str]:
+    """v6.59.0 PURE: the report lines of a _calib_call_split result. [] when
+    there is no split (gate off: no attribute) or no bucket; one
+    'unavailable' line for an empty or malformed split (gate on, the split
+    failed). Never raises."""
+    if not isinstance(split, dict):
+        return []
+    unavailable = [f"  Call mix {_CALL_SPLIT_TAG}: unavailable (the split could not be computed; see the log)"]
+    if not split:
+        return unavailable
+    if isinstance(split.get("buckets"), list) and not split["buckets"]:
+        return []
+    try:
+        out = [
+            f"  Call mix {_CALL_SPLIT_TAG}: win = the call was right (a buy rose, a sell fell);",
+            "    call roi = price ROI x call sign over the buy and sell calls (a buy's return, a",
+            "    sell's move avoided); price roi = the same records unsigned; HOLD is neutral. The",
+            "    bucket 'roi' above is the price ROI over all n, HOLD included. CIs count every",
+            "    record as independent; one symbol's daily records overlap, so 'sym' is the",
+            "    effective sample.",
+        ]
+        for row in split["buckets"]:
+            if row.get("call_roi") is None:
+                roi = "call roi=n/a"
+            else:
+                roi = "call roi=%+.2f%% price roi=%+.2f%%" % (row["call_roi"], row["price_roi"])
+            out.append(
+                f"    {row['name']:<14} {_fmt_call_family('buy', row['buy'], row.get('buy_symbols'))} | "
+                f"{_fmt_call_family('sell', row['sell'], row.get('sell_symbols'))} | "
+                f"hold n={row['hold']} | {roi}")
+        for key in ("buy", "sell"):
+            note = (split.get("like_for_like") or {}).get(key)
+            if note:
+                out.append(f"  Like-for-like, {key} calls only: {note}")
+        return out
+    except Exception:
+        return unavailable
 
 
 def render_calibration_report(rep: CalibrationReport, verbose: bool = False) -> None:
@@ -8850,6 +9066,8 @@ def render_calibration_report(rep: CalibrationReport, verbose: bool = False) -> 
     for b in rep.by_investability:
         _out(_fmt_cal_bucket(b))
     _out(f"  {rep.discrimination_note}")
+    for _line in _calib_call_split_lines(getattr(rep, "call_split", None)):   # v6.59.0
+        _out(_line)
     _out("")
     _out("By stated-reliability band:")
     for b in rep.by_reliability_band:

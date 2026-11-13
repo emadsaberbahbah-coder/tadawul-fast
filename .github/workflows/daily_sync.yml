@@ -1484,6 +1484,11 @@ jobs:
           TRACK_DEDUP_MATURED: ${{ vars.TRACK_DEDUP_MATURED || 'off' }}
           TRACK_RISK_BLANK: ${{ vars.TRACK_RISK_BLANK || '0' }}
           TRACK_DEDUP_SIGNAL_HISTORY: ${{ vars.TRACK_DEDUP_SIGNAL_HISTORY || 'observe' }}
+          # (2026-11-07) track_performance v6.59.0 [CALIB-CALL-SPLIT], mirrored from
+          # track_performance.yml 1.0.13 (ENV PARITY): the calibration's call-mix
+          # and like-for-like lines on this lane's --analyze too. Report lines
+          # only. 'off' = v6.53.0. ROLLBACK: unset.
+          TRACK_CALIB_CALL_SPLIT: ${{ vars.TRACK_CALIB_CALL_SPLIT || 'off' }}
           # (2026-10-11) v6.45.0 prospective schema / publication identities.
           # Defaults off: arm one measured lane-consistent feature at a time.
           # Immutable snapshots retain first and subsequent daily publications;

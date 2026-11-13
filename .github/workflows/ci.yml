@@ -2,6 +2,24 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.84 (2026-11-07) -- CALIBRATION CALL MIX (track_performance v6.59.0)
+# (Main holds every number up to 1.1.79; its 1.1.75 is a line inside its
+# 1.1.76 block. Open claims, re-numbered 2026-11-11 so each sits above main's
+# newest block: 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926,
+# 1.1.85 #954, 1.1.86 #938, 1.1.87 #915.
+# This release first claimed 1.1.71, then 1.1.77.)
+#
+# v1.1.84: run tests/test_calib_call_split.py (track_performance v6.59.0
+# [CALIB-CALL-SPLIT], TRACK_CALIB_CALL_SPLIT default off = v6.53.0: the
+# reliability calibration's per-bucket buy / sell / hold split, call-signed
+# ROI and like-for-like INVESTABLE vs WATCHLIST notes) in its own blocking
+# lean-unit step after the board scorecard harness. Offline fixtures and an
+# embedded v6.53.0 golden; the step fetches main a85edfc6 by SHA for the
+# legs that read it with `git show` and sets TFB_TEST_REQUIRE_BASE=1, so a
+# missing base FAILS those legs instead of skipping them. PyYAML (already in
+# the lane) reads the tracker and CI workflows. Nothing is removed and no
+# existing entry moves.
+#
 # VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
 #
 # v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
@@ -1324,6 +1342,17 @@ jobs:
             f60cff37707812bd89f41c47ed4ddd3f2c4c9746 \
             || echo "::notice::scorecard golden bases not fetched - P9/P12/P15 will SKIP"
           python tests/test_board_scorecard_p182.py
+
+      - name: Calibration call mix (track_performance v6.59.0, golden base fetched by SHA)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
+        run: |
+          # v1.1.84: the off-identity, V2 and X1 legs read track_performance
+          # v6.53.0 at main a85edfc6; with TFB_TEST_REQUIRE_BASE=1 a failed
+          # fetch FAILS them instead of skipping them.
+          git fetch --no-tags --depth=1 origin a85edfc6099ac3b44ff0a24b36d74f712843a33a \
+            || echo "::warning::a85edfc6 base not fetched - the golden legs will FAIL"
+          python -m pytest -q tests/test_calib_call_split.py
 
       - name: ✅ Coverage note
         run: |
