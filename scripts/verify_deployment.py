@@ -358,11 +358,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.5.0", "daily plan"),
+    ("daily_plan", "1.6.0", "daily plan"),
     ("exit_plan", "1.3.0", "exit plan"),
     ("consistency_check", "1.1.0", "consistency check"),
     ("evidence_board", "1.2.0", "evidence board"),
-    ("today_action_plan", "1.1.0", "today action plan"),
+    ("today_action_plan", "1.2.0", "today action plan"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]

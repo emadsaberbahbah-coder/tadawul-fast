@@ -1,7 +1,11 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.4.0 (2026-11-12)
+# VERSION 1.5.0 (2026-11-13)
+#
+# 1.5.0: CASH FROM THE CASH LEDGER (daily_plan 1.6.0). The cut sizes from the
+# smaller of the main page's typed cash cell and the latest _Cash_Snapshot
+# balance: TFB_PLAN_CASH_SOURCE lower | snapshot | panel.
 #
 # 1.4.0: STABILITY AND QUOTE AGE (daily_plan 1.5.0; consolidated plan of 12 Nov).
 # A new name is picked first when its score is at the entry level (72); a
@@ -135,6 +139,7 @@ jobs:
           TFB_PLAN_DIV_TAX_MIN_PCT: ${{ vars.TFB_PLAN_DIV_TAX_MIN_PCT || '0.25' }}
           TFB_PLAN_WHT_PCT: ${{ vars.TFB_PLAN_WHT_PCT || '30' }}
           TFB_PLAN_STABLE: ${{ vars.TFB_PLAN_STABLE || 'prefer' }}
+          TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'lower' }}
           TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}
           TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}

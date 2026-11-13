@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.1.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.2.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -649,3 +649,179 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     assert "TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}" in raw
     assert ("TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE "
             "|| 'on' }}") in raw and "TFB_TAP_STALE_EVIDENCE_H: ${{ vars.TFB_TAP_STALE_EVIDENCE_H || '18' }}" in raw
+
+
+# ----------------------------------------------------------------------------- T8 (1.2.0) aligned with the other pages
+T10 = [["TOP 10 INVESTMENTS - DECISION"], ["Status:", "Last run 2026-11-12 08:52:11 | status: ok | output: QUALIFIED_UNFUNDED"],
+       [], ["FEED ACTIONABLE - HELD - 0 EXECUTABLE TICKETS + 3 RESEARCH (NO ALLOCATION)"],
+       ["Rank", "Symbol", "Name", "Price", "Ticket SAR", "Shares", "Funds From", "Stability"],
+       ["1", "ZTO.US", "ZTO", "20.46", "6,000 SAR", "78", "Cash", "ACTIVE (day 3)"],
+       ["2", "NMM.US", "Navios", "88.00", "0 SAR", "0", "Research — no allocation", "FAST-TRACK"],
+       ["3", "EFC.US", "Ellington", "11.60", "—", "—", "", "GRACE (1/3 missed)"],
+       [], ["ALL QUALIFIED"], ["Rank", "Symbol", "Name"], ["1", "OTHER.US", "x"]]
+V2 = [["TOP 10 INVESTMENTS — DECISION v2", "", "EXECUTABLE", "run 1 · cockpit 2026-11-12 06:46:43 · page built 2026-11-12 08:16"],
+      ["Feed: released"], [],
+      ["#", "Symbol · name", "", "3-month close", "Seat status", "Price", "Alloc SAR", "Buy qty", "Flags"],
+      ["2", "TEN.US · Tsakos Energy", "", "", "ACTIVE (day 3)", "47.04 USD", "5,117", "29", "engine ticket"],
+      ["4", "NMM.US · Navios", "", "", "FAST-TRACK (day 2)", "88.00 USD", "—", "—", "research"],
+      [], ["next table"]]
+NEWS = [["Run At (Riyadh)", "Run ID", "Verdict", "Drivers"],
+        ["2026-11-11 04:34", "1", "GO", ""],
+        ["2026-11-12 03:32", "2", "NO_NEW_ENTRY", "macro: war_escalation/hormuz grade 1, 17 sources"]]
+CASH = [["Date", "Time", "Type", "Amount SAR", "Balance SAR", "Delta vs Prev", "Note"],
+        ["2026-11-10", "", "SNAPSHOT (broker read)", "33,125.00", "", "", ""],
+        ["2026-11-12", "", "CALCULATED SNAPSHOT", "-15,578.18", "17,546.82", "-15,578.18", "deduction"]]
+
+
+def aligned_book(**over):
+    tabs = {"Top_10_Investments": Sheet(T10), "Top_10_Investments_v2": Sheet(V2), "_News_Gate": Sheet(NEWS),
+            "_Cash_Snapshot": Sheet(CASH)}
+    tabs.update(over)
+    return full_book(**tabs)
+
+
+def test_t8_readers_of_the_top10_pages_the_news_gate_and_cost():
+    t = tap.read_top10(T10)
+    assert t["read"] and t["built"] == "2026-11-12 08:52" and t["banner"].startswith("FEED ACTIONABLE - HELD")
+    assert list(t["seats"]) == ["ZTO.US", "NMM.US", "EFC.US"]                             # stops at the first blank row
+    assert t["seats"]["ZTO.US"] == {"ticket": 6000.0, "shares": 78.0, "seat": "Cash"}
+    assert t["seats"]["NMM.US"]["seat"] == "Research — no allocation" and t["seats"]["EFC.US"]["seat"] == "GRACE (1/3 missed)"
+    v = tap.read_top10_v2(V2)
+    assert v["read"] and v["banner"] == "EXECUTABLE" and v["built"] == "2026-11-12 08:16"
+    assert v["seats"] == {"TEN.US": {"ticket": 5117.0, "shares": 29.0, "seat": "ACTIVE (day 3)"},
+                          "NMM.US": {"ticket": 0.0, "shares": 0.0, "seat": "FAST-TRACK (day 2)"}}
+    assert not tap.read_top10([])["read"] and not tap.read_top10_v2([["x"]])["read"]
+    broken = [list(r) for r in V2]                                                       # live page, 13 Nov: header cells
+    broken[3] = ["#", "Symbol \u00b7 name", "", "3-month\nclose", "Seat\nstatus", "Price", "Alloc\u00a0SAR", "Buy\n qty", "Flags"]
+    assert tap.read_top10_v2(broken)["seats"] == v["seats"]                               # broken over two lines
+    prev = [list(r) for r in V2]                                                         # live page, 13 Nov 11:16: no engine
+    prev[3][6:8] = ["Preview SAR", "Preview qty"]                                        # ticket -> a research preview
+    pv = tap.read_top10_v2(prev)
+    assert pv["read"] and pv["seats"]["TEN.US"] == {"ticket": 0.0, "shares": 0.0, "seat": "ACTIVE (day 3)", "preview": (5117.0, 29.0)}
+    assert "preview" not in pv["seats"]["NMM.US"]
+    assert tap._seat_text(pv, "TEN.US") == ("ACTIVE (day 3) · preview only (29 shares), not a ticket", False)
+    rows = tap.align(tap.read_plan(LEDGER, dt.date(2026, 11, 12)), t, pv)
+    assert [(a["symbol"], a["level"]) for a in rows] == [("NMM.US", "soft"), ("EFC.US", "ok"), ("ZERO.US", "ok"), ("ZTO.US", "hard")]
+    wrapped = [list(r) for r in T10]
+    wrapped[4] = ["Rank", "Symbol", "Name", "Price", "Ticket\nSAR", "Shares", "Funds\nFrom", "Stability"]
+    assert tap.read_top10(wrapped)["seats"] == t["seats"]
+    n = tap.read_news_gate(NEWS, NOW)                                                     # 09:00 Riyadh, 12 Nov
+    assert (n["verdict"], n["at"]) == ("NO_NEW_ENTRY", "2026-11-12 03:32") and round(n["age_h"], 2) == 5.47
+    assert not tap.read_news_gate([], NOW)["read"] and tap.read_news_gate(NEWS[:2], NOW)["verdict"] == "GO"
+    assert tap.pick_cost({"alloc": 7800.0, "qty": 1, "price": 1, "ccy": "USD"}) == 7800.0
+    assert tap.pick_cost({"qty": 10, "price": 100.0, "ccy": "usd"}) == 3750.0 and tap.pick_cost({"qty": 10, "price": 5.0, "ccy": "SAR"}) == 50.0
+    assert tap.pick_cost({"qty": 10, "price": 5.0, "ccy": "GBX"}) is None and tap.pick_cost({"qty": 0, "price": 5.0, "ccy": "USD"}) is None
+    # Codex P2, #971: the cost is taken at the highest price the buy step allows, not at the entry price
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 100.0, "zone_high": 101.0, "ccy": "USD"}) == 3787.5
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 101.5, "zone_high": 101.0, "ccy": "USD"}) == 3806.25
+    assert tap.pick_cost({"alloc": 3750.0, "qty": 10, "price": 99.0, "zone_high": 99.5, "ccy": "USD"}) == 3750.0   # never under
+    assert tap.pick_cost({"alloc": 900.0, "qty": 10, "price": 5.0, "zone_high": 5.1, "ccy": "GBX"}) == 900.0        # no rate
+    tight = [{"symbol": "T", "status": "OPEN", "qty": 10, "rank": 1, "alloc": 3750.0, "price": 101.0, "zone_high": 101.0, "ccy": "USD"}]
+    assert tap.fund(tight, 3750.0) == 3750.0 and tight[0]["unfunded"] == (3787.5, 3750.0)
+    picks = [{"symbol": "B", "status": "OPEN", "qty": 1, "rank": 2, "alloc": 6000.0},
+             {"symbol": "A", "status": "OPEN", "qty": 1, "rank": 1, "alloc": 7000.0},
+             {"symbol": "C", "status": "OPEN", "qty": 1, "rank": 3, "alloc": 3000.0},
+             {"symbol": "W", "status": "WAIT", "qty": 1, "rank": 0, "alloc": 9000.0}]
+    assert tap.fund(picks, 10500.0) == 500.0                                             # A, then C fits; B does not
+    assert [p["symbol"] for p in picks if p.get("unfunded")] == ["B"] and picks[0]["unfunded"] == (6000.0, 3500.0)
+    assert tap.fund([dict(p, unfunded=None) for p in picks], None) is None                # cash not known: nothing marked
+
+
+def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
+    """13 Nov: this page said buy three names, the v2 page sized a fourth, the main page sized none."""
+    book = aligned_book()
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    cs = cards(page)
+    assert [(c[0], c[1]) for c in cs] == [(1, "SUPN.US"), (2, "DDI.US"), (3, "IBOC.US"), (4, "TEN.US"), (5, "ZTO.US"),
+                                          (6, "NEWS"), (7, "NMM.US")]
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    assert [page[a + 3 + 2 * i][0] for i in (3, 4, 5, 6)] == ["DO NOT BUY", "DO NOT BUY", "READ FIRST", "BUY"]
+    assert cs[3][2] == "Do not buy TEN.US from Top_10_Investments_v2: it is not in today's plan."
+    assert cs[3][3] == "Top_10_Investments_v2" and cs[3][4] == "shown there: 29 shares, 5,117 SAR"
+    assert cs[4][2] == "Do not buy ZTO.US from Top_10_Investments: the plan holds it back (next in line (rank 9))."
+    assert cs[5][2] == "Read before buying: the News & Macro Gate reads NO NEW ENTRY (2026-11-12 03:32 Riyadh)."
+    assert cs[5][5] == "macro: war_escalation/hormuz grade 1, 17 sources" and cs[5][4].startswith("observe-only gate")
+    assert page[2][0] == ("3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to "
+                          "know about · PAGES DISAGREE: ZTO.US, TEN.US · NEWS GATE: NO NEW ENTRY")
+    fm = book.tabs["Today_Action_Plan"].formats
+    assert fm[2][0]["backgroundColor"] == tap._rgb(tap.STYLES["alert"]["bg"])
+    assert fm[a + 2 + 6][0]["backgroundColor"] == tap._rgb(tap.CHIP["skip"][0])           # the TEN card
+    g = [i for i, r in enumerate(page) if str(r[0]).startswith("PAGE ALIGNMENT")][0]
+    assert page[g + 2][0] == "Top 10 (main)" and page[g + 2][2].endswith("built 2026-11-12 08:52")
+    assert page[g + 3][:3] == ["Top 10 v2", "", "EXECUTABLE · built 2026-11-12 08:16"]
+    rows = {r[0]: r for r in page[g + 5:g + 10]}
+    assert rows["NMM.US"][1] == "OPEN - buy 24" and rows["NMM.US"][3] == "Research — no allocation"
+    assert rows["NMM.US"][5] == "FAST-TRACK (day 2)" and rows["NMM.US"][8] == (
+        "FOLLOW THIS PAGE: the plan is the order of record; the Top 10 pages show no ticket.")
+    assert rows["EFC.US"][1] == "WAIT - price 11.60 is above the entry zone" and rows["EFC.US"][8] == "ALIGNED: no page sizes it."
+    assert rows["TEN.US"][1] == "not in today's plan" and rows["TEN.US"][3] == "not seated" and rows["TEN.US"][5] == "ticket: 29 shares, 5,117 SAR"
+    assert rows["TEN.US"][8] == "DO NOT BUY from Top_10_Investments_v2: it is not in today's plan."
+    assert rows["ZTO.US"][1] == "pipeline: next in line (rank 9)" and rows["ZTO.US"][3] == "ticket: 78 shares, 6,000 SAR"
+    assert fm[g + 5 + list(rows).index("TEN.US")][8]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1])
+    assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32" for r in page)
+    assert any(r[0] == "17,547 SAR" and r[3] == "open buys cost 7,921 SAR · left after the funded buys 9,626 SAR" for r in page)   # 24 x 88.01 x 3.75
+    out = capsys.readouterr().out
+    assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash 17,547 SAR" in out
+    for name in ("Top_10_Investments", "Top_10_Investments_v2", "_News_Gate", "_Cash_Snapshot"):
+        assert book.tabs[name].updates == 0 and book.tabs[name].hides == 0                # read only
+    both = aligned_book(Top_10_Investments=Sheet(T10[:6] + [["2", "NMM.US", "Navios", "88", "7,800 SAR", "24", "Cash", ""]]),
+                        Top_10_Investments_v2=Sheet(V2[:4] + [["4", "NMM.US · Navios", "", "", "ACTIVE", "", "7,800", "24"]]),
+                        _News_Gate=Sheet(NEWS[:2]))
+    assert tap.run_once(False, book=both, now=NOW) == 0
+    p2 = both.tabs["Today_Action_Plan"].values
+    assert any(r[0] == "NMM.US" and r[8] == "ALIGNED: all three pages size it." for r in p2)
+    assert [c[1] for c in cards(p2)] == ["SUPN.US", "DDI.US", "IBOC.US", "ZTO.US", "NMM.US"]   # GO: no READ FIRST step
+    assert "NEWS GATE" not in p2[2][0] and p2[2][0].endswith("· PAGES DISAGREE: ZTO.US")
+
+
+def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
+    poor = [list(r) for r in CASH] + [["2026-11-12", "", "CALCULATED SNAPSHOT", "-12,546.82", "5,000.00", "", ""]]
+    book = aligned_book(_Cash_Snapshot=Sheet(poor), Top_10_Investments_v2=Sheet(V2[:4]), Top_10_Investments=Sheet(T10[:5]))
+    assert tap.run_once(False, book=book, now=NOW) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    cs = cards(page)
+    assert [(c[1]) for c in cs] == ["SUPN.US", "DDI.US", "IBOC.US", "NMM.US"]              # no buy left: no READ FIRST step
+    assert cs[3][2] == ("NMM.US is not funded today: its 24 shares need 7,921 SAR and 5,000 SAR of cash is left after "
+                        "the buys above.")
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    assert page[a + 3 + 2 * 3][0] == "NOT FUNDED" and "Buy 24 NMM.US" not in " ".join(str(c) for r in page for c in r)
+    assert page[2][0].startswith("3 step(s) on holdings · 0 new buy(s) open") and "· NOT FUNDED: NMM.US · NEWS GATE: NO NEW ENTRY" in page[2][0]
+    assert any(r[0] == "NMM.US" and r[1] == "OPEN, not funded today" and r[8] == "ALIGNED: no page sizes it." for r in page)
+    fresh_go = aligned_book(_News_Gate=Sheet(NEWS + [["2026-11-12 08:00", "3", "GO", ""]]))   # the latest verdict is GO
+    assert tap.run_once(False, book=fresh_go, now=NOW) == 0
+    gp = fresh_go.tabs["Today_Action_Plan"].values
+    assert not any(r[1] == "NEWS" for r in gp) and "NEWS GATE" not in gp[2][0] and any(r[0] == "GO" and r[2] == "2026-11-12 08:00" for r in gp)
+    late = aligned_book()                                                                 # the verdict is 29.5 h old
+    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
+    lp = late.tabs["Today_Action_Plan"].values
+    assert not any(r[1] == "NEWS" for r in lp) and "NEWS GATE" not in lp[2][0]
+    assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32 (older than the limit)" for r in lp)
+    monkeypatch.setenv("TFB_TAP_NEWS_MAX_H", "48")
+    assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
+    assert "NEWS GATE: NO NEW ENTRY" in late.tabs["Today_Action_Plan"].values[2][0]
+    monkeypatch.delenv("TFB_TAP_NEWS_MAX_H")
+
+    class Odd(Sheet):                                                                    # an optional tab that will not read
+        def get(self, rng):
+            raise RuntimeError("bad range")
+    odd = aligned_book(Top_10_Investments=Odd([]), _Cash_Snapshot=Odd([]))
+    assert tap.run_once(False, book=odd, now=NOW) == 0
+    op = odd.tabs["Today_Action_Plan"].values
+    out = capsys.readouterr().out
+    assert "Top_10_Investments not read: RuntimeError" in out and "_Cash_Snapshot not read: RuntimeError" in out
+    assert any(r[0] == "Top 10 (main)" and r[2] == "page not read" for r in op)
+    assert any("The _Cash_Snapshot tab was not read" in str(r[1]) for r in op)
+    assert [c[1] for c in cards(op)] == ["SUPN.US", "DDI.US", "IBOC.US", "TEN.US", "NEWS", "NMM.US"]   # v2 still read
+    waits = []
+    slow = aligned_book(_News_Gate=Flaky(NEWS, fail=1))                                   # the quota on an optional tab
+    assert tap.run_once(False, book=slow, now=NOW, sleep=waits.append) == 0 and waits == [20.0]
+    assert any(r[1] == "NEWS" for r in slow.tabs["Today_Action_Plan"].values)
+    monkeypatch.setenv("TFB_TAP_ALIGN", "off")
+    off = aligned_book(Top_10_Investments=Odd([]))
+    assert tap.run_once(False, book=off, now=NOW) == 0
+    fp = off.tabs["Today_Action_Plan"].values
+    assert not any(str(r[0]).startswith("PAGE ALIGNMENT") for r in fp) and [c[1] for c in cards(fp)] == ["SUPN.US", "DDI.US", "IBOC.US", "NMM.US"]
+    assert fp[2][0] == "3 step(s) on holdings · 1 new buy(s) open · 1 pick(s) waiting for price · 2 page difference(s) to know about"
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_ALIGN: ${{ vars.TFB_TAP_ALIGN || 'on' }}" in raw and "TFB_TAP_NEWS_MAX_H: ${{ vars.TFB_TAP_NEWS_MAX_H || '24' }}" in raw

@@ -791,3 +791,46 @@ def test_h5_workflow_maps_the_new_knobs():
     assert env["TFB_PLAN_STABLE_ENTER"] == "${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}"
     assert env["TFB_PLAN_STABLE_EXIT"] == "${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}"
     assert env["TFB_PLAN_QUOTE_MAX_AGE_H"] == "${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}"
+
+
+# ----------------------------------------------------------------------------- H6 (1.6.0) cash from the cash ledger
+SNAP = [["Date", "Time", "Type", "Amount SAR", "Balance SAR", "Delta vs Prev", "Note"],
+        ["2026-07-17", "", "OPENING (broker read)", "17,025.00", "17,025.00", "", ""],
+        ["2026-11-10", "", "SNAPSHOT (broker read)", "33,125.00", "", "", "Derayah USD 9130"],
+        ["2026-11-12", "", "CALCULATED SNAPSHOT", "-15,578.18", "17,546.82", "-15,578.18", "User-requested deduction"]]
+
+
+def test_h6_the_cut_sizes_from_the_cash_ledger_when_it_is_lower(monkeypatch, capsys):
+    """13 Nov: the typed cell read 33,125 SAR the morning after two buys; the cash ledger read 17,547."""
+    assert dp.snapshot_cash(SNAP) == (17546.82, "2026-11-12 · CALCULATED SNAPSHOT")
+    assert dp.snapshot_cash(SNAP[:3]) == (33125.0, "2026-11-10 · SNAPSHOT (broker read)")    # the only figure of the row
+    assert dp.snapshot_cash([]) == (None, "") and dp.snapshot_cash([["x"], ["2026-11-12", "5"]]) == (None, "")
+    assert dp.snapshot_cash(SNAP[:1] + [["not a date", "", "X", "", "9"], ["2026-11-12", "", "CALCULATED", "-5", ""]]) == (None, "")
+    assert dp.snapshot_cash(SNAP[:1] + [["2026-11-12", "", "CALCULATED SNAPSHOT", "500", ""]]) == (None, "")   # a change, not a balance
+    # Codex P2, #971: the latest balance stands when it is negative - no buying power, never the older figure
+    assert dp.snapshot_cash(SNAP + [["2026-11-13", "", "CALCULATED SNAPSHOT", "-17,646.82", "-100.00"]]) == (
+        0.0, "2026-11-13 · CALCULATED SNAPSHOT")
+    assert dp.snapshot_cash(SNAP[:1] + [["2026-11-12", "", "WITHDRAWAL", "500", ""]]) == (None, "")   # not a broker read
+    assert dp.sizing_cash(33125.0, 0.0, "lower") == (0.0, "snapshot (lower than the panel)")
+    assert dp.sizing_cash(33125.0, 17546.82, "lower") == (17546.82, "snapshot (lower than the panel)")
+    assert dp.sizing_cash(10000.0, 17546.82, "lower") == (10000.0, "panel (not above the snapshot)")
+    assert dp.sizing_cash(33125.0, 17546.82, "snapshot")[0] == 17546.82 and dp.sizing_cash(33125.0, 17546.82, "panel") == (33125.0, "panel")
+    assert dp.sizing_cash(33125.0, None, "lower") == (33125.0, "panel")
+    assert dp.cash_source_mode() == "lower"
+    monkeypatch.setenv("TFB_DAILY_PLAN", "on")
+    rich, poor = book(), book(_Cash_Snapshot=Sheet(SNAP))
+    assert dp.main([], book=rich, now=NOW) == 0                                           # no cash ledger: as before
+    out_rich = capsys.readouterr().out
+    assert dp.main([], book=poor, now=NOW) == 0
+    out_poor = capsys.readouterr().out
+    assert "cash for sizing: 33,125 SAR from the panel | panel 33,125 | snapshot not read" in out_rich
+    assert ("cash for sizing: 17,547 SAR from the snapshot (lower than the panel) | panel 33,125 | snapshot 17,547 "
+            "(2026-11-12 · CALCULATED SNAPSHOT)") in out_poor
+    qty = lambda b: sum(float(r[14] or 0) * float(r[11] or 0) for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK")
+    assert 0 < qty(poor) < qty(rich)                                                      # smaller tickets, never larger
+    monkeypatch.setenv("TFB_PLAN_CASH_SOURCE", "panel")
+    old = book(_Cash_Snapshot=Sheet(SNAP))
+    assert dp.main([], book=old, now=NOW) == 0 and qty(old) == qty(rich)
+    assert "cash for sizing: 33,125 SAR from the panel" in capsys.readouterr().out
+    raw = (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'lower' }}" in raw

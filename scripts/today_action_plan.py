@@ -4,7 +4,21 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.1.0 (2026-11-12)
+v1.2.0 (2026-11-13)
+  1.2.0: ALIGNED WITH THE TOP 10 PAGES, THE NEWS GATE AND THE CASH LEDGER (owner, 13 Nov 11:05: "between top investment
+         and V2 top investment and today action misalignment need to be matching and aligned to avoid mistake").
+         On 13 Nov three pages gave three answers: this page said buy EFC, INSW and AX; Top_10_Investments_v2 read
+         EXECUTABLE with a 29-share ticket on TEN (earnings in 6 days - the plan holds it back); the main page sized
+         nothing. Two more facts never reached this page: the News & Macro Gate read NO_NEW_ENTRY (Hormuz), and the
+         three buys cost about 21,700 SAR against 17,547 SAR of cash. Now:
+           - PAGE ALIGNMENT (new section): every name that is a pick here or a sized ticket on either Top 10 page, with
+             what each page says and one reading. This page is the order of record.
+           - a ticket on a Top 10 page that is not an OPEN pick here becomes a DO NOT BUY step;
+           - buys are funded in rank order from the latest _Cash_Snapshot balance; one that does not fit reads
+             NOT FUNDED instead of BUY;
+           - a News & Macro Gate verdict other than GO, at most TFB_TAP_NEWS_MAX_H hours old (24), is a READ FIRST step
+             ahead of the buys (the gate is observe-only: the plan does not obey it yet).
+         The four new reads are optional: a tab that cannot be read is named "not read" and changes no step.
   1.1.0: THE PAGE'S DESIGN (owner, 12 Nov 12:07: "this page need to improve formatting ... to get better design").
          Until now the page was a plain grid: one font, no colour, ten equal columns, text running under its
          neighbours. Now:
@@ -73,7 +87,7 @@ ENV
     TFB_TAP_HIDE_TABS (_Daily_Plan,_Exit_Plan,_Evidence_Log; "none" = hide none),
     TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none),
     TFB_TAP_STYLE (on | off = plain grid), TFB_TAP_PREVIEW (false | true = write the preview tab),
-    TFB_TAP_STALE_EVIDENCE_H (18).
+    TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_NEWS_MAX_H (24).
 ================================================================================
 """
 from __future__ import annotations
@@ -87,7 +101,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -254,7 +268,8 @@ def read_plan(values: Sequence[Sequence[Any]], today: _dt.date) -> Dict[str, Any
              "stop": num(cell(r, col.get("Stop"))), "tp1": num(cell(r, col.get("TP1"))),
              "score": num(cell(r, col.get("Score"))), "labels": text(cell(r, col.get("Labels"))),
              "waiting": text(cell(r, col.get("Waiting For"))), "status": text(cell(r, col.get("Status"))).upper(),
-             "reason": text(cell(r, col.get("Status Reason"))), "price": num(cell(r, col.get("Last Price")))}
+             "reason": text(cell(r, col.get("Status Reason"))), "price": num(cell(r, col.get("Last Price"))),
+             "alloc": num(cell(r, col.get("Alloc SAR")))}
         out["cut_at"] = out["cut_at"] or text(cell(r, col.get("Cut At (Riyadh)")))
         out["quality"] = out["quality"] or text(cell(r, col.get("Cut Quality")))
         kind = text(cell(r, col["Kind"])).upper()
@@ -311,6 +326,202 @@ def read_consistency(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
 
 
 # ----------------------------------------------------------------------------- #
+# 1.2.0 [ALIGN]: the Top 10 pages, the news gate, the cash ledger (pure)
+# ----------------------------------------------------------------------------- #
+PEG = 3.75
+NEWS_TAB, CASH_TAB = "_News_Gate", "_Cash_Snapshot"
+T10_TAB, V2_TAB = "Top_10_Investments", "Top_10_Investments_v2"
+
+
+def _stamp(s: str, after: str = "") -> str:
+    """The first 'YYYY-MM-DD HH:MM' in s (after the word `after` when given), or ''."""
+    if after:
+        if after not in s:
+            return ""
+        s = s[s.index(after):]
+    m = _TS_RE.search(s)
+    return "%s-%s-%s %s:%s" % m.groups() if m else ""
+
+
+def _squash(v: Any) -> str:
+    """Cell text with every run of white space (a line break inside a header cell, a no-break space) as one space."""
+    return " ".join(text(v).replace("\u00a0", " ").split())
+
+
+def _header(rows: Sequence[Sequence[Any]], need: Sequence[str]) -> Tuple[Optional[int], Dict[str, int]]:
+    """find_table on squashed header text: the live pages break header cells over two lines."""
+    for i, r in enumerate(rows):
+        cells = [_squash(c) for c in r]
+        if all(n in cells for n in need):
+            col: Dict[str, int] = {}
+            for j, name in enumerate(cells):
+                if name and name not in col:
+                    col[name] = j
+            return i, col
+    return None, {}
+
+
+def read_top10(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    """The main Top 10 page: {"read", "banner", "built", "seats": {SYMBOL: {"ticket", "shares", "seat"}}}.
+    A seat is a ticket when both its Ticket SAR and its Shares are above zero."""
+    rows = [list(r) for r in values]
+    out: Dict[str, Any] = {"read": False, "banner": "", "built": "", "seats": {}}
+    h, col = _header(rows, ("Rank", "Symbol", "Ticket SAR", "Shares"))
+    if h is None:
+        return out
+    out["read"] = True
+    out["banner"] = " ".join(_squash(c) for c in rows[h - 1] if text(c)) if h else ""
+    for r in rows[:4]:
+        for c in r:
+            out["built"] = out["built"] or _stamp(text(c), "Last run")
+    for r in rows[h + 1:]:
+        sym = text(cell(r, col["Symbol"])).upper()
+        if not sym:
+            break
+        out["seats"][sym] = {"ticket": num(cell(r, col["Ticket SAR"])) or 0.0, "shares": num(cell(r, col["Shares"])) or 0.0,
+                             "seat": text(cell(r, col.get("Funds From"))) or text(cell(r, col.get("Stability")))}
+    return out
+
+
+def read_top10_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    """The v2 Top 10 page, in the same shape as read_top10 (its headline is the banner). The page has two forms:
+    with the engine's tickets its columns read "Alloc SAR" / "Buy qty"; without one they read "Preview SAR" /
+    "Preview qty" - a research sizing, kept as seat["preview"] and never counted as a ticket."""
+    rows = [list(r) for r in values]
+    out: Dict[str, Any] = {"read": False, "banner": "", "built": "", "seats": {}}
+    sar, qty = "Alloc SAR", "Buy qty"
+    h, col = _header(rows, ("Symbol · name", "Seat status", sar, qty))
+    if h is None:
+        sar, qty = "Preview SAR", "Preview qty"
+        h, col = _header(rows, ("Symbol · name", "Seat status", sar, qty))
+    if h is None:
+        return out
+    preview = sar.startswith("Preview")
+    out["read"] = True
+    top = [text(c) for c in (rows[0] if rows else []) if text(c)]
+    out["banner"] = top[1] if len(top) > 1 else ""
+    out["built"] = _stamp(" ".join(top), "page built")
+    for r in rows[h + 1:]:
+        name = text(cell(r, col["Symbol · name"]))
+        if not name:
+            break
+        a, q = num(cell(r, col[sar])) or 0.0, num(cell(r, col[qty])) or 0.0
+        seat = {"ticket": 0.0 if preview else a, "shares": 0.0 if preview else q, "seat": text(cell(r, col["Seat status"]))}
+        if preview and a > 0 and q > 0:
+            seat["preview"] = (a, q)
+        out["seats"][name.split("·")[0].strip().upper()] = seat
+    return out
+
+
+def read_news_gate(values: Sequence[Sequence[Any]], now: _dt.datetime) -> Dict[str, Any]:
+    """The latest row of the _News_Gate tab: {"read", "verdict", "drivers", "at", "age_h"}."""
+    rows = [list(r) for r in values if r]
+    out: Dict[str, Any] = {"read": False, "verdict": "", "drivers": "", "at": "", "age_h": None}
+    h, col = find_table(rows, ("Run At (Riyadh)", "Verdict"))
+    if h is None:
+        return out
+    for r in rows[h + 1:]:
+        v = text(cell(r, col["Verdict"])).upper()
+        if v:
+            out.update({"read": True, "verdict": v, "drivers": text(cell(r, col.get("Drivers"))),
+                        "at": _stamp(text(cell(r, col["Run At (Riyadh)"])))})
+    m = _TS_RE.search(out["at"])
+    if m:
+        t = _dt.datetime(*[int(x) for x in m.groups()], tzinfo=RIYADH)
+        out["age_h"] = max(0.0, (now - t).total_seconds() / 3600.0)
+    return out
+
+
+def pick_cost(p: Dict[str, Any]) -> Optional[float]:
+    """What a pick can cost in SAR: its shares at the highest price the step allows (the top of the entry zone, or
+    the last price when that is higher), at the peg (USD) or at par (SAR) - and never less than the plan's own
+    allocation, which was computed at the entry price (Codex P2, #971). Another currency: the allocation alone."""
+    alloc = float(p["alloc"]) if p.get("alloc") else None
+    fx = {"USD": PEG, "SAR": 1.0}.get(text(p.get("ccy")).upper())
+    top = max(float(p.get("zone_high") or 0.0), float(p.get("price") or 0.0))
+    if not (fx and p.get("qty") and top > 0):
+        return alloc
+    return max(alloc or 0.0, float(p["qty"]) * top * fx)
+
+
+def fund(picks: Sequence[Dict[str, Any]], cash: Optional[float]) -> Optional[float]:
+    """Fund the OPEN picks in rank order from `cash`; a pick that does not fit gets p["unfunded"] = (cost, left).
+    Returns the cash left (None when the cash is not known - then nothing is marked)."""
+    if cash is None:
+        return None
+    left = float(cash)
+    for p in sorted([p for p in picks if p["status"] == "OPEN" and p.get("qty")], key=lambda p: p.get("rank") or 1e9):
+        cost = pick_cost(p)
+        if cost is None:
+            continue
+        if cost <= left + 0.5:
+            left -= cost
+        else:
+            p["unfunded"] = (cost, left)
+    return left
+
+
+def _seat_text(page: Dict[str, Any], sym: str) -> Tuple[str, bool]:
+    """(what the page says about sym, whether it sizes a ticket)."""
+    if not page.get("read"):
+        return "page not read", False
+    s = page["seats"].get(sym)
+    if s is None:
+        return "not seated", False
+    if s["ticket"] > 0 and s["shares"] > 0:
+        return "ticket: %s shares, %s SAR" % (fmt(s["shares"], 0), fmt(s["ticket"], 0)), True
+    if s.get("preview"):
+        return "%s · preview only (%s shares), not a ticket" % (s["seat"] or "seated", fmt(s["preview"][1], 0)), False
+    return s["seat"] or "seated, not sized", False
+
+
+def align(plan: Dict[str, Any], t10: Dict[str, Any], v2: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One row for every name that is a pick of today's plan or a sized ticket on either Top 10 page:
+    {symbol, plan, main, v2, reading, level} with level ok | soft (this page buys, a Top 10 page does not size) |
+    hard (a Top 10 page sizes a ticket this page does not hold as an OPEN buy)."""
+    picks = {p["symbol"]: p for p in (plan["picks"] if plan.get("is_today") else [])}
+    pipe = {p["symbol"]: p for p in (plan["pipeline"] if plan.get("is_today") else [])}
+    names = list(picks)
+    for page in (t10, v2):
+        names += sorted(s for s, y in (page.get("seats") or {}).items() if y["ticket"] > 0 and y["shares"] > 0 and s not in names)
+    out: List[Dict[str, Any]] = []
+    for sym in names:
+        p = picks.get(sym)
+        buys = bool(p and p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded"))
+        if p and p.get("unfunded"):
+            mine, held = "OPEN, not funded today", "it is not funded today"
+        elif buys:
+            mine, held = "OPEN - buy %s" % fmt(p["qty"], 0), ""
+        elif p:
+            mine = "%s%s" % (p["status"] or "PICK", " - " + p["reason"] if p.get("reason") else "")
+            held = "it reads %s here" % (p["status"] or "not open")
+        elif sym in pipe:
+            mine = "pipeline: %s" % (pipe[sym].get("waiting") or "waiting")
+            held = "the plan holds it back (%s)" % (pipe[sym].get("waiting") or "pipeline")
+        elif plan.get("is_today"):
+            mine, held = "not in today's plan", "it is not in today's plan"
+        else:
+            mine, held = "no plan cut today", "no plan has been cut today"
+        (a, a_buy), (b, b_buy) = _seat_text(t10, sym), _seat_text(v2, sym)
+        sized = [n for n, y in ((T10_TAB, a_buy), (V2_TAB, b_buy)) if y]
+        if sized and not buys:
+            level, reading = "hard", "DO NOT BUY from %s: %s." % (" or ".join(sized), held)
+        elif buys and len(sized) == 2:
+            level, reading = "ok", "ALIGNED: all three pages size it."
+        elif buys:
+            unread = [n for n, pg in ((T10_TAB, t10), (V2_TAB, v2)) if not pg.get("read")]
+            level = "ok" if len(unread) == 2 else "soft"
+            reading = ("Top 10 pages not read." if len(unread) == 2 else
+                       "FOLLOW THIS PAGE: the plan is the order of record; %s no ticket." % (
+                           "the Top 10 pages show" if not sized else "one Top 10 page shows"))
+        else:
+            level, reading = "ok", "ALIGNED: no page sizes it."
+        out.append({"symbol": sym, "plan": mine, "main": a, "v2": b, "reading": reading, "level": level,
+                    "sized": sized, "held": held})
+    return out
+
+
+# ----------------------------------------------------------------------------- #
 # The plan (pure)
 # ----------------------------------------------------------------------------- #
 def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) -> List[Dict[str, Any]]:
@@ -357,6 +568,14 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
     """The buy step of an OPEN pick; None for every other status."""
     if p["status"] != "OPEN" or not p.get("qty"):
         return None
+    if p.get("unfunded"):                                           # 1.2.0: the cash ledger does not cover it
+        cost, left = p["unfunded"]
+        return {"urgency": 6 + (p.get("rank") or 0) / 1000.0, "symbol": p["symbol"], "kind": "nofund", "source": "Daily_Plan",
+                "do": "%s is not funded today: its %s shares need %s SAR and %s SAR of cash is left after the buys above." % (
+                    p["symbol"], fmt(p["qty"], 0), fmt(cost, 0), fmt(left, 0)),
+                "levels": "plan: limit %s - %s · stop %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high")), fmt(p.get("stop"))),
+                "why": "The plan was sized from the cash cell of the main page; the cash ledger (_Cash_Snapshot) reads less. "
+                       "Buying it would use margin."}
     e = ev.get(p["symbol"]) or {}
     why = p.get("reason", "")
     if e.get("chance"):
@@ -380,7 +599,9 @@ def stale_limit(name: str, k: Dict[str, float]) -> float:
 
 def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[str, Any], issues: List[Dict[str, str]],
           ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = (),
-          broker_note: str = "") -> Dict[str, Any]:
+          broker_note: str = "", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """`extra` (1.2.0): {"t10", "v2", "news", "cash", "cash_at"} - the Top 10 pages, the news gate and the cash ledger."""
+    x = extra or {}
     steps: List[Dict[str, Any]] = []
     for h in holdings:
         steps += holding_steps(h, k["stop_tol"], not broker_note)
@@ -395,15 +616,37 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
                       "why": "The Exit Plan reports: %s. A stop may be in place at the broker; the workbook could not "
                              "compare it." % broker_note})
     picks = plan["picks"] if plan.get("is_today") else []
+    cash_left = fund(picks, x.get("cash"))
     for p in picks:
         s = pick_step(p, evidence.get("names") or {}, plan.get("quality", "").upper() == "VERIFIED")
         if s:
             steps.append(s)
+    rows = align(plan, x.get("t10") or {}, x.get("v2") or {}) if x else []
+    for a in rows:
+        if a["level"] == "hard":
+            src = x["t10"] if T10_TAB in a["sized"] else x["v2"]
+            seat = src["seats"][a["symbol"]]
+            steps.append({"urgency": 4.6, "symbol": a["symbol"], "kind": "skip", "source": " / ".join(a["sized"]),
+                          "do": "Do not buy %s from %s: %s." % (a["symbol"], " or ".join(a["sized"]), a["held"]),
+                          "levels": "shown there: %s shares, %s SAR" % (fmt(seat["shares"], 0), fmt(seat["ticket"], 0)),
+                          "why": "Orders come from this page only. The Top 10 pages size from their own rules and "
+                                 "times; the Daily Plan is the one cut for the day."})
+    news = x.get("news") or {}
+    news_live = bool(news.get("read") and news.get("verdict") not in ("", "GO") and news.get("age_h") is not None
+                     and news["age_h"] <= k.get("news_max_h", 24.0))
+    if news_live and any(step_kind(s) == "buy" for s in steps):
+        steps.append({"urgency": 4.9, "symbol": "NEWS", "kind": "news", "source": NEWS_TAB,
+                      "do": "Read before buying: the News & Macro Gate reads %s (%s Riyadh)." % (
+                          news["verdict"].replace("_", " "), news["at"]),
+                      "levels": "observe-only gate: the plan does not obey it yet",
+                      "why": news.get("drivers") or "no driver recorded"})
     steps.sort(key=lambda s: (s["urgency"], s["symbol"]))
     stale = sorted(n for n, a in ages.items() if a is not None and a > stale_limit(n, k))
     return {"steps": steps, "holdings": holdings, "picks": picks, "pipeline": (plan["pipeline"] if plan.get("is_today") else []),
             "plan": plan, "evidence": evidence, "issues": issues, "ages": ages, "stale": stale,
-            "missing": sorted(missing), "broker_note": broker_note}
+            "missing": sorted(missing), "broker_note": broker_note, "align": rows, "news": news,
+            "news_live": news_live, "cash": x.get("cash"), "cash_at": x.get("cash_at", ""), "cash_left": cash_left,
+            "t10": x.get("t10") or {}, "v2": x.get("v2") or {}, "aligned": bool(x)}
 
 
 # ----------------------------------------------------------------------------- #
@@ -450,7 +693,8 @@ STYLES: Dict[str, Dict[str, Any]] = {
     "foot": {"fg": MUTE, "italic": True, "size": 9, "valign": "TOP"},
 }
 CHIP = {"sell": ("C62828", "SELL"), "profit": ("2E7D32", "TAKE PROFIT"), "stop": ("EF6C00", "RAISE STOP"),
-        "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY")}
+        "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY"),
+        "skip": ("7B1F1F", "DO NOT BUY"), "news": ("8E5A00", "READ FIRST"), "nofund": ("5F6B7A", "NOT FUNDED")}
 for _k, (_bg, _label) in CHIP.items():                         # the step number, and the kind's name under it
     STYLES["chip_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 15, "align": "CENTER", "valign": "BOTTOM"}
     STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
@@ -462,7 +706,9 @@ STATUS_STYLE = {"OPEN": "st_good", "WAIT": "st_warn", "MATCH": "st_good", "MISMA
 
 
 def step_kind(s: Dict[str, Any]) -> str:
-    """The colour family of a step, from the urgency its source gave it."""
+    """The colour family of a step: its own "kind" when it names one, else from the urgency its source gave it."""
+    if s.get("kind") in CHIP:
+        return s["kind"]
     u = float(s.get("urgency") or 0)
     return ("sell" if u < 1 else "profit" if u < 2 else "stop" if u < 2.5 else "broker" if u < 3 else
             "review" if u < 5 else "buy")
@@ -529,7 +775,12 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     ev, plan = d["evidence"], d["plan"]
     miss = d.get("missing") or []
     n_hold = sum(1 for s in d["steps"] if s["source"] == "Exit_Plan")
-    n_buy = len(d["steps"]) - n_hold
+    n_buy = sum(1 for s in d["steps"] if s["source"] == "Daily_Plan" and step_kind(s) == "buy")
+    hard = [a["symbol"] for a in d.get("align") or [] if a["level"] == "hard"]
+    unfunded = [p["symbol"] for p in d["picks"] if p.get("unfunded")]
+    flags = ((" · PAGES DISAGREE: " + ", ".join(hard) if hard else "") +
+             (" · NOT FUNDED: " + ", ".join(unfunded) if unfunded else "") +
+             (" · NEWS GATE: " + d["news"]["verdict"].replace("_", " ") if d.get("news_live") else ""))
     waiting = sum(1 for p in d["picks"] if p["status"] == "WAIT")
     pg = _Page()
     pg.full("TODAY ACTION PLAN - %s" % day, "title", 44)
@@ -538,9 +789,9 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
             "sub")
     pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
             "know about%s" % (n_hold, n_buy, waiting, len(d["issues"]),
-                              (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
+                              flags + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
                               (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")),
-            "alert" if (d["stale"] or miss) else "summary", 30)
+            "alert" if (d["stale"] or miss or flags) else "summary", 30)
     pg.add(height=10)
 
     # ---- A. the day's steps: two rows each - the instruction, then its levels and reason
@@ -561,6 +812,25 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     elif "Exit_Plan" in miss or "_Daily_Plan" in miss:
         pg.add(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
             m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))], ["", "", "msg_alert"], [(2, WIDTH)])
+
+    # ---- 1.2.0 [ALIGN]: the same names on the Top 10 pages and here
+    if d.get("aligned"):
+        t10, v2 = d["t10"], d["v2"]
+        pg.add(height=10)
+        pg.full("PAGE ALIGNMENT - the same names on Top 10, Top 10 v2 and this plan", "band", 30)
+        pg.full("Orders come from section A only. The Top 10 pages rank and research; a ticket there that is not an OPEN "
+                "pick here is not an order.", "msg")
+        for label, page in (("Top 10 (main)", t10), ("Top 10 v2", v2)):
+            pg.add([label, "", ("%s · built %s" % (page.get("banner") or "no banner", page.get("built") or "time not read"))
+                    if page.get("read") else "page not read"], ["cell_b", "", "cell"], [(0, 2), (2, WIDTH)])
+        pg.add(["Symbol", "This plan (order of record)", "", "Top 10 (main)", "", "Top 10 v2", "", "", "Reading"], "head",
+               [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
+        for a in d["align"]:
+            pg.add([a["symbol"], a["plan"], "", a["main"], "", a["v2"], "", "", a["reading"]],
+                   ["cell_b", "cell", "", "cell", "", "cell", "", "", {"hard": "bad", "soft": "warn"}.get(a["level"], "ok")],
+                   [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
+        if not d["align"]:
+            pg.add(["", "No pick today and no sized ticket on either Top 10 page."], ["", "msg"], [(1, WIDTH)])
 
     # ---- B. holdings
     pg.add(height=10)
@@ -639,6 +909,26 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
                   ["", "", "none", "The pages agree on every checked figure."]]
     for x in issues:
         pg.add(x, ["cell_b", "", STATUS_STYLE.get(x[2], "st_info"), "cell"], [(0, 2), (3, WIDTH)])
+    if d.get("aligned"):                                            # 1.2.0: the news gate and the cash ledger
+        news = d.get("news") or {}
+        pg.full("News & Macro Gate (_News_Gate; observe-only)", "subhead")
+        if news.get("read"):
+            old = news.get("age_h") is not None and not d.get("news_live") and news["verdict"] != "GO"
+            pg.add([news["verdict"].replace("_", " "), "", news["at"] + (" (older than the limit)" if old else ""),
+                    news.get("drivers") or "no driver recorded"],
+                   ["bad" if d.get("news_live") else "cell_b", "", "cell", "cell"], [(0, 2), (3, WIDTH)])
+        else:
+            pg.add(["", "The _News_Gate tab was not read."], ["", "msg"], [(1, WIDTH)])
+        pg.full("Cash (_Cash_Snapshot)", "subhead")
+        if d.get("cash") is not None:
+            open_cost = sum(pick_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty"))
+            pg.add(["%s SAR" % fmt(d["cash"], 0), "", d.get("cash_at", ""),
+                    "open buys cost %s SAR · left after the funded buys %s SAR" % (fmt(open_cost, 0), fmt(d.get("cash_left"), 0))],
+                   ["cell_b", "", "cell", "bad" if any(p.get("unfunded") for p in d["picks"]) else "cell"],
+                   [(0, 2), (3, WIDTH)])
+        else:
+            pg.add(["", "The _Cash_Snapshot tab was not read: the buys were not checked against cash."], ["", "msg"],
+                   [(1, WIDTH)])
     pg.full("Source pages", "subhead")
     pg.add(["Source page", "", "Age (hours)", "Reading"], ["head", "", "head_num", "head"], [(0, 2), (3, WIDTH)])
     for name in sorted(d["ages"]):
@@ -823,7 +1113,9 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         return 0
     k = {"stale_h": _env_num("TFB_TAP_STALE_H", 3, 0.25, 72), "stop_tol": _env_num("TFB_TAP_STOP_TOL_PCT", 1, 0, 20),
          "pipeline": _env_num("TFB_TAP_PIPELINE", 5, 0, 30),
-         "stale_ev": _env_num("TFB_TAP_STALE_EVIDENCE_H", 18, 0.25, 96)}
+         "stale_ev": _env_num("TFB_TAP_STALE_EVIDENCE_H", 18, 0.25, 96),
+         "news_max_h": _env_num("TFB_TAP_NEWS_MAX_H", 24, 1, 168)}
+    aligned = _env("TFB_TAP_ALIGN", "on").lower() not in ("off", "0", "false", "no")
     retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep
     held = {"book": book}
 
@@ -836,6 +1128,16 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         got = {"Exit_Plan": _read(b, "Exit_Plan", "A1:P80"), "Daily_Plan": _read(b, "Daily_Plan", "A1:N6"),
                "Evidence_Board": _read(b, "Evidence_Board", "A1:L120"),
                "Consistency_Check": _read(b, "Consistency_Check", "A1:F60")}
+        more: Dict[str, List[List[Any]]] = {}
+        for tab, rng in (((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000"))
+                         if aligned else ()):
+            try:                                                    # optional: a tab that cannot be read changes no step
+                more[tab] = _read(b, tab, rng)
+            except Exception as e:  # noqa: BLE001
+                if quota_error(e):
+                    raise
+                _out("%s not read: %s" % (tab, type(e).__name__))
+        held["more"] = more
         return got, _read(b, "_Daily_Plan", "A1:AB2100")
     try:
         pages, ledger = with_retry(load, retries, sleep, "reading the source pages")
@@ -855,8 +1157,27 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     plan = read_plan(ledger, local.date())
     if not plan["date"]:
         missing.append("_Daily_Plan")
+    extra: Optional[Dict[str, Any]] = None
+    if aligned:
+        from scripts.daily_plan import snapshot_cash  # noqa: PLC0415
+        more = held.get("more") or {}
+        cash, cash_at = snapshot_cash(more.get(CASH_TAB) or [])
+        extra = {"t10": read_top10(more.get(T10_TAB) or []), "v2": read_top10_v2(more.get(V2_TAB) or []),
+                 "news": read_news_gate(more.get(NEWS_TAB) or [], now), "cash": cash, "cash_at": cash_at}
     d = build(read_holdings(pages["Exit_Plan"]), plan, read_evidence(pages["Evidence_Board"]),
-              read_consistency(pages["Consistency_Check"]), ages, k, missing, broker_unknown(pages["Exit_Plan"]))
+              read_consistency(pages["Consistency_Check"]), ages, k, missing, broker_unknown(pages["Exit_Plan"]), extra)
+    for tab, page in (((T10_TAB, d["t10"]), (V2_TAB, d["v2"])) if aligned else ()):
+        if not page.get("read"):                                    # say what was read, so a moved header is visible
+            got = (held.get("more") or {}).get(tab) or []
+            near = [" | ".join(_squash(c) for c in r if text(c))[:160] for r in got
+                    if any(_squash(c) in ("Seat status", "Ticket SAR") for c in r)]
+            _out("%s: no seats table found in %d row(s)%s" % (tab, len(got), "; nearest header: " + near[0] if near else ""))
+    for a in d["align"]:
+        _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"], a["main"], a["v2"]))
+    if aligned:
+        _out("news gate %s (%s) · cash %s SAR (%s)" % (
+            d["news"].get("verdict") or "not read", d["news"].get("at") or "-",
+            fmt(d["cash"], 0) if d["cash"] is not None else "not read", d["cash_at"] or "-"))
     for i, s in enumerate(d["steps"], 1):
         _out("STEP %d %-9s %s | %s" % (i, s["symbol"], s["do"], s["levels"]))
     if not d["steps"]:

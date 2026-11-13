@@ -1,7 +1,10 @@
 # =============================================================================
 # ✅ Today Action Plan - one page that says what to do today, and why
 # -----------------------------------------------------------------------------
-# VERSION 1.1.0 (2026-11-12)
+# VERSION 1.2.0 (2026-11-13)
+#   1.2.0: ALIGNMENT (today_action_plan 1.2.0). The page also reads the two
+#          Top 10 pages, the news gate and the cash ledger: TFB_TAP_ALIGN
+#          on | off, TFB_TAP_NEWS_MAX_H (24).
 #   1.1.0: the page is written with its design (today_action_plan 1.1.0).
 #          TFB_TAP_STYLE=off writes the plain grid. A run by hand with
 #          "preview" writes the tab Today_Action_Plan_Preview and leaves the
@@ -104,6 +107,8 @@ jobs:
           TFB_TAP_PIPELINE: ${{ vars.TFB_TAP_PIPELINE || '5' }}
           TFB_TAP_HIDE_TABS: ${{ vars.TFB_TAP_HIDE_TABS || '_Daily_Plan,_Exit_Plan,_Evidence_Log' }}
           TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}
+          TFB_TAP_ALIGN: ${{ vars.TFB_TAP_ALIGN || 'on' }}
+          TFB_TAP_NEWS_MAX_H: ${{ vars.TFB_TAP_NEWS_MAX_H || '24' }}
           TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE || 'on' }}
           TFB_TAP_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.preview || 'false' }}
           EVENT_NAME: ${{ github.event_name }}
