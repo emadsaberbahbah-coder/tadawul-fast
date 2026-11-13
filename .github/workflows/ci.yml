@@ -2,6 +2,24 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.86 (2026-11-08) -- HIST-CLOSE OUTCOME PREVIEW (track_performance v6.60.0)
+# (Main holds every number up to 1.1.79; its 1.1.75 is a line inside its
+# 1.1.76 block. Open claims, re-numbered 2026-11-11 so each sits above main's
+# newest block: 1.1.80 #946, 1.1.81 #922, 1.1.82 #923, 1.1.83 #909, 1.1.84 #926,
+# 1.1.85 #954, 1.1.86 #938, 1.1.87 #915.
+# This release first claimed 1.1.72, then 1.1.78.)
+#
+# v1.1.86: run tests/test_hist_close_preview.py (track_performance v6.60.0
+# [HIST-PREVIEW], TRACK_HIST_CLOSE_PREVIEW default off = v6.53.0: under
+# TRACK_HIST_TARGET_CLOSE=observe the audit logs the outcomes enforce would
+# publish) in its own blocking lean-unit step after the witnessed maturity
+# preflight. It runs the real audit loop offline (fake transport, offline
+# calendar sessions, a fake BigQuery session); the step fetches main
+# c7e666a4 by SHA for the legs that read it with `git show` and sets
+# TFB_TEST_REQUIRE_BASE=1, so a missing base FAILS those legs instead of
+# skipping them. PyYAML (already in the lane) reads the workflows. Nothing
+# is removed and no existing entry moves.
+#
 # VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
 #
 # v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
@@ -1367,6 +1385,17 @@ jobs:
 
       - name: 🧪 Deterministic witnessed maturity preflight
         run: python scripts/test_maturation.py
+
+      - name: HIST-CLOSE outcome preview (track_performance v6.60.0, golden base fetched by SHA)
+        env:
+          TFB_TEST_REQUIRE_BASE: "1"
+        run: |
+          # v1.1.86: the off-identity, V2 and X1 legs read track_performance
+          # v6.53.0 at main c7e666a4; with TFB_TEST_REQUIRE_BASE=1 a failed
+          # fetch FAILS them instead of skipping them.
+          git fetch --no-tags --depth=1 origin c7e666a4bba1165cace2cb839d7839a2bc01c78f \
+            || echo "::warning::c7e666a4 base not fetched - the golden legs will FAIL"
+          python -m pytest -q tests/test_hist_close_preview.py
 
   # ==========================================================================
   # JOB 3 — schema / route contract (BLOCKING)

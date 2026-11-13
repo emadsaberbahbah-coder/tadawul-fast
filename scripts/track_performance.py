@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.60.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,89 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# v6.60.0 (2026-11-08) [HIST-PREVIEW]: TRACK_HIST_TARGET_CLOSE=observe can
+# show the outcomes enforce would publish, not only how many. ENV-gated,
+# DEFAULT OFF (TRACK_HIST_CLOSE_PREVIEW) = v6.53.0 byte-identical apart from
+# the version string. 6.54.0-6.59.0 are claimed by the open PRs #845, #857,
+# #915, #922, #923 and #926, so this build takes 6.60.0; whichever lands
+# later re-numbers.
+# EVIDENCE (Performance Clock, main, observe with the archive source):
+#   run 42352240437 (2026-11-07 07:40Z): '[HIST-CLOSE v6.47.0] mode=observe
+#     candidates=1843 witnessed=1735 (1M:389 1W:394 2W:367 3M:585) matured=0
+#     refused=108 (hist_close_archive_not_daily:108)'; 'matured-fresh=77 |
+#     pending-price=6492'.
+#   run 42460376051 (2026-11-08 07:49Z): 'candidates=3709 witnessed=3598
+#     (1M:826 1W:945 2W:893 3M:934) matured=0 refused=111'; 'matured-fresh=0
+#     | pending-price=6735'; 13,104 records matured to date, 3,911 of them
+#     decided (the calibration's sample).
+#   Past-due records keep growing (6,492 -> 6,735 in a day). Every record
+#   the archive witnesses is a maturation candidate under enforce (3,598 in
+#   one pass), less those the default-on CA-GUARD defers or expires (a
+#   re-based one still matures, on the re-based ROI); only buy and sell
+#   calls add decided outcomes. The observe line
+#   says how MANY; it never says WHAT: no win / loss split, no ROI, no
+#   outlier. The judge already computes each candidate's ROI from the
+#   archive close (_hist_close_judge returns it) and observe discards it, so
+#   the owner has to arm enforce, which writes to Performance_Log, to see
+#   the numbers it would publish.
+# WHAT: with TRACK_HIST_CLOSE_PREVIEW=1/on/true/yes AND the judge in observe
+#   mode, the observe judge loop keeps (record, context, verdict) and, after
+#   the HIST-CLOSE / ARCHIVE-BAR lines, _hist_close_preview summarises the
+#   witnessed ones. With the CA-GUARD on (its default) it applies the
+#   deterministic part of enforce's corporate-action step the way enforce
+#   does: a confirmed _Corporate_Actions factor between entry and the target
+#   session re-bases the ROI (_ca_ledger_factor / _ca_ledger_roi /
+#   _ca_decide_v2; no network). A record without one whose |ROI| reaches
+#   _ca_verify_pct() (15 pp by default) is in the VERIFY band: enforce
+#   checks it against the adjusted series and may keep, re-base, defer or
+#   expire it, which observe cannot know. Up to five WARNING lines:
+#     '[v6.60.0 HIST-PREVIEW] mode=observe witnessed=N decided=D wins=W
+#       losses=L breakeven=B hold=H win=x% CI[lo,hi] price_roi mean=..
+#       median=.. min=.. max=.. call_roi=.. outliers(|roi|>=50pp)=K
+#       ca_guard=on ledger=J verify(|roi|>=15pp)=V (ledger factors applied;
+#       dedup is enforce's; nothing written)' ('ledger off' with
+#       TFB_TRACK_CA_LEDGER off; 'ca_guard=off (dedup is enforce's; nothing
+#       written)' with the guard off);
+#     '... settled (the verify band left out: what enforce matures as
+#       shown): all n= decided= win= CI wins= losses= breakeven= hold='
+#       (only with the guard on);
+#     '... by horizon: 1W n= decided= win= | 2W ...';
+#     '... by bucket: <entry investability> n= decided= win= | ...';
+#     '... outliers: <symbol> <horizon> <roi> (entry -> close, session[,
+#       ledger-rebased]) | ...' (the five largest |ROI|, ties by symbol, only
+#       when K > 0; a re-based ROI is marked, its prices are the raw prints).
+#   A ledger re-base that is not finite is left out, as enforce leaves the
+#   record PENDING (outcome_roi_nonfinite).
+#   Outcome = _directional_outcome of the entry call (HOLD neutral), the
+#   definition every report uses; call_roi = ROI x call sign over the buy
+#   and sell calls. _LAST_HIST_PREVIEW keeps the summary dict. Records,
+#   Notes, receipts, _hist_stats / _LAST_HIST_CLOSE, the HIST-CLOSE and
+#   ARCHIVE-BAR lines, every sheet and every other log line are unchanged,
+#   on or off; under enforce or off the gate is not even read. Never raises:
+#   a failing summary logs two WARNING lines ('preview unavailable: <class>'
+#   and one 'unavailable' line).
+# GATE: TRACK_HIST_CLOSE_PREVIEW, DEFAULT OFF. ENV LANE:
+#   .github/workflows/track_performance.yml 'Run performance clock' only,
+#   beside TRACK_HIST_TARGET_CLOSE; daily_sync.yml maps neither (the v6.47.0
+#   lane rule). Safe to arm at once: log lines only.
+# KNOWN LIMITS: the VERIFY band is counted, not resolved: the 'settled'
+#   line is what enforce matures as shown once it reaches a record, and
+#   enforce may still mature some of the band (an adjusted series that
+#   agrees or re-bases) within its CA verification budget (60 symbols /
+#   240 s per run by default). The matured-duplicate dedup and the save are
+#   enforce's. With the yfinance sources both modes admit the same
+#   TRACK_HIST_CLOSE_BUDGET symbol window, but under enforce the
+#   TRACK_HIST_CLOSE_TIME_SEC window also covers the CA-GUARD's in-loop
+#   verification pulls (observe judges after the loop), so enforce can defer
+#   some settled records to a later pass; the archive source (production)
+#   pulls nothing. The 50 pp outlier mark is a reporting flag, not a gate.
+# ZERO functions removed. Additions: _hist_close_preview_enabled,
+#   _hist_close_preview, _hist_close_preview_lines (+ _HIST_PREVIEW_TAG,
+#   _HIST_PREVIEW_OUTLIER_PP, _LAST_HIST_PREVIEW). Changed: the observe judge
+#   loop keeps the judge's return value (one line) and appends it when the
+#   preview is on.
+# ROLLBACK: unset TRACK_HIST_CLOSE_PREVIEW (or set off).
+SCRIPT_VERSION = "6.60.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -4285,6 +4367,169 @@ def _hist_close_judge(record: Any, context: Dict[str, Any], current: OutcomePric
         horizon = _safe_str(getattr(record.horizon, "value", record.horizon))
         stats["by_horizon"][horizon] = stats["by_horizon"].get(horizon, 0) + 1
     return evidence, reason, roi
+
+
+# v6.60.0 [HIST-PREVIEW] (default off): see the v6.60.0 WHY block.
+_HIST_PREVIEW_TAG = "[v6.60.0 HIST-PREVIEW]"
+_HIST_PREVIEW_OUTLIER_PP = 50.0          # |price ROI| flagged for a look before enforce
+_LAST_HIST_PREVIEW: Dict[str, Any] = {}  # read-back of the last observe preview
+
+
+def _hist_close_preview_enabled() -> bool:
+    """v6.60.0: TRACK_HIST_CLOSE_PREVIEW=1/on/true/yes summarises, under
+    TRACK_HIST_TARGET_CLOSE=observe, the outcomes enforce would publish.
+    DEFAULT OFF (no line, no state)."""
+    return (os.getenv("TRACK_HIST_CLOSE_PREVIEW") or "off").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _hist_close_preview(judged: List[Any]) -> Dict[str, Any]:
+    """v6.60.0: (record, context, (evidence, reason, roi)) triples from the
+    observe judge -> the outcome summary enforce would publish for the
+    witnessed ones. With the CA-GUARD on (its default) the deterministic
+    part of enforce's corporate-action step is applied as enforce applies
+    it: a confirmed _Corporate_Actions factor between entry and the target
+    session re-bases the ROI (_ca_ledger_factor / _ca_ledger_roi /
+    _ca_decide_v2, no network). A record without one whose |ROI| reaches
+    _ca_verify_pct() is in the VERIFY band: enforce checks it against the
+    adjusted series and may keep, re-base, defer or expire it, which this
+    pass cannot know, so the 'settled' tally leaves it out. Outcome is
+    _directional_outcome of the entry call (HOLD neutral); call_roi is the
+    price ROI x call sign over the buy and sell calls. Never raises (an
+    error returns {} and logs one warning)."""
+    try:
+        guard = _ca_guard_enabled()
+        verify_pp = _ca_verify_pct()
+        rows: List[Tuple[Any, Any, float, Optional[str], str, str]] = []
+        for record, context, verdict in judged or []:
+            evidence, _reason, roi = verdict
+            if evidence is None:
+                continue
+            roi = float(roi)
+            if not math.isfinite(roi):
+                continue
+            session = _safe_str((context or {}).get("target_session") or "")[:10]
+            ca = ""
+            if guard:
+                ledger_roi = _ca_ledger_roi(roi, _ca_ledger_factor(
+                    record.symbol, record.date_recorded, session or None))
+                if ledger_roi is not None:
+                    basis, roi = _ca_decide_v2(roi, None, ledger_roi)
+                    ca = "ledger" if basis == "ledger" else "confirmed"
+                    if not math.isfinite(roi):
+                        continue    # enforce leaves it PENDING (outcome_roi_nonfinite)
+                elif abs(roi) >= verify_pp:
+                    ca = "verify"
+            rows.append((record, evidence, roi,
+                         _directional_outcome(getattr(record, "entry_recommendation", None), roi),
+                         session, ca))
+
+        def tally(sub: List[Any]) -> Dict[str, Any]:
+            wins = sum(1 for x in sub if x[3] == "WIN")
+            losses = sum(1 for x in sub if x[3] == "LOSS")
+            even = sum(1 for x in sub if x[3] == "BREAKEVEN")
+            lo, hi = wilson_interval(wins, wins + losses)
+            return {"n": len(sub), "decided": wins + losses, "wins": wins, "losses": losses,
+                    "breakeven": even, "hold": len(sub) - wins - losses - even,
+                    "win_rate": (round(wins / (wins + losses) * 100.0, 1) if (wins + losses) else None),
+                    "ci": (round(lo), round(hi))}
+
+        rois = sorted(x[2] for x in rows)
+        signed = [x[2] * _reco_trade_sign(getattr(x[0], "entry_recommendation", None)) for x in rows
+                  if _reco_trade_sign(getattr(x[0], "entry_recommendation", None))]
+        n = len(rois)
+        median = ((rois[n // 2] if n % 2 else (rois[n // 2 - 1] + rois[n // 2]) / 2.0) if n else None)
+        out: Dict[str, Any] = dict(tally(rows))
+        out.update(
+            witnessed=n,
+            price_roi_mean=(round(sum(rois) / n, 2) + 0.0 if n else None),
+            price_roi_median=(round(median, 2) + 0.0 if n else None),
+            price_roi_min=(round(rois[0], 2) + 0.0 if n else None),
+            price_roi_max=(round(rois[-1], 2) + 0.0 if n else None),
+            call_roi_mean=(round(sum(signed) / len(signed), 2) + 0.0 if signed else None),
+            outliers=sum(1 for x in rows if abs(x[2]) >= _HIST_PREVIEW_OUTLIER_PP),
+            ca_guard=bool(guard), ca_verify_pp=float(verify_pp),
+            ca_ledger_on=bool(guard and _ca_ledger_enabled()),
+            ca_ledger=sum(1 for x in rows if x[5] == "ledger"),
+            ca_verify=sum(1 for x in rows if x[5] == "verify"),
+            settled=tally([x for x in rows if x[5] != "verify"]))
+        order = {h: i for i, h in enumerate(_HORIZON_TRADING_DAYS)}
+        horizons: Dict[str, List[Any]] = defaultdict(list)
+        buckets: Dict[str, List[Any]] = defaultdict(list)
+        for x in rows:
+            horizons[_safe_str(getattr(x[0].horizon, "value", x[0].horizon))].append(x)
+            buckets[(_safe_str(getattr(x[0], "entry_investability_status", "")) or "UNSPECIFIED").upper()].append(x)
+        out["by_horizon"] = {h: tally(horizons[h]) for h in sorted(horizons, key=lambda k: (order.get(k, 99), k))}
+        out["by_bucket"] = {b: tally(buckets[b]) for b in sorted(buckets)}
+        worst = sorted((x for x in rows if abs(x[2]) >= _HIST_PREVIEW_OUTLIER_PP),
+                       key=lambda x: (-round(abs(x[2]), 2), _safe_str(x[0].symbol)))[:5]
+        out["outlier_samples"] = [
+            {"symbol": _safe_str(x[0].symbol), "horizon": _safe_str(getattr(x[0].horizon, "value", x[0].horizon)),
+             "roi": round(x[2], 2) + 0.0, "entry": float(x[0].entry_price), "close": float(x[1].price),
+             "session": x[4], "ca": x[5]} for x in worst]
+        out["records"] = [{"symbol": _safe_str(x[0].symbol),
+                           "horizon": _safe_str(getattr(x[0].horizon, "value", x[0].horizon)),
+                           "roi": x[2], "outcome": x[3], "ca": x[5]} for x in rows]
+        return out
+    except Exception as exc:
+        logger.warning("%s preview unavailable: %s", _HIST_PREVIEW_TAG, type(exc).__name__)
+        return {}
+
+
+def _hist_close_preview_lines(summary: Any) -> List[str]:
+    """v6.60.0 PURE: the log lines of a _hist_close_preview result; one
+    'unavailable' line for an empty or malformed one. Never raises."""
+    unavailable = ["%s mode=observe unavailable (the preview could not be computed; see the log)"
+                   % _HIST_PREVIEW_TAG]
+    if not isinstance(summary, dict) or not summary:
+        return unavailable
+    try:
+        def rate(t: Dict[str, Any]) -> str:
+            if not t.get("decided"):
+                return "win=n/a"
+            return "win=%.1f%% CI[%d,%d]" % (t["win_rate"], t["ci"][0], t["ci"][1])
+
+        def part(name: str, t: Dict[str, Any]) -> str:
+            return "%s n=%d decided=%d %s" % (name, t["n"], t["decided"], rate(t))
+
+        if not summary["witnessed"]:
+            return ["%s mode=observe witnessed=0 (nothing for enforce to mature this pass)" % _HIST_PREVIEW_TAG]
+        if summary["ca_guard"]:
+            ca_part = "ca_guard=on ledger=%d verify(|roi|>=%gpp)=%d (%s; dedup is enforce's; nothing written)" % (
+                summary["ca_ledger"], summary["ca_verify_pp"], summary["ca_verify"],
+                "ledger factors applied" if summary["ca_ledger_on"] else "ledger off")
+        else:
+            ca_part = "ca_guard=off (dedup is enforce's; nothing written)"
+        lines = [
+            "%s mode=observe witnessed=%d decided=%d wins=%d losses=%d breakeven=%d hold=%d %s "
+            "price_roi mean=%+.2f%% median=%+.2f%% min=%+.2f%% max=%+.2f%% call_roi=%s "
+            "outliers(|roi|>=%dpp)=%d %s" % (
+                _HIST_PREVIEW_TAG, summary["witnessed"], summary["decided"], summary["wins"],
+                summary["losses"], summary["breakeven"], summary["hold"], rate(summary),
+                summary["price_roi_mean"], summary["price_roi_median"], summary["price_roi_min"],
+                summary["price_roi_max"],
+                ("n/a" if summary["call_roi_mean"] is None else "%+.2f%%" % summary["call_roi_mean"]),
+                int(_HIST_PREVIEW_OUTLIER_PP), summary["outliers"], ca_part)]
+        if summary["ca_guard"]:
+            lines.append("%s settled (the verify band left out: what enforce matures as shown): %s wins=%d "
+                         "losses=%d breakeven=%d hold=%d" % (
+                             _HIST_PREVIEW_TAG, part("all", summary["settled"]), summary["settled"]["wins"],
+                             summary["settled"]["losses"], summary["settled"]["breakeven"],
+                             summary["settled"]["hold"]))
+        lines += [
+            "%s by horizon: %s" % (_HIST_PREVIEW_TAG, " | ".join(
+                part(h, t) for h, t in summary["by_horizon"].items())),
+            "%s by bucket: %s" % (_HIST_PREVIEW_TAG, " | ".join(
+                part(b, t) for b, t in summary["by_bucket"].items())),
+        ]
+        if summary["outlier_samples"]:
+            lines.append("%s outliers: %s" % (_HIST_PREVIEW_TAG, " | ".join(
+                "%s %s %+.2f%% (entry %.4f -> close %.4f, %s%s)" % (
+                    o["symbol"], o["horizon"], o["roi"], o["entry"], o["close"], o["session"] or "-",
+                    ", ledger-rebased" if o.get("ca") == "ledger" else "")
+                for o in summary["outlier_samples"])))
+        return lines
+    except Exception:
+        return unavailable
 
 
 # v6.53.0 - ARCHIVE BAR SOURCE (TRACK_HIST_CLOSE_SOURCE) + DUE-ONLY AUDIT
@@ -10986,8 +11231,12 @@ class PerformanceTrackerApp:
                     # v6.53.0 [ARCHIVE-BAR]: observe's one archive read.
                     _hist_archive_prefetch([(_r.symbol, _safe_str(_ctx.get("target_session") or "")[:10])
                                             for _r, _ctx, _ev in _hist_observe])
+            # v6.60.0 [HIST-PREVIEW]: None unless observe and the preview gate.
+            _hist_preview = [] if (_hist_mode == "observe" and _hist_close_preview_enabled()) else None
             for _r, _ctx, _ev in _hist_observe:
-                _hist_close_judge(_r, _ctx, _ev, now_r, _hist_stats)
+                _hist_verdict = _hist_close_judge(_r, _ctx, _ev, now_r, _hist_stats)
+                if _hist_preview is not None:
+                    _hist_preview.append((_r, _ctx, _hist_verdict))
             for _r, _px0, _roi0 in _hist_used:
                 if _r.status != PerformanceStatus.MATURED:
                     _r.current_price, _r.unrealized_roi = _px0, _roi0
@@ -11023,6 +11272,13 @@ class PerformanceTrackerApp:
                     int(_arch.get("fallback") or 0), 1 if _arch.get("unavailable") else 0,
                     (" error=" + _safe_str(_arch.get("error"))) if _arch.get("error") else "",
                     float(_arch.get("query_sec") or 0.0))
+            if _hist_preview is not None:
+                # v6.60.0 [HIST-PREVIEW]: what enforce would publish (observe only).
+                _hist_pv = _hist_close_preview(_hist_preview)
+                _LAST_HIST_PREVIEW.clear()
+                _LAST_HIST_PREVIEW.update(_hist_pv)
+                for _hist_line in _hist_close_preview_lines(_hist_pv):
+                    logger.warning(_hist_line)
             _LAST_HIST_CLOSE.clear()
             _LAST_HIST_CLOSE.update(_hist_stats)
 
