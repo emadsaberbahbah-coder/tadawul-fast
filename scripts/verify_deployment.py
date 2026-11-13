@@ -301,7 +301,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
-    ("track_performance", "6.53.0", "track performance"),
+    # 2026-11-05: 6.57.0 [SESSION-OVERRIDES] the exam day and the JSE half
+    # days on their real hours (TRACK_SESSION_OVERRIDES, default off); 6.54.0,
+    # 6.55.0 and 6.56.0 are claimed by open PRs #845 / #857 / #915 (pin only).
+    ("track_performance", "6.57.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.

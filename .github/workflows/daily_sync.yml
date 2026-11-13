@@ -1517,6 +1517,12 @@ jobs:
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
+          # (2026-11-05) track_performance v6.57.0 [SESSION-OVERRIDES], mirrored
+          # from track_performance.yml 1.0.11 (ENV PARITY): the exam day and the
+          # JSE half days are judged on their real hours, so a manual
+          # run_tracker=true audit matures the same records as the clock. Inert
+          # on record-only schedules (no audit). 'off' = v6.53.0. ROLLBACK: unset.
+          TRACK_SESSION_OVERRIDES: ${{ vars.TRACK_SESSION_OVERRIDES || 'off' }}
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then

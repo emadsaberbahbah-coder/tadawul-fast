@@ -1,5 +1,16 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.11 (2026-11-05) -- SPECIAL SESSIONS ON THEIR REAL HOURS (OWNER OPT-IN)
+# (1.0.8, 1.0.9 and 1.0.10 are claimed by the open PRs #845, #857 and #915.)
+# track_performance v6.57.0 [SESSION-OVERRIDES]: TRACK_SESSION_OVERRIDES (default
+# 'off' = v6.53.0) re-times the sessions the pinned exchange calendar gets wrong
+# (the Korean exam day 10:00-16:30 KST, the JSE 12:00 half days), so a forecast
+# due that day is not scored on an intraday price or on a close struck before
+# its target. The 'Run performance clock' step maps it; daily_sync.yml's tracker
+# step maps the same Variable (ENV PARITY). No cron, concurrency or other step
+# changes. ARMING (owner): set the Variable to on before Thu 19 Nov 2026.
+# ROLLBACK: unset it.
+#
 # VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT
 # WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve today,
 # results tomorrow"): Performance_Log holds 13,856 active forecast records
@@ -384,6 +395,11 @@ jobs:
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
+          # (2026-11-05) 1.0.11: track_performance v6.57.0 [SESSION-OVERRIDES]:
+          # the exam day and the JSE half days are judged on their real hours.
+          # 'off' = v6.53.0. Mirrored in daily_sync.yml (ENV PARITY). ROLLBACK:
+          # unset or off.
+          TRACK_SESSION_OVERRIDES: ${{ vars.TRACK_SESSION_OVERRIDES || 'off' }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
