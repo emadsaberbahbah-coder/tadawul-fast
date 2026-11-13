@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_consistency_check.py - scripts/consistency_check.py 1.1.0: the same figure on every page.
+"""tests/test_consistency_check.py - scripts/consistency_check.py 1.2.0: the same figure on every page.
 
   K1  a workbook shaped like 11 Nov 2026 11:30: every mismatch of that morning is reported
   K2  an aligned workbook reads MATCH on every check (NAV as a named INFO)
@@ -7,6 +7,9 @@
   K4  the gate, the page, read failure
   K5  the workflow (1.1.0: hourly), the manifest pin and the CI lane
   K6  (1.1.0) C11: how old each output page is; STALE past the limit; a page without a build time is INFO
+  K7  (1.2.0) the workbook of 13 Nov 12:34: C11 counts market-open hours; a position-cap TRIM is C12, not C10;
+      an unsized open pick is INFO; C8 names each typed cell; C9 says which stop rules
+  K8  (1.2.0) market-open hours: Tadawul Sun-Thu, the US session on New York's clock, weekends, the idle limit
 
 Run: pytest -q tests/test_consistency_check.py
 """
@@ -99,6 +102,7 @@ def test_k1_the_11_nov_morning():
     assert by(g, "C8 cash")[0][1] == "MATCH"
     c9 = by(g, "C9 stops")[0]
     assert c9[1] == "MISMATCH" and "DDI.US Portfolio_Decision 14.44 vs Exit Plan 14.24" in c9[2] and "GLPI" not in c9[2]
+    assert c9[2].endswith(" - the stop to place is the Exit Plan's (the Today Action Plan shows it)")   # 1.2.0
     assert by(g, "C10 actions")[0][1] == "MATCH"                                   # TRIM and TAKE PROFIT both sell
 
 
@@ -141,7 +145,9 @@ def test_k3_edges():
     assert by(g, "C3 v2 freshness")[0][1] == "INFO"
     g = wb()
     g["Top_10_Investments"][2][7] = "30,000 SAR"
-    assert by(g, "C8 cash")[0][1] == "MISMATCH" and "3,125 SAR" in by(g, "C8 cash")[0][2]
+    c8 = by(g, "C8 cash")[0]
+    assert c8[1] == "MISMATCH" and "Top_10_Investments 'Cash Available (SAR)' reads 30,000 SAR (3,125 SAR less)" in c8[2]
+    assert "PF: Cash Available SAR" not in c8[2] and c8[4] == "30,000"           # 1.2.0: the cell is named
     g = wb()
     g["Portfolio_Decision"][5][0] = "70,000 SAR"                                  # a gap the outside holding does not explain
     assert by(g, "C7 NAV")[0][1] == "MISMATCH"
@@ -194,9 +200,21 @@ def test_k4_gate_page_and_read_failure(monkeypatch, capsys):
     # C11 adds six rows: Top_10 11:11 and Portfolio_Decision 11:07 MATCH; Portfolio_Decision_v2 STALE;
     # Daily_Plan, Exit_Plan (not in this workbook) and Top_10_v2 (no 'page built') INFO
     assert page[1][0].startswith("As of 2026-11-11 11:30 Riyadh · 4 mismatch(es) · 3 stale · 6 match · 4 note(s)")
-    assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared"]
+    assert page[0][0].startswith("INTERNAL CONTROL - CONSISTENCY CHECK")
+    assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared", "Control rule"]
+    assert all(len(r) == 7 for r in page) and all(r[6] for r in page[3:])          # every check carries its rule
+    assert [r[6] for r in page[3:] if r[0] == "C9 stops"] == ["The stop to place is the Exit Plan's. Another page's stop is analysis."]
+    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 13))
     assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 3 + ["INFO"] * 4 + ["MATCH"] * 6
     assert set(b.tabs) - set(wb()) == {"Consistency_Check"}                       # no other page is touched
+    log = capsys.readouterr().out                                                 # 1.2.0: the run log is public
+    assert "SAR" not in log and "58,880" not in log and "14.44" not in log and "3.7570" not in log
+    assert "C8 cash          MATCH    (figures on the Consistency_Check page)" in log
+    assert "C9 stops         MISMATCH (figures on the Consistency_Check page)" in log
+    assert "ZTO.US: ticket on the main page, not an open pick" in log and "ZTO.US (earnings in 6 day(s))" in log
+    assert "Portfolio_Decision: built 2026-11-11 11:07 Riyadh" in log
+    assert cc.log_detail(["C12 position cap", "OVER CAP", "AAA.US 18.0%"]) == "(figures on the Consistency_Check page)"
+    assert cc.log_detail(["C1 decision", "INFO", "x"]) == "x" and cc.log_detail(["C10 actions", "MATCH", "y"]) != "y"
     monkeypatch.setenv("TFB_CONSISTENCY", "off")
     assert cc.main(["--dry-run"]) == 0 and "nothing to do" in capsys.readouterr().out
     monkeypatch.setenv("TFB_CONSISTENCY", "yes")
@@ -236,7 +254,7 @@ def test_k6_page_freshness():
     got = {r[2].split(":")[0]: r for r in rows}
     assert [r[0] for r in rows] == ["C11 freshness"] * 6
     assert got["Daily_Plan"][1] == "MATCH" and "built 2026-11-11 12:20 Riyadh, 0.7 h ago" in got["Daily_Plan"][2]
-    assert got["Exit_Plan"][1] == "STALE" and "5.5 h ago (limit 2 h)" in got["Exit_Plan"][2]
+    assert got["Exit_Plan"][1] == "STALE" and "5.5 h ago, 3.0 h of it with a market open (limit 2 h)" in got["Exit_Plan"][2]
     assert got["Top_10_Investments"][1] == "MATCH" and "1.8 h ago" in got["Top_10_Investments"][2]
     assert got["Portfolio_Decision"][1] == "MATCH"
     assert got["Top_10_Investments_v2"][1] == "STALE" and got["Top_10_Investments_v2"][3] == "2026-11-10 16:06"
@@ -245,3 +263,119 @@ def test_k6_page_freshness():
     blank = cc.freshness({}, now, 2.0)
     assert {r[1] for r in blank} == {"INFO"} and "Daily_Plan: no build time found" in blank[2][2]
     assert not [r for r in cc.run_checks(g, TODAY, cc.knobs()) if r[0] == "C11 freshness"]   # needs the time
+
+
+PH7 = ["Action", "Symbol", "Qty", "Price", "Price SAR", "Weight %", "Stop SAR", "Advisor Note"]
+
+
+def wb13():
+    """The shape of the workbook of Fri 13 Nov 2026 12:34 Riyadh. Every figure and ticker is invented (public repository)."""
+    g = wb()
+    g["Top_10_Investments"] = [["TOP 10"], ["Status:", "Last run 2026-11-13 10:52:11 | status: ok | output: QUALIFIED_UNFUNDED"],
+                               ["x", "", "", "", "", "", "Cash Available (SAR)", "50,000 SAR"], [], SH,
+                               [1, "AAA.US", "Alpha", "0 SAR", 0, "Research — awaiting confirmation"],
+                               [2, "BBB.US", "Beta", "0 SAR", 0, "Research — awaiting confirmation"], [], ["ALL QUALIFIED"]]
+    g["_Daily_Plan"] = [["Plan Date", "Kind", "Symbol", "Status"], ["2026-11-13", "PICK", "AAA.US", "OPEN"],
+                        ["2026-11-13", "PICK", "BBB.US", "OPEN"], ["2026-11-13", "PICK", "CCC.US", "WAIT"]]
+    g["Calendar_Events"] = [["Symbol", "Next Earnings Date", "Days To Earnings", "Next Ex-Div Date", "Days To ExDiv"]]
+    g["Portfolio_Decision"] = [["MY PORTFOLIO"], ["Status:", "Last run 2026-11-13 08:42:10 | status: ok"],
+                               ["PF: Cash Available SAR", "50,000 SAR", "", "PF: Max Position %", "15.0"], ["KPIs"],
+                               ["Portfolio (SAR)", "Holdings (SAR)", "Cash (SAR)"], ["130,000 SAR", "100,000 SAR", "30,000 SAR"],
+                               [], PH7,
+                               ["TRIM", "HHH.US", 100, 20.00, 75.0, "18.0%", 67.5,
+                                "Position 18.0% > Max Position 15.0% \u2014 trim to cap"],
+                               ["TRIM", "JJJ.US", 50, 40.00, 150.0, "16.0%", 135.0, "Position 16.0% > Max Position 15.0%"],
+                               ["HOLD", "KKK.US", 80, 30.00, 112.5, "12.5%", 101.25, ""], [], ["SECTOR SUMMARY"]]
+    g["_Exit_Plan"] = [["Date", "Symbol", "Stop", "Action"], ["2026-11-13", "HHH.US", 19.00, "RAISE STOP"],
+                       ["2026-11-13", "JJJ.US", 36.00, "HOLD"], ["2026-11-13", "KKK.US", 27.00, "HOLD"]]
+    return g
+
+
+def test_k7_the_13_nov_differences():
+    now = dt.datetime(2026, 11, 13, 8, 50, tzinfo=dt.timezone.utc)                # Fri 11:50 Riyadh
+    today = dt.date(2026, 11, 13)
+    got = cc.run_checks(wb13(), today, cc.knobs(), now)
+    one = lambda name: [r for r in got if r[0] == name]                           # noqa: E731
+    # C11: built 08:42 on a Friday, 3.1 h ago, and no market open since - not stale
+    pdf = [r for r in one("C11 freshness") if r[5] == "Portfolio_Decision"][0]
+    assert pdf[1] == "MATCH" and pdf[2] == "Portfolio_Decision: built 2026-11-13 08:42 Riyadh, 3.1 h ago, no market open since"
+    # C10 / C12: the cap, not a price exit
+    assert one("C10 actions")[0][1] == "MATCH"
+    c12 = one("C12 position cap")
+    assert len(c12) == 1 and c12[0][1] == "OVER CAP"
+    assert c12[0][2] == ("above the position cap of 15%: HHH.US 18.0% (Exit Plan: RAISE STOP); JJJ.US 16.0% (Exit Plan: HOLD) - "
+                         "Portfolio_Decision says TRIM to the cap; a trim is a sizing decision, not a price exit")
+    # C1: three open picks the main page has not sized - information, the plan is the order of record
+    c1 = one("C1 decision")[0]
+    assert c1[1] == "INFO" and c1[3] == "none" and c1[4] == "AAA.US, BBB.US, CCC.US"
+    assert "CCC.US: open pick, main page says 'not seated'" in c1[2] and "the Today Action Plan is the order of record" in c1[2]
+    # C8: both typed cells named against the broker's cash
+    c8 = one("C8 cash")[0]
+    assert c8[1] == "MISMATCH" and c8[2].startswith("typed cash is not Portfolio_Decision's cash of 30,000 SAR: ")
+    assert "Top_10_Investments 'Cash Available (SAR)' reads 50,000 SAR (20,000 SAR more)" in c8[2]
+    assert "Portfolio_Decision 'PF: Cash Available SAR' reads 50,000 SAR (20,000 SAR more)" in c8[2]
+    # C9: unchanged in logic
+    c9 = one("C9 stops")[0]
+    assert c9[1] == "MISMATCH" and "HHH.US Portfolio_Decision 18.00 vs Exit Plan 19.00" in c9[2] and "KKK" not in c9[2]
+    # the typed cells corrected: C8 matches
+    g = wb13()
+    g["Top_10_Investments"][2][7] = g["Portfolio_Decision"][2][1] = "30,000 SAR"
+    assert [r for r in cc.run_checks(g, today, cc.knobs(), now) if r[0] == "C8 cash"][0][1] == "MATCH"
+    g["Portfolio_Decision"][2][1] = "40,000 SAR"                                  # one cell alone is still named
+    c8 = [r for r in cc.run_checks(g, today, cc.knobs(), now) if r[0] == "C8 cash"][0]
+    assert c8[1] == "MISMATCH" and "Top_10_Investments" not in c8[2] and "(10,000 SAR more)" in c8[2]
+    # a dangerous direction stays a MISMATCH: a main-page ticket that is not an open pick
+    g = wb13()
+    g["Top_10_Investments"][5] = [1, "ZTO.US", "ZTO", "5,071 SAR", 66, "Cash"]
+    c1 = [r for r in cc.run_checks(g, today, cc.knobs(), now) if r[0] == "C1 decision"][0]
+    assert c1[1] == "MISMATCH" and "order of record" not in c1[2]
+    # a TRIM that is not about the cap is still compared: below the cap, no note
+    g = wb13()
+    g["Portfolio_Decision"][9][5], g["Portfolio_Decision"][9][7] = "12.0%", "Reduce: weak momentum"
+    got = cc.run_checks(g, today, cc.knobs(), now)
+    assert "JJJ.US Portfolio_Decision TRIM vs Exit Plan HOLD" in [r for r in got if r[0] == "C10 actions"][0][2]
+    assert "JJJ" not in [r for r in got if r[0] == "C12 position cap"][0][2]
+    # the note alone is enough (no weight column value); a cap TRIM the Exit Plan also sells is not listed
+    g = wb13()
+    g["Portfolio_Decision"][8][5] = ""
+    g["_Exit_Plan"][2][3] = "SELL"
+    got = cc.run_checks(g, today, cc.knobs(), now)
+    c12 = [r for r in got if r[0] == "C12 position cap"][0]
+    assert "HHH.US (Exit Plan: RAISE STOP)" in c12[2] and "JJJ" not in c12[2]
+    assert [r for r in got if r[0] == "C10 actions"][0][1] == "MATCH"
+    # the page: its own count and place
+    page = cc.page_rows(cc.run_checks(wb13(), today, cc.knobs(), now), "2026-11-13 11:50")
+    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.2.0" in page[1][0]
+    order = [r[1] for r in page[4:]]
+    assert order.index("OVER CAP") > max(i for i, s in enumerate(order) if s in ("MISMATCH", "STALE"))
+    assert order.index("OVER CAP") < min(i for i, s in enumerate(order) if s in ("INFO", "MATCH"))
+    assert cc.RANGES["Portfolio_Decision"] == "A1:Z60"                            # the Advisor Note is column Z
+    assert " over the position cap" not in cc.page_rows(cc.run_checks(wb(), TODAY, cc.knobs()), "x")[1][0]
+
+
+def test_k8_market_open_hours():
+    R = dt.timezone(dt.timedelta(hours=3))
+    t = lambda d, h, m=0: dt.datetime(2026, 11, d, h, m, tzinfo=R)               # noqa: E731 - Riyadh, Nov 2026 (13 = Friday)
+    assert cc.open_hours(t(13, 8, 42), t(13, 11, 50)) == 0.0                      # Friday morning: nothing open
+    assert cc.open_hours(t(13, 8, 42), t(13, 19, 30)) == pytest.approx(2.0)       # US open 17:30 Riyadh in winter
+    assert cc.open_hours(t(12, 9, 0), t(12, 23, 0)) == pytest.approx(5.0 + 5.5)   # Thursday: Tadawul 10-15, then the US
+    assert cc.open_hours(t(13, 23, 0), t(15, 9, 59)) == pytest.approx(1.0)        # Fri 23:00 -> Sun 09:59: the US close only
+    assert cc.open_hours(t(14, 0, 0), t(15, 12, 0)) == pytest.approx(2.0)         # Saturday shut; Sunday Tadawul from 10:00
+    assert cc.open_hours(t(15, 16, 0), t(15, 23, 59)) == 0.0                      # Sunday evening: no US session
+    assert cc.open_hours(t(13, 12, 0), t(13, 11, 0)) == 0.0 and cc.open_hours(t(13, 12, 0), t(13, 12, 0)) == 0.0
+    summer = dt.datetime(2026, 7, 6, 16, 0, tzinfo=R)                             # Mon 6 Jul: US opens 16:30 Riyadh
+    assert cc.open_hours(summer, summer + dt.timedelta(hours=2)) == pytest.approx(1.5)
+    g = {"Portfolio_Decision": [["x"], ["Status:", "Last run 2026-11-13 08:42:10"]]}
+    row_at = lambda now, **k: [r for r in cc.freshness(g, now, 2.0, **k) if r[5] == "Portfolio_Decision"][0]   # noqa: E731
+    assert row_at(t(13, 11, 50))[1] == "MATCH"
+    r = row_at(t(13, 19, 0))                                                      # 1.5 h of the US session: within the limit
+    assert r[1] == "MATCH" and r[2].endswith("10.3 h ago, 1.5 h of it with a market open")
+    r = row_at(t(13, 19, 45))
+    assert r[1] == "STALE" and r[2].endswith("11.1 h ago, 2.2 h of it with a market open (limit 2 h)")
+    g = {"Portfolio_Decision": [["x"], ["Status:", "Last run 2026-11-14 00:30:00"]]}   # built after the US close
+    r = row_at(t(15, 3, 0))                                                       # 26.5 h later, markets shut throughout
+    assert r[1] == "STALE" and r[2].endswith("26.5 h ago (limit 26 h with the markets closed)")
+    assert row_at(t(15, 2, 0))[1] == "MATCH" and row_at(t(15, 3, 0), idle_h=48.0)[1] == "MATCH"
+    assert cc.knobs()["idle_h"] == 26.0 and cc.knobs()["page_h"] == 2.0
+    raw = (ROOT / ".github/workflows/consistency_check.yml").read_text(encoding="utf-8")
+    assert "TFB_CONS_PAGE_IDLE_MAX_H: ${{ vars.TFB_CONS_PAGE_IDLE_MAX_H || '26' }}" in raw
