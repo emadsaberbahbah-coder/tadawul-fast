@@ -816,21 +816,66 @@ def test_h6_the_cut_sizes_from_the_cash_ledger_when_it_is_lower(monkeypatch, cap
     assert dp.sizing_cash(10000.0, 17546.82, "lower") == (10000.0, "panel (not above the snapshot)")
     assert dp.sizing_cash(33125.0, 17546.82, "snapshot")[0] == 17546.82 and dp.sizing_cash(33125.0, 17546.82, "panel") == (33125.0, "panel")
     assert dp.sizing_cash(33125.0, None, "lower") == (33125.0, "panel")
-    assert dp.cash_source_mode() == "lower"
+    assert dp.cash_source_mode() == "ibkr"                                                # 1.7.0: the broker first
     monkeypatch.setenv("TFB_DAILY_PLAN", "on")
     rich, poor = book(), book(_Cash_Snapshot=Sheet(SNAP))
     assert dp.main([], book=rich, now=NOW) == 0                                           # no cash ledger: as before
     out_rich = capsys.readouterr().out
     assert dp.main([], book=poor, now=NOW) == 0
     out_poor = capsys.readouterr().out
-    assert "cash for sizing: 33,125 SAR from the panel | panel 33,125 | snapshot not read" in out_rich
-    assert ("cash for sizing: 17,547 SAR from the snapshot (lower than the panel) | panel 33,125 | snapshot 17,547 "
-            "(2026-11-12 · CALCULATED SNAPSHOT)") in out_poor
+    assert "cash for sizing: from the panel | snapshot not read" in out_rich
+    assert "cash for sizing: from the snapshot (lower than the panel) | snapshot 2026-11-12 · CALCULATED SNAPSHOT" in out_poor
+    assert "33,125" not in out_poor and "17,547" not in out_poor and "NAV" not in out_poor   # no account total is logged
+    assert "| cash from the snapshot (lower than the panel)" in out_poor
+    assert "IBKR capture not used for sizing: no capture" in out_poor
     qty = lambda b: sum(float(r[14] or 0) * float(r[11] or 0) for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK")
     assert 0 < qty(poor) < qty(rich)                                                      # smaller tickets, never larger
     monkeypatch.setenv("TFB_PLAN_CASH_SOURCE", "panel")
     old = book(_Cash_Snapshot=Sheet(SNAP))
     assert dp.main([], book=old, now=NOW) == 0 and qty(old) == qty(rich)
-    assert "cash for sizing: 33,125 SAR from the panel" in capsys.readouterr().out
+    assert "cash for sizing: from the panel" in capsys.readouterr().out
     raw = (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")
-    assert "TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'lower' }}" in raw
+    assert "TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}" in raw
+
+
+# ----------------------------------------------------------------------------- H7 (1.7.0) cash from the broker
+def cap_of(cash=4679.15, settled=4679.15, age_h=2.0, buys=None, ok=True, reason=""):
+    return {"ok": ok, "reason": reason, "age_h": age_h, "cash_usd": cash, "settled_usd": settled, "buys": buys or {},
+            "positions": {}, "stops": {}, "limits": {}, "n_orders": 0, "name": "TFB_IBKR_Capture_x.json"}
+
+
+def test_h7_the_cut_sizes_from_the_ibkr_capture(monkeypatch, capsys):
+    """Owner, 13 Nov 11:51: the plan should follow the cash available at IBKR."""
+    assert dp.capture_cash(cap_of(), 30) == (4679.15 * 3.75, "")
+    assert dp.capture_cash(cap_of(cash=5000.0, settled=4000.0), 30)[0] == 4000.0 * 3.75        # the smaller of the two
+    assert dp.capture_cash(cap_of(cash=4000.0, settled=None), 30)[0] == 15000.0
+    held = {"INSW.US": [(99.4, 20.0)], "AX.US": [(90.0, 10.0)]}
+    assert dp.capture_cash(cap_of(buys=held), 30)[0] == pytest.approx((4679.15 - 1988.0 - 900.0) * 3.75)
+    assert dp.capture_cash(cap_of(cash=100.0, settled=100.0, buys=held), 30)[0] == 0.0         # never negative
+    assert dp.capture_cash(cap_of(buys={"X.US": [(None, 5.0)]}), 30) == (
+        None, "a working buy order has no limit price, so the cash it holds is not known")
+    assert dp.capture_cash(cap_of(age_h=31.0), 30) == (None, "the newest capture is 31 h old (limit 30 h)")
+    assert dp.capture_cash(cap_of(ok=False, reason="capture is not JSON"), 30) == (None, "capture is not JSON")
+    assert dp.capture_cash(None, 30) == (None, "no capture")
+    assert dp.sizing_cash(33125.0, 20000.0, "ibkr", 17546.81) == (17546.81, "IBKR capture")
+    assert dp.sizing_cash(33125.0, 20000.0, "ibkr", None) == (20000.0, "snapshot (lower than the panel)")   # the 1.6.0 rule
+    assert dp.sizing_cash(33125.0, 20000.0, "lower", 17546.81)[0] == 20000.0 and dp.sizing_cash(1.0, 2.0, "panel", 3.0)[0] == 1.0
+    assert dp.sizing_cash(33125.0, 20000.0, "ibkr", 40000.0) == (40000.0, "IBKR capture")      # the broker rules, up or down
+    monkeypatch.setenv("TFB_DAILY_PLAN", "on")
+    qty = lambda b: sum(float(r[14] or 0) * float(r[11] or 0) for r in b.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK")
+    rich, ib, stale = book(), book(), book()
+    assert dp.main([], book=rich, now=NOW) == 0
+    capsys.readouterr()
+    assert dp.main([], book=ib, now=NOW, capture=cap_of()) == 0
+    out = capsys.readouterr().out
+    assert "cash for sizing: from the IBKR capture | snapshot not read" in out and "17,5" not in out and "| cash from the IBKR capture" in out
+    assert 0 < qty(ib) < qty(rich)
+    assert dp.main([], book=stale, now=NOW, capture=cap_of(age_h=40.0)) == 0
+    out = capsys.readouterr().out
+    assert "IBKR capture not used for sizing: the newest capture is 40 h old (limit 30 h)" in out and qty(stale) == qty(rich)
+    monkeypatch.setenv("TFB_PLAN_CASH_SOURCE", "lower")
+    low = book()
+    assert dp.main([], book=low, now=NOW, capture=cap_of()) == 0 and qty(low) == qty(rich)     # the capture is not consulted
+    assert "IBKR" not in capsys.readouterr().out
+    raw = (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}" in raw and "TFB_IBKR_CAPTURE_FOLDER_ID" in raw

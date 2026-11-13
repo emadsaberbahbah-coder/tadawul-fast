@@ -112,6 +112,14 @@ the latest balance on _Cash_Snapshot as well: TFB_PLAN_CASH_SOURCE = lower
 (default: the smaller of the two, so a stale cell can never over-size) |
 snapshot | panel (as before). An unreadable snapshot leaves the panel figure.
 
+1.7.0 (2026-11-13): CASH FROM THE BROKER (owner, 11:51 Riyadh: "the action plan
+should be as per the cash available on IBKR"). TFB_PLAN_CASH_SOURCE = ibkr (the
+new default): the cut sizes from the newest read-only IBKR capture
+(scripts/ibkr_capture.py) when it is at most TFB_PLAN_IBKR_MAX_AGE_H hours old
+(30) - the smaller of its cash and settled cash, less every working BUY order,
+at the 3.75 peg. Without a usable capture the 1.6.0 rule stands (the smaller of
+the typed cell and the cash ledger). The run log no longer prints a cash amount.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -125,7 +133,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -220,7 +228,8 @@ def knobs() -> Dict[str, Any]:
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "quote_max_h": _env_num("TFB_PLAN_QUOTE_MAX_AGE_H", 96, 0, 720),          # 1.5.0: 0 = no age check
         "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
-        "cash_source": cash_source_mode(),                                        # 1.6.0
+        "cash_source": cash_source_mode(),                                        # 1.6.0; 1.7.0 adds ibkr
+        "ibkr_max_h": _env_num("TFB_PLAN_IBKR_MAX_AGE_H", 30, 0.5, 96),
         "stable_enter": _env_num("TFB_PLAN_STABLE_ENTER", 72, 0, 100),
         "stable_exit": _env_num("TFB_PLAN_STABLE_EXIT", 67, 0, 100),
         "div_tax": _env("TFB_PLAN_DIV_TAX", "on").lower() in ("on", "1", "true", "yes"),
@@ -312,8 +321,8 @@ def board_state(values: Sequence[Sequence[Any]], now: _dt.datetime) -> Dict[str,
 
 
 def cash_source_mode() -> str:
-    m = _env("TFB_PLAN_CASH_SOURCE", "lower").lower()
-    return m if m in ("lower", "snapshot", "panel") else "lower"
+    m = _env("TFB_PLAN_CASH_SOURCE", "ibkr").lower()
+    return m if m in ("ibkr", "lower", "snapshot", "panel") else "ibkr"
 
 
 def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str]:
@@ -342,8 +351,28 @@ def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str
     return best
 
 
-def sizing_cash(panel: float, snap: Optional[float], mode: str) -> Tuple[float, str]:
-    """(cash to size from, which figure it is). Without a snapshot the panel figure stands."""
+def capture_cash(cap: Optional[Dict[str, Any]], max_age_h: float) -> Tuple[Optional[float], str]:
+    """(SAR the broker shows as free for new buys, why not) from a parsed IBKR capture: the smaller of cash and
+    settled cash, less every working BUY order, at the peg. (None, reason) when the capture cannot be used."""
+    if not cap:
+        return None, "no capture"
+    if not cap.get("ok"):
+        return None, cap.get("reason") or "capture not read"
+    if cap["age_h"] > max_age_h:
+        return None, "the newest capture is %.0f h old (limit %.0f h)" % (cap["age_h"], max_age_h)
+    from scripts.ibkr_capture import reserved_usd  # noqa: PLC0415
+    usd = min(x for x in (cap.get("cash_usd"), cap.get("settled_usd")) if x is not None)
+    held, complete = reserved_usd(cap)
+    if not complete:
+        return None, "a working buy order has no limit price, so the cash it holds is not known"
+    return max(0.0, usd - held) * 3.75, ""
+
+
+def sizing_cash(panel: float, snap: Optional[float], mode: str, ibkr: Optional[float] = None) -> Tuple[float, str]:
+    """(cash to size from, which figure it is). The broker's figure rules in mode ibkr when there is one; else the
+    smaller of the typed cell and the cash ledger; without a snapshot the panel figure stands."""
+    if mode == "ibkr" and ibkr is not None:
+        return ibkr, "IBKR capture"
     if snap is None or mode == "panel":
         return panel, "panel"
     if mode == "snapshot":
@@ -894,7 +923,7 @@ def write_grid(book, tab: str, rows: List[List[Any]], width: int, min_rows: int)
 
 
 def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.datetime] = None,
-         sleep=None) -> int:
+         sleep=None, capture: Optional[Dict[str, Any]] = None) -> int:
     ap = argparse.ArgumentParser(description="Cut or refresh the frozen Daily Plan.")
     ap.add_argument("--dry-run", action="store_true", help="compute and print, write nothing")
     ap.add_argument("--wait-min", type=int, default=0,
@@ -909,7 +938,7 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.d
     waited = 0
     while True:
         t = (now + _dt.timedelta(minutes=waited)) if now is not None else None
-        code, has_plan = run_once(args.dry_run, book, t)
+        code, has_plan = run_once(args.dry_run, book, t, capture)
         if code != 0 or has_plan or waited + 5 > max(0, min(args.wait_min, 180)):
             return code
         _out("no plan yet - looking again in 5 minutes (%d of %d waited)" % (waited, args.wait_min))
@@ -917,13 +946,15 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.d
         waited += 5
 
 
-def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tuple[int, bool]:
+def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
+             capture: Optional[Dict[str, Any]] = None) -> Tuple[int, bool]:
     """One look at the workbook: cut today's plan if there is none, else refresh its status."""
     write = mode() == "on" and not dry_run
     now = now or _dt.datetime.now(UTC)
     k = knobs()
     today = now.astimezone(RIYADH).date()
     stamp = riyadh_str(now)
+    own_book = book is None                                          # 1.7.0: only a live run reads the capture
     if book is None:
         from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
         try:
@@ -976,15 +1007,23 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
             qualified = read_qualified(board)
             panel_cash = num(panel_value(board, "Cash Available (SAR)")) or 0.0
             snap, snap_at = None, ""
-            if k.get("cash_source", "lower") != "panel":                     # 1.6.0: the cash ledger's own figure
+            if k.get("cash_source", "ibkr") != "panel":                      # 1.6.0: the cash ledger's own figure
                 try:
                     snap, snap_at = snapshot_cash(_read(book, "_Cash_Snapshot", "A1:G2000"))
                 except Exception as e:  # noqa: BLE001 - the panel figure stands
                     _out("cash snapshot not read (%s): sizing from the panel" % type(e).__name__)
-            cash, cash_from = sizing_cash(panel_cash, snap, k.get("cash_source", "lower"))
-            _out("cash for sizing: %s SAR from the %s | panel %s | snapshot %s%s" % (
-                fmt(cash, 0), cash_from, fmt(panel_cash, 0), fmt(snap, 0) if snap is not None else "not read",
-                " (%s)" % snap_at if snap_at else ""))
+            ibkr_cash, ibkr_why = None, ""
+            if k.get("cash_source", "ibkr") == "ibkr":                       # 1.7.0: the broker's own figure
+                cap = capture
+                if cap is None and own_book:
+                    from scripts import ibkr_capture  # noqa: PLC0415
+                    cap = ibkr_capture.latest(now, out=_out)
+                ibkr_cash, ibkr_why = capture_cash(cap, k.get("ibkr_max_h", 30.0))
+                if ibkr_cash is None:
+                    _out("IBKR capture not used for sizing: %s" % ibkr_why)
+            cash, cash_from = sizing_cash(panel_cash, snap, k.get("cash_source", "ibkr"), ibkr_cash)
+            _out("cash for sizing: from the %s | snapshot %s" % (                 # no amount in the run log
+                cash_from, snap_at if snap is not None else "not read"))
             mps = int(num(panel_value(board, "T10: Max Per Sector")) or 2)
             plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
             if not qualified:
@@ -992,10 +1031,9 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> Tu
             else:
                 rows = ledger_rows(plan, day, stamp, state["run_at"], quality)
                 today_rows = [{LEDGER_HEADERS[i]: r[i] for i in range(len(LEDGER_HEADERS))} for r in rows]
-                _out("CUT %s from the render of %s (%s): %d pick(s), %d in the pipeline | NAV %s cash %s "
-                     "deployable %s per pick %s" % (day, state["run_at"], quality, len(plan["picks"]),
-                                                    len(plan["pipeline"]), fmt(plan["nav"], 0), fmt(cash, 0),
-                                                    fmt(plan["deployable"], 0), fmt(plan["per_pick"], 0)))
+                # 1.7.0: the account's totals stay out of the run log (the repository's logs are public)
+                _out("CUT %s from the render of %s (%s): %d pick(s), %d in the pipeline | cash from the %s" % (
+                    day, state["run_at"], quality, len(plan["picks"]), len(plan["pipeline"]), cash_from))
     if today_rows:
         live = live_overlay(today_rows, sources) if k["live"] else {}
         if live:

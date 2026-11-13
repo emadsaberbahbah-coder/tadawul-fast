@@ -735,7 +735,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     news = x.get("news") or {}
     news_live = bool(news.get("read") and news.get("verdict") not in ("", "GO") and news.get("age_h") is not None
                      and news["age_h"] <= k.get("news_max_h", 24.0))
-    if news_live and any(step_kind(s) == "buy" for s in steps):
+    if news_live and any(step_kind(s) in ("buy", "placed") for s in steps):
         steps.append({"urgency": 4.9, "symbol": "NEWS", "kind": "news", "source": NEWS_TAB,
                       "do": "Read before buying: the News & Macro Gate reads %s (%s Riyadh)." % (
                           news["verdict"].replace("_", " "), news["at"]),
