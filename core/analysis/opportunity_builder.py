@@ -1716,7 +1716,17 @@ from typing import Optional
 #   unmerged on 8 Nov and superseded by the cockpit-side #933; reused here.
 #   Rollback: unset TFB_OPP_SIZING_MODE (or set cap), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.29.0"
+# -----------------------------------------------------------------------------
+# v1.29.1 (2026-11-13) - ANNUALIZED FIGURE NAMES ITS PERIOD (audit 13 Nov).
+#   The ticket note printed "valuation upside 33.4% (ann 216.7%)": ann_roi_pct
+#   compounds the valuation upside over the panel period (3 months live), so
+#   it assumes the whole upside arrives within that period. The note now reads
+#   "(ann 216.7% if reached in 3m)". Text of the note only: no gate, rank,
+#   size, ROI, R/R or schema change. The version bump retires frozen board-
+#   funding snapshots issued by 1.29.0 (as every version change does): deploy
+#   outside a sync. Functions added: 0. Removed: 0. Rollback: git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.29.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -6869,8 +6879,15 @@ def _entry_zone(cand):
     return _fmt_px(low) + "\u2013" + _fmt_px(high) + " SAR"
 
 
-def _advisor_sentence(cand, suggested_sar, shares, conf, review_date):
-    """L8: ACTION + SIZE + LEVELS + one-line REASON + CONFIDENCE + REVIEW."""
+def _advisor_sentence(cand, suggested_sar, shares, conf, review_date,
+                      period_months=None):
+    """L8: ACTION + SIZE + LEVELS + one-line REASON + CONFIDENCE + REVIEW.
+
+    v1.29.1: the annualized figure names its assumption. ann_roi_pct
+    compounds the valuation upside over the panel period (period_months),
+    i.e. it assumes the whole upside is reached within that period; a 33.4%
+    upside on a 3-month panel prints 216.7%. Without the period the number
+    read as an expected annual return (13 Nov 2026 audit: 3 of 3 tickets)."""
     fx = cand["fx_to_sar"] or 0.0
     size_txt = (_fmt_sar(suggested_sar) + " (" + "{:,}".format(shares) +
                 " sh)") if shares > 0 else "no size (no deployable capital)"
@@ -6878,9 +6895,14 @@ def _advisor_sentence(cand, suggested_sar, shares, conf, review_date):
               _fmt_px((cand["stop"] or 0) * fx) + ", TP1 " +
               _fmt_px((cand["tp1"] or 0) * fx) + ", TP2 " +
               _fmt_px((cand["tp2"] or 0) * fx) + " SAR")
+    try:
+        _pm = int(period_months) if period_months is not None else None
+    except (TypeError, ValueError):
+        _pm = None
+    _ann_txt = ("% (ann " + _fmt_num(_round1(cand["ann_roi_pct"])) +
+                ("% if reached in " + str(max(1, _pm)) + "m)" if _pm else "%)"))
     reason = ("valuation upside " + _fmt_num(_round1(cand["roi_pct"])) +
-              "% (ann " + _fmt_num(_round1(cand["ann_roi_pct"])) +
-              "%) via " + (cand["valuation_basis"] or "?") + ", R/R " +
+              _ann_txt + " via " + (cand["valuation_basis"] or "?") + ", R/R " +
               _fmt_num(_round2(cand["rr"])) + ", reliability " +
               _fmt_num(_round1(cand["reliability"])))
     return ("INVEST \u2014 " + size_txt + " @ " + levels + "; " + reason +
@@ -6960,7 +6982,7 @@ def _build_ticket(rank, pick, criteria, review_date):
                               and _basis_engine and engine_pct is not None)
     detail_engine_roi = _round1(cand["engine_roi_12m_pct"])
     note = _advisor_sentence(cand, suggested, pick["suggested_shares"], conf,
-                             review_date)
+                             review_date, criteria.get("period_months"))
     if _ticket_plan_primary:
         # Reproducibility contract preserved: exp_gain == suggested x
         # displayed ann / 100, with ann = the PLAN ROI annualized over the

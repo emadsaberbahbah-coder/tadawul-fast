@@ -211,7 +211,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-08 (post-mortem item 3; manifest pin only): 1.28.0 -> 1.29.0
     # (TFB_OPP_SIZING_MODE=risk + TFB_OPP_RISK_BUDGET_PCT, default cap).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.29.0", "opportunity builder"),
+     "1.29.1", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
