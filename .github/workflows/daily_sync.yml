@@ -1514,6 +1514,13 @@ jobs:
           # pattern. ROLLBACK: unset (or yfinance / 0).
           TRACK_HIST_CLOSE_SOURCE: ${{ vars.TRACK_HIST_CLOSE_SOURCE || 'yfinance' }}
           TRACK_AUDIT_DUE_ONLY: ${{ vars.TRACK_AUDIT_DUE_ONLY || '0' }}
+          # (2026-11-04) track_performance v6.56.0 [OUTCOME-CAL-EXT], mirrored
+          # from track_performance.yml 1.0.10 (ENV PARITY): a forecast on a venue
+          # the outcome map lacks uses the builder's reviewed venue calendar, so
+          # a manual run_tracker=true audit matures the same records as the
+          # clock. Inert on record-only schedules (no audit). 'off' = v6.53.0.
+          # ROLLBACK: unset or off.
+          TRACK_OUTCOME_CAL_EXT: ${{ vars.TRACK_OUTCOME_CAL_EXT || 'off' }}
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
