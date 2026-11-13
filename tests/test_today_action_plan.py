@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.2.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.3.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -594,7 +594,7 @@ def test_t7_plain_fallback_style_off_and_preview(monkeypatch, capsys):
     assert tap.run_once(False, book=off, now=NOW) == 0
     ws = off.tabs["Today_Action_Plan"]
     ws.row_count = before = len(ws.values)                                                # what the styled run left
-    assert ws.merges and ws.formats and ws.sizes[("ROWS", 3)] == 10                       # e.g. a 10 px spacer row
+    assert ws.merges and ws.formats and ws.sizes[("ROWS", 3)] == 8                        # e.g. an 8 px spacer row
     monkeypatch.setenv("TFB_TAP_STYLE", "off")
     assert tap.run_once(False, book=off, now=NOW) == 0
     assert ws.plain_updates == 1 and ", plain)" in capsys.readouterr().out
@@ -762,7 +762,7 @@ def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
     assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32" for r in page)
     assert any(r[0] == "17,547 SAR" and r[3] == "open buys cost 7,921 SAR · left after the funded buys 9,626 SAR" for r in page)   # 24 x 88.01 x 3.75
     out = capsys.readouterr().out
-    assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash 17,547 SAR" in out
+    assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash read (2026-11-12 · CALCULATED SNAPSHOT)" in out and "17,547" not in out
     for name in ("Top_10_Investments", "Top_10_Investments_v2", "_News_Gate", "_Cash_Snapshot"):
         assert book.tabs[name].updates == 0 and book.tabs[name].hides == 0                # read only
     both = aligned_book(Top_10_Investments=Sheet(T10[:6] + [["2", "NMM.US", "Navios", "88", "7,800 SAR", "24", "Cash", ""]]),
@@ -811,7 +811,7 @@ def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Top_10_Investments not read: RuntimeError" in out and "_Cash_Snapshot not read: RuntimeError" in out
     assert any(r[0] == "Top 10 (main)" and r[2] == "page not read" for r in op)
-    assert any("The _Cash_Snapshot tab was not read" in str(r[1]) for r in op)
+    assert any("No cash figure was read" in str(r[1]) for r in op)
     assert [c[1] for c in cards(op)] == ["SUPN.US", "DDI.US", "IBOC.US", "TEN.US", "NEWS", "NMM.US"]   # v2 still read
     waits = []
     slow = aligned_book(_News_Gate=Flaky(NEWS, fail=1))                                   # the quota on an optional tab
