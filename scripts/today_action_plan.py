@@ -1097,7 +1097,9 @@ def archive_rows(d: Dict[str, Any], now: _dt.datetime, rid: str) -> List[Dict[st
     c = day_counts(d)
     steps = [dict(s, kind=step_kind(s), label=CHIP[step_kind(s)][1]) for s in d["steps"]]
     tiles = day_tiles(d, c["n_buy"], c["hard"], c["unfunded"]) if d.get("aligned") else []
-    return plan_archive.plan_rows(steps, tiles, summary_line(d)[0], d["stale"], d.get("missing") or [], now, rid, __version__)
+    line, alert = summary_line(d)
+    return plan_archive.plan_rows(steps, tiles, line, d["stale"], d.get("missing") or [], now, rid, __version__,
+                                  alert=alert)
 
 
 def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:

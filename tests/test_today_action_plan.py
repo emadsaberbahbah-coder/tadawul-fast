@@ -1278,3 +1278,22 @@ def test_t14_an_archive_fault_never_changes_the_page(monkeypatch, capsys):
     assert tap.run_once(False, book=broken, now=NOW, capture=plan_capture(), bq_session=Down()) == 0
     assert broken.tabs["Today_Action_Plan"].values == ref.tabs["Today_Action_Plan"].values
     assert "plan archive not written: ConnectionError: network down" in capsys.readouterr().out
+
+
+def test_t14_the_archived_summary_keeps_the_page_alert(monkeypatch):
+    """A flag on the page (pages disagree, not funded, news gate) is an alert in the archive too, sources fresh or not."""
+    monkeypatch.setenv("TFB_TAP_BQ", "on")
+    monkeypatch.setenv("TFB_BQ_PROJECT", "proj-1")
+    monkeypatch.setenv("TFB_BQ_DATASET", "ds_1")
+    seen = {}
+    real = tap.summary_line
+
+    def flagged(d):
+        line, _ = real(d)
+        seen["fresh"] = not (d["stale"] or d.get("missing"))
+        return line + " · NEWS GATE: RISK OFF", True
+    monkeypatch.setattr(tap, "summary_line", flagged)
+    bq = _BQ()
+    assert tap.run_once(False, book=full_book(), now=NOW, capture=plan_capture(), bq_session=bq) == 0
+    summary = [r["json"] for r in bq.inserts[0]["rows"] if r["json"]["row_type"] == "summary"][0]
+    assert seen["fresh"] and summary["tone"] == "alert" and summary["instruction"].endswith("NEWS GATE: RISK OFF")

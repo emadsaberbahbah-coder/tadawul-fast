@@ -79,13 +79,15 @@ def run_id(now: _dt.datetime) -> str:
 
 
 def plan_rows(steps: Sequence[Dict[str, Any]], tiles: Sequence[Sequence[str]], summary: str, stale: Sequence[str],
-              missing: Sequence[str], now: _dt.datetime, rid: str, version: str) -> List[Dict[str, Any]]:
-    """The run as rows. `steps` carry "kind" and "label" (the page's chip); `tiles` are (label, value, note, tone)."""
+              missing: Sequence[str], now: _dt.datetime, rid: str, version: str,
+              alert: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """The run as rows. `steps` carry "kind" and "label" (the page's chip); `tiles` are (label, value, note, tone).
+    `alert` is the page's own alert state (its summary band); without it, a stale or unread source is the alert."""
     base = {"run_at": now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "plan_date": now.astimezone(RIYADH).strftime("%Y-%m-%d"), "run_id": rid, "version": version}
     out: List[Dict[str, Any]] = [dict(base, row_type="summary", seq=0, kind="", label="", symbol="",
                                       instruction=_t(summary), levels=_t(", ".join(stale)), why=_t(", ".join(missing)),
-                                      source="", tone="alert" if (stale or missing) else "ok")]
+                                      source="", tone="alert" if (alert or stale or missing) else "ok")]
     for i, s in enumerate(steps, 1):
         out.append(dict(base, row_type="step", seq=i, kind=_t(s.get("kind")), label=_t(s.get("label")),
                         symbol=_t(s.get("symbol")), instruction=_t(s.get("do")), levels=_t(s.get("levels")),

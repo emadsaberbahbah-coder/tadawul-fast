@@ -64,6 +64,9 @@ def test_p1_rows_copy_the_run_and_carry_the_riyadh_day():
     assert set(rows[0]) == {f["name"] for f in pa.SCHEMA}          # every row carries exactly the table's columns
     calm = pa.plan_rows([], [], "0 step(s)", [], [], NOW, "x", "v")
     assert calm[0]["tone"] == "ok" and len(calm) == 1
+    flagged = pa.plan_rows([], [], "0 step(s) · NEWS GATE: RISK OFF", [], [], NOW, "x", "v", alert=True)
+    assert flagged[0]["tone"] == "alert"                            # the page's own alert, with every source fresh
+    assert pa.plan_rows([], [], "", [], [], NOW, "x", "v", alert=False)[0]["tone"] == "ok"
     long = pa.plan_rows([dict(STEPS[0], why="w" * 5000)], [], "", [], [], NOW, "x", "v")
     assert len(long[1]["why"]) == pa.MAX_TEXT and long[1]["why"].endswith("…")
 
