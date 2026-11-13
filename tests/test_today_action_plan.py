@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.3.2 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.3.3 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -1159,3 +1159,61 @@ def test_t12_a_new_buy_needs_a_capture_within_two_market_hours():
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_BUY_CAPTURE_MARKET_H: ${{ vars.TFB_TAP_BUY_CAPTURE_MARKET_H || '2' }}" in raw
     assert '"TFB_TAP_BUY_CAPTURE_MARKET_H", 2,' in (ROOT / "scripts/today_action_plan.py").read_text(encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------- T13 (1.3.3) an attached stop; the log
+def test_t13_a_stop_attached_to_a_working_buy_and_no_amount_in_the_log(capsys):
+    def text(low, priced=24.0, unpriced=0.0, held=0.0, tol=1.0):
+        p = {"symbol": "NMM.US", "stop": 80.17, "stop_tol": tol}
+        if low != "none":
+            p["placed_stop"] = (low, priced, unpriced, held)
+        return tap.placed_stop_text(p, 24.0)
+
+    todo = "After it fills, place the stop at 80.17."
+    assert text("none") == todo
+    assert text(80.17) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
+    assert text(80.98) == "Its stop at 80.98 is attached at IBKR; nothing more to place."      # tighter than the plan
+    assert text(79.50) == "Its stop at 79.50 is attached at IBKR; nothing more to place."      # within 1%
+    assert text(78.00) == "The stop attached at IBKR is 78.00, below the plan's 80.17."
+    assert text(79.50, tol=0.0) == "The stop attached at IBKR is 79.50, below the plan's 80.17."
+    assert text(80.17, priced=10.0) == "The stop attached at IBKR covers 10 of 24 shares; the plan's stop is 80.17."
+    unread = "A stop order is attached at IBKR but its price was not read; the plan's stop is 80.17."
+    assert text(None, priced=0.0, unpriced=24.0) == unread
+    # Codex P2 on #975: a stop that protects shares already held is not the new order's stop
+    assert text(80.17, priced=20.0, held=20.0) == todo
+    assert text(80.17, priced=44.0, held=20.0) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
+    assert text(80.17, priced=30.0, held=20.0) == "The stop attached at IBKR covers 10 of 24 shares; the plan's stop is 80.17."
+    # Codex P2 on #975: shares stopped at an unread price are not protected at the read price
+    assert text(80.17, priced=10.0, unpriced=14.0) == unread
+    assert text(80.17, priced=10.0, unpriced=4.0) == "The stop attached at IBKR covers 14 of 24 shares; the plan's stop is 80.17."
+    assert text(80.17, priced=24.0, unpriced=5.0) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
+    cap0 = {"stops": {"X.US": [(80.17, 10.0), (None, 14.0), (79.0, 3.0)]}, "positions": {"X.US": 20.0}}
+    assert tap.stop_summary(cap0, "X.US") == (79.0, 13.0, 14.0, 20.0) and tap.stop_summary(cap0, "Y.US") == (None, 0, 0, 0.0)
+    # the page: a bracket stop on the working buy
+    orders = [ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9),
+              ib_order("Sell 24 NMM", "STOP", "SELL", "STP 80.17, GTC", 24),
+              ib_order("Sell 24 NMM", "LIMIT", "SELL", "Limit 99.50, GTC", 24, limit=99.5)]
+    cap = ib_capture(orders, at=NOW.astimezone(tap.RIYADH).isoformat())
+    holdings, plan = tap.read_holdings(EXIT), tap.read_plan(LEDGER, NOW.astimezone(tap.RIYADH).date())
+    broker = tap.apply_capture(holdings, plan, cap, 30, NOW)
+    assert broker["open_stops"] == {"NMM.US": (80.17, 24.0, 0.0, 0.0)}
+    d = tap.build(holdings, plan, {}, [], {"Exit_Plan": 0.5, "Daily_Plan": 0.3}, K, extra={"broker": broker, "cash": broker["cash"]})
+    nmm = next(s for s in d["steps"] if s["symbol"] == "NMM.US")
+    assert nmm["do"] == ("The buy order for NMM.US is working at IBKR: 24 shares at 87.90. Its stop at 80.17 is attached "
+                         "at IBKR; nothing more to place.")
+    broker = tap.apply_capture(holdings, plan, ib_capture(orders[:1], at=NOW.astimezone(tap.RIYADH).isoformat()), 30, NOW)
+    assert broker["open_stops"] == {}
+    d = tap.build(holdings, plan, {}, [], {"Exit_Plan": 0.5, "Daily_Plan": 0.3}, K, extra={"broker": broker, "cash": broker["cash"]})
+    nmm = next(s for s in d["steps"] if s["symbol"] == "NMM.US")
+    assert nmm["do"].endswith("After it fills, place the stop at 80.17.") and "placed_stop" not in d["picks"][0]
+    # the public run log carries no SAR amount; the page keeps them
+    assert tap.log_text("its 21 shares need 9,999 SAR and 1,234 SAR of cash is left") == (
+        "its 21 shares need (amount on the page) and (amount on the page) of cash is left")
+    assert tap.log_text("ticket: 66 shares, 5,071.50 SAR") == "ticket: 66 shares, (amount on the page)"
+    assert tap.log_text("Buy 24 NMM.US with a limit between 86.99 and 88.73") == "Buy 24 NMM.US with a limit between 86.99 and 88.73"
+    capsys.readouterr()
+    book = aligned_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture(cash_sar=3000.0)) == 0
+    out = capsys.readouterr().out
+    assert " SAR" not in "\n".join(line for line in out.splitlines() if " STEP " in line or " ALIGN " in line)
+    assert any("SAR" in str(c) for r in book.tabs["Today_Action_Plan"].values for c in r)

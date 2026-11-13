@@ -4,7 +4,16 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.3.2 (2026-11-13)
+v1.3.3 (2026-11-13)
+  1.3.3: A STOP ALREADY ATTACHED TO A WORKING BUY IS RECOGNISED; NO AMOUNT IN THE RUN LOG (owner, 13 Nov 19:12: "full
+         check ... another improvement"). Read on the live page at 19:16 Riyadh: both working buys carried their
+         stop as an attached order at IBKR, and the page still said "After it fills, place the stop at ...".
+           - when the capture shows a working stop on a placed pick covering the order's shares at the plan's stop
+             (within TFB_TAP_STOP_TOL_PCT), the step says the stop is attached; a lower, partial or unpriced stop is
+             named as such; no stop keeps the old sentence. Stops on the symbol are counted against shares already
+             held first, and only shares stopped at a read price count as protected (Codex P2 x2, #975).
+           - the run log is public: a step's sentence is printed without its SAR amounts ("... SAR" -> "(amount on
+             the page)"). The page is unchanged.
   1.3.2: A NEW BUY NEEDS A CAPTURE FROM THIS SESSION (owner, 13 Nov 18:33: "other approval you can select the best
          options"; the 13 Nov review asked for one capture-age policy). Holdings and stops keep the 30-hour limit
          (TFB_TAP_IBKR_MAX_AGE_H): a stop protects shares the account already holds. A NEW BUY also needs the capture to
@@ -135,7 +144,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -605,7 +614,12 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
     out.update({"used": True, "at": cap["as_of"].astimezone(RIYADH).strftime("%Y-%m-%d %H:%M"),
                 "cash": max(0.0, usd - held_back) * PEG if complete else None,
                 "reserved": held_back * PEG, "complete": complete,
-                "open_orders": dict((sym, rows) for sym, rows in (cap.get("buys") or {}).items() if sym in picks)})
+                "open_orders": dict((sym, rows) for sym, rows in (cap.get("buys") or {}).items() if sym in picks),
+                # 1.3.3: the stop orders already working on a pick (an attached bracket stop):
+                # (lowest read price, shares at a read price, shares at an unread price, shares already held).
+                # The capture does not say which order a stop belongs to, so stops are counted against the
+                # shares already held first (Codex P2 x2, #975).
+                "open_stops": dict((sym, stop_summary(cap, sym)) for sym in picks if (cap.get("stops") or {}).get(sym))})
     if now is not None:                                             # 1.3.2: market-open hours since the capture
         from scripts.consistency_check import open_hours  # noqa: PLC0415
         out["market_h"] = open_hours(cap["as_of"], now)
@@ -703,6 +717,44 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
     return steps
 
 
+def stop_summary(cap: Dict[str, Any], symbol: str) -> Tuple[Optional[float], float, float, float]:
+    """(lowest read stop price, shares stopped at a read price, shares stopped at an unread price, shares already
+    held) for a symbol of the capture."""
+    rows = (cap.get("stops") or {}).get(symbol) or []
+    prices = [px for px, _ in rows if px]
+    return (min(prices) if prices else None, sum(q for px, q in rows if px), sum(q for px, q in rows if not px),
+            float((cap.get("positions") or {}).get(symbol) or 0.0))
+
+
+def placed_stop_text(p: Dict[str, Any], o_qty: float) -> str:
+    """What to say about the stop of a working buy (1.3.3): attached at IBKR, or still to place. Stops on the symbol
+    protect the shares already held first; only what is left counts for the new shares, and only shares stopped at a
+    read price count as protected at that price."""
+    plan, at = p.get("stop"), p.get("placed_stop")
+    todo = "After it fills, place the stop at %s." % fmt(plan)
+    if not at:
+        return todo
+    low, priced, unpriced, held = at
+    free = priced + unpriced - held                                 # stop shares left for the new order
+    if free <= 1e-6:
+        return todo
+    if priced - held + 1e-6 >= o_qty:                               # read-price stops cover the held and the new shares
+        if plan and low < plan * (1 - (p.get("stop_tol") or 0.0) / 100.0):
+            return "The stop attached at IBKR is %s, below the plan's %s." % (fmt(low), fmt(plan))
+        return "Its stop at %s is attached at IBKR; nothing more to place." % fmt(low)
+    if free + 1e-6 >= o_qty:                                        # covered only by counting an unread price
+        return "A stop order is attached at IBKR but its price was not read; the plan's stop is %s." % fmt(plan)
+    return "The stop attached at IBKR covers %s of %s shares; the plan's stop is %s." % (fmt(free, 0), fmt(o_qty, 0), fmt(plan))
+
+
+_AMOUNT = re.compile(r"\d[\d,]*(?:\.\d+)? SAR")
+
+
+def log_text(s: str) -> str:
+    """A step's sentence for the public run log: SAR amounts are not printed (1.3.3)."""
+    return _AMOUNT.sub("(amount on the page)", s)
+
+
 def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional[Dict[str, Any]]:
     """The buy step of an OPEN pick; None for every other status."""
     if p["status"] != "OPEN" or not p.get("qty"):
@@ -736,8 +788,8 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
         o_qty = sum(q for _, q in p["placed"])
         o_px = ", ".join(sorted(set(fmt(px) if px is not None else "no limit" for px, _ in p["placed"])))
         return {"urgency": 5 + (p.get("rank") or 0) / 1000.0, "symbol": p["symbol"], "kind": "placed", "source": "Daily_Plan",
-                "do": "The buy order for %s is working at IBKR: %s shares at %s. After it fills, place the stop at %s.%s" % (
-                    p["symbol"], fmt(o_qty, 0), o_px, fmt(p.get("stop")),
+                "do": "The buy order for %s is working at IBKR: %s shares at %s. %s%s" % (
+                    p["symbol"], fmt(o_qty, 0), o_px, placed_stop_text(p, o_qty),
                     " Cash does not cover it: it needs %s SAR and %s SAR is left." % (
                         fmt(p["unfunded"][0], 0), fmt(p["unfunded"][1], 0)) if p.get("unfunded") else ""),
                 "levels": "plan: %s shares · limit %s - %s · first target %s" % (
@@ -804,8 +856,12 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
         p.pop("review_reason", None)
         p.pop("placed", None)
         p.pop("unfunded", None)
+        p.pop("placed_stop", None)
         if p["status"] == "OPEN" and (broker.get("open_orders") or {}).get(p["symbol"]):
             p["placed"] = broker["open_orders"][p["symbol"]]
+            if (broker.get("open_stops") or {}).get(p["symbol"]):   # 1.3.3
+                p["placed_stop"] = broker["open_stops"][p["symbol"]]
+        p["stop_tol"] = k["stop_tol"]
         reason = plan_reason or custody_reason or (funding_reason if not p.get("placed") else "")
         if reason and p["status"] == "OPEN" and p.get("qty"):
             p["review_reason"] = reason
@@ -1455,13 +1511,14 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                     if any(_squash(c) in ("Seat status", "Ticket SAR") for c in r)]
             _out("%s: no seats table found in %d row(s)%s" % (tab, len(got), "; nearest header: " + near[0] if near else ""))
     for a in d["align"]:
-        _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"], a["main"], a["v2"]))
+        _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"], log_text(a["main"]),
+                                                                 log_text(a["v2"])))
     if aligned:
         _out("news gate %s (%s) · cash %s (%s)" % (                  # no amount in the run log
             d["news"].get("verdict") or "not read", d["news"].get("at") or "-",
             "read" if d["cash"] is not None else "not read", d["cash_at"] or "-"))
     for i, s in enumerate(d["steps"], 1):
-        _out("STEP %d %-9s %s | %s" % (i, s["symbol"], s["do"], s["levels"]))
+        _out("STEP %d %-9s %s | %s" % (i, s["symbol"], log_text(s["do"]), log_text(s["levels"])))
     if not d["steps"]:
         _out("no step today")
     _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s · not read: %s" % (
