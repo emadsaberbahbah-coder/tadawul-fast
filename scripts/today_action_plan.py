@@ -4,7 +4,10 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.3.0 (2026-11-13)
+v1.3.1 (2026-11-13)
+  1.3.1: Action advice requires current source pages and a usable broker capture. Missing custody, a position
+         quantity mismatch, or an unpriced external buy reservation gives a VERIFY step with the research levels.
+         Working orders remain visible. Ledger cash alone does not approve a new buy.
   1.3.0: THE BROKER'S OWN CASH AND ORDERS, AND A CLEARER PAGE (owner, 13 Nov 11:51: "the action plan should be as per
          the cash available on IBKR ... full review for the action plan formatting").
          BROKER. The page reads the newest read-only IBKR capture (scripts/ibkr_capture.py; the file the scheduled
@@ -116,7 +119,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -519,8 +522,10 @@ def align(plan: Dict[str, Any], t10: Dict[str, Any], v2: Dict[str, Any]) -> List
     out: List[Dict[str, Any]] = []
     for sym in names:
         p = picks.get(sym)
-        buys = bool(p and p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded"))
-        if p and p.get("unfunded"):
+        buys = bool(p and p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded") and not p.get("review_reason"))
+        if p and p.get("review_reason"):
+            mine, held = "VERIFY - " + p["review_reason"], p["review_reason"]
+        elif p and p.get("unfunded"):
             mine, held = "OPEN, not funded today", "it is not funded today"
         elif buys:
             mine, held = "OPEN - buy %s" % fmt(p["qty"], 0), ""
@@ -612,6 +617,11 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
     sym, qty, stop, bs, act = h["symbol"], h.get("qty") or 0, h.get("stop"), h.get("broker_stop"), h["action"]
     steps: List[Dict[str, Any]] = []
     shares = "%s shares" % fmt(qty, 0) if qty else "the position"
+    if h.get("review_reason") and act != "NO RULE":
+        return [{"urgency": 2.6, "symbol": sym, "kind": "verify", "source": "Exit_Plan",
+                 "do": "Verify %s at IBKR before acting: %s." % (sym, h["review_reason"]),
+                 "levels": "research: %s shares · last %s · plan stop %s" % (fmt(qty, 0), fmt(h.get("last")), fmt(stop)),
+                 "why": h.get("why", "")}]
 
     def step(urg: float, do: str, levels: str) -> None:
         steps.append({"urgency": urg, "symbol": sym, "do": do, "levels": levels, "why": h.get("why", ""),
@@ -674,6 +684,15 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
     """The buy step of an OPEN pick; None for every other status."""
     if p["status"] != "OPEN" or not p.get("qty"):
         return None
+    if p.get("review_reason"):
+        working = ""
+        if p.get("placed"):
+            working = "An order for %s shares is already working at IBKR. " % fmt(sum(q for _, q in p["placed"]), 0)
+        return {"urgency": 4.8, "symbol": p["symbol"], "kind": "placed" if working else "verify", "source": "Daily_Plan",
+                "do": working + "Verify %s before any new buy or stop change: %s." % (p["symbol"], p["review_reason"]),
+                "levels": "research: %s shares · limit %s - %s · stop %s" % (
+                    fmt(p["qty"], 0), fmt(p.get("zone_low")), fmt(p.get("zone_high")), fmt(p.get("stop"))),
+                "why": p.get("reason", "")}
     if p.get("unfunded") and not p.get("placed"):                   # 1.2.0: the cash does not cover it
         cost, left = p["unfunded"]
         return {"urgency": 6 + (p.get("rank") or 0) / 1000.0, "symbol": p["symbol"], "kind": "nofund", "source": "Daily_Plan",
@@ -714,17 +733,36 @@ def stale_limit(name: str, k: Dict[str, float]) -> float:
     return max(k["stale_h"], k.get("stale_ev", 0.0)) if name == "Evidence_Board" else k["stale_h"]
 
 
+def action_source_reason(name: str, ages: Dict[str, Optional[float]], k: Dict[str, float]) -> str:
+    age = ages.get(name)
+    if age is None:
+        return "%s update time is unknown" % name
+    if age > stale_limit(name, k):
+        return "%s is %.1f h old; refresh it first" % (name, age)
+    return ""
+
+
 def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[str, Any], issues: List[Dict[str, str]],
           ages: Dict[str, Optional[float]], k: Dict[str, float], missing: Sequence[str] = (),
           broker_note: str = "", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """`extra` (1.2.0): {"t10", "v2", "news", "cash", "cash_at"} - the Top 10 pages, the news gate and the cash ledger."""
     x = extra or {}
+    broker = x.get("broker") or {}
+    custody_reason = "" if broker.get("used") else "broker cash and orders are unverified (%s)" % (broker.get("why") or "no capture")
+    exit_reason = action_source_reason("Exit_Plan", ages, k) or custody_reason
     steps: List[Dict[str, Any]] = []
     for h in holdings:
+        h.pop("review_reason", None)
+        if exit_reason:
+            h["review_reason"] = exit_reason
+        elif h.get("at_broker") is False:
+            h["review_reason"] = "the holding is absent from the broker capture"
+        elif h.get("qty") is None or h.get("broker_qty") is None or abs(h["qty"] - h["broker_qty"]) > 1e-6:
+            h["review_reason"] = "plan quantity %s differs from broker quantity %s" % (fmt(h.get("qty"), 0), fmt(h.get("broker_qty"), 0))
         steps += holding_steps(h, k["stop_tol"], not broker_note)
     # a SELL row is leaving in full: no stop to confirm on it (Codex P2, #967)
     unread = [h["symbol"] for h in holdings
-              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL")]
+              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL") and not h.get("review_reason")]
     if broker_note and unread:
         steps.append({"urgency": 2.6, "symbol": "ALL", "source": "Exit_Plan",
                       "do": "Confirm in IBKR that each holding's stop matches the plan's stop in section B (%s)."
@@ -733,11 +771,18 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
                       "why": "The Exit Plan reports: %s. A stop may be in place at the broker; the workbook could not "
                              "compare it." % broker_note})
     picks = plan["picks"] if plan.get("is_today") else []
-    broker = x.get("broker") or {}
+    funding_reason = custody_reason or ("a working buy reservation has no limit price" if broker.get("complete") is False else "")
+    plan_reason = action_source_reason("Daily_Plan", ages, k) or ("source pages were unverified at the cut" if plan.get("quality", "").upper() != "VERIFIED" else "")
     for p in picks:
+        p.pop("review_reason", None)
+        p.pop("placed", None)
+        p.pop("unfunded", None)
         if p["status"] == "OPEN" and (broker.get("open_orders") or {}).get(p["symbol"]):
             p["placed"] = broker["open_orders"][p["symbol"]]
-    cash_left = fund(picks, x.get("cash"))
+        reason = plan_reason or custody_reason or (funding_reason if not p.get("placed") else "")
+        if reason and p["status"] == "OPEN" and p.get("qty"):
+            p["review_reason"] = reason
+    cash_left = fund([p for p in picks if not p.get("review_reason") or p.get("placed")], None if funding_reason else x.get("cash"))
     for p in picks:
         s = pick_step(p, evidence.get("names") or {}, plan.get("quality", "").upper() == "VERIFIED")
         if s:
@@ -768,7 +813,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
             "missing": sorted(missing), "broker_note": broker_note, "align": rows, "news": news,
             "news_live": news_live, "cash": x.get("cash"), "cash_at": x.get("cash_at", ""), "cash_left": cash_left,
             "t10": x.get("t10") or {}, "v2": x.get("v2") or {}, "aligned": bool(x), "broker": broker,
-            "cash_src": x.get("cash_src", "")}
+            "cash_src": x.get("cash_src", ""), "funding_reason": funding_reason}
 
 
 # ----------------------------------------------------------------------------- #
@@ -823,7 +868,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
 CHIP = {"sell": ("C62828", "SELL"), "profit": ("2E7D32", "TAKE PROFIT"), "stop": ("EF6C00", "RAISE STOP"),
         "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY"),
         "skip": ("7B1F1F", "DO NOT BUY"), "news": ("8E5A00", "READ FIRST"), "nofund": ("5F6B7A", "NOT FUNDED"),
-        "placed": ("00695C", "PLACED")}
+        "placed": ("00695C", "PLACED"), "verify": ("B26A00", "VERIFY")}
 for _k, (_bg, _label) in CHIP.items():                         # the step number, and the kind's name under it
     STYLES["chip_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 15, "align": "CENTER", "valign": "BOTTOM"}
     STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
@@ -902,16 +947,18 @@ class _Page(object):
 def day_tiles(d: Dict[str, Any], n_buy: int, hard: Sequence[str], unfunded: Sequence[str]) -> List[Tuple[str, str, str, str]]:
     """Five (label, value, note, tone) tiles; tone is plain | good | warn | bad."""
     cash, src = d.get("cash"), d.get("cash_src") or "ledger"
-    open_cost = sum(commit_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded"))
+    open_cost = sum(commit_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded") and not p.get("review_reason"))
     placed = sum(1 for p in d["picks"] if p.get("placed"))
     news = d.get("news") or {}
     where = {"ibkr": "CASH AT IBKR", "ledger": "CASH (LEDGER)"}.get(src, "CASH")
     t: List[Tuple[str, str, str, str]] = []
     t.append((where, "%s SAR" % fmt(cash, 0) if cash is not None else "not read",
-              d.get("cash_at") or "the buys were not checked against cash", "plain" if cash is not None else "warn"))
+              ("research only: " + d["funding_reason"]) if d.get("funding_reason") else (d.get("cash_at") or "the buys were not checked against cash"),
+              "plain" if cash is not None and not d.get("funding_reason") else "warn"))
     t.append(("BUYS TODAY", "%d of %d" % (n_buy + placed, sum(1 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty"))),
               ("%s SAR" % fmt(open_cost, 0) if open_cost else "no open buy") +
-              (" · %d placed" % placed if placed else "") + (" · %d not funded" % len(unfunded) if unfunded else ""),
+              (" · %d placed" % placed if placed else "") + (" · %d not funded" % len(unfunded) if unfunded else "") +
+              (" · funding unverified" if d.get("funding_reason") else ""),
               "bad" if unfunded else "plain"))
     t.append(("CASH AFTER THE BUYS", "%s SAR" % fmt(d.get("cash_left"), 0) if d.get("cash_left") is not None else "-",
               "after every funded buy fills at its top limit", "plain"))
@@ -1007,18 +1054,19 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     for h in d["holdings"]:
         bs = h.get("broker_stop")
         state = stop_state(h, k["stop_tol"])
-        note = "" if h["action"] == "NO RULE" else (
+        note = "" if h["action"] == "NO RULE" else (h.get("review_reason") or (
             {"none": "no stop at IBKR", "partial": "stop covers %s of %s shares" % (fmt(h.get("broker_cover"), 0), fmt(h.get("qty"), 0)),
              "unpriced": "stop price not read", "low": "broker stop below the plan", "ok": "stop in place"}[state] if state else (
                 "not at IBKR" if h.get("at_broker") is False and h.get("stop") else (
                     ("broker orders not read" if d.get("broker_note") else "no broker stop read") if bs is None else (
                         "broker stop below the plan" if h.get("stop") and bs < h["stop"] * (1 - k["stop_tol"] / 100.0)
-                        else "stop in place"))))
+                        else "stop in place")))))
         pl = text(h.get("pl_pct", ""))
-        pg.add([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), h["action"],
+        shown_action = "VERIFY" if h.get("review_reason") and h["action"] != "NO RULE" else h["action"]
+        pg.add([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), shown_action,
                 fmt(h.get("stop")), fmt(bs), fmt(h.get("target")), note],
                ["cell_b", "cell", "num", "num", "neg" if pl.startswith("-") else ("pos" if pl else "num"),
-                ACTION_STYLE.get(h["action"], "act_hold"), "num", "num", "num",
+                "act_review" if shown_action == "VERIFY" else ACTION_STYLE.get(h["action"], "act_hold"), "num", "num", "num",
                 "ok" if note == "stop in place" else ("bad" if state in ("none", "partial") else ("warn" if note else "cell"))])
     if not d["holdings"]:
         pg.add(["", "The Exit_Plan page lists no holding (or could not be read)."], ["", "msg"], [(1, WIDTH)])
@@ -1033,11 +1081,11 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     for p in d["picks"]:
         e = (ev.get("names") or {}).get(p["symbol"]) or {}
         # 1.3.0: the status says what section A says (an OPEN pick that is not funded, or whose order is working)
-        shown = "PLACED" if p.get("placed") else ("NOT FUNDED" if p.get("unfunded") else p["status"])
+        shown = "PLACED" if p.get("placed") else ("VERIFY" if p.get("review_reason") and p["status"] == "OPEN" and p.get("qty") else ("NOT FUNDED" if p.get("unfunded") else p["status"]))
         pg.add([p["symbol"], shown, fmt(p.get("qty"), 0),
                 "%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))), fmt(p.get("price")), fmt(p.get("stop")),
-                fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("reason", "")],
-               ["cell_b", {"PLACED": "st_good", "NOT FUNDED": "st_bad"}.get(shown) or STATUS_STYLE.get(p["status"], "st_info"),
+                fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("review_reason") or p.get("reason", "")],
+               ["cell_b", {"PLACED": "st_good", "VERIFY": "st_warn", "NOT FUNDED": "st_bad"}.get(shown) or STATUS_STYLE.get(p["status"], "st_info"),
                 "num", "num", "num", "num", "num", "num", "num", "cell"])
     if not d["picks"]:
         pg.add(["", "No plan has been cut today yet." if not plan.get("is_today") else
@@ -1107,7 +1155,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
             pg.add(["", "IBKR capture not used: %s." % (broker.get("why") or "not read")], ["", "msg"], [(1, WIDTH)])
         elif not broker.get("complete", True):
             pg.add(["", "IBKR cash not used: a working buy order on another name has no limit price, so the cash it "
-                        "holds is not known. The figure above is the workbook's cash ledger."], ["", "msg_alert"], [(1, WIDTH)])
+                        "holds is not known. Ledger cash is research only; verify the reservation before a new buy."], ["", "msg_alert"], [(1, WIDTH)])
         elif broker.get("reserved"):
             pg.add(["", "%s SAR is held by working buy orders on other names and is not counted." % fmt(broker["reserved"], 0)],
                    ["", "msg"], [(1, WIDTH)])
