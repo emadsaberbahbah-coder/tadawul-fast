@@ -362,9 +362,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("exit_plan", "1.3.1", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.4.0", "today action plan"),
+    ("today_action_plan", "1.4.1", "today action plan"),
     ("plan_archive", "1.0.0", "plan archive"),
-    ("ibkr_capture", "1.0.0", "ibkr capture"),
+    ("ibkr_capture", "1.1.0", "ibkr capture"),
     ("cash_cells", "1.0.0", "cash cells"),
     ("sheets_quota", "1.0.0", "sheets quota"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.

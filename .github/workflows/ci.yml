@@ -2,6 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.80 (2026-11-13) -- AUDIT 13 NOV SUITES
+#
+# v1.1.80: run tests/test_ptc_quota_wait_v130.py (provider-target coverage
+# 1.3.0: a Sheets 429 is waited out before READ_FAIL),
+# tests/test_ob_ann_note_period_v1291.py (opportunity_builder 1.29.1: the
+# ticket note names the period of its annualized figure) and
+# tests/test_main_worker_boot_stamp_v8149.py (main 8.14.9: per-worker boot
+# stamp) in the blocking lean lane. ibkr_capture 1.1.0 extends the existing
+# tests/test_ibkr_capture.py.
+#
 # VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
 #
 # v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
@@ -1185,6 +1195,9 @@ jobs:
             tests/test_consistency_check.py \
             tests/test_cash_cells.py \
             tests/test_sheets_quota.py \
+            tests/test_ptc_quota_wait_v130.py \
+            tests/test_ob_ann_note_period_v1291.py \
+            tests/test_main_worker_boot_stamp_v8149.py \
             tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
