@@ -1501,6 +1501,12 @@ jobs:
           # enforce; both tracker lanes map the same Variable (ENV PARITY).
           # Rollback: unset or off.
           TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
+          # (2026-11-06) track_performance v6.58.0 [XCAL-DATA-EXT], mirrored from
+          # track_performance.yml 1.0.12 (ENV PARITY): the pinned XSES calendar
+          # plus the 2027 SGX closures, so a manual run_tracker=true audit reads
+          # the same Singapore sessions as the clock. 'off' = v6.53.0.
+          # ROLLBACK: unset.
+          TFB_XCAL_DATA_EXT: ${{ vars.TFB_XCAL_DATA_EXT || 'off' }}
           # (2026-11-02) track_performance v6.53.0 [ARCHIVE-BAR + DUE-ONLY],
           # mirrored VERBATIM from track_performance.yml 1.0.7 (ENV PARITY).
           # TRACK_HIST_CLOSE_SOURCE: 'yfinance' (default) = the v6.47.0 pull;

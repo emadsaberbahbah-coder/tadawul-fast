@@ -1716,7 +1716,44 @@ from typing import Optional
 #   unmerged on 8 Nov and superseded by the cockpit-side #933; reused here.
 #   Rollback: unset TFB_OPP_SIZING_MODE (or set cap), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.29.0"
+# v1.29.1 (2026-11-06) [XCAL-DATA-EXT] - .SI QUOTES KEEP A VENUE CALENDAR AFTER 2026
+#   First numbered 1.28.3 (1.28.1 and 1.28.2 are claimed by the open PRs
+#   #778 / #779); re-numbered 1.29.1 on 2026-11-08 when main took 1.29.0
+#   (#936, risk-budget sizing) and this block moved after its WHY block.
+#   Whichever lands later re-numbers.
+# EVIDENCE: the pinned exchange_calendars==4.13.2 (still the newest release
+#   on PyPI on 2026-11-06) records SGX holidays only to 2026, so XSES ends at
+#   the 2026-12-31 close. From 17:00 SGT that day (09:00Z), previous_close
+#   raises MinuteOutOfBounds for every later instant: _venue_state returns
+#   None, and a .SI quote older than TFB_TICKET_MAX_QUOTE_AGE_MIN reads
+#   "UNVERIFIED_PRICE: ... venue calendar unavailable" on Top_10, even when it
+#   is that venue's latest close (every weekend, holiday and overnight).
+# WHAT: _venue_state asks _venue_cal_data_ext(code) after the cache lookup.
+#   That is core.exchange_calendar_ext.extended_calendar (v1.0.0): only with
+#   TFB_XCAL_DATA_EXT on / 1 / true / yes, only for XSES, it returns the
+#   pinned calendar plus the eight 2027 SGX closures and the five SGX half
+#   days from 2026-12-24 on (24 / 31 Dec 2026, 5 Feb and 24 / 31 Dec 2027)
+#   closing at 12:00 SGT; every other pinned session keeps its open and
+#   close. The freshness rule is unchanged: it becomes decidable after 2026
+#   again, and on those half days the venue reads closed after 12:00 SGT (a
+#   witnessed close is certified instead of "STALE_PRICE intraday"); it
+#   never widens the live-age or close test.
+# OFF (unset): byte-identical v1.29.0 except the version stamp (the extension
+#   is None and the cached pinned calendar answers, as before).
+# GATE: TFB_XCAL_DATA_EXT (Render env), DEFAULT OFF. The same name is read by
+#   track_performance v6.58.0 in GitHub Actions (Singapore outcomes).
+# ARMING (owner): Render env TFB_XCAL_DATA_EXT=on before Thu 31 Dec 2026.
+# KNOWN LIMITS: XSHG (.SS) and XBOM (.BO) end at 2026-12-31 in 4.13.2 too;
+#   their 2027 calendars were not official on 2026-11-06, so those rows still
+#   read "venue calendar unavailable" from 2026-12-31 until the package or
+#   this table carries 2027. The new XSES bound is the 2027-12-31 close
+#   (04:00Z): the 2028 rows are needed before then. MERGE NOTE: #778 adds
+#   _venue_next_close, which reads the pinned calendar directly; whichever PR
+#   lands second sends it through _venue_cal_data_ext too.
+#   Functions added: 1 (_venue_cal_data_ext). Removed: 0.
+#   Rollback: unset TFB_XCAL_DATA_EXT, or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.29.1"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4799,6 +4836,17 @@ def _venue_cal_code(suffix):
     if _venue_cal_ext_enabled():
         return _VENUE_CAL_EXT_MAP.get(suffix)
     return None
+def _venue_cal_data_ext(code):
+    """v1.29.1 [XCAL-DATA-EXT]: core.exchange_calendar_ext.extended_calendar,
+    the pinned calendar plus its added holiday years, only when
+    TFB_XCAL_DATA_EXT is on and `code` has an extension (XSES); None
+    otherwise or on any error (the caller keeps the pinned calendar).
+    NEVER raises."""
+    try:
+        from core.exchange_calendar_ext import extended_calendar
+        return extended_calendar(code)
+    except Exception:
+        return None
 _LOG = logging.getLogger("core.analysis.opportunity_builder")
 _VENUE_LAST_ERROR = {"msg": ""}
 _FRESHNESS_FALLBACK_LOGGED = set()
@@ -4825,6 +4873,9 @@ def _venue_state(symbol, now_utc):
             import exchange_calendars as _xc  # lazy; present on Render
             cal = _xc.get_calendar(code)
             _VENUE_CAL_CACHE[code] = cal
+        _ext_cal = _venue_cal_data_ext(code)  # v1.29.1 [XCAL-DATA-EXT] (default off: None)
+        if _ext_cal is not None:
+            cal = _ext_cal
         import pandas as _pd  # lazy
         ts = _pd.Timestamp(now_utc)
         try:

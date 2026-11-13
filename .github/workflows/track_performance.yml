@@ -1,5 +1,15 @@
 name: 📈 TFB Performance Clock (record + audit + calibrate)
 
+# VERSION 1.0.12 (2026-11-06) -- SINGAPORE OUTCOMES KEEP A CALENDAR AFTER 2026 (OWNER OPT-IN)
+# (1.0.8-1.0.11 are claimed by the open PRs #845, #857, #915 and #922.)
+# track_performance v6.58.0 [XCAL-DATA-EXT]: TFB_XCAL_DATA_EXT (default 'off'
+# = v6.53.0) extends the pinned XSES calendar (holidays recorded only to 2026)
+# with the eight 2027 SGX closures, so .SI / .SG outcomes stop reading
+# outcome_calendar_unknown from 18 Dec 2026. The 'Run performance clock' step
+# maps it; daily_sync.yml's tracker step maps the same Variable (ENV PARITY).
+# No cron, concurrency or other step changes. ARMING (owner): set the Variable
+# to on before Fri 18 Dec 2026. ROLLBACK: unset it.
+#
 # VERSION 1.0.7 (2026-11-02) -- ARCHIVE BARS, DUE-ONLY PRICING, A POST-US-CLOSE SLOT
 # WHY (owner, 2 Nov 2026 00:13 Riyadh: "learning is slow ... improve today,
 # results tomorrow"): Performance_Log holds 13,856 active forecast records
@@ -435,6 +445,10 @@ jobs:
           # enforce; both tracker lanes map the same Variable (ENV PARITY).
           # Rollback: unset or off.
           TRACK_LOG_UNFORMATTED_READ: ${{ vars.TRACK_LOG_UNFORMATTED_READ || 'off' }}
+          # (2026-11-06) 1.0.12: track_performance v6.58.0 [XCAL-DATA-EXT]: the
+          # pinned XSES calendar plus the 2027 SGX closures. 'off' = v6.53.0.
+          # Mirrored in daily_sync.yml (ENV PARITY). ROLLBACK: unset or off.
+          TFB_XCAL_DATA_EXT: ${{ vars.TFB_XCAL_DATA_EXT || 'off' }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
           # user-visible Signal_Trends tab (one row per decision symbol:
           # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,
