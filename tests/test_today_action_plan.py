@@ -694,6 +694,14 @@ def test_t8_readers_of_the_top10_pages_the_news_gate_and_cost():
     broken = [list(r) for r in V2]                                                       # live page, 13 Nov: header cells
     broken[3] = ["#", "Symbol \u00b7 name", "", "3-month\nclose", "Seat\nstatus", "Price", "Alloc\u00a0SAR", "Buy\n qty", "Flags"]
     assert tap.read_top10_v2(broken)["seats"] == v["seats"]                               # broken over two lines
+    prev = [list(r) for r in V2]                                                         # live page, 13 Nov 11:16: no engine
+    prev[3][6:8] = ["Preview SAR", "Preview qty"]                                        # ticket -> a research preview
+    pv = tap.read_top10_v2(prev)
+    assert pv["read"] and pv["seats"]["TEN.US"] == {"ticket": 0.0, "shares": 0.0, "seat": "ACTIVE (day 3)", "preview": (5117.0, 29.0)}
+    assert "preview" not in pv["seats"]["NMM.US"]
+    assert tap._seat_text(pv, "TEN.US") == ("ACTIVE (day 3) · preview only (29 shares), not a ticket", False)
+    rows = tap.align(tap.read_plan(LEDGER, dt.date(2026, 11, 12)), t, pv)
+    assert [(a["symbol"], a["level"]) for a in rows] == [("NMM.US", "soft"), ("EFC.US", "ok"), ("ZERO.US", "ok"), ("ZTO.US", "hard")]
     wrapped = [list(r) for r in T10]
     wrapped[4] = ["Rank", "Symbol", "Name", "Price", "Ticket\nSAR", "Shares", "Funds\nFrom", "Stability"]
     assert tap.read_top10(wrapped)["seats"] == t["seats"]

@@ -384,12 +384,19 @@ def read_top10(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
 
 
 def read_top10_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
-    """The v2 Top 10 page, in the same shape as read_top10 (its headline is the banner)."""
+    """The v2 Top 10 page, in the same shape as read_top10 (its headline is the banner). The page has two forms:
+    with the engine's tickets its columns read "Alloc SAR" / "Buy qty"; without one they read "Preview SAR" /
+    "Preview qty" - a research sizing, kept as seat["preview"] and never counted as a ticket."""
     rows = [list(r) for r in values]
     out: Dict[str, Any] = {"read": False, "banner": "", "built": "", "seats": {}}
-    h, col = _header(rows, ("Symbol · name", "Seat status", "Alloc SAR", "Buy qty"))
+    sar, qty = "Alloc SAR", "Buy qty"
+    h, col = _header(rows, ("Symbol · name", "Seat status", sar, qty))
+    if h is None:
+        sar, qty = "Preview SAR", "Preview qty"
+        h, col = _header(rows, ("Symbol · name", "Seat status", sar, qty))
     if h is None:
         return out
+    preview = sar.startswith("Preview")
     out["read"] = True
     top = [text(c) for c in (rows[0] if rows else []) if text(c)]
     out["banner"] = top[1] if len(top) > 1 else ""
@@ -398,9 +405,11 @@ def read_top10_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
         name = text(cell(r, col["Symbol · name"]))
         if not name:
             break
-        out["seats"][name.split("·")[0].strip().upper()] = {
-            "ticket": num(cell(r, col["Alloc SAR"])) or 0.0, "shares": num(cell(r, col["Buy qty"])) or 0.0,
-            "seat": text(cell(r, col["Seat status"]))}
+        a, q = num(cell(r, col[sar])) or 0.0, num(cell(r, col[qty])) or 0.0
+        seat = {"ticket": 0.0 if preview else a, "shares": 0.0 if preview else q, "seat": text(cell(r, col["Seat status"]))}
+        if preview and a > 0 and q > 0:
+            seat["preview"] = (a, q)
+        out["seats"][name.split("·")[0].strip().upper()] = seat
     return out
 
 
@@ -457,6 +466,8 @@ def _seat_text(page: Dict[str, Any], sym: str) -> Tuple[str, bool]:
         return "not seated", False
     if s["ticket"] > 0 and s["shares"] > 0:
         return "ticket: %s shares, %s SAR" % (fmt(s["shares"], 0), fmt(s["ticket"], 0)), True
+    if s.get("preview"):
+        return "%s · preview only (%s shares), not a ticket" % (s["seat"] or "seated", fmt(s["preview"][1], 0)), False
     return s["seat"] or "seated, not sized", False
 
 
