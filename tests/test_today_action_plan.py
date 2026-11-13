@@ -1,4 +1,4 @@
-"""scripts/today_action_plan.py v1.3.3 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
+"""scripts/today_action_plan.py v1.4.0 - the Today Action Plan page (owner, 12 Nov 2026): one page that orders the
 day's steps and copies every level from Exit_Plan, _Daily_Plan, Evidence_Board and Consistency_Check."""
 from __future__ import annotations
 
@@ -373,8 +373,9 @@ def test_t4_workflow_manifest_and_single_write():
     assert step["env"]["TFB_TODAY_PLAN"] == "${{ vars.TFB_TODAY_PLAN || 'on' }}" and "--dry-run" in step["run"]
     assert step["env"]["TFB_TAP_HIDE_TABS"] == "${{ vars.TFB_TAP_HIDE_TABS || '_Daily_Plan,_Exit_Plan,_Evidence_Log' }}"
     src = (ROOT / "scripts/today_action_plan.py").read_text(encoding="utf-8")
+    read_by = src + (ROOT / "scripts/plan_archive.py").read_text(encoding="utf-8")   # 1.4.0: the archive reads its own
     for name in re.findall(r"(TFB_T[A-Z_]+): \$\{\{", raw):
-        assert '"%s"' % name in src, name
+        assert '"%s"' % name in read_by, name
     # 1.1.0: the page goes out as ONE batch; the plain grid is only the fallback when Sheets refuses the styled one
     assert src.count("book.batch_update(") == 2 and src.count("write_grid(") == 1 and "write_grid(book, tab," in src
     assert ".del_worksheet" not in src and "delete" not in src.lower().replace("never deletes", "").replace("not deleted", "")
@@ -1217,3 +1218,63 @@ def test_t13_a_stop_attached_to_a_working_buy_and_no_amount_in_the_log(capsys):
     out = capsys.readouterr().out
     assert " SAR" not in "\n".join(line for line in out.splitlines() if " STEP " in line or " ALIGN " in line)
     assert any("SAR" in str(c) for r in book.tabs["Today_Action_Plan"].values for c in r)
+
+
+# ----------------------------------------------------------------------------- T14 (1.4.0) the run, kept for the dashboard
+class _BQ:
+    """A fake BigQuery session: the table is there; every insert is kept."""
+
+    def __init__(self):
+        self.inserts = []
+
+    def get(self, url, timeout=None):
+        return type("R", (), {"status_code": 200, "json": lambda self: {}})()
+
+    def post(self, url, json=None, timeout=None):
+        self.inserts.append(json)
+        return type("R", (), {"status_code": 200, "json": lambda self: {}})()
+
+
+def test_t14_the_live_page_is_archived_with_its_own_words(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_TAP_BQ", "on")
+    monkeypatch.setenv("TFB_BQ_PROJECT", "proj-1")
+    monkeypatch.setenv("TFB_BQ_DATASET", "ds_1")
+    monkeypatch.setenv("GITHUB_RUN_ID", "555")
+    bq, book = _BQ(), full_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture(), bq_session=bq) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    rows = [r["json"] for r in bq.inserts[0]["rows"]]
+    steps = [r for r in rows if r["row_type"] == "step"]
+    assert [(r["seq"], r["symbol"]) for r in steps] == [(c[0], c[1]) for c in cards(page)]
+    assert [r["instruction"] for r in steps] == [c[2] for c in cards(page)]
+    assert all(r["label"] == tap.CHIP[r["kind"]][1] for r in steps)
+    summary = [r for r in rows if r["row_type"] == "summary"][0]
+    assert summary["instruction"] == page[2][0] and summary["plan_date"] == "2026-11-12" and summary["run_id"] == "555-1"
+    tiles = [r for r in rows if r["row_type"] == "tile"]
+    assert [t["label"] for t in tiles] == [page[4][i] for i in range(0, tap.WIDTH, 2)]
+    assert [t["instruction"] for t in tiles] == [page[5][i] for i in range(0, tap.WIDTH, 2)]
+    assert "plan archive: %d row(s) appended to ds_1.today_action_plan" % len(rows) in capsys.readouterr().out
+    dry = _BQ()                                                     # a dry run and a preview archive nothing
+    assert tap.run_once(True, book=full_book(), now=NOW, capture=plan_capture(), bq_session=dry) == 0 and dry.inserts == []
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "true")
+    assert tap.run_once(False, book=full_book(), now=NOW, capture=plan_capture(), bq_session=dry) == 0 and dry.inserts == []
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "false")
+    monkeypatch.setenv("TFB_TAP_BQ", "off")                         # off: the page alone, as in 1.3.3
+    assert tap.run_once(False, book=full_book(), now=NOW, capture=plan_capture(), bq_session=dry) == 0 and dry.inserts == []
+
+
+def test_t14_an_archive_fault_never_changes_the_page(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_TAP_BQ", "on")
+    monkeypatch.setenv("TFB_BQ_PROJECT", "proj-1")
+    monkeypatch.setenv("TFB_BQ_DATASET", "ds_1")
+
+    class Down(_BQ):
+        def get(self, url, timeout=None):
+            raise ConnectionError("network down")
+    ref, broken = full_book(), full_book()
+    monkeypatch.setenv("TFB_TAP_BQ", "off")
+    assert tap.run_once(False, book=ref, now=NOW, capture=plan_capture()) == 0
+    monkeypatch.setenv("TFB_TAP_BQ", "on")
+    assert tap.run_once(False, book=broken, now=NOW, capture=plan_capture(), bq_session=Down()) == 0
+    assert broken.tabs["Today_Action_Plan"].values == ref.tabs["Today_Action_Plan"].values
+    assert "plan archive not written: ConnectionError: network down" in capsys.readouterr().out

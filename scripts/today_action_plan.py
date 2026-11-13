@@ -4,7 +4,13 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.3.3 (2026-11-13)
+v1.4.0 (2026-11-13)
+  1.4.0: THE RUN IS KEPT IN BIGQUERY FOR THE DASHBOARD (owner, 13 Nov 22:44: "add action plan to the IBKR Dashboard").
+         After the live page is written (never for a preview or a dry run), scripts/plan_archive.py appends the run's
+         steps (with their chip), the five tiles and the summary line to <dataset>.today_action_plan, so the IBKR
+         dashboard shows this page's own words. Off unless TFB_TAP_BQ is on (the workflow maps on); an archive fault
+         is reported and never changes or fails the page. The summary line and the tile counts moved into
+         day_counts() / summary_line() so the page and the archive share them; the page is unchanged.
   1.3.3: A STOP ALREADY ATTACHED TO A WORKING BUY IS RECOGNISED; NO AMOUNT IN THE RUN LOG (owner, 13 Nov 19:12: "full
          check ... another improvement"). Read on the live page at 19:16 Riyadh: both working buys carried their
          stop as an attached order at IBKR, and the page still said "After it fills, place the stop at ...".
@@ -119,7 +125,8 @@ WHAT
     hold the history the pages and the forward record are built from).
 
 SAFETY
-    Reads four tabs, writes one. No order is placed, changed or cancelled.
+    Reads four tabs, writes one; with TFB_TAP_BQ on, also appends the run to
+    BigQuery (1.4.0). No order is placed, changed or cancelled.
     TFB_TODAY_PLAN = on (default) | off. --dry-run prints and writes nothing.
 
 ENV
@@ -130,7 +137,8 @@ ENV
     TFB_TAP_STYLE (on | off = plain grid), TFB_TAP_PREVIEW (false | true = write the preview tab),
     TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_NEWS_MAX_H (24),
     TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
-    TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2).
+    TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2), TFB_TAP_BQ (off | on; 1.4.0), TFB_TAP_BQ_TABLE (today_action_plan),
+    TFB_BQ_PROJECT, TFB_BQ_DATASET.
 ================================================================================
 """
 from __future__ import annotations
@@ -144,7 +152,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1059,29 +1067,52 @@ def day_tiles(d: Dict[str, Any], n_buy: int, hard: Sequence[str], unfunded: Sequ
     return t
 
 
-def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:
-    """The whole page: values (every one copied from a source page), a style name per cell, merges, row heights."""
-    ev, plan = d["evidence"], d["plan"]
-    miss = d.get("missing") or []
-    n_hold = sum(1 for s in d["steps"] if s["source"] == "Exit_Plan")
-    n_buy = sum(1 for s in d["steps"] if s["source"] == "Daily_Plan" and step_kind(s) == "buy")
+def day_counts(d: Dict[str, Any]) -> Dict[str, Any]:
+    """The counts the summary line and the tiles are made of (1.4.0: shared by the page and the plan archive)."""
     hard = [a["symbol"] for a in d.get("align") or [] if a["level"] == "hard"]
     unfunded = [p["symbol"] for p in d["picks"] if p.get("unfunded")]
     flags = ((" · PAGES DISAGREE: " + ", ".join(hard) if hard else "") +
              (" · NOT FUNDED: " + ", ".join(unfunded) if unfunded else "") +
              (" · NEWS GATE: " + d["news"]["verdict"].replace("_", " ") if d.get("news_live") else ""))
-    waiting = sum(1 for p in d["picks"] if p["status"] == "WAIT")
+    return {"n_hold": sum(1 for s in d["steps"] if s["source"] == "Exit_Plan"),
+            "n_buy": sum(1 for s in d["steps"] if s["source"] == "Daily_Plan" and step_kind(s) == "buy"),
+            "hard": hard, "unfunded": unfunded, "flags": flags,
+            "waiting": sum(1 for p in d["picks"] if p["status"] == "WAIT")}
+
+
+def summary_line(d: Dict[str, Any]) -> Tuple[str, bool]:
+    """The page's summary band: its text, and whether it is an alert."""
+    c = day_counts(d)
+    line = ("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d control exception(s) to "
+            "know about%s" % (c["n_hold"], c["n_buy"], c["waiting"], len([x for x in d["issues"] if x["status"] != "OVER CAP"]),
+                              c["flags"] + (" · OVER THE POSITION CAP" if any(x["status"] == "OVER CAP" for x in d["issues"])
+                                            else "") + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
+                              (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")))
+    return line, bool(d["stale"] or (d.get("missing") or []) or c["flags"])
+
+
+def archive_rows(d: Dict[str, Any], now: _dt.datetime, rid: str) -> List[Dict[str, Any]]:
+    """1.4.0: the run as rows for the plan archive - the steps with their chip, the five tiles, the summary line."""
+    from scripts import plan_archive  # noqa: PLC0415
+    c = day_counts(d)
+    steps = [dict(s, kind=step_kind(s), label=CHIP[step_kind(s)][1]) for s in d["steps"]]
+    tiles = day_tiles(d, c["n_buy"], c["hard"], c["unfunded"]) if d.get("aligned") else []
+    return plan_archive.plan_rows(steps, tiles, summary_line(d)[0], d["stale"], d.get("missing") or [], now, rid, __version__)
+
+
+def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:
+    """The whole page: values (every one copied from a source page), a style name per cell, merges, row heights."""
+    ev, plan = d["evidence"], d["plan"]
+    miss = d.get("missing") or []
+    c = day_counts(d)
+    n_buy, hard, unfunded = c["n_buy"], c["hard"], c["unfunded"]
     pg = _Page()
     pg.full("TODAY ACTION PLAN - %s" % day, "title", 44)
     pg.full("Built %s Riyadh · today_action_plan %s · copied from Exit_Plan, Daily_Plan, Evidence_Board and "
             "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__),
             "sub")
-    pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d control exception(s) to "
-            "know about%s" % (n_hold, n_buy, waiting, len([x for x in d["issues"] if x["status"] != "OVER CAP"]),
-                              flags + (" · OVER THE POSITION CAP" if any(x["status"] == "OVER CAP" for x in d["issues"])
-                                       else "") + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
-                              (" · NOT READ: " + ", ".join(d["missing"]) if d.get("missing") else "")),
-            "alert" if (d["stale"] or miss or flags) else "summary", 30)
+    line, alert = summary_line(d)
+    pg.full(line, "alert" if alert else "summary", 30)
     if d.get("aligned"):                                            # 1.3.0: five tiles - the day at a glance
         tiles = day_tiles(d, n_buy, hard, unfunded)
         pg.add(height=8)
@@ -1422,7 +1453,8 @@ def hide_tabs(book: Any, names: Sequence[str]) -> List[str]:
 
 
 def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
-             sleep: Optional[Callable[[float], None]] = None, capture: Optional[Dict[str, Any]] = None) -> int:
+             sleep: Optional[Callable[[float], None]] = None, capture: Optional[Dict[str, Any]] = None,
+             bq_session: Any = None) -> int:
     """`capture` (1.3.0): a parsed IBKR capture (scripts.ibkr_capture.parse). Left out, the live run reads the newest
     one from Drive; a run on an injected workbook reads none."""
     now = now or _dt.datetime.now(UTC)
@@ -1536,6 +1568,9 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     hidden = [] if preview else hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)) + [PREVIEW_TAB])
     _out("wrote the %s page (%d rows, %d step(s), %s)%s" % (tab, len(rows), len(d["steps"]), how,
                                                             "; hid " + ", ".join(hidden) if hidden else ""))
+    if not preview:                                                 # 1.4.0: the run, kept for the dashboard
+        from scripts import plan_archive  # noqa: PLC0415
+        plan_archive.archive(archive_rows(d, now, plan_archive.run_id(now)), _out, session=bq_session)
     return 0
 
 

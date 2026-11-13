@@ -1179,6 +1179,7 @@ jobs:
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
             tests/test_today_action_plan.py \
+            tests/test_plan_archive.py \
             tests/test_ibkr_capture.py \
             tests/test_exit_plan.py \
             tests/test_consistency_check.py \
