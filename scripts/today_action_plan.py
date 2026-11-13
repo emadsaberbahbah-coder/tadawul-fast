@@ -754,7 +754,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
 # ----------------------------------------------------------------------------- #
 # The page: values, styles, merges and row heights (pure)
 # ----------------------------------------------------------------------------- #
-COL_PX = (95, 185, 75, 125, 90, 115, 90, 120, 95, 290)         # A..J; sections B and C set the grid
+COL_PX = (95, 180, 80, 125, 90, 115, 90, 120, 95, 290)         # A..J; C holds a status chip (MISMATCH needs 80)
 PLAIN_COL_PX = 130                                             # every column, when the page is written plain
 INK, MUTE, LINE, HAIR = "1F2933", "6B7785", "C5CDD8", "E8ECF1"
 _GOOD, _WARN, _BAD, _INFO = ("E6F4EA", "2E7D32"), ("FFF3E0", "B45309"), ("FDECEA", "B3261E"), ("F1F3F4", "4A5568")
