@@ -10,7 +10,8 @@ v1.3.3 (2026-11-13)
          stop as an attached order at IBKR, and the page still said "After it fills, place the stop at ...".
            - when the capture shows a working stop on a placed pick covering the order's shares at the plan's stop
              (within TFB_TAP_STOP_TOL_PCT), the step says the stop is attached; a lower, partial or unpriced stop is
-             named as such; no stop keeps the old sentence.
+             named as such; no stop keeps the old sentence. Stops on the symbol are counted against shares already
+             held first, and only shares stopped at a read price count as protected (Codex P2 x2, #975).
            - the run log is public: a step's sentence is printed without its SAR amounts ("... SAR" -> "(amount on
              the page)"). The page is unchanged.
   1.3.2: A NEW BUY NEEDS A CAPTURE FROM THIS SESSION (owner, 13 Nov 18:33: "other approval you can select the best
@@ -614,8 +615,11 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
                 "cash": max(0.0, usd - held_back) * PEG if complete else None,
                 "reserved": held_back * PEG, "complete": complete,
                 "open_orders": dict((sym, rows) for sym, rows in (cap.get("buys") or {}).items() if sym in picks),
-                # 1.3.3: the stop orders already working on a pick (an attached bracket stop): (lowest price, shares)
-                "open_stops": dict((sym, stop_cover(cap, sym)) for sym in picks if (cap.get("stops") or {}).get(sym))})
+                # 1.3.3: the stop orders already working on a pick (an attached bracket stop):
+                # (lowest read price, shares at a read price, shares at an unread price, shares already held).
+                # The capture does not say which order a stop belongs to, so stops are counted against the
+                # shares already held first (Codex P2 x2, #975).
+                "open_stops": dict((sym, stop_summary(cap, sym)) for sym in picks if (cap.get("stops") or {}).get(sym))})
     if now is not None:                                             # 1.3.2: market-open hours since the capture
         from scripts.consistency_check import open_hours  # noqa: PLC0415
         out["market_h"] = open_hours(cap["as_of"], now)
@@ -713,20 +717,34 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
     return steps
 
 
+def stop_summary(cap: Dict[str, Any], symbol: str) -> Tuple[Optional[float], float, float, float]:
+    """(lowest read stop price, shares stopped at a read price, shares stopped at an unread price, shares already
+    held) for a symbol of the capture."""
+    rows = (cap.get("stops") or {}).get(symbol) or []
+    prices = [px for px, _ in rows if px]
+    return (min(prices) if prices else None, sum(q for px, q in rows if px), sum(q for px, q in rows if not px),
+            float((cap.get("positions") or {}).get(symbol) or 0.0))
+
+
 def placed_stop_text(p: Dict[str, Any], o_qty: float) -> str:
-    """What to say about the stop of a working buy (1.3.3): attached at IBKR, or still to place."""
+    """What to say about the stop of a working buy (1.3.3): attached at IBKR, or still to place. Stops on the symbol
+    protect the shares already held first; only what is left counts for the new shares, and only shares stopped at a
+    read price count as protected at that price."""
     plan, at = p.get("stop"), p.get("placed_stop")
     todo = "After it fills, place the stop at %s." % fmt(plan)
     if not at:
         return todo
-    px, cover = at
-    if px is None:
+    low, priced, unpriced, held = at
+    free = priced + unpriced - held                                 # stop shares left for the new order
+    if free <= 1e-6:
+        return todo
+    if priced - held + 1e-6 >= o_qty:                               # read-price stops cover the held and the new shares
+        if plan and low < plan * (1 - (p.get("stop_tol") or 0.0) / 100.0):
+            return "The stop attached at IBKR is %s, below the plan's %s." % (fmt(low), fmt(plan))
+        return "Its stop at %s is attached at IBKR; nothing more to place." % fmt(low)
+    if free + 1e-6 >= o_qty:                                        # covered only by counting an unread price
         return "A stop order is attached at IBKR but its price was not read; the plan's stop is %s." % fmt(plan)
-    if cover + 1e-6 < o_qty:
-        return "The stop attached at IBKR covers %s of %s shares; the plan's stop is %s." % (fmt(cover, 0), fmt(o_qty, 0), fmt(plan))
-    if plan and px < plan * (1 - (p.get("stop_tol") or 0.0) / 100.0):
-        return "The stop attached at IBKR is %s, below the plan's %s." % (fmt(px), fmt(plan))
-    return "Its stop at %s is attached at IBKR; nothing more to place." % fmt(px)
+    return "The stop attached at IBKR covers %s of %s shares; the plan's stop is %s." % (fmt(free, 0), fmt(o_qty, 0), fmt(plan))
 
 
 _AMOUNT = re.compile(r"\d[\d,]*(?:\.\d+)? SAR")

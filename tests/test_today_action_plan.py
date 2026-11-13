@@ -1163,20 +1163,32 @@ def test_t12_a_new_buy_needs_a_capture_within_two_market_hours():
 
 # ----------------------------------------------------------------------------- T13 (1.3.3) an attached stop; the log
 def test_t13_a_stop_attached_to_a_working_buy_and_no_amount_in_the_log(capsys):
-    def text(stop, cover=24.0, tol=1.0):
+    def text(low, priced=24.0, unpriced=0.0, held=0.0, tol=1.0):
         p = {"symbol": "NMM.US", "stop": 80.17, "stop_tol": tol}
-        if stop != "none":
-            p["placed_stop"] = (stop, cover)
+        if low != "none":
+            p["placed_stop"] = (low, priced, unpriced, held)
         return tap.placed_stop_text(p, 24.0)
 
-    assert text("none") == "After it fills, place the stop at 80.17."
+    todo = "After it fills, place the stop at 80.17."
+    assert text("none") == todo
     assert text(80.17) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
     assert text(80.98) == "Its stop at 80.98 is attached at IBKR; nothing more to place."      # tighter than the plan
     assert text(79.50) == "Its stop at 79.50 is attached at IBKR; nothing more to place."      # within 1%
     assert text(78.00) == "The stop attached at IBKR is 78.00, below the plan's 80.17."
     assert text(79.50, tol=0.0) == "The stop attached at IBKR is 79.50, below the plan's 80.17."
-    assert text(80.17, cover=10.0) == "The stop attached at IBKR covers 10 of 24 shares; the plan's stop is 80.17."
-    assert text(None) == "A stop order is attached at IBKR but its price was not read; the plan's stop is 80.17."
+    assert text(80.17, priced=10.0) == "The stop attached at IBKR covers 10 of 24 shares; the plan's stop is 80.17."
+    unread = "A stop order is attached at IBKR but its price was not read; the plan's stop is 80.17."
+    assert text(None, priced=0.0, unpriced=24.0) == unread
+    # Codex P2 on #975: a stop that protects shares already held is not the new order's stop
+    assert text(80.17, priced=20.0, held=20.0) == todo
+    assert text(80.17, priced=44.0, held=20.0) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
+    assert text(80.17, priced=30.0, held=20.0) == "The stop attached at IBKR covers 10 of 24 shares; the plan's stop is 80.17."
+    # Codex P2 on #975: shares stopped at an unread price are not protected at the read price
+    assert text(80.17, priced=10.0, unpriced=14.0) == unread
+    assert text(80.17, priced=10.0, unpriced=4.0) == "The stop attached at IBKR covers 14 of 24 shares; the plan's stop is 80.17."
+    assert text(80.17, priced=24.0, unpriced=5.0) == "Its stop at 80.17 is attached at IBKR; nothing more to place."
+    cap0 = {"stops": {"X.US": [(80.17, 10.0), (None, 14.0), (79.0, 3.0)]}, "positions": {"X.US": 20.0}}
+    assert tap.stop_summary(cap0, "X.US") == (79.0, 13.0, 14.0, 20.0) and tap.stop_summary(cap0, "Y.US") == (None, 0, 0, 0.0)
     # the page: a bracket stop on the working buy
     orders = [ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9),
               ib_order("Sell 24 NMM", "STOP", "SELL", "STP 80.17, GTC", 24),
@@ -1184,7 +1196,7 @@ def test_t13_a_stop_attached_to_a_working_buy_and_no_amount_in_the_log(capsys):
     cap = ib_capture(orders, at=NOW.astimezone(tap.RIYADH).isoformat())
     holdings, plan = tap.read_holdings(EXIT), tap.read_plan(LEDGER, NOW.astimezone(tap.RIYADH).date())
     broker = tap.apply_capture(holdings, plan, cap, 30, NOW)
-    assert broker["open_stops"] == {"NMM.US": (80.17, 24.0)}
+    assert broker["open_stops"] == {"NMM.US": (80.17, 24.0, 0.0, 0.0)}
     d = tap.build(holdings, plan, {}, [], {"Exit_Plan": 0.5, "Daily_Plan": 0.3}, K, extra={"broker": broker, "cash": broker["cash"]})
     nmm = next(s for s in d["steps"] if s["symbol"] == "NMM.US")
     assert nmm["do"] == ("The buy order for NMM.US is working at IBKR: 24 shares at 87.90. Its stop at 80.17 is attached "
