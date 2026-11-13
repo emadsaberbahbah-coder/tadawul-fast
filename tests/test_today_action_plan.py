@@ -759,8 +759,9 @@ def test_t8_one_order_of_record_and_the_other_pages_flagged(capsys):
     assert rows["TEN.US"][8] == "DO NOT BUY from Top_10_Investments_v2: it is not in today's plan."
     assert rows["ZTO.US"][1] == "pipeline: next in line (rank 9)" and rows["ZTO.US"][3] == "ticket: 78 shares, 6,000 SAR"
     assert fm[g + 5 + list(rows).index("TEN.US")][8]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1])
-    assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32" for r in page)
-    assert any(r[0] == "17,547 SAR" and r[3] == "open buys cost 7,921 SAR · left after the funded buys 9,626 SAR" for r in page)   # 24 x 88.01 x 3.75
+    assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32 Riyadh · macro: war_escalation/hormuz grade 1, 17 sources" for r in page)
+    assert any(r[0] == "17,547 SAR" and r[2] == ("2026-11-12 · CALCULATED SNAPSHOT · every open pick costs 7,921 SAR · left after the "
+                                                 "funded buys 9,626 SAR") for r in page)   # 24 x 88.01 x 3.75
     out = capsys.readouterr().out
     assert "ALIGN TEN.US    hard" in out and "news gate NO_NEW_ENTRY (2026-11-12 03:32) · cash read (2026-11-12 · CALCULATED SNAPSHOT)" in out and "17,547" not in out
     for name in ("Top_10_Investments", "Top_10_Investments_v2", "_News_Gate", "_Cash_Snapshot"):
@@ -786,17 +787,19 @@ def test_t8_funding_news_age_optional_reads_and_off(monkeypatch, capsys):
                         "the buys above.")
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
     assert page[a + 3 + 2 * 3][0] == "NOT FUNDED" and "Buy 24 NMM.US" not in " ".join(str(c) for r in page for c in r)
+    cc = [i for i, r in enumerate(page) if str(r[0]).startswith("C. NEW BUYS")][0]
+    assert [page[cc + 2 + i][:2] for i in (0, 1)] == [["NMM.US", "NOT FUNDED"], ["EFC.US", "WAIT"]]   # section C says what A says
     assert page[2][0].startswith("3 step(s) on holdings · 0 new buy(s) open") and "· NOT FUNDED: NMM.US · NEWS GATE: NO NEW ENTRY" in page[2][0]
     assert any(r[0] == "NMM.US" and r[1] == "OPEN, not funded today" and r[8] == "ALIGNED: no page sizes it." for r in page)
     fresh_go = aligned_book(_News_Gate=Sheet(NEWS + [["2026-11-12 08:00", "3", "GO", ""]]))   # the latest verdict is GO
     assert tap.run_once(False, book=fresh_go, now=NOW) == 0
     gp = fresh_go.tabs["Today_Action_Plan"].values
-    assert not any(r[1] == "NEWS" for r in gp) and "NEWS GATE" not in gp[2][0] and any(r[0] == "GO" and r[2] == "2026-11-12 08:00" for r in gp)
+    assert not any(r[1] == "NEWS" for r in gp) and "NEWS GATE" not in gp[2][0] and any(r[0] == "GO" and r[2] == "2026-11-12 08:00 Riyadh · no driver recorded" for r in gp)
     late = aligned_book()                                                                 # the verdict is 29.5 h old
     assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
     lp = late.tabs["Today_Action_Plan"].values
     assert not any(r[1] == "NEWS" for r in lp) and "NEWS GATE" not in lp[2][0]
-    assert any(r[0] == "NO NEW ENTRY" and r[2] == "2026-11-12 03:32 (older than the limit)" for r in lp)
+    assert any(r[0] == "NO NEW ENTRY" and str(r[2]).startswith("2026-11-12 03:32 Riyadh (older than the limit) · macro") for r in lp)
     monkeypatch.setenv("TFB_TAP_NEWS_MAX_H", "48")
     assert tap.run_once(False, book=late, now=NOW + dt.timedelta(hours=24)) == 0
     assert "NEWS GATE: NO NEW ENTRY" in late.tabs["Today_Action_Plan"].values[2][0]
@@ -876,6 +879,7 @@ def test_t9_the_page_follows_the_brokers_cash_and_orders(capsys):
     assert cs[6][4] == "plan: 24 shares · limit 84.50 - 88.01 · first target 95.00"
     a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
     assert page[a + 3 + 2 * 6][0] == "PLACED" and "for the 48 shares that remain (broker stop now: 23.00)" in cs[0][2]
+    assert any(r[:2] == ["NMM.US", "PLACED"] for r in page)                               # section C says what A says
     b = [i for i, r in enumerate(page) if str(r[0]).startswith("B. HOLDINGS")][0]
     assert page[b][0] == "B. HOLDINGS (5) - broker stops from the IBKR capture of 2026-11-12 08:41 Riyadh"
     notes = dict((page[b + i][0], (page[b + i][7], page[b + i][9])) for i in (2, 3, 4, 5, 6))

@@ -754,7 +754,7 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
 # ----------------------------------------------------------------------------- #
 # The page: values, styles, merges and row heights (pure)
 # ----------------------------------------------------------------------------- #
-COL_PX = (95, 160, 80, 130, 95, 115, 95, 125, 100, 290)        # A..J; sections B and C set the grid
+COL_PX = (95, 185, 75, 125, 90, 115, 90, 120, 95, 290)         # A..J; sections B and C set the grid
 PLAIN_COL_PX = 130                                             # every column, when the page is written plain
 INK, MUTE, LINE, HAIR = "1F2933", "6B7785", "C5CDD8", "E8ECF1"
 _GOOD, _WARN, _BAD, _INFO = ("E6F4EA", "2E7D32"), ("FFF3E0", "B45309"), ("FDECEA", "B3261E"), ("F1F3F4", "4A5568")
@@ -1012,10 +1012,13 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
            ["head", "head", "head_num", "head_num", "head_num", "head_num", "head_num", "head_num", "head_num", "head"])
     for p in d["picks"]:
         e = (ev.get("names") or {}).get(p["symbol"]) or {}
-        pg.add([p["symbol"], p["status"], fmt(p.get("qty"), 0),
+        # 1.3.0: the status says what section A says (an OPEN pick that is not funded, or whose order is working)
+        shown = "PLACED" if p.get("placed") else ("NOT FUNDED" if p.get("unfunded") else p["status"])
+        pg.add([p["symbol"], shown, fmt(p.get("qty"), 0),
                 "%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))), fmt(p.get("price")), fmt(p.get("stop")),
                 fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("reason", "")],
-               ["cell_b", STATUS_STYLE.get(p["status"], "st_info"), "num", "num", "num", "num", "num", "num", "num", "cell"])
+               ["cell_b", {"PLACED": "st_good", "NOT FUNDED": "st_bad"}.get(shown) or STATUS_STYLE.get(p["status"], "st_info"),
+                "num", "num", "num", "num", "num", "num", "num", "cell"])
     if not d["picks"]:
         pg.add(["", "No plan has been cut today yet." if not plan.get("is_today") else
                 "Today's plan has no pick: no name passed the execution gates."], ["", "msg"], [(1, WIDTH)])
@@ -1066,18 +1069,18 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         pg.full("News & Macro Gate (_News_Gate; observe-only)", "subhead")
         if news.get("read"):
             old = news.get("age_h") is not None and not d.get("news_live") and news["verdict"] != "GO"
-            pg.add([news["verdict"].replace("_", " "), "", news["at"] + (" (older than the limit)" if old else ""),
-                    news.get("drivers") or "no driver recorded"],
-                   ["bad" if d.get("news_live") else "cell_b", "", "cell", "cell"], [(0, 2), (3, WIDTH)])
+            # 1.3.0: verdict | when and why, in one wide cell (a date no longer wraps in an 80 px column)
+            pg.add([news["verdict"].replace("_", " "), "", "%s Riyadh%s · %s" % (
+                news["at"], " (older than the limit)" if old else "", news.get("drivers") or "no driver recorded")],
+                ["bad" if d.get("news_live") else "cell_b", "", "cell"], [(0, 2), (2, WIDTH)])
         else:
             pg.add(["", "The _News_Gate tab was not read."], ["", "msg"], [(1, WIDTH)])
         pg.full("Cash (%s)" % {"ibkr": "IBKR read-only capture"}.get(d.get("cash_src"), "_Cash_Snapshot"), "subhead")
         if d.get("cash") is not None:
             open_cost = sum(pick_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty"))
-            pg.add(["%s SAR" % fmt(d["cash"], 0), "", d.get("cash_at", ""),
-                    "open buys cost %s SAR · left after the funded buys %s SAR" % (fmt(open_cost, 0), fmt(d.get("cash_left"), 0))],
-                   ["cell_b", "", "cell", "bad" if any(p.get("unfunded") for p in d["picks"]) else "cell"],
-                   [(0, 2), (3, WIDTH)])
+            pg.add(["%s SAR" % fmt(d["cash"], 0), "", "%s · every open pick costs %s SAR · left after the funded buys %s SAR" % (
+                d.get("cash_at", ""), fmt(open_cost, 0), fmt(d.get("cash_left"), 0))],
+                ["cell_b", "", "bad" if any(p.get("unfunded") for p in d["picks"]) else "cell"], [(0, 2), (2, WIDTH)])
         else:
             pg.add(["", "No cash figure was read: the buys were not checked against cash."], ["", "msg"], [(1, WIDTH)])
         if not broker.get("used"):
