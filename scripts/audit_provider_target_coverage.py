@@ -48,6 +48,11 @@ surface: this control cannot change a ticket.  It ALERTS; prevention of
 provenance-driven verdict flips is the R-6 keep-last-good layer
 (target_keeper.py), by design.
 
+v1.3.0 (2026-11-13): a page read that hits the Sheets per-minute quota
+(HTTP 429) waits 65 s and is tried again, at most twice
+(scripts/sheets_quota.py), before the page counts as READ_FAIL. Nothing
+else changes: the baseline rules, thresholds and exit codes are as in 1.2.1.
+
 Exit codes: 0 healthy / bootstrap / structural-zero; 1 coverage failure
 (collapse, floor breach, row collapse); 2 control-health failure.
 
@@ -86,7 +91,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -618,8 +623,34 @@ async def _read(reader: Callable[..., Any], sid: str, page: str) -> list:
     return [list(r) if isinstance(r, (list, tuple)) else [r] for r in val]
 
 
+async def _read_quota_aware(reader: Callable[..., Any], sid: str, page: str,
+                            sleep: Optional[Callable[[float], Any]] = None) -> list:
+    """v1.3.0: wait out the Sheets per-minute read quota (HTTP 429) before a
+    page counts as unreadable. 13 Nov 2026 14:41Z all four pages answered 429
+    in the same minute as the Exit Plan and Evidence Board reads, so the run
+    reported READ_FAIL on every page. The wait (65 s, at most twice) is the
+    one scripts/sheets_quota.py uses; every other error is raised unchanged,
+    so a page that still cannot be read stays a CONTROL failure."""
+    from scripts.sheets_quota import RETRIES, wait_for  # noqa: PLC0415
+    attempt = 0
+    while True:
+        try:
+            return await _read(reader, sid, page)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless quota and tries remain
+            wait = wait_for(exc, attempt + 1)
+            if wait is None or attempt >= RETRIES:
+                raise
+            attempt += 1
+            print(f"[PTC v{VERSION}] Sheets quota reached reading {page}: waiting {wait:.0f} s, "
+                  f"then try {attempt} of {RETRIES}", file=sys.stderr)
+            res = (sleep or asyncio.sleep)(wait)
+            if inspect.isawaitable(res):
+                await res
+
+
 async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Optional[dict],
-                   cfg: Config, bootstrap: bool, accept: bool, reader=None) -> CoverageReport:
+                   cfg: Config, bootstrap: bool, accept: bool, reader=None,
+                   sleep: Optional[Callable[[float], Any]] = None) -> CoverageReport:
     masked = (spreadsheet_id[:5] + "..." + spreadsheet_id[-5:]
               if len(spreadsheet_id) > 10 else "***")
     if not spreadsheet_id:
@@ -635,7 +666,7 @@ async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Op
     errors: dict[str, str] = {}
     for page in pages:
         try:
-            grids[page] = await _read(reader, spreadsheet_id, page)
+            grids[page] = await _read_quota_aware(reader, spreadsheet_id, page, sleep=sleep)
         except Exception as exc:
             grids[page] = []
             errors[page] = f"{type(exc).__name__}: {exc}"

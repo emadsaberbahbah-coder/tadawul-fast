@@ -153,7 +153,7 @@ ENV_ROUTE_BASE = "TFB_ROUTE_AUTH_BASE"
 # is unchanged: the stub never raises, so each decision and denial is identical.
 # v8.14.7 changes diagnostic inventory only; retain every auth assertion.
 # v8.14.8 (2026-10-28) adds /health pf_gates keys only; same rule.
-EXPECTED_VERSION = "8.14.8"
+EXPECTED_VERSION = "8.14.9"
 NEW_HELPERS = ["_global_auth_exempt_request", "_request_scope_path", "_scope_route_path"]
 TOKEN = "harness-wall-token-7q2"
 RID = "harness-rid-1"
