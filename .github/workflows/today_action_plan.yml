@@ -86,7 +86,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Install dependencies
-        run: python -m pip install --quiet gspread==6.2.1 google-auth
+        run: python -m pip install --quiet gspread==6.2.1 google-auth requests
 
       - name: 🔎 Resolve spreadsheet id
         id: sheet
@@ -116,6 +116,11 @@ jobs:
           TFB_TAP_NEWS_MAX_H: ${{ vars.TFB_TAP_NEWS_MAX_H || '24' }}
           TFB_TAP_IBKR_MAX_AGE_H: ${{ vars.TFB_TAP_IBKR_MAX_AGE_H || '30' }}
           TFB_TAP_BUY_CAPTURE_MARKET_H: ${{ vars.TFB_TAP_BUY_CAPTURE_MARKET_H || '2' }}
+          TFB_TAP_BQ: ${{ vars.TFB_TAP_BQ || 'on' }}
+          TFB_TAP_BQ_TABLE: ${{ vars.TFB_TAP_BQ_TABLE || 'today_action_plan' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE || 'on' }}
