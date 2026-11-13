@@ -26,7 +26,7 @@ def test_version():
 def test_note_names_period():
     n = _note(3)
     assert "valuation upside 33.4% (ann 216.7% if reached in 3m) via target_price" in n
-    assert n.startswith("INVEST — ")
+    assert n.startswith("INVEST \u2014 ")
 
 
 def test_note_without_period_is_unchanged_shape():
