@@ -5,6 +5,17 @@ scripts/today_action_plan.py
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
 v1.3.2 (2026-11-13)
+  1.3.2: A NEW BUY NEEDS A CAPTURE FROM THIS SESSION (owner, 13 Nov 18:33: "other approval you can select the best
+         options"; the 13 Nov review asked for one capture-age policy). Holdings and stops keep the 30-hour limit
+         (TFB_TAP_IBKR_MAX_AGE_H): a stop protects shares the account already holds. A NEW BUY also needs the capture to
+         be at most TFB_TAP_BUY_CAPTURE_MARKET_H (2) market-open hours old - the hours Tadawul or the US market was
+         in session since it was taken (consistency_check.open_hours) - because cash and working orders change only
+         while a market trades. An older capture gives VERIFY on the buy, with the research levels; a working order
+         stays visible. A capture taken overnight therefore still approves a buy before the next open, and the
+         hourly capture keeps it current during a session.
+  1.3.2: PAGE ALIGNMENT IS AN INTERNAL CONTROL (owner, 13 Nov 18:35). The section is headed "Internal control - page
+         alignment (Consistency_Check)", counts "control exception(s)" and shows each control's rule (which page
+         rules) after the detail, read from the check's new 'Control rule' column.
   1.3.2: A POSITION OVER THE CAP IS SHOWN, AND IS NOT A PAGE DIFFERENCE (owner, 13 Nov 12:34, on the Consistency_Check
          rows: "need to solve it"). consistency_check 1.2.0 reports a Portfolio_Decision TRIM on a holding above
          'PF: Max Position %' as C12 position cap (status OVER CAP) instead of a C10 mismatch. The page lists that row
@@ -109,7 +120,8 @@ ENV
     TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none),
     TFB_TAP_STYLE (on | off = plain grid), TFB_TAP_PREVIEW (false | true = write the preview tab),
     TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_NEWS_MAX_H (24),
-    TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID.
+    TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
+    TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2).
 ================================================================================
 """
 from __future__ import annotations
@@ -343,7 +355,11 @@ def read_consistency(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
     for r in list(values)[h + 1:]:
         st = text(cell(r, col["Status"])).upper()
         if st in ("MISMATCH", "STALE", "OVER CAP"):
-            out.append({"check": text(cell(r, col["Check"])), "status": st, "detail": text(cell(r, col["Detail"]))})
+            item = {"check": text(cell(r, col["Check"])), "status": st, "detail": text(cell(r, col["Detail"]))}
+            rule = text(cell(r, col.get("Control rule"))) if col.get("Control rule") is not None else ""
+            if rule:                                                # 1.3.2: which page rules
+                item["rule"] = rule
+            out.append(item)
     return out
 
 
@@ -566,7 +582,7 @@ def align(plan: Dict[str, Any], t10: Dict[str, Any], v2: Dict[str, Any]) -> List
 # 1.3.0 [IBKR]: the broker's own cash and working orders, from the read-only capture (pure)
 # ----------------------------------------------------------------------------- #
 def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Optional[Dict[str, Any]],
-                  max_age_h: float) -> Dict[str, Any]:
+                  max_age_h: float, now: Optional[_dt.datetime] = None) -> Dict[str, Any]:
     """Put the capture's working stops on the holdings and return the broker view:
     {"used", "why", "at", "cash", "reserved", "open_orders": {SYM: [(limit, qty)]}}. Not used (holdings untouched)
     when there is no capture, it could not be read, or it is older than max_age_h."""
@@ -590,6 +606,9 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
                 "cash": max(0.0, usd - held_back) * PEG if complete else None,
                 "reserved": held_back * PEG, "complete": complete,
                 "open_orders": dict((sym, rows) for sym, rows in (cap.get("buys") or {}).items() if sym in picks)})
+    if now is not None:                                             # 1.3.2: market-open hours since the capture
+        from scripts.consistency_check import open_hours  # noqa: PLC0415
+        out["market_h"] = open_hours(cap["as_of"], now)
     for h in holdings:
         h["at_broker"] = h["symbol"] in cap["positions"]
         if h["at_broker"]:
@@ -776,6 +795,10 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
                              "compare it." % broker_note})
     picks = plan["picks"] if plan.get("is_today") else []
     funding_reason = custody_reason or ("a working buy reservation has no limit price" if broker.get("complete") is False else "")
+    buy_h = k.get("buy_market_h")
+    if not funding_reason and buy_h is not None and (broker.get("market_h") or 0.0) > buy_h:   # 1.3.2
+        funding_reason = ("the IBKR capture of %s Riyadh is %.1f market hours old; a new buy needs one within %g - "
+                          "check cash and orders at IBKR" % (broker.get("at") or "?", broker["market_h"], buy_h))
     plan_reason = action_source_reason("Daily_Plan", ages, k) or ("source pages were unverified at the cut" if plan.get("quality", "").upper() != "VERIFIED" else "")
     for p in picks:
         p.pop("review_reason", None)
@@ -997,7 +1020,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     pg.full("Built %s Riyadh · today_action_plan %s · copied from Exit_Plan, Daily_Plan, Evidence_Board and "
             "Consistency_Check · not an order: nothing here places, changes or cancels a trade" % (stamp, __version__),
             "sub")
-    pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d page difference(s) to "
+    pg.full("%d step(s) on holdings · %d new buy(s) open · %d pick(s) waiting for price · %d control exception(s) to "
             "know about%s" % (n_hold, n_buy, waiting, len([x for x in d["issues"] if x["status"] != "OVER CAP"]),
                               flags + (" · OVER THE POSITION CAP" if any(x["status"] == "OVER CAP" for x in d["issues"])
                                        else "") + (" · OLD SOURCE: " + ", ".join(d["stale"]) if d["stale"] else "") +
@@ -1130,12 +1153,13 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         rest = " · ".join(cells[1:])
         verdict = "bad" if re.search(r"\bFAIL\b", rest) else ("ok" if re.search(r"\bPASS\b", rest) else "cell")
         pg.add([cells[0], "", rest], ["cell_b", "", verdict], [(0, 2), (2, WIDTH)])
-    pg.full("Page differences (Consistency_Check)", "subhead")
+    pg.full("Internal control - page alignment (Consistency_Check)", "subhead")
     pg.add(["Check", "", "Status", "Detail"], "head", [(0, 2), (3, WIDTH)])
-    issues = [[x["check"], "", x["status"], x["detail"]] for x in d["issues"]]
+    issues = [[x["check"], "", x["status"], x["detail"] + (" · RULE: " + x["rule"] if x.get("rule") else "")]
+              for x in d["issues"]]
     if not issues:
         issues = [["", "", "not read", "The Consistency_Check page could not be read."] if "Consistency_Check" in miss else
-                  ["", "", "none", "The pages agree on every checked figure."]]
+                  ["", "", "none", "Every control holds: the pages agree on every checked figure."]]
     for x in issues:
         pg.add(x, ["cell_b", "", STATUS_STYLE.get(x[2], "st_info"), "cell"], [(0, 2), (3, WIDTH)])
     if d.get("aligned"):                                            # 1.2.0: the news gate and the cash ledger
@@ -1354,7 +1378,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
          "pipeline": _env_num("TFB_TAP_PIPELINE", 5, 0, 30),
          "stale_ev": _env_num("TFB_TAP_STALE_EVIDENCE_H", 18, 0.25, 96),
          "news_max_h": _env_num("TFB_TAP_NEWS_MAX_H", 24, 1, 168),
-         "ibkr_max_h": _env_num("TFB_TAP_IBKR_MAX_AGE_H", 30, 0.5, 96)}
+         "ibkr_max_h": _env_num("TFB_TAP_IBKR_MAX_AGE_H", 30, 0.5, 96),
+         "buy_market_h": _env_num("TFB_TAP_BUY_CAPTURE_MARKET_H", 2, 0.25, 48)}
     aligned = _env("TFB_TAP_ALIGN", "on").lower() not in ("off", "0", "false", "no")
     retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep
     held = {"book": book}
@@ -1367,7 +1392,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         b = held["book"]
         got = {"Exit_Plan": _read(b, "Exit_Plan", "A1:P80"), "Daily_Plan": _read(b, "Daily_Plan", "A1:N6"),
                "Evidence_Board": _read(b, "Evidence_Board", "A1:L120"),
-               "Consistency_Check": _read(b, "Consistency_Check", "A1:F60")}
+               "Consistency_Check": _read(b, "Consistency_Check", "A1:G60")}
         more: Dict[str, List[List[Any]]] = {}
         for tab, rng in (((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000"))
                          if aligned else ()):
@@ -1410,7 +1435,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         if capture is None and own_book:
             from scripts import ibkr_capture  # noqa: PLC0415
             capture = ibkr_capture.latest(now, out=_out)
-        broker = apply_capture(holdings, plan, capture, k["ibkr_max_h"])
+        broker = apply_capture(holdings, plan, capture, k["ibkr_max_h"], now)
         extra["broker"] = broker
         if broker["used"]:
             broker_note = ""                                        # the orders are known: each holding is checked

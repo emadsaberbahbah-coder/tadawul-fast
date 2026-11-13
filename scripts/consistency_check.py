@@ -62,6 +62,12 @@ the page's rows: "need to solve it"). Read on the live workbook that hour:
       Portfolio_Decision's cash (the broker's when a capture is applied).
   C9  unchanged in logic (two stop engines); the row now says which stop rules.
 Portfolio_Decision is read to column Z (the Advisor Note).
+INTERNAL CONTROL (owner, 13 Nov 18:35: "solve the misalignment between different
+pages; consider that part of internal control rather than a problem"). Each
+check is a control with a written rule: which page rules when two disagree,
+and what an exception means. The page carries the rule in a seventh column,
+'Control rule', and its title says INTERNAL CONTROL. The Today Action Plan is
+the page that gives orders; every other page is analysis and is held to it.
 THE RUN LOG IS PUBLIC (the repository is): since 1.2.0 it prints the detail of
 C1, C2, C3 and C11 only (names and times). Every row that can carry cash, a
 total, a quantity, a weight or a stop prints its status alone; the figures are
@@ -90,7 +96,7 @@ __version__ = "1.2.0"
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 PAGE_TAB = "Consistency_Check"
-PAGE_WIDTH = 6
+PAGE_WIDTH = 7
 PEG = 3.75
 READ_ATTEMPTS = 3
 READ_RETRY_S = 20
@@ -422,6 +428,23 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
     return out
 
 
+# The control rule of each check: which page rules, and what an exception means (owner, 13 Nov 18:35).
+CONTROLS = {
+    "C1": "Orders come from the Today Action Plan. A Top 10 ticket that is not an open pick is not bought; an open "
+          "pick the Top 10 has not sized is still an order of the plan.",
+    "C2": "No new buy inside the earnings window (the Daily Plan's rule).",
+    "C3": "The v2 pages mirror the main pages. Read the main page while a v2 page is older.",
+    "C4": "One price per holding within tolerance. The ledger's price rules until the page is refreshed.",
+    "C5": "The share count is the broker's; the ledger must equal it.",
+    "C6": "USD is valued at the 3.75 peg on every page.",
+    "C7": "Portfolio_Decision totals the broker account; the ledger total adds holdings kept elsewhere.",
+    "C8": "Cash is the broker's (IBKR capture). The typed cash cells follow it; a different cell is corrected.",
+    "C9": "The stop to place is the Exit Plan's. Another page's stop is analysis.",
+    "C10": "A price exit is the Exit Plan's call. Another page's sell-side action is analysis.",
+    "C11": "A page not rebuilt within the limit is analysis only until it is rebuilt.",
+    "C12": "The position cap is the owner's rule. A holding above it is reported; trimming is the owner's decision.",
+}
+
 LOG_DETAIL = ("C1", "C2", "C3", "C11")                             # names and times only; nothing of the account
 
 
@@ -432,14 +455,15 @@ def log_detail(r: Sequence[str]) -> str:
 
 def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
     n = {s: sum(1 for r in results if r[1] == s) for s in ("MISMATCH", "STALE", "OVER CAP", "MATCH", "INFO")}
-    rows = [["CONSISTENCY CHECK - the same figure on every page"],
+    rows = [["INTERNAL CONTROL - CONSISTENCY CHECK: the same figure on every page, and which page rules"],
             ["As of %s Riyadh · %d mismatch(es) · %d stale · %s%d match · %d note(s) · consistency_check %s" % (
                 stamp, n["MISMATCH"], n["STALE"], "%d over the position cap · " % n["OVER CAP"] if n["OVER CAP"] else "",
                 n["MATCH"], n["INFO"], __version__)],
             [],
-            ["Check", "Status", "Detail", "First page", "Second page", "Pages compared"]]
+            ["Check", "Status", "Detail", "First page", "Second page", "Pages compared", "Control rule"]]
     order = {"MISMATCH": 0, "STALE": 1, "OVER CAP": 2, "INFO": 3, "MATCH": 4}
-    rows += sorted(results, key=lambda r: (order.get(r[1], 9), r[0]))
+    rows += [(list(r) + [""] * 6)[:6] + [CONTROLS.get(r[0].split(" ")[0], "")]
+             for r in sorted(results, key=lambda r: (order.get(r[1], 9), r[0]))]
     return [(list(r) + [""] * PAGE_WIDTH)[:PAGE_WIDTH] for r in rows]
 
 

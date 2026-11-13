@@ -200,7 +200,11 @@ def test_k4_gate_page_and_read_failure(monkeypatch, capsys):
     # C11 adds six rows: Top_10 11:11 and Portfolio_Decision 11:07 MATCH; Portfolio_Decision_v2 STALE;
     # Daily_Plan, Exit_Plan (not in this workbook) and Top_10_v2 (no 'page built') INFO
     assert page[1][0].startswith("As of 2026-11-11 11:30 Riyadh · 4 mismatch(es) · 3 stale · 6 match · 4 note(s)")
-    assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared"]
+    assert page[0][0].startswith("INTERNAL CONTROL - CONSISTENCY CHECK")
+    assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared", "Control rule"]
+    assert all(len(r) == 7 for r in page) and all(r[6] for r in page[3:])          # every check carries its rule
+    assert [r[6] for r in page[3:] if r[0] == "C9 stops"] == ["The stop to place is the Exit Plan's. Another page's stop is analysis."]
+    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 13))
     assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 3 + ["INFO"] * 4 + ["MATCH"] * 6
     assert set(b.tabs) - set(wb()) == {"Consistency_Check"}                       # no other page is touched
     log = capsys.readouterr().out                                                 # 1.2.0: the run log is public

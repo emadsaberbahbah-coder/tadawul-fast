@@ -1182,6 +1182,7 @@ jobs:
             tests/test_ibkr_capture.py \
             tests/test_exit_plan.py \
             tests/test_consistency_check.py \
+            tests/test_cash_cells.py \
             tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
