@@ -55,7 +55,9 @@ MAX_BYTES = 400000
 MAX_CLOCK_GAP_S = 600                                  # captured_at against Drive's creation time
 FUTURE_SLACK_S = 300
 _FOLDER_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
-_DONE_RE = re.compile(r"FILLED|CANCEL|EXPIRED|INACTIVE|REJECT", re.I)
+# An order that can no longer trade. Matched on the WHOLE status: "PARTIALLY_FILLED" is still working for its
+# remaining shares (Codex P1, #972), and an unknown status is kept as working.
+_DONE_RE = re.compile(r"^(FILLED|(API_?)?CANCELL?ED|EXPIRED|INACTIVE|REJECTED)$", re.I)
 _DESC_RE = re.compile(r"^(buy|sell)\s+[\d,\.]+\s+(\S+)", re.I)
 _STP_RE = re.compile(r"STP\s+(?:LMT\s+)?([\d,]*\.?\d+)", re.I)
 
@@ -159,7 +161,7 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
         return out
     for o in orders:
         o = o or {}
-        if _DONE_RE.search(str(o.get("order_status") or "")):
+        if _DONE_RE.match(re.sub(r"[\s-]+", "_", str(o.get("order_status") or "").strip())):
             continue
         m = _DESC_RE.match(str(o.get("primary_description") or ""))
         if not m:

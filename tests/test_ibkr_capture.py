@@ -60,6 +60,11 @@ def test_c1_parse_reads_cash_positions_and_working_orders():
     assert p["stops"] == {"DDI.US": [(14.8, 120.0)], "GLPI.US": [(35.74, 79.0), (35.1, 40.0)], "NMM.US": [(1080.98, 24.0)]}
     assert p["limits"] == {"NMM.US": [(99.5, 24.0)]}
     assert p["buys"] == {"INSW.US": [(99.4, 20.0)], "AX.US": [(None, 5.0)]} and p["n_orders"] == 7   # done orders skipped
+    for status, working in (("PARTIALLY_FILLED", True), ("Partially Filled", True), ("PENDING_CANCEL", True), ("PreSubmitted", True),
+                            ("Filled", False), ("CANCELLED", False), ("Canceled", False), ("Api Cancelled", False),
+                            ("EXPIRED", False), ("Inactive", False), ("Rejected", False)):   # Codex P1, #972: whole status
+        c = capture(orders={"orders": [order("Sell 50 DDI", "STOP", "SELL", "STP 14.80, GTC", status=status, total="100", rem="50")]})
+        assert (ic.parse(c, CREATED, NOW)["stops"] == {"DDI.US": [(14.8, 50.0)]}) is working, status
     assert ic.stop_cover(p, "DDI.US") == (14.8, 120.0) and ic.stop_cover(p, "GLPI.US") == (35.1, 119.0)   # the lowest stop
     assert ic.stop_cover(p, "IBOC.US") == (None, 0)
     assert ic.stop_cover({"stops": {"X.US": [(None, 50.0)]}}, "X.US") == (None, 50.0)             # covered, price unread

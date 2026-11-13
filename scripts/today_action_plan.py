@@ -459,20 +459,37 @@ def pick_cost(p: Dict[str, Any]) -> Optional[float]:
     return max(alloc or 0.0, float(p["qty"]) * top * fx)
 
 
+def commit_cost(p: Dict[str, Any]) -> Optional[float]:
+    """What a pick takes from cash. An order already working at the broker counts at ITS OWN shares and limit (a
+    market order at the highest price the plan allows), whatever the frozen ticket said (Codex P1, #972); a pick
+    with no order counts as pick_cost."""
+    if not p.get("placed"):
+        return pick_cost(p)
+    fx = {"USD": PEG, "SAR": 1.0}.get(text(p.get("ccy")).upper())
+    top = max(float(p.get("zone_high") or 0.0), float(p.get("price") or 0.0))
+    if not fx or any(px is None and top <= 0 for px, _ in p["placed"]):
+        return pick_cost(p)
+    return sum(q * (px if px is not None else top) for px, q in p["placed"]) * fx
+
+
 def fund(picks: Sequence[Dict[str, Any]], cash: Optional[float]) -> Optional[float]:
-    """Fund the OPEN picks in rank order from `cash`; a pick that does not fit gets p["unfunded"] = (cost, left).
-    Returns the cash left (None when the cash is not known - then nothing is marked)."""
+    """Fund the OPEN picks from `cash`: first the orders already working at the broker (they are commitments), then
+    the rest in rank order. A pick that does not fit gets p["unfunded"] = (cost, left). Returns the cash left (None
+    when the cash is not known - then nothing is marked)."""
     if cash is None:
         return None
     left = float(cash)
-    for p in sorted([p for p in picks if p["status"] == "OPEN" and p.get("qty")], key=lambda p: p.get("rank") or 1e9):
-        cost = pick_cost(p)
+    live = sorted([p for p in picks if p["status"] == "OPEN" and p.get("qty")], key=lambda p: p.get("rank") or 1e9)
+    for p in [p for p in live if p.get("placed")] + [p for p in live if not p.get("placed")]:
+        cost = commit_cost(p)
         if cost is None:
             continue
         if cost <= left + 0.5:
             left -= cost
         else:
             p["unfunded"] = (cost, left)
+            if p.get("placed"):
+                left = 0.0                                          # the order stands at the broker: nothing is left
     return left
 
 
@@ -558,8 +575,11 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
     picks = set(p["symbol"] for p in (plan["picks"] if plan.get("is_today") else []) if p["status"] == "OPEN")
     usd = min(x for x in (cap.get("cash_usd"), cap.get("settled_usd")) if x is not None)
     held_back, complete = reserved_usd(cap, picks)
+    # a working buy on another name without a limit price holds an unknown amount: the broker's cash is then not
+    # used for the funding check at all (Codex P1, #972) - the page falls back to the cash ledger and says why
     out.update({"used": True, "at": cap["as_of"].astimezone(RIYADH).strftime("%Y-%m-%d %H:%M"),
-                "cash": max(0.0, usd - held_back) * PEG, "reserved": held_back * PEG, "complete": complete,
+                "cash": max(0.0, usd - held_back) * PEG if complete else None,
+                "reserved": held_back * PEG, "complete": complete,
                 "open_orders": dict((sym, rows) for sym, rows in (cap.get("buys") or {}).items() if sym in picks)})
     for h in holdings:
         h["at_broker"] = h["symbol"] in cap["positions"]
@@ -882,7 +902,7 @@ class _Page(object):
 def day_tiles(d: Dict[str, Any], n_buy: int, hard: Sequence[str], unfunded: Sequence[str]) -> List[Tuple[str, str, str, str]]:
     """Five (label, value, note, tone) tiles; tone is plain | good | warn | bad."""
     cash, src = d.get("cash"), d.get("cash_src") or "ledger"
-    open_cost = sum(pick_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded"))
+    open_cost = sum(commit_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded"))
     placed = sum(1 for p in d["picks"] if p.get("placed"))
     news = d.get("news") or {}
     where = {"ibkr": "CASH AT IBKR", "ledger": "CASH (LEDGER)"}.get(src, "CASH")
@@ -1077,7 +1097,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
             pg.add(["", "The _News_Gate tab was not read."], ["", "msg"], [(1, WIDTH)])
         pg.full("Cash (%s)" % {"ibkr": "IBKR read-only capture"}.get(d.get("cash_src"), "_Cash_Snapshot"), "subhead")
         if d.get("cash") is not None:
-            open_cost = sum(pick_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty"))
+            open_cost = sum(commit_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty"))
             pg.add(["%s SAR" % fmt(d["cash"], 0), "", "%s · every open pick costs %s SAR · left after the funded buys %s SAR" % (
                 d.get("cash_at", ""), fmt(open_cost, 0), fmt(d.get("cash_left"), 0))],
                 ["cell_b", "", "bad" if any(p.get("unfunded") for p in d["picks"]) else "cell"], [(0, 2), (2, WIDTH)])
@@ -1085,10 +1105,12 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
             pg.add(["", "No cash figure was read: the buys were not checked against cash."], ["", "msg"], [(1, WIDTH)])
         if not broker.get("used"):
             pg.add(["", "IBKR capture not used: %s." % (broker.get("why") or "not read")], ["", "msg"], [(1, WIDTH)])
+        elif not broker.get("complete", True):
+            pg.add(["", "IBKR cash not used: a working buy order on another name has no limit price, so the cash it "
+                        "holds is not known. The figure above is the workbook's cash ledger."], ["", "msg_alert"], [(1, WIDTH)])
         elif broker.get("reserved"):
-            pg.add(["", "%s SAR is held by working buy orders on other names and is not counted%s." % (
-                fmt(broker["reserved"], 0), "" if broker.get("complete", True) else "; a buy order without a limit price is not counted either")],
-                ["", "msg"], [(1, WIDTH)])
+            pg.add(["", "%s SAR is held by working buy orders on other names and is not counted." % fmt(broker["reserved"], 0)],
+                   ["", "msg"], [(1, WIDTH)])
     pg.full("Source pages", "subhead")
     pg.add(["Source page", "", "Age (hours)", "Reading"], ["head", "", "head_num", "head"], [(0, 2), (3, WIDTH)])
     for name in sorted(d["ages"]):
@@ -1338,7 +1360,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         extra["broker"] = broker
         if broker["used"]:
             broker_note = ""                                        # the orders are known: each holding is checked
-            extra.update({"cash": broker["cash"], "cash_at": "IBKR capture of %s Riyadh" % broker["at"], "cash_src": "ibkr"})
+            if broker["cash"] is not None:                          # None: a reservation could not be priced
+                extra.update({"cash": broker["cash"], "cash_at": "IBKR capture of %s Riyadh" % broker["at"],
+                              "cash_src": "ibkr"})
+            else:
+                _out("IBKR cash not used: a working buy order has no limit price")
         else:
             _out("IBKR capture not used: %s" % broker["why"])
     d = build(holdings, plan, read_evidence(pages["Evidence_Board"]),

@@ -887,9 +887,10 @@ def test_t9_the_page_follows_the_brokers_cash_and_orders(capsys):
                      "IBOC.US": ("", "no stop at IBKR"), "SUPN.US": ("23.00", "broker stop below the plan"), "5023.SR": ("", "")}
     fm = book.tabs["Today_Action_Plan"].formats
     assert fm[b + 2][9]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1]) == fm[b + 4][9]["textFormat"]["foregroundColor"]
-    t = tiles_of(page)                                             # (4,679.15 - 10 x 50 on another name) x 3.75; NMM at its top limit
+    t = tiles_of(page)                                             # (4,679.15 - 10 x 50 on another name) x 3.75
     assert t["CASH AT IBKR"] == ("15,672 SAR", "IBKR capture of 2026-11-12 08:41 Riyadh")
-    assert t["BUYS TODAY"] == ("1 of 1", "7,921 SAR · 1 placed") and t["CASH AFTER THE BUYS"][0] == "7,751 SAR"
+    # the working order counts at its own 24 shares x 87.90 x 3.75 = 7,911 (Codex P1, #972), not at the plan's top limit
+    assert t["BUYS TODAY"] == ("1 of 1", "7,911 SAR · 1 placed") and t["CASH AFTER THE BUYS"][0] == "7,761 SAR"
     assert t["NEWS GATE"][0] == "NO NEW ENTRY" and t["PAGES"] == ("DISAGREE", "do not buy: ZTO.US, TEN.US")
     ti = [n for n, r in enumerate(page) if r[0] == "CASH AT IBKR"][0]
     assert fm[ti + 1][6]["textFormat"]["foregroundColor"] == tap._rgb(tap._BAD[1]) and (ti, ti + 1, 0, 2) in book.tabs["Today_Action_Plan"].merges
@@ -943,6 +944,50 @@ def test_t9_stop_states_fallbacks_and_a_stop_the_broker_already_carries(capsys):
     b4 = aligned_book()
     assert tap.run_once(False, book=b4, now=NOW, capture=tight) == 0
     p4 = b4.tabs["Today_Action_Plan"].values
-    assert any(c[1] == "NMM.US" and c[2].endswith("Cash does not cover it: it needs 7,921 SAR and 1,875 SAR is left.") for c in cards(p4))
+    assert any(c[1] == "NMM.US" and c[2].endswith("Cash does not cover it: it needs 7,911 SAR and 1,875 SAR is left.") for c in cards(p4))
     assert tiles_of(p4)["BUYS TODAY"] == ("1 of 1", "no open buy · 1 placed · 1 not funded")
+    assert tiles_of(p4)["CASH AFTER THE BUYS"][0] == "0 SAR"                                # the order stands at the broker
     assert tap.apply_capture([], tap.read_plan([], dt.date(2026, 11, 12)), ib_capture(cash=5000.0, settled=4000.0), 30)["cash"] == pytest.approx((4000.0 - 500 - 2109.6) * 3.75)   # no pick: every buy order is held back
+
+
+def test_t9_review_fixes_actual_commitments_partial_fills_and_unpriced_reservations(capsys):
+    """Codex P1 x3 on #972."""
+    # (1) an order already working counts at its own shares and limit, and before any unplaced pick
+    a = {"symbol": "A.US", "status": "OPEN", "qty": 10.0, "rank": 2, "alloc": 375.0, "price": 10.0, "zone_high": 10.0,
+         "ccy": "USD", "placed": [(10.0, 80.0)]}
+    b = {"symbol": "B.US", "status": "OPEN", "qty": 50.0, "rank": 1, "alloc": 1875.0, "price": 10.0, "zone_high": 10.0, "ccy": "USD"}
+    assert tap.commit_cost(a) == 3000.0 and tap.commit_cost(b) == 1875.0                    # 80 x 10 x 3.75, not 10 x 10
+    assert tap.fund([a, b], 3750.0) == 750.0 and "unfunded" not in a and b["unfunded"] == (1875.0, 750.0)   # 1,000 USD
+    mkt = dict(a, placed=[(None, 20.0), (9.0, 10.0)], zone_high=10.5)
+    assert tap.commit_cost(mkt) == (20 * 10.5 + 10 * 9.0) * 3.75                            # a market order: the plan's top
+    assert tap.commit_cost(dict(a, ccy="GBX")) == 375.0                                    # no rate: the plan's allocation
+    over = dict(a, placed=[(10.0, 200.0)])
+    c = dict(b)
+    c.pop("unfunded", None)
+    assert tap.fund([over, c], 3750.0) == 0.0 and over["unfunded"] == (7500.0, 3750.0) and c["unfunded"] == (1875.0, 0.0)
+    # (2) a partially filled order is still working for the shares that remain
+    part = [ib_order("Sell 240 DDI", "STOP", "SELL", "STP 14.80, GTC", 240, status="PARTIALLY_FILLED"),
+            ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9, status="Partially Filled"),
+            ib_order("Sell 79 GLPI", "STOP", "SELL", "STP 35.74, GTC", 79, status="Filled"),
+            ib_order("Sell 52 IBOC", "STOP", "SELL", "STP 63.20, GTC", 52, status="Api Cancelled"),
+            ib_order("Sell 95 SUPN", "STOP", "SELL", "STP 24.25, GTC", 95, status="PENDING_CANCEL")]
+    part[0]["remaining_shares_qty"], part[1]["remaining_shares_qty"] = "140", "9"
+    cap = ib_capture(part)
+    assert cap["stops"] == {"DDI.US": [(14.8, 140.0)], "SUPN.US": [(24.25, 95.0)]}          # filled and cancelled: gone
+    assert cap["buys"] == {"NMM.US": [(87.9, 9.0)]} and cap["n_orders"] == 3
+    # (3) a working buy on another name without a limit: the broker's cash is not used for the funding check
+    odd = ib_capture([ib_order("Buy 10 OTHER", "MARKET", "BUY", "Market, Day", 10),
+                      ib_order("Sell 79 GLPI", "STOP", "SELL", "STP 35.74, GTC", 79)])
+    book = aligned_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=odd) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert tiles_of(page)["CASH (LEDGER)"][0] == "17,547 SAR"                               # the established fallback
+    assert any("IBKR cash not used: a working buy order on another name has no limit price" in str(r[1]) for r in page)
+    assert "IBKR cash not used: a working buy order has no limit price" in capsys.readouterr().out
+    assert any(r[0] == "GLPI.US" and r[9] == "stop in place" for r in page)                 # the orders are still used
+    assert str([r for r in page if str(r[0]).startswith("B. HOLDINGS")][0][0]).endswith("IBKR capture of 2026-11-12 08:41 Riyadh")
+    assert tap.apply_capture([], tap.read_plan([], dt.date(2026, 11, 12)), odd, 30)["cash"] is None
+    own = ib_capture([ib_order("Buy 24 NMM", "MARKET", "BUY", "Market, Day", 24)])          # a market order on the PICK
+    b2 = aligned_book()
+    assert tap.run_once(False, book=b2, now=NOW, capture=own) == 0                          # is priced at the plan's top
+    assert tiles_of(b2.tabs["Today_Action_Plan"].values)["BUYS TODAY"] == ("1 of 1", "7,921 SAR · 1 placed")
