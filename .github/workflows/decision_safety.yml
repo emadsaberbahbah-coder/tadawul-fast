@@ -1,0 +1,79 @@
+name: 🧱 Real-Money Decision Safety
+
+on:
+  pull_request:
+    paths:
+      - 'core/runtime_decision_safety.py'
+      - 'sitecustomize.py'
+      - 'scripts/print_decision_safety.py'
+      - 'tests/test_runtime_decision_safety.py'
+      - '.github/workflows/decision_safety.yml'
+      - 'docs/G3_REAL_MONEY_REMEDIATION_PLAN.md'
+  push:
+    branches: [main]
+    paths:
+      - 'core/runtime_decision_safety.py'
+      - 'sitecustomize.py'
+      - 'scripts/print_decision_safety.py'
+      - 'tests/test_runtime_decision_safety.py'
+      - '.github/workflows/decision_safety.yml'
+      - 'docs/G3_REAL_MONEY_REMEDIATION_PLAN.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decision-safety-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m py_compile \
+            core/runtime_decision_safety.py \
+            sitecustomize.py \
+            scripts/print_decision_safety.py \
+            tests/test_runtime_decision_safety.py
+
+      - name: Run contract tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          TFB_DECISION_SAFETY_MODE: off
+        run: python -m unittest tests/test_runtime_decision_safety.py
+
+      - name: Prove shadow mode is non-mutating
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          TFB_DECISION_SAFETY_MODE: shadow
+        run: |
+          python scripts/print_decision_safety.py --mode shadow --json-out decision-safety-shadow.json
+          python - <<'PY'
+          import json
+          data = json.load(open('decision-safety-shadow.json', encoding='utf-8'))
+          assert data['mode'] == 'shadow'
+          assert data['mutations_applied'] == {}
+          assert data['would_set'], data
+          print('shadow contract OK')
+          PY
+
+      - name: Upload shadow report
+        uses: actions/upload-artifact@v7
+        with:
+          name: decision-safety-shadow
+          path: decision-safety-shadow.json
+          retention-days: 30
