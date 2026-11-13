@@ -1,7 +1,11 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.5.0 (2026-11-13)
+# VERSION 1.6.0 (2026-11-13)
+#
+# 1.6.0: CASH FROM THE BROKER (daily_plan 1.7.0). TFB_PLAN_CASH_SOURCE = ibkr
+# (default): the newest read-only IBKR capture on Drive, at most
+# TFB_PLAN_IBKR_MAX_AGE_H hours old; else the 1.5.0 rule.
 #
 # 1.5.0: CASH FROM THE CASH LEDGER (daily_plan 1.6.0). The cut sizes from the
 # smaller of the main page's typed cash cell and the latest _Cash_Snapshot
@@ -139,7 +143,10 @@ jobs:
           TFB_PLAN_DIV_TAX_MIN_PCT: ${{ vars.TFB_PLAN_DIV_TAX_MIN_PCT || '0.25' }}
           TFB_PLAN_WHT_PCT: ${{ vars.TFB_PLAN_WHT_PCT || '30' }}
           TFB_PLAN_STABLE: ${{ vars.TFB_PLAN_STABLE || 'prefer' }}
-          TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'lower' }}
+          TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}
+          TFB_PLAN_IBKR_MAX_AGE_H: ${{ vars.TFB_PLAN_IBKR_MAX_AGE_H || '30' }}
+          TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
+          TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}
           TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
