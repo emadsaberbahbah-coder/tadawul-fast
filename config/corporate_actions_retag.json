@@ -1,0 +1,56 @@
+{
+ "schema": "tfb.corporate-actions-retag.v1",
+ "why": "repair_corporate_actions 1.1.0 (run 43638975586, 14 Nov 2026) rebased these MBRX.US rows once and then cut their Notes to 250 characters, which removed the ca_adjusted tag; without it the next run would rebase them a second time. Each row is retagged once, only if its Entry Price is still the original divided by the factor. Matured rows get their original Notes back (from the BigQuery performance_log snapshot of 2026-11-14, SHA-256 checked); active rows keep their current Notes, whose receipt the tracker rewrites.",
+ "rows": [
+  {
+   "record_id": "56e371da-b978-4150-9ebb-b6c6bf2ab86c",
+   "symbol": "MBRX.US",
+   "sheet_row_on_14_nov": 16659,
+   "status_on_14_nov": "matured",
+   "factor": 0.05,
+   "entry_before": 0.5507,
+   "original_notes": "[v6.22.0 CA-ADJUST] print +1186.5% vs adjusted series +1149.6% — corporate action re-based the prints; matured on the adjusted series | [OUTCOME-WITNESS v1] {\"acquired_at\":\"2026-10-26T20:56:02.346578+00:00\",\"actual_horizon_days\":32.109849537037036,\"calendar\":\"XNYS\",\"evaluated_at\":\"2026-10-27T00:05:03.401552+03:00\",\"intended_horizon_days\":30.0,\"price\":7.085,\"provider\":\"eodhd\",\"quote_asof\":\"2026-10-26T20:00:00+00:00\",\"quote_kind\":\"source_quote\",\"quote_session\":\"2026-10-26\",\"realized_roi_pp\":1149.559151620873,\"reason\":\"\",\"requested_horizon\":\"1M\",\"roi_basis\":\"adjust\",\"schema\":\"tfb.outcome-price.v1\",\"state\":\"MATURED\",\"target_at\":\"2026-10-24T17:21:49+00:00\",\"target_session\":\"2026-10-26\",\"target_session_close\":\"2026-10-26T20:00:00+00:00\",\"tracker_version\":\"6.49.0\"}",
+   "original_notes_sha256": "7eb10c86730da6ecde1b3e7f1b77b2a81adc420d094b0a5e9d477efc554c3df8"
+  },
+  {
+   "record_id": "e8cbbd06-7277-4c95-afaf-057ec6623d6b",
+   "symbol": "MBRX.US",
+   "sheet_row_on_14_nov": 16838,
+   "status_on_14_nov": "active",
+   "factor": 0.05,
+   "entry_before": 0.6358,
+   "original_notes": null,
+   "original_notes_sha256": null
+  },
+  {
+   "record_id": "bbec739b-3dd1-401f-83ba-2b10eab9956c",
+   "symbol": "MBRX.US",
+   "sheet_row_on_14_nov": 16839,
+   "status_on_14_nov": "matured",
+   "factor": 0.05,
+   "entry_before": 0.6358,
+   "original_notes": "[v6.22.0 CA-ADJUST] print +1014.3% vs adjusted series +1076.9% — corporate action re-based the prints; matured on the adjusted series | [OUTCOME-WITNESS v1] {\"acquired_at\":\"2026-10-26T20:56:02.346578+00:00\",\"actual_horizon_days\":31.109537037037036,\"calendar\":\"XNYS\",\"evaluated_at\":\"2026-10-27T00:05:03.401552+03:00\",\"intended_horizon_days\":30.0,\"price\":7.085,\"provider\":\"eodhd\",\"quote_asof\":\"2026-10-26T20:00:00+00:00\",\"quote_kind\":\"source_quote\",\"quote_session\":\"2026-10-26\",\"realized_roi_pp\":1076.9103090688961,\"reason\":\"\",\"requested_horizon\":\"1M\",\"roi_basis\":\"adjust\",\"schema\":\"tfb.outcome-price.v1\",\"state\":\"MATURED\",\"target_at\":\"2026-10-25T17:22:16+00:00\",\"target_session\":\"2026-10-26\",\"target_session_close\":\"2026-10-26T20:00:00+00:00\",\"tracker_version\":\"6.49.0\"}",
+   "original_notes_sha256": "b168d0df964989155b6e5ccceb046e4c215eadc16ac2f090741bce95e82772f9"
+  },
+  {
+   "record_id": "0ab7b394-82d6-4abf-8865-2c44ea8bcb04",
+   "symbol": "MBRX.US",
+   "sheet_row_on_14_nov": 17080,
+   "status_on_14_nov": "active",
+   "factor": 0.05,
+   "entry_before": 0.6016,
+   "original_notes": null,
+   "original_notes_sha256": null
+  },
+  {
+   "record_id": "d6552b78-dc9f-4626-ba3d-9f48c5fdfa81",
+   "symbol": "MBRX.US",
+   "sheet_row_on_14_nov": 17081,
+   "status_on_14_nov": "matured",
+   "factor": 0.05,
+   "entry_before": 0.6016,
+   "original_notes": "[OUTCOME-WITNESS v1] {\"acquired_at\":\"2026-10-26T20:56:02.346578+00:00\",\"actual_horizon_days\":30.41378472222222,\"calendar\":\"XNYS\",\"evaluated_at\":\"2026-10-27T00:05:03.401552+03:00\",\"intended_horizon_days\":30.0,\"price\":7.085,\"provider\":\"eodhd\",\"quote_asof\":\"2026-10-26T20:00:00+00:00\",\"quote_kind\":\"source_quote\",\"quote_session\":\"2026-10-26\",\"realized_roi_pp\":1077.692819148936,\"reason\":\"\",\"requested_horizon\":\"1M\",\"roi_basis\":\"ok\",\"schema\":\"tfb.outcome-price.v1\",\"state\":\"MATURED\",\"target_at\":\"2026-10-26T10:04:09+00:00\",\"target_session\":\"2026-10-26\",\"target_session_close\":\"2026-10-26T20:00:00+00:00\",\"tracker_version\":\"6.49.0\"}",
+   "original_notes_sha256": "7024809738221e68f11d0c955bd7dbf32743b37a86344c3173717d357ba65879"
+  }
+ ]
+}

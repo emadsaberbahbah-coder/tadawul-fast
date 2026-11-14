@@ -531,6 +531,39 @@ def test_confirmed_ledger_excludes_actions_effective_after_target(monkeypatch):
     assert index["SYNTH.US"][-1][1] == 3
 
 
+def test_v6550_a_rebased_entry_is_not_rebased_again_by_the_ledger(monkeypatch):
+    """v6.55.0 [CA-REBASED]: a confirmed 2-for-1 before the target. An untagged record (raw entry 100, exit 90 on
+    the new basis) matures on the ledger: (0.9 * 2 - 1) = +80%. A record the repair tool rebased (entry 50, tagged
+    ca_adjusted) matures on its honest print, 90/50 - 1 = +80%, and is NOT multiplied by 2 again (+260%)."""
+    monkeypatch.setattr(tp, "_ca_guard_enabled", lambda: True)
+    monkeypatch.setattr(tp, "_ca_budget_state", lambda *a: "available")
+    monkeypatch.setattr(tp, "_ca_adjusted_roi", lambda *a: 80.0)       # the adjusted series agrees with +80%
+    monkeypatch.setattr(tp, "_ca_ledger_factor", lambda *a: 2.0)
+    raw = record()
+    run(app_with_response([row(price=90)]).audit_active_records([raw]))
+    assert raw.status == tp.PerformanceStatus.MATURED and raw.realized_roi == pytest.approx(80.0)
+    assert receipt(raw)["roi_basis"] == "ledger"
+    rebased = record(entry=50.0)
+    rebased.notes = "ca_adjusted:v1.1.1:f=2"
+    run(app_with_response([row(price=90)]).audit_active_records([rebased]))
+    assert rebased.status == tp.PerformanceStatus.MATURED and rebased.realized_roi == pytest.approx(80.0)
+    assert receipt(rebased)["roi_basis"] == "ok" and rebased.notes.startswith("ca_adjusted:v1.1.1:f=2")
+    assert tp._CA_REBASED_TAG == __import__("core.corporate_actions", fromlist=["x"]).APPLIED_TAG
+    # Codex P2 on #983: no adjusted history and no verification budget - the ledger still verifies it, at +80%
+    monkeypatch.setattr(tp, "_ca_adjusted_roi", lambda *a: None)
+    monkeypatch.setattr(tp, "_ca_budget_state", lambda *a: "exhausted")
+    alone = record(entry=50.0)
+    alone.notes = "ca_adjusted:v1.1.1:f=2"
+    run(app_with_response([row(price=90)]).audit_active_records([alone]))
+    assert alone.status == tp.PerformanceStatus.MATURED and alone.realized_roi == pytest.approx(80.0)
+    assert receipt(alone)["roi_basis"] == "ok"
+    monkeypatch.setattr(tp, "_ca_ledger_factor", lambda *a: None)              # no confirmed action: as before
+    plain = record(entry=50.0)
+    plain.notes = "ca_adjusted:v1.1.1:f=2"
+    run(app_with_response([row(price=90)]).audit_active_records([plain]))
+    assert plain.status == tp.PerformanceStatus.ACTIVE
+
+
 def test_real_offline_calendars_dst_holiday_early_close_and_saudi_weekend(monkeypatch):
     pytest.importorskip("exchange_calendars")
     monkeypatch.setattr(tp, "_outcome_calendar_schedule", REAL_CALENDAR)
