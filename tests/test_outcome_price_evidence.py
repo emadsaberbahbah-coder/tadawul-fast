@@ -549,6 +549,19 @@ def test_v6550_a_rebased_entry_is_not_rebased_again_by_the_ledger(monkeypatch):
     assert rebased.status == tp.PerformanceStatus.MATURED and rebased.realized_roi == pytest.approx(80.0)
     assert receipt(rebased)["roi_basis"] == "ok" and rebased.notes.startswith("ca_adjusted:v1.1.1:f=2")
     assert tp._CA_REBASED_TAG == __import__("core.corporate_actions", fromlist=["x"]).APPLIED_TAG
+    # Codex P2 on #983: no adjusted history and no verification budget - the ledger still verifies it, at +80%
+    monkeypatch.setattr(tp, "_ca_adjusted_roi", lambda *a: None)
+    monkeypatch.setattr(tp, "_ca_budget_state", lambda *a: "exhausted")
+    alone = record(entry=50.0)
+    alone.notes = "ca_adjusted:v1.1.1:f=2"
+    run(app_with_response([row(price=90)]).audit_active_records([alone]))
+    assert alone.status == tp.PerformanceStatus.MATURED and alone.realized_roi == pytest.approx(80.0)
+    assert receipt(alone)["roi_basis"] == "ok"
+    monkeypatch.setattr(tp, "_ca_ledger_factor", lambda *a: None)              # no confirmed action: as before
+    plain = record(entry=50.0)
+    plain.notes = "ca_adjusted:v1.1.1:f=2"
+    run(app_with_response([row(price=90)]).audit_active_records([plain]))
+    assert plain.status == tp.PerformanceStatus.ACTIVE
 
 
 def test_real_offline_calendars_dst_holiday_early_close_and_saudi_weekend(monkeypatch):

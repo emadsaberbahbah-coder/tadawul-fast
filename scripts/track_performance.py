@@ -1985,8 +1985,10 @@ from urllib.error import HTTPError, URLError
 #   a confirmed action and tags them `ca_adjusted` in Notes; for those the print
 #   is already honest, and applying f again would mature an MBRX 3M record
 #   (target 23-25 Dec) at about -96% instead of about -35%. A record whose Notes
-#   carry the tag now gets no ledger factor at maturity; untagged records are
-#   unchanged. The bars-units refusal of a historical close after a later
+#   carry the tag now gets the identity factor 1.0 at maturity when a confirmed
+#   action covers it: the ledger still verifies it deterministically (no wait
+#   on adjusted bars or the verification budget), and the price is not
+#   rebased again. Untagged records are unchanged. The bars-units refusal of a historical close after a later
 #   action is untouched. ZERO functions removed, none added.
 #   ROLLBACK: revert this build.
 _CA_REBASED_TAG = "ca_adjusted"     # core.corporate_actions.APPLIED_TAG
@@ -10899,8 +10901,9 @@ class PerformanceTrackerApp:
                     _roi_print = float(r.unrealized_roi or 0.0)
                     _verdict, _roi_use = "ok", _roi_print
                     _lf = (_ca_ledger_factor(r.symbol, r.date_recorded, _context["target_session"])
-                           if _ca_guard_enabled() and _CA_REBASED_TAG not in str(r.notes or "")
-                           else None)                      # v6.55.0 [CA-REBASED]
+                           if _ca_guard_enabled() else None)
+                    if _lf is not None and _CA_REBASED_TAG in str(r.notes or ""):
+                        _lf = 1.0           # v6.55.0 [CA-REBASED]: confirmed action already in the entry
                     _ledger_roi = _ca_ledger_roi(_roi_print, _lf)
                     if _ca_guard_enabled() and (
                             abs(_roi_print) >= _ca_verify_pct()
