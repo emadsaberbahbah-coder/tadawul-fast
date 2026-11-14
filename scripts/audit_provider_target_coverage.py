@@ -12,6 +12,13 @@ by 2-3 hours; Global_Markets provider-target share fell 27.5% -> 10.7%
 byte-identical prices, in the mirror direction of the 2026-08-16 event.
 Nothing in the system announced either event.
 
+v1.2.2 (2026-11-14): a Sheets quota answer (HTTP 429) on a page read is waited
+out and the read tried again (scripts/sheets_quota.py: 65 s, at most twice),
+instead of reporting CH_READ_FAIL at once. The alert failed red on 11, 12
+and 13 Nov because the four page reads met the per-minute read quota shared
+with the jobs that run at the same time. Any other read error still fails
+at once, as before.
+
 v1.1.0 (external audit 2026-08-17, ChatGPT P0-1..P0-4 all confirmed by
 reproduction and ACCEPTED)
 --------------------------------------------------------------------------
@@ -86,7 +93,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -618,8 +625,29 @@ async def _read(reader: Callable[..., Any], sid: str, page: str) -> list:
     return [list(r) if isinstance(r, (list, tuple)) else [r] for r in val]
 
 
+async def _read_waiting(reader: Callable[..., Any], sid: str, page: str,
+                        sleep: Callable[[float], Any]) -> list:
+    """v1.2.2: _read, with a Sheets quota answer waited out (65 s, at most twice); other errors raise at once."""
+    from scripts.sheets_quota import RETRIES, wait_for  # noqa: PLC0415
+    attempt = 0
+    while True:
+        try:
+            return await _read(reader, sid, page)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is the quota answer and tries remain
+            attempt += 1
+            wait = wait_for(exc, attempt)
+            if wait is None or attempt > RETRIES:
+                raise
+            print(f"Sheets quota reached while reading {page}: waiting {wait:.0f} s, then try {attempt} of {RETRIES}",
+                  flush=True)
+            res = sleep(wait)
+            if inspect.isawaitable(res):
+                await res
+
+
 async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Optional[dict],
-                   cfg: Config, bootstrap: bool, accept: bool, reader=None) -> CoverageReport:
+                   cfg: Config, bootstrap: bool, accept: bool, reader=None,
+                   sleep: Optional[Callable[[float], Any]] = None) -> CoverageReport:
     masked = (spreadsheet_id[:5] + "..." + spreadsheet_id[-5:]
               if len(spreadsheet_id) > 10 else "***")
     if not spreadsheet_id:
@@ -635,7 +663,7 @@ async def run_live(spreadsheet_id: str, pages: Sequence[str], baseline_state: Op
     errors: dict[str, str] = {}
     for page in pages:
         try:
-            grids[page] = await _read(reader, spreadsheet_id, page)
+            grids[page] = await _read_waiting(reader, spreadsheet_id, page, sleep or asyncio.sleep)
         except Exception as exc:
             grids[page] = []
             errors[page] = f"{type(exc).__name__}: {exc}"
