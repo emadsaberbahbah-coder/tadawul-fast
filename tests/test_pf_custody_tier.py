@@ -471,6 +471,20 @@ class FakeRedis:
             raise RuntimeError("redis down")
         return self.data.get(key)
 
+    def eval(self, script, numkeys, *args):
+        # The same decision as pa._CUSTODY_PUT_LUA; the script itself runs on a real server in test_s2c.
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("redis down")
+        assert script is pa._CUSTODY_PUT_LUA and numkeys == 2
+        body_key, at_key, body, at, ttl = args
+        assert (body_key, at_key) == ("tfb:pf:custody_receipt:v1", "tfb:pf:custody_receipt:v1:at")
+        held = self.data.get(at_key)
+        if held is not None and int(held) > int(at):
+            return 0
+        self.data[body_key], self.data[at_key], self.ttl = body, at, int(ttl)
+        return 1
+
     def delete(self, key):
         self.calls += 1
         self.data.pop(key, None)
@@ -517,6 +531,117 @@ def test_s2_newer_wins_and_redis_trouble_never_blocks(monkeypatch):
     rows = [holding("AAA.SR", Recommendation="HOLD", **{"Intrinsic Value": 104})]
     assert build(rows)["meta"]["execution_ready"] is True               # the write failed; the run did not
     assert build(rows, evidence=None)["actions"][0]["action"] == "HOLD"  # memory still serves
+
+    class WriteDown(FakeRedis):                                          # the read works, the write does not
+        def eval(self, *args):
+            raise RuntimeError("redis write down")
+
+    _redis(monkeypatch, WriteDown())
+    monkeypatch.setattr(pa, "_CUSTODY_RECEIPT", None)
+    later = dict(newer, captured_at=_stamp(now + dt.timedelta(minutes=1)))
+    pa._custody_receipt_put(later)
+    assert pa._CUSTODY_RECEIPT is later and pa._CONFIRM_REDIS_DEAD is True   # kept in memory; Redis latched off
+
+
+def test_s2b_a_worker_with_empty_memory_never_rolls_the_shared_receipt_back(monkeypatch):
+    # Review on PR #989: worker A stored a capture showing 3 shares; worker B (empty memory) then receives a
+    # still-valid packet captured a minute earlier showing 10. The shared receipt must stay the newer one.
+    fake = FakeRedis()
+    _redis(monkeypatch, fake)
+    now = dt.datetime.now(UTC)
+    rows = [holding("AAA.SR", Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    newer = {"schema": "tfb.custody-receipt/v1", "captured_at": _stamp(now), "unrepresented": 0,
+             "holdings": [{"symbol": "AAA.SR", "currency": "SAR", "quantity": "3"}]}
+    fake.data["tfb:pf:custody_receipt:v1"] = json.dumps(newer)
+    older = packet(rows, when=now - dt.timedelta(minutes=1))
+    got = build(rows, evidence=older)                                    # worker B: valid, fresh, older
+    assert got["meta"]["execution_ready"] is True
+    assert json.loads(fake.data["tfb:pf:custody_receipt:v1"]) == newer and pa._CUSTODY_RECEIPT == newer
+    blocked = build(rows, evidence=None)["actions"][0]                   # 10 on the page, 3 at the newest capture
+    assert blocked["action"] == "BLOCK" and blocked["action_reason"].endswith("shows a different share count for this row")
+    later = packet(rows, when=now + dt.timedelta(seconds=1))             # a newer packet does replace it
+    later["accounts"][0]["positions_asof"] = later["accounts"][0]["cash_asof"] = later["captured_at"] = _stamp(now)
+    monkeypatch.setattr(pa, "_CUSTODY_RECEIPT", None)
+    fake.data["tfb:pf:custody_receipt:v1"] = json.dumps(dict(newer, captured_at=_stamp(now - dt.timedelta(minutes=5))))
+    build(rows, evidence=later)
+    assert json.loads(fake.data["tfb:pf:custody_receipt:v1"])["holdings"][0]["quantity"] == "10"
+
+
+def test_s2c_the_write_is_one_redis_step_and_the_newest_capture_wins(monkeypatch, tmp_path):
+    # The race the pre-read cannot close: worker B read "nothing newer", worker A then stored a newer capture,
+    # and B writes last. The decision is taken inside Redis, so B's older receipt is refused there.
+    now = dt.datetime.now(UTC)
+    mine = {"schema": "tfb.custody-receipt/v1", "captured_at": _stamp(now), "holdings": [], "unrepresented": 0}
+    theirs = dict(mine, captured_at=_stamp(now + dt.timedelta(minutes=3)), unrepresented=7)
+
+    class Raced(FakeRedis):
+        def eval(self, *args):
+            if "tfb:pf:custody_receipt:v1" not in self.data:             # worker A lands between B's read and write
+                at = (dt.datetime.fromisoformat(theirs["captured_at"].replace("Z", "+00:00"))
+                      - dt.datetime(1970, 1, 1, tzinfo=UTC)) // dt.timedelta(microseconds=1)
+                self.data.update({"tfb:pf:custody_receipt:v1": json.dumps(theirs),
+                                  "tfb:pf:custody_receipt:v1:at": str(at)})
+            return super().eval(*args)
+
+    fake = Raced()
+    _redis(monkeypatch, fake)
+    pa._custody_receipt_put(mine)
+    assert json.loads(fake.data["tfb:pf:custody_receipt:v1"]) == theirs
+    assert pa._CUSTODY_RECEIPT is None and pa._custody_receipt_get() == theirs   # memory never kept the loser
+    pa._custody_receipt_put(dict(theirs, unrepresented=8))               # the same instant may be written again
+    assert json.loads(fake.data["tfb:pf:custody_receipt:v1"])["unrepresented"] == 8 and fake.ttl == 48 * 3600
+    exact = dict(mine, captured_at=now.replace(microsecond=250000).isoformat().replace("+00:00", "Z"))
+    fake2 = FakeRedis()
+    _redis(monkeypatch, fake2)
+    monkeypatch.setattr(pa, "_CUSTODY_RECEIPT", None)
+    pa._custody_receipt_put(exact)                                       # the instant is kept to the microsecond
+    assert int(fake2.data["tfb:pf:custody_receipt:v1:at"]) % 1_000_000 == 250000
+
+
+def test_s2d_the_script_itself_on_a_real_redis_server(monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+    import time
+    redis = pytest.importorskip("redis")
+    server = shutil.which("redis-server") or shutil.which("valkey-server")
+    if not server:
+        pytest.skip("no redis-server on this machine; FakeRedis.eval carries the same decision")
+    sock = str(tmp_path / "r.sock")
+    proc = subprocess.Popen([server, "--port", "0", "--unixsocket", sock, "--save", "", "--appendonly", "no",
+                             "--dir", str(tmp_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        cli = redis.Redis(unix_socket_path=sock, decode_responses=True)
+        for _ in range(100):
+            try:
+                cli.ping()
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(0.05)
+        else:
+            pytest.skip("the local redis-server did not start")
+        _redis(monkeypatch, cli)
+        now = dt.datetime.now(UTC)
+        first = {"schema": "tfb.custody-receipt/v1", "captured_at": _stamp(now), "holdings": [], "unrepresented": 0}
+        older = dict(first, captured_at=_stamp(now - dt.timedelta(minutes=1)), unrepresented=1)
+        newer = dict(first, captured_at=_stamp(now + dt.timedelta(minutes=1)), unrepresented=2)
+        key, at_key = "tfb:pf:custody_receipt:v1", "tfb:pf:custody_receipt:v1:at"
+        pa._custody_receipt_put(first)
+        assert json.loads(cli.get(key)) == first and 0 < cli.ttl(key) <= 48 * 3600 and 0 < cli.ttl(at_key) <= 48 * 3600
+        args = (2, key, at_key)
+        stale = str(int(cli.get(at_key)) - 60_000_000)
+        assert cli.eval(pa._CUSTODY_PUT_LUA, *args, json.dumps(older), stale, "172800") == 0   # refused in Redis
+        assert json.loads(cli.get(key)) == first
+        monkeypatch.setattr(pa, "_CUSTODY_RECEIPT", None)                # another worker, empty memory
+        pa._custody_receipt_put(older)
+        assert json.loads(cli.get(key)) == first and pa._CUSTODY_RECEIPT == first
+        pa._custody_receipt_put(newer)
+        assert json.loads(cli.get(key)) == newer and pa._CUSTODY_RECEIPT is newer and pa._CONFIRM_REDIS_DEAD is False
+        again = dict(newer, unrepresented=9)
+        pa._custody_receipt_put(again)                                   # the same instant is not "older"
+        assert json.loads(cli.get(key)) == again
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def test_s3_the_persist_kill_switch_keeps_the_receipt_in_memory_only(monkeypatch):

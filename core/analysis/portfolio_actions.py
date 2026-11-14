@@ -4354,6 +4354,19 @@ CUSTODY_DIFFERS_NOTE = "the last IBKR capture (%s) shows a different share count
 CUSTODY_QUOTE_NOTE = "custody matches the IBKR capture, but this holding has no verified current price"
 _CUSTODY_RECEIPT = None
 _CUSTODY_REDIS_KEY = "tfb:pf:custody_receipt:v1"
+_CUSTODY_REDIS_AT_KEY = _CUSTODY_REDIS_KEY + ":at"
+# Newest-wins as ONE Redis step (review, PR #989): two workers holding
+# different valid captures cannot interleave a read and a write.
+# KEYS: receipt, capture instant. ARGV: receipt JSON, instant (epoch
+# microseconds), time to live (seconds). Returns 1 when written.
+_CUSTODY_PUT_LUA = (
+    "local held = tonumber(redis.call('get', KEYS[2])) "
+    "if held and held > tonumber(ARGV[2]) then return 0 end "
+    "redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[3]) "
+    "redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3]) "
+    "return 1"
+)
+_CUSTODY_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _env_custody_tier_mode():
@@ -4386,23 +4399,35 @@ def _custody_stamp(receipt):
 
 
 def _custody_receipt_put(receipt):
-    """v1.18.0: keep the newest receipt (memory, then Redis fail-open)."""
+    """v1.18.0: keep the newest receipt (memory, then Redis fail-open). An
+    older receipt never replaces a newer one, in memory or in Redis."""
     global _CUSTODY_RECEIPT, _CONFIRM_REDIS_DEAD
     stamp = _custody_stamp(receipt)
     if stamp is None:
         return
-    held = _custody_stamp(_CUSTODY_RECEIPT) if _CUSTODY_RECEIPT else None
+    # The shared copy is read first: a worker whose memory is empty must not
+    # replace a newer receipt another worker wrote (review, PR #989).
+    newest = _custody_receipt_get()
+    held = _custody_stamp(newest) if newest else None
     if held is not None and held > stamp:
         return
-    _CUSTODY_RECEIPT = receipt
+    micros = (stamp - _CUSTODY_EPOCH) // timedelta(microseconds=1)
     cli = _confirm_redis() if _confirm_persist_enabled() else None
     if cli is None:
+        _CUSTODY_RECEIPT = receipt
         return
     try:
-        cli.set(_CUSTODY_REDIS_KEY, json.dumps(receipt, sort_keys=True), ex=CUSTODY_MAX_AGE_CEILING)
+        won = cli.eval(_CUSTODY_PUT_LUA, 2, _CUSTODY_REDIS_KEY, _CUSTODY_REDIS_AT_KEY,
+                       json.dumps(receipt, sort_keys=True), str(micros), str(CUSTODY_MAX_AGE_CEILING))
     except Exception as exc:  # noqa: BLE001 - the cache never blocks the page
         _CONFIRM_REDIS_DEAD = True
+        _CUSTODY_RECEIPT = receipt
         logger.warning("[PF v1.18.0] custody receipt not mirrored: %s", type(exc).__name__)
+        return
+    if won:
+        _CUSTODY_RECEIPT = receipt
+    # Not written: another worker stored a newer capture in between; the
+    # next read takes that one from Redis.
 
 
 def _custody_receipt_get():
