@@ -280,7 +280,7 @@ INSTALLED = {
 # 341bd1f3a44d (1.5.0).
 PENDING = {
     # apply_bq_views 1.8.0 (14 Nov 2026): the first controlled trial, C-1
-    "v_trial_c1": "7c1875d9f4c18e8bf1d7fa4051d92cd6f9323c46df5bfe6b56b2a411ed5b37cd",
+    "v_trial_c1": "fd4bf8b9a0dbb95f5e8394dec7d873a1deb693402020e1e3bd0a8e3a91f0a507",
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
     "v_outcome_engine": "85d51279fdaa42b351c5ab8c277b507923005c6395fbf9b866aab01deed64c5e",

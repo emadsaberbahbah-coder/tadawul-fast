@@ -12,6 +12,9 @@
 -- PROMOTION RULE (fixed now): forward, at least 20 call days and 40 matured
 -- C-1 calls, and C-1's mean daily edge above the champion's with t >= 2.
 -- Even then the owner decides; nothing here changes a page or an order.
+-- NO LOOK-AHEAD: C-1 membership uses only sessions completed BEFORE the call
+-- date (a call recorded at 04:30 Riyadh cannot see that day's close), and the
+-- reading is judged on unrounded statistics; only the shown columns are rounded.
 -- COLUMNS: period ('forward from 2026-11-15' / 'in-sample, not evidence'),
 -- horizon (1W / 2W / 1M / 3M / ALL), arm (CHAMPION / C1 / LEFT_OUT /
 -- C1_MINUS_CHAMPION), calls, days, edge_pp (mean return minus the market
@@ -38,19 +41,19 @@ calls AS (
   SELECT b.record_id, ANY_VALUE(b.market) AS market, ANY_VALUE(b.horizon) AS horizon,
     ANY_VALUE(b.recorded_date) AS recorded_date, ANY_VALUE(b.confidence) AS confidence,
     ANY_VALUE(b.rel) AS rel, ANY_VALUE(b.edge) AS edge,
-    ARRAY_AGG(IF(s.date <= b.recorded_date, COALESCE(s.adj_close, s.close), NULL) IGNORE NULLS
+    ARRAY_AGG(IF(s.date < b.recorded_date, COALESCE(s.adj_close, s.close), NULL) IGNORE NULLS
               ORDER BY s.date DESC LIMIT 1)[SAFE_OFFSET(0)] AS p0,
-    ARRAY_AGG(IF(s.date <= DATE_SUB(b.recorded_date, INTERVAL 30 DAY), COALESCE(s.adj_close, s.close), NULL)
+    ARRAY_AGG(IF(s.date < DATE_SUB(b.recorded_date, INTERVAL 30 DAY), COALESCE(s.adj_close, s.close), NULL)
               IGNORE NULLS ORDER BY s.date DESC LIMIT 1)[SAFE_OFFSET(0)] AS p30,
-    ARRAY_AGG(IF(t.date <= b.recorded_date, t.c, NULL) IGNORE NULLS ORDER BY t.date DESC LIMIT 1)[SAFE_OFFSET(0)] AS i0,
-    ARRAY_AGG(IF(t.date <= DATE_SUB(b.recorded_date, INTERVAL 30 DAY), t.c, NULL) IGNORE NULLS
+    ARRAY_AGG(IF(t.date < b.recorded_date, t.c, NULL) IGNORE NULLS ORDER BY t.date DESC LIMIT 1)[SAFE_OFFSET(0)] AS i0,
+    ARRAY_AGG(IF(t.date < DATE_SUB(b.recorded_date, INTERVAL 30 DAY), t.c, NULL) IGNORE NULLS
               ORDER BY t.date DESC LIMIT 1)[SAFE_OFFSET(0)] AS i30
   FROM base b
   LEFT JOIN `{{DS}}.symbol_bars_daily` s
     ON b.market = 'Tadawul' AND s.symbol = b.bars_symbol
-   AND s.date BETWEEN DATE_SUB(b.recorded_date, INTERVAL 45 DAY) AND b.recorded_date
+   AND s.date >= DATE_SUB(b.recorded_date, INTERVAL 45 DAY) AND s.date < b.recorded_date
   LEFT JOIN tasi_d t
-    ON t.mkt = b.market AND t.date BETWEEN DATE_SUB(b.recorded_date, INTERVAL 45 DAY) AND b.recorded_date
+    ON t.mkt = b.market AND t.date >= DATE_SUB(b.recorded_date, INTERVAL 45 DAY) AND t.date < b.recorded_date
   GROUP BY b.record_id
 ),
 f AS (
@@ -82,22 +85,23 @@ rows_ AS (
   SELECT period, hz AS horizon, arm,
     CASE arm WHEN 'CHAMPION' THEN n_all WHEN 'C1' THEN n_c1 WHEN 'LEFT_OUT' THEN n_out ELSE n_c1 END AS calls,
     CASE arm WHEN 'CHAMPION' THEN d_all WHEN 'C1' THEN d_c1 WHEN 'LEFT_OUT' THEN d_out ELSE d_c1 END AS days,
-    ROUND(CASE arm WHEN 'CHAMPION' THEN SAFE_DIVIDE(s_all, n_all) WHEN 'C1' THEN SAFE_DIVIDE(s_c1, n_c1)
-                   WHEN 'LEFT_OUT' THEN SAFE_DIVIDE(s_out, n_out) ELSE dm END, 2) AS edge_pp,
+    CASE arm WHEN 'CHAMPION' THEN SAFE_DIVIDE(s_all, n_all) WHEN 'C1' THEN SAFE_DIVIDE(s_c1, n_c1)
+             WHEN 'LEFT_OUT' THEN SAFE_DIVIDE(s_out, n_out) ELSE dm END AS edge_x,
     ROUND(100 * CASE arm WHEN 'CHAMPION' THEN SAFE_DIVIDE(w_all, n_all) WHEN 'C1' THEN SAFE_DIVIDE(w_c1, n_c1)
                          WHEN 'LEFT_OUT' THEN SAFE_DIVIDE(w_out, n_out) END, 1) AS right_pct,
-    IF(arm = 'C1_MINUS_CHAMPION', ROUND(SAFE_DIVIDE(dm, SAFE_DIVIDE(dsd, SQRT(d_c1))), 2), NULL) AS t_stat,
+    IF(arm = 'C1_MINUS_CHAMPION', SAFE_DIVIDE(dm, SAFE_DIVIDE(dsd, SQRT(d_c1))), NULL) AS t_x,
     first_day, last_day
   FROM agg CROSS JOIN UNNEST(['CHAMPION', 'C1', 'LEFT_OUT', 'C1_MINUS_CHAMPION']) AS arm
 )
-SELECT *,
+SELECT period, horizon, arm, calls, days, ROUND(edge_x, 2) AS edge_pp, right_pct, ROUND(t_x, 2) AS t_stat,
+  first_day, last_day,
   CASE
     WHEN arm != 'C1_MINUS_CHAMPION' THEN NULL
     WHEN period != 'forward from 2026-11-15' THEN 'in-sample: shows why the rule was chosen, not evidence'
     WHEN days < 20 OR calls < 40 THEN CONCAT('collecting: ', CAST(days AS STRING), ' of 20 days, ',
                                              CAST(calls AS STRING), ' of 40 calls')
-    WHEN t_stat >= 2 AND edge_pp > 0 THEN 'C-1 ahead: the owner may consider it'
-    WHEN edge_pp <= 0 THEN 'C-1 not ahead: keep the champion'
+    WHEN t_x >= 2 AND edge_x > 0 THEN 'C-1 ahead: the owner may consider it'
+    WHEN edge_x <= 0 THEN 'C-1 not ahead: keep the champion'
     ELSE 'C-1 ahead but not yet clear (t under 2): keep collecting'
   END AS reading
 FROM rows_;

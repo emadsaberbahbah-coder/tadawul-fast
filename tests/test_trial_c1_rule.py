@@ -21,5 +21,22 @@ def test_the_rule_is_the_one_fixed_on_14_nov():
 def test_only_forward_calls_are_evidence_and_the_promotion_rule_is_fixed():
     assert CODE.count("DATE '2026-11-15'") == 1
     assert "WHEN period != 'forward from 2026-11-15' THEN 'in-sample: shows why the rule was chosen, not evidence'" in CODE
-    assert "WHEN days < 20 OR calls < 40 THEN" in CODE and "WHEN t_stat >= 2 AND edge_pp > 0 THEN" in CODE
+    assert "WHEN days < 20 OR calls < 40 THEN" in CODE and "WHEN t_x >= 2 AND edge_x > 0 THEN" in CODE
     assert re.search(r"the owner decides", SQL) and "never reads BigQuery" in SQL
+
+
+def test_membership_sees_only_sessions_completed_before_the_call():
+    # A call recorded at 04:30 Riyadh must not be judged on that day's close (Codex P1 on #982).
+    for col in ("s.date", "t.date"):
+        assert f"IF({col} < b.recorded_date," in CODE
+        assert f"IF({col} < DATE_SUB(b.recorded_date, INTERVAL 30 DAY)," in CODE
+        assert f"AND {col} < b.recorded_date" in CODE
+        assert f"{col} <= " not in CODE and "BETWEEN" not in CODE
+
+
+def test_the_reading_is_judged_before_rounding():
+    # Rounding is for display only: t 1.996 must not pass t >= 2 (Codex P2 on #982).
+    reading = CODE[CODE.index("CASE\n    WHEN arm != 'C1_MINUS_CHAMPION'"):]
+    assert "t_stat" not in reading and "edge_pp" not in reading
+    assert "ROUND(edge_x, 2) AS edge_pp" in CODE and "ROUND(t_x, 2) AS t_stat" in CODE
+    assert "ROUND(SAFE_DIVIDE(dm" not in CODE and "ELSE dm END, 2)" not in CODE
