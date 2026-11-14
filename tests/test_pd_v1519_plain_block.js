@@ -45,8 +45,25 @@ const newSource = fs.readFileSync(NEW_PATH, 'utf8');
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1519.json'), 'utf8'));
 const V1518_SHA = '62b15eaa5eda541b867cd5fd667b71bbcd15c53732a730636ce0056d70f7f973';   // v1.5.18 (origin/main 8478029d)
-function reverseEdits(src) {
+/* merge note 2026-11-03 (#780): panel preserve is v1.5.20 over this v1.5.19 (PD_PANEL_PRESERVE, default off;
+ * tests/js/pf_panel_preserve.test.js). A delivered file above v1.5.19 is first rebuilt into the v1.5.19 file (the
+ * v1.5.20 hunks of tests/js/pd_edits_v1520.json reversed, SHA-256 pinned), then into the v1.5.18 base as below, so
+ * the V1518_SHA pin holds. Behaviour still runs on the delivered file; P0 takes a 1.5.19 floor (header in lockstep)
+ * and P8 counts #780's three functions, one var, three replaced seed lines and 125 added lines apart. */
+const EDITS1520 = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1520.json'), 'utf8'));
+const V1519_SHA = '4f246be194a7ce5ade7a53e56381c19b44c20055608e33979584e47aeccfe584';   // v1.5.19 (origin/main 3e326e26)
+function v1519Of(src) {
+  if (/^var PD_VERSION = '1\.5\.19';$/m.test(src)) return src;
   let out = src;
+  for (const [cur, prev] of EDITS1520) {
+    assert.equal(out.split(cur).length, 2, 'exactly one approved v1.5.20 hunk: ' + cur.split('\n')[0].slice(0, 80));
+    out = out.replace(cur, () => prev);
+  }
+  assert.equal(sha256(out), V1519_SHA, 'v1.5.20 changes only its enumerated hunks (their reversal = the v1.5.19 file)');
+  return out;
+}
+function reverseEdits(src) {
+  let out = v1519Of(src);   // merge note 2026-11-03 (#780)
   for (const [cur, prev] of EDITS) {
     assert.equal(out.split(cur).length, 2, 'exactly one approved v1.5.19 hunk: ' + cur.split('\n')[0].slice(0, 80));
     out = out.replace(cur, () => prev);
@@ -526,7 +543,9 @@ function battery() {
   section('P0 compile both, version lockstep 1.5.19, base oracle (SHA-256 pinned); the base lacks the new names', () => {
     new vm.Script(newSource, {filename: 'new.gs'}); new vm.Script(baseSource, {filename: 'base.gs'});
     assert.equal(sha256(baseSource), V1518_SHA);
-    assert.equal(NV, '1.5.19'); assert.ok(/^ \* Version: 1\.5\.19$/m.test(newSource), 'header lockstep');
+    // merge note 2026-11-03 (#780): the delivered file may sit above v1.5.19 (panel preserve is v1.5.20): floor 1.5.19
+    assert.ok(NV.split('.').map(Number).reduce((a, x) => a * 1000 + x, 0) >= 1005019, 'PD_VERSION floor 1.5.19: ' + NV);
+    assert.ok(new RegExp('^ \\* Version: ' + NV.replace(/\./g, '\\.') + '$', 'm').test(newSource), 'header lockstep');
     assert.ok(/^var PD_VERSION = '1\.5\.18';$/m.test(baseSource) && /^ \* Version: 1\.5\.18$/m.test(baseSource), 'base is 1.5.18');
     for (const name of ['pdPlainMode_', 'pdIbkrDrift_', 'pdPlainCodes_', 'pdPlainClause_', 'pdPlainLine_', 'pdWritePlainLine_', 'pdPlainCoreOk_']) {
       assert.equal(baseSource.indexOf('function ' + name + '('), -1, 'the base lacks ' + name);
@@ -547,18 +566,25 @@ function battery() {
   section('P7 pdSelfTest: the v1.5.18 report while off; one core-ok line while on, after the cash snapshot core line', () => { checkSelfTest(ACTIVE_SOURCE); });
   section('P8 ES5 / ASCII lint of the v1.5.19 diff; inventory 7 functions + 2 vars, 0 removed; the four replaced base lines; 8 hunks whose reversal is the v1.5.18 file; WHY block', () => {
     const names = (s, re) => (s.match(re) || []).map((m) => m.replace(/^(function|var)\s+/, '').replace(/[\s(=].*$/, ''));
+    // merge note 2026-11-03 (#780): panel preserve (v1.5.20 over this v1.5.19) is counted apart when the delivered
+    // file carries it: three functions, one var, the three builder seed lines it replaces, 125 added lines.
+    const PD780 = v1519Of(newSource) === newSource ? {fns: [], vars: [], seed: [], lines: 0} : {
+      fns: ['pdPanelPreserveMode_', 'pdPanelPreserve_', 'pdPanelSeedValue_'], vars: ['PD_PANEL_PRESERVE_PROP'],
+      seed: ['    var seed = defaults.hasOwnProperty(item.label) &&',
+             '               pdHasValue_(defaults[item.label]) ? defaults[item.label]',
+             '                                                 : item.def;'], lines: 125};
     const fb = names(baseSource, /^function\s+[A-Za-z_$][\w$]*\s*\(/mg), fn = names(newSource, /^function\s+[A-Za-z_$][\w$]*\s*\(/mg);
     for (const f of fb) assert.ok(fn.indexOf(f) >= 0, 'removed ' + f);
-    assert.deepEqual(fn.filter((f) => fb.indexOf(f) < 0).sort(), ['pdIbkrDrift_', 'pdPlainClause_', 'pdPlainCodes_', 'pdPlainCoreOk_', 'pdPlainLine_', 'pdPlainMode_', 'pdWritePlainLine_']);
+    assert.deepEqual(fn.filter((f) => fb.indexOf(f) < 0).sort(), ['pdIbkrDrift_', 'pdPlainClause_', 'pdPlainCodes_', 'pdPlainCoreOk_', 'pdPlainLine_', 'pdPlainMode_', 'pdWritePlainLine_'].concat(PD780.fns).sort());   // + #780
     const vb = names(baseSource, /^var\s+[A-Za-z_$][\w$]*/mg), vn = names(newSource, /^var\s+[A-Za-z_$][\w$]*/mg);
     for (const v of vb) assert.ok(vn.indexOf(v) >= 0, 'var removed ' + v);
-    assert.deepEqual(vn.filter((v) => vb.indexOf(v) < 0).sort(), ['PD_PLAIN_PROP', 'PD_PLAIN_TEXT']);
+    assert.deepEqual(vn.filter((v) => vb.indexOf(v) < 0).sort(), ['PD_PLAIN_PROP', 'PD_PLAIN_TEXT'].concat(PD780.vars).sort());   // + #780
     const nl = new Set(newSource.split('\n')), bl = new Set(baseSource.split('\n'));
-    assert.deepEqual(baseSource.split('\n').filter((l) => !nl.has(l)).map((l) => l.trim()),
+    assert.deepEqual(baseSource.split('\n').filter((l) => !nl.has(l) && PD780.seed.indexOf(l) < 0).map((l) => l.trim()),   // + #780
       ['* Version: 1.5.18', "var PD_VERSION = '1.5.18';", 'pdRenderPayload_(sheet, payload, tokens, ibkr ? ibkr.excluded : null);',
        'function pdRenderPayload_(sheet, payload, tokens, outOfScope) {'], 'only these base lines replaced');
     const added = newSource.split('\n').filter((l) => !bl.has(l));
-    assert.ok(added.length >= 180 && added.length <= 300, 'added lines ' + added.length);
+    assert.ok(added.length >= 180 + PD780.lines && added.length <= 300 + PD780.lines, 'added lines ' + added.length);   // + #780
     const ES6 = /(^|[^A-Za-z0-9_$.'"])(let|const|class|import|export|yield|async|await)\s|=>|`|\.\.\./;
     for (const l of added) {
       assert.ok(/^[\x09\x20-\x7e]*$/.test(l), 'ASCII: ' + l);
