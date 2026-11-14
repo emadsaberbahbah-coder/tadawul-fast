@@ -182,6 +182,7 @@ Entries in the verifier's `_WORKFLOW_SCOPED` set live in GitHub workflow env and
 | `TFB_TICKET_MAX_QUOTE_AGE_MIN` | `15` | in-session live-quote max age (W-2) | no | value | no | not recorded |
 | `TFB_TICKET_FALLBACK_MAX_AGE_H` | `78` | no-calendar freshness cap (W-2) | no | value | no | not recorded |
 | `TFB_YC_SYMBOL_SKIP` | `''` | yahoo-chart hard-skips dead symbols (W-5) | no | value | no | not recorded |
+| `TFB_YC_HISTORY_MISS_TTL_SEC` | `0` | yahoo-chart history: 404-on-every-host id held as a miss, no yfinance fallback (0=off; 60-86400 s) | no | value | no | not recorded |
 | `TFB_SHARIAH_SHEET_ID` | `''` | authority reader workbook override (P0-B) | no | value | no | not recorded |
 | `TFB_COMPLIANCE_SURFACE_GATE` | `1` | KSA authority FAIL blocks candidates | yes (declared disarm: reported, not scored) | toggle | no | not recorded |
 | `TFB_ELIGIBILITY_GATE` | `1` | Nomu + foreign-restricted blocked (operator universe) | yes; armed when unset | toggle | no | not recorded |

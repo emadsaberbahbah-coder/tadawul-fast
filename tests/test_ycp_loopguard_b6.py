@@ -42,7 +42,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 TARGET = _REPO / "core" / "providers" / "yahoo_chart_provider.py"
-EXPECTED_VERSION = "8.15.1"
+EXPECTED_VERSION = "8.16.0"
 BASE_ENV = "YCP_BASE"
 
 
