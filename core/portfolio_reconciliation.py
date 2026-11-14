@@ -24,13 +24,31 @@ from core.execution_accounting import (
 # never turn a cents quote into a native cash or holdings declaration.
 # Reject USX in lockstep with TFB_OPP_FX_USX_SUBUNIT; DEFAULT OFF preserves
 # the previous strict currency parser and evidence contract.
-__version__ = "1.0.1"
+# v1.1.0 (2026-11-15) WHY: the 900 s packet is the only custody proof, and the
+# broker capture is hourly, so a page refreshed more than 15 minutes after a
+# capture reads every holding as unreconciled (the archive: 100% of rows BLOCK
+# on each of 18 mornings) although the certified run a few minutes earlier
+# matched every one. Two PURE additions, no change to certify_portfolio_inputs:
+#   custody_receipt        what a valid, fresh packet proved about positions
+#                          (symbol, currency, quantity per linked row; never
+#                          cash, account ids or instrument ids);
+#   certify_recent_custody the rows of a later request against that receipt
+#                          while it is at most CUSTODY_MAX_AGE_SECONDS old.
+# A receipt never funds anything: the result is always withheld, with no
+# certified cash. Callers decide what a matched row may show.
+__version__ = "1.1.0"
 SCHEMA_VERSION = 1
 MAX_ACCOUNTS = 100
 MAX_HOLDINGS = 500
 MAX_POSITIONS = 10_000
 MAX_EVIDENCE_BYTES = 1_000_000
 DEFAULT_MAX_AGE_SECONDS = 900
+CUSTODY_MAX_AGE_SECONDS = 108_000          # 30 h: one daily capture plus slack
+CUSTODY_MAX_AGE_CEILING = 172_800          # no caller may stretch it past 48 h
+CUSTODY_RECEIPT_SCHEMA = "tfb.custody-receipt/v1"
+_NO_PACKET = frozenset({"missing_evidence", "invalid_evidence"})
+_NO_POSITIONS = frozenset({"positions_incomplete", "future_positions",
+                           "stale_positions", "invalid_positions_time"})
 
 
 def _token(value: Any) -> str:
@@ -325,3 +343,114 @@ def certify_portfolio_inputs(holdings: list, evidence: Any, fx_rates: dict | Non
     except (AccountingError, TypeError, ValueError, OverflowError):
         # Never include source refs, account IDs, financial values or raw errors.
         return _empty(count, "invalid_evidence" if evidence is not None else "missing_evidence")
+
+
+def custody_receipt(holdings: list, evidence: Any, certification: Any) -> dict | None:
+    """v1.1.0: what the packet just certified proved about positions. PURE.
+
+    None unless `certification` is certify_portfolio_inputs' own reading of
+    this packet and that reading found the packet valid, fresh and complete
+    for positions. One entry per linked row whose broker position exists and
+    carries the linked supplier symbol and the row's currency: the row's
+    symbol and currency with the BROKER quantity. `unrepresented` counts the
+    positive broker positions no row links to. No cash, account or instrument
+    identifier is kept."""
+    try:
+        reasons = set((certification or {}).get("reason_counts") or {})
+        if not isinstance(evidence, dict) or reasons & (_NO_PACKET | _NO_POSITIONS):
+            return None
+        rows = [_holding(row) for row in _list(holdings, MAX_HOLDINGS)]
+        if len((certification or {}).get("row_results") or []) != len(rows):
+            return None
+        positions = {}
+        for account in _list(evidence.get("accounts"), MAX_ACCOUNTS):
+            aid = _text(account.get("account_id"), "account_id")
+            for position in _list(account.get("positions"), MAX_POSITIONS):
+                positions[(aid, _text(position.get("instrument_id"), "instrument_id"))] = {
+                    "symbol": _text(position.get("symbol"), "position symbol").upper(),
+                    "currency": _native_currency(position.get("currency")),
+                    "quantity": _number(position.get("quantity"), "position quantity", allow_zero=True)}
+        held, used = [], set()
+        for link in _list(evidence.get("holding_links"), MAX_HOLDINGS):
+            key = (_text(link.get("account_id"), "link account_id"),
+                   _text(link.get("instrument_id"), "link instrument_id"))
+            used.add(key)
+            row = rows[link["row_index"]]
+            position = positions.get(key)
+            if (position is None or position["currency"] != row["currency"]
+                    or position["symbol"] != _text(link.get("position_symbol"), "position_symbol").upper()):
+                continue                      # proves nothing for that row
+            held.append({"symbol": row["symbol"], "currency": row["currency"],
+                         "quantity": _amount(position["quantity"])})
+        captured = _timestamp(evidence.get("captured_at"), "captured_at")
+        return {"schema": CUSTODY_RECEIPT_SCHEMA,
+                "captured_at": captured.isoformat().replace("+00:00", "Z"),
+                "holdings": sorted(held, key=lambda item: (item["symbol"], item["currency"])),
+                "unrepresented": sum(1 for key, position in positions.items()
+                                     if position["quantity"] > 0 and key not in used)}
+    except (AccountingError, TypeError, ValueError, KeyError, IndexError, OverflowError):
+        return None
+
+
+def certify_recent_custody(holdings: list, receipt: Any, *, now: dt.datetime | None = None,
+                           max_age_seconds: int = CUSTODY_MAX_AGE_SECONDS) -> dict | None:
+    """v1.1.0: this request's rows against the last custody receipt. PURE.
+
+    None when the receipt is absent, malformed, from the future or older than
+    max_age_seconds (1..CUSTODY_MAX_AGE_CEILING), or the rows are unreadable.
+    Otherwise a certify_portfolio_inputs-shaped result that is ALWAYS withheld
+    (no certified holdings, no cash, no funding): a row is 'matched' only when
+    the receipt holds its symbol and currency with exactly its quantity (> 0);
+    a different quantity is quantity_mismatch / position_closed; a row the
+    receipt does not hold is custody_unknown. reason_counts always carries
+    funding_evidence_stale; custody_recent gives the capture time and age."""
+    try:
+        current = _clock(now)
+        if (isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, int)
+                or not 1 <= max_age_seconds <= CUSTODY_MAX_AGE_CEILING):
+            raise AccountingError("invalid_age_limit")
+        if not isinstance(receipt, dict) or receipt.get("schema") != CUSTODY_RECEIPT_SCHEMA:
+            return None
+        captured = _timestamp(receipt.get("captured_at"), "captured_at")
+        age = (current - captured).total_seconds()
+        if age < 0 or age > max_age_seconds:
+            return None
+        unrepresented = receipt.get("unrepresented")
+        if isinstance(unrepresented, bool) or not isinstance(unrepresented, int) or unrepresented < 0:
+            return None
+        rows = [_holding(row) for row in _list(holdings, MAX_HOLDINGS)]
+        if len({(row["symbol"], row["currency"]) for row in rows}) != len(rows):
+            return None
+        held = {}
+        for item in _list(receipt.get("holdings"), MAX_HOLDINGS):
+            key = (_text(item.get("symbol"), "symbol").upper(), _native_currency(item.get("currency")))
+            if key in held:
+                return None
+            held[key] = _number(item.get("quantity"), "quantity", allow_zero=True)
+        result = _empty(len(rows), "custody_unknown")
+        reasons = Counter()
+        seen = set()
+        for index, row in enumerate(rows):
+            key = (row["symbol"], row["currency"])
+            status = "custody_unknown"
+            if key in held:
+                seen.add(key)
+                if held[key] != row["quantity"]:
+                    status = "position_closed" if held[key] == 0 else "quantity_mismatch"
+                else:
+                    status = "matched" if row["quantity"] > 0 else "inactive_zero"
+            trusted = status == "matched"
+            result["row_results"][index] = {"row_index": index, "trusted": trusted, "status": status}
+            if not trusted:
+                reasons[status] += 1
+        if unrepresented or any(quantity > 0 and key not in seen for key, quantity in held.items()):
+            reasons["unrepresented_positions"] += 1
+        reasons["funding_evidence_stale"] += 1
+        result.update({
+            "reason_counts": dict(sorted(reasons.items())),
+            "custody_recent": {"captured_at": captured.isoformat().replace("+00:00", "Z"),
+                               "age_seconds": int(age)},
+        })
+        return result
+    except (AccountingError, TypeError, ValueError, AttributeError, OverflowError):
+        return None

@@ -201,7 +201,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", '5.11.4', "scoring"),
     ("core.financial_units", "__version__", "1.0.0", "financial unit contract"),
     ("core.execution_accounting", "__version__", "1.0.1", "offline execution accounting"),
-    ("core.portfolio_reconciliation", "__version__", '1.0.1', "portfolio input reconciliation"),
+    ("core.portfolio_reconciliation", "__version__", '1.1.0', "portfolio input reconciliation"),
     ("core.sheet_presentation", "__version__", '1.0.2', "sheet presentation"),
     ("core.data_validity", "DATA_VALIDITY_VERSION", "1.0.2", "price acquisition evidence"),
     ("integrations.google_sheets_service", "SERVICE_VERSION", "6.2.2", "Sheets publication writer"),
@@ -215,7 +215,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.17.1", "portfolio actions"),
+     "1.18.0", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
