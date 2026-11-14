@@ -172,7 +172,7 @@ def test_r1_scan_writes_nothing_and_apply_writes_register_then_repairs(monkeypat
     assert cells[col("Entry Price") + "6"] == pytest.approx(8.0) and cells[col("Target Price") + "6"] == pytest.approx(10.0)
     assert cells[col("Current Price") + "6"] == pytest.approx(6.5)
     assert cells[col("Realized ROI %") + "6"] == pytest.approx(-18.75) and cells[col("Outcome") + "6"] == "LOSS"
-    assert cells[col("Notes") + "6"].startswith("ca_adjusted:v1.1.0:f=0.05")
+    assert cells[col("Notes") + "6"].startswith("ca_adjusted:v1.1.1:f=0.05")
     assert "seed_rows=1" in b.tabs["_Run_Log"].appended[-1][5]
     # the next run: the register holds the row, so the seed adds nothing; the repaired row is tagged and skipped
     b.tabs["Performance_Log"].values[5][HDR.index("Notes")] = cells[col("Notes") + "6"]
@@ -196,6 +196,94 @@ def test_r3_a_missing_seed_is_loud_and_a_held_row_is_never_written(monkeypatch, 
     out = capsys.readouterr().out
     assert "plan=0 finished=0 held=1" in out and "HELD row     2 RVS.US" in out
     assert b.tabs["Performance_Log"].batches == [] and "held=1" in b.tabs["_Run_Log"].appended[-1][5]
+
+
+# ----------------------------------------------------------------------------- 1.1.1: the tag is never cut off
+LONG = "[OUTCOME-WITNESS v1] " + json.dumps({"k": "v" * 700})               # a 600-770 character receipt, as on MBRX
+
+
+def test_t1_long_notes_keep_every_character_and_the_tag(monkeypatch, tmp_path, capsys):
+    assert rca._tag_notes("", "ca_adjusted:x") == "ca_adjusted:x" and rca._tag_notes("a", "t") == "a | t"
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"actions": [SEED["actions"][0]]}), encoding="utf-8")
+    pl = [HDR, rec("a", "RVS.US", "2026-09-24", "0.40", "0.50", "active", "6.5", notes=LONG)]
+    b = _book(pl)
+    monkeypatch.setattr(rca, "_open_sheet", lambda cli: b)
+    assert rca.main(["--apply", "--seed", str(seed), "--retag", str(_retag(tmp_path, []))]) == 0
+    cells = {u["range"]: u["values"][0][0] for u in b.tabs["Performance_Log"].batches}
+    note = cells[rca._col_letter(HDR.index("Notes")) + "2"]
+    assert note == LONG + " | ca_adjusted:v1.1.1:f=0.05" and len(note) > 700     # 1.1.0 cut this to 250
+    b.tabs["Performance_Log"].values[1][HDR.index("Notes")] = note
+    b.tabs["Performance_Log"].values[1][HDR.index("Entry Price")] = "8.0"
+    capsys.readouterr()
+    assert rca.main(["--scan", "--seed", str(seed), "--retag", str(_retag(tmp_path, []))]) == 0
+    assert "plan=0" in capsys.readouterr().out                                   # never rebased twice
+
+
+def _retag(tmp_path, rows):
+    f = tmp_path / "retag.json"
+    f.write_text(json.dumps({"schema": "tfb.corporate-actions-retag.v1", "rows": rows}), encoding="utf-8")
+    return f
+
+
+def test_t2_plan_retags_only_a_row_rebased_exactly_once():
+    cut = "[OUTCOME-WITNESS v1] {cut off at 250"
+    pl = [HDR,
+          rec("m", "RVS.US", "2026-09-24", "8.0", "10", "matured", "6.5", notes=cut),       # once rebased, untagged
+          rec("x", "RVS.US", "2026-09-24", "8.0", "10", "active", "6.5", notes=cut),        # active: keeps notes
+          rec("t", "RVS.US", "2026-09-24", "8.0", "10", "matured", "6.5", notes="ca_adjusted:v1.1.0:f=0.05"),
+          rec("w", "RVS.US", "2026-09-24", "160", "10", "matured", "6.5", notes=cut)]       # twice: held
+    spec = [{"record_id": r, "factor": 0.05, "entry_before": 0.4, "original_notes": o}
+            for r, o in (("m", "ORIGINAL m"), ("x", None), ("t", "T"), ("w", "W"), ("gone", "G"))]
+    plan, hdr_i, cols = rca.plan_repairs(pl, IDX)
+    ups, held, ids = rca.plan_retags(pl, hdr_i, cols, {"rows": spec}, "9.9.9")
+    assert ids == {"m", "x", "t", "w", "gone"}
+    assert {u["record_id"]: u["notes_new"] for u in ups} == {
+        "m": "ORIGINAL m | ca_adjusted:v9.9.9:f=0.05:retag", "x": cut + " | ca_adjusted:v9.9.9:f=0.05:retag"}
+    assert [u["sheet_row"] for u in ups] == [2, 3]
+    assert len(held) == 2 and "row 5 w: Entry Price 160.0 is not 0.4 / 0.05" in held[0] and "gone" in held[1]
+    assert {p["record_id"] for p in plan} == {"m", "x", "w"}                      # main drops these from the plan
+    assert rca.plan_retags(pl, hdr_i, cols, {}, "x") == ([], [], set())
+
+
+def test_t3_apply_retags_and_never_rebases_a_listed_row(monkeypatch, tmp_path, capsys):
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"actions": [SEED["actions"][0]]}), encoding="utf-8")
+    reg = [ca.ACTIONS_HEADER, ["RVS.US", "REVERSE_SPLIT", "2026-10-20", "20", "", "", "SEC 8-K 2026-10-16", "", ""]]
+    pl = [HDR, rec("m", "RVS.US", "2026-09-24", "8.0", "10", "matured", "6.5", "-18.75", "LOSS",
+                   "2026-10-24 21:00:00", notes="[OUTCOME-WITNESS v1] {cut")]
+    rt = _retag(tmp_path, [{"record_id": "m", "factor": 0.05, "entry_before": 0.4, "original_notes": "FULL"}])
+    b = _book(pl, register=reg)
+    monkeypatch.setattr(rca, "_open_sheet", lambda cli: b)
+    assert rca.main(["--scan", "--seed", str(seed), "--retag", str(rt)]) == 0
+    out = capsys.readouterr().out
+    assert "plan=0 finished=0 held=0 retag=1 retag_held=0" in out and "RETAG row     2 m" in out
+    assert b.tabs["Performance_Log"].batches == []
+    assert rca.main(["--apply", "--seed", str(seed), "--retag", str(rt)]) == 0
+    cells = {u["range"]: u["values"][0][0] for u in b.tabs["Performance_Log"].batches}
+    assert cells == {rca._col_letter(HDR.index("Notes")) + "2": "FULL | ca_adjusted:v1.1.1:f=0.05:retag"}
+    assert "retag=1" in b.tabs["_Run_Log"].appended[-1][5]
+    b.tabs["Performance_Log"].values[1][HDR.index("Notes")] = cells[rca._col_letter(HDR.index("Notes")) + "2"]
+    capsys.readouterr()
+    assert rca.main(["--scan", "--seed", str(seed), "--retag", str(rt)]) == 0
+    assert "plan=0 finished=0 held=0 retag=0 retag_held=0" in capsys.readouterr().out
+    assert rca.main(["--scan", "--seed", str(seed), "--retag", str(tmp_path / "absent.json")]) == 2
+
+
+def test_t4_the_shipped_retag_file_is_the_five_mbrx_rows():
+    import hashlib
+    doc = json.loads((ROOT / "config/corporate_actions_retag.json").read_text(encoding="utf-8"))
+    assert doc["schema"] == "tfb.corporate-actions-retag.v1" and len(doc["rows"]) == 5
+    assert {r["symbol"] for r in doc["rows"]} == {"MBRX.US"} and {r["factor"] for r in doc["rows"]} == {0.05}
+    assert sorted(r["sheet_row_on_14_nov"] for r in doc["rows"]) == [16659, 16838, 16839, 17080, 17081]
+    for r in doc["rows"]:
+        assert r["entry_before"] in (0.5507, 0.6358, 0.6016)
+        if r["status_on_14_nov"] == "matured":
+            n = r["original_notes"]
+            assert hashlib.sha256(n.encode()).hexdigest() == r["original_notes_sha256"] and len(n) > 600
+            assert "[OUTCOME-WITNESS v1] {" in n and n.endswith('"tracker_version":"6.49.0"}')
+        else:
+            assert r["original_notes"] is None
 
 
 def test_r2_the_workflows_base64_credentials_are_read(monkeypatch, tmp_path):

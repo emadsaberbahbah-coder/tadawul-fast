@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.54.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.55.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1978,7 +1978,21 @@ from urllib.error import HTTPError, URLError
 #   so the in-memory and the reloaded summaries agree. Truly invalid stored
 #   values are untouched: the flag is only set where a realized ROI is written.
 # ZERO functions removed, none added. ROLLBACK: revert this build.
-SCRIPT_VERSION = "6.54.0"
+# -----------------------------------------------------------------------------
+# v6.55.0 (2026-11-14) [CA-REBASED]: the confirmed-ledger guard re-bases a
+#   print ROI from a RAW entry ((1 + print) * f - 1). Since 14 Nov the repair
+#   tool (repair_corporate_actions) rebases the Entry Price of records before
+#   a confirmed action and tags them `ca_adjusted` in Notes; for those the print
+#   is already honest, and applying f again would mature an MBRX 3M record
+#   (target 23-25 Dec) at about -96% instead of about -35%. A record whose Notes
+#   carry the tag now gets the identity factor 1.0 at maturity when a confirmed
+#   action covers it: the ledger still verifies it deterministically (no wait
+#   on adjusted bars or the verification budget), and the price is not
+#   rebased again. Untagged records are unchanged. The bars-units refusal of a historical close after a later
+#   action is untouched. ZERO functions removed, none added.
+#   ROLLBACK: revert this build.
+_CA_REBASED_TAG = "ca_adjusted"     # core.corporate_actions.APPLIED_TAG
+SCRIPT_VERSION = "6.55.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -10888,6 +10902,8 @@ class PerformanceTrackerApp:
                     _verdict, _roi_use = "ok", _roi_print
                     _lf = (_ca_ledger_factor(r.symbol, r.date_recorded, _context["target_session"])
                            if _ca_guard_enabled() else None)
+                    if _lf is not None and _CA_REBASED_TAG in str(r.notes or ""):
+                        _lf = 1.0           # v6.55.0 [CA-REBASED]: confirmed action already in the entry
                     _ledger_roi = _ca_ledger_roi(_roi_print, _lf)
                     if _ca_guard_enabled() and (
                             abs(_roi_print) >= _ca_verify_pct()
