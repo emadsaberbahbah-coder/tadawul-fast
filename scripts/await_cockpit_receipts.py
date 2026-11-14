@@ -2,6 +2,68 @@
 """Dispatch the audited decision-feed release as soon as both cockpits consumed
 a completed production sync (bounded, read-only wait).
 
+VERSION 1.3.0 (2026-11-05) -- THE HANDSHAKE COVERS ONE RENDER RETRY
+(--wait-only bound: default 15 -> 30 minutes, hard cap 20 -> 35).
+
+WHY (GitHub Actions + Apps Script executions + _Run_Log, Thu 5 Nov 2026)
+- Sync 41901407829 (the 23:17 slot) wrote UPSTREAM_READY at 01:01:14 Riyadh;
+  the handshake started at 01:01:25. 26_Decision_Chain 1.0.4 rendered Top_10
+  early at 01:04:49 and again at 01:14:49; both Apps Script executions were
+  stopped at the 6-minute limit ("Timed Out", 361 s), overlapping the hourly
+  Decision Pages v2 build (329 s) and the 15-minute Plan of Record refresh
+  (220 s). The handshake ended at 01:15:30 (15 min), the audit failed
+  (decision_failed) and the veto was published at 01:17:57. The third render
+  (01:24:49, 216 s) wrote VERIFIED (run 41901407829) at 01:27:55, and Release
+  After Sync released the run at 01:30:43: 26.5 minutes after the handshake
+  began. The chain retries a stopped render about every 10 minutes (claim
+  TTL 7 min + 5-minute tick), so a 15-minute bound fails on any single stop.
+- WHAT: the --wait-only default is 30 minutes and the hard cap 35 (one stop
+  plus one retry fit). Evidence first: the wait still ends at the first poll
+  that reads both receipts, and every veto, receipt rule and audit is
+  unchanged. The daily_sync and decision_surface_freshness steps carry the
+  new default and a 40-minute step backstop. A Variable
+  TFB_SYNC_AWAIT_RENDER_MIN still wins (clamped to 35).
+
+VERSION 1.2.0 (2026-11-03) -- THE RELEASE'S OWN PRIOR RULE FOR AN OLDER RUN'S
+VETO (vars.TFB_RELEASE_AFTER_SYNC_PRIOR = strict, default | release).
+
+WHY (GitHub Actions + _Status, Tue 3 Nov 2026, read-only)
+- Sync 41566014627 (the 23:17 slot, started 05:25 Riyadh) completed SUCCESS
+  at 04:35Z: its final job 'Verify final decision publication' passed now
+  that the sync-render handshake (v1.1.0 below) audits after the cockpits
+  rendered, so finalize_decision_publication.py wrote no veto (it writes
+  only blockers). 'TFB Decision Feed' therefore still carried the 23:32
+  withdrawal of the PREVIOUS run: 'NOT_ACTIONABLE(final_publication) |
+  run=41445971593 | ... | decision_failed | release=41519935330'.
+- The after-sync attempt 41578984787 (04:35Z) saw both receipts verified
+  (PF consumed 41566014627 at 05:27, T10 at 07:33) and stopped:
+  decision_feed_not_this_run. v1.0.0 stopped on an older run's veto
+  because "this run's final veto never landed", which held while every
+  final job failed pre-render. With the handshake a healthy final job no
+  longer writes a veto, so a CLEAN sync is the one case this path can no
+  longer release, while a failed one still can.
+- The release script itself accepts that prior: classify_prior ->
+  ('eligible', 'older_run_veto'), and the same for its exact supersede
+  grammar ('superseded_older_run'). The cohort waited for the next
+  scheduled slot instead: the 08:30 Riyadh release had not been delivered
+  by 09:10 (GitHub ran this repository's crons 2-3 h late that morning),
+  and the 480-minute clock runs from the sync's own stamp either way.
+
+WHAT (decides only WHEN; the release re-checks everything)
+- prior 'release': when the decision feed names a run OLDER than SOURCE,
+  evaluate() asks release_decision_feed.classify_prior(value, SOURCE), the
+  rule the dispatched release applies at its own step 1. 'eligible' keeps
+  the attempt waiting for both receipts exactly as for this run's own veto;
+  anything else stops with 'prior_<reason>' (an older EXECUTABLE value:
+  prior_executable_other_run; a supersede by a newer run:
+  prior_superseded_by_run). A newer run, an unreadable feed, this run's own
+  veto and this run's EXECUTABLE are handled exactly as in v1.0.0.
+- prior 'strict' (default; unset or any other word): v1.0.0 byte for byte.
+- The evidence gains 'prior_rule' and, per poll, 'prior' (the classify
+  reason, or null). No new I/O, no new write; the receipts, provenance,
+  in-flight and release-run probes, the dispatch and the deadline are
+  unchanged. Rollback: unset the variable.
+
 VERSION 1.1.0 (2026-11-02) -- WAIT-ONLY MODE (--wait-only): THE SYNC-RENDER
 HANDSHAKE. Nothing removed; the v1.0.0 dispatch mode is byte-identical.
 Workflow gate vars.TFB_SYNC_AWAIT_RENDER, default OFF (step-level 'if').
@@ -151,8 +213,9 @@ from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 from scripts import release_decision_feed as release  # noqa: E402
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.3.0"
 GATE_ENV = "TFB_RELEASE_AFTER_SYNC"
+PRIOR_ENV = "TFB_RELEASE_AFTER_SYNC_PRIOR"   # v1.2.0: strict (default) | release
 WAIT_ENV = "TFB_RELEASE_AFTER_SYNC_WAIT_MIN"
 RELEASE_WORKFLOW = "release_decision_feed.yml"
 RELEASE_REF = "main"
@@ -168,8 +231,8 @@ MAX_DISPATCH_FAILURES = 2
 WAIT_ONLY_MODE = "wait_only"
 WAIT_ONLY_GATE_VAR = "TFB_SYNC_AWAIT_RENDER"
 WAIT_ONLY_BOUND_VAR = "TFB_SYNC_AWAIT_RENDER_MIN"
-WAIT_ONLY_DEFAULT_MIN = 15
-WAIT_ONLY_MAX_MIN = 20
+WAIT_ONLY_DEFAULT_MIN = 30   # v1.3.0: was 15
+WAIT_ONLY_MAX_MIN = 35       # v1.3.0: was 20
 WAIT_ONLY_DEFAULT_POLL_S = 60
 WAIT_ONLY_MIN_POLL_S = 30
 WAIT_ONLY_MAX_POLL_S = 90
@@ -185,6 +248,12 @@ _INT_RE = re.compile(r"[0-9]{1,4}", re.ASCII)
 def gate_armed() -> bool:
     """TFB_RELEASE_AFTER_SYNC, default OFF (the release script's vocabulary)."""
     return (os.getenv(GATE_ENV) or "0").strip().lower() in release._ARMED
+
+
+def prior_rule() -> str:
+    """v1.2.0 TFB_RELEASE_AFTER_SYNC_PRIOR: exactly 'release' (trimmed, any case)
+    applies the release's own prior rule to an older run's value; else 'strict'."""
+    return "release" if (os.getenv(PRIOR_ENV) or "").strip().lower() == "release" else "strict"
 
 
 # --------------------------------------------------------------------------- pure
@@ -222,14 +291,18 @@ def _moved(run: str, source: str, older_reason: str) -> str:
     return "superseded_by_newer_cohort" if int(run) > int(source) else older_reason
 
 
-def evaluate(source: str, key_grid: Any, pf_grid: Any, t10_grid: Any) -> dict:
+def evaluate(source: str, key_grid: Any, pf_grid: Any, t10_grid: Any,
+             prior: str = "strict") -> dict:
     """PURE. One poll -> {'state': 'ready'|'wait'|'stop', 'reason', derived}.
 
     Raises on a key-block layout fault so the caller counts it as a fault.
-    'ready' is about the workbook only; the caller still probes GitHub."""
+    'ready' is about the workbook only; the caller still probes GitHub.
+    v1.2.0: prior 'release' weighs a decision feed naming an OLDER run with
+    the release's own classify_prior instead of stopping on it."""
     verdict = {"state": "wait", "reason": "receipts_pending",
                "in_flight": None, "release_runs_active": None,
                "gm_run": None, "decision_run": None, "decision_executable": None,
+               "prior": None,
                "pf": surface_receipt(pf_grid), "t10": surface_receipt(t10_grid)}
     value = _decision_value(key_grid)
     gm_run, why = release.discover_source(key_grid)
@@ -247,8 +320,15 @@ def evaluate(source: str, key_grid: Any, pf_grid: Any, t10_grid: Any) -> dict:
         verdict.update(state="stop", reason="decision_feed_unreadable")
         return verdict
     if run != source:
-        verdict.update(state="stop", reason=_moved(run, source, "decision_feed_not_this_run"))
-        return verdict
+        if prior != "release" or int(run) > int(source):
+            verdict.update(state="stop", reason=_moved(run, source, "decision_feed_not_this_run"))
+            return verdict
+        kind, why = release.classify_prior(value, source)
+        verdict["prior"] = why
+        if kind != "eligible":
+            verdict.update(state="stop", reason="prior_" + why)
+            return verdict
+        verdict["decision_executable"] = False
     if verdict["decision_executable"]:
         verdict.update(state="stop", reason="already_executable")
         return verdict
@@ -371,11 +451,12 @@ def run(sheet_id: Any, source_run_id: Any, *, wait_min: Any = None, poll_s: Any 
     fetch_provenance = provenance or release.github_provenance
     send = dispatch or github_dispatch
     armed = gate_armed()
+    prior = prior_rule()
     source = source_run_id.strip() if isinstance(source_run_id, str) else None
     wait = _bounded_int(DEFAULT_WAIT_MIN if wait_min is None else wait_min, 1, MAX_WAIT_MIN)
     poll = _bounded_int(DEFAULT_POLL_S if poll_s is None else poll_s, MIN_POLL_S, MAX_POLL_S)
     out: dict = {
-        "script_version": SCRIPT_VERSION, "gate": armed,
+        "script_version": SCRIPT_VERSION, "gate": armed, "prior_rule": prior,
         "source_run_id": source if source and release.SOURCE_RE.fullmatch(source) else None,
         "release_workflow": RELEASE_WORKFLOW, "wait_min": wait, "poll_s": poll,
         "started_utc": _utc(clock), "finished_utc": None, "waited_s": 0, "polls": 0,
@@ -451,7 +532,7 @@ def run(sheet_id: Any, source_run_id: Any, *, wait_min: Any = None, poll_s: Any 
         verdict = None
         try:
             grids = read_surfaces(service, sheet_id)
-            verdict = evaluate(source, grids[0], grids[1], grids[2])
+            verdict = evaluate(source, grids[0], grids[1], grids[2], prior=prior)
             read_misses = 0
         except Exception as exc:  # noqa: BLE001 - counted; three in a row fail
             fault(exc)

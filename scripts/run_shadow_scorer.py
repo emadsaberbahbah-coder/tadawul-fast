@@ -1,6 +1,61 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.6 (2026-11-14) — NO CORPORATE-ACTION EVIDENCE IS NOT A PASS
+WHY (review of 14 Nov, P1 "vacuous corporate-action PASS"): ca_is_clean()
+returned True when _Corporate_Actions held no action at all and when the read
+failed ("absence of ledger is not a violation"), so criterion 5 of the legacy
+gate passed on no evidence: the live register is header-only while the
+archive still holds MBRX outcomes above +1,000% around its 20 Oct 1-for-20
+reverse split. ca_is_clean() now answers None (not evaluable) for a register
+with no row (the criteria-v2 C5 rule) or an unreadable one, and evaluate_s1() files criterion 5 as PENDING
+on None, so the verdict is NOT_DECIDABLE until real evidence exists. A
+populated register still PASSes when every confirmed action is repaired in
+Performance_Log, and still FAILs when one is not. Nothing is promoted either
+way (the gate never auto-promotes). Rollback: TFB_S1_CA_EVIDENCE=legacy (the
+1.9.5 answer, True). Functions added: 1 (_ca_evidence_mode).
+
+VERSION 1.9.5 (2026-11-10) — THE LASTSCORED READ-BACK NAMES ITS LEGS (P-186 armed)
+WHY: shadow_scorer.yml 1.0.2 arms TFB_S1_BASE_POLICY=lastscored (9 Nov was lost
+under legacy: DAY_EXCLUDED_INFRA fresh=0/5 because the 8 Nov row held no
+price; the last scored row, 6 Nov, held the basket actually carried into
+Monday). Under lastscored the [S1-BASE] read-back read 'pairable' from the
+inline pass-1 measurement, which never carries that key, so every lastscored
+run printed `readback_error=KeyError` instead of its pairing (observe was
+unaffected: there the lastscored side comes from _measure_one). The line now
+falls back to the base row's pairable count (_bp_pairable, the same number
+the floor divides by).
+Review on PR #952 (Codex P1): under lastscored an empty challenger board on a
+trading day could still be SCORED (the floor divides by the base row's legs),
+storing an empty snapshot that then became every later day's base: each
+later day failed the floor and, being excluded, could never become a base -
+a permanent stall that legacy would have recovered from. Two guards:
+  * a lastscored day whose challenger snapshot would store no price (empty
+    board, or no seat priced today) is EXCLUDED (reason=no-snapshot or
+    no-challenger), so the base stays the last row that holds prices;
+  * recovery: when any basket's last-scored base is older than
+    TFB_S1_BASE_MAX_AGE_D calendar days (default 7), that run behaves as
+    observe (legacy rows written, both pairings printed, '| fallback=legacy
+    (<basket>:<date>)' on the [S1-BASE] line), so the window resumes as
+    legacy would.
+Functions added: 2 (_base_max_age_d, base_too_old). Legacy and observe are
+byte-identical to 1.9.4 apart from the read-back fix.
+
+VERSION 1.9.4 (2026-11-10) — A SEAT THAT ENTERS ON A NON-TRADING DAY GETS ITS BASE
+WHY: S-1 stayed at 26/28. The board rotated over the weekend (7-8 Nov) to five
+new names. A non-trading row stores a fresh bar or carries the previous stored
+price, so a NEW seat (no previous price, no bar newer than the previous row)
+was stored with no price at all. On Monday 9 Nov nothing could be paired:
+DAY_EXCLUDED_INFRA fresh=0/5 new=[EFC.US,MBIN.US,PFS.US,SPFI.US,ZTO.US], the
+55th excluded day. Every weekend rotation costs one evidence day this way.
+FIX: stored_prices_today (the unchanged snapshot rule, moved into a pure
+helper) also stores, on a DAY_NON_TRADING row only, the latest real close of
+a new seat as its base. No session happened since that close, so the next
+session's return pairs exactly one session; nothing is scored on the seeding
+row, and a fresh or carried price always wins. The row note gains
+"seeded=<names>". GATE: TFB_S1_SEED_NEW_SEATS = off (default, byte-identical)
+| on (shadow_scorer.yml maps on). Counting, basket math, criteria: unchanged.
+
 VERSION 1.9.3 (2026-10-08) — FAIL CLOSED ON UNAVAILABLE HISTORY (TFB-20)
 Lookup/read failures previously became empty regret or shadow history. A failed
 regret read could append an existing fork again, replace its summary and publish
@@ -461,7 +516,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.3"
+SCRIPT_VERSION = "1.9.6"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -587,6 +642,53 @@ def _num(x: Any) -> Optional[float]:
 # --------------------------------------------------------------------------- #
 # pure scoring core (fully selftested offline)                                 #
 # --------------------------------------------------------------------------- #
+def _seed_new_seats_enabled() -> bool:
+    """v1.9.4 [SEED-NEW-SEATS]: TFB_S1_SEED_NEW_SEATS=1/true/yes/on; default off."""
+    return (os.getenv("TFB_S1_SEED_NEW_SEATS") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _prev_weekday(d: date) -> date:
+    """v1.9.4: the last Monday-Friday date strictly before d."""
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d
+
+
+def stored_prices_today(syms: List[str], spot: Dict[str, float], spot_asof: Dict[str, Any],
+                        p: Optional[Dict[str, Any]], p_date: Optional[date],
+                        day_non_trading: bool,
+                        row_day: Optional[date] = None) -> Tuple[Dict[str, float], List[str]]:
+    """v1.9.4 PURE: the price snapshot a row stores. Fresh symbols at today's
+    bar; stale symbols carry their previous stored price so the next fresh bar
+    captures the full move; nothing is stored at an invented level. With
+    TFB_S1_SEED_NEW_SEATS on, a DAY_NON_TRADING row also stores the latest real
+    close of a seat that has neither a fresh bar nor a previous price (it
+    entered while no venue traded): that close is exactly the base the next
+    session's return needs - but only when that close is dated the last weekday
+    before the row (row_day), so the next return spans exactly one session; an
+    older or undated close is never a base (review on PR #949: a Thursday close
+    seeded on Sunday would pair Friday+Monday against a one-session benchmark).
+    Returns (prices, seeded symbols)."""
+    prices_today: Dict[str, float] = {}
+    seeded: List[str] = []
+    prev_prices = (p.get("prices") or {}) if p else {}
+    for s in syms:
+        if s in spot and (not _price_honesty_enabled() or p_date is None
+                          or (spot_asof.get(s) is not None
+                              and spot_asof[s] > p_date)):
+            prices_today[s] = spot[s]
+        elif p and s in prev_prices:
+            prices_today[s] = prev_prices[s]
+        elif (day_non_trading and _seed_new_seats_enabled() and spot.get(s)
+              and row_day is not None and spot_asof.get(s) is not None
+              and spot_asof[s] == _prev_weekday(row_day)):
+            prices_today[s] = spot[s]
+            seeded.append(s)
+    return prices_today, seeded
+
+
 def _price_honesty_enabled() -> bool:
     """v1.2.0 kill-switch — default ON (protective; guards ship armed)."""
     return (os.getenv("TFB_SHADOW_PRICE_HONESTY") or "1").strip().lower() \
@@ -1190,7 +1292,7 @@ def criteria_v2_line(gate: Dict[str, Any]) -> str:
 
 def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
-                calibration_state: str, ca_clean: bool, pit_ok: bool,
+                calibration_state: str, ca_clean: Optional[bool], pit_ok: bool,
                 pit_note: str, drill_date: Optional[str],
                 excluded_days: int = 0,
                 calibration_detail: str = "") -> Dict[str, Any]:
@@ -1223,9 +1325,14 @@ def evaluate_s1(days: int, violations: List[str],
               "detail": calibration_detail or (
                   "7D/14D horizons land in Wave B (track_performance)"
                   if calibration_state == "PENDING" else "in band")})
-    c.append({"id": 5, "name": "corporate-actions + point-in-time",
-              "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
-              "detail": f"CA {'clean' if ca_clean else 'UNREPAIRED'}; {pit_note}"})
+    if ca_clean is None and pit_ok:              # v1.9.6: no evidence is pending, never a pass
+        c.append({"id": 5, "name": "corporate-actions + point-in-time", "status": "PENDING",
+                  "detail": f"CA not evaluable (register empty or unreadable); {pit_note}"})
+    else:
+        c.append({"id": 5, "name": "corporate-actions + point-in-time",
+                  "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
+                  "detail": f"CA {'clean' if ca_clean else ('not evaluable' if ca_clean is None else 'UNREPAIRED')}"
+                            f"; {pit_note}"})
     c.append({"id": 6, "name": "rollback drill passed",
               "status": "PASS" if drill_date else "PENDING",
               "detail": drill_date or "not yet run (operator, monthly)"})
@@ -1643,6 +1750,31 @@ def last_scored_row_for(history: List[Dict[str, Any]], basket: str
     return None
 
 
+def _base_max_age_d() -> int:
+    """v1.9.5: TFB_S1_BASE_MAX_AGE_D (default 7, clamp 1..60) - the oldest a
+    last-scored base may be before the run falls back to legacy pairing."""
+    try:
+        v = int(float(os.getenv("TFB_S1_BASE_MAX_AGE_D") or 7))
+    except Exception:  # noqa: BLE001
+        return 7
+    return v if 1 <= v <= 60 else 7
+
+
+def base_too_old(base_map: Dict[str, Optional[Dict[str, Any]]], today: date,
+                 max_age_d: int) -> str:
+    """v1.9.5 PURE: '<basket>:<date>' of the first base older than max_age_d
+    calendar days before `today` (or with no date), else ''. A missing base
+    (first-ever run) is not 'too old'."""
+    for b in sorted(base_map):
+        row = base_map[b]
+        if not row:
+            continue
+        d = _parse_iso_date(row.get("date"))
+        if d is None or (today - d).days > max_age_d:
+            return f"{b.lower()}:{row.get('date')}"
+    return ""
+
+
 def _sg_filter_prev(prev_map: Dict[str, Optional[Dict[str, Any]]]
                     ) -> Dict[str, Optional[Dict[str, Any]]]:
     """v1.9.1 [P-186] PURE: the v1.7.2 shape-guard filter applied to a base
@@ -1846,21 +1978,36 @@ def find_drill_marker(sh, since: date) -> Optional[str]:
     return f"{newest.isoformat()} ({marker})" if newest else None
 
 
-def ca_is_clean(sh) -> bool:
-    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log."""
+def _ca_evidence_mode() -> str:
+    """v1.9.6: TFB_S1_CA_EVIDENCE = strict (default) | legacy (1.9.5: no evidence passes)."""
+    raw = (os.getenv("TFB_S1_CA_EVIDENCE") or "strict").strip().lower()
+    return "legacy" if raw == "legacy" else "strict"
+
+
+def ca_is_clean(sh) -> Optional[bool]:
+    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log.
+    v1.9.6: True = a register with rows, every confirmed action repaired; False = one is not; None = not
+    evaluable (the register has no row, or it cannot be read). Under TFB_S1_CA_EVIDENCE=legacy the
+    None cases answer True, as in 1.9.5."""
+    vacuous: Optional[bool] = True if _ca_evidence_mode() == "legacy" else None
     try:
         from core import corporate_actions as ca
+        values = sh.worksheet(ca.TAB_ACTIONS).get_all_values()
+        if not any(any(str(c).strip() for c in r) for r in (values or [])[1:]):
+            return vacuous           # a register with no row certifies nothing (the v2 rule, C5)
+        acts = ca.parse_actions(values)
+        if not acts:
+            return True              # rows, but no split, reverse split or rename to repair
         rp_path = os.path.join(_ROOT, "scripts", "repair_corporate_actions.py")
         spec = importlib.util.spec_from_file_location("tfb_ca_repair", rp_path)
         rp = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rp)  # type: ignore[union-attr]
-        acts = ca.parse_actions(sh.worksheet(ca.TAB_ACTIONS).get_all_values())
         idx = ca.build_adjustment_index(acts, confirmed_only=True)
         plan, _hdr, _cols = rp.plan_repairs(
             sh.worksheet("Performance_Log").get_all_values(), idx)
         return len(plan) == 0
     except Exception:  # noqa: BLE001
-        return True          # absence of ledger is not a violation
+        return vacuous               # an unreadable register certifies nothing
 
 
 # --------------------------------------------------------------------------- #
@@ -1980,10 +2127,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bp_mode = _base_policy()
     _prev_legacy = prev
     _prev_ls: Dict[str, Optional[Dict[str, Any]]] = {}
+    _bp_fallback = ""
     if _bp_mode != "legacy":
         _prev_ls = {b: last_scored_row_for(history, b) for b in prev}
         if _sg_on:
             _prev_ls = _sg_filter_prev(_prev_ls)
+        # v1.9.5: recovery path. A base older than TFB_S1_BASE_MAX_AGE_D calendar
+        # days (a basket whose names stopped pricing, a long gap) would keep every
+        # later day excluded, because excluded rows never become a base. Past the
+        # limit this run behaves as observe: legacy rows (pairing against the last
+        # row) are written, so the window resumes the way legacy would.
+        if _bp_mode == "lastscored":
+            _stale_b = base_too_old(_prev_ls, today, _base_max_age_d())
+            if _stale_b:
+                _bp_fallback = f"fallback=legacy({_stale_b})"
+                _bp_mode = "observe"
         if _bp_mode == "lastscored":
             prev = _prev_ls
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
@@ -2082,11 +2240,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"chal legacy={_f(_leg_c['ret'])}@{_leg_base or '-'} "
                           f"lastscored={_f(_ls_c['ret'])}@{_ls_base or '-'} "
-                          f"legs={_ls_c['n_fresh']}/{_ls_c['pairable']} | "
+                          f"legs={_ls_c['n_fresh']}/{_ls_c.get('pairable', _bp_pairable)} | "
                           f"bench legacy={_f(_leg_b['ret'])} lastscored={_f(_ls_b['ret'])} | "
                           f"alpha legacy={_f(_a_leg)} lastscored={_f(_a_ls)} "
                           f"delta={'n/a' if _a_delta is None else f'{_a_delta:+.4f}pp'} | "
-                          f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}")
+                          f"fresh_den legacy={len(chal_syms)} pairable={_bp_pairable}"
+                          + (f" | {_bp_fallback}" if _bp_fallback else ""))
         except Exception as _bp_exc:  # noqa: BLE001 - read-back is additive, never fatal
             _base_line = (f"[S1-BASE v{SCRIPT_VERSION}] mode={_bp_mode} "
                           f"readback_error={type(_bp_exc).__name__}")
@@ -2097,11 +2256,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         _price_honesty_enabled() and _day_class_venue_enabled()
         and _chal_m["p"] is not None
         and day_is_non_trading(chal_syms, _chal_p_date, today))
+    # v1.9.5: under lastscored the scored row becomes tomorrow's base, so a day
+    # whose challenger snapshot would store no price (an empty board, or no
+    # seat priced today) is never scored: it would leave an empty base and
+    # stall every later day (Codex P1 on PR #952). Excluded instead; the base
+    # stays the last row that holds prices.
+    _snap_empty = False
+    if _bp_mode == "lastscored" and not day_non_trading and _chal_m["p"] is not None:
+        _snap_empty = not stored_prices_today(
+            chal_syms, spot, spot_asof, _chal_m["p"], _chal_p_date, False, row_day=today)[0]
     day_excluded = bool(
         (not day_non_trading)
         and _price_honesty_enabled()
         and _chal_m["p"] is not None
         and (_chal_frac < _min_fresh_frac()
+             or _snap_empty
              or (measured[BENCHMARK]["p"] is not None
                  and measured[BENCHMARK]["ret"] is None)))
     total_stale = sum(m["n_stale"] for m in measured.values())
@@ -2114,6 +2283,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _excl_reason = "no-challenger"
         elif _chal_frac < _min_fresh_frac():
             _excl_reason = "fresh-floor"
+        elif _snap_empty:
+            _excl_reason = "no-snapshot"
         else:
             _excl_reason = "benchmark-leg"
 
@@ -2135,17 +2306,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Stored snapshot: fresh symbols at today's bar; stale symbols carry
         # their previous stored price so the next fresh bar captures the full
         # move; nothing is stored at an invented level.
-        prices_today: Dict[str, float] = {}
-        for s in syms:
-            if s in spot and (not _price_honesty_enabled() or p_date is None
-                              or (spot_asof.get(s) is not None
-                                  and spot_asof[s] > p_date)):
-                prices_today[s] = spot[s]
-            elif p and s in (p.get("prices") or {}):
-                prices_today[s] = p["prices"][s]
+        prices_today, _seeded = stored_prices_today(      # v1.9.4: same rule, pure helper
+            syms, spot, spot_asof, p, p_date, day_non_trading, row_day=today)
         if day_non_trading and p:                  # v1.5.0 B-2
             note = (f"DAY_NON_TRADING no-venue-session "
-                    f"fresh={m['n_fresh']}/{len(syms)}")
+                    f"fresh={m['n_fresh']}/{len(syms)}"
+                    + (f" seeded={','.join(_seeded[:6])}" if _seeded else ""))
         elif day_excluded and p:
             note = (f"DAY_EXCLUDED_INFRA fresh={m['n_fresh']}/{len(syms)} "
                     f"stale={m['n_stale']}")
@@ -2430,6 +2596,10 @@ def _selftest() -> int:
     g6 = evaluate_s1(30, [], 3.0, "PASS", False, True, "ok", "2026-08-01")
     checks.append(("gate: unrepaired corporate action -> FAIL",
                    g6["verdict"] == "FAIL"))
+    g7 = evaluate_s1(30, [], 3.0, "PASS", None, True, "ok", "2026-08-01")
+    checks.append(("v1.9.6 gate: no corporate-action evidence -> 5 PENDING, NOT_DECIDABLE",
+                   g7["verdict"] == "NOT_DECIDABLE" and g7["criteria"][4]["status"] == "PENDING"
+                   and "5" in g7["why"]))
     checks.append(("gate always reports six criteria", len(g4["criteria"]) == 6))
 
     ex = [{"symbol": "TRMD.US", "fork": rg.COMPLIANCE_BLOCK},

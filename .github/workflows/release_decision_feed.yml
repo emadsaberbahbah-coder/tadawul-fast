@@ -1,6 +1,24 @@
 # =============================================================================
 # Release Decision Feed (P0-1) - .github/workflows/release_decision_feed.yml
 # =============================================================================
+# VERSION 1.4.0 (2026-11-03) -- RENDER HOLD MAPPING (release_decision_feed 1.4.0)
+#
+# WHY (3 Nov 2026): a re-verification of the live release of run
+# 41566014627 read Top_10_Investments mid-render, settled once (150 s),
+# still failed (the next render, Portfolio_Decision, ran 10:08:14-10:08:29)
+# and withdrew the release at 10:08:41 Riyadh; release_window_consumed then
+# refuses that run until the next sync. See the script's v1.4.0 WHY.
+# WHAT: the release STEP env maps
+# TFB_RELEASE_RENDER_HOLD: ${{ vars.TFB_RELEASE_RENDER_HOLD || '0' }}
+# (default OFF). The JOB env is untouched, so its parity with the final job
+# of daily_sync.yml (tests/test_release_decision_feed.py case_n16) holds. A
+# hold ends the script with exit 1 (deferred, zero writes): green with the
+# existing warning on the schedule, red on a dispatch, exactly like every
+# other deferral. The release summary prints a render_hold row only when
+# the result carries that key (absent when the gate is off). Nothing else
+# changes: triggers, group, gates, steps, permissions, the artifact.
+# ROLLBACK: unset the variable, or revert this line.
+#
 # VERSION 1.3.0 (2026-11-02) -- DEFER WHILE A PRODUCTION SYNC IS RUNNING
 # (1.2.1 is claimed by open PR #831, which defers inside the script.)
 #
@@ -374,6 +392,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           # v1.2.0: release_decision_feed 1.3.0 render settle (default OFF).
           TFB_RELEASE_RENDER_SETTLE: ${{ vars.TFB_RELEASE_RENDER_SETTLE || '0' }}
+          # v1.4.0: release_decision_feed 1.4.0 render hold (default OFF).
+          TFB_RELEASE_RENDER_HOLD: ${{ vars.TFB_RELEASE_RENDER_HOLD || '0' }}
         run: |
           set -euo pipefail
           code=0
@@ -423,6 +443,9 @@ jobs:
                   if 'render_settle' in result:
                       # v1.2.0: only when release_decision_feed 1.3.0 settled a render.
                       handle.write('| render_settle | ' + json.dumps(result['render_settle']) + ' |\n')
+                  if 'render_hold' in result:
+                      # v1.4.0: only when release_decision_feed 1.4.0 held a live release.
+                      handle.write('| render_hold | ' + json.dumps(result['render_hold']) + ' |\n')
                   handle.write('\nA released value is shown on the board only after both cockpits re-render.\n')
           PY
 

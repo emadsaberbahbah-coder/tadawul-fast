@@ -1,0 +1,115 @@
+# ============================================================================
+# TFB Pre-Open Check -- the Pre_Open_Check tab ~30 min before the US open
+# ============================================================================
+# 2026-11-08 (v1.0.0): scripts/pre_open_check.py reads the EXECUTABLE
+# tickets of Top_10_Investments, fetches S&P 500 futures (ES=F) and each US
+# ticket's pre-market quote (the Yahoo chart path the market archive uses)
+# and writes one verdict per ticket: WAIT when the futures are down 1 % or
+# more from settlement or the name sits 3 % or more from its planned price,
+# GO inside the band, CHECK when a quote is missing, SKIP for another
+# session. WHY: on 5 Nov 2026 two tickets were bought at the 17:30 Riyadh
+# open of a day the futures had already marked down; one stopped out two
+# hours later. The tickets are computed the night before and cannot see the
+# open; this tab can.
+# The schedule fires at 13:00 and 14:00 UTC; the script acts only inside
+# [open - 75 min, open + 15 min] of the NYSE session (exchange_calendars
+# XNYS), so exactly one firing lands in winter (open 14:30 UTC) and one in
+# summer (open 13:30 UTC); a US holiday writes nothing. A manual dispatch
+# writes ONLY with write=true; ignore_window=true rehearses outside the
+# window. Nothing here places an order or changes a count.
+# 2026-11-10 (v1.1.0 BOARD-GUARD): a ticket counts only when the board's own
+# status line reads 'output: EXECUTABLE' and is at most 3 h old; otherwise
+# every ticket row reads CHECK (never GO). Mapped to enforce below; rollback:
+# set the repository variable TFB_PREOPEN_BOARD_GUARD=off.
+name: ⏰ Pre-Open Check
+
+on:
+  schedule:
+    - cron: "0 13,14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Write the Pre_Open_Check tab (default: dry run)"
+        type: boolean
+        default: false
+      ignore_window:
+        description: "Run outside the pre-open window (rehearsal)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tfb-pre-open-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  pre_open_check:
+    name: ⏰ Read futures & pre-market, publish the verdicts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: ⏰ Run pre-open check
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_PREOPEN_ES_WAIT_PCT: ${{ vars.TFB_PREOPEN_ES_WAIT_PCT || '1.0' }}
+          TFB_PREOPEN_GAP_PCT: ${{ vars.TFB_PREOPEN_GAP_PCT || '3.0' }}
+          TFB_PREOPEN_BOARD_GUARD: ${{ vars.TFB_PREOPEN_BOARD_GUARD || 'enforce' }}
+          TFB_PREOPEN_BOARD_MAX_AGE_H: ${{ vars.TFB_PREOPEN_BOARD_MAX_AGE_H || '3' }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry-run otherwise).
+          MODE="--write"
+          EXTRA=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ github.event.inputs.write }}" != "true" ]]; then
+              MODE="--dry-run"
+              echo "Dry-run mode - printing the verdicts, writing nothing (tick write=true to publish)."
+            fi
+            if [[ "${{ github.event.inputs.ignore_window }}" == "true" ]]; then
+              EXTRA="--ignore-window"
+            fi
+          fi
+          python scripts/pre_open_check.py $MODE $EXTRA

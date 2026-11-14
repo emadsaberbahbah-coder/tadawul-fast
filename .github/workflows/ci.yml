@@ -2,7 +2,132 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.61 (2026-10-31) -- DAILY BRIEF SEND WINDOW
+# VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
+#
+# v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
+# 1.0.0 and consistency_check.yml 1.0.0: the same figure on every decision
+# page, one result page) in the blocking lean lane.
+#
+# VERSION 1.1.78 (2026-11-11) -- EXIT PLAN SUITE
+#
+# v1.1.78: run tests/test_exit_plan.py (scripts/exit_plan.py 1.0.0 and
+# exit_plan.yml 1.0.0: a stop and a target per holding from its own ATR,
+# reviewed every morning, the stop never moves down) in the blocking lean lane.
+#
+# VERSION 1.1.77 (2026-11-10) -- S-1 LASTSCORED REPLAY SUITE
+#
+# v1.1.77: run tests/test_s1_lastscored_nov9_replay.py (run_shadow_scorer
+# 1.9.5 and shadow_scorer.yml 1.0.2: the P-186 base policy armed; the real
+# 6-9 Nov shape scores Monday under lastscored) in the blocking lean lane.
+#
+# VERSION 1.1.76 (2026-11-10) -- DAILY PLAN SUITE
+#
+# v1.1.76: run tests/test_daily_plan.py (scripts/daily_plan.py 1.0.0 and
+# daily_plan.yml 1.0.0: one plan per Riyadh day cut from the main page's
+# first finished, verified render and frozen; later runs refresh only the
+# status) in the blocking lean lane.
+#
+# v1.1.75: run tests/test_sync_watchdog.py (scripts/sync_watchdog.py 1.0.0 and
+# daily_sync.yml 1.0.13: no cron in the sync workflow, the Apps Script
+# dispatcher is the clock, the watchdog dispatches one sync when none has
+# started for 10 hours) in the blocking lean lane.
+#
+# VERSION 1.1.74 (2026-11-10) -- STAMP-REPAIR SUITE
+#
+# v1.1.74: run tests/test_sync_stamp_repair.py (run_dashboard_sync 6.72.0:
+# TFB_SYNC_STAMP_REPAIR=1 writes a _Status stamp that failed on a timeout
+# once more at the end of the run; default off) in the blocking lean lane
+# next to the v6.70.2 stamp-retry suite.
+#
+# VERSION 1.1.73 (2026-11-09) -- VERDICT-REUSE HARNESS
+#
+# v1.1.73: run tests/test_dt10_v1290_verdict_reuse.js (16_Decision_Top10.gs
+# v1.29.0: DT10_VERDICT_REUSE=on drops the two source checks that decide
+# nothing - the pre-POST readiness behind a Logger line and verdict 2 across
+# the stability step - about 49 s of a 205.6 s render; default off) in the
+# blocking lean lane after the v1.28.0 render-timing harness.
+#
+# VERSION 1.1.72 (2026-11-09) -- EVIDENCE-COHORT SUITE
+#
+# v1.1.72: run tests/test_de_evidence_cohort.py (data_engine_v2 v5.160.0:
+# TFB_EVIDENCE_GATE off|observe|enforce demotes an INVESTABLE row whose
+# MARKET:CONFIDENCE cohort loses on matured Performance_Log records,
+# default SR:HIGH; off = byte-identical) next to the Fix P strict-gate
+# suite in the blocking data engine job.
+#
+# VERSION 1.1.71 (2026-11-09) -- RENDER-TIMING + CLEAR-LATE HARNESS
+#
+# v1.1.71: run tests/test_dt10_v1280_render_timing.js (16_Decision_Top10.gs
+# v1.28.0: DT10_RENDER_TIMING=on times each phase of the cockpit render -
+# streamed console lines, the last phase reached in the P-195 marker and
+# one _Run_Log TIMING row; DT10_CLEAR_LATE=on clears the board zones right
+# before the paint, so a render stopped at 6 minutes keeps the previous
+# board; both default off, nothing a decision reads changes)
+# in the blocking lean lane after the v1.27.0 corp-guard harness. The
+# advisory whole-suite job gets 25 minutes instead of 15: pytest itself now
+# takes 11.3 min on a fast runner and ~14.5 on a slow one, and three main
+# pushes (7 Nov 22:53, 8 Nov 07:16 and 08:17 UTC) were cancelled at 15 min
+# seconds after reaching 100%.
+#
+# VERSION 1.1.70 (2026-11-08) -- PRE-OPEN CHECK SUITE
+#
+# v1.1.70: run tests/test_pre_open_check.py (scripts/pre_open_check.py
+# v1.0.0: the Pre_Open_Check tab ~30 min before the US open - S&P futures
+# and each executable ticket's pre-market gap read as WAIT / GO / CHECK;
+# the tab is the owner's 17:00 Riyadh checklist) in the blocking lean lane.
+#
+# VERSION 1.1.69 (2026-11-08) -- RISK-BUDGET SIZING SUITE
+#
+# v1.1.69: run tests/test_ob_risk_sizing.py (opportunity_builder v1.29.0:
+# TFB_OPP_SIZING_MODE=risk sizes each ticket so its loss at the printed stop
+# is TFB_OPP_RISK_BUDGET_PCT of the sizing basis; default cap byte-identical)
+# in the blocking lean lane next to the conviction suite.
+#
+# VERSION 1.1.68 (2026-11-08) -- CORP-EVENT GUARD HARNESS
+#
+# v1.1.68: run tests/test_dt10_v1270_corp_guard.js (16_Decision_Top10.gs
+# v1.27.0: DT10_GUARD_CORP_DAYS makes the ticket guard hold a name whose
+# Corporate_Events row - SEC EDGAR 8-K merger / control / charter /
+# delisting / restatement / bankruptcy filings, scripts/run_corporate_events.py
+# v1.0.0 - lies within the window; default off) beside the other cockpit
+# harnesses; its golden negatives rebuild the v1.26.0 file from the delivered
+# one. The lean job also runs tests/test_run_corporate_events.py.
+# v1.1.67: run tests/test_dt10_v1260_fundable_seats.js (16_Decision_Top10.gs
+# v1.26.0: TFB_T10_FUNDABLE_CCY makes the stability core seat listed
+# currencies first; an unlisted name never takes a listed seat; default off)
+# beside the other cockpit harnesses; its golden negatives rebuild the
+# v1.25.0 file from the delivered one.
+# v1.1.66: run tests/test_dt10_v1250_owner_bands.js (16_Decision_Top10.gs
+# v1.25.0: DT10_OWNER_RULE_BANDS lets the owner rule and the ticket guard
+# accept the listed confidence bands, e.g. HIGH,MEDIUM; ROI 12M < 34 and every
+# other gate unchanged; default off) beside the other cockpit harnesses; its
+# golden negatives rebuild the v1.24.0 file from the delivered one.
+# v1.1.65: run tests/test_dt10_v1240_seat_guard.js (16_Decision_Top10.gs
+# v1.24.0: TFB_T10_HARD_EXIT_CONFIRM keeps a seat one day-key on a data-side
+# hard exit; TFB_T10_SEAT_GUARD_DAYS makes displacement take a non-qualifying
+# or unconfirmed fast-track seat before a confirmed one and never a confirmed
+# seat in its first N day-keys; both default off; the cool-down token names a
+# seated sold name once) beside the other cockpit harnesses; its golden
+# negatives rebuild the v1.23.1 file from the delivered one.
+# v1.1.64: run tests/test_dt10_v1231_confirm_window_fix.js (16_Decision_Top10.gs
+# v1.23.1: the window history carries its day-key; a disarmed render day drops
+# the stale bits and a same-day recovery after an outage pause appends today's
+# bit -- the two Codex findings on PR #927) beside the other cockpit harnesses;
+# its golden negatives rebuild the v1.23.0 file from the delivered one.
+# v1.1.63: run tests/test_dt10_v1230_reentry_cooldown.js (16_Decision_Top10.gs
+# v1.23.0: a name sold inside the last N calendar days per _Portfolio_CostBasis
+# cannot be seated on the Top-10 board, Script Property
+# TFB_T10_REENTRY_COOLDOWN_DAYS, default off = v1.22.0 byte for byte) beside
+# the v1.22.0 harness; its golden negative rebuilds the v1.22.0 file from the
+# delivered one (tests/js/dt10_edits_v1230.json, SHA-256 pinned).
+# v1.1.62: run tests/test_dt10_v1220_confirm_window.js (16_Decision_Top10.gs
+# v1.22.0: entry confirmation counts qualified day-keys inside a rolling
+# window, Script Property TFB_T10_CONFIRM_WINDOW, default off = v1.21.1 byte
+# for byte) in the native Apps Script step beside the other cockpit
+# harnesses; its golden negative rebuilds the v1.21.1 file from the delivered
+# one (tests/js/dt10_edits_v1220.json, SHA-256 pinned) so no fetch is needed.
+# The sibling harnesses' delivered-version pins move to 1.22.0 in the same
+# change, as every prior cockpit release did.
 #
 # v1.1.61 (ported from open PR #860 through #874; its first numbers went to
 # #859 (1.1.50) and #875-#879 (1.1.56-1.1.60)): run
@@ -882,7 +1007,7 @@ jobs:
   whole-suite:
     name: 🧪 Whole suite (pinned Python 3.11)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25   # v1.1.71: 15 cut slow runners off seconds after 100% (11.3-14.5 min of pytest)
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -1025,6 +1150,9 @@ jobs:
             tests/test_portfolio_membership_reader.py \
             tests/test_calendar_sticky_contracts.py \
             tests/test_bq_archive.py \
+            tests/test_archive_coherent_snapshot.py \
+            tests/test_coherent_real_audits.py \
+            tests/test_coherent_staging.py \
             tests/test_bq_views.py \
             tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
@@ -1047,9 +1175,21 @@ jobs:
             tests/test_sync_hk_reporting_fx.py \
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
+            tests/test_sync_stamp_repair.py \
+            tests/test_sync_watchdog.py \
+            tests/test_daily_plan.py \
+            tests/test_today_action_plan.py \
+            tests/test_plan_archive.py \
+            tests/test_ibkr_capture.py \
+            tests/test_exit_plan.py \
+            tests/test_consistency_check.py \
+            tests/test_cash_cells.py \
+            tests/test_sheets_quota.py \
+            tests/test_s1_lastscored_nov9_replay.py \
             tests/test_daily_sync_stamp_budget.py \
             tests/test_fw2_stale_pe.py \
             tests/test_news_macro_gate.py \
+            tests/test_run_corporate_events.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
             tests/test_symbols_reader_thread_local.py \
@@ -1082,6 +1222,7 @@ jobs:
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
             tests/test_shadow_scorer_regret_read_failure.py \
+            tests/test_s1_ca_evidence.py \
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \
@@ -1130,7 +1271,9 @@ jobs:
             tests/test_backup_upload_resume.py \
             tests/test_release_auto_source.py \
             tests/test_await_cockpit_receipts.py \
-            tests/test_ob_conviction_sizing.py $EXTRA
+            tests/test_ob_conviction_sizing.py \
+            tests/test_ob_risk_sizing.py \
+            tests/test_pre_open_check.py $EXTRA
           echo "::endgroup::"
 
       - name: 🧪 Work-brief capture, repair and pure contract regressions
@@ -1207,6 +1350,15 @@ jobs:
           node tests/test_dt10_shadow_rank_log.js
           node tests/test_dt10_shadow_momentum.js
           node tests/test_dt10_post_earnings.js
+          node tests/test_dt10_v1220_confirm_window.js
+          node tests/test_dt10_v1230_reentry_cooldown.js
+          node tests/test_dt10_v1231_confirm_window_fix.js
+          node tests/test_dt10_v1240_seat_guard.js
+          node tests/test_dt10_v1250_owner_bands.js
+          node tests/test_dt10_v1260_fundable_seats.js
+          node tests/test_dt10_v1270_corp_guard.js
+          node tests/test_dt10_v1280_render_timing.js
+          node tests/test_dt10_v1290_verdict_reuse.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js
@@ -1384,6 +1536,7 @@ jobs:
             tests/test_sync_klg_crypto_name_p192.py \
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
+            tests/test_de_evidence_cohort.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \

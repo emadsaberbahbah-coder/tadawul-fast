@@ -129,7 +129,7 @@ T10_TAIL = ("Last run 2026-10-28 22:45:00 | status: ok | sheets pool 9694 rows "
 BUSY_WRITER = [{"workflow": "page_refresh_recovery.yml", "id": 41, "event": "workflow_dispatch",
                 "status": "in_progress"}]
 BUSY_RELEASE = [{"id": 42, "event": "workflow_dispatch", "status": "pending"}]
-_ENV = ("TFB_RELEASE_AFTER_SYNC", "TFB_RELEASE_AFTER_SYNC_WAIT_MIN", "GITHUB_TOKEN",
+_ENV = ("TFB_RELEASE_AFTER_SYNC", "TFB_RELEASE_AFTER_SYNC_WAIT_MIN", "TFB_RELEASE_AFTER_SYNC_PRIOR", "GITHUB_TOKEN",
         "GITHUB_REPOSITORY", "GITHUB_API_URL", "GITHUB_RUN_ID", "DEFAULT_SPREADSHEET_ID")
 
 
@@ -781,7 +781,8 @@ def case_w14_workflow_contract(mp, tmp_path):
         "TARGET_SHEET_ID": "${{ vars.DEFAULT_SPREADSHEET_ID }}",
         "TFB_RELEASE_AFTER_SYNC": "${{ vars.TFB_RELEASE_AFTER_SYNC || '0' }}",
         "TFB_RELEASE_AFTER_SYNC_WAIT_MIN": "${{ vars.TFB_RELEASE_AFTER_SYNC_WAIT_MIN || '%d' }}"
-                                           % W.DEFAULT_WAIT_MIN}
+                                           % W.DEFAULT_WAIT_MIN,
+        "TFB_RELEASE_AFTER_SYNC_PRIOR": "${{ vars.TFB_RELEASE_AFTER_SYNC_PRIOR || 'strict' }}"}
     steps = {step["name"]: step for step in job["steps"]}
     for step in job["steps"]:
         assert "${{" not in step.get("run", ""), step["name"]
@@ -949,7 +950,7 @@ def case_w18_wait_only_consumed_on_the_second_poll(mp, tmp_path):
     assert result["consumed_at_utc"] == {"pf": NOW.isoformat(timespec="seconds"),
                                          "t10": NOW.isoformat(timespec="seconds")}
     assert result["mode"] == "wait_only" and result["run_id"] == SOURCE
-    assert result["max_min"] == 15 and result["poll_s"] == 60 and result["max_min_clamped"] is False
+    assert result["max_min"] == 30 and result["poll_s"] == 60 and result["max_min_clamped"] is False
     assert result["dispatched"] is False and result["dispatch_attempts"] == 0
     assert result["faults"] == 0 and result["gate_variable"] == "TFB_SYNC_AWAIT_RENDER"
     # the SAME bounded ranges, reader and render option as the dispatch mode
@@ -969,22 +970,22 @@ def case_w18_wait_only_consumed_on_the_second_poll(mp, tmp_path):
     result = h.wait()
     assert result["outcome"] == "consumed" and result["polls"] == 1 and h.clock.sleeps == []
     assert result["consumed_at_s"] == {"pf": 0, "t10": 0}
-    assert W.WAIT_ONLY_DEFAULT_MIN == 15 and W.WAIT_ONLY_MAX_MIN == 20
+    assert W.WAIT_ONLY_DEFAULT_MIN == 30 and W.WAIT_ONLY_MAX_MIN == 35   # v1.3.0 (was 15 / 20)
     assert W.WAIT_ONLY_DEFAULT_POLL_S == 60 and (W.WAIT_ONLY_MIN_POLL_S, W.WAIT_ONLY_MAX_POLL_S) == (30, 90)
 
 
 def case_w19_wait_only_is_bounded_and_ends_early_on_evidence(mp, tmp_path):
     _clean(mp)
     _seal_github(mp)
-    # never consumed: 15 minutes at 60 s = 16 polls, exit 0 with a notice
+    # never consumed: 30 minutes at 60 s = 31 polls, exit 0 with a notice (v1.3.0; was 15 / 16)
     h = WaitHarness([state(t10_grid=t10(""))])
     result = h.wait()
     assert result["exit_code"] == 0 and result["outcome"] == "timeout", result
     assert result["reasons"] == ["receipts_timeout"]
-    assert result["polls"] == 16 and h.clock.sleeps == [60] * 15 and result["waited_s"] == 900
+    assert result["polls"] == 31 and h.clock.sleeps == [60] * 30 and result["waited_s"] == 1800
     assert result["consumed"] == {"pf": True, "t10": False}
     assert result["consumed_at_s"] == {"pf": 0, "t10": None}
-    assert result["notice"].startswith("no receipt for run " + SOURCE + " from Top_10_Investments after 900 s")
+    assert result["notice"].startswith("no receipt for run " + SOURCE + " from Top_10_Investments after 1800 s")
     assert result["notice"].endswith("the audit that follows decides.")
     assert result["dispatched"] is False and result["last"]["state"] == "wait"
     # every receipt the strict audit would reject keeps waiting (never consumed)
@@ -994,14 +995,14 @@ def case_w19_wait_only_is_bounded_and_ends_early_on_evidence(mp, tmp_path):
         result = h.wait(max_min="2")
         assert result["outcome"] == "timeout" and result["polls"] == 3, receipt
         assert result["consumed"] == {"pf": False, "t10": True}, receipt
-    # the bound: default 15, cap 20, larger values clamped and recorded
-    for raw, minutes, polls, clamped in (("1", 1, 2, False), ("20", 20, 21, False), ("21", 20, 21, True),
-                                         ("600", 20, 21, True), (None, 15, 16, False)):
+    # the bound: default 30, cap 35 (v1.3.0; was 15 / 20), larger values clamped and recorded
+    for raw, minutes, polls, clamped in (("1", 1, 2, False), ("15", 15, 16, False), ("35", 35, 36, False),
+                                         ("36", 35, 36, True), ("600", 35, 36, True), (None, 30, 31, False)):
         h = WaitHarness([state(t10_grid=t10(""))])
         result = h.wait(max_min=raw)
         assert (result["max_min"], result["polls"], result["max_min_clamped"]) == (minutes, polls, clamped), raw
         assert ("max_minutes_clamped" in result["reasons"]) is clamped, raw
-    for poll, polls in (("30", 31), ("90", 11)):
+    for poll, polls in (("30", 61), ("90", 21)):   # v1.3.0: over the 30-minute default
         h = WaitHarness([state(t10_grid=t10(""))])
         result = h.wait(poll_s=poll)
         assert result["polls"] == polls and result["poll_s"] == int(poll), poll
@@ -1239,7 +1240,7 @@ def case_w23_handshake_step_contract(mp, tmp_path):
         assert names[-1].startswith("Secure") and "shred -u -z" in steps[-1]["run"]
         step = steps[index]
         assert set(step) == {"name", "if", "timeout-minutes", "env", "run"}, (path.name, set(step))
-        assert step["timeout-minutes"] == 25 and "continue-on-error" not in json.dumps(steps)
+        assert step["timeout-minutes"] == 40 and "continue-on-error" not in json.dumps(steps)   # v1.3.0: was 25
         assert "${{" not in step["run"] and step["run"].startswith("set -euo pipefail\n")
         # the exact command: wait-only, this run (or the triggering sync), env-mapped bound, || true
         run_env = "$GITHUB_RUN_ID" if path == DAILY_YML else "$SOURCE_RUN_ID"
@@ -1255,7 +1256,7 @@ def case_w23_handshake_step_contract(mp, tmp_path):
         for forbidden in ("--source-run-id", "release_decision_feed", "finalize_decision_publication",
                           "audit_decision_surface_freshness", "--publish", "dispatch"):
             assert forbidden not in step["run"], (path.name, forbidden)
-        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '15' }}"}
+        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}"}
         if path == FRESH_YML:
             expected_env["SOURCE_RUN_ID"] = "${{ github.event.workflow_run.id }}"
         assert step["env"] == expected_env, path.name
@@ -1511,6 +1512,73 @@ def case_w25_executed_shell_blocks(mp, tmp_path):
                     '| reasons | ["' + reason + '"] |'):
             assert row in rendered, row
         assert "DRY-RUN (TFB_DECISION_RELEASE off)" in rendered and "render_settle" not in rendered
+
+
+def case_w26_prior_release_rule_for_an_older_runs_veto(mp, tmp_path):
+    """v1.2.0 (3 Nov 2026): a clean sync's final job writes no veto, so the feed
+    still names the previous run. 'release' weighs that value with the release's
+    own classify_prior; 'strict' (default) stops exactly as v1.0.0."""
+    supersede = ("NOT_ACTIONABLE(final_publication) | run=" + OLDER +
+                 " | 2026-10-28 21:00:00+03:00 | superseded_by_run=" + SOURCE + ".1")
+    withdrawn = veto(OLDER) + " | release=41519935330"     # the live 3 Nov shape
+    for word in (None, "", "strict", "releases", "on", "1", "observe"):
+        _clean(mp)
+        arm(mp)
+        if word is not None:
+            mp.setenv("TFB_RELEASE_AFTER_SYNC_PRIOR", word)
+        assert W.prior_rule() == "strict", word
+        for feed in (veto(OLDER), supersede, withdrawn):
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["prior_rule"] == "strict"
+            assert result["outcome"] == "stopped" and result["reasons"] == ["decision_feed_not_this_run"], (word, result)
+            assert h.calls["dispatch"] == [] and h.writers.calls == 0 and h.releases.calls == 0
+    for word in ("release", " Release ", "RELEASE"):
+        _clean(mp)
+        arm(mp)
+        mp.setenv("TFB_RELEASE_AFTER_SYNC_PRIOR", word)
+        assert W.prior_rule() == "release", word
+        for feed, why in ((veto(OLDER), "older_run_veto"), (withdrawn, "older_run_veto"),
+                          (supersede, "superseded_older_run")):
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["prior_rule"] == "release"
+            assert result["outcome"] == "dispatched" and result["reasons"] == ["both_receipts_verified"], (feed, result)
+            assert h.calls["dispatch"] == [SOURCE] and result["dispatch_status"] == 204
+            assert result["last"]["prior"] == why and result["last"]["decision_run"] == OLDER
+            assert result["last"]["decision_executable"] is False and result["last"]["state"] == "ready"
+            assert R.classify_prior(feed, SOURCE) == ("eligible", why)
+        stops = [
+            (live(OLDER), "prior_executable_other_run"),
+            ("NOT_ACTIONABLE(final_publication) | run=" + OLDER + " | 2026-10-28 21:00:00+03:00"
+             " | superseded_by_run=" + NEWER + ".1", "prior_superseded_by_run"),
+            (veto(NEWER), "superseded_by_newer_cohort"),
+            ("NOT_ACTIONABLE(owner_hold) | 2026-10-28 22:00:00+03:00", "decision_feed_unreadable"),
+            (None, "decision_feed_unreadable"),
+            (live(), "already_executable"),
+        ]
+        for feed, reason in stops:
+            h = Harness([state(key=key_grid(feed=feed))])
+            result = h.run()
+            assert result["outcome"] == "stopped" and result["reasons"] == [reason], (feed, result)
+            assert h.calls["dispatch"] == [] and h.writers.calls == 0 and h.releases.calls == 0
+        # this run's own veto: unchanged (no classify_prior, prior stays null)
+        h = Harness([state()])
+        result = h.run()
+        assert result["outcome"] == "dispatched" and result["last"]["prior"] is None
+        # the older veto still needs both receipts: a cockpit on another run times out, never dispatches
+        h = Harness([state(key=key_grid(feed=veto(OLDER)), t10_grid=t10(verified(OLDER)))])
+        result = h.run(wait_min=3, poll_s=90)
+        assert result["outcome"] == "timeout" and result["reasons"] == ["receipts_timeout"]
+        assert h.calls["dispatch"] == [] and result["last"]["prior"] == "older_run_veto"
+        # a newer cohort mid-wait still stops the attempt
+        h = Harness([state(key=key_grid(feed=veto(OLDER)), t10_grid=t10("")),
+                     state(key=key_grid(gm_value=gm(NEWER), feed=veto(OLDER)), t10_grid=t10(""))])
+        result = h.run()
+        assert result["reasons"] == ["superseded_by_newer_cohort"] and h.calls["dispatch"] == []
+    # the module default and the workflow default agree
+    _clean(mp)
+    assert W.PRIOR_ENV == "TFB_RELEASE_AFTER_SYNC_PRIOR" and W.prior_rule() == "strict"
 
 
 # --------------------------------------------------------------------------- runner

@@ -1,0 +1,42 @@
+[
+ [
+  " * Version: 1.29.0 (see DT10_VERSION; header kept in lockstep",
+  " * Version: 1.28.0 (see DT10_VERSION; header kept in lockstep"
+ ],
+ [
+  " * v1.29.0 (2026-11-09) [VERDICT-REUSE] -- ONE SOURCE CHECK FEWER BEFORE THE POST AND ONE FEWER AFTER STABILITY\n *   (ONE KNOB, DEFAULT OFF)\n * WHY (render timing, Mon 9 Nov 2026): the first armed DT10_RENDER_TIMING line, the 12:09 evidence follow-up\n *   render, read 'phases 205.6s: ... src 9.5 | pool 29.6 | ready 26 | post 38 | attach 0.3 | verdict1 23.5 |\n *   stab 1.5 | verdict2 22.9 | ... | r_verdict 22.2 | ... | r_cands 11.4 | ... | status 3.3'. The source\n *   readiness (dt10SourceReadiness_: the approved-scope Symbol reads and digests of the four pool pages plus\n *   _Status) runs five times per render, about 104 s of 205.6. Two of the five decide nothing:\n *   - 'ready' (26 s) feeds only the Logger line before the POST; the status line is rebuilt from the\n *     pre-paint recheck's readiness (finalSource) and never shows it;\n *   - 'verdict2' (22.9 s) repeats verdict 1 across the stability step, which reads neither the feed nor the\n *     source pages (1.5 s), and the render's own recheck (r_verdict) runs again before any value is\n *     painted, followed by a second dt10FinalizeBoard_.\n *   On 9 Nov 4 of 13 renders were stopped at the 6-minute limit.\n * WHAT: Script Property DT10_VERDICT_REUSE = 'on' (any case, spaces trimmed). Absent, anything else, or a\n *   PropertiesService fault = off: the render is v1.28.0 byte for byte (one extra property read per\n *   refresh). Armed:\n *   (a) the pre-POST readiness is not computed; the POST Logger line ends 'source readiness checked after\n *       the POST (DT10_VERDICT_REUSE)';\n *   (b) verdict 1 stands for verdict 2 (payload._dt10_uv is kept across the stability step).\n *   The three checks that decide something stay: verdict 1 (it freezes stability on blocked sources), the\n *   pre-paint recheck r_verdict (it re-finalizes the board before any value is painted) and the\n *   selection-log recheck (it withholds logged tickets). A source change during the stability step is still\n *   caught by r_verdict, as one during the allocation replay always was. With the timer armed the marks keep\n *   their names; 'ready' and 'verdict2' read about 0. Expected saving: about 49 s per render (26.0 + 22.9 s\n *   at 12:09). dt10SelfTest: the render-timing line names the knob (line count unchanged).\n *   Rollback: delete the property.\n *\n * v1.28.0 (2026-11-09) [RENDER-TIMING] + [CLEAR-LATE] -- THE RENDER MEASURES EACH PHASE; A STOPPED RENDER KEEPS\n",
+  " * v1.28.0 (2026-11-09) [RENDER-TIMING] + [CLEAR-LATE] -- THE RENDER MEASURES EACH PHASE; A STOPPED RENDER KEEPS\n"
+ ],
+ [
+  "var DT10_VERSION = '1.29.0';",
+  "var DT10_VERSION = '1.28.0';"
+ ],
+ [
+  "var DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]\nvar DT10_VERDICT_REUSE_PROP = 'DT10_VERDICT_REUSE';   // v1.29.0 [VERDICT-REUSE]\n",
+  "var DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]\n"
+ ],
+ [
+  "function dt10ClearLateOn_() {\n  try {\n    return String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_CLEAR_LATE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eCl) {}\n  return false;\n}\n/** v1.29.0 [VERDICT-REUSE]: Script Property DT10_VERDICT_REUSE = 'on' (trimmed,\n * any case) drops the two source checks that decide nothing (the pre-POST\n * readiness behind the Logger line; verdict 2, which repeats verdict 1 across\n * the stability step); absent / anything else / a PropertiesService fault =\n * off (the v1.28.0 checks). Never throws. Read once per refresh. */\nfunction dt10VerdictReuseOn_() {\n  try {\n    return String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_VERDICT_REUSE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eVr) {}\n  return false;\n}\n",
+  "function dt10ClearLateOn_() {\n  try {\n    return String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_CLEAR_LATE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eCl) {}\n  return false;\n}\n"
+ ],
+ [
+  "  var clearLate = dt10ClearLateOn_();   // v1.28.0 [CLEAR-LATE]\n  var verdictReuse = dt10VerdictReuseOn_();   // v1.29.0 [VERDICT-REUSE]: one read; off => the v1.28.0 checks\n",
+  "  var clearLate = dt10ClearLateOn_();   // v1.28.0 [CLEAR-LATE]\n"
+ ],
+ [
+  "    // v1.29.0 [VERDICT-REUSE]: this readiness feeds only the Logger line below; armed, it is not computed\n    // (null) -- the status line is rebuilt from the pre-paint recheck's readiness.\n    poolNote = dt10PoolNote_(pool, verdictReuse ? null : dt10SourceReadiness_(ss, sourceContext));\n",
+  "    poolNote = dt10PoolNote_(pool, dt10SourceReadiness_(ss, sourceContext));\n"
+ ],
+ [
+  "      ' | source readiness ' + (source === null ? 'checked after the POST (DT10_VERDICT_REUSE)' :   // v1.29.0\n          (source.ready ? 'VERIFIED (run ' + source.cohort + ')' : 'WITHHELD: ' + source.reason));\n",
+  "      ' | source readiness ' + (source.ready ? 'VERIFIED (run ' + source.cohort + ')' : 'WITHHELD: ' + source.reason);\n"
+ ],
+ [
+  "  dt10PhaseMark_('stab');   // v1.28.0\n  // v1.29.0 [VERDICT-REUSE]: the stability step reads neither the feed nor the source pages, so armed,\n  // verdict 1 stands for verdict 2; the pre-paint recheck (r_verdict) still runs before any value is painted.\n  if (!verdictReuse) payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  dt10PhaseMark_('verdict2');   // v1.28.0\n",
+  "  dt10PhaseMark_('stab');   // v1.28.0\n  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  dt10PhaseMark_('verdict2');   // v1.28.0\n"
+ ],
+ [
+  "      'render keeps the previous board); verdict reuse (DT10_VERDICT_REUSE): ' +\n      (dt10VerdictReuseOn_() ? 'on' : 'off') + ' (no log-only source check before the POST; verdict 1 stands ' +\n      'for verdict 2; the pre-paint and selection-log rechecks stay)');\n",
+  "      'render keeps the previous board)');\n"
+ ]
+]

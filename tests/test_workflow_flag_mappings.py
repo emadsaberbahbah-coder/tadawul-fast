@@ -28,10 +28,11 @@ SYNC_DEFAULTS = {
     "TFB_OPP_FX_USX_SUBUNIT": "0",
     # daily_sync.yml 1.0.8 (2026-10-29): run_dashboard_sync 6.71.0 FW2-STALE-PE.
     "TFB_SYNC_FW2_STALE_PE": "off",
+    # daily_sync.yml 1.0.12 (2026-11-10): run_dashboard_sync 6.72.0 STAMP-REPAIR.
+    "TFB_SYNC_STAMP_REPAIR": "0",
+    "TFB_SYNC_STAMP_REPAIR_BUDGET_S": "480",
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
-# 2026-10-26: v6.54.0 [MATURED-EVIDENCE]; both tracker lanes can audit.
-TRACKER_DEFAULTS["TRACK_MATURED_EVIDENCE_VALID"] = "off"
 
 
 def _workflow(name):

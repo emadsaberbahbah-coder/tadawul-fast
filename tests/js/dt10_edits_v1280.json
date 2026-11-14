@@ -1,0 +1,154 @@
+[
+ [
+  " * Version: 1.28.0 (see DT10_VERSION; header kept in lockstep",
+  " * Version: 1.27.0 (see DT10_VERSION; header kept in lockstep"
+ ],
+ [
+  "var DT10_VERSION = '1.28.0';",
+  "var DT10_VERSION = '1.27.0';"
+ ],
+ [
+  " * v1.28.0 (2026-11-09) [RENDER-TIMING] + [CLEAR-LATE] -- THE RENDER MEASURES EACH PHASE; A STOPPED RENDER KEEPS\n *   THE PREVIOUS BOARD (TWO KNOBS, BOTH DEFAULT OFF)\n * WHY (morning review, Mon 9 Nov 2026): the cockpit render now runs into the Apps Script 6-minute limit. _Run_Log\n *   counts, 4-9 Nov: ABORTED_PREV (a previous run left no completion) 2, 9, 4, 3, 2, 3 a day, beside 0-2\n *   NOT_FINISHED decision-chain renders a day; finished renders 140-344 s (medians 211-275 s). On 9 Nov the\n *   08:44 evidence follow-up - the render meant to use the fresh 08:41 IBKR capture - was stopped at 361 s, the\n *   09:12 Decision Pages v2 build too, and the 09:20 render finished in 326 s with a capture 39 minutes old, so\n *   Top_10_Investments read QUALIFIED_UNFUNDED / HELD all morning. The five log lines of a finished run give\n *   only coarse phases (09:20 run: start->funding 33 s, sources + pool rows 75 s, backend POST ~40 s,\n *   stability 28 s, allocation replay 53 s, finalize -> earnings tag 79 s, paint + logs 32 s) and a stopped run\n *   says nothing at all. The fix has to be aimed; this version measures.\n * WHAT: Script Property DT10_RENDER_TIMING = 'on' (any case, spaces trimmed). Absent, anything else, or a\n *   PropertiesService fault = off: DT10_PH_ stays null, every dt10PhaseMark_ is a no-op and the render is\n *   v1.27.0 byte for byte (one extra property read at start). Armed:\n *   (a) dt10PhaseMark_(name) at 35 points (setup, gates, inputs, funding, src, pool, ready, post, attach,\n *       verdict1, stab, verdict2, alloc, final, r_clear, r_verdict, r_final, r_live, r_earn, r_postearn,\n *       r_guard, r_kpi, r_selected, r_qualified, r_nearmiss, r_alerts, r_gaps, r_cands, r_end, render, notes,\n *       sellog, exitlog, shadow, status) streams 'console.log [DT10 v1.28.0] t+123.4s pool +40.2s' at once;\n *   (b) once this run owns the P-195 marker, the marker JSON gains ph (last phase) and at (seconds), written\n *       at most every 5 s; the next run's ABORTED_PREV row then ends '; last phase reached: alloc at t+251.4s'\n *       and its details carry trail (dt10PhaseTrailNote_; '' for a marker without ph, so the row is the v1.27.0\n *       row);\n *   (c) a finished render logs 'phases 326.0s: setup 3.1 | gates 1.2 | ...' and writes ONE _Run_Log row\n *       (INFO, TIMING, the same line, details {version, total_ms, marks}).\n *   The status line, the board, the stability state and every decision value are untouched.\n *   (d) [CLEAR-LATE] Script Property DT10_CLEAR_LATE = 'on' (same spellings; a fault = off): the refresh\n *       attaches payload._dt10_clear_late = 1 and dt10RenderPayload_ clears the board zones (dt10ClearZones_,\n *       the v1.27.0 clear unchanged) after the pre-paint steps - verdict recheck, finalize, live fill,\n *       earnings and post-earnings tags, ticket guard - instead of before them (one extra mark,\n *       r_clear_late, when the timer is armed too). On 9 Nov the 10:14 follow-up render was stopped after\n *       the clear: Top_10_Investments showed the control panel and the KPI strip and nothing below row 16\n *       until the next render. Armed, a render stopped inside those steps leaves the previous board on\n *       screen (its own banner and verdict age; the Status line still says running); a finished render\n *       paints the same board. Those steps read only other sheets (_Status, the source pages,\n *       Calendar_Events, the dividend and corporate-event sheets) and the payload, never the board zones,\n *       so none of their results change. Off (absent / anything else): no payload key, the v1.27.0 order.\n *   Rollback: delete either property.\n *\n * v1.27.0 (2026-11-08) [CORP-EVENT-GUARD]",
+  " * v1.27.0 (2026-11-08) [CORP-EVENT-GUARD]"
+ ],
+ [
+  "var DT10_P195_LIMIT_MIN = 7;          // GAS 6-minute limit + skew\nvar DT10_RENDER_TIMING_PROP = 'DT10_RENDER_TIMING';   // v1.28.0 [RENDER-TIMING]\nvar DT10_RENDER_TIMING_MARKER_MS = 5000;   // v1.28.0: marker rewrite at most every 5 s\nvar DT10_PH_ = null;   // v1.28.0: this execution's phase clock (null = off)\nvar DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]",
+  "var DT10_P195_LIMIT_MIN = 7;          // GAS 6-minute limit + skew"
+ ],
+ [
+  "/** v1.28.0 [RENDER-TIMING]: Script Property DT10_RENDER_TIMING = 'on' arms\n * the phase clock; absent / anything else / a PropertiesService fault = off.\n * Never throws. */\nfunction dt10RenderTimingOn_() {\n  try {\n    return String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_RENDER_TIMING_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eRt) {}\n  return false;\n}\n/** v1.28.0 [CLEAR-LATE]: Script Property DT10_CLEAR_LATE = 'on' (trimmed, any\n * case) moves the board-zone clear after the pre-paint steps; absent /\n * anything else / a PropertiesService fault = off (the v1.27.0 order).\n * Never throws. Read once per refresh (the payload carries the answer). */\nfunction dt10ClearLateOn_() {\n  try {\n    return String(PropertiesService.getScriptProperties()\n        .getProperty(DT10_CLEAR_LATE_PROP) || '')\n        .replace(/^\\s+|\\s+$/g, '').toLowerCase() === 'on';\n  } catch (eCl) {}\n  return false;\n}\n/** v1.28.0 [RENDER-TIMING] I/O: start this execution's phase clock when\n * armed (one property read); off => DT10_PH_ stays null and every mark is a\n * no-op. Returns the clock or null. */\nfunction dt10PhaseStart_(t0) {\n  DT10_PH_ = null;\n  if (!dt10RenderTimingOn_()) return null;\n  DT10_PH_ = { t0: t0, last: t0, marks: [], marker: null, wrote: 0 };\n  return DT10_PH_;\n}\n/** v1.28.0 [RENDER-TIMING] I/O: close the phase since the previous mark.\n * Streams one console line at once (a run stopped at 6 minutes still shows\n * how far it got) and, once this run owns the P-195 marker, writes the last\n * phase reached into it (at most every DT10_RENDER_TIMING_MARKER_MS). Off =>\n * nothing. Never throws. */\nfunction dt10PhaseMark_(name) {\n  var ph = DT10_PH_;\n  if (!ph) return;\n  try {\n    var now = new Date().getTime();\n    var d = now - ph.last;\n    ph.last = now;\n    ph.marks.push([String(name), d]);\n    var at = Math.round((now - ph.t0) / 100) / 10;\n    try {\n      console.log('[DT10 v' + DT10_VERSION + '] t+' + at + 's ' + name + ' +' +\n                  Math.round(d / 100) / 10 + 's');\n    } catch (eCl) {}\n    if (ph.marker && now - ph.wrote >= DT10_RENDER_TIMING_MARKER_MS) {\n      ph.marker.ph = String(name);\n      ph.marker.at = at;\n      ph.wrote = now;\n      PropertiesService.getScriptProperties()\n          .setProperty(DT10_P195_MARKER_PROP, JSON.stringify(ph.marker));\n    }\n  } catch (eMk) {}\n}\n/** v1.28.0 [RENDER-TIMING] PURE: 'phases 326s: setup 3.1 | gates 1.2 | ...'\n * (seconds, one decimal; at most 400 characters); '' without a clock. */\nfunction dt10PhaseLine_(ph) {\n  if (!ph || !ph.marks) return '';\n  var parts = [];\n  for (var i = 0; i < ph.marks.length; i++) {\n    parts.push(ph.marks[i][0] + ' ' + Math.round(ph.marks[i][1] / 100) / 10);\n  }\n  return ('phases ' + Math.round((ph.last - ph.t0) / 100) / 10 + 's: ' +\n          parts.join(' | ')).slice(0, 400);\n}\n/** v1.28.0 [RENDER-TIMING] PURE: the previous marker's last phase as\n * '; last phase reached: alloc at t+251.4s'; '' when the marker carries none\n * (an unarmed or older run) or is not JSON. */\nfunction dt10PhaseTrailNote_(prevRaw) {\n  try {\n    var obj = JSON.parse(String(prevRaw || ''));\n    if (obj && typeof obj.ph === 'string' && obj.ph &&\n        obj.at !== null && obj.at !== undefined && obj.at !== '' && isFinite(Number(obj.at))) {\n      return '; last phase reached: ' + obj.ph.slice(0, 40) + ' at t+' + Number(obj.at) + 's';\n    }\n  } catch (eTn) {}\n  return '';\n}\nfunction dt10RunMarkerCore_(prevRaw, nowMs, limitMin) {",
+  "function dt10RunMarkerCore_(prevRaw, nowMs, limitMin) {"
+ ],
+ [
+  "    if (judged.aborted) {\n      // v1.28.0 [RENDER-TIMING]: '' unless the stopped run carried a phase.\n      var trail = dt10PhaseTrailNote_(prev);\n      var abDetails = { version: DT10_VERSION, started: judged.startedIso,\n            age_min: judged.ageMin };\n      if (trail) abDetails.trail = trail.replace(/^; /, '');\n      dt10RunLogRow_('WARN', 'ABORTED_PREV',\n          'P-195: previous cockpit run started ' + judged.startedIso + ' (' +\n          judged.ageMin + 'm ago) left no completion -- aborted or timed ' +\n          'out before clearing its marker; this run proceeds' + trail,\n          abDetails);\n    }\n    var mk = {\n      started: new Date().toISOString(), v: DT10_VERSION,\n      entry: String(entry || 'refreshDecisionTop10') };\n    props.setProperty(DT10_P195_MARKER_PROP, JSON.stringify(mk));\n    if (DT10_PH_) DT10_PH_.marker = mk;   // v1.28.0: armed marks write the last phase into it",
+  "    if (judged.aborted) {\n      dt10RunLogRow_('WARN', 'ABORTED_PREV',\n          'P-195: previous cockpit run started ' + judged.startedIso + ' (' +\n          judged.ageMin + 'm ago) left no completion -- aborted or timed ' +\n          'out before clearing its marker; this run proceeds',\n          { version: DT10_VERSION, started: judged.startedIso,\n            age_min: judged.ageMin });\n    }\n    props.setProperty(DT10_P195_MARKER_PROP, JSON.stringify({\n      started: new Date().toISOString(), v: DT10_VERSION,\n      entry: String(entry || 'refreshDecisionTop10') }));"
+ ],
+ [
+  "function dt10RefreshDecisionTop10Run_(run) {\n  var t0 = new Date().getTime();\n  dt10PhaseStart_(t0);   // v1.28.0 [RENDER-TIMING]: null (no-op marks) unless armed",
+  "function dt10RefreshDecisionTop10Run_(run) {\n  var t0 = new Date().getTime();"
+ ],
+ [
+  "  SpreadsheetApp.flush();\n  dt10PhaseMark_('setup');   // v1.28.0\n  var panel = dt10ReadPanel_(sheet, ss);",
+  "  SpreadsheetApp.flush();\n  var panel = dt10ReadPanel_(sheet, ss);"
+ ],
+ [
+  "  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker\n  dt10PhaseMark_('gates');   // v1.28.0",
+  "  run.markerOwned = true;   // v1.13.10: a later throw clears this run's marker"
+ ],
+ [
+  "  dt10PhaseMark_('inputs');   // v1.28.0\n  var fundingNote = dt10FundingApply_(body, Date.now());\n  dt10PhaseMark_('funding');   // v1.28.0",
+  "  var fundingNote = dt10FundingApply_(body, Date.now());"
+ ],
+ [
+  "  var sourceContext = dt10SourceCapture_(ss);\n  dt10PhaseMark_('src');   // v1.28.0",
+  "  var sourceContext = dt10SourceCapture_(ss);"
+ ],
+ [
+  "    pool = dt10CollectPoolRows_(ss, poolLimit, sourceContext);\n    dt10PhaseMark_('pool');   // v1.28.0",
+  "    pool = dt10CollectPoolRows_(ss, poolLimit, sourceContext);"
+ ],
+ [
+  "    poolNote = dt10PoolNote_(pool, dt10SourceReadiness_(ss, sourceContext));\n  }\n  dt10PhaseMark_('ready');   // v1.28.0",
+  "    poolNote = dt10PoolNote_(pool, dt10SourceReadiness_(ss, sourceContext));\n  }"
+ ],
+ [
+  "  dt10PhaseMark_('post');   // v1.28.0\n  if (resp.code !== 200 || !resp.json) {",
+  "  if (resp.code !== 200 || !resp.json) {"
+ ],
+ [
+  "  dt10PhaseMark_('attach');   // v1.28.0\n  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  dt10PhaseMark_('verdict1');   // v1.28.0\n  // Incomplete source evidence must not advance confirmation/miss memory.\n  var stab = payload._dt10_uv.source_blocked === true ?\n      {note: 'stab: frozen (source readiness withheld)'} :\n      dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]\n  dt10PhaseMark_('stab');   // v1.28.0\n  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  dt10PhaseMark_('verdict2');   // v1.28.0\n  if (resp.local !== true) dt10ReallocateBoard_(payload, body);\n  dt10PhaseMark_('alloc');   // v1.28.0\n  dt10FinalizeBoard_(payload);\n  dt10PhaseMark_('final');   // v1.28.0\n",
+  "  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  // Incomplete source evidence must not advance confirmation/miss memory.\n  var stab = payload._dt10_uv.source_blocked === true ?\n      {note: 'stab: frozen (source readiness withheld)'} :\n      dt10ApplyStability_(payload, panel, dt10Outage);   // v1.11.10 [P-168]\n  payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);\n  if (resp.local !== true) dt10ReallocateBoard_(payload, body);\n  dt10FinalizeBoard_(payload);\n"
+ ],
+ [
+  "  var earn = dt10RenderPayload_(sheet, payload, tokens);\n  dt10PhaseMark_('render');   // v1.28.0",
+  "  var earn = dt10RenderPayload_(sheet, payload, tokens);"
+ ],
+ [
+  "      dt10OutputStatus_(payload));   // v1.11.0 (2)\n  dt10PhaseMark_('notes');   // v1.28.0",
+  "      dt10OutputStatus_(payload));   // v1.11.0 (2)"
+ ],
+ [
+  "dt10OutputStatus_(payload), sourceContext);  // v1.11.2 [P-62]\n  dt10PhaseMark_('sellog');   // v1.28.0",
+  "dt10OutputStatus_(payload), sourceContext);  // v1.11.2 [P-62]"
+ ],
+ [
+  "      (stab && stab.audit) ? stab.audit : {}, statusLine);\n  dt10PhaseMark_('exitlog');   // v1.28.0",
+  "      (stab && stab.audit) ? stab.audit : {}, statusLine);"
+ ],
+ [
+  "      finalSource && finalSource.ready ? finalSource.cohort : '');\n  dt10PhaseMark_('shadow');   // v1.28.0",
+  "      finalSource && finalSource.ready ? finalSource.cohort : '');"
+ ],
+ [
+  "  dt10PhaseMark_('status');   // v1.28.0 [RENDER-TIMING]\n  if (DT10_PH_) {\n    var phLine = dt10PhaseLine_(DT10_PH_);\n    Logger.log('[DT10 v' + DT10_VERSION + '] ' + phLine);\n    dt10RunLogRow_('INFO', 'TIMING', phLine,\n        { version: DT10_VERSION, total_ms: DT10_PH_.last - DT10_PH_.t0,\n          marks: DT10_PH_.marks });\n  }\n  Logger.log('[DT10 v' + DT10_VERSION + '] done status=' + payload.status +\n             ' in ' + secs + 's');\n  dt10RunMarkerClear_();   // v1.11.12 [P-195]: normal completion",
+  "  Logger.log('[DT10 v' + DT10_VERSION + '] done status=' + payload.status +\n             ' in ' + secs + 's');\n  dt10RunMarkerClear_();   // v1.11.12 [P-195]: normal completion"
+ ],
+ [
+  "  var venueOn = dt10VenueLineOn_();\n  var clearLate = dt10ClearLateOn_();   // v1.28.0 [CLEAR-LATE]",
+  "  var venueOn = dt10VenueLineOn_();"
+ ],
+ [
+  "  if (venueOn) payload._dt10_venue = { mode: 'on' };\n  if (clearLate) payload._dt10_clear_late = 1;   // v1.28.0 [CLEAR-LATE]: rides only when armed",
+  "  if (venueOn) payload._dt10_venue = { mode: 'on' };"
+ ],
+ [
+  "/** Clear the dynamic zones (breakApart first: section headers and empty-state\n * lines are merged ranges; writing over stale merges throws in GAS).\n * v1.28.0 [CLEAR-LATE]: lifted out of dt10RenderPayload_ unchanged. */\nfunction dt10ClearZones_(sheet) {\n  var lastRow = sheet.getMaxRows();\n  if (lastRow >= DT10_ZONES_START) {\n    var zone = sheet.getRange(DT10_ZONES_START, 1,\n                              lastRow - DT10_ZONES_START + 1,\n                              sheet.getMaxColumns());\n    zone.breakApart();\n    zone.clear();\n  }\n}\nfunction dt10RenderPayload_(sheet, payload, tokens) {\n  // v1.28.0 [CLEAR-LATE]: payload._dt10_clear_late (attached by the refresh\n  // only while DT10_CLEAR_LATE is on) moves this clear after the pre-paint\n  // steps below, so a render Google stops inside them keeps the previous\n  // board on screen. No key = the v1.27.0 order.\n  var clearLate = !!(payload && payload._dt10_clear_late === 1);\n  if (!clearLate) dt10ClearZones_(sheet);\n  dt10PhaseMark_('r_clear');   // v1.28.0 [RENDER-TIMING]\n",
+  "function dt10RenderPayload_(sheet, payload, tokens) {\n  // Clear dynamic zones (breakApart first: section headers and empty-state\n  // lines are merged ranges; writing over stale merges throws in GAS).\n  var lastRow = sheet.getMaxRows();\n  if (lastRow >= DT10_ZONES_START) {\n    var zone = sheet.getRange(DT10_ZONES_START, 1,\n                              lastRow - DT10_ZONES_START + 1,\n                              sheet.getMaxColumns());\n    zone.breakApart();\n    zone.clear();\n  }\n"
+ ],
+ [
+  "  payload._dt10_uv = dt10BoardVerdict_(sheet.getParent(), payload._dt10_source_context || {});\n  dt10PhaseMark_('r_verdict');   // v1.28.0\n  dt10FinalizeBoard_(payload);\n  dt10PhaseMark_('r_final');   // v1.28.0\n",
+  "  payload._dt10_uv = dt10BoardVerdict_(sheet.getParent(), payload._dt10_source_context || {});\n  dt10FinalizeBoard_(payload);\n"
+ ],
+ [
+  "  if (liveFillNote) payload._dt10_live_note = liveFillNote;\n  dt10PhaseMark_('r_live');   // v1.28.0",
+  "  if (liveFillNote) payload._dt10_live_note = liveFillNote;"
+ ],
+ [
+  "  var earn = dt10EarningsAnnotate_(payload, sheet.getParent());\n  dt10PhaseMark_('r_earn');   // v1.28.0",
+  "  var earn = dt10EarningsAnnotate_(payload, sheet.getParent());"
+ ],
+ [
+  "  if (postEarn) earn.note = earn.note ? earn.note + ' | ' + postEarn : postEarn;\n  dt10PhaseMark_('r_postearn');   // v1.28.0",
+  "  if (postEarn) earn.note = earn.note ? earn.note + ' | ' + postEarn : postEarn;"
+ ],
+ [
+  "  if (tguardNote) payload._dt10_tguard_note = tguardNote;\n  dt10PhaseMark_('r_guard');   // v1.28.0\n  if (clearLate) {   // v1.28.0 [CLEAR-LATE]: the zones clear here, right before the first paint\n    dt10ClearZones_(sheet);\n    dt10PhaseMark_('r_clear_late');\n  }\n  // KPI strip",
+  "  if (tguardNote) payload._dt10_tguard_note = tguardNote;\n  // KPI strip"
+ ],
+ [
+  "  dt10PhaseMark_('r_kpi');   // v1.28.0\n  var row = DT10_ZONES_START;",
+  "  var row = DT10_ZONES_START;"
+ ],
+ [
+  "  dt10ColorStability_(sheet, selT.firstDataRow, selT.count, 25, tokens);\n  dt10PhaseMark_('r_selected');   // v1.28.0",
+  "  dt10ColorStability_(sheet, selT.firstDataRow, selT.count, 25, tokens);"
+ ],
+ [
+  "  dt10ColorQualified_(sheet, qT.firstDataRow, qT.count, 14, qualified, tokens);\n  dt10PhaseMark_('r_qualified');   // v1.28.0",
+  "  dt10ColorQualified_(sheet, qT.firstDataRow, qT.count, 14, qualified, tokens);"
+ ],
+ [
+  "  dt10ColorVerdicts_(sheet, nmT.firstDataRow, nmT.count, 5, tokens);\n  dt10PhaseMark_('r_nearmiss');   // v1.28.0",
+  "  dt10ColorVerdicts_(sheet, nmT.firstDataRow, nmT.count, 5, tokens);"
+ ],
+ [
+  "  row = alT.next + 1;\n  dt10PhaseMark_('r_alerts');   // v1.28.0",
+  "  row = alT.next + 1;"
+ ],
+ [
+  "  row = gapT.next + 1;\n  dt10PhaseMark_('r_gaps');   // v1.28.0",
+  "  row = gapT.next + 1;"
+ ],
+ [
+  "  row = cT.next + 1;\n  dt10PhaseMark_('r_cands');   // v1.28.0",
+  "  row = cT.next + 1;"
+ ],
+ [
+  "      .setFontColor(DT10_MUTED).setFontSize(8).setFontStyle('italic');\n  dt10PhaseMark_('r_end');   // v1.28.0\n  return earn;",
+  "      .setFontColor(DT10_MUTED).setFontSize(8).setFontStyle('italic');\n  return earn;"
+ ],
+ [
+  "       : 'FAIL [' + vl1 + ' | ' + vl2 + ' | ' + vlSummer + ' | ' + vlSr + ' | ' + vlWk + ']'));\n  /* v1.28.0 [RENDER-TIMING]: property line (one read) + pure battery on local\n     clocks only (the execution's own DT10_PH_ is never touched). */\n  report.push('render timing (DT10_RENDER_TIMING): ' + (dt10RenderTimingOn_() ? 'on' : 'off') +\n      ' (phase lines stream to the execution log; a finished render writes one TIMING row to _Run_Log; ' +\n      'the P-195 marker keeps the last phase reached); clear late (DT10_CLEAR_LATE): ' +\n      (dt10ClearLateOn_() ? 'on' : 'off') + ' (the board zones clear after the pre-paint steps, so a stopped ' +\n      'render keeps the previous board)');\n  var rtClock = { t0: 1000, last: 4300, marks: [['setup', 1200], ['pool', 2100]] };\n  var rtLine = dt10PhaseLine_(rtClock);\n  var rtTrail = dt10PhaseTrailNote_('{\"started\":\"2026-11-09T05:44:28.522Z\",\"v\":\"1.28.0\",' +\n      '\"entry\":\"refreshDecisionTop10\",\"ph\":\"alloc\",\"at\":251.4}');\n  report.push('render timing core: ' +\n      ((rtLine === 'phases 3.3s: setup 1.2 | pool 2.1' &&\n        rtTrail === '; last phase reached: alloc at t+251.4s' &&\n        dt10PhaseTrailNote_('{\"started\":\"2026-11-09T05:44:28.522Z\",\"v\":\"1.27.0\",\"entry\":\"refreshDecisionTop10\"}') === '' &&\n        dt10PhaseTrailNote_('2026-11-09T05:44:28.522Z') === '' && dt10PhaseTrailNote_('') === '' &&\n        dt10PhaseTrailNote_('{\"ph\":\"alloc\",\"at\":null}') === '' && dt10PhaseLine_(null) === '')\n       ? 'ok (phase line, last-phase trail; a marker without a phase adds nothing)'\n       : 'FAIL [' + rtLine + ' | ' + rtTrail + ']'));\n  var msg = report.join('\\n');",
+  "       : 'FAIL [' + vl1 + ' | ' + vl2 + ' | ' + vlSummer + ' | ' + vlSr + ' | ' + vlWk + ']'));\n  var msg = report.join('\\n');"
+ ]
+]

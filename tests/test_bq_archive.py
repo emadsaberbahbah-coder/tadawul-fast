@@ -294,7 +294,7 @@ def test_a6_workflow():
     on = wf.get(True) or wf.get("on")
     assert on["schedule"] == [{"cron": "5 23 * * *"}]
     assert on["workflow_dispatch"]["inputs"]["write"]["default"] is False
-    assert wf["permissions"] == {"contents": "read"}
+    assert wf["permissions"] == {"contents": "read", "actions": "read"}
     step = [s for s in wf["jobs"]["archive"]["steps"] if s.get("name", "").endswith("Run the archive")][0]
     env = step["env"]
     assert env["TFB_BQ_ARCHIVE"] == "${{ vars.TFB_BQ_ARCHIVE || 'on' }}"

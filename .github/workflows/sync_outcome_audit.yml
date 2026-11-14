@@ -60,7 +60,7 @@ jobs:
     name: Verify required market pages actually refreshed
     if: >-
       ${{
-        (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') ||
+        (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch')) ||
         github.event_name == 'workflow_dispatch'
       }}
     runs-on: ubuntu-24.04

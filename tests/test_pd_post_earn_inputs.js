@@ -196,9 +196,11 @@ ok(r.status === 'unavailable', 'E5 getSheetByName throws');
 const realDate = global.Date;
 global.Date = class extends realDate { constructor(...args) { if (args.length) super(...args); else super(NOW.getTime()); } static now() { return NOW.getTime(); } };
 r = pdPostEarnBody_(sheetSs({ rows: 7, cols: 10, values: grid() }), rows);
-global.Date = realDate;
 ok(r.status === 'ok' && deep(Object.keys(r.map), ['FRST.US']) && r.map['FRST.US'].sessions === 4, 'E5 live read, held symbols from the rows');
+// 2026-11-04: the no-rows read runs on the same frozen clock (it ran on the real clock and failed once the
+// fixture's dates aged out: a time bomb, red on main since 4 Nov 00:00 UTC).
 r = pdPostEarnBody_(sheetSs({ rows: 7, cols: 10, values: grid() }), null);
+global.Date = realDate;
 ok(r.status === 'ok' && deep(r.map, {}), 'E5 no rows -> empty map');
 console.log('E5 PASS live read');
 

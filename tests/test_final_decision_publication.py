@@ -32,7 +32,7 @@ def current_publication_grids():
             row[3] = row[3].replace(f"acquired={row[6]}/{row[6]}", f"acquired={approved}/{approved}")
             row[6] = approved
     top10[1][1] = top10[1][1].replace("Market_Leaders 1356/1356", "Market_Leaders 255/255").replace(
-        "Mutual_Funds 4496/4496", "Mutual_Funds 2474/2474")
+        "Mutual_Funds 4496/4496", "Mutual_Funds 2422/2422")
     return sources, portfolio, top10
 
 
@@ -461,7 +461,7 @@ def test_real_finalizer_and_live_freshness_reader_enforce_consumed_source_run(mo
             receipt["excluded"][0]["owner"] = "Commodities_FX"
         elif fault == "pool_capped":
             receipt["pages"]["Mutual_Funds"]["included"] -= 1
-            top10[1][1] = top10[1][1].replace("2469/2474", "2468/2474")
+            top10[1][1] = top10[1][1].replace("2417/2422", "2416/2422")
         if fault != "pool_missing_receipt":
             _attach_pool_receipt(surfaces, receipt)
     for row in sources[1:]:

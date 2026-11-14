@@ -1,0 +1,161 @@
+# =============================================================================
+# 🗓️ Daily Plan - one decision a day, frozen
+# -----------------------------------------------------------------------------
+# VERSION 1.6.0 (2026-11-13)
+#
+# 1.6.0: CASH FROM THE BROKER (daily_plan 1.7.0). TFB_PLAN_CASH_SOURCE = ibkr
+# (default): the newest read-only IBKR capture on Drive, at most
+# TFB_PLAN_IBKR_MAX_AGE_H hours old; else the 1.5.0 rule.
+#
+# 1.5.0: CASH FROM THE CASH LEDGER (daily_plan 1.6.0). The cut sizes from the
+# smaller of the main page's typed cash cell and the latest _Cash_Snapshot
+# balance: TFB_PLAN_CASH_SOURCE lower | snapshot | panel.
+#
+# 1.4.0: STABILITY AND QUOTE AGE (daily_plan 1.5.0; consolidated plan of 12 Nov).
+# A new name is picked first when its score is at the entry level (72); a
+# previous pick keeps its place down to the exit level (67): TFB_PLAN_STABLE
+# off | prefer | strict. A price older than TFB_PLAN_QUOTE_MAX_AGE_H reads CHECK.
+#
+# 1.3.0: DIVIDEND TAX (owner, 11 Nov 17:01; daily_plan 1.4.0). A US name whose
+# ex-dividend is within 10 days waits until after it when the 30% withholding
+# would cost 0.25% of the price or more (TFB_PLAN_DIV_TAX* / TFB_PLAN_WHT_PCT).
+#
+# 1.2.0: ACTIVE HOURS (owner, 11 Nov 14:16). Minute 20 from 07:20 to 23:20
+# Riyadh (17 runs) plus after every sync; no plan is cut before 07:00 Riyadh
+# (daily_plan 1.3.0, TFB_PLAN_CUT_FROM_H).
+#
+# 1.1.0: HOURLY (owner, 11 Nov 12:52). The plan is checked every hour at
+# minute 20; the picks stay frozen and their status uses live prices
+# (daily_plan 1.2.0, TFB_PLAN_LIVE_PRICE=on). The after-sync trigger stays.
+#
+# 1.0.1: daily_plan 1.1.0's evidence rule is mapped in OBSERVE (a label on every
+# qualified name; picks are chosen as before). on = a name that is not PASS is
+# not picked. Rollback: repository variable TFB_PLAN_EVIDENCE=off.
+#
+# WHY: a ticket on the main page existed only while six conditions held at the
+# same moment, each re-tested on every render (6-9 Nov: 32 board versions in
+# 77 hours, 4 of 319 seat-slots carried a ticket; the funded render timed out
+# at the Apps Script 6-minute limit on all 7 logged attempts of 9-10 Nov).
+# scripts/daily_plan.py 1.0.0 cuts one plan per Riyadh day from the first
+# finished, verified render of the main page and freezes it: later runs only
+# refresh each pick's status. It reads the workbook and writes its own two
+# tabs (_Daily_Plan, Daily_Plan); it calls no backend and no broker.
+#
+# WHEN: after every production sync finishes (workflow_run fires on the
+# event, so GitHub's late cron does not delay it), waiting up to 45 minutes
+# for the main page's verified render; three scheduled runs a day refresh the
+# status (a late start only delays that refresh); dispatch by hand.
+#
+# Rollback: set the repository variable TFB_DAILY_PLAN=off.
+# =============================================================================
+name: 🗓️ Daily Plan
+
+on:
+  workflow_run:
+    workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
+    types: [completed]
+  schedule:
+    - cron: "20 4-20 * * *"         # 07:20-23:20 Riyadh
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and print only (write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tfb-daily-plan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  daily_plan:
+    name: 🗓️ Cut or refresh the frozen plan
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.event == 'schedule' ||
+      github.event.workflow_run.event == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 google-auth
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 🗓️ Run the daily plan
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_DAILY_PLAN: ${{ vars.TFB_DAILY_PLAN || 'on' }}
+          TFB_PLAN_PICKS: ${{ vars.TFB_PLAN_PICKS || '3' }}
+          TFB_PLAN_FUNDABLE_CCY: ${{ vars.TFB_PLAN_FUNDABLE_CCY || 'USD,SAR' }}
+          TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
+          TFB_PLAN_EXDIV_DAYS: ${{ vars.TFB_PLAN_EXDIV_DAYS || '3' }}
+          TFB_PLAN_EXDIV_PCT: ${{ vars.TFB_PLAN_EXDIV_PCT || '2.0' }}
+          TFB_PLAN_HELD_TARGET_MAX_H: ${{ vars.TFB_PLAN_HELD_TARGET_MAX_H || '48' }}
+          TFB_PLAN_STOP_PCT: ${{ vars.TFB_PLAN_STOP_PCT || '8' }}
+          TFB_PLAN_RISK_PCT_NAV: ${{ vars.TFB_PLAN_RISK_PCT_NAV || '1.0' }}
+          TFB_PLAN_MAX_WEIGHT_PCT: ${{ vars.TFB_PLAN_MAX_WEIGHT_PCT || '15' }}
+          TFB_PLAN_CASH_FLOOR_PCT: ${{ vars.TFB_PLAN_CASH_FLOOR_PCT || '10' }}
+          TFB_PLAN_MIN_TICKET_SAR: ${{ vars.TFB_PLAN_MIN_TICKET_SAR || '2000' }}
+          TFB_PLAN_KEEP_RANK: ${{ vars.TFB_PLAN_KEEP_RANK || '8' }}
+          TFB_PLAN_COOLDOWN_DAYS: ${{ vars.TFB_PLAN_COOLDOWN_DAYS || '10' }}
+          TFB_PLAN_UNVERIFIED_AFTER_H: ${{ vars.TFB_PLAN_UNVERIFIED_AFTER_H || '15' }}
+          TFB_PLAN_EVIDENCE: ${{ vars.TFB_PLAN_EVIDENCE || 'observe' }}
+          TFB_PLAN_EV_RISK_MAX: ${{ vars.TFB_PLAN_EV_RISK_MAX || '30' }}
+          TFB_PLAN_EV_UPSIDE_MIN: ${{ vars.TFB_PLAN_EV_UPSIDE_MIN || '15' }}
+          TFB_PLAN_LIVE_PRICE: ${{ vars.TFB_PLAN_LIVE_PRICE || 'on' }}
+          TFB_PLAN_CUT_FROM_H: ${{ vars.TFB_PLAN_CUT_FROM_H || '7' }}
+          TFB_PLAN_DIV_TAX: ${{ vars.TFB_PLAN_DIV_TAX || 'on' }}
+          TFB_PLAN_DIV_TAX_DAYS: ${{ vars.TFB_PLAN_DIV_TAX_DAYS || '10' }}
+          TFB_PLAN_DIV_TAX_MIN_PCT: ${{ vars.TFB_PLAN_DIV_TAX_MIN_PCT || '0.25' }}
+          TFB_PLAN_WHT_PCT: ${{ vars.TFB_PLAN_WHT_PCT || '30' }}
+          TFB_PLAN_STABLE: ${{ vars.TFB_PLAN_STABLE || 'prefer' }}
+          TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}
+          TFB_PLAN_IBKR_MAX_AGE_H: ${{ vars.TFB_PLAN_IBKR_MAX_AGE_H || '30' }}
+          TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
+          TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
+          TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}
+          TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
+          TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
+        run: |
+          EXTRA=""
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            EXTRA="--wait-min 45"
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            EXTRA="--dry-run"
+          fi
+          python scripts/daily_plan.py $EXTRA

@@ -31,7 +31,7 @@ from scripts.approved_universe_scope import (
 )
 from scripts.workflow_validation_scope import SOURCE_PAGES, strict_json
 
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.1.3"   # 1.1.3 (2026-11-05): Mutual_Funds baseline 2422 = the approved fund scope v2
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -39,8 +39,12 @@ REQUIRED_PAGES = {
     "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
     "My_Portfolio", "Insights_Analysis", "Data_Dictionary",
 }
+# The two scoped pages read their floor from config/approved_universe_scope_v1.json
+# (final_policy); their baselines here mirror it so a test can prove no env weakens
+# them. 2026-11-05: Mutual_Funds 2474 -> 2422 with policy 2026-11-05.mf-retire-52.v2
+# (52 dead fund rows retired, owner approval); every other floor is unchanged.
 MARKET_FLOORS = {"Market_Leaders": 255, "Global_Markets": 6512,
-                 "Commodities_FX": 453, "Mutual_Funds": 2474}
+                 "Commodities_FX": 453, "Mutual_Funds": 2422}
 # The per-leg validator has always allowed these advisory WARNs (exit 1).
 # Moving validation stages must not turn them into a new release policy.
 SOFT_VALIDATION_WARNINGS = frozenset({

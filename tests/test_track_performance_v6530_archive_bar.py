@@ -418,6 +418,23 @@ def test_s2_bq_archive_matures_on_the_archive_bar_with_one_query():
         _s2_case(close, outcome)
 
 
+def test_s2v_a_record_matured_in_the_pass_is_valid_evidence_in_the_pass():
+    """v6.54.0 [MATURED-VALID] (14 Nov review): a row loaded with a blank Realized ROI starts invalid; once it
+    matures in this pass the summary cohort counts it, as the saved and reloaded row would."""
+    tp._LAST_HIST_CLOSE.clear()
+    rec = record(tp)
+    rec.realized_roi_source_valid = False                         # as the loader reads a blank Realized ROI
+    audit(tp, [rec], [row()], env=BQ, session=FakeSession({"SYNTH.US": bars(104.0)}), bar_map={})
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi == pytest.approx(4.0)
+    assert rec.realized_roi_source_valid is True
+    cohort, duplicates, invalid = tp._summary_outcome_cohort([rec])
+    assert [r.key for r in cohort] == [rec.key] and (duplicates, invalid) == (0, 0)
+    left = record(tp)
+    left.realized_roi_source_valid = False                        # not matured in the pass: untouched
+    audit(tp, [left], [row()], env=BQ, session=FakeSession({"OTHER.US": bars(1.0)}), bar_map={})
+    assert left.status != tp.PerformanceStatus.MATURED and left.realized_roi_source_valid is False
+
+
 def _s2_case(close, outcome):
     tp._LAST_HIST_CLOSE.clear()
     rec = record(tp)
@@ -1030,8 +1047,7 @@ def test_w1_workflows_crons_env_parity_version_and_pin():
         assert clock_line == daily_line and len(clock_line) == 1, name          # ENV PARITY
     assert "TRACK_HIST_TARGET_CLOSE" not in daily                               # the v6.47.0 invariant holds
     src = DELIVERED.read_text(encoding="utf-8")
-    # 2026-11-02 (#845 merge, 6.54.0): a floor, so a later release keeps this green.
-    assert tuple(int(x) for x in tp.SCRIPT_VERSION.split(".")[:3]) >= (6, 53, 0), tp.SCRIPT_VERSION
+    assert tuple(int(x) for x in tp.SCRIPT_VERSION.split(".")) >= (6, 53, 0)   # later builds stack on 6.53.0
     assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]
     assert re.search(r'os\.getenv\("TRACK_HIST_CLOSE_SOURCE"\)\s*or\s*"yfinance"', src)
     assert re.search(r'os\.getenv\("TRACK_AUDIT_DUE_ONLY"\)\s*or\s*"0"', src)
@@ -1096,7 +1112,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
     title = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
     assert title % "6.50.0" in removed and 'SCRIPT_VERSION = "6.50.0"' in removed
     assert len(removed) <= 16, removed                             # the anchored replacements only
-    fresh = [ln for ln in added if ln != title % tp.SCRIPT_VERSION]   # 2026-11-02: was "6.53.0"
+    fresh = [ln for ln in added if ln != title % tp.SCRIPT_VERSION]
     assert fresh and all(ln.isascii() for ln in fresh), [ln for ln in fresh if not ln.isascii()][:3]
     import ast
 
@@ -1104,15 +1120,11 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
         return {n.name for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     gone = fns("\n".join(old)) - fns("\n".join(new))
     assert not gone, gone
-    mine = {
+    assert fns("\n".join(new)) - fns("\n".join(old)) == {
         "_hist_close_source", "_bq_project", "_bq_dataset", "_bq_location", "_audit_due_only_enabled",
         "_audit_due_symbols", "_archive_bar_module", "_archive_bar_session", "_archive_bar_scrub",
         "_archive_bar_query", "_archive_bar_rows", "_hist_archive_prefetch", "_hist_close_bars_for",
         "_hist_close_candidate_session"}
-    if tp.SCRIPT_VERSION == "6.53.0":        # exactly this release's additions
-        assert fns("\n".join(new)) - fns("\n".join(old)) == mine
-    else:                                    # 2026-11-02 (#845 merge): a later release may add more
-        assert mine <= fns("\n".join(new)) - fns("\n".join(old))
 
 
 if __name__ == "__main__":
