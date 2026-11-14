@@ -2,6 +2,12 @@
 """
 scripts/ibkr_capture.py - the latest read-only IBKR capture, for the plan pages
 ================================================================================
+VERSION 1.1.0 (2026-11-13, audit) - share-class symbols and unclear orders
+  symbol_of('BRK B') -> 'BRK.B.US' (was 'BRK.B'); an order description keeps the
+  class letter ('Buy 3 BRK B ...' -> 'BRK.B.US', was 'BRK.US'); key() / rekey()
+  file the capture under the workbook's spelling (BRK-B.US). A working order
+  whose side or name cannot be read is filed as a buy without a price, so the
+  broker's cash is not used (as the workbook's reader does). Rollback: revert.
 VERSION 1.0.0 (2026-11-13) - NEW MODULE
 
 WHY (owner, 13 Nov 2026 11:51 Riyadh: "the action plan should be as per the cash
@@ -45,7 +51,7 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -58,7 +64,9 @@ _FOLDER_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 # An order that can no longer trade. Matched on the WHOLE status: "PARTIALLY_FILLED" is still working for its
 # remaining shares (Codex P1, #972), and an unknown status is kept as working.
 _DONE_RE = re.compile(r"^(FILLED|(API_?)?CANCELL?ED|EXPIRED|INACTIVE|REJECTED)$", re.I)
-_DESC_RE = re.compile(r"^(buy|sell)\s+[\d,\.]+\s+(\S+)", re.I)
+_DESC_RE = re.compile(r"^(buy|sell)\s+[\d,\.]+\s+([A-Za-z0-9.\-]+(?:\s[A-Za-z](?=[\s,]|$))?)", re.I)
+_CLASS_SPACE_RE = re.compile(r"^([A-Z]{1,5}) ([A-Z])$")               # IBKR's share-class spelling: 'BRK B'
+_CLASS_KEY_RE = re.compile(r"^([A-Z]{1,5})[.\-]([A-Z])\.US$")        # 'BRK.B.US' / 'BRK-B.US' 
 _STP_RE = re.compile(r"STP\s+(?:LMT\s+)?([\d,]*\.?\d+)", re.I)
 
 
@@ -97,9 +105,48 @@ def _time(v: Any) -> Optional[_dt.datetime]:
 
 
 def symbol_of(base: str) -> str:
-    """IBKR's bare symbol as the workbook writes it: 'DDI' -> 'DDI.US'; one that already has a suffix is kept."""
-    s = str(base or "").strip().upper().replace(" ", ".")
+    """IBKR's bare symbol as the workbook writes it: 'DDI' -> 'DDI.US'; one that already has a suffix is kept.
+    1.1.0: IBKR's share-class spelling 'BRK B' -> 'BRK.B.US' (1.0.0 gave 'BRK.B', which no workbook symbol
+    matched, while the same name's orders were filed under 'BRK.US')."""
+    s = re.sub(r"\s+", " ", str(base or "").strip().upper())
+    m = _CLASS_SPACE_RE.match(s)
+    if m:
+        return "%s.%s.US" % (m.group(1), m.group(2))
+    s = s.replace(" ", ".")
     return s if "." in s else (s + ".US" if s else "")
+
+
+def key(symbol: str) -> str:
+    """1.1.0: one comparison key for a US share-class symbol however it is spelled ('BRK-B.US', 'BRK.B.US' ->
+    'BRK.B.US'); every other symbol is only upper-cased."""
+    s = str(symbol or "").strip().upper()
+    m = _CLASS_KEY_RE.match(s)
+    return "%s.%s.US" % (m.group(1), m.group(2)) if m else s
+
+
+def rekey(cap: Dict[str, Any], symbols: Any) -> Dict[str, Any]:
+    """1.1.0: a copy of a parsed capture whose positions, stops, limits and buys are filed under the workbook's
+    own spelling of each symbol in `symbols` when the two spell the same name differently (BRK-B.US in the
+    workbook, BRK.B.US in the capture). Other entries keep their key. PURE."""
+    if not isinstance(cap, dict):
+        return cap
+    want = {}
+    for sym in symbols or ():
+        want.setdefault(key(sym), sym)
+    out = dict(cap)
+    for part in ("positions", "stops", "limits", "buys"):
+        src = cap.get(part)
+        if not isinstance(src, dict):
+            continue
+        dst: Dict[str, Any] = {}
+        for sym, val in src.items():
+            k = want.get(key(sym), sym)
+            if k in dst:
+                dst[k] = (dst[k] + val) if isinstance(val, (int, float)) else list(dst[k]) + list(val)
+            else:
+                dst[k] = val
+        out[part] = dst
+    return out
 
 
 def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name: str = "") -> Dict[str, Any]:
@@ -164,12 +211,22 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
         if _DONE_RE.match(re.sub(r"[\s-]+", "_", str(o.get("order_status") or "").strip())):
             continue
         m = _DESC_RE.match(str(o.get("primary_description") or ""))
-        if not m:
-            continue
-        side = str(o.get("side") or m.group(1)).upper()
-        sym = symbol_of(m.group(2))
+        side = str(o.get("side") or (m.group(1) if m else "")).strip().upper()
+        side = {"B": "BUY", "BOT": "BUY", "S": "SELL", "SLD": "SELL"}.get(side, side)
         rem = _num(o.get("remaining_shares_qty"))
         qty = rem if rem is not None else _num(o.get("total_shares_qty"))
+        if side not in ("BUY", "SELL") or (side == "BUY" and not m):
+            # 1.1.0: a working order whose side or name cannot be read may hold cash. It is filed as a buy
+            # without a price, so reserved_usd() reports the reservations incomplete and the broker's cash is
+            # not used (the workbook's reader does the same); 1.0.0 dropped it or read it as a sell.
+            out["n_orders"] += 1
+            out.setdefault("unclear", 0)
+            out["unclear"] += 1
+            out["buys"].setdefault(symbol_of(m.group(2)) if m else "?", []).append((None, qty or 0.0))
+            continue
+        if not m:
+            continue
+        sym = symbol_of(m.group(2))
         if not sym or not qty or qty <= 0:
             continue
         typ = str(o.get("order_type") or "").upper()

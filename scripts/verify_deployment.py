@@ -180,7 +180,7 @@ SCRIPT_VERSION = "1.0.61"  # v1.0.49 (2026-10-11) - pins data_engine_v2 5.152.0-
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
-    ('main', 'APP_ENTRY_VERSION', '8.14.8', 'application route diagnostics'),
+    ('main', 'APP_ENTRY_VERSION', '8.14.9', 'application route diagnostics'),
     ('core.price_precision', '__version__', '1.0.0', 'price rounding contract'),
     ('core.symbols.crypto_identity', '__version__', '1.0.0', 'crypto name vocabulary'),
     ('core.symbols.normalize', '__version__', '5.7.1', 'symbol normalization'),
@@ -211,7 +211,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-08 (post-mortem item 3; manifest pin only): 1.28.0 -> 1.29.0
     # (TFB_OPP_SIZING_MODE=risk + TFB_OPP_RISK_BUDGET_PCT, default cap).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.29.0", "opportunity builder"),
+     "1.29.1", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
@@ -362,9 +362,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("exit_plan", "1.3.2", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.4.0", "today action plan"),
+    ("today_action_plan", "1.4.1", "today action plan"),
     ("plan_archive", "1.0.0", "plan archive"),
-    ("ibkr_capture", "1.0.0", "ibkr capture"),
+    ("ibkr_capture", "1.1.0", "ibkr capture"),
     ("cash_cells", "1.0.0", "cash cells"),
     ("sheets_quota", "1.0.0", "sheets quota"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.

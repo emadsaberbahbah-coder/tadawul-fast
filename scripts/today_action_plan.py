@@ -4,7 +4,10 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.4.0 (2026-11-13)
+v1.4.1 (2026-11-13)
+  1.4.1: apply_capture reads the capture under the workbook's spelling of each held or picked symbol
+         (scripts/ibkr_capture.py 1.1.0 rekey): a share-class name such as BRK-B.US is found at the broker and its
+         working stop is seen, instead of reading "not at IBKR" / "no stop working". Nothing else changes.
   1.4.0: THE RUN IS KEPT IN BIGQUERY FOR THE DASHBOARD (owner, 13 Nov 22:44: "add action plan to the IBKR Dashboard").
          After the live page is written (never for a preview or a dry run), scripts/plan_archive.py appends the run's
          steps (with their chip), the five tiles and the summary line to <dataset>.today_action_plan, so the IBKR
@@ -152,7 +155,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -613,8 +616,10 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
     if cap["age_h"] > max_age_h:
         out["why"] = "the newest capture is %.0f h old (limit %.0f h)" % (cap["age_h"], max_age_h)
         return out
-    from scripts.ibkr_capture import reserved_usd, stop_cover  # noqa: PLC0415
+    from scripts.ibkr_capture import rekey, reserved_usd, stop_cover  # noqa: PLC0415
     picks = set(p["symbol"] for p in (plan["picks"] if plan.get("is_today") else []) if p["status"] == "OPEN")
+    # 1.4.1: the capture's entries under the workbook's spelling of each symbol (BRK-B.US vs BRK.B.US)
+    cap = rekey(cap, list(picks) + [h["symbol"] for h in holdings])
     usd = min(x for x in (cap.get("cash_usd"), cap.get("settled_usd")) if x is not None)
     held_back, complete = reserved_usd(cap, picks)
     # a working buy on another name without a limit price holds an unknown amount: the broker's cash is then not

@@ -56,7 +56,7 @@ def test_c1_parse_reads_cash_positions_and_working_orders():
     assert p["ok"] and p["reason"] == "" and p["name"].endswith("084101.json")
     assert p["as_of"] == dt.datetime(2026, 11, 13, 5, 41, 1, 522873, tzinfo=UTC) and round(p["age_h"], 2) == 3.32
     assert (p["cash_usd"], p["settled_usd"], p["nav_usd"], p["stock_usd"]) == (4679.15, 4500.0, 22071.82, 17361.74)   # USD row
-    assert p["positions"] == {"DDI.US": 240.0, "GLPI.US": 79.0, "NMM.US": 24.0, "BRK.B": 3.0}       # flat position dropped
+    assert p["positions"] == {"DDI.US": 240.0, "GLPI.US": 79.0, "NMM.US": 24.0, "BRK.B.US": 3.0}       # flat position dropped
     assert p["stops"] == {"DDI.US": [(14.8, 120.0)], "GLPI.US": [(35.74, 79.0), (35.1, 40.0)], "NMM.US": [(1080.98, 24.0)]}
     assert p["limits"] == {"NMM.US": [(99.5, 24.0)]}
     assert p["buys"] == {"INSW.US": [(99.4, 20.0)], "AX.US": [(None, 5.0)]} and p["n_orders"] == 7   # done orders skipped
@@ -168,3 +168,44 @@ def test_c3_latest_reads_the_newest_file_and_never_raises(monkeypatch):
     assert ic.latest(NOW)["reason"].startswith("capture read failed (")                           # no credentials: no raise
     src = (ROOT / "scripts/ibkr_capture.py").read_text(encoding="utf-8")
     assert "drive.readonly" in src and "auth/drive\"" not in src and ".post(" not in src and ".patch(" not in src and ".delete(" not in src
+
+
+# ---- 1.1.0: share-class symbols and unclear orders ---------------------------------------------------------------
+def _cap_with(orders, positions=None):
+    c = capture()
+    c["orders"] = {"orders": orders}
+    if positions is not None:
+        c["positions"] = {"positions": positions}
+    return ic.parse(c, CREATED, NOW, "x.json")
+
+
+def test_c110_share_class_position_and_orders_share_one_symbol():
+    p = _cap_with([order("Sell 3 BRK B", "STOP", "SELL", "STP 450.00, GTC", total="3"),
+                   order("Buy 3 BRK B", "LIMIT", "BUY", "Limit 480.00, Day", total="3", limit="480")],
+                  [{"contract_description": "BRK B", "position": 3.0}])
+    assert p["positions"] == {"BRK.B.US": 3.0}
+    assert p["stops"] == {"BRK.B.US": [(450.0, 3.0)]} and p["buys"] == {"BRK.B.US": [(480.0, 3.0)]}
+
+
+def test_c110_rekey_files_under_the_workbook_spelling():
+    p = _cap_with([order("Sell 3 BRK B", "STOP", "SELL", "STP 450.00, GTC", total="3")],
+                  [{"contract_description": "BRK B", "position": 3.0}, {"contract_description": "DDI", "position": 1.0}])
+    r = ic.rekey(p, ["BRK-B.US", "DDI.US"])
+    assert r["positions"] == {"BRK-B.US": 3.0, "DDI.US": 1.0} and ic.stop_cover(r, "BRK-B.US") == (450.0, 3.0)
+    assert p["positions"] == {"BRK.B.US": 3.0, "DDI.US": 1.0}          # the parsed capture is not changed
+    assert ic.key("BRK-B.US") == ic.key("brk.b.us") == "BRK.B.US" and ic.key("VOD.L") == "VOD.L"
+
+
+def test_c110_plain_tickers_and_descriptions_unchanged():
+    assert ic.symbol_of("DDI") == "DDI.US" and ic.symbol_of("2222.SR") == "2222.SR"
+    p = _cap_with([order("Sell 79 GLPI", "STOP", "SELL", "STP 35.74, GTC", total="79")])
+    assert p["stops"] == {"GLPI.US": [(35.74, 79.0)]}
+
+
+def test_c110_unclear_working_buy_makes_cash_incomplete():
+    p = _cap_with([order("Buy 10 INSW", "LIMIT", "B", "Limit 100, Day", total="10", limit="100")])
+    assert p["buys"] == {"INSW.US": [(100.0, 10.0)]}                   # 'B' is read as a buy
+    p = _cap_with([order("Buy 10 INSW", "LIMIT", "XYZ", "Limit 100, Day", total="10", limit="100")])
+    assert p["unclear"] == 1 and ic.reserved_usd(p) == (0.0, False)
+    p = _cap_with([order("??", "LIMIT", "BUY", "Limit 100, Day", total="10", limit="100")])
+    assert p["unclear"] == 1 and ic.reserved_usd(p)[1] is False

@@ -475,7 +475,11 @@ class _StrictJSONResponse(JSONResponse):
 # open-ticket ADD guards (no boot line; the v8.14.1 / v8.14.4 gap). Additive
 # keys only; an unset gate reports "unset". No route, auth or engine change.
 # Rollback: remove the keys and restore 8.14.7.
-APP_ENTRY_VERSION = "8.14.8"
+# v8.14.9 (2026-11-13): /health worker_boot_utc is per worker - a forked or
+# recycled gunicorn worker stamps its own boot time instead of inheriting the
+# master's import-time value. Provenance only; no route, auth or engine change.
+# Rollback: restore 8.14.8.
+APP_ENTRY_VERSION = "8.14.9"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -534,6 +538,32 @@ SERVICE_VERSION = APP_ENTRY_VERSION
 # means the worker restarted (Render deploy / ENV change / crash) -- the event
 # that wipes the engine's per-worker in-memory fund cache.
 _PROCESS_BOOT_UTC: str = datetime.now(timezone.utc).isoformat()
+_PROCESS_BOOT_PID: int = os.getpid()
+
+
+def _reset_boot_stamp_after_fork() -> None:
+    """v8.14.9: a forked worker gets its own boot stamp.
+
+    When the app module is imported before gunicorn forks (preload, or any
+    import in the master), every worker inherited the master's import-time
+    stamp, so /health showed the same worker_boot_utc after a worker was
+    recycled (13 Nov 2026: 7 recycles in 24 h, pid 862 -> 1109, stamp
+    unchanged at the 9 Nov deploy time)."""
+    global _PROCESS_BOOT_UTC, _PROCESS_BOOT_PID
+    _PROCESS_BOOT_UTC = datetime.now(timezone.utc).isoformat()
+    _PROCESS_BOOT_PID = os.getpid()
+
+
+def _current_boot_stamp() -> str:
+    if os.getpid() != _PROCESS_BOOT_PID:
+        _reset_boot_stamp_after_fork()
+    return _PROCESS_BOOT_UTC
+
+
+try:
+    os.register_at_fork(after_in_child=_reset_boot_stamp_after_fork)
+except Exception:  # pragma: no cover - platforms without fork
+    pass
 
 # Project-canonical 8-value boolean vocabulary.
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
@@ -2298,7 +2328,7 @@ def _deploy_provenance() -> Dict[str, Any]:
     try:
         out: Dict[str, Any] = {k.lower(): _env_or_unset(k) for k in _DEPLOY_ENVS}
         out["worker_pid"] = int(os.getpid())
-        out["worker_boot_utc"] = _PROCESS_BOOT_UTC
+        out["worker_boot_utc"] = _current_boot_stamp()
         return out
     except Exception:
         return {}
