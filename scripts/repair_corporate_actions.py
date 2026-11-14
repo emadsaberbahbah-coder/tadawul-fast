@@ -1,6 +1,24 @@
 """
 scripts/repair_corporate_actions.py — Performance_Log CA sweep & repair
 ========================================================================
+VERSION 1.1.1  (2026-11-14)  — THE REPAIR TAG IS NEVER CUT OFF
+WHY: the first apply (run 43638975586) rebased 12 MBRX rows, but five of them
+already held long Notes (the outcome-price receipt, 600-769 characters) and
+the tag was appended and the whole cell cut to 250 characters: the receipt
+lost its tail and the `ca_adjusted` tag itself was cut away, so the next run
+would have rebased those rows a SECOND time (-35.7% -> -96.8%). The daily job
+was disabled the same evening, before any second run.
+WHAT:
+  * _tag_notes keeps the whole of the existing Notes and appends the tag;
+    nothing is truncated (a Sheets cell holds 50,000 characters).
+  * --retag FILE (default config/corporate_actions_retag.json): rows already
+    rebased once whose tag was lost. Each is retagged once, and only while its
+    Entry Price is still exactly the original divided by the factor; a
+    matured row gets its original Notes back (from the archived snapshot,
+    SHA-256 checked); an active row keeps its current Notes. Those rows are
+    never in the rebase plan. A row whose entry no longer matches is HELD.
+  * plan rows carry their Record ID.
+
 VERSION 1.1.0  (2026-11-14)  — A REVIEWED SEED, AND FINISHED OUTCOMES REPAIRED
 WHY (owner 14 Nov: "move to the next action"; reviews of 13-14 Nov): the
 _Corporate_Actions register was header-only, so nothing was ever repaired:
@@ -45,6 +63,7 @@ GOVERNANCE (hard rules):
 USAGE:
   --selftest                       offline fixtures, no network
   --seed FILE                      reviewed confirmed actions (1.1.0)
+  --retag FILE                     rows rebased once whose tag was lost (1.1.1)
   --scan            (default)     dry-run: print plan + proposals
   --apply                         execute the confirmed plan + write proposals
   --sheet-id ID                   override spreadsheet id
@@ -68,7 +87,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import corporate_actions as ca  # noqa: E402
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 _RIYADH = timezone(timedelta(hours=3))
 PL_TAB = "Performance_Log"
 
@@ -132,6 +151,7 @@ def plan_repairs(values: Sequence[Sequence[Any]],
             continue
         item = {
             "sheet_row": r_i + 1, "symbol": sym, "date": str(d or ""),
+            "record_id": str(_cell(row, cols.get("Record ID")) or "").strip(),      # 1.1.1
             "factor": f,
             "entry_old": ep, "entry_new": round(ep / f, 6),
             "target_old": tp,
@@ -179,6 +199,51 @@ def _finished_repair(row: Sequence[Any], cols: Dict[str, Optional[int]], sym: st
     out: Dict[str, Any] = {"exit_old": cur, "exit_new": round(cur_new, 6), "roi_old": roi_old, "roi_new": roi_new,
                            "outcome_new": "WIN" if roi_new > 0 else ("LOSS" if roi_new < 0 else "BREAKEVEN")}
     return out
+
+
+def _tag_notes(notes_old: str, tag: str) -> str:
+    """1.1.1: the existing Notes, whole, then the tag. Never truncated: cutting the cell is how 1.1.0 lost the tag
+    (and the tail of the outcome receipt) on five MBRX rows. PURE."""
+    notes_old = str(notes_old or "")
+    return f"{notes_old} | {tag}" if notes_old.strip() else tag
+
+
+def plan_retags(values: Sequence[Sequence[Any]], hdr_i: Optional[int], cols: Dict[str, Optional[int]],
+                retag: Dict[str, Any], version: str = SCRIPT_VERSION
+                ) -> Tuple[List[Dict[str, Any]], List[str], set]:
+    """1.1.1: (Notes writes, held notes, the record IDs the retag file covers). A listed row that already carries
+    the tag needs nothing. One without it is retagged only while its Entry Price equals entry_before / factor (it
+    was rebased exactly once); otherwise it is held. PURE."""
+    want = {str(r.get("record_id") or "").strip(): r for r in (retag or {}).get("rows") or []
+            if str(r.get("record_id") or "").strip()}
+    ups: List[Dict[str, Any]] = []
+    held: List[str] = []
+    if hdr_i is None or not want or cols.get("Record ID") is None:
+        return ups, held, set(want)
+    seen = set()
+    for r_i in range(hdr_i + 1, len(values)):
+        row = values[r_i]
+        rid = str(_cell(row, cols.get("Record ID")) or "").strip()
+        spec = want.get(rid)
+        if spec is None:
+            continue
+        seen.add(rid)
+        notes = str(_cell(row, cols.get("Notes")) or "")
+        if ca.APPLIED_TAG in notes:
+            continue
+        factor = ca._as_float(spec.get("factor"))
+        before = ca._as_float(spec.get("entry_before"))
+        now = ca._as_float(_cell(row, cols.get("Entry Price")))
+        if not factor or not before or now is None or abs(now - before / factor) > 1e-6 * max(1.0, abs(now)):
+            held.append(f"row {r_i + 1} {rid}: Entry Price {now} is not {before} / {factor} - not retagged")
+            continue
+        base = spec.get("original_notes")
+        tag = f"{ca.APPLIED_TAG}:v{version}:f={factor:g}:retag"
+        ups.append({"sheet_row": r_i + 1, "record_id": rid,
+                    "notes_new": _tag_notes(base if base else notes, tag)})
+    for rid in sorted(set(want) - seen):
+        held.append(f"{rid}: not found in Performance_Log")
+    return ups, held, set(want)
 
 
 def seed_rows(seed: Dict[str, Any], existing: Sequence[Sequence[Any]], today: date,
@@ -300,9 +365,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--sheet-id")
     ap.add_argument("--seed", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                    "config", "corporate_actions_confirmed.json"))
+    ap.add_argument("--retag", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                    "config", "corporate_actions_retag.json"))
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
+    retag: Dict[str, Any] = {}
+    if args.retag:                                                    # 1.1.1: rows whose tag 1.1.0 cut off
+        if not os.path.isfile(args.retag):
+            print(f"::error::corporate-actions retag file not found: {args.retag}")
+            return 2
+        with open(args.retag, encoding="utf-8") as fh:
+            retag = json.load(fh)
     seed: Dict[str, Any] = {}
     if args.seed:                                                     # 1.1.0: the reviewed seed
         if not os.path.isfile(args.seed):                             # a configured seed that is missing is loud
@@ -334,18 +408,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     values = ws_pl.get_all_values()
     plan, hdr_i, cols = plan_repairs(values, index)
     held_rows = [p for p in plan if "held" in p]                      # 1.1.0: basis unknown -> untouched
-    plan = [p for p in plan if "held" not in p]
+    retags, retag_held, retag_ids = plan_retags(values, hdr_i, cols, retag)
+    plan = [p for p in plan if "held" not in p and p.get("record_id") not in retag_ids]   # 1.1.1
     proposals = detect_proposals(values, index, actions)
 
     print(f"[CA-REPAIR v{SCRIPT_VERSION}] confirmed_actions="
           f"{sum(1 for a in actions if a.confirmed)} seed_rows={len(new_rows)} plan={len(plan)} "
           f"finished={sum(1 for p in plan if 'roi_new' in p)} held={len(held_rows)} "
+          f"retag={len(retags)} retag_held={len(retag_held)} "
           f"proposals={len(proposals)} mode={'APPLY' if args.apply else 'DRY-RUN'}")
     for p in plan[:25]:
         print(f"  row {p['sheet_row']:>5} {p['symbol']:<10} f={p['factor']:g} "
               f"entry {p['entry_old']} -> {p['entry_new']}"
               + (f" | exit {p['exit_old']} -> {p['exit_new']} | realized {p['roi_old']} -> {p['roi_new']}"
                  if "roi_new" in p else ""))
+    for t in retags:
+        print(f"  RETAG row {t['sheet_row']:>5} {t['record_id']}")
+    for h in retag_held:
+        print("  RETAG HELD " + h)
     for p in held_rows[:25]:
         print(f"  HELD row {p['sheet_row']:>5} {p['symbol']:<10} {p['held']}")
     for pr in proposals[:15]:
@@ -367,11 +447,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                                  ("Outcome", p["outcome_new"])):
                     if cols.get(col) is not None:
                         updates.append({"range": f"{_col_letter(cols[col])}{r}", "values": [[val]]})
-            if cols.get("Notes") is not None:
-                tag = (f"{p['notes_old']} | " if p["notes_old"] else "") + \
-                      f"{ca.APPLIED_TAG}:v{SCRIPT_VERSION}:f={p['factor']:g}"
+            if cols.get("Notes") is not None:                         # 1.1.1: never truncated
                 updates.append({"range": f"{_col_letter(cols['Notes'])}{r}",
-                                "values": [[tag[:250]]]})
+                                "values": [[_tag_notes(p["notes_old"],
+                                                       f"{ca.APPLIED_TAG}:v{SCRIPT_VERSION}:f={p['factor']:g}")]]})
+        if cols.get("Notes") is not None:
+            for t in retags:                                          # 1.1.1: the tag 1.1.0 cut off
+                updates.append({"range": f"{_col_letter(cols['Notes'])}{t['sheet_row']}",
+                                "values": [[t["notes_new"]]]})
         for i in range(0, len(updates), 50):
             ws_pl.batch_update(updates[i:i + 50])
         if proposals:
@@ -379,7 +462,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             sh.worksheet("_Run_Log").append_row(
                 [_now_utc(), "INFO", "ca_repair", PL_TAB, "OK",
-                 f"[CA-REPAIR v{SCRIPT_VERSION}] applied={len(plan)} held={len(held_rows)} "
+                 f"[CA-REPAIR v{SCRIPT_VERSION}] applied={len(plan)} held={len(held_rows)} retag={len(retags)} "
                  f"seed_rows={len(new_rows)} proposals={len(proposals)}", "", "", "",
                  json.dumps({"version": SCRIPT_VERSION})],
                 value_input_option="RAW")
@@ -387,7 +470,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
         print(f"[CA-REPAIR v{SCRIPT_VERSION}] APPLIED cells="
               f"{len(updates)} proposal_rows={len(proposals)}")
-    elif proposals or new_rows or plan:
+    elif proposals or new_rows or plan or retags:
         print("  (dry-run: nothing written; re-run with --apply)")
     return 0
 
