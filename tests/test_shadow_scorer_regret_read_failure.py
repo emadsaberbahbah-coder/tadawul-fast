@@ -109,7 +109,9 @@ def _sheet(scorer, *, ledger=None, history=None):
         scorer.sb.TAB_OUT: board,
         scorer.TAB_S1_CAL: [["State", "As of (Riyadh)", "Detail"],
                             ["PASS", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "synthetic calibration"]],
-        "_Corporate_Actions": [], "Performance_Log": [],
+        # shadow_scorer 1.9.6: an empty register is not evidence, so the complete-evidence fixture holds a row
+        "_Corporate_Actions": [["Symbol", "Action Type", "Effective Date", "Ratio"],
+                               ["SYNTHETIC.US", "DIVIDEND", "2026-10-15", "1.0"]], "Performance_Log": [],
         "_Run_Log": [[str(TODAY), "INFO", "synthetic", "", "OK", "[ROLLBACK-DRILL] passed"]],
     })
 

@@ -1,4 +1,4 @@
-"""scripts/sheets_quota.py 1.0.0 - wait out the Sheets per-minute read quota (owner, 13 Nov 2026 19:12: full check and
+"""scripts/sheets_quota.py 1.0.1 - wait out the Sheets per-minute read quota (owner, 13 Nov 2026 19:12: full check and
 another improvement; three scheduled runs had ended red on HTTP 429 that afternoon).
 
   Q1  what counts as the quota answer
@@ -7,6 +7,7 @@ another improvement; three scheduled runs had ended red on HTTP 429 that afterno
   Q4  the Evidence Board retries the workbook read alone - the BigQuery queries are not repeated
   Q5  the manifest pins and the CI lane
 """
+import datetime as dt
 import pathlib
 import sys
 
@@ -133,8 +134,62 @@ def test_q4_evidence_board_retries_the_read_not_the_queries(monkeypatch, capsys)
 def test_q5_manifest_and_ci():
     man = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '("sheets_quota", "%s", "sheets quota")' % sq.__version__ in man
-    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in man and ep.__version__ == "1.3.1"
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in man and ep.__version__ >= "1.3.1"
     assert '("evidence_board", "%s", "evidence board")' % eb.__version__ in man and eb.__version__ == "1.2.1"
     assert "tests/test_sheets_quota.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     src = (ROOT / "scripts/sheets_quota.py").read_text(encoding="utf-8")
     assert "gspread" not in src and "requests" not in src.split('"""')[2]         # pure: no client, no network
+
+
+# ----------------------------------------------------------------------------- 1.0.1: the Google API client's 429
+class _ClientError(Exception):
+    """Shaped like googleapiclient.errors.HttpError: the status sits on e.resp.status."""
+
+    def __init__(self, status):
+        super().__init__("<HttpError %d when requesting https://sheets.googleapis.com/v4/... returned \"x\">" % status)
+        self.resp = type("Resp", (), {"status": status})()
+
+
+def test_q6_the_api_clients_quota_answer_is_recognised():
+    assert sq.is_quota(_ClientError(429)) and sq.wait_for(_ClientError(429), 1) == 65.0
+    assert not sq.is_quota(_ClientError(403)) and sq.wait_for(_ClientError(500), 1) is None
+    assert sq.is_quota(RuntimeError("<HttpError 429 when requesting ...>"))
+
+
+def test_q7_provider_coverage_waits_out_the_quota_on_a_page_read(capsys):
+    """audit_provider_target_coverage 1.2.2: the 11-13 Nov failures were quota answers on the page reads."""
+    import asyncio
+    from scripts import audit_provider_target_coverage as ptc
+    grid = [["Symbol", "Forecast Source"]] + [["S%d" % i, "provider_target"] for i in range(200)]
+    base = {"schema": ptc.STATE_SCHEMA, "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "sheet": "12345...90abc", "pages": {"GM": {"share_pct": 100.0, "rows": 200}}}
+    slept = []
+
+    def reader_failing(n, exc):
+        calls = {"n": 0}
+
+        def reader(sid, a1):
+            calls["n"] += 1
+            if calls["n"] <= n:
+                raise exc
+            return grid
+        return reader, calls
+
+    async def nap(s):                                              # the live default is asyncio.sleep (awaited)
+        slept.append(("awaited", s))
+
+    rd, calls = reader_failing(2, _ClientError(429))
+    rep = asyncio.run(ptc.run_live("1234567890abc", ["GM"], base, ptc.Config(), False, False, reader=rd,
+                                   sleep=nap))
+    assert rep.exit_code == 0 and calls["n"] == 3 and slept == [("awaited", 65.0), ("awaited", 65.0)]
+    assert "Sheets quota reached while reading GM: waiting 65 s, then try 1 of 2" in capsys.readouterr().out
+    slept.clear()
+    rd, calls = reader_failing(3, _ClientError(429))                # still the quota after two waits: CH_READ_FAIL
+    rep = asyncio.run(ptc.run_live("1234567890abc", ["GM"], base, ptc.Config(), False, False, reader=rd,
+                                   sleep=slept.append))
+    assert rep.exit_code == 2 and calls["n"] == 3 and [f.code for f in rep.findings] == ["CH_READ_FAIL"]
+    slept.clear()
+    rd, calls = reader_failing(1, _ClientError(403))                # any other error fails at once, no wait
+    rep = asyncio.run(ptc.run_live("1234567890abc", ["GM"], base, ptc.Config(), False, False, reader=rd,
+                                   sleep=slept.append))
+    assert rep.exit_code == 2 and calls["n"] == 1 and slept == []

@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.53.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.54.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1966,7 +1966,19 @@ from urllib.error import HTTPError, URLError
 #   TRACK_AUDIT_DUE_ONLY (or set 0); the cron line can be removed on its
 #   own. Records matured from archive bars keep their receipts
 #   (hist_provider 'bq_archive_bar' marks them).
-SCRIPT_VERSION = "6.53.0"
+# -----------------------------------------------------------------------------
+# v6.54.0 (2026-11-14) [MATURED-VALID]: a record that matures in this pass is
+#   valid evidence in this pass. A row loaded with a blank Realized ROI starts
+#   realized_roi_source_valid=False (the loader's honest reading of a missing
+#   number); the maturity step then wrote a real realized ROI but left the flag
+#   False, so the in-memory summary and canonical report dropped every record
+#   matured in the run (14 Nov review: the latest run matured 98 and counted
+#   98 invalid) while the same rows, saved and reloaded, counted as valid. The
+#   maturity step now sets the flag from the number it writes (finite = valid),
+#   so the in-memory and the reloaded summaries agree. Truly invalid stored
+#   values are untouched: the flag is only set where a realized ROI is written.
+# ZERO functions removed, none added. ROLLBACK: revert this build.
+SCRIPT_VERSION = "6.54.0"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -10947,6 +10959,7 @@ class PerformanceTrackerApp:
                     r.status = PerformanceStatus.MATURED
                     r.maturity_date = now_r
                     r.realized_roi = float(_roi_use)
+                    r.realized_roi_source_valid = math.isfinite(r.realized_roi)   # v6.54.0 [MATURED-VALID]
                     if (r.realized_roi or 0.0) > 0:
                         r.outcome = "WIN"
                     elif (r.realized_roi or 0.0) < 0:

@@ -418,6 +418,23 @@ def test_s2_bq_archive_matures_on_the_archive_bar_with_one_query():
         _s2_case(close, outcome)
 
 
+def test_s2v_a_record_matured_in_the_pass_is_valid_evidence_in_the_pass():
+    """v6.54.0 [MATURED-VALID] (14 Nov review): a row loaded with a blank Realized ROI starts invalid; once it
+    matures in this pass the summary cohort counts it, as the saved and reloaded row would."""
+    tp._LAST_HIST_CLOSE.clear()
+    rec = record(tp)
+    rec.realized_roi_source_valid = False                         # as the loader reads a blank Realized ROI
+    audit(tp, [rec], [row()], env=BQ, session=FakeSession({"SYNTH.US": bars(104.0)}), bar_map={})
+    assert rec.status == tp.PerformanceStatus.MATURED and rec.realized_roi == pytest.approx(4.0)
+    assert rec.realized_roi_source_valid is True
+    cohort, duplicates, invalid = tp._summary_outcome_cohort([rec])
+    assert [r.key for r in cohort] == [rec.key] and (duplicates, invalid) == (0, 0)
+    left = record(tp)
+    left.realized_roi_source_valid = False                        # not matured in the pass: untouched
+    audit(tp, [left], [row()], env=BQ, session=FakeSession({"OTHER.US": bars(1.0)}), bar_map={})
+    assert left.status != tp.PerformanceStatus.MATURED and left.realized_roi_source_valid is False
+
+
 def _s2_case(close, outcome):
     tp._LAST_HIST_CLOSE.clear()
     rec = record(tp)
@@ -1030,11 +1047,11 @@ def test_w1_workflows_crons_env_parity_version_and_pin():
         assert clock_line == daily_line and len(clock_line) == 1, name          # ENV PARITY
     assert "TRACK_HIST_TARGET_CLOSE" not in daily                               # the v6.47.0 invariant holds
     src = DELIVERED.read_text(encoding="utf-8")
-    assert tp.SCRIPT_VERSION == "6.53.0"
+    assert tuple(int(x) for x in tp.SCRIPT_VERSION.split(".")) >= (6, 53, 0)   # later builds stack on 6.53.0
     assert "(v%s)" % tp.SCRIPT_VERSION in src.splitlines()[4]
     assert re.search(r'os\.getenv\("TRACK_HIST_CLOSE_SOURCE"\)\s*or\s*"yfinance"', src)
     assert re.search(r'os\.getenv\("TRACK_AUDIT_DUE_ONLY"\)\s*or\s*"0"', src)
-    version_line = re.search(r'^SCRIPT_VERSION = "6\.53\.0"', src, re.M)
+    version_line = re.search(r'^SCRIPT_VERSION = "%s"' % re.escape(tp.SCRIPT_VERSION), src, re.M)
     assert version_line and src.index("# v6.53.0 (2026-11-02)") < version_line.start()
     assert src.index("# v6.50.0 (2026-10-25)") < src.index("# v6.53.0 (2026-11-02)")
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
@@ -1095,7 +1112,7 @@ def test_n2_added_lines_are_ascii_and_nothing_removed():
     title = "TADAWUL FAST BRIDGE \u2013 ADVANCED PERFORMANCE ANALYTICS ENGINE (v%s)"
     assert title % "6.50.0" in removed and 'SCRIPT_VERSION = "6.50.0"' in removed
     assert len(removed) <= 16, removed                             # the anchored replacements only
-    fresh = [ln for ln in added if ln != title % "6.53.0"]
+    fresh = [ln for ln in added if ln != title % tp.SCRIPT_VERSION]
     assert fresh and all(ln.isascii() for ln in fresh), [ln for ln in fresh if not ln.isascii()][:3]
     import ast
 
