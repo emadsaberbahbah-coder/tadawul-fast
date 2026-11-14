@@ -1,0 +1,91 @@
+# =============================================================================
+# 🧾 Corporate Actions - repair_corporate_actions.py 1.1.0
+# VERSION 1.0.0 (2026-11-14) - NEW WORKFLOW
+# WHY: the _Corporate_Actions register was header-only, so splits were never
+#   repaired: MBRX's 1-for-20 reverse split (20 Oct) left matured outcomes
+#   above +1,000% in Performance_Log, and the S-1 corporate-action check had
+#   no evidence (shadow_scorer 1.9.6 reads an empty register as pending).
+# WHAT: once a day (and on dispatch) the script writes the reviewed actions in
+#   data/corporate_actions_confirmed.json into _Corporate_Actions on or after
+#   each one's effective date, then repairs Performance_Log for every confirmed
+#   action: entry and target rebased, and a finished outcome that spans the
+#   action recomputed. Idempotent: a repaired row carries the ca_adjusted tag
+#   and is never touched again; a register row is never written twice.
+#   Merging a change to the seed file is the confirmation.
+# MODE: TFB_CA_REPAIR = apply (default) | scan (print only). A dispatch picks
+#   its own mode. Rollback: repository variable TFB_CA_REPAIR=scan.
+# =============================================================================
+name: 🧾 Corporate Actions
+
+on:
+  schedule:
+    - cron: "40 2 * * *"            # 05:40 Riyadh: before the morning tracker and scorer runs
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan = print the register rows and repairs only; apply = write them"
+        type: choice
+        options: [scan, apply]
+        default: scan
+
+concurrency:
+  group: tfb-corporate-actions
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  corporate_actions:
+    name: 🧾 Register and repair corporate actions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 google-auth requests
+
+      - name: 🧪 Selftest
+        run: python scripts/repair_corporate_actions.py --selftest
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 🧾 Register and repair
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_CA_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || vars.TFB_CA_REPAIR || 'apply' }}
+        run: |
+          if [[ "$TFB_CA_REPAIR" == "apply" ]]; then
+            python scripts/repair_corporate_actions.py --apply
+          else
+            python scripts/repair_corporate_actions.py --scan
+          fi

@@ -1,6 +1,35 @@
 """
 scripts/repair_corporate_actions.py — Performance_Log CA sweep & repair
 ========================================================================
+VERSION 1.1.0  (2026-11-14)  — A REVIEWED SEED, AND FINISHED OUTCOMES REPAIRED
+WHY (owner 14 Nov: "move to the next action"; reviews of 13-14 Nov): the
+_Corporate_Actions register was header-only, so nothing was ever repaired:
+MBRX's 1-for-20 reverse split of 20 Oct left seven matured outcomes above
++1,000% in Performance_Log, and the S-1 corporate-action check had nothing
+to stand on (shadow_scorer 1.9.6 now reads an empty register as pending).
+WHAT:
+  * --seed FILE (default data/corporate_actions_confirmed.json): actions
+    confirmed from the issuer's filing and merged through review are written
+    into _Corporate_Actions with their filing as Source, ON OR AFTER their
+    effective date only - never earlier, because the repair rebases prices
+    dated before the effective date and today's quotes are still on the old
+    basis until then. A row already in the register (same symbol, type and
+    date) is not written again.
+  * plan_repairs now also repairs a FINISHED outcome (matured / stopped) that
+    spans the action: the exit price (Current Price) is put on the same
+    basis as the rebased entry - divided by the factors of actions effective
+    after its Maturity Date - and Realized ROI % and Outcome are recomputed
+    from the two. An outcome wholly before or wholly after the action keeps
+    its ROI (only its prices move onto today's basis).
+  * the credentials read accepts the base64 form the workflows pass in
+    GOOGLE_SHEETS_CREDENTIALS.
+  * --scan prints the seed rows it would write and the repairs, and writes
+    nothing; --apply writes both, then the plan.
+Workflow: .github/workflows/corporate_actions.yml (daily, and on dispatch).
+Rollback: repository variable TFB_CA_REPAIR=scan (the workflow then only
+prints), or remove a row from the seed (rows already written stay; edit the
+register's Source to AUTO_DETECT to stop it applying).
+
 VERSION 1.0.0  (2026-07-18)  — NEW SCRIPT (Wave A0, deliverable #6b)
 
 WHY: see core/corporate_actions.py v1.0.0 (the pure library this tool drives).
@@ -15,6 +44,7 @@ GOVERNANCE (hard rules):
 
 USAGE:
   --selftest                       offline fixtures, no network
+  --seed FILE                      reviewed confirmed actions (1.1.0)
   --scan            (default)     dry-run: print plan + proposals
   --apply                         execute the confirmed plan + write proposals
   --sheet-id ID                   override spreadsheet id
@@ -31,14 +61,15 @@ import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Allow both repo-root and scripts/ execution
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import corporate_actions as ca  # noqa: E402
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+_RIYADH = timezone(timedelta(hours=3))
 PL_TAB = "Performance_Log"
 
 
@@ -74,7 +105,8 @@ def plan_repairs(values: Sequence[Sequence[Any]],
     hdr = [str(h).strip() for h in values[hdr_i]]
     cols = {k: _col(hdr, k) for k in
             ("Record ID", "Symbol", "Date Recorded (Riyadh)", "Entry Price",
-             "Target Price", "Status", "Current Price", "Notes")}
+             "Target Price", "Status", "Current Price", "Notes",
+             "Realized ROI %", "Outcome", "Maturity Date")}
     plan: List[Dict[str, Any]] = []
     for r_i in range(hdr_i + 1, len(values)):
         row = values[r_i]
@@ -98,15 +130,79 @@ def plan_repairs(values: Sequence[Sequence[Any]],
             if cols["Target Price"] is not None else None
         if ep is None:
             continue
-        plan.append({
+        item = {
             "sheet_row": r_i + 1, "symbol": sym, "date": str(d or ""),
             "factor": f,
             "entry_old": ep, "entry_new": round(ep / f, 6),
             "target_old": tp,
             "target_new": (round(tp / f, 6) if tp is not None else None),
             "notes_old": notes,
-        })
+        }
+        item.update(_finished_repair(row, cols, sym, ep / f, index))      # 1.1.0
+        plan.append(item)
     return plan, hdr_i, cols
+
+
+_FINISHED = ("matured", "stopped")
+
+
+def _cell(row: Sequence[Any], c: Optional[int]) -> Any:
+    return row[c] if c is not None and len(row) > c else None
+
+
+def _finished_repair(row: Sequence[Any], cols: Dict[str, Optional[int]], sym: str, entry_new: float,
+                     index: Dict[str, List[Tuple[date, float]]]) -> Dict[str, Any]:
+    """1.1.0: a finished outcome (matured / stopped) with an exit price: the exit price on today's basis and the
+    Realized ROI % and Outcome recomputed from it and the rebased entry. {} when the row is not finished, has no
+    exit price, or nothing changes."""
+    status = str(_cell(row, cols.get("Status")) or "").strip().lower()
+    cur = ca._as_float(_cell(row, cols.get("Current Price")))
+    if status not in _FINISHED or cur is None or not entry_new:
+        return {}
+    exit_on = ca._as_date(_cell(row, cols.get("Maturity Date")))
+    if exit_on is None:
+        return {}                                  # without the exit date the basis of the exit price is unknown
+    f_exit = ca.cumulative_factor(sym, exit_on, index)
+    cur_new = cur / f_exit
+    roi_new = round((cur_new / entry_new - 1.0) * 100.0, 4)
+    roi_old = ca._as_float(_cell(row, cols.get("Realized ROI %")))
+    out: Dict[str, Any] = {"exit_old": cur, "exit_new": round(cur_new, 6), "roi_old": roi_old, "roi_new": roi_new,
+                           "outcome_new": "WIN" if roi_new > 0 else ("LOSS" if roi_new < 0 else "BREAKEVEN")}
+    return out
+
+
+def seed_rows(seed: Dict[str, Any], existing: Sequence[Sequence[Any]], today: date,
+              stamp: str) -> Tuple[List[List[str]], List[str]]:
+    """1.1.0: (_Corporate_Actions rows to write, notes on the seed rows held back). A seed action is written once
+    its effective date has come (today >= effective) and when the register holds no row with the same symbol,
+    type and effective date. PURE."""
+    have = set()
+    for r in list(existing or [])[1:]:
+        if r and str(r[0]).strip():
+            have.add((str(r[0]).strip().upper(), str(r[1] if len(r) > 1 else "").strip().upper(),
+                      str(ca._as_date(r[2] if len(r) > 2 else None) or "")))
+    rows: List[List[str]] = []
+    held: List[str] = []
+    for a in (seed or {}).get("actions") or []:
+        sym = str(a.get("symbol") or "").strip().upper()
+        typ = str(a.get("action_type") or "").strip().upper()
+        eff = ca._as_date(a.get("effective_date"))
+        src = str(a.get("source") or "").strip()
+        ratio = ca._as_float(a.get("ratio"))
+        if not sym or typ not in ("SPLIT", "REVERSE_SPLIT", "SYMBOL_CHANGE") or eff is None or not src \
+                or src.upper() == ca.SOURCE_AUTO or (typ != "SYMBOL_CHANGE" and not ratio):
+            held.append("%s: not a complete confirmed action - skipped" % (sym or "?"))
+            continue
+        if (sym, typ, str(eff)) in have:
+            continue
+        if eff > today:
+            held.append("%s %s effective %s - written on that day" % (sym, typ, eff))
+            continue
+        rows.append([sym, typ, str(eff), ("" if ratio is None else ("%g" % ratio)),
+                     str(a.get("old_symbol") or ""), str(a.get("new_symbol") or ""), src[:240], stamp,
+                     ("seed: " + str(a.get("notes") or ""))[:240]])
+        have.add((sym, typ, str(eff)))
+    return rows, held
 
 
 def detect_proposals(values: Sequence[Sequence[Any]],
@@ -167,6 +263,8 @@ def _open_sheet(cli: Optional[str]):
     raw, b64 = os.getenv("GOOGLE_SHEETS_CREDENTIALS"), os.getenv("GOOGLE_SHEETS_CREDENTIALS_B64")
     if not path and (raw or b64):
         data = raw or base64.b64decode(b64).decode("utf-8")
+        if not data.lstrip().startswith("{"):                       # 1.1.0: the workflows may pass base64 here
+            data = base64.b64decode(data).decode("utf-8")
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         f.write(data); f.close(); path = f.name
     if not path:
@@ -190,6 +288,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--sheet-id")
+    ap.add_argument("--seed", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                   "data", "corporate_actions_confirmed.json"))
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
@@ -203,7 +303,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         ws_a = sh.add_worksheet(title=ca.TAB_ACTIONS, rows=200,
                                 cols=len(ca.ACTIONS_HEADER))
         ws_a.update(values=[ca.ACTIONS_HEADER], range_name="A1")
-    actions = ca.parse_actions(ws_a.get_all_values())
+    register = ws_a.get_all_values()
+    seed: Dict[str, Any] = {}
+    if args.seed and os.path.isfile(args.seed):                      # 1.1.0: the reviewed seed
+        with open(args.seed, encoding="utf-8") as fh:
+            seed = json.load(fh)
+    today = datetime.now(timezone.utc).astimezone(_RIYADH).date()
+    new_rows, held = seed_rows(seed, register, today, _now_utc())
+    for h in held:
+        print("  seed held: " + h)
+    for r in new_rows:
+        print(f"  seed row: {r[0]} {r[1]} {r[2]} ratio={r[3]} source={r[6][:60]}")
+    actions = ca.parse_actions(list(register) + new_rows)
     index = ca.build_adjustment_index(actions, confirmed_only=True)
 
     ws_pl = sh.worksheet(PL_TAB)
@@ -212,15 +323,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     proposals = detect_proposals(values, index, actions)
 
     print(f"[CA-REPAIR v{SCRIPT_VERSION}] confirmed_actions="
-          f"{sum(1 for a in actions if a.confirmed)} plan={len(plan)} "
+          f"{sum(1 for a in actions if a.confirmed)} seed_rows={len(new_rows)} plan={len(plan)} "
+          f"finished={sum(1 for p in plan if 'roi_new' in p)} "
           f"proposals={len(proposals)} mode={'APPLY' if args.apply else 'DRY-RUN'}")
-    for p in plan[:15]:
+    for p in plan[:25]:
         print(f"  row {p['sheet_row']:>5} {p['symbol']:<10} f={p['factor']:g} "
-              f"entry {p['entry_old']} -> {p['entry_new']}")
+              f"entry {p['entry_old']} -> {p['entry_new']}"
+              + (f" | exit {p['exit_old']} -> {p['exit_new']} | realized {p['roi_old']} -> {p['roi_new']}"
+                 if "roi_new" in p else ""))
     for pr in proposals[:15]:
         print(f"  PROPOSAL {pr[0]:<10} {pr[1]} ratio={pr[3]}")
 
     if args.apply:
+        if new_rows:                                                  # 1.1.0: the register first
+            ws_a.append_rows(new_rows, value_input_option="RAW")
         updates = []
         for p in plan:
             r = p["sheet_row"]
@@ -229,6 +345,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             if p["target_new"] is not None and cols.get("Target Price") is not None:
                 updates.append({"range": f"{_col_letter(cols['Target Price'])}{r}",
                                 "values": [[p["target_new"]]]})
+            if "roi_new" in p:                                         # 1.1.0: a finished outcome
+                for col, val in (("Current Price", p["exit_new"]), ("Realized ROI %", p["roi_new"]),
+                                 ("Outcome", p["outcome_new"])):
+                    if cols.get(col) is not None:
+                        updates.append({"range": f"{_col_letter(cols[col])}{r}", "values": [[val]]})
             if cols.get("Notes") is not None:
                 tag = (f"{p['notes_old']} | " if p["notes_old"] else "") + \
                       f"{ca.APPLIED_TAG}:v{SCRIPT_VERSION}:f={p['factor']:g}"
@@ -242,15 +363,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             sh.worksheet("_Run_Log").append_row(
                 [_now_utc(), "INFO", "ca_repair", PL_TAB, "OK",
                  f"[CA-REPAIR v{SCRIPT_VERSION}] applied={len(plan)} "
-                 f"proposals={len(proposals)}", "", "", "",
+                 f"seed_rows={len(new_rows)} proposals={len(proposals)}", "", "", "",
                  json.dumps({"version": SCRIPT_VERSION})],
                 value_input_option="RAW")
         except Exception:
             pass
         print(f"[CA-REPAIR v{SCRIPT_VERSION}] APPLIED cells="
               f"{len(updates)} proposal_rows={len(proposals)}")
-    elif proposals:
-        print("  (dry-run: proposals NOT written; re-run with --apply)")
+    elif proposals or new_rows or plan:
+        print("  (dry-run: nothing written; re-run with --apply)")
     return 0
 
 
