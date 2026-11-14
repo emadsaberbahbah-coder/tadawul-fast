@@ -106,7 +106,7 @@ def plan_repairs(values: Sequence[Sequence[Any]],
     cols = {k: _col(hdr, k) for k in
             ("Record ID", "Symbol", "Date Recorded (Riyadh)", "Entry Price",
              "Target Price", "Status", "Current Price", "Notes",
-             "Realized ROI %", "Outcome", "Maturity Date")}
+             "Realized ROI %", "Outcome", "Maturity Date", "Target Date (Riyadh)")}
     plan: List[Dict[str, Any]] = []
     for r_i in range(hdr_i + 1, len(values)):
         row = values[r_i]
@@ -154,16 +154,26 @@ def _finished_repair(row: Sequence[Any], cols: Dict[str, Optional[int]], sym: st
                      index: Dict[str, List[Tuple[date, float]]]) -> Dict[str, Any]:
     """1.1.0: a finished outcome (matured / stopped) with an exit price: the exit price on today's basis and the
     Realized ROI % and Outcome recomputed from it and the rebased entry. {} when the row is not finished, has no
-    exit price, or nothing changes."""
+    exit price, or nothing changes; {"held": reason} when the exit price's basis cannot be established.
+
+    The exit quote session is not the processing time: track_performance prices a late-finalized outcome at the
+    TARGET session's historical close but stamps Maturity Date with the run time. So the exit session lies
+    between Target Date (Riyadh) and Maturity Date. The basis is known only when no action falls between the two
+    (the same factor at both ends); otherwise the whole row is held for review, never rewritten on a guess."""
     status = str(_cell(row, cols.get("Status")) or "").strip().lower()
     cur = ca._as_float(_cell(row, cols.get("Current Price")))
     if status not in _FINISHED or cur is None or not entry_new:
         return {}
-    exit_on = ca._as_date(_cell(row, cols.get("Maturity Date")))
-    if exit_on is None:
-        return {}                                  # without the exit date the basis of the exit price is unknown
-    f_exit = ca.cumulative_factor(sym, exit_on, index)
-    cur_new = cur / f_exit
+    target_on = ca._as_date(_cell(row, cols.get("Target Date (Riyadh)")))
+    matured_on = ca._as_date(_cell(row, cols.get("Maturity Date")))
+    if target_on is None or matured_on is None:
+        return {"held": "finished outcome without Target Date and Maturity Date: exit basis unknown"}
+    lo, hi = min(target_on, matured_on), max(target_on, matured_on)
+    f_lo, f_hi = ca.cumulative_factor(sym, lo, index), ca.cumulative_factor(sym, hi, index)
+    if abs(f_lo - f_hi) > 1e-12:
+        return {"held": f"an action falls between the target session {lo} and the maturity stamp {hi}: "
+                        "exit basis ambiguous, review by hand"}
+    cur_new = cur / f_hi
     roi_new = round((cur_new / entry_new - 1.0) * 100.0, 4)
     roi_old = ca._as_float(_cell(row, cols.get("Realized ROI %")))
     out: Dict[str, Any] = {"exit_old": cur, "exit_new": round(cur_new, 6), "roi_old": roi_old, "roi_new": roi_new,
@@ -293,6 +303,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
+    seed: Dict[str, Any] = {}
+    if args.seed:                                                     # 1.1.0: the reviewed seed
+        if not os.path.isfile(args.seed):                             # a configured seed that is missing is loud
+            print(f"::error::corporate-actions seed not found: {args.seed}")
+            return 2
+        with open(args.seed, encoding="utf-8") as fh:
+            seed = json.load(fh)
 
     sh = _open_sheet(args.sheet_id)
 
@@ -304,10 +321,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 cols=len(ca.ACTIONS_HEADER))
         ws_a.update(values=[ca.ACTIONS_HEADER], range_name="A1")
     register = ws_a.get_all_values()
-    seed: Dict[str, Any] = {}
-    if args.seed and os.path.isfile(args.seed):                      # 1.1.0: the reviewed seed
-        with open(args.seed, encoding="utf-8") as fh:
-            seed = json.load(fh)
     today = datetime.now(timezone.utc).astimezone(_RIYADH).date()
     new_rows, held = seed_rows(seed, register, today, _now_utc())
     for h in held:
@@ -320,17 +333,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     ws_pl = sh.worksheet(PL_TAB)
     values = ws_pl.get_all_values()
     plan, hdr_i, cols = plan_repairs(values, index)
+    held_rows = [p for p in plan if "held" in p]                      # 1.1.0: basis unknown -> untouched
+    plan = [p for p in plan if "held" not in p]
     proposals = detect_proposals(values, index, actions)
 
     print(f"[CA-REPAIR v{SCRIPT_VERSION}] confirmed_actions="
           f"{sum(1 for a in actions if a.confirmed)} seed_rows={len(new_rows)} plan={len(plan)} "
-          f"finished={sum(1 for p in plan if 'roi_new' in p)} "
+          f"finished={sum(1 for p in plan if 'roi_new' in p)} held={len(held_rows)} "
           f"proposals={len(proposals)} mode={'APPLY' if args.apply else 'DRY-RUN'}")
     for p in plan[:25]:
         print(f"  row {p['sheet_row']:>5} {p['symbol']:<10} f={p['factor']:g} "
               f"entry {p['entry_old']} -> {p['entry_new']}"
               + (f" | exit {p['exit_old']} -> {p['exit_new']} | realized {p['roi_old']} -> {p['roi_new']}"
                  if "roi_new" in p else ""))
+    for p in held_rows[:25]:
+        print(f"  HELD row {p['sheet_row']:>5} {p['symbol']:<10} {p['held']}")
     for pr in proposals[:15]:
         print(f"  PROPOSAL {pr[0]:<10} {pr[1]} ratio={pr[3]}")
 
@@ -362,7 +379,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             sh.worksheet("_Run_Log").append_row(
                 [_now_utc(), "INFO", "ca_repair", PL_TAB, "OK",
-                 f"[CA-REPAIR v{SCRIPT_VERSION}] applied={len(plan)} "
+                 f"[CA-REPAIR v{SCRIPT_VERSION}] applied={len(plan)} held={len(held_rows)} "
                  f"seed_rows={len(new_rows)} proposals={len(proposals)}", "", "", "",
                  json.dumps({"version": SCRIPT_VERSION})],
                 value_input_option="RAW")

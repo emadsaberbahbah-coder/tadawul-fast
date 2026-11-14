@@ -26,11 +26,12 @@ HDR = ["Record ID", "Key", "Symbol", "Horizon", "Date Recorded (Riyadh)", "Entry
        "Sharpe Ratio", "Sector", "Factor Exposures", "Last Updated (Riyadh)", "Maturity Date", "Notes"]
 
 
-def rec(rid, sym, recorded, entry, target, status, cur, realized="", outcome="", maturity="", notes=""):
+def rec(rid, sym, recorded, entry, target, status, cur, realized="", outcome="", maturity="", notes="", tdate=None):
     r = [""] * len(HDR)
+    tdate = maturity[:10] if tdate is None else tdate                # the target session; by default the same day
     for k, v in (("Record ID", rid), ("Symbol", sym), ("Date Recorded (Riyadh)", recorded), ("Entry Price", entry),
                  ("Target Price", target), ("Status", status), ("Current Price", cur), ("Realized ROI %", realized),
-                 ("Outcome", outcome), ("Maturity Date", maturity), ("Notes", notes)):
+                 ("Outcome", outcome), ("Maturity Date", maturity), ("Notes", notes), ("Target Date (Riyadh)", tdate)):
         r[HDR.index(k)] = str(v)
     return r
 
@@ -96,7 +97,26 @@ def test_f1_a_matured_outcome_across_the_split_is_recomputed():
     assert b["entry_new"] == pytest.approx(10.0) and b["exit_new"] == pytest.approx(9.0)
     assert b["roi_new"] == pytest.approx(-10.0) and b["outcome_new"] == "LOSS"
     assert "roi_new" not in by[9]                                          # active: entry only
-    assert "roi_new" not in by[10]                                         # no exit date: basis unknown, left alone
+    assert "roi_new" not in by[10] and "exit basis unknown" in by[10]["held"]   # no exit date: held, untouched
+
+
+def test_f2_an_exit_priced_before_the_split_but_stamped_after_it_is_held():
+    # Codex P1 on #981: entry 100, historical exit 90 at the target session before a 2-for-1, finalized after it.
+    # Using the processing date would make it entry 50 / exit 90 = +80%; the basis is ambiguous, so it is held.
+    idx = ca.build_adjustment_index(ca.parse_actions([ca.ACTIONS_HEADER,
+                                                      ["TWO.US", "SPLIT", "2026-10-20", "2", "", "", "issuer", "", ""]]))
+    pl = [HDR,
+          rec("x", "TWO.US", "2026-10-01", "100", "110", "matured", "90", "-10.0", "LOSS", "2026-10-25 21:00:00",
+              tdate="2026-10-15"),
+          rec("y", "TWO.US", "2026-10-01", "100", "110", "matured", "45", "-10.0", "LOSS", "2026-10-25 21:00:00",
+              tdate="2026-10-22"),                                           # target after the split: basis known
+          rec("z", "TWO.US", "2026-10-01", "100", "110", "stopped", "90", "-10.0", "LOSS", "2026-10-25 21:00:00",
+              tdate="")]                                                     # no target session: held
+    plan, _, _ = rca.plan_repairs(pl, idx)
+    by = {p["sheet_row"]: p for p in plan}
+    assert "roi_new" not in by[2] and "ambiguous" in by[2]["held"] and "2026-10-15" in by[2]["held"]
+    assert by[3]["entry_new"] == pytest.approx(50.0) and by[3]["roi_new"] == pytest.approx(-10.0)
+    assert "held" not in by[3] and "unknown" in by[4]["held"]
 
 
 class Tab:
@@ -159,6 +179,23 @@ def test_r1_scan_writes_nothing_and_apply_writes_register_then_repairs(monkeypat
     b.tabs[ca.TAB_ACTIONS].appended.clear()
     assert rca.main(["--apply", "--seed", str(seed)]) == 0
     assert b.tabs[ca.TAB_ACTIONS].appended == [] and "seed_rows=0 plan=0" in capsys.readouterr().out
+
+
+def test_r3_a_missing_seed_is_loud_and_a_held_row_is_never_written(monkeypatch, tmp_path, capsys):
+    opened = []
+    monkeypatch.setattr(rca, "_open_sheet", lambda cli: opened.append(cli))
+    assert rca.main(["--scan", "--seed", str(tmp_path / "absent.json")]) == 2          # not a silent empty seed
+    assert "::error::corporate-actions seed not found" in capsys.readouterr().out and opened == []
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"actions": [SEED["actions"][0]]}), encoding="utf-8")
+    pl = [HDR, rec("h", "RVS.US", "2026-09-24", "0.40", "0.50", "matured", "0.36", "-10.0", "LOSS",
+                   "2026-10-25 21:00:00", tdate="2026-10-15")]                      # priced before, stamped after
+    b = _book(pl)
+    monkeypatch.setattr(rca, "_open_sheet", lambda cli: b)
+    assert rca.main(["--apply", "--seed", str(seed)]) == 0
+    out = capsys.readouterr().out
+    assert "plan=0 finished=0 held=1" in out and "HELD row     2 RVS.US" in out
+    assert b.tabs["Performance_Log"].batches == [] and "held=1" in b.tabs["_Run_Log"].appended[-1][5]
 
 
 def test_r2_the_workflows_base64_credentials_are_read(monkeypatch, tmp_path):
