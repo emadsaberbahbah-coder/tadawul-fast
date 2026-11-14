@@ -282,6 +282,13 @@ def test_x12_parsers():
             ["2026-11-10", "PIPELINE", "EFC.US", 11.4, "", "", "", "USD"],
             ["2026-11-09", "PICK", "OLD.US", 10, 1, 9, "OPEN", "USD"]]
     assert [p["symbol"] for p in ep.read_plan_picks(plan)] == ["TEN.US"]
+    # 1.3.2: the plan's date is the newest of any row; a newer plan cut with no pick lists none, not older picks
+    nopick = plan + [["2026-11-11", "PIPELINE", "AX.US", 90, "", "", "", "USD"]]
+    assert ep.read_plan_picks(nopick) == [] and ep.read_plan_picks(nopick, TODAY) == []
+    assert [p["symbol"] for p in ep.read_plan_picks(plan, dt.date(2026, 11, 10))] == ["TEN.US"]
+    assert ep.read_plan_picks(plan, TODAY) == []                    # yesterday's picks are not today's
+    fresh = plan + [["2026-11-11", "PICK", "NEW.US", 5, 10, 4.5, "OPEN", "USD"]]
+    assert [p["symbol"] for p in ep.read_plan_picks(fresh, TODAY)] == ["NEW.US"]
     led = [{"Date": "2026-11-09", "Lot": "L", "Stop": 10.0, "TP1 Reached": "yes", "Basis": 0.5},
            {"Date": "2026-11-10", "Lot": "L", "Stop": 9.5, "TP1 Reached": "no", "Basis": 1.0},
            {"Date": "2026-11-11", "Lot": "L", "Stop": 12.0, "TP1 Reached": "no", "Basis": 1.0},
@@ -353,7 +360,7 @@ LOTS2 = [["Symbol", "Name", "Ccy", "Status", "Buy Date", "Buy Price", "Shares"],
          ["5023.SR", "Sukuk", "SAR", "Active", "2025-11-23", "100", "100"],
          ["GONE.US", "Gone", "USD", "Active", days(30)[29].isoformat(), "5", "10"]]
 PLAN = [["Plan Date", "Kind", "Symbol", "Entry", "Qty", "Stop", "Status", "Ccy"],
-        ["2026-11-10", "PICK", "TEN.US", 100, 47, 92, "CHECK", "USD"]]
+        ["2026-11-11", "PICK", "TEN.US", 100, 47, 92, "CHECK", "USD"]]
 SERIES = {"DDI": [100.0] * 30 + [104.0, 110.0], "TEN.US": [100.0] * 40, "TEN": [100.0] * 40}
 
 
@@ -429,6 +436,17 @@ def test_x13_run(monkeypatch):
     def boom(*a):
         raise OSError("smtp down")
     assert ep.run(False, True, book=b, now=later, opener=opener, mailer=boom) == 4
+
+
+def test_x13b_the_run_lists_only_todays_plan_picks(monkeypatch):
+    """1.3.2 (14 Nov review): a plan of an earlier day never shows as today's plan picks."""
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    old = [PLAN[0], ["2026-11-10"] + PLAN[1][1:]]
+    b = Book({"_Portfolio_CostBasis": Sheet(LOTS2), "My_Portfolio": Sheet(PORT), "_Daily_Plan": Sheet(old)})
+    assert ep.run(False, False, book=b, now=NOW, opener=opener, mailer=lambda *a: None) == 0
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "TODAY'S PLAN PICKS - per-stock levels (0)" in page and "TEN.US | 100.00" not in page
 
 
 def test_x13_gate_and_unreadable(monkeypatch, capsys):

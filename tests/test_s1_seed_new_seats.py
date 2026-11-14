@@ -93,7 +93,7 @@ def test_n6_gate_version_and_selftest(monkeypatch):
     for raw, want in (("", False), ("off", False), ("1", True), ("on", True), ("TRUE", True)):
         monkeypatch.setenv("TFB_S1_SEED_NEW_SEATS", raw)
         assert s1._seed_new_seats_enabled() is want
-    assert s1.SCRIPT_VERSION == "1.9.5"
+    assert s1.SCRIPT_VERSION == "1.9.6"
     wf = (ROOT / ".github" / "workflows" / "shadow_scorer.yml").read_text(encoding="utf-8")
     assert "TFB_S1_SEED_NEW_SEATS: ${{ vars.TFB_S1_SEED_NEW_SEATS || 'on' }}" in wf
     env = {k: v for k, v in os.environ.items() if not k.startswith("TFB_")}

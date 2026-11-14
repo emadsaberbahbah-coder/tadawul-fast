@@ -2,7 +2,14 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.3.1 (2026-11-13) - first written 2026-11-11 (1.0.0)
+VERSION 1.3.2 (2026-11-14) - first written 2026-11-11 (1.0.0)
+1.3.2 (2026-11-14): ONLY TODAY'S PLAN PICKS. On 14 Nov the Daily Plan was cut
+    with pipeline rows and no pick, and this page still listed INSW 18, EFC 180
+    and AX 21 - the picks of 13 Nov - as today's plan picks, because the newest
+    date was taken among PICK rows only. The plan's date is now the newest date
+    of any row (as the Today Action Plan reads it), and its picks are listed
+    only when that date is today in Riyadh: before the morning cut, or on a day
+    cut with no pick, the section is empty instead of showing older picks.
 
 1.3.1 (2026-11-13): THE SHEETS QUOTA IS WAITED OUT. Two runs of 13 Nov (16:21
 and 17:41 Riyadh) ended red on Sheets HTTP 429: the read was retried twice,
@@ -122,7 +129,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -565,15 +572,17 @@ def read_broker_stops(account: Sequence[Sequence[Any]], orders: Sequence[Sequenc
     return out, "broker orders read %s" % as_of.strftime("%Y-%m-%d %H:%M")
 
 
-def read_plan_picks(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
-    """The latest plan's PICK rows that are still open (not EXECUTED / INVALIDATED)."""
+def read_plan_picks(values: Sequence[Sequence[Any]], today: Optional[_dt.date] = None) -> List[Dict[str, Any]]:
+    """The latest plan's PICK rows that are still open (not EXECUTED / INVALIDATED). 1.3.2: the plan's date is the
+    newest date of any of its rows, and with `today` its picks count only when that date is today."""
     h, col = table_index(values, ("Plan Date", "Kind", "Symbol", "Entry"))
     if h is None:
         return []
-    rows = [r for r in list(values)[h + 1:] if text(cell(r, col.get("Kind"))) == "PICK"]
-    dates = sorted({text(cell(r, col.get("Plan Date"))) for r in rows if parse_date(cell(r, col.get("Plan Date")))})
-    if not dates:
+    every = list(values)[h + 1:]
+    dates = sorted({text(cell(r, col.get("Plan Date"))) for r in every if parse_date(cell(r, col.get("Plan Date")))})
+    if not dates or (today is not None and parse_date(dates[-1]) != today):
         return []
+    rows = [r for r in every if text(cell(r, col.get("Kind"))) == "PICK"]
     out = []
     for r in rows:
         if text(cell(r, col.get("Plan Date"))) != dates[-1]:
@@ -836,7 +845,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             news = read_news(_read(book, "_News_Items", "A1:M12000"), now, k["news_days"])
             stops, broker_note = read_broker_stops(_read(book, "_IBKR_Account", "A1:B40"),
                                                    _read(book, "_IBKR_Orders", "A1:H200"), now)
-            picks = read_plan_picks(_read(book, "_Daily_Plan", "A1:AB2001"))
+            picks = read_plan_picks(_read(book, "_Daily_Plan", "A1:AB2001"), today)
             ledger = parse_ledger(_read(book, LEDGER_TAB, "A1:%s%d" % (_col(len(LEDGER_HEADERS)), MAX_LEDGER_ROWS + 1)))
             break
         except Exception as e:  # noqa: BLE001

@@ -291,7 +291,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # default strict; workflow-scoped, never on Render).
     ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
-    ("run_shadow_scorer", "1.9.5", "shadow scorer"),
+    ("run_shadow_scorer", "1.9.6", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
@@ -301,7 +301,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
-    ("track_performance", "6.53.0", "track performance"),
+    ("track_performance", "6.54.0", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
@@ -359,7 +359,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.7.0", "daily plan"),
-    ("exit_plan", "1.3.1", "exit plan"),
+    ("exit_plan", "1.3.2", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
     ("today_action_plan", "1.4.0", "today action plan"),
