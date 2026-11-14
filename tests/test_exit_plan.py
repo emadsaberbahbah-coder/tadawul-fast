@@ -449,6 +449,29 @@ def test_x13b_the_run_lists_only_todays_plan_picks(monkeypatch):
     assert "TODAY'S PLAN PICKS - per-stock levels (0)" in page and "TEN.US | 100.00" not in page
 
 
+def test_x13c_broker_stops_come_from_the_ibkr_capture(monkeypatch, capsys):
+    """1.3.2: the stops come from the same IBKR capture as the Today Action Plan; the tabs stay the fallback."""
+    cap = {"ok": True, "as_of": NOW - dt.timedelta(hours=2), "stops": {"DDI.US": [(98.5, 200.0), (97.0, 40.0)],
+                                                                      "NOPX.US": [(None, 5.0)]}}
+    stops, note = ep.capture_stops(cap, NOW)
+    assert stops == {"DDI.US": 97.0} and note == "broker orders from the IBKR capture of 2026-11-11 05:30 Riyadh"
+    assert ep.capture_stops(dict(cap, as_of=NOW - dt.timedelta(hours=31)), NOW) is None      # too old
+    assert ep.capture_stops(dict(cap, as_of=NOW - dt.timedelta(hours=31)), NOW, 40.0) is not None
+    assert ep.capture_stops({"ok": False, "reason": "x"}, NOW) is None and ep.capture_stops(None, NOW) is None
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    b = wbook()
+    assert ep.run(False, False, book=b, now=NOW, opener=opener, mailer=lambda *a: None, capture=cap) == 0
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "broker orders from the IBKR capture of 2026-11-11 05:30 Riyadh" in page and "97.00" in page
+    old = dict(cap, as_of=NOW - dt.timedelta(hours=50))
+    b2 = wbook()
+    assert ep.run(False, False, book=b2, now=NOW, opener=opener, mailer=lambda *a: None, capture=old) == 0
+    page2 = "\n".join(" | ".join(str(c) for c in r) for r in b2.tabs["Exit_Plan"].values)
+    assert "IBKR capture" not in page2 and "broker orders unknown" in page2
+    assert "IBKR capture not used for stops (older than 30 h)" in capsys.readouterr().out
+
+
 def test_x13_gate_and_unreadable(monkeypatch, capsys):
     monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
     monkeypatch.setenv("TFB_EXIT_PLAN", "off")

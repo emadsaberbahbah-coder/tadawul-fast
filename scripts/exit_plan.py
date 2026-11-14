@@ -10,6 +10,12 @@ VERSION 1.3.2 (2026-11-14) - first written 2026-11-11 (1.0.0)
     of any row (as the Today Action Plan reads it), and its picks are listed
     only when that date is today in Riyadh: before the morning cut, or on a day
     cut with no pick, the section is empty instead of showing older picks.
+    ONE BROKER SOURCE. The broker stops came from the _IBKR_Account /
+    _IBKR_Orders tabs, last written 17 Oct, so this page said "broker orders
+    unknown" while the Today Action Plan read the hourly IBKR capture. The
+    stops now come from the same capture (scripts/ibkr_capture.py) when it is
+    at most TFB_EXIT_IBKR_MAX_AGE_H hours old (30); the tabs stay the
+    fallback. Each stop is the lowest working stop price on the symbol.
 
 1.3.1 (2026-11-13): THE SHEETS QUOTA IS WAITED OUT. Two runs of 13 Nov (16:21
 and 17:41 Riyadh) ended red on Sheets HTTP 429: the read was retried twice,
@@ -189,6 +195,7 @@ def knobs() -> Dict[str, Any]:
         "div_warn_days": int(_env_num("TFB_EXIT_DIV_WARN_DAYS", 10, 0, 60)),
         "wht": _env_num("TFB_EXIT_WHT_PCT", 30.0, 0.0, 100.0),
         "mail": _env("TFB_EXIT_MAIL", "0") in ("1", "true", "on", "yes"),
+        "ibkr_max_h": _env_num("TFB_EXIT_IBKR_MAX_AGE_H", 30.0, 1.0, 240.0),      # 1.3.2
     }
     k["min_pct"] = min(k["min_pct"], k["max_pct"])
     k["trail_tight"] = min(k["trail_tight"], k["trail"])
@@ -572,6 +579,24 @@ def read_broker_stops(account: Sequence[Sequence[Any]], orders: Sequence[Sequenc
     return out, "broker orders read %s" % as_of.strftime("%Y-%m-%d %H:%M")
 
 
+def capture_stops(cap: Optional[Dict[str, Any]], now: _dt.datetime,
+                  max_age_h: float = 30.0) -> Optional[Tuple[Dict[str, float], str]]:
+    """1.3.2: the broker stops from a parsed IBKR capture (scripts.ibkr_capture.parse), or None when the capture
+    is missing, unusable or older than `max_age_h` (the caller then reads the workbook tabs)."""
+    if not cap or not cap.get("ok") or cap.get("as_of") is None:
+        return None
+    age = (now - cap["as_of"]).total_seconds() / 3600.0
+    if age > max_age_h:
+        return None
+    out: Dict[str, float] = {}
+    for sym, rows in (cap.get("stops") or {}).items():
+        prices = [px for px, _q in rows if px]
+        if prices:
+            out[text(sym).upper()] = min(prices)
+    return out, "broker orders from the IBKR capture of %s Riyadh" % cap["as_of"].astimezone(RIYADH).strftime(
+        "%Y-%m-%d %H:%M")
+
+
 def read_plan_picks(values: Sequence[Sequence[Any]], today: Optional[_dt.date] = None) -> List[Dict[str, Any]]:
     """The latest plan's PICK rows that are still open (not EXECUTED / INVALIDATED). 1.3.2: the plan's date is the
     newest date of any of its rows, and with `today` its picks count only when that date is today."""
@@ -816,8 +841,11 @@ def _mail(subject: str, text_body: str, html_body: str) -> None:  # pragma: no c
 
 
 def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None,
-        opener: Optional[Callable[..., Any]] = None, mailer: Optional[Callable[[str, str, str], None]] = None) -> int:
+        opener: Optional[Callable[..., Any]] = None, mailer: Optional[Callable[[str, str, str], None]] = None,
+        capture: Optional[Dict[str, Any]] = None) -> int:
+    """`capture` (1.3.2): a parsed IBKR capture; left out, the live run (no `book` given) reads the newest one."""
     k = knobs()
+    own_book = book is None
     write = mode() == "on" and not dry_run
     now = now or _dt.datetime.now(UTC)
     today = now.astimezone(RIYADH).date()
@@ -857,6 +885,15 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             _out("read failed (%s) - attempt %d of %d, retrying in %d s" % (type(e).__name__, attempt,
                                                                           READ_ATTEMPTS, wait))
             _SLEEP(wait)
+    if capture is None and own_book:                              # 1.3.2: the broker's own working stops
+        from scripts import ibkr_capture  # noqa: PLC0415
+        capture = ibkr_capture.latest(now, out=_out)
+    from_capture = capture_stops(capture, now, k["ibkr_max_h"])
+    if from_capture is not None:
+        stops, broker_note = from_capture
+    elif capture:
+        _out("IBKR capture not used for stops (%s); the workbook's broker tabs decide" % (
+            capture.get("reason") or "older than %.0f h" % k["ibkr_max_h"]))
     info_map = read_info(grids)
     bars_cache: Dict[str, Tuple[List[Bar], Optional[float]]] = {}
     now_ts = now.timestamp()
