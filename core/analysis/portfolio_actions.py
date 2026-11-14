@@ -350,6 +350,8 @@ import logging
 from core.secret_redaction import safe_error_text
 from core.symbols.normalize import US_SHARE_CLASS_DOT_RE, split_symbol_exchange
 from core.portfolio_reconciliation import MAX_HOLDINGS, certify_portfolio_inputs, certification_summary
+from core.portfolio_reconciliation import (                         # v1.18.0
+    CUSTODY_MAX_AGE_CEILING, certify_recent_custody, custody_receipt)
 from core.execution_accounting import AccountingError, _number
 from decimal import Decimal, localcontext
 logger = logging.getLogger("core.analysis.portfolio_actions")
@@ -924,7 +926,55 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   post_earn_guard meta block. Removed: 0. Tests:
 #   tests/test_pf_add_guards_d1.py, tests/test_pf_add_guards_d1_route.py.
 #   Rollback: TFB_PF_ADD_POST_EARN unset (off is the v1.17.0 output) or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.17.1"
+# ---------------------------------------------------------------------------
+# v1.18.0 (2026-11-15) [CUSTODY-TIER] A HOLDING THE LAST IBKR CAPTURE MATCHED
+#   SHOWS ITS VERDICT, NOT BLOCK
+# WHY (owner, 15 Nov 00:48 Riyadh: "no block to my portfolio"): the page read
+#   BLOCK on 6 of 6 holdings ("RECONCILIATION_REQUIRED: missing_evidence")
+#   while the rule verdict on every one was HOLD. The archive shows 100% of
+#   rows BLOCK on each of the last 18 mornings, and the run log shows 39
+#   certified renders in five days: the broker capture is hourly and its
+#   packet is accepted for 900 s, so each certified page is overwritten by
+#   the next refresh. Custody proven a few minutes or hours earlier was
+#   thrown away, and BLOCK stopped meaning "something is wrong".
+# WHAT: two sources of custody proof, neither of which funds anything.
+#   (a) packet: this request carries a valid fresh packet but funding is
+#       withheld (cash, quote, FX or another row). Rows the packet matched
+#       are custody-proven now.
+#   (b) receipt: this request carries no valid packet. The last valid packet
+#       left a custody receipt (core.portfolio_reconciliation.custody_receipt:
+#       symbol, currency and broker quantity per linked row; no cash, account
+#       or instrument id), kept in memory and mirrored to the existing Redis
+#       client (key tfb:pf:custody_receipt:v1, 48 h TTL, fail-open; memory
+#       only under TFB_PF_CONFIRM_PERSIST=0). A row
+#       whose symbol, currency and exact quantity are on a receipt no older
+#       than TFB_PF_CUSTODY_MAX_AGE_H (default 30, 1..48) is custody-proven
+#       as of that capture.
+#   A custody-proven row whose rule verdict (_research_verdict: the same
+#   chain as the research view, no cap trim, no confirmation clock) is HOLD,
+#   TRIM or EXIT shows that verdict as its action with its amounts and
+#   levels; TRIM / EXIT carry share deltas and say "check the position at
+#   the broker before selling". An ADD verdict shows HOLD with the unchanged
+#   "new-money verdict withheld ..." text: new money still needs a fresh
+#   packet. A BLOCK verdict, an FX-rejected row, a row the proof does not
+#   match and a truncated holdings input keep today's row untouched; a row
+#   without a verified current price (the funded path's own quote rule)
+#   stays BLOCK and says so. When the
+#   receipt holds a DIFFERENT quantity for a row, the row stays BLOCK and
+#   says so. meta.execution_ready stays False, funding KPIs stay 0, no weight
+#   is published. The alert counts the rows still blocked; with none left it
+#   becomes custody_matched_funding_withheld.
+# GATE TFB_PF_CUSTODY_TIER = enforce (DEFAULT, owner request above) | observe
+#   (rows unchanged; reason and note gain " | [custody-observe] would show
+#   <X>") | off (0 / false / no: the v1.17.1 output byte for byte, no receipt
+#   is written or read). Read at call time.
+# Functions added: 10 (_env_custody_tier_mode, _env_custody_max_age_s,
+#   _custody_stamp, _custody_receipt_put, _custody_receipt_get,
+#   _custody_tier_remember, _custody_quote_ok, _custody_when, _custody_tier_reason,
+#   _custody_tier_portfolio). Changed: _build (one remember call, one
+#   dispatch). Removed: 0. Tests: tests/test_pf_custody_tier.py.
+#   Rollback: TFB_PF_CUSTODY_TIER=off, or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.18.0"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -4295,12 +4345,261 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
     return result
 
 
+# ---------------------------------------------------------------------------
+# v1.18.0 [CUSTODY-TIER] - TFB_PF_CUSTODY_TIER (default enforce). See the
+# version block above. Nothing below can fund or size new money.
+# ---------------------------------------------------------------------------
+CUSTODY_SELL_NOTE = "check the position at the broker before selling"
+CUSTODY_DIFFERS_NOTE = "the last IBKR capture (%s) shows a different share count for this row"
+CUSTODY_QUOTE_NOTE = "custody matches the IBKR capture, but this holding has no verified current price"
+_CUSTODY_RECEIPT = None
+_CUSTODY_REDIS_KEY = "tfb:pf:custody_receipt:v1"
+
+
+def _env_custody_tier_mode():
+    """v1.18.0: enforce (default) | observe | off. Only an explicit off word
+    disarms it; a blank or misspelt value keeps the default."""
+    v = str(os.environ.get("TFB_PF_CUSTODY_TIER", "")).strip().lower()
+    if v in ("off", "0", "false", "no"):
+        return "off"
+    return "observe" if v == "observe" else "enforce"
+
+
+def _env_custody_max_age_s():
+    """v1.18.0: TFB_PF_CUSTODY_MAX_AGE_H in hours (default 30, clamped
+    1..48) as whole seconds. Anything unreadable is the default."""
+    try:
+        hours = float(str(os.environ.get("TFB_PF_CUSTODY_MAX_AGE_H", "")).strip() or 30.0)
+        if hours != hours:
+            hours = 30.0
+    except (TypeError, ValueError):
+        hours = 30.0
+    return int(min(float(CUSTODY_MAX_AGE_CEILING), max(3600.0, hours * 3600.0)))
+
+
+def _custody_stamp(receipt):
+    """v1.18.0: the receipt's capture instant (aware UTC) or None."""
+    try:
+        return datetime.fromisoformat(str(receipt["captured_at"]).replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _custody_receipt_put(receipt):
+    """v1.18.0: keep the newest receipt (memory, then Redis fail-open)."""
+    global _CUSTODY_RECEIPT, _CONFIRM_REDIS_DEAD
+    stamp = _custody_stamp(receipt)
+    if stamp is None:
+        return
+    held = _custody_stamp(_CUSTODY_RECEIPT) if _CUSTODY_RECEIPT else None
+    if held is not None and held > stamp:
+        return
+    _CUSTODY_RECEIPT = receipt
+    cli = _confirm_redis() if _confirm_persist_enabled() else None
+    if cli is None:
+        return
+    try:
+        cli.set(_CUSTODY_REDIS_KEY, json.dumps(receipt, sort_keys=True), ex=CUSTODY_MAX_AGE_CEILING)
+    except Exception as exc:  # noqa: BLE001 - the cache never blocks the page
+        _CONFIRM_REDIS_DEAD = True
+        logger.warning("[PF v1.18.0] custody receipt not mirrored: %s", type(exc).__name__)
+
+
+def _custody_receipt_get():
+    """v1.18.0: the newest receipt this process or Redis holds, else None."""
+    global _CUSTODY_RECEIPT, _CONFIRM_REDIS_DEAD
+    cli = _confirm_redis() if _confirm_persist_enabled() else None
+    if cli is not None:
+        try:
+            raw = cli.get(_CUSTODY_REDIS_KEY)
+            stored = json.loads(raw) if raw else None
+            if isinstance(stored, dict) and _custody_stamp(stored) is not None:
+                held = _custody_stamp(_CUSTODY_RECEIPT) if _CUSTODY_RECEIPT else None
+                if held is None or _custody_stamp(stored) > held:
+                    _CUSTODY_RECEIPT = stored
+        except Exception as exc:  # noqa: BLE001
+            _CONFIRM_REDIS_DEAD = True
+            logger.warning("[PF v1.18.0] custody receipt not read: %s", type(exc).__name__)
+    return _CUSTODY_RECEIPT
+
+
+def _custody_tier_remember(rows, evidence, certification):
+    """v1.18.0: a valid fresh packet leaves a custody receipt. Never raises."""
+    try:
+        receipt = custody_receipt(rows, evidence, certification)
+        if receipt is not None:
+            _custody_receipt_put(receipt)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[PF v1.18.0] custody receipt withheld: %s", type(exc).__name__)
+
+
+def _custody_quote_ok(cand):
+    """v1.18.0: the funded path's own quote rule for one row (successful
+    acquisition, a witnessed quote instant, _quote_freshness_assessment).
+    Anything unprovable is False. Never raises."""
+    try:
+        proof = cand.get("quote_evidence") or {}
+        if proof.get("status") != "SUCCESS" or not proof.get("quote_asof"):
+            return False
+        return bool(_ob._quote_freshness_assessment(cand)[0])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _custody_when(recent):
+    """v1.18.0: '2026-11-14 08:40 Riyadh (16.1 h old)' for a receipt reading."""
+    info = (recent or {}).get("custody_recent") or {}
+    stamp = _custody_stamp(info)
+    if stamp is None:
+        return "time unknown"
+    age_h = float(info.get("age_seconds") or 0) / 3600.0
+    return "%s Riyadh (%s old)" % (
+        (stamp + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
+        ("%d min" % round(age_h * 60.0)) if age_h < 1.0 else ("%.1f h" % age_h))
+
+
+def _custody_tier_reason(verdict, why, source, when, withheld):
+    """v1.18.0: the reason text of a custody-proven row. PURE."""
+    proof = ("holding matches the IBKR capture of %s" % when if source == "receipt"
+             else "holding matches the fresh IBKR capture")
+    money = ("new money waits for a fresh capture" if source == "receipt"
+             else "new money withheld (%s)" % withheld)
+    head = RESEARCH_ADD_WITHHELD if verdict == ACTION_ADD else why
+    tail = "; " + CUSTODY_SELL_NOTE if verdict in (ACTION_TRIM, ACTION_EXIT) else ""
+    return "%s | %s; %s%s" % (head, proof, money, tail)
+
+
+def _custody_tier_portfolio(rows, ctl, fx_rates, result, certification, mode):
+    """v1.18.0 [CUSTODY-TIER]: custody-proven rows show their rule verdict.
+
+    `result` is the unverified / research output for this request and is
+    returned untouched whenever nothing is custody-proven or anything fails.
+    See the version block for the rules; nothing here funds a row."""
+    meta = {"mode": mode, "status": "ok", "source": None, "matched": 0, "shown": 0,
+            "verdicts": {}, "kept": {}}
+    try:
+        reasons = dict(certification.get("reason_counts") or {})
+        listed = rows if isinstance(rows, list) else []
+        indices = [index for index, raw in enumerate(listed[:MAX_HOLDINGS]) if isinstance(raw, dict)]
+        if reasons.get("holdings_input_incomplete") or len(indices) != len(listed) \
+                or len(indices) != len(result["actions"]):
+            meta["status"] = "skipped_holdings_input_incomplete"
+            result["meta"]["custody_tier"] = meta
+            return result
+        when, recent = None, None
+        if set(reasons) & {"missing_evidence", "invalid_evidence"}:
+            receipt = _custody_receipt_get()
+            recent = certify_recent_custody(listed, receipt, max_age_seconds=_env_custody_max_age_s()) \
+                if receipt else None
+            if recent is None:
+                meta["status"] = "no_recent_capture"
+                result["meta"]["custody_tier"] = meta
+                return result
+            states, source, when = recent["row_results"], "receipt", _custody_when(recent)
+            meta.update(captured_at=recent["custody_recent"]["captured_at"],
+                        age_seconds=recent["custody_recent"]["age_seconds"])
+        else:
+            states, source = certification["row_results"], "packet"
+        meta["source"] = source
+        states = {row["row_index"]: row for row in states}
+        withheld = ", ".join(sorted(reasons)) or "portfolio_inputs_unverified"
+        actions = list(result["actions"])
+        for pos, index in enumerate(indices):
+            legacy = actions[pos]
+            status = (states.get(index) or {}).get("status")
+            if status != "matched":
+                if source == "receipt" and status in ("quantity_mismatch", "position_closed"):
+                    meta["kept"]["capture_differs"] = meta["kept"].get("capture_differs", 0) + 1
+                    if mode == "enforce":
+                        note = " | " + CUSTODY_DIFFERS_NOTE % when
+                        legacy = dict(legacy)
+                        legacy["action_reason"] = str(legacy.get("action_reason") or "") + note
+                        legacy["advisor_note"] = str(legacy.get("advisor_note") or "") + note
+                        actions[pos] = legacy
+                continue
+            meta["matched"] += 1
+            cand = normalize_holding(listed[index], fx_rates, ctl)
+            verdict, why, proceeds = _research_verdict(cand, ctl)
+            if verdict == ACTION_BLOCK:
+                meta["kept"]["rule_block"] = meta["kept"].get("rule_block", 0) + 1
+                continue
+            if _research_fx_rejected(listed[index], cand, fx_rates):
+                meta["kept"]["fx_rejected"] = meta["kept"].get("fx_rejected", 0) + 1
+                continue
+            if not _custody_quote_ok(cand):
+                meta["kept"]["quote_unverified"] = meta["kept"].get("quote_unverified", 0) + 1
+                if mode == "enforce":
+                    note = " | " + CUSTODY_QUOTE_NOTE
+                    legacy = dict(legacy)
+                    legacy["action_reason"] = str(legacy.get("action_reason") or "") + note
+                    legacy["advisor_note"] = str(legacy.get("advisor_note") or "") + note
+                    actions[pos] = legacy
+                continue
+            shown = ACTION_HOLD if verdict == ACTION_ADD else verdict
+            label = "NEW_MONEY_WITHHELD" if verdict == ACTION_ADD else verdict
+            meta["verdicts"][label] = meta["verdicts"].get(label, 0) + 1
+            if mode == "observe":
+                note = " | [custody-observe] would show %s" % shown
+                legacy = dict(legacy)
+                legacy["action_reason"] = str(legacy.get("action_reason") or "") + note
+                legacy["advisor_note"] = str(legacy.get("advisor_note") or "") + note
+                actions[pos] = legacy
+                continue
+            sell = shown in (ACTION_TRIM, ACTION_EXIT)
+            entry = {"cand": cand, "action": shown,
+                     "action_reason": _custody_tier_reason(verdict, why, source, when, withheld),
+                     "proceeds_sar": (proceeds or 0.0) if sell else 0.0, "capped_from": None,
+                     "weight_pct": None, "sector_weight_pct": None,
+                     "confidence_band": legacy["confidence_band"],
+                     "suggested_delta_sar": None, "suggested_delta_shares": None, "funds_from": None}
+            if sell:
+                _sell_side_deltas([entry], ctl, None)
+            rendered = _action_row(entry, legacy["detail"]["review_date"], ctl)
+            rendered["detail"].update({"position_evidence_matched": True, "reconciliation_status": "matched",
+                                       "execution_ready": False,
+                                       "custody_tier": {"source": source, "verdict": label}})
+            actions[pos] = rendered
+            meta["shown"] += 1
+        if meta["shown"] or any(meta["kept"].values()) or mode == "observe":
+            result["actions"] = actions
+        if meta["shown"]:
+            counts = {action: 0 for action in ACTIONS}
+            for row in actions:
+                counts[row["action"]] = counts.get(row["action"], 0) + 1
+            kpis = dict(result["kpis"])
+            kpis["action_counts"] = counts
+            result["kpis"] = kpis
+            blocked = counts.get(ACTION_BLOCK, 0)
+            if blocked:
+                alerts = [dict(alert) for alert in result["alerts"]]
+                for alert in alerts:
+                    if alert.get("type") == "portfolio_inputs_unverified":
+                        alert["count"] = blocked
+                result["alerts"] = alerts
+            else:
+                result["alerts"] = [{
+                    "type": "custody_matched_funding_withheld", "unit": "count", "count": meta["shown"],
+                    "required_action": ("Holdings match the IBKR capture%s; new money needs a fresh capture "
+                                        "with settled cash. No ledger or order was changed"
+                                        % (" of " + when if when else ""))}]
+        result["meta"]["custody_tier"] = meta
+        return result
+    except Exception as exc:  # noqa: BLE001 - fail closed to the untouched output
+        logger.warning("[PF v1.18.0] custody tier withheld: %s", type(exc).__name__)
+        result["meta"]["custody_tier"] = {"mode": mode, "status": "error", "error_class": type(exc).__name__}
+        return result
+
+
 def _build(rows, ctl, fx_rates, upstream_meta):
     upstream = dict(upstream_meta) if isinstance(upstream_meta, dict) else {}
     evidence = upstream.pop("reconciliation_evidence", None)
     # v1.17.0 [D1b]: private guard inputs, never echoed in meta.upstream.
     post_earnings = upstream.pop("post_earnings", None)
     certification = certify_portfolio_inputs(rows, evidence, fx_rates)
+    # v1.18.0 [CUSTODY-TIER]: off reads and writes nothing.
+    _custody_mode = _env_custody_tier_mode()
+    if _custody_mode != "off":
+        _custody_tier_remember(rows, evidence, certification)
     if upstream.get("holdings_input_incomplete") or (ctl["max_holdings"] and len(rows) > ctl["max_holdings"]):
         certification["funding_eligible"] = False
         certification["holdings_certified"] = False
@@ -4349,8 +4648,12 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     if not certification["funding_eligible"]:
         # v1.16.0 [P0-6]: off (default) is the v1.15.1 call verbatim.
         if _env_research_view_mode() == "off":
-            return _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
-        return _research_view_portfolio(rows, ctl, fx_rates, upstream, certification)
+            protective = _unverified_portfolio(rows, ctl, fx_rates, upstream, certification)
+        else:
+            protective = _research_view_portfolio(rows, ctl, fx_rates, upstream, certification)
+        if _custody_mode == "off":      # v1.18.0: the v1.17.1 output verbatim
+            return protective
+        return _custody_tier_portfolio(rows, ctl, fx_rates, protective, certification, _custody_mode)
     effective = dict(ctl)
     effective["cash_available_sar"] = certification["certified_cash_available_sar"]
     effective["rebalance_mode"] = REBALANCE_NEW_CASH

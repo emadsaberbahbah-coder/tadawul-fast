@@ -172,3 +172,27 @@ def test_each_fix_is_necessary(live, label, mutate, reason):
     assert cert["status"] == "withheld", label
     assert cert["funding_eligible"] is False, label
     assert reason in cert["reason_counts"], (label, cert["reason_counts"])
+
+
+def test_v1180_the_next_refresh_without_a_fresh_capture_keeps_the_verdicts(live, monkeypatch):
+    """portfolio_actions 1.18.0 [CUSTODY-TIER] on the REAL Apps Script request: the certified run leaves a
+    custody receipt; the page's next refresh (no packet, or the same capture 16 minutes later) shows each
+    holding's verdict instead of BLOCK, and funds nothing."""
+    monkeypatch.delenv("TFB_PF_CUSTODY_TIER", raising=False)
+    assert _build(live)["meta"]["execution_ready"] is True
+    no_packet = copy.deepcopy(live)
+    no_packet.pop("reconciliation_evidence")
+    aged = copy.deepcopy(live)
+    _aged(aged)
+    for label, body in (("no packet", no_packet), ("capture 16 minutes old", aged)):
+        out = _build(body)
+        tier = out["meta"]["custody_tier"]
+        assert out["meta"]["execution_ready"] is False and tier["source"] == "receipt", label
+        assert tier["matched"] == 3 and tier["shown"] == 3 and tier["kept"] == {}, (label, tier)
+        assert out["kpis"]["adds_funded_sar"] == 0 and out["kpis"]["deployable_sar"] == 0, label
+        for action in out["actions"]:
+            assert action["action"] in ("HOLD", "TRIM", "EXIT"), (label, action["action"], action["action_reason"])
+            assert "holding matches the IBKR capture of " in action["action_reason"], label
+            assert action["weight_pct"] is None and action["detail"]["execution_ready"] is False, label
+    monkeypatch.setenv("TFB_PF_CUSTODY_TIER", "off")
+    assert [a["action"] for a in _build(no_packet)["actions"]] == ["BLOCK"] * 3

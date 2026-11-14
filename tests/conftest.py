@@ -110,6 +110,29 @@ def _restore_policy_environment():
         yield
 
 
+# 2026-11-15 (portfolio_actions 1.18.0 [CUSTODY-TIER], default enforce): the
+# suites below were written for the v1.15-v1.17 protective contract ("a row
+# without a certified packet is BLOCK") and prove TFB_PF_CUSTODY_TIER=off is
+# that contract unchanged. The tier itself is tested in
+# tests/test_pf_custody_tier.py. Every test also starts without a custody
+# receipt left in the imported module by an earlier test.
+_PF_PROTECTIVE_CONTRACT_SUITES = frozenset({
+    "test_portfolio_action_reconciliation", "test_portfolio_reconciliation_route",
+    "test_pf_research_view_p06", "test_portfolio_actions",
+})
+
+
+@pytest.fixture(autouse=True)
+def _pf_custody_tier_scope(request, monkeypatch):
+    module = sys.modules.get("core.analysis.portfolio_actions")
+    if module is not None and hasattr(module, "_CUSTODY_RECEIPT"):
+        monkeypatch.setattr(module, "_CUSTODY_RECEIPT", None)
+    name = getattr(getattr(request, "module", None), "__name__", "")
+    if name.rsplit(".", 1)[-1] in _PF_PROTECTIVE_CONTRACT_SUITES:
+        monkeypatch.setenv("TFB_PF_CUSTODY_TIER", "off")
+    yield
+
+
 # Example placeholder -- uncomment and expand when shared fixtures are needed:
 #
 # import pytest
