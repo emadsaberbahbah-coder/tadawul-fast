@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.29.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.30.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.30.0 (2026-11-15): the RESEARCH stage keeps a name whose price is the
+latest session's price, TFB_T10_RESEARCH_QUOTE = on (default) | off. Which
+names sit on the board no longer depends on whether the venue happens to be
+trading; sizing (the allocate replay and the single pass) keeps the live rule
+unchanged. See the dated WHY block above OPPORTUNITY_BUILDER_VERSION.
 
 v1.29.0 (2026-11-08): risk-budget ticket sizing, TFB_OPP_SIZING_MODE = risk
 (cap and conviction unchanged). Each seat's ticket is the amount whose loss
@@ -1716,7 +1722,54 @@ from typing import Optional
 #   unmerged on 8 Nov and superseded by the cockpit-side #933; reused here.
 #   Rollback: unset TFB_OPP_SIZING_MODE (or set cap), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.29.0"
+# v1.30.0 (2026-11-15) [RESEARCH-QUOTE] - THE BOARD NO LONGER EMPTIES WHILE THE
+# VENUE TRADES
+# EVIDENCE (Render logs 12-14 Nov, the INVEST pool the ranking challenger
+#   reports on every build; Riyadh time):
+#     07:20-15:40   pool 16-24, US names (venue closed, last close certified)
+#     18:15-22:15   pool 1-2: 0998.HK and 1030.SR only (their venues closed)
+#     23:20-03:06   pool 6: HK, SR and European names; still no US name
+#     07:20 next    pool 23-24 again; Saturday (US closed): 18-23 all day
+#   Every US candidate fails "Quote Freshness" MAJOR from the US open until
+#   the morning sync has fetched the close: in session the sheet quote is
+#   older than TFB_TICKET_MAX_QUOTE_AGE_MIN (15); after the close it predates
+#   the close. The cockpit then finds no seated name in the feed: on 12 and
+#   13 Nov the 18:16 / 19:02 renders show all ten seats GRACE, board HELD,
+#   "hxconfirm held 5" (hard exits pending on names that qualified at 15:41).
+#   The owner reads the board in the evening: "no investment present".
+# WHY THE GATE WAS RIGHT AND ITS REACH WAS NOT: v1.4.0 stops a ticket being
+#   SIZED at a stale price (EXE 88.13 vs 86.95). It was written before the
+#   two-pass board (research, then allocate). In the research stage nothing
+#   is sized: the stage decides which names hold a seat. Evaluated there, the
+#   same rule turns "the price is some hours old" into "the name no longer
+#   qualifies", which the stability layer counts against the seat.
+# CHANGE: in the RESEARCH stage only (criteria board_funding_stage ==
+#   "research"), _quote_research_assessment replaces the live rule. It calls
+#   _quote_freshness_assessment first and upgrades exactly two of its
+#   failures, both with a successful acquisition and a witnessed quote instant:
+#     session_open    the venue trades and the quote is at or after the
+#                     previous close (yesterday's close or today's price)
+#                     -> passes, mode research_session_open
+#     session_closed  the venue has closed and the quote was taken during
+#                     that last session (not older than the close minus
+#                     TFB_T10_RESEARCH_QUOTE_SESSION_H, default 10, 1..24)
+#                     -> passes, mode research_last_session
+#   The gate's current text says "research: ... sizing needs a live quote";
+#   its required text is unchanged, and a research payload whose quotes pass
+#   the live rule is byte-identical to 1.29.0. Failed or
+#   missing acquisition, an unknown or future instant, a venue without a
+#   calendar and a quote older than those bounds fail MAJOR as before.
+# NOT CHANGED: the allocate replay and the single pass evaluate the live
+#   rule byte for byte, so no ticket is sized, funded or reserved from such a
+#   price; a research seat whose price is not live comes back unfunded and
+#   the cockpit prints it as a research seat. Gate order, verdict derivation,
+#   scores, ranking, caps, the snapshot contract: untouched. No ticket schema
+#   change. TFB_T10_RESEARCH_QUOTE=off restores 1.29.0 byte for byte.
+#   Functions added: 3 (_env_research_quote, _env_research_quote_session_h,
+#   _quote_research_assessment). Removed: 0.
+#   Rollback: TFB_T10_RESEARCH_QUOTE=off (read per call), or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.30.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -4272,6 +4325,23 @@ def _env_freshness_fallback_h():
         return 78.0
 
 
+def _env_research_quote():
+    """v1.30.0 kill-switch - DEFAULT ON. off / 0 / false / no restores the
+    1.29.0 research stage (the live rule decides seats too)."""
+    return (os.getenv("TFB_T10_RESEARCH_QUOTE") or "on").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _env_research_quote_session_h():
+    """v1.30.0: how far before the last close a quote may have been taken and
+    still be that session's price (hours; default 10, clamped 1..24)."""
+    try:
+        v = float(os.getenv("TFB_T10_RESEARCH_QUOTE_SESSION_H") or 10.0)
+        return min(24.0, max(1.0, v)) if math.isfinite(v) else 10.0
+    except (TypeError, ValueError):
+        return 10.0
+
+
 # -----------------------------------------------------------------------------
 # v1.21.0 [PRICE-XCHECK] helpers — see the header WHY block. Pure except the
 # network leg (_xcheck_fetch_eodhd), which is budgeted and never raises.
@@ -4914,6 +4984,40 @@ def _quote_freshness_assessment(cand):
                    % (age_min / 60.0)), detail
 
 
+def _quote_research_assessment(cand):
+    """v1.30.0 [RESEARCH-QUOTE]: the quote rule of the RESEARCH stage (which
+    names hold a seat; nothing is sized there). The live rule runs first; two
+    of its failures pass here, both with a proven acquisition and a witnessed
+    quote instant: the venue trades and the quote is at or after the previous
+    close, or the venue has closed and the quote was taken during that last
+    session. Everything else is returned unchanged. Never raises."""
+    passed, current, detail = _quote_freshness_assessment(cand)
+    if passed:
+        return passed, current, detail
+    try:
+        mode = detail.get("mode")
+        if mode not in ("session_open", "session_closed"):
+            return passed, current, detail
+        quoted = datetime.fromisoformat(detail["quote_ts"])
+        close = datetime.fromisoformat(detail["prev_close"])
+        age_h = float(detail["age_min"]) / 60.0
+        if mode == "session_open":
+            if quoted < close - timedelta(minutes=2):
+                return passed, current, detail
+            text = ("research: last price %.1fh old while the venue trades; "
+                    "sizing needs a live quote" % age_h)
+            return True, text, dict(detail, mode="research_session_open",
+                                    live_rule=current)
+        if quoted < close - timedelta(hours=_env_research_quote_session_h()):
+            return passed, current, detail
+        text = ("research: last-session price %.1fh old, taken before the "
+                "close; sizing needs the close" % age_h)
+        return True, text, dict(detail, mode="research_last_session",
+                                live_rule=current)
+    except Exception:  # noqa: BLE001 - an unreadable detail stays a failure
+        return passed, current, detail
+
+
 def _data_trust_assessment(cand, criteria):
     """v1.0.6 Phase-0 trust signal for a Top_10 candidate. Returns
     (passed, current_str, detail). passed=False => the caller emits a MAJOR
@@ -5149,7 +5253,14 @@ def evaluate_gates(cand, criteria, held_symbols=None,
                         or quote_stamp is None
                         or quote_stamp > datetime.now(timezone.utc) + timedelta(seconds=60))
     if _env_freshness_gate() or unverified_quote:
-        f_ok, f_cur, f_detail = _quote_freshness_assessment(cand)
+        # v1.30.0 [RESEARCH-QUOTE]: the research stage sizes nothing, so the
+        # latest session's price keeps a name on the board there; every other
+        # stage evaluates the live rule exactly as before.
+        _research_quote = (criteria.get("board_funding_stage") == "research"
+                           and _env_research_quote())
+        f_ok, f_cur, f_detail = (_quote_research_assessment(cand)
+                                 if _research_quote
+                                 else _quote_freshness_assessment(cand))
         fg = _gate(
             "Quote Freshness", f_ok, FAIL_MAJOR, f_cur,
             ("successful price acquisition with actual quote as-of; live <= "
