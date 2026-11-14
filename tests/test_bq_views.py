@@ -279,6 +279,8 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.8.0 (14 Nov 2026): the first controlled trial, C-1
+    "v_trial_c1": "7c1875d9f4c18e8bf1d7fa4051d92cd6f9323c46df5bfe6b56b2a411ed5b37cd",
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
     "v_outcome_engine": "85d51279fdaa42b351c5ab8c277b507923005c6395fbf9b866aab01deed64c5e",
@@ -302,9 +304,10 @@ EXPECTED_ORDER = [
     "v_outcome_engine", "v_outcome_calibration", "v_board_archive", "v_outcome_coverage",
     "v_signal_edge_daily", "v_signal_edge",
     "v_outcome_excess", "v_market_regime", "v_seat_regime", "v_regime_outcomes",
+    "v_trial_c1",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 19)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 20)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -863,8 +866,10 @@ def case_v18():
     assert {n: t for n, t in used.items() if t} == {
         "v_symbol_candles": {"symbol_bars_daily"}, "v_symbol_analyst": {"symbol_analyst_daily"},
         "v_symbol_news": {"symbol_news"},
-        "v_outcome_engine": {"symbol_bars_daily"}}, used          # v1.5.0: the engine reads the bars too
+        "v_outcome_engine": {"symbol_bars_daily"},           # v1.5.0: the engine reads the bars too
+        "v_trial_c1": {"symbol_bars_daily"}}, used            # v1.8.0: the trial reads each call's 1-month price
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
+    assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
               "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):
