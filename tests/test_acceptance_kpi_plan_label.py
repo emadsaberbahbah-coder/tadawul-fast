@@ -27,7 +27,8 @@ def _board(label, value):
 
 
 def test_version_bumped():
-    assert acc.VERSION == "1.0.11"
+    # merge note (2026-11-02, #808): the relocated audit grid is v1.0.12 over this v1.0.11; a floor.
+    assert tuple(int(x) for x in acc.VERSION.split(".")) >= (1, 0, 11)
 
 
 def test_12m_label_reads_as_before():
