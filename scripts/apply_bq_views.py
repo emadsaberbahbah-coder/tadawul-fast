@@ -2,8 +2,22 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.7.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.8.0 (program register C8, Phase 2)
 ================================================================================
+v1.8.0 (14 Nov 2026, the first controlled trial). WHY (owner, 14 Nov 2026:
+"make full review ... which area still least improved ... let's work to
+improve it"; the full review of that day found the project's HIGH
+confidence, reliability 80+ and Tadawul buy calls losing to their market).
+New v_trial_c1: challenger C-1, its rule fixed on 14 Nov before any forward
+data - keep a buy call unless its confidence is HIGH or its reliability is
+80+, or it is a Tadawul call whose own 1-month return did not beat TASI's -
+against the champion (every buy call), per horizon, with the calls left out,
+the mean daily difference and its t, and a reading. Only calls recorded from
+15 Nov 2026 count as evidence (period 'forward'); the earlier calls are shown
+as in-sample, which is why the rule was chosen. Promotion rule fixed now: 20
+call days, 40 matured C-1 calls, t >= 2; the owner decides even then.
+Research view: the live system never reads BigQuery; no decision, gate,
+count or broker action depends on it.
 v1.7.0 (8 Nov 2026, total return, benchmarks and regimes). WHY (owner, 8
 Nov 2026, after the week of 2-6 Nov: "how we can avoid that in the future";
 "let's do the requirement and implement it"): three lessons from that week
@@ -168,7 +182,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
