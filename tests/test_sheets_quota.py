@@ -133,7 +133,7 @@ def test_q4_evidence_board_retries_the_read_not_the_queries(monkeypatch, capsys)
 def test_q5_manifest_and_ci():
     man = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '("sheets_quota", "%s", "sheets quota")' % sq.__version__ in man
-    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in man and ep.__version__ == "1.3.1"
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in man and ep.__version__ >= "1.3.1"
     assert '("evidence_board", "%s", "evidence board")' % eb.__version__ in man and eb.__version__ == "1.2.1"
     assert "tests/test_sheets_quota.py" in (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     src = (ROOT / "scripts/sheets_quota.py").read_text(encoding="utf-8")

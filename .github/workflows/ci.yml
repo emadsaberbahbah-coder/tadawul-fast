@@ -1222,6 +1222,7 @@ jobs:
             tests/test_sync_insights_publication.py \
             tests/test_sync_publication_clock.py \
             tests/test_shadow_scorer_regret_read_failure.py \
+            tests/test_s1_ca_evidence.py \
             tests/test_opportunity_builder.py \
             tests/test_ob_board_funding.py \
             tests/test_ob_research_diversify.py \

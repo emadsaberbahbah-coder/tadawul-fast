@@ -1,6 +1,20 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.6 (2026-11-14) — NO CORPORATE-ACTION EVIDENCE IS NOT A PASS
+WHY (review of 14 Nov, P1 "vacuous corporate-action PASS"): ca_is_clean()
+returned True when _Corporate_Actions held no action at all and when the read
+failed ("absence of ledger is not a violation"), so criterion 5 of the legacy
+gate passed on no evidence: the live register is header-only while the
+archive still holds MBRX outcomes above +1,000% around its 20 Oct 1-for-20
+reverse split. ca_is_clean() now answers None (not evaluable) for a register
+with no row (the criteria-v2 C5 rule) or an unreadable one, and evaluate_s1() files criterion 5 as PENDING
+on None, so the verdict is NOT_DECIDABLE until real evidence exists. A
+populated register still PASSes when every confirmed action is repaired in
+Performance_Log, and still FAILs when one is not. Nothing is promoted either
+way (the gate never auto-promotes). Rollback: TFB_S1_CA_EVIDENCE=legacy (the
+1.9.5 answer, True). Functions added: 1 (_ca_evidence_mode).
+
 VERSION 1.9.5 (2026-11-10) — THE LASTSCORED READ-BACK NAMES ITS LEGS (P-186 armed)
 WHY: shadow_scorer.yml 1.0.2 arms TFB_S1_BASE_POLICY=lastscored (9 Nov was lost
 under legacy: DAY_EXCLUDED_INFRA fresh=0/5 because the 8 Nov row held no
@@ -502,7 +516,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.5"
+SCRIPT_VERSION = "1.9.6"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -1278,7 +1292,7 @@ def criteria_v2_line(gate: Dict[str, Any]) -> str:
 
 def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
-                calibration_state: str, ca_clean: bool, pit_ok: bool,
+                calibration_state: str, ca_clean: Optional[bool], pit_ok: bool,
                 pit_note: str, drill_date: Optional[str],
                 excluded_days: int = 0,
                 calibration_detail: str = "") -> Dict[str, Any]:
@@ -1311,9 +1325,14 @@ def evaluate_s1(days: int, violations: List[str],
               "detail": calibration_detail or (
                   "7D/14D horizons land in Wave B (track_performance)"
                   if calibration_state == "PENDING" else "in band")})
-    c.append({"id": 5, "name": "corporate-actions + point-in-time",
-              "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
-              "detail": f"CA {'clean' if ca_clean else 'UNREPAIRED'}; {pit_note}"})
+    if ca_clean is None and pit_ok:              # v1.9.6: no evidence is pending, never a pass
+        c.append({"id": 5, "name": "corporate-actions + point-in-time", "status": "PENDING",
+                  "detail": f"CA not evaluable (register empty or unreadable); {pit_note}"})
+    else:
+        c.append({"id": 5, "name": "corporate-actions + point-in-time",
+                  "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
+                  "detail": f"CA {'clean' if ca_clean else ('not evaluable' if ca_clean is None else 'UNREPAIRED')}"
+                            f"; {pit_note}"})
     c.append({"id": 6, "name": "rollback drill passed",
               "status": "PASS" if drill_date else "PENDING",
               "detail": drill_date or "not yet run (operator, monthly)"})
@@ -1959,21 +1978,36 @@ def find_drill_marker(sh, since: date) -> Optional[str]:
     return f"{newest.isoformat()} ({marker})" if newest else None
 
 
-def ca_is_clean(sh) -> bool:
-    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log."""
+def _ca_evidence_mode() -> str:
+    """v1.9.6: TFB_S1_CA_EVIDENCE = strict (default) | legacy (1.9.5: no evidence passes)."""
+    raw = (os.getenv("TFB_S1_CA_EVIDENCE") or "strict").strip().lower()
+    return "legacy" if raw == "legacy" else "strict"
+
+
+def ca_is_clean(sh) -> Optional[bool]:
+    """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log.
+    v1.9.6: True = a register with rows, every confirmed action repaired; False = one is not; None = not
+    evaluable (the register has no row, or it cannot be read). Under TFB_S1_CA_EVIDENCE=legacy the
+    None cases answer True, as in 1.9.5."""
+    vacuous: Optional[bool] = True if _ca_evidence_mode() == "legacy" else None
     try:
         from core import corporate_actions as ca
+        values = sh.worksheet(ca.TAB_ACTIONS).get_all_values()
+        if not any(any(str(c).strip() for c in r) for r in (values or [])[1:]):
+            return vacuous           # a register with no row certifies nothing (the v2 rule, C5)
+        acts = ca.parse_actions(values)
+        if not acts:
+            return True              # rows, but no split, reverse split or rename to repair
         rp_path = os.path.join(_ROOT, "scripts", "repair_corporate_actions.py")
         spec = importlib.util.spec_from_file_location("tfb_ca_repair", rp_path)
         rp = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rp)  # type: ignore[union-attr]
-        acts = ca.parse_actions(sh.worksheet(ca.TAB_ACTIONS).get_all_values())
         idx = ca.build_adjustment_index(acts, confirmed_only=True)
         plan, _hdr, _cols = rp.plan_repairs(
             sh.worksheet("Performance_Log").get_all_values(), idx)
         return len(plan) == 0
     except Exception:  # noqa: BLE001
-        return True          # absence of ledger is not a violation
+        return vacuous               # an unreadable register certifies nothing
 
 
 # --------------------------------------------------------------------------- #
@@ -2562,6 +2596,10 @@ def _selftest() -> int:
     g6 = evaluate_s1(30, [], 3.0, "PASS", False, True, "ok", "2026-08-01")
     checks.append(("gate: unrepaired corporate action -> FAIL",
                    g6["verdict"] == "FAIL"))
+    g7 = evaluate_s1(30, [], 3.0, "PASS", None, True, "ok", "2026-08-01")
+    checks.append(("v1.9.6 gate: no corporate-action evidence -> 5 PENDING, NOT_DECIDABLE",
+                   g7["verdict"] == "NOT_DECIDABLE" and g7["criteria"][4]["status"] == "PENDING"
+                   and "5" in g7["why"]))
     checks.append(("gate always reports six criteria", len(g4["criteria"]) == 6))
 
     ex = [{"symbol": "TRMD.US", "fork": rg.COMPLIANCE_BLOCK},
