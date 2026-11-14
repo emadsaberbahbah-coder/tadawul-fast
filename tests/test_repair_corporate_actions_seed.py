@@ -61,7 +61,7 @@ def test_s1_seed_rows_are_written_on_or_after_their_date_and_once():
 
 
 def test_s2_the_shipped_seed_is_well_formed():
-    seed = json.loads((ROOT / "data/corporate_actions_confirmed.json").read_text(encoding="utf-8"))
+    seed = json.loads((ROOT / "config/corporate_actions_confirmed.json").read_text(encoding="utf-8"))
     rows, held = rca.seed_rows(seed, [ca.ACTIONS_HEADER], date(2026, 11, 14), "x")
     assert [(r[0], r[1], r[2], r[3]) for r in rows] == [("MBRX.US", "REVERSE_SPLIT", "2026-10-20", "20")]
     assert held == ["GRT-UN.TO SPLIT effective 2026-11-24 - written on that day"]

@@ -1,0 +1,26 @@
+{
+  "schema": "tfb.corporate-actions-confirmed.v1",
+  "about": "Corporate actions confirmed from the issuer's own filing. Merging a change to this file is the confirmation: scripts/repair_corporate_actions.py writes each row into _Corporate_Actions on or after its effective date (never before, so prices are not rebased early) and repairs Performance_Log. Ratio follows core/corporate_actions.py: SPLIT r = r-for-1, REVERSE_SPLIT r = 1-for-r. Effective date = the first session priced on the new basis.",
+  "actions": [
+    {
+      "symbol": "MBRX.US",
+      "action_type": "REVERSE_SPLIT",
+      "effective_date": "2026-10-20",
+      "ratio": 20,
+      "source": "SEC 8-K 2026-10-16 https://www.sec.gov/Archives/edgar/data/0001659617/000143774926032969/mbrx20261015d_8k.htm",
+      "notes": "1-for-20; opened post-split on Nasdaq 2026-10-20, same ticker, new CUSIP 60855D 507"
+    },
+    {
+      "symbol": "GRT-UN.TO",
+      "action_type": "SPLIT",
+      "effective_date": "2026-11-24",
+      "ratio": 3,
+      "source": "Granite REIT release 2026-11 (three-for-one unit split; record 2026-11-18, payment 2026-11-23, due bills redeemed 2026-11-24)",
+      "notes": "3-for-1; TSX due-bill trading 2026-11-18 to 2026-11-23, first ex-split session 2026-11-24"
+    }
+  ],
+  "not_price_actions": [
+    {"symbol": "DDI.US", "event": "conditional cash tender at USD 16.25 per ADS (announced 2026-11-09); each ADS = 0.05 common share", "why": "not a split or rename: no price rebase; recorded for the news and events work"},
+    {"symbol": "INDV.US / SUPN.US", "event": "combination; the new Supernus, Inc. trades as SUPN", "why": "a combination, not a rename: the histories are not joined until a dated exchange ratio is confirmed"}
+  ]
+}

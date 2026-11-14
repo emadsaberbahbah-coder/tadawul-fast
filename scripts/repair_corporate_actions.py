@@ -8,7 +8,7 @@ MBRX's 1-for-20 reverse split of 20 Oct left seven matured outcomes above
 +1,000% in Performance_Log, and the S-1 corporate-action check had nothing
 to stand on (shadow_scorer 1.9.6 now reads an empty register as pending).
 WHAT:
-  * --seed FILE (default data/corporate_actions_confirmed.json): actions
+  * --seed FILE (default config/corporate_actions_confirmed.json): actions
     confirmed from the issuer's filing and merged through review are written
     into _Corporate_Actions with their filing as Source, ON OR AFTER their
     effective date only - never earlier, because the repair rebases prices
@@ -289,7 +289,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--sheet-id")
     ap.add_argument("--seed", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                   "data", "corporate_actions_confirmed.json"))
+                                                   "config", "corporate_actions_confirmed.json"))
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()

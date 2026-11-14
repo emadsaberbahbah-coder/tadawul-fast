@@ -6,7 +6,7 @@
 #   above +1,000% in Performance_Log, and the S-1 corporate-action check had
 #   no evidence (shadow_scorer 1.9.6 reads an empty register as pending).
 # WHAT: once a day (and on dispatch) the script writes the reviewed actions in
-#   data/corporate_actions_confirmed.json into _Corporate_Actions on or after
+#   config/corporate_actions_confirmed.json into _Corporate_Actions on or after
 #   each one's effective date, then repairs Performance_Log for every confirmed
 #   action: entry and target rebased, and a finished outcome that spans the
 #   action recomputed. Idempotent: a repaired row carries the ca_adjusted tag
