@@ -2,6 +2,12 @@
 """
 scripts/sheets_quota.py - wait out the Google Sheets per-minute read quota
 ==========================================================================
+VERSION 1.0.1 (2026-11-14) - THE GOOGLE API CLIENT'S 429 IS THE QUOTA TOO
+The Provider Target Coverage Alert reads through the Google API client, whose
+quota answer is "<HttpError 429 when requesting ...>" with the status on
+e.resp.status, and 1.0.0 did not recognise it (the monitor failed red on
+11, 12 and 13 Nov). is_quota() now also reads e.resp.status and that text.
+
 VERSION 1.0.0 (2026-11-13) - NEW SCRIPT
 
 WHY (owner, Fri 13 Nov 2026 19:12 Riyadh: "make full check ... another
@@ -26,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 WAITS = (65.0, 65.0)                       # seconds; the quota is counted per minute
 RETRIES = 2
@@ -35,8 +41,10 @@ RETRIES = 2
 def is_quota(e: BaseException) -> bool:
     """True for the Sheets per-minute quota answer (HTTP 429)."""
     code = getattr(getattr(e, "response", None), "status_code", None)
+    status = getattr(getattr(e, "resp", None), "status", None)          # 1.0.1: googleapiclient HttpError
     s = "%s %s" % (type(e).__name__, e)
-    return code == 429 or "[429]" in s or "Quota exceeded" in s or "RESOURCE_EXHAUSTED" in s
+    return (code == 429 or str(status) == "429" or "[429]" in s or "HttpError 429" in s or "Quota exceeded" in s
+            or "RESOURCE_EXHAUSTED" in s)
 
 
 def wait_for(e: BaseException, attempt: int) -> Optional[float]:
