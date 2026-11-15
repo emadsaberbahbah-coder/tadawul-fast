@@ -1,4 +1,4 @@
-"""portfolio_actions 1.18.0 [CUSTODY-TIER] + portfolio_reconciliation 1.1.0.
+"""portfolio_actions 1.18.1 [CUSTODY-TIER] + portfolio_reconciliation 1.1.0.
 
 Owner, 15 Nov 2026: the page read BLOCK on 6 of 6 holdings ("missing_evidence") while every rule verdict
 was HOLD, because the hourly IBKR capture is accepted for 900 s and each certified page is overwritten by the
@@ -246,8 +246,10 @@ def test_t1_after_a_certified_run_the_same_rows_without_a_packet_show_their_verd
         assert row["market_value_sar"] and row["stop_sar"] and row["detail"]["position_evidence_matched"] is True
         assert row["detail"]["reconciliation_status"] == "matched" and row["suggested_delta_sar"] is None
         assert row["suggested_delta_shares"] is None and row["proceeds_sar"] == 0
-    assert r["AAA.SR"]["detail"]["custody_tier"] == {"source": "receipt", "verdict": "NEW_MONEY_WITHHELD"}
-    assert r["BBB.SR"]["detail"]["custody_tier"] == {"source": "receipt", "verdict": "HOLD"}
+    assert r["AAA.SR"]["detail"]["custody_tier"] == {"source": "receipt", "verdict": "NEW_MONEY_WITHHELD",
+                                                     "price": "live"}
+    assert r["BBB.SR"]["detail"]["custody_tier"] == {"source": "receipt", "verdict": "HOLD", "price": "live"}
+    assert got["meta"]["custody_tier"]["prices"] == {"live": 2}
     assert got["kpis"]["action_counts"] == {"ADD": 0, "HOLD": 2, "TRIM": 0, "EXIT": 0, "BLOCK": 0}
     assert [a["type"] for a in got["alerts"]] == ["custody_matched_funding_withheld"] and got["alerts"][0]["count"] == 2
     tier = got["meta"]["custody_tier"]
@@ -266,7 +268,8 @@ def test_t2_without_a_receipt_the_page_is_the_protective_page():
     finally:
         monkey.undo()
     assert got["meta"].pop("custody_tier") == {"mode": "enforce", "status": "no_recent_capture", "source": None,
-                                               "matched": 0, "shown": 0, "verdicts": {}, "kept": {}}
+                                               "matched": 0, "shown": 0, "verdicts": {}, "kept": {},
+                                               "prices": {}}
     assert "custody_tier" not in want["meta"]
     for page in (got, want):
         page["meta"].pop("generated_utc", None)
@@ -432,7 +435,7 @@ def test_t9_an_old_receipt_and_a_truncated_input_change_nothing(monkeypatch):
 def test_t10_a_fault_inside_the_tier_returns_the_protective_page(monkeypatch):
     rows = [holding("AAA.SR")]
     build(rows)
-    monkeypatch.setattr(pa, "_custody_quote_ok", lambda cand: 1 / 0)
+    monkeypatch.setattr(pa, "_custody_quote_level", lambda cand: 1 / 0)
     got = build(rows, evidence=None)
     assert got["actions"][0]["action"] == "BLOCK" and got["meta"]["custody_tier"] == {
         "mode": "enforce", "status": "error", "error_class": "ZeroDivisionError"}
@@ -654,12 +657,124 @@ def test_s3_the_persist_kill_switch_keeps_the_receipt_in_memory_only(monkeypatch
     assert fake.calls == 0 and fake.data == {}
 
 
+# ----------------------------------------------------------------------------- 1.18.1: the price level
+def _quoted(symbol, when, **updates):
+    stamp = when.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return holding(symbol, **dict({"Warnings": "acquisition_status:success; acquisition_provider:EODHD; "
+                                               "acquisition_acquired_at:" + _stamp() + "; acquisition_quote_asof:"
+                                               + stamp}, **updates))
+
+
+def _venue(monkeypatch, is_open, close):
+    monkeypatch.setattr(pa._ob, "_venue_state", lambda *_args: (is_open, close))
+
+
+def test_p1_while_the_venue_trades_the_verdict_stays_and_says_how_old_the_price_is(monkeypatch):
+    # Every evening from the US open: the sheet quote is hours old, the live rule fails, 1.18.0 printed BLOCK.
+    now = dt.datetime.now(UTC)
+    _venue(monkeypatch, True, now - dt.timedelta(hours=20))
+    rows = [_quoted("AAA.SR", now - dt.timedelta(hours=3), Recommendation="HOLD", **{"Intrinsic Value": 104}),
+            holding("BBB.SR", Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    live = [holding("AAA.SR", Recommendation="HOLD", **{"Intrinsic Value": 104}), rows[1]]
+    assert build(live)["meta"]["execution_ready"] is True                # a capture certified these holdings
+    got = build(rows, evidence=None)
+    assert_never_funds(got)
+    r = by_symbol(got)
+    assert r["AAA.SR"]["action"] == "HOLD" and r["BBB.SR"]["action"] == "HOLD"
+    note = r["AAA.SR"]["action_reason"].split(" | ")[-1]
+    assert note.startswith("price of ") and " Riyadh (3.0 h old) is the latest session's, not a live quote; " in note
+    assert note.endswith("confirm it at the broker before acting")
+    quoted = (now - dt.timedelta(hours=3) + dt.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    assert ("price of %s Riyadh" % quoted) in note
+    assert "holding matches the IBKR capture of " in r["AAA.SR"]["action_reason"]
+    assert "latest session" not in r["BBB.SR"]["action_reason"]
+    assert r["AAA.SR"]["detail"]["custody_tier"]["price"] == "session"
+    assert r["BBB.SR"]["detail"]["custody_tier"]["price"] == "live"
+    tier = got["meta"]["custody_tier"]
+    assert tier["prices"] == {"session": 1, "live": 1} and tier["kept"] == {} and tier["shown"] == 2
+    assert got["kpis"]["action_counts"]["BLOCK"] == 0
+    assert pa._custody_quote_level(pa.normalize_holding(rows[0], {"SAR": 1}, pa.make_controls())) == "session"
+    assert pa._custody_quote_ok(pa.normalize_holding(rows[0], {"SAR": 1}, pa.make_controls())) is True
+
+
+def test_p2_a_capture_taken_in_session_shows_the_verdicts_too(monkeypatch):
+    # A fresh packet with an in-session quote: funding is withheld (holding_quote_unverified), custody is proven.
+    now = dt.datetime.now(UTC)
+    _venue(monkeypatch, True, now - dt.timedelta(hours=20))
+    rows = [_quoted("AAA.SR", now - dt.timedelta(hours=3), Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    got = build(rows)
+    assert_never_funds(got)
+    assert got["meta"]["input_certification"]["reason_counts"] == {"holding_quote_unverified": 1}
+    row = got["actions"][0]
+    assert row["action"] == "HOLD" and got["meta"]["custody_tier"]["source"] == "packet"
+    assert " | holding matches the fresh IBKR capture; new money withheld (holding_quote_unverified) | price of " \
+        in row["action_reason"]
+    assert got["meta"]["custody_tier"]["prices"] == {"session": 1}
+
+
+def test_p3_a_sale_is_never_sized_from_a_session_price(monkeypatch):
+    now = dt.datetime.now(UTC)
+    rows = [holding("SELL.SR", Recommendation="STRONG_SELL", **{"Investability Status": "BLOCKED"}),
+            holding("TRIM.SR", quantity=40, Recommendation="HOLD", **{"Intrinsic Value": 92})]
+    build(rows)
+    live = by_symbol(build(rows, evidence=None))
+    assert live["SELL.SR"]["suggested_delta_shares"] == -10 and live["TRIM.SR"]["proceeds_sar"] > 0
+    _venue(monkeypatch, True, now - dt.timedelta(hours=20))
+    old = now - dt.timedelta(hours=2)
+    stale = [_quoted("SELL.SR", old, Recommendation="STRONG_SELL", **{"Investability Status": "BLOCKED"}),
+             _quoted("TRIM.SR", old, quantity=40, Recommendation="HOLD", **{"Intrinsic Value": 92})]
+    got = build(stale, evidence=None)
+    assert_never_funds(got)
+    r = by_symbol(got)
+    assert r["SELL.SR"]["action"] == "EXIT" and r["TRIM.SR"]["action"] == "TRIM"
+    for symbol in ("SELL.SR", "TRIM.SR"):
+        assert r[symbol]["suggested_delta_shares"] is None and r[symbol]["suggested_delta_sar"] is None
+        assert r[symbol]["proceeds_sar"] == 0 and r[symbol]["detail"]["custody_tier"]["price"] == "session"
+        assert r[symbol]["action_reason"].endswith(
+            "confirm it at the broker before acting; no sale size is computed from it")
+        assert pa.CUSTODY_SELL_NOTE in r[symbol]["action_reason"]
+    assert got["kpis"]["proceeds_pending_sar"] == 0
+    assert got["kpis"]["action_counts"] == {"ADD": 0, "HOLD": 0, "TRIM": 1, "EXIT": 1, "BLOCK": 0}
+
+
+def test_p4_a_price_older_than_the_session_and_the_switch_off_keep_the_block(monkeypatch):
+    now = dt.datetime.now(UTC)
+    close = now - dt.timedelta(hours=20)
+    _venue(monkeypatch, True, close)
+    fresh = [holding("AAA.SR", Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    build(fresh)
+    older = [_quoted("AAA.SR", close - dt.timedelta(hours=5), Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    got = build(older, evidence=None)                                    # yesterday's intraday price
+    assert got["actions"][0]["action"] == "BLOCK" and got["meta"]["custody_tier"]["kept"] == {"quote_unverified": 1}
+    assert got["actions"][0]["action_reason"].endswith(" | " + pa.CUSTODY_QUOTE_NOTE)
+    assert got["meta"]["custody_tier"]["prices"] == {}
+    session = [_quoted("AAA.SR", now - dt.timedelta(hours=3), Recommendation="HOLD", **{"Intrinsic Value": 104})]
+    assert build(session, evidence=None)["actions"][0]["action"] == "HOLD"
+    monkeypatch.setenv("TFB_T10_RESEARCH_QUOTE", "off")                  # 1.18.0
+    off = build(session, evidence=None)
+    assert off["actions"][0]["action"] == "BLOCK" and off["meta"]["custody_tier"]["kept"] == {"quote_unverified": 1}
+    assert pa._custody_quote_level(pa.normalize_holding(session[0], {"SAR": 1}, pa.make_controls())) is None
+    assert pa._custody_quote_ok(pa.normalize_holding(session[0], {"SAR": 1}, pa.make_controls())) is False
+
+
+def test_p5_the_level_and_the_note_never_raise(monkeypatch):
+    assert pa._custody_quote_level({}) is None and pa._custody_quote_level({"quote_evidence": {"status": "SUCCESS"}}) is None
+    monkeypatch.setattr(pa._ob, "_quote_freshness_assessment", lambda cand: 1 / 0)
+    assert pa._custody_quote_level({"quote_evidence": {"status": "SUCCESS", "quote_asof": _stamp()}}) is None
+    assert pa._custody_price_note({}, False) == ("price of an earlier time is the latest session's, not a live quote; "
+                                                 "confirm it at the broker before acting")
+    half = {"quote_evidence": {"quote_asof": _stamp(dt.datetime.now(UTC) - dt.timedelta(minutes=30))}}
+    assert " Riyadh (30 min old) is the latest session's" in pa._custody_price_note(half, False)
+    assert pa._custody_price_note(half, True).endswith("; no sale size is computed from it")
+
+
 def test_v1_versions_and_pins():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.18.0" and pr.__version__ == "1.1.0"
+    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.18.1" and pr.__version__ == "1.1.0"
     manifest = (root / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.18.0", "portfolio actions")' in manifest
+    assert '"1.18.1", "portfolio actions")' in manifest
+    assert '"1.30.0", "opportunity builder")' in manifest
     assert """("core.portfolio_reconciliation", "__version__", '1.1.0'""" in manifest
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "tests/test_pf_custody_tier.py" in ci

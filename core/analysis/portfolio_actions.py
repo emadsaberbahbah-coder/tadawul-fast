@@ -974,7 +974,37 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _custody_tier_portfolio). Changed: _build (one remember call, one
 #   dispatch). Removed: 0. Tests: tests/test_pf_custody_tier.py.
 #   Rollback: TFB_PF_CUSTODY_TIER=off, or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.18.0"
+# ---------------------------------------------------------------------------
+# v1.18.1 (2026-11-15) [CUSTODY-TIER] THE VERDICT STAYS WHILE THE VENUE TRADES
+# WHY: 1.18.0 kept a custody-proven row BLOCK unless the funded path's quote
+#   rule passed. That rule (opportunity_builder._quote_freshness_assessment)
+#   fails every holding whose venue is trading and whose sheet quote is older
+#   than 15 minutes, and every holding from the close until the morning sync
+#   has fetched it. For six US holdings that is every evening from 17:30
+#   Riyadh to the next morning: the hours the owner reads the page. The same
+#   rule also withholds funding on a fresh packet ("holding_quote_unverified"),
+#   so a capture taken in session changed nothing either.
+# WHAT: a custody-proven row now has a price level (_custody_quote_level).
+#   live     the funded path's rule passes: 1.18.0 behaviour, unchanged.
+#   session  only the research rule passes (opportunity_builder 1.30.0
+#            _quote_research_assessment: a proven acquisition and a witnessed
+#            quote at or after the previous close while the venue trades, or
+#            taken during the session that just closed). The row shows its
+#            HOLD / TRIM / EXIT verdict and says when the price was taken and
+#            that it is not a live quote. A TRIM or EXIT at this level carries
+#            NO share or SAR delta and no proceeds: the size of a sale is not
+#            computed from a price that may have moved.
+#   none     no proven price, or older than the latest session: BLOCK with
+#            the 1.18.0 note, as before.
+#   detail.custody_tier gains "price"; meta.custody_tier gains "prices"
+#   {live, session}. Funding is untouched: new money, ADD sizing and the
+#   verified path still need the live rule. TFB_T10_RESEARCH_QUOTE=off gives
+#   1.18.0 back (the session level never applies).
+# Functions added: 2 (_custody_quote_level, _custody_price_note). Changed:
+#   _custody_quote_ok (now: a level exists), _custody_tier_portfolio.
+#   Removed: 0. Tests: tests/test_pf_custody_tier.py (p1-p5).
+#   Rollback: TFB_T10_RESEARCH_QUOTE=off, TFB_PF_CUSTODY_TIER=off, or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.18.1"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -4458,17 +4488,49 @@ def _custody_tier_remember(rows, evidence, certification):
         logger.warning("[PF v1.18.0] custody receipt withheld: %s", type(exc).__name__)
 
 
-def _custody_quote_ok(cand):
-    """v1.18.0: the funded path's own quote rule for one row (successful
-    acquisition, a witnessed quote instant, _quote_freshness_assessment).
-    Anything unprovable is False. Never raises."""
+def _custody_quote_level(cand):
+    """v1.18.1: the price level of one custody-proven row. "live" when the
+    funded path's own quote rule passes (successful acquisition, a witnessed
+    quote instant, _quote_freshness_assessment); "session" when only the
+    research rule passes (the latest session's price, opportunity_builder
+    1.30.0, TFB_T10_RESEARCH_QUOTE); None for anything unprovable or older.
+    Never raises."""
     try:
         proof = cand.get("quote_evidence") or {}
         if proof.get("status") != "SUCCESS" or not proof.get("quote_asof"):
-            return False
-        return bool(_ob._quote_freshness_assessment(cand)[0])
+            return None
+        if _ob._quote_freshness_assessment(cand)[0]:
+            return "live"
+        if _ob._env_research_quote() and _ob._quote_research_assessment(cand)[0]:
+            return "session"
+        return None
     except Exception:  # noqa: BLE001
-        return False
+        return None
+
+
+def _custody_quote_ok(cand):
+    """v1.18.0: a custody-proven row may show its verdict only on a proven
+    price. v1.18.1: that is any level _custody_quote_level names. Never
+    raises."""
+    return _custody_quote_level(cand) is not None
+
+
+def _custody_price_note(cand, sell):
+    """v1.18.1: the sentence a session-level row carries, e.g. 'price of
+    2026-11-13 22:02 Riyadh (3.1 h old) is the latest session's, not a live
+    quote; confirm it at the broker before acting'. Never raises."""
+    tail = "; no sale size is computed from it" if sell else ""
+    try:
+        from core.data_validity import precise_utc
+        quoted = precise_utc((cand.get("quote_evidence") or {}).get("quote_asof"))
+        age_h = max(0.0, (datetime.now(timezone.utc) - quoted).total_seconds() / 3600.0)
+        when = "%s Riyadh (%s old)" % (
+            (quoted + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
+            ("%d min" % round(age_h * 60.0)) if age_h < 1.0 else ("%.1f h" % age_h))
+    except Exception:  # noqa: BLE001
+        when = "an earlier time"
+    return ("price of %s is the latest session's, not a live quote; confirm it at "
+            "the broker before acting%s" % (when, tail))
 
 
 def _custody_when(recent):
@@ -4501,7 +4563,7 @@ def _custody_tier_portfolio(rows, ctl, fx_rates, result, certification, mode):
     returned untouched whenever nothing is custody-proven or anything fails.
     See the version block for the rules; nothing here funds a row."""
     meta = {"mode": mode, "status": "ok", "source": None, "matched": 0, "shown": 0,
-            "verdicts": {}, "kept": {}}
+            "verdicts": {}, "kept": {}, "prices": {}}
     try:
         reasons = dict(certification.get("reason_counts") or {})
         listed = rows if isinstance(rows, list) else []
@@ -4551,7 +4613,8 @@ def _custody_tier_portfolio(rows, ctl, fx_rates, result, certification, mode):
             if _research_fx_rejected(listed[index], cand, fx_rates):
                 meta["kept"]["fx_rejected"] = meta["kept"].get("fx_rejected", 0) + 1
                 continue
-            if not _custody_quote_ok(cand):
+            level = _custody_quote_level(cand)            # v1.18.1: live | session | None
+            if level is None:
                 meta["kept"]["quote_unverified"] = meta["kept"].get("quote_unverified", 0) + 1
                 if mode == "enforce":
                     note = " | " + CUSTODY_QUOTE_NOTE
@@ -4570,19 +4633,25 @@ def _custody_tier_portfolio(rows, ctl, fx_rates, result, certification, mode):
                 legacy["advisor_note"] = str(legacy.get("advisor_note") or "") + note
                 actions[pos] = legacy
                 continue
+            meta["prices"][level] = meta["prices"].get(level, 0) + 1
             sell = shown in (ACTION_TRIM, ACTION_EXIT)
+            # v1.18.1: a sale is sized only from a live price.
+            sized = sell and level == "live"
+            reason = _custody_tier_reason(verdict, why, source, when, withheld)
+            if level != "live":
+                reason += " | " + _custody_price_note(cand, sell)
             entry = {"cand": cand, "action": shown,
-                     "action_reason": _custody_tier_reason(verdict, why, source, when, withheld),
-                     "proceeds_sar": (proceeds or 0.0) if sell else 0.0, "capped_from": None,
+                     "action_reason": reason,
+                     "proceeds_sar": (proceeds or 0.0) if sized else 0.0, "capped_from": None,
                      "weight_pct": None, "sector_weight_pct": None,
                      "confidence_band": legacy["confidence_band"],
                      "suggested_delta_sar": None, "suggested_delta_shares": None, "funds_from": None}
-            if sell:
+            if sized:
                 _sell_side_deltas([entry], ctl, None)
             rendered = _action_row(entry, legacy["detail"]["review_date"], ctl)
             rendered["detail"].update({"position_evidence_matched": True, "reconciliation_status": "matched",
                                        "execution_ready": False,
-                                       "custody_tier": {"source": source, "verdict": label}})
+                                       "custody_tier": {"source": source, "verdict": label, "price": level}})
             actions[pos] = rendered
             meta["shown"] += 1
         if meta["shown"] or any(meta["kept"].values()) or mode == "observe":
