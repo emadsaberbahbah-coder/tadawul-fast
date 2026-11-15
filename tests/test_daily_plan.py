@@ -1082,3 +1082,34 @@ def test_w7_the_wait_log_line_carries_no_amount(monkeypatch, capsys):
     assert "SAR" not in out and str(cap_of()["cash_usd"])[:4] not in out
     assert not __import__("re").search(r"\d,\d{3}", out)                              # no amount of any kind
 
+
+def test_w8_a_live_run_with_the_reader_off_or_not_set_up_does_not_wait(monkeypatch, capsys):
+    """Codex P2, #993: TFB_IBKR_CAPTURE=off answers with a refusal without reading anything; the cut is not held."""
+    import scripts.ibkr_capture as ic
+    import scripts.run_calendar_sync as rcs
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    folder = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    for switch, fid, expected in (("on", folder, True), ("off", folder, False), ("on", "", False), ("on", "bad id", False)):
+        monkeypatch.setenv("TFB_IBKR_CAPTURE", switch)
+        monkeypatch.setenv("TFB_IBKR_CAPTURE_FOLDER_ID", fid)
+        assert dp.capture_expected() is expected, (switch, fid)
+    with monkeypatch.context() as m:
+        m.setattr(ic, "enabled", lambda: 1 / 0)
+        assert dp.capture_expected() is False                                        # never raises
+    monkeypatch.setenv("TFB_IBKR_CAPTURE_FOLDER_ID", folder)
+    # the reader is off: the real latest() refuses without a network call, and the plan is cut at once (as in 1.8.0)
+    monkeypatch.setenv("TFB_IBKR_CAPTURE", "off")
+    off = book()
+    monkeypatch.setattr(rcs, "_open_book", lambda: off)
+    assert dp.main([], now=NOW) == 0
+    out = capsys.readouterr().out
+    assert "IBKR capture not used for sizing: TFB_IBKR_CAPTURE is off" in out and "waiting for the broker" not in out
+    assert [r for r in _cut(off) if r[0] == "PICK"] and not any("not the broker" in str(c) for r in _ledger(off) for c in r)
+    # the reader is on and the newest capture is refused: a live run waits
+    monkeypatch.setenv("TFB_IBKR_CAPTURE", "on")
+    on = book()
+    monkeypatch.setattr(rcs, "_open_book", lambda: on)
+    monkeypatch.setattr(ic, "latest", lambda now=None, **kw: cap_of(age_h=40.0))
+    assert dp.main([], now=NOW) == 0
+    assert _ledger(on) == [] and W_WAIT % W_OLD in capsys.readouterr().out
+

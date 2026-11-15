@@ -154,7 +154,8 @@ DISAGREE). The same gap opens every Sunday.
 TFB_PLAN_IBKR_WAIT_UNTIL_H = 11 (default; 0 = off = 1.8.0 byte for byte):
 with TFB_PLAN_CASH_SOURCE=ibkr, a run that READ the capture folder and could
 not use the newest capture cuts nothing before that hour (Riyadh); the page
-says what it waits for. The hourly run cuts as soon as a usable capture is
+says what it waits for. With the reader off (TFB_IBKR_CAPTURE) or its folder
+not set up, no capture can arrive and the cut does not wait. The hourly run cuts as soon as a usable capture is
 there. From that hour the cut goes ahead on the 1.6.0 rule as before, and the
 plan says so: every pick carries the label, and every name waiting for cash
 the words, "cash from the cash ledger | typed cash cell, not the broker
@@ -416,6 +417,17 @@ def capture_cash(cap: Optional[Dict[str, Any]], max_age_h: float) -> Tuple[Optio
     if not complete:
         return None, "a working buy order has no limit price, so the cash it holds is not known"
     return max(0.0, usd - held) * 3.75, ""
+
+
+def capture_expected() -> bool:
+    """1.9.0: True when a live run can read a capture at all - TFB_IBKR_CAPTURE is on and the folder id is usable.
+    With the reader switched off or not set up no capture will arrive, so the cut has nothing to wait for."""
+    try:
+        from scripts import ibkr_capture  # noqa: PLC0415
+        return bool(ibkr_capture.enabled()
+                    and ibkr_capture._FOLDER_RE.match(ibkr_capture._env("TFB_IBKR_CAPTURE_FOLDER_ID")))
+    except Exception:  # noqa: BLE001 - an unreadable switch is not a reason to hold the plan
+        return False
 
 
 def sizing_cash(panel: float, snap: Optional[float], mode: str, ibkr: Optional[float] = None) -> Tuple[float, str]:
@@ -1079,8 +1091,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                 ibkr_cash, ibkr_why = capture_cash(cap, k.get("ibkr_max_h", 30.0))
                 if ibkr_cash is None:
                     _out("IBKR capture not used for sizing: %s" % ibkr_why)
-            # 1.9.0: the capture folder was read and gave no usable figure (cap is None when nothing was read)
-            no_broker = cap is not None and ibkr_cash is None and k.get("ibkr_wait_h", 0) > 0
+            # 1.9.0: a capture was looked for and gave no usable figure. cap is None when nothing was looked for;
+            # a live run with the reader off or not set up (Codex P2, #993) has nothing to wait for either.
+            looked = cap is not None and (capture is not None or capture_expected())
+            no_broker = looked and ibkr_cash is None and k.get("ibkr_wait_h", 0) > 0
             cash, cash_from = sizing_cash(panel_cash, snap, k.get("cash_source", "ibkr"), ibkr_cash)
             mps = int(num(panel_value(board, "T10: Max Per Sector")) or 2)
             waits = no_broker and hour < k["ibkr_wait_h"]
