@@ -504,3 +504,209 @@ def test_v104_workflow_maps_the_backend_token_into_the_refresh_step_only():
     assert refresh["env"]["BACKEND_TOKEN"] == "${{ secrets.BACKEND_TOKEN }}"
     assert "BACKEND_TOKEN" not in (w.get("env") or {})
     assert all("BACKEND_TOKEN" not in (job.get("env") or {}) for job in w["jobs"].values())
+
+
+# ------------------------------------------------------------ v1.0.5 -------
+# 15 Nov 2026 (run 43724490164): 400 harvested symbols went to each target page in one GET; the backend passed
+# its own 25 s limit, the client gave up after 45 s on both pages, and no quote had been read since 8 Nov.
+import urllib.parse
+
+
+class Wide(Book):
+    """Holdings H1; board names A1..A5 and the label TYPE; three of them on each target page."""
+    def __init__(self):
+        super().__init__()
+        self.pages["My_Portfolio"] = Worksheet([["Symbol", "Position Qty"], ["H1.SR", 10]])
+        self.pages["Top_10_Investments"] = Worksheet([["Symbol", "Name"]] + [["A%d.SR" % i, "n"] for i in range(1, 6)] + [["TYPE", "label"]])
+        self.pages["Shadow_Board"] = Worksheet([["Symbol", "Name"], ["A1.SR", "n"]])
+        self.pages["Market_Leaders"] = Worksheet([HEADER] + [target(s) for s in ("A2.SR", "H1.SR", "A1.SR", "OTHER.SR")])
+        self.pages["Global_Markets"] = Worksheet([HEADER] + [target(s) for s in ("A3.SR", "A4.SR", "A5.SR")])
+
+
+def _wire(monkeypatch, book, fail=(), mode="--apply"):
+    """A backend that answers each request for exactly the symbols it names; `fail` = symbols whose batch answers 503."""
+    calls = []
+    monkeypatch.delenv("TFB_IQR_SYMBOL_PAGES", raising=False)        # the 1.0.5 default: holdings first
+    def get(req, **kwargs):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query)
+        syms = q["symbols"][0].split(",")
+        calls.append((q["page"][0], syms, q["limit"][0], kwargs.get("timeout")))
+        if set(syms) & set(fail):
+            raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b""))
+        return Response({"row_objects": [source(s) for s in syms]})
+    monkeypatch.setattr(urllib.request, "urlopen", get)
+    monkeypatch.setattr(iqr, "_open_sheet", lambda *args: book)
+    monkeypatch.setattr(sys, "argv", ["intraday_quote_refresh", mode, "--backend", "https://synthetic.invalid"])
+    return calls
+
+
+def _written(book, page):
+    return sorted({book.pages[page].values[int(re.fullmatch(r"[A-Z]+([0-9]+)", u["range"])[1]) - 1][0]
+                   for w in book.pages[page].writes for u in w})
+
+
+def test_v105_a_page_is_asked_only_for_its_own_symbols_in_batches_holdings_first(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_IQR_BATCH", "2")
+    book = Wide()
+    calls = _wire(monkeypatch, book)
+    assert iqr.main() == 0
+    assert [(c[0], c[1], c[2]) for c in calls] == [
+        ("Market_Leaders", ["H1.SR", "A1.SR"], "2"), ("Market_Leaders", ["A2.SR"], "1"),
+        ("Global_Markets", ["A3.SR", "A4.SR"], "2"), ("Global_Markets", ["A5.SR"], "1")]
+    assert all(c[3] == 45 for c in calls)
+    assert not any("TYPE" in c[1] or "OTHER.SR" in c[1] for c in calls)          # a label is not a row; a row nobody decides on is not asked
+    assert _written(book, "Market_Leaders") == ["A1.SR", "A2.SR", "H1.SR"] and _written(book, "Global_Markets") == ["A3.SR", "A4.SR", "A5.SR"]
+    out = capsys.readouterr().out
+    assert "[FETCH] Market_Leaders   wanted=3 batches=2 failed=0 skipped=0 returned=3 usable=3 no_evidence=0 conflicting=0" in out
+    assert "[FETCH] Global_Markets   wanted=3 batches=2 failed=0 skipped=0 returned=3 usable=3" in out
+    assert "[AGE] Market_Leaders   other n=3" in out and "decision_symbols=7" in out
+    assert book.pages["_Run_Log"].appends[-1][4] == "OK"
+    assert iqr.SCRIPT_VERSION == "1.0.5"
+
+
+def test_v105_one_failed_batch_does_not_lose_the_others(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_IQR_BATCH", "1")
+    book = Wide()
+    calls = _wire(monkeypatch, book, fail=("A1.SR",))
+    assert iqr.main() == 0
+    assert len(calls) == 6 and _written(book, "Market_Leaders") == ["A2.SR", "H1.SR"]
+    assert _written(book, "Global_Markets") == ["A3.SR", "A4.SR", "A5.SR"]
+    out = capsys.readouterr().out
+    assert "[FETCH] Market_Leaders   wanted=3 batches=3 failed=1 skipped=0 returned=2 usable=2" in out
+    assert out.count("[FETCH-FAIL] Market_Leaders: HTTPError 503") == 1 and "FETCH FAILED on every target page" not in out
+    log = book.pages["_Run_Log"].appends[-1]
+    assert log[1] == "INFO" and log[4] == "FETCH_PARTIAL"
+
+
+def test_v105_a_page_whose_every_batch_failed_is_a_page_failure_and_all_pages_is_exit_3(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_IQR_BATCH", "2")
+    book = Wide()
+    _wire(monkeypatch, book, fail=("H1.SR", "A2.SR"))                # both Market_Leaders batches
+    assert iqr.main() == 0 and _written(book, "Market_Leaders") == [] and len(_written(book, "Global_Markets")) == 3
+    assert book.pages["_Run_Log"].appends[-1][4] == "FETCH_PARTIAL"
+    capsys.readouterr()
+    book = Wide()
+    _wire(monkeypatch, book, fail=("H1.SR", "A2.SR", "A3.SR", "A5.SR"))
+    assert iqr.main() == 3
+    out = capsys.readouterr().out
+    assert "FETCH FAILED on every target page (Market_Leaders HTTPError 503; Global_Markets HTTPError 503)" in out
+    assert out.count("[FETCH-FAIL]") == 4 and book.pages["_Run_Log"].appends[-1][4] == "FETCH_FAILED"
+
+
+def test_v105_a_failed_batch_on_every_page_is_not_a_run_failure_and_a_skipped_page_is_not_an_answer(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_IQR_BATCH", "1")
+    book = Wide()
+    _wire(monkeypatch, book, fail=("A1.SR", "A3.SR"))                # one batch of each page fails; quotes were read on both
+    assert iqr.main() == 0 and book.pages["_Run_Log"].appends[-1][4] == "FETCH_PARTIAL"
+    assert _written(book, "Market_Leaders") == ["A2.SR", "H1.SR"] and _written(book, "Global_Markets") == ["A4.SR", "A5.SR"]
+    # the only page that was asked failed, and the other was never reached: no quote was read, so the run is red
+    monkeypatch.setenv("TFB_IQR_BATCH", "2")
+    monkeypatch.setenv("TFB_IQR_BUDGET_SEC", "60")
+    ticks = iter([0.0, 1.0, 2.0])
+    monkeypatch.setattr(iqr, "_mono", lambda: next(ticks, 999.0))
+    book = Wide()
+    calls = _wire(monkeypatch, book, fail=("H1.SR", "A2.SR"))
+    assert iqr.main() == 3 and {c[0] for c in calls} == {"Market_Leaders"}
+    assert book.pages["_Run_Log"].appends[-1][4] == "FETCH_FAILED"
+    assert "FETCH FAILED on every target page (Market_Leaders HTTPError 503)" in capsys.readouterr().out
+
+
+def test_v105_a_run_that_could_send_no_batch_at_all_is_a_failed_run(monkeypatch, capsys):
+    """Codex P2, #999: the budget gone before the first batch is not a partial success."""
+    monkeypatch.setenv("TFB_IQR_BUDGET_SEC", "60")
+    for mode in ("--scan", "--apply"):
+        ticks = iter([0.0])                                          # the start; every later reading is past the limit
+        monkeypatch.setattr(iqr, "_mono", lambda: next(ticks, 999.0))
+        book = Wide()
+        calls = _wire(monkeypatch, book, mode=mode)
+        assert iqr.main() == 3 and calls == [], mode
+        out = capsys.readouterr().out
+        assert "NO REQUEST WAS SENT: the 60 s request budget was used up before the first batch" in out
+        assert "FETCH FAILED on every target page" not in out and out.count("[BUDGET]") == 2
+        if mode == "--apply":
+            assert book.pages["_Run_Log"].appends[-1][1] == "ERROR" and book.pages["_Run_Log"].appends[-1][4] == "FETCH_FAILED"
+    # no decision symbol on any page is not this case: nothing was wanted, nothing failed
+    monkeypatch.setattr(iqr, "_mono", lambda: 999.0)
+    quiet = Wide()
+    quiet.pages["Market_Leaders"] = Worksheet([HEADER, target("ELSE.SR")])
+    quiet.pages["Global_Markets"] = Worksheet([HEADER, target("ELSE.SR")])
+    calls = _wire(monkeypatch, quiet, mode="--apply")
+    assert iqr.main() == 0 and calls == [] and quiet.pages["_Run_Log"].appends[-1][4] == "OK"
+
+
+def test_v105_no_request_starts_after_the_budget(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_IQR_BATCH", "1")
+    monkeypatch.setenv("TFB_IQR_BUDGET_SEC", "60")
+    ticks = iter([0.0, 10.0, 59.9, 60.0])                            # the start, then one reading before each batch
+    monkeypatch.setattr(iqr, "_mono", lambda: next(ticks, 999.0))
+    book = Wide()
+    calls = _wire(monkeypatch, book)
+    assert iqr.main() == 0
+    assert [(c[0], c[1]) for c in calls] == [("Market_Leaders", ["H1.SR"]), ("Market_Leaders", ["A1.SR"])]   # 60.0 is the limit itself
+    out = capsys.readouterr().out
+    assert "[FETCH] Market_Leaders   wanted=3 batches=2 failed=0 skipped=1" in out
+    assert "[BUDGET] Market_Leaders: 1 batch(es) not sent - the 60 s request budget was used up" in out
+    assert "[FETCH] Global_Markets   wanted=3 batches=0 failed=0 skipped=3" in out and "[BUDGET] Global_Markets: 3 batch(es)" in out
+    assert _written(book, "Market_Leaders") == ["A1.SR", "H1.SR"] and _written(book, "Global_Markets") == []
+    assert book.pages["_Run_Log"].appends[-1][4] == "FETCH_PARTIAL" and "FETCH FAILED on every" not in out
+
+
+def test_v105_a_page_without_a_decision_symbol_is_not_asked_and_a_page_without_a_symbol_column_is_not_filtered(monkeypatch, capsys):
+    book = Wide()
+    book.pages["Global_Markets"] = Worksheet([HEADER, target("ELSE.SR")])
+    calls = _wire(monkeypatch, book, mode="--scan")
+    assert iqr.main() == 0
+    assert {c[0] for c in calls} == {"Market_Leaders"}
+    assert "Global_Markets   rows=1      no decision symbol has a row on this page - nothing asked" in capsys.readouterr().out
+    assert iqr.page_symbols([HEADER, target("a1.sr"), target("B2.SR"), [""]]) == {"A1.SR", "B2.SR"}
+    assert iqr.page_symbols([]) is None and iqr.page_symbols([["Name", "Price"], ["x", 1]]) is None
+    odd = Wide()
+    odd.pages["Global_Markets"] = Worksheet([["Name", "Price"], ["x", 1]])       # no symbol column: nothing is known
+    calls = _wire(monkeypatch, odd, mode="--scan")
+    assert iqr.main() == 0
+    assert [c[1] for c in calls if c[0] == "Global_Markets"] == [["H1.SR", "A1.SR", "A2.SR", "A3.SR", "A4.SR", "A5.SR", "TYPE"]]
+
+
+def test_v105_batch_counts_reasons_and_ages_add_up_exactly(monkeypatch):
+    rows = {"AAA.US": [source("AAA.US", currency="USD")],
+            "BBB.US": [{"symbol": "BBB.US", "current_price": 5}],                                   # no source witness
+            "CCC.US": [source("CCC.US", price=1, currency="USD"), source("CCC.US", price=2, currency="USD")],   # disagree
+            "DDD.US": [source("DDD.US", currency="USD", acquisition_quote_asof=(NOW - timedelta(minutes=40)).isoformat())],
+            "EEE.SR": [source("EEE.SR")]}
+    served = []
+    def one(base, page, symbols, timeout=45):
+        served.append(list(symbols))
+        return [r for s in symbols for r in rows.get(s, [])], None, NOW
+    monkeypatch.setattr(iqr, "fetch_rows", one)
+    order = ["AAA.US", "BBB.US", "CCC.US", "DDD.US", "EEE.SR", "GONE.US"]
+    q, failure, ages, info = iqr.fetch_page_quotes("https://synthetic.invalid", "Global_Markets", order, batch=2)
+    assert served == [["AAA.US", "BBB.US"], ["CCC.US", "DDD.US"], ["EEE.SR", "GONE.US"]] and failure is None
+    assert info == {"wanted": 6, "batches": 3, "failed": 0, "skipped": 0, "returned": 5, "usable": len(q),
+                    "no_evidence": 5 - len(q) - 1, "conflicting": 1}
+    assert "AAA.US" in q and "EEE.SR" in q and "BBB.US" not in q and "CCC.US" not in q
+    whole = iqr.quote_age_report([r for s in order for r in rows.get(s, [])], order, NOW)
+    assert ages == whole and ages["US"]["n"] >= 2 and ages["US"]["age_max"] == 40.0
+    one_call = iqr.fetch_page_quotes("https://synthetic.invalid", "Global_Markets", order, batch=200)
+    assert one_call[0] == q and one_call[2] == ages and one_call[3]["batches"] == 1
+    assert iqr.fetch_page_quotes("https://synthetic.invalid", "Global_Markets", [], batch=2)[3]["batches"] == 0
+    assert iqr.quotes_from_rows([], ["AAA.US"], NOW) == ({}, {"returned": 0, "usable": 0, "conflicting": 0, "no_evidence": 0})
+
+
+def test_v105_knobs_are_clamped_and_the_workflow_maps_them(monkeypatch):
+    book = Wide()
+    for value, sizes in (("0", [1, 1, 1]), ("999", [3]), ("junk", [3]), ("2", [2, 1])):
+        monkeypatch.setenv("TFB_IQR_BATCH", value)
+        calls = _wire(monkeypatch, book, mode="--scan")
+        assert iqr.main() == 0
+        assert [len(c[1]) for c in calls if c[0] == "Market_Leaders"] == sizes, value
+    monkeypatch.setenv("TFB_IQR_TIMEOUT_SEC", "7")                   # each request carries the configured timeout
+    calls = _wire(monkeypatch, book, mode="--scan")
+    assert iqr.main() == 0 and calls and all(c[3] == 7 for c in calls)
+    w = yaml.load(open(iqr.Path(__file__).resolve().parents[1] / ".github/workflows/intraday_refresh.yml").read(),
+                  Loader=yaml.BaseLoader)
+    env = next(st for job in w["jobs"].values() for st in job.get("steps", [])
+               if st.get("name") == "Refresh decision-symbol quotes")["env"]
+    assert env["TFB_IQR_BATCH"] == "40" and env["TFB_IQR_BUDGET_SEC"] == "300" and env["TFB_IQR_TIMEOUT_SEC"] == "45"
+    assert env["TFB_IQR_SYMBOL_PAGES"] == "My_Portfolio,Top_10_Investments,Shadow_Board"
+    minutes = int(next(job for job in w["jobs"].values() if "steps" in job)["timeout-minutes"])
+    assert int(env["TFB_IQR_BUDGET_SEC"]) + int(env["TFB_IQR_TIMEOUT_SEC"]) < minutes * 60        # the budget fits the job limit

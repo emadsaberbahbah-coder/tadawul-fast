@@ -2,9 +2,37 @@
 # scripts/intraday_quote_refresh.py
 """
 ================================================================================
-Intraday Quote Refresh — v1.0.4 (2026-11-04)
+Intraday Quote Refresh — v1.0.5 (2026-11-15)
 ================================================================================
 NEW script. Closes the largest recoverable loss in the system.
+
+v1.0.5 (2026-11-15) — BATCHES, ONLY THE SYMBOLS A PAGE HOLDS, HOLDINGS FIRST
+    Evidence: every run since 8 Nov failed (run 43724490164, 15 Nov:
+    "decision_symbols=400 ... [FETCH-FAIL] Market_Leaders: TimeoutError",
+    both pages). The harvest reached its 400-symbol ceiling (17 symbols on
+    5 Nov, the last green run) and all 400 went to each target page in one
+    GET. The Render log of that minute shows the backend's own 25-second
+    proxy limit passing for page=Market_Leaders, and provider lookups for
+    the words TYPE and INVESTABILITY, which the harvest had read as symbols.
+    The client gave up after 45 seconds, twice, and no quote was read. Now:
+      * a target page is asked only for the decision symbols it has a row
+        for (the plan never used any other), so a label that is not a row
+        is not sent at all;
+      * the request goes out in batches of TFB_IQR_BATCH symbols (40,
+        1..200), each with its own timeout; a batch that fails is counted
+        and the others still run. A page has failed to fetch only when
+        every batch it sent failed;
+      * no new batch starts after TFB_IQR_BUDGET_SEC seconds (300, 30..3600)
+        from the start of the run; what was skipped is printed, and a run
+        that could send no batch at all is a failed run (exit 3);
+      * My_Portfolio is harvested first, so the holdings are inside the
+        ceiling and in the first batches;
+      * one [FETCH] line per page: wanted, batches, failed, skipped, rows
+        returned, usable quotes, rows without source evidence, conflicts.
+    A run in which some batches failed or were skipped logs FETCH_PARTIAL
+    and stays green; a run in which no page answered exits 3 as before.
+    The write rules are unchanged. fetch_quotes_ex and quote_age_report
+    answer exactly as in 1.0.4.
 
 v1.0.4 (2026-11-04) — THE BACKEND TOKEN, A VISIBLE FETCH FAILURE, QUOTE AGES
     Evidence: the 17:46 Riyadh dry run of 4 Nov (run 41851262140) printed
@@ -78,10 +106,12 @@ ENV
     TARGET_SHEET_ID / DEFAULT_SPREADSHEET_ID     workbook id
     TFB_BACKEND_URL / BACKEND_URL                backend base url
     GOOGLE_SHEETS_CREDENTIALS(_B64) | GOOGLE_APPLICATION_CREDENTIALS
-    TFB_IQR_SYMBOL_PAGES   default "Top_10_Investments,My_Portfolio,Shadow_Board"
+    TFB_IQR_SYMBOL_PAGES   default "My_Portfolio,Top_10_Investments,Shadow_Board" (1.0.5: holdings first)
     TFB_IQR_TARGET_PAGES   default "Market_Leaders,Global_Markets"
     TFB_IQR_MAX_SYMBOLS    default 400   hard ceiling on the fetch
-    TFB_IQR_TIMEOUT_SEC    default 45
+    TFB_IQR_TIMEOUT_SEC    default 45    per request
+    TFB_IQR_BATCH          default 40    symbols per request (1.0.5)
+    TFB_IQR_BUDGET_SEC     default 300   no new request after this many seconds (1.0.5)
 ================================================================================
 """
 from __future__ import annotations
@@ -95,11 +125,12 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-SCRIPT_VERSION = "1.0.4"
+SCRIPT_VERSION = "1.0.5"
 # v1.0.3: share supplier quote-time parsing with acquisition validity so an
 # EODHD integer epoch serialized as a string retains its actual quote receipt.
 
@@ -531,19 +562,17 @@ def _open_sheet(cli_id: Optional[str]):
     return gspread.authorize(creds).open_by_key(sid)
 
 
-def quote_age_report(rows: Sequence[Dict[str, Any]], requested: Sequence[str],
-                     now: datetime) -> Dict[str, Dict[str, Any]]:
-    """v1.0.4 PURE: {'US'|'other': {n, age_median, age_max, within, delay_median}}
-    over every returned row of a requested symbol whose acquisition proof
-    carries quote_asof, fresh or not; minutes. within = ages <= the in-session
-    limit TFB_TICKET_MAX_QUOTE_AGE_MIN (default 15)."""
+def _age_samples(rows: Sequence[Dict[str, Any]], requested: Sequence[str], now: datetime,
+                 ages: Optional[Dict[str, List[float]]] = None, delays: Optional[Dict[str, List[float]]] = None,
+                 seen: Optional[set] = None) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], set]:
+    """1.0.5 PURE: the minutes behind quote_age_report, as lists per region, so several batches of one page add
+    up exactly. `seen` carries the symbols already counted."""
     from core.analysis import opportunity_builder as ob
     from core.data_validity import row_acquisition
-    limit = float(_env_int("TFB_TICKET_MAX_QUOTE_AGE_MIN", 15))
     want = {_s(symbol).upper() for symbol in requested}
-    ages: Dict[str, List[float]] = {}
-    delays: Dict[str, List[float]] = {}
-    seen = set()
+    ages = {} if ages is None else ages
+    delays = {} if delays is None else delays
+    seen = set() if seen is None else seen
     for row in rows:
         try:
             declared = {_s(value).upper() for name, value in row.items()
@@ -563,6 +592,12 @@ def quote_age_report(rows: Sequence[Dict[str, Any]], requested: Sequence[str],
                 delays.setdefault(region, []).append((acquired - asof).total_seconds() / 60.0)
         except Exception:                                 # noqa: BLE001
             continue
+    return ages, delays, seen
+
+
+def _age_summary(ages: Dict[str, List[float]], delays: Dict[str, List[float]]) -> Dict[str, Dict[str, Any]]:
+    """1.0.5 PURE: {'US'|'other': {n, age_median, age_max, within, limit, delay_median}} from the lists."""
+    limit = float(_env_int("TFB_TICKET_MAX_QUOTE_AGE_MIN", 15))
 
     def median(values: List[float]) -> Optional[float]:
         if not values:
@@ -579,15 +614,26 @@ def quote_age_report(rows: Sequence[Dict[str, Any]], requested: Sequence[str],
     return out
 
 
-def fetch_quotes_ex(base_url: str, page: str, symbols: Sequence[str],
-                    timeout: int = 45) -> Tuple[Dict[str, QuoteEvidence], Optional[str], Dict[str, Dict[str, Any]]]:
-    """v1.0.4: (quotes, failure, ages). failure names the exception and HTTP
-    status when the request failed ('HTTPError 401'), else None."""
+def quote_age_report(rows: Sequence[Dict[str, Any]], requested: Sequence[str],
+                     now: datetime) -> Dict[str, Dict[str, Any]]:
+    """v1.0.4 PURE: {'US'|'other': {n, age_median, age_max, within, delay_median}}
+    over every returned row of a requested symbol whose acquisition proof
+    carries quote_asof, fresh or not; minutes. within = ages <= the in-session
+    limit TFB_TICKET_MAX_QUOTE_AGE_MIN (default 15)."""
+    ages, delays, _seen = _age_samples(rows, requested, now)
+    return _age_summary(ages, delays)
+
+
+_mono = time.monotonic                                   # 1.0.5: the run's clock for the request budget
+
+
+def fetch_rows(base_url: str, page: str, symbols: Sequence[str],
+               timeout: int = 45) -> Tuple[List[Dict[str, Any]], Optional[str], datetime]:
+    """1.0.5: one GET /v1/analysis/sheet-rows for `symbols` -> (dictionary rows, failure, retrieval instant).
+    failure names the exception and HTTP status when the request failed ('HTTPError 401'), else None."""
     import urllib.parse
     import urllib.request
 
-    if not base_url or not symbols:
-        return {}, None, {}
     qs = urllib.parse.urlencode({"page": page,
                                  "symbols": ",".join(symbols),
                                  "limit": str(len(symbols))})
@@ -599,16 +645,23 @@ def fetch_quotes_ex(base_url: str, page: str, symbols: Sequence[str],
         code = getattr(exc, "code", None)
         failure = type(exc).__name__ + (" %s" % code if isinstance(code, int) else "")
         print("  [FETCH-FAIL] %s: %s" % (page, failure))
-        return {}, failure, {}
+        return [], failure, _clock()
 
     retrieved = _clock()
     if not isinstance(payload, dict):
-        return {}, None, {}
+        return [], None, retrieved
     # The real sheet-rows route has matrix rows and dictionary data/row_objects.
     # Collect only dictionary aliases; contradictory source duplicates fail
     # closed even when returned in different aliases in the same envelope.
     rows = [row for name in ("row_objects", "rows", "data", "items", "records", "quotes", "results")
             for row in (payload.get(name) if isinstance(payload.get(name), list) else []) if isinstance(row, dict)]
+    return rows, None, retrieved
+
+
+def quotes_from_rows(rows: Sequence[Dict[str, Any]], symbols: Sequence[str],
+                     retrieved: datetime) -> Tuple[Dict[str, QuoteEvidence], Dict[str, int]]:
+    """1.0.5 PURE: the usable quote per requested symbol, and why the others are not: {returned, usable,
+    no_evidence (a row without a source witness), conflicting (duplicates that disagree)}."""
     requested = {_s(symbol).upper() for symbol in symbols}
     grouped: Dict[str, List[Optional[QuoteEvidence]]] = {}
     for row in rows:
@@ -619,7 +672,67 @@ def fetch_quotes_ex(base_url: str, page: str, symbols: Sequence[str],
             grouped.setdefault(sym, []).append(_source_quote(row, sym, retrieved))
     quotes = {symbol: evidence[0] for symbol, evidence in grouped.items()
               if evidence[0] is not None and len(set(evidence)) == 1}
-    return quotes, None, quote_age_report(rows, sorted(requested), retrieved)
+    conflicting = sum(1 for evidence in grouped.values() if len(set(evidence)) != 1)
+    return quotes, {"returned": len(grouped), "usable": len(quotes), "conflicting": conflicting,
+                    "no_evidence": len(grouped) - len(quotes) - conflicting}
+
+
+def fetch_quotes_ex(base_url: str, page: str, symbols: Sequence[str],
+                    timeout: int = 45) -> Tuple[Dict[str, QuoteEvidence], Optional[str], Dict[str, Dict[str, Any]]]:
+    """v1.0.4: (quotes, failure, ages). failure names the exception and HTTP
+    status when the request failed ('HTTPError 401'), else None."""
+    if not base_url or not symbols:
+        return {}, None, {}
+    rows, failure, retrieved = fetch_rows(base_url, page, symbols, timeout=timeout)
+    if failure:
+        return {}, failure, {}
+    quotes, _info = quotes_from_rows(rows, symbols, retrieved)
+    return quotes, None, quote_age_report(rows, sorted({_s(symbol).upper() for symbol in symbols}), retrieved)
+
+
+def page_symbols(values: Sequence[Sequence[Any]]) -> Optional[set]:
+    """1.0.5 PURE: the symbols a target page has a row for (header on row 1, as plan_page_updates reads it), or
+    None when the page shows no symbol column - then nothing is known and nothing is filtered."""
+    if not values:
+        return None
+    si = _pick([_s(c) for c in values[0]], SYMBOL_HEADERS)
+    if si is None:
+        return None
+    return {_s(row[si]).upper() for row in values[1:] if si < len(row) and _s(row[si])}
+
+
+def fetch_page_quotes(base_url: str, page: str, symbols: Sequence[str], timeout: int = 45, batch: int = 40,
+                      deadline: Optional[float] = None
+                      ) -> Tuple[Dict[str, QuoteEvidence], Optional[str], Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """1.0.5: `symbols` in batches -> (quotes, failure, ages, info). A batch that fails is counted and the next one
+    still runs; no batch starts once _mono() has reached `deadline`. failure is set only when every batch that
+    was sent failed. info = {wanted, batches, failed, skipped, returned, usable, no_evidence, conflicting}."""
+    info = {"wanted": len(symbols), "batches": 0, "failed": 0, "skipped": 0, "returned": 0, "usable": 0,
+            "no_evidence": 0, "conflicting": 0}
+    quotes: Dict[str, QuoteEvidence] = {}
+    ages: Dict[str, List[float]] = {}
+    delays: Dict[str, List[float]] = {}
+    seen: set = set()
+    failures: List[str] = []
+    size = max(1, int(batch))
+    for start in range(0, len(symbols), size):
+        chunk = list(symbols[start:start + size])
+        if deadline is not None and _mono() >= deadline:
+            info["skipped"] += 1
+            continue
+        info["batches"] += 1
+        rows, failure, retrieved = fetch_rows(base_url, page, chunk, timeout=timeout)
+        if failure:
+            info["failed"] += 1
+            failures.append(failure)
+            continue
+        got, stats = quotes_from_rows(rows, chunk, retrieved)
+        quotes.update(got)
+        for key in ("returned", "usable", "no_evidence", "conflicting"):
+            info[key] += stats[key]
+        _age_samples(rows, chunk, retrieved, ages, delays, seen)
+    failure = failures[0] if info["batches"] and info["failed"] == info["batches"] else None
+    return quotes, failure, _age_summary(ages, delays), info
 
 
 def fetch_quotes(base_url: str, page: str, symbols: Sequence[str],
@@ -701,7 +814,7 @@ def main() -> int:
     base = args.backend or _env("TFB_BACKEND_URL") or _env("BACKEND_URL")
     src_pages = [p.strip() for p in _env(
         "TFB_IQR_SYMBOL_PAGES",
-        "Top_10_Investments,My_Portfolio,Shadow_Board").split(",") if p.strip()]
+        "My_Portfolio,Top_10_Investments,Shadow_Board").split(",") if p.strip()]
     tgt_pages = [p.strip() for p in _env(
         "TFB_IQR_TARGET_PAGES",
         "Market_Leaders,Global_Markets").split(",") if p.strip()]
@@ -711,6 +824,9 @@ def main() -> int:
         print("  [SCOPE] refused %d unsupported target page(s)" % len(denied))
     max_syms = _env_int("TFB_IQR_MAX_SYMBOLS", 400)
     timeout = _env_int("TFB_IQR_TIMEOUT_SEC", 45)
+    batch = max(1, min(200, _env_int("TFB_IQR_BATCH", 40)))                      # 1.0.5
+    budget = max(30, min(3600, _env_int("TFB_IQR_BUDGET_SEC", 300)))
+    deadline = _mono() + budget
 
     sh = _open_sheet(args.sheet_id)
 
@@ -736,6 +852,8 @@ def main() -> int:
     write_failed = False
     fetch_failures: List[str] = []   # v1.0.4
     fetched_pages = 0
+    partial = False                  # 1.0.5: a batch failed or was skipped, and the run still read quotes
+    asked_pages = 0                  # 1.0.5: pages with a decision symbol to ask for
     for page in tgt_pages:
         try:
             ws = sh.worksheet(page)
@@ -744,10 +862,29 @@ def main() -> int:
             print("  [PAGE-MISS] %s: %s" % (page, exc))
             continue
 
-        quotes, failure, ages = fetch_quotes_ex(base, page, symbols, timeout=timeout)
+        on_page = page_symbols(values)                    # 1.0.5: ask a page only for the symbols it has a row for
+        wanted = list(symbols) if on_page is None else [sym for sym in symbols if _s(sym).upper() in on_page]
+        if not wanted:
+            print("  %-16s rows=%-6d no decision symbol has a row on this page - nothing asked"
+                  % (page, max(0, len(values) - 1)))
+            continue
+        asked_pages += 1
+        quotes, failure, ages, info = fetch_page_quotes(base, page, wanted, timeout=timeout, batch=batch,
+                                                        deadline=deadline)
+        print("  [FETCH] %-16s wanted=%d batches=%d failed=%d skipped=%d returned=%d usable=%d no_evidence=%d "
+              "conflicting=%d" % (page, info["wanted"], info["batches"], info["failed"], info["skipped"],
+                                  info["returned"], info["usable"], info["no_evidence"], info["conflicting"]))
+        if info["skipped"]:
+            print("  [BUDGET] %s: %d batch(es) not sent - the %d s request budget was used up"
+                  % (page, info["skipped"], budget))
+        if not info["batches"]:
+            partial = True
+            continue
         fetched_pages += 1
         if failure:
             fetch_failures.append(page + " " + failure)
+        elif info["failed"] or info["skipped"]:
+            partial = True
         for region in sorted(ages):   # v1.0.4: the measured in-session freshness
             a = ages[region]
             print("  [AGE] %-16s %-5s n=%-4d age_min median=%.1f max=%.1f within_%dmin=%d delay_min median=%s"
@@ -780,14 +917,20 @@ def main() -> int:
         print("     wrote %d cell(s)" % written)
 
     all_failed = bool(fetched_pages) and len(fetch_failures) == fetched_pages   # v1.0.4
-    if all_failed:
+    unsent = bool(asked_pages) and not fetched_pages     # 1.0.5 (Codex P2, #999): the budget was gone before any request
+    if unsent:
+        all_failed = True
+        print("[IQR v%s] NO REQUEST WAS SENT: the %d s request budget was used up before the first batch - no quote"
+              " was read" % (SCRIPT_VERSION, budget))
+    elif all_failed:
         print("[IQR v%s] FETCH FAILED on every target page (%s) - no quote was read; a 401 means the"
               " backend token (BACKEND_TOKEN) is missing or wrong" % (SCRIPT_VERSION, "; ".join(fetch_failures)))
     if args.apply:
         try:
             sh.worksheet(RUN_LOG_TAB).append_row(
                 [_now_utc(), "ERROR" if all_failed else "INFO", "intraday_quote_refresh", ",".join(tgt_pages),
-                 "FETCH_FAILED" if all_failed else "PARTIAL" if write_failed else "OK",
+                 "FETCH_FAILED" if all_failed else "PARTIAL" if write_failed else
+                 "FETCH_PARTIAL" if (partial or fetch_failures) else "OK",
                  "[IQR v%s] symbols=%d cells=%d"
                  % (SCRIPT_VERSION, len(symbols), total_written),
                  "", "", "", json.dumps({"version": SCRIPT_VERSION})],

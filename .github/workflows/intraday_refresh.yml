@@ -206,10 +206,17 @@ jobs:
           # The same secret daily_sync maps; intraday_quote_refresh 1.0.4 sends
           # it as X-APP-TOKEN + Bearer and never prints it. Step-scoped.
           BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
-          TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
+          # (2026-11-15, intraday_quote_refresh 1.0.5) Every run since 8 Nov
+          # timed out: 400 harvested symbols went to each page in one GET.
+          # Holdings are harvested first; a page is asked only for symbols it
+          # has a row for, 40 per request, and no request starts after 300 s
+          # (the job limit is 8 minutes).
+          TFB_IQR_SYMBOL_PAGES: "My_Portfolio,Top_10_Investments,Shadow_Board"
           TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
           TFB_IQR_MAX_SYMBOLS: "400"
           TFB_IQR_TIMEOUT_SEC: "45"
+          TFB_IQR_BATCH: "40"
+          TFB_IQR_BUDGET_SEC: "300"
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
              [ "${{ github.event.inputs.apply }}" != "true" ]; then
