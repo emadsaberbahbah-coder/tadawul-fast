@@ -1354,8 +1354,9 @@ def test_t15_several_lots_of_one_symbol_and_a_long_table():
     two = [_h("AAA.US", "HOLD", 8.0)]
     y = tap.read_pf_v2([hdr, ["AAA.US", "SELL \u2014 rule exit 2026-11-06 not acted"], ["AAA.US", "HOLD \u2014 trailing"]])
     assert [r["level"] for r in tap.align_holdings(two, {"read": False}, y, 1.0)] == ["hard"]
-    m = tap.read_pf_main([["Action", "Symbol"], ["EXIT", "AAA.US"], ["HOLD", "AAA.US"], ["HOLD", "BBB.US"], ["TRIM", "BBB.US"]])
-    assert m["rows"] == {"AAA.US": "EXIT", "BBB.US": "HOLD"}
+    m = tap.read_pf_main([["Action", "Symbol"], ["EXIT", "AAA.US"], ["HOLD", "AAA.US"], ["HOLD", "BBB.US"], ["TRIM", "BBB.US"],
+                          ["HOLD", "CCC.US"], ["EXIT", "CCC.US"]])
+    assert m["rows"] == {"AAA.US": "EXIT", "BBB.US": "HOLD", "CCC.US": "EXIT"}      # a sale stands wherever its row is
     # the table starts under the charts: a sale on the 30th lot, 60 rows down, is still read
     long = [["PORTFOLIO DECISION v2"]] + [[""]] * 25 + [hdr] + [["L%02d.US" % i, "HOLD \u2014 trailing"] for i in range(29)] + [
         ["LAST.US", "SELL NOW \u2014 stop 9.00 hit"]]
