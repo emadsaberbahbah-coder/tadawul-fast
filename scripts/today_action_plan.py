@@ -4,6 +4,26 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
+v1.6.0 (2026-11-16)
+  1.6.0: ONE DECISION PER STOCK (owner, 16 Nov 01:01: "different pages ... in the end they should provide the same
+         recommendations ... the final decision should be one decision: buy, hold, sell or watchlist or don't
+         invest"). Until now each page wrote its own verb and this page listed where they differed: on 16 Nov
+         Portfolio_Decision_v2 read SELL NOW on SUPN.US ("stop 33.76 hit": its own trailing rule, run on prices not
+         adjusted for the 8.13 USD special dividend of 3 Nov) while the Exit Plan read HOLD. Now every run also
+         writes the Final_Decisions tab: ONE row per stock named on any page - each holding, today's picks and
+         pipeline, and every seat on either Top 10 page - with ONE decision out of five:
+           SELL           the Exit Plan sells (all, or half at a take-profit);
+           BUY            an OPEN, funded, verified pick of today's plan (or its order already working at IBKR);
+           HOLD           a holding the Exit Plan keeps (its stop, a raise, or a check named in "Do today");
+           WATCH          a candidate that is not today's order: waiting for price, cash, a check or the plan;
+           DO NOT INVEST  a pick the plan invalidated today (earnings in the window, price under the stop).
+         The decision follows the rules of record already in force: the Exit Plan for holdings, the Daily Plan for
+         new buys, with the broker capture and the cash as gates. What the other pages' own rules say is kept in
+         the row as analysis ("Other pages' own rules", "Analysis differs on") - it never changes the decision.
+         The other pages read this tab and show the decision as theirs (Decision Pages v2 1.4.0 first). Section
+         "ONE DECISION PER STOCK" on this page shows the same rows. Off with TFB_TAP_FINAL=off (then nothing of
+         1.6.0 is written). read_pf_v2 reads the v2 rule from its new "· v2 rule: ..." text, so a v2 page that
+         shows the final decision still has its own rule compared.
 v1.4.0 (2026-11-13)
   1.4.0: THE RUN IS KEPT IN BIGQUERY FOR THE DASHBOARD (owner, 13 Nov 22:44: "add action plan to the IBKR Dashboard").
          After the live page is written (never for a preview or a dry run), scripts/plan_archive.py appends the run's
@@ -152,6 +172,7 @@ ENV
     TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_HOLD_ALIGN (on | off; 1.5.0), TFB_TAP_NEWS_MAX_H (24),
     TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
     TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2), TFB_TAP_BQ (off | on; 1.4.0), TFB_TAP_BQ_TABLE (today_action_plan),
+    TFB_TAP_FINAL (on | off; 1.6.0),
     TFB_BQ_PROJECT, TFB_BQ_DATASET.
 ================================================================================
 """
@@ -166,7 +187,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -660,6 +681,11 @@ def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
         if not sym or " " in sym:
             break
         sig = _squash(cell(r, col["Exit signal"]))
+        rule = re.search(r"v2 rule:\s*(.+)$", sig, re.I)            # 1.6.0: "FINAL: HOLD ... · v2 rule: SELL NOW ..."
+        if rule:
+            sig = rule.group(1).strip()
+        elif sig.upper().startswith("FINAL"):
+            sig = ""                                                # the page shows the final decision and no rule of its own
         up = sig.upper()
         verb = "SELL" if up.startswith("SELL") else "RAISE STOP" if up.startswith("RAISE STOP") else \
             "HOLD" if up.startswith("HOLD") else ""
@@ -711,6 +737,167 @@ def align_holdings(holdings: Sequence[Dict[str, Any]], main: Dict[str, Any], v2:
                     "main": (m or "not listed") if main.get("read") else "page not read",
                     "v2": (y.get("signal") or "not listed") if v2.get("read") else "page not read"})
     out.sort(key=lambda r: r["level"] != "hard")                    # a page that says sell first; the order holds otherwise
+    return out
+
+
+# ----------------------------------------------------------------------------- #
+# 1.6.0 [ONE-DECISION]: one decision per stock, from the rules of record (pure)
+# ----------------------------------------------------------------------------- #
+FINAL_TAB = "Final_Decisions"
+FINAL_HEAD = ["Symbol", "Decision", "Do today", "Qty", "Limit", "Stop", "Cost SAR", "Why", "Rule of record",
+              "Other pages' own rules", "Analysis differs on", "Decided At (Riyadh)", "Version"]
+DECISIONS = ("SELL", "BUY", "HOLD", "WATCH", "DO NOT INVEST")
+_DEC_ORDER = {d: i for i, d in enumerate(DECISIONS)}
+
+
+def final_on() -> bool:
+    return _env("TFB_TAP_FINAL", "on").lower() not in ("off", "0", "false", "no")
+
+
+def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
+    """(decision, what it means today) for one holding, from the Exit Plan's action - the exit rule of record."""
+    act, qty, stop = h["action"], h.get("qty") or 0, h.get("stop")
+    shares = "%s shares" % fmt(qty, 0) if qty else "the position"
+    if h.get("review_reason") and act != "NO RULE":
+        return "HOLD", "Hold. Verify at IBKR before any change: %s." % h["review_reason"]
+    if act == "SELL":
+        return "SELL", "Sell all %s." % shares
+    if act == "TAKE PROFIT":
+        half = int(qty // 2) if qty else 0
+        return "SELL", "Sell half (%s); keep a stop at %s on the rest." % (
+            "%d shares" % half if half else "half the position", fmt(stop))
+    if act == "RAISE STOP":
+        return "HOLD", "Hold; raise the stop to %s for all %s." % (fmt(stop), shares)
+    if act in ("REVIEW", "CHECK"):
+        return "HOLD", "Hold; review today: the exit rule could not decide on its own."
+    if act == "NO RULE":
+        return "HOLD", "Hold; the Exit Plan has no rule for this holding."
+    return "HOLD", "Hold; stop %s." % fmt(stop) if stop else "Hold."
+
+
+def _pick_decision(p: Dict[str, Any]) -> Tuple[str, str]:
+    """(decision, what it means today) for a pick of today's plan - the buy rule of record."""
+    st = p.get("status") or ""
+    if st == "OPEN" and p.get("qty"):
+        if p.get("placed"):
+            return "BUY", "The buy order is working at IBKR (%s shares); nothing new to place." % fmt(
+                sum(q for _, q in p["placed"]), 0)
+        if p.get("review_reason"):
+            return "WATCH", "Do not buy yet: verify first - %s." % p["review_reason"]
+        if p.get("unfunded"):
+            return "WATCH", "Do not buy today: not funded (needs %s SAR, %s SAR left)." % (
+                fmt(p["unfunded"][0], 0), fmt(p["unfunded"][1], 0))
+        return "BUY", "Buy %s shares with a limit between %s and %s; place the stop at %s." % (
+            fmt(p["qty"], 0), fmt(p.get("zone_low")), fmt(p.get("zone_high")), fmt(p.get("stop")))
+    if st == "OPEN":
+        return "WATCH", "Do not buy yet: the plan gave it no share count."
+    if st == "INVALIDATED":
+        return "DO NOT INVEST", "Do not buy: the plan invalidated it today (%s)." % (p.get("reason") or "rule")
+    if st == "EXECUTED":
+        return "HOLD", "Bought; the Exit Plan takes it over from the next run."
+    return "WATCH", "Do not buy yet: %s%s." % (st or "pick", " - " + p["reason"] if p.get("reason") else "")
+
+
+def _page_views(sym: str, d: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """What each other page's own rule says about sym: [(page, its words, the verb those words imply)].
+    The verb is SELL, HOLD, BUY, WATCH, or SIZE (a trim to the position cap - a size, never a decision)."""
+    out: List[Tuple[str, str, str]] = []
+    pf, pf2 = d.get("pf") or {}, d.get("pf2") or {}
+    if pf.get("read") and sym in (pf.get("rows") or {}):
+        m = pf["rows"][sym]
+        out.append((PFD_TAB, m, "SELL" if any(m.startswith(w) for w in _SELL_WORDS) else
+                    "SIZE" if m.startswith("TRIM") else "BUY" if m.startswith(("BUY", "ADD")) else "HOLD"))
+    if pf2.get("read") and sym in (pf2.get("rows") or {}) and (pf2["rows"][sym] or {}).get("signal"):
+        y = pf2["rows"][sym]
+        out.append((PF2_TAB, y["signal"], "SELL" if y["verb"] == "SELL" else "HOLD"))
+    for tab, page in ((T10_TAB, d.get("t10") or {}), (V2_TAB, d.get("v2") or {})):
+        if page.get("read") and sym in (page.get("seats") or {}):
+            words, sized = _seat_text(page, sym)
+            out.append((tab, words, "BUY" if sized else "WATCH"))
+    return out
+
+
+def _differs(dec: str, held: bool, h: Optional[Dict[str, Any]], views: Sequence[Tuple[str, str, str]],
+             tol_pct: float, pf2: Dict[str, Any]) -> List[str]:
+    """The pages whose own rule implies another decision than the final one (analysis only)."""
+    out: List[str] = []
+    for page, _, verb in views:
+        if verb == "SIZE":
+            continue
+        if held and page in (T10_TAB, V2_TAB):
+            implied = "BUY" if verb == "BUY" else "HOLD"            # a held name seated on a Top 10 page is a hold
+        else:
+            implied = verb
+        if implied != dec:
+            out.append(page)
+        elif page == PF2_TAB and dec == "HOLD" and h is not None:   # the same verb with another stop
+            y = (pf2.get("rows") or {}).get(h["symbol"]) or {}
+            stop = h.get("stop")
+            if y.get("verb") == "RAISE STOP" and y.get("level") and stop and abs(y["level"] - stop) / stop * 100.0 > tol_pct:
+                out.append(page + " (stop %s)" % fmt(y["level"]))
+    return out
+
+
+def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, Any]]:
+    """One row per stock named by this run's sources: every holding (Exit Plan), every pick and pipeline name of
+    today's plan, every seat on either Top 10 page. Each row has ONE decision out of DECISIONS, decided by the rule
+    of record; the other pages' own readings ride along as analysis. Sorted SELL, BUY, HOLD, WATCH, DO NOT INVEST."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    pf2 = d.get("pf2") or {}
+    pf = d.get("pf") or {}
+    news_note = ("; the News & Macro Gate reads %s (observe-only: it does not change the decision yet)" %
+                 d["news"]["verdict"].replace("_", " ")) if d.get("news_live") else ""
+
+    def put(sym: str, dec: str, do: str, rule: str, why: str, held: bool, h: Optional[Dict[str, Any]] = None,
+            qty: Any = None, limit: str = "", stop: Any = None, cost: Optional[float] = None) -> None:
+        views = _page_views(sym, d)
+        rows[sym] = {"symbol": sym, "decision": dec, "do": do, "qty": qty, "limit": limit, "stop": stop, "cost": cost,
+                     "why": why, "rule": rule, "views": views, "held": held,
+                     "differs": _differs(dec, held, h, views, tol_pct, pf2)}
+
+    for h in d.get("holdings") or []:
+        dec, do = _holding_decision(h)
+        if pf.get("read") and (pf.get("rows") or {}).get(h["symbol"], "").startswith("TRIM") and dec == "HOLD":
+            do += " Above the position cap: no new buys of it (a trim is the owner's call)."
+        put(h["symbol"], dec, do, "Exit Plan", h.get("why", ""), True, h, qty=h.get("qty"), stop=h.get("stop"))
+    plan_rows = [(p, False) for p in d.get("picks") or []] + [(p, True) for p in d.get("pipeline") or []]
+    for p, in_pipe in plan_rows:
+        sym = p["symbol"]
+        if sym in rows:
+            continue                                                # a holding, or a pick listed before: decided
+        if in_pipe:
+            dec, do = "WATCH", "Not today's pick: waiting for %s." % (p.get("waiting") or "the plan")
+            why = p.get("reason") or ""
+        else:
+            dec, do = _pick_decision(p)
+            why = (p.get("reason") or "") + (news_note if dec == "BUY" else "")
+        put(sym, dec, do, "Daily Plan", why.strip("; "), False,
+            qty=p.get("qty") if dec == "BUY" else None,
+            limit="%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))) if dec == "BUY" else "",
+            stop=p.get("stop") if dec == "BUY" else None,
+            cost=commit_cost(p) if dec == "BUY" else None)
+    for tab, page in ((T10_TAB, d.get("t10") or {}), (V2_TAB, d.get("v2") or {})):
+        for sym in sorted((page.get("seats") or {}) if page.get("read") else {}):
+            if sym in rows:
+                continue
+            _, sized = _seat_text(page, sym)
+            put(sym, "WATCH", ("Do not buy from the Top 10 pages: it is not a pick of today's plan." if sized else
+                               "On the Top 10 list; not a pick of today's plan."), "Daily Plan",
+                "The Top 10 pages rank and research; only the Daily Plan's cut is an order.", False)
+    out = list(rows.values())
+    out.sort(key=lambda r: (_DEC_ORDER[r["decision"]], r["symbol"]))
+    return out
+
+
+def final_rows(decisions: Sequence[Dict[str, Any]], stamp: str) -> List[List[Any]]:
+    """The Final_Decisions tab: a header and one row per stock (plain values; read by the other pages)."""
+    out: List[List[Any]] = [list(FINAL_HEAD)]
+    for r in decisions:
+        out.append([r["symbol"], r["decision"], r["do"], "" if r["qty"] is None else round(float(r["qty"]), 4), r["limit"],
+                    "" if r["stop"] is None else round(float(r["stop"]), 4),
+                    "" if r["cost"] is None else round(float(r["cost"])),
+                    r["why"][:400], r["rule"], " · ".join("%s: %s" % (p, w) for p, w, _ in r["views"])[:600],
+                    ", ".join(r["differs"]) or "none", stamp, __version__])
     return out
 
 
@@ -1098,6 +1285,8 @@ for _k, (_bg, _label) in CHIP.items():                         # the step number
     STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
 ACTION_STYLE = {"SELL": "act_sell", "TAKE PROFIT": "act_profit", "RAISE STOP": "act_stop", "REVIEW": "act_review",
                 "CHECK": "act_review", "HOLD": "act_hold", "NO RULE": "act_none"}
+DECISION_STYLE = {"SELL": "act_sell", "BUY": "act_profit", "HOLD": "act_hold", "WATCH": "act_stop",   # 1.6.0
+                  "DO NOT INVEST": "st_bad"}
 STATUS_STYLE = {"OPEN": "st_good", "WAIT": "st_warn", "MATCH": "st_good", "MISMATCH": "st_warn", "STALE": "st_warn",
                 "OVER CAP": "st_warn",
                 "INFO": "st_info", "none": "st_good", "not read": "st_bad", "PASS": "st_good", "FAIL": "st_bad",
@@ -1287,6 +1476,19 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     elif "Exit_Plan" in miss or "_Daily_Plan" in miss:
         pg.add(["", "", "INCOMPLETE: %s could not be read, so steps may be missing." % ", ".join(
             m for m in miss if m in ("Exit_Plan", "_Daily_Plan"))], ["", "", "msg_alert"], [(2, WIDTH)])
+
+    # ---- 1.6.0 [ONE-DECISION]: every stock on any page, one decision each
+    if d.get("final"):
+        pg.add(height=10)
+        pg.full("ONE DECISION PER STOCK - every page shows this decision (written to the %s tab)" % FINAL_TAB, "band_a", 30)
+        pg.full("Holdings follow the Exit Plan, new buys the Daily Plan; another page's own rule is analysis and never "
+                "changes the decision.", "msg")
+        pg.add(["Symbol", "Decision", "Do today", "", "", "", "Rule of record", "Analysis differs on"], "head",
+               [(2, 6), (7, WIDTH)])
+        for r in d["final"]:
+            pg.add([r["symbol"], r["decision"], r["do"], "", "", "", r["rule"], ", ".join(r["differs"]) or "none"],
+                   ["cell_b", DECISION_STYLE[r["decision"]], "cell", "", "", "", "cell", "warn" if r["differs"] else "ok"],
+                   [(2, 6), (7, WIDTH)])
 
     # ---- 1.2.0 [ALIGN]: the same names on the Top 10 pages and here
     if d.get("aligned"):
@@ -1726,6 +1928,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s · not read: %s" % (
         len(d["holdings"]), len(d["picks"]), ", ".join("%s %s" % (p["symbol"], p["status"]) for p in d["picks"]) or "-",
         len(d["pipeline"]), len(d["issues"]), ", ".join(d["stale"]) or "none", ", ".join(d["missing"]) or "none"))
+    d["final"] = final_decisions(d, k["stop_tol"]) if aligned and final_on() else []      # 1.6.0
+    for r in d["final"]:
+        _out("FINAL %-9s %-13s rule: %s | analysis differs on: %s" % (r["symbol"], r["decision"], r["rule"],
+                                                                     ", ".join(r["differs"]) or "none"))
     pg = page_layout(d, local.strftime("%Y-%m-%d %H:%M"), local.strftime("%a %d %b %Y"), k)
     rows = pg.rows
     if dry_run:
@@ -1738,6 +1944,19 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     hidden = [] if preview else hide_tabs(book, hide_list(_env("TFB_TAP_HIDE_TABS", DEFAULT_HIDE)) + [PREVIEW_TAB])
     _out("wrote the %s page (%d rows, %d step(s), %s)%s" % (tab, len(rows), len(d["steps"]), how,
                                                             "; hid " + ", ".join(hidden) if hidden else ""))
+    if d["final"] and not preview:                                  # 1.6.0: the one decision per stock, for every page
+        try:
+            from scripts.daily_plan import write_grid  # noqa: PLC0415
+            body = final_rows(d["final"], local.strftime("%Y-%m-%d %H:%M"))
+            with_retry(lambda: write_grid(book, FINAL_TAB, body, len(FINAL_HEAD), 60), retries, sleep,
+                       "writing the final decisions")
+            _out("wrote the %s tab (%d stock(s))" % (FINAL_TAB, len(d["final"])))
+        except Exception as e:  # noqa: BLE001 - the page above already carries every decision
+            if quota_error(e):
+                raise
+            print("::warning::Today Action Plan: the %s tab was not written (%s)" % (FINAL_TAB, type(e).__name__),
+                  flush=True)
+            _out("%s not written: %s: %s" % (FINAL_TAB, type(e).__name__, text(e)[:300]))
     if not preview:                                                 # 1.4.0: the run, kept for the dashboard
         from scripts import plan_archive  # noqa: PLC0415
         plan_archive.archive(archive_rows(d, now, plan_archive.run_id(now)), _out, session=bq_session)

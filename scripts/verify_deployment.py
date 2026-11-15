@@ -362,7 +362,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("exit_plan", "1.3.2", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.5.0", "today action plan"),
+    ("today_action_plan", "1.6.0", "today action plan"),
     ("plan_archive", "1.0.0", "plan archive"),
     ("ibkr_capture", "1.0.0", "ibkr capture"),
     ("cash_cells", "1.0.0", "cash cells"),

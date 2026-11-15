@@ -377,7 +377,9 @@ def test_t4_workflow_manifest_and_single_write():
     for name in re.findall(r"(TFB_T[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in read_by, name
     # 1.1.0: the page goes out as ONE batch; the plain grid is only the fallback when Sheets refuses the styled one
-    assert src.count("book.batch_update(") == 2 and src.count("write_grid(") == 1 and "write_grid(book, tab," in src
+    # 1.6.0: the second write_grid is the Final_Decisions tab, after the page
+    assert src.count("book.batch_update(") == 2 and src.count("write_grid(") == 2 and "write_grid(book, tab," in src
+    assert "write_grid(book, FINAL_TAB," in src
     assert ".del_worksheet" not in src and "delete" not in src.lower().replace("never deletes", "").replace("not deleted", "")
     assert '("today_action_plan", "%s", "today action plan")' % tap.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
@@ -1493,3 +1495,121 @@ def test_t15_off_reads_neither_page_and_a_missing_page_changes_no_step(monkeypat
     wf = yaml.safe_load((ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8"))
     envs = [s.get("env", {}) for j in wf["jobs"].values() for s in j["steps"] if "today_action_plan.py" in str(s.get("run", ""))]
     assert envs and envs[0]["TFB_TAP_HOLD_ALIGN"] == "${{ vars.TFB_TAP_HOLD_ALIGN || 'on' }}"
+
+
+# ----------------------------------------------------------------------------- T16 (1.6.0) one decision per stock
+def _final_book(**over):
+    tabs = dict(Exit_Plan=Sheet(_hold_exit()), Portfolio_Decision=Sheet(PFM), Portfolio_Decision_v2=Sheet(PF2))
+    tabs.update(over)
+    return aligned_book(**tabs)
+
+
+def _final(book):
+    vals = [r for r in book.tabs["Final_Decisions"].values if any(c != "" for c in r)]
+    head = vals[0]
+    return head, {r[0]: dict(zip(head, r)) for r in vals[1:]}
+
+
+def test_t16_every_stock_on_any_page_gets_one_decision(capsys):
+    """Owner, 16 Nov 01:01: the pages may use different rules, but each stock gets ONE final decision."""
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    head, rows = _final(book)
+    assert head == tap.FINAL_HEAD
+    assert set(r["Decision"] for r in rows.values()) <= set(tap.DECISIONS)
+    # every holding, every pick and pipeline name, every Top 10 seat: one row each
+    assert {"SUPN.US", "GLPI.US", "DDI.US", "IBOC.US", "5023.SR", "NMM.US", "EFC.US", "ZERO.US", "MBIN.US", "TEN.US",
+            "ZTO.US"} <= set(rows)
+    # the holding another page sells: the Exit Plan decides, the other rule is analysis
+    s = rows["SUPN.US"]
+    assert s["Decision"] == "HOLD" and s["Rule of record"] == "Exit Plan" and s["Analysis differs on"] == "Portfolio_Decision_v2"
+    assert "Portfolio_Decision_v2: SELL" in s["Other pages' own rules"]
+    # another stop on v2: a hold whose analysis differs on the stop
+    assert rows["GLPI.US"]["Analysis differs on"] == "Portfolio_Decision_v2 (stop 38.27)"
+    # a trim to the cap is a size, not a decision
+    d = rows["DDI.US"]
+    assert d["Decision"] == "HOLD" and "no new buys of it" in d["Do today"] and d["Analysis differs on"] == "none"
+    # today's funded pick: the only BUY, with its levels; the Top 10 pages that do not size it are analysis
+    n = rows["NMM.US"]
+    assert n["Decision"] == "BUY" and n["Do today"].startswith("Buy 24 shares with a limit between 84.50 and 88.01")
+    assert n["Qty"] == 24 and n["Stop"] == 80.17 and n["Cost SAR"] > 0 and n["Limit"] == "84.50 - 88.01"
+    assert [k for k, r in rows.items() if r["Decision"] == "BUY"] == ["NMM.US"]
+    # a Top 10 ticket that is not today's pick: WATCH, never a buy
+    assert rows["TEN.US"]["Decision"] == "WATCH" and rows["TEN.US"]["Analysis differs on"] == "Top_10_Investments_v2"
+    assert rows["ZTO.US"]["Decision"] == "WATCH" and rows["ZTO.US"]["Do today"].startswith("Not today's pick")
+    assert rows["EFC.US"]["Decision"] == "WATCH" and "WAIT" in rows["EFC.US"]["Do today"]
+    # sorted by decision: SELL, BUY, HOLD, WATCH, DO NOT INVEST
+    order = [r[1] for r in book.tabs["Final_Decisions"].values[1:] if r[0]]
+    assert order == sorted(order, key=lambda x: tap.DECISIONS.index(x))
+    # the page shows the same rows; the run log names each decision and no amount
+    flat = [" | ".join(str(c) for c in r if c != "") for r in book.tabs["Today_Action_Plan"].values]
+    i = [n for n, x in enumerate(flat) if x.startswith("ONE DECISION PER STOCK")][0]
+    assert flat[i + 2] == "Symbol | Decision | Do today | Rule of record | Analysis differs on"
+    assert flat[i + 3].startswith("NMM.US | BUY | Buy 24 shares")
+    assert "SUPN.US | HOLD | Hold; stop 24.25. | Exit Plan | Portfolio_Decision_v2" in flat
+    out = capsys.readouterr().out
+    assert "FINAL SUPN.US   HOLD" in out and "wrote the Final_Decisions tab (" in out and " SAR" not in out.split("FINAL")[1]
+
+
+def test_t16_the_decision_words_for_each_rule():
+    hd = tap._holding_decision
+    assert hd(_h("A", "SELL", 9.0) | {"qty": 10}) == ("SELL", "Sell all 10 shares.")
+    assert hd(_h("A", "TAKE PROFIT", 9.0) | {"qty": 10}) == ("SELL", "Sell half (5 shares); keep a stop at 9.00 on the rest.")
+    assert hd(_h("A", "RAISE STOP", 9.5) | {"qty": 10})[0] == "HOLD"
+    assert hd(_h("A", "REVIEW", 9.0))[0] == "HOLD" and hd(_h("A", "NO RULE", None))[0] == "HOLD"
+    assert hd(_h("A", "SELL", 9.0) | {"review_reason": "quantity differs"}) == (
+        "HOLD", "Hold. Verify at IBKR before any change: quantity differs.")      # never a sale on an unverified book
+    pd = tap._pick_decision
+    base = {"symbol": "X.US", "status": "OPEN", "qty": 10, "zone_low": 1.0, "zone_high": 1.1, "stop": 0.9}
+    assert pd(base)[0] == "BUY"
+    assert pd(dict(base, placed=[(1.05, 10)]))[0] == "BUY"
+    assert pd(dict(base, review_reason="capture old"))[0] == "WATCH"
+    assert pd(dict(base, unfunded=(5000.0, 100.0)))[0] == "WATCH"
+    assert pd(dict(base, qty=None))[0] == "WATCH"
+    assert pd(dict(base, status="WAIT", reason="above the zone"))[0] == "WATCH"
+    assert pd(dict(base, status="INVALIDATED", reason="earnings in 3 day(s)")) == (
+        "DO NOT INVEST", "Do not buy: the plan invalidated it today (earnings in 3 day(s)).")
+    assert pd(dict(base, status="EXECUTED"))[0] == "HOLD"
+    # a pick that is also a holding: the Exit Plan's decision stands
+    d = {"holdings": [_h("X.US", "HOLD", 0.9) | {"qty": 5}], "picks": [base], "pipeline": [], "t10": {}, "v2": {}}
+    assert [(r["symbol"], r["decision"], r["rule"]) for r in tap.final_decisions(d)] == [("X.US", "HOLD", "Exit Plan")]
+    # the news gate does not change a decision yet; it is named in the reason
+    d2 = {"holdings": [], "picks": [dict(base, reason="inside the zone")], "pipeline": [], "news_live": True,
+          "news": {"verdict": "NO_NEW_ENTRY"}}
+    r = tap.final_decisions(d2)[0]
+    assert r["decision"] == "BUY" and "NO NEW ENTRY (observe-only" in r["why"]
+
+
+def test_t16_a_v2_page_that_shows_the_final_decision_keeps_its_own_rule_as_analysis():
+    hdr = ["Symbol", "Exit signal"]
+    y = tap.read_pf_v2([hdr, ["SUPN.US", "FINAL: HOLD (Today Action Plan) · v2 rule: SELL NOW — stop 33.76 hit"],
+                        ["GLPI.US", "FINAL: HOLD (Today Action Plan) · v2 rule: RAISE STOP 35.74 → 38.27"],
+                        ["IBOC.US", "FINAL: HOLD (Today Action Plan)"]])["rows"]
+    assert y["SUPN.US"] == {"verb": "SELL", "signal": "SELL NOW — stop 33.76 hit", "level": None}
+    assert y["GLPI.US"]["verb"] == "RAISE STOP" and y["GLPI.US"]["level"] == 38.27
+    assert y["IBOC.US"]["verb"] == ""
+
+
+def test_t16_off_preview_and_a_refused_tab_write(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_TAP_FINAL", "off")
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    assert "Final_Decisions" not in book.tabs
+    assert not any("ONE DECISION PER STOCK" in str(r[0]) for r in book.tabs["Today_Action_Plan"].values if r)
+    monkeypatch.delenv("TFB_TAP_FINAL")
+    monkeypatch.setenv("TFB_TAP_PREVIEW", "true")
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    assert "Final_Decisions" not in book.tabs                         # a preview never writes the decisions
+    monkeypatch.delenv("TFB_TAP_PREVIEW")
+    real = tap.final_rows
+
+    def boom(*a, **k):
+        raise RuntimeError("refused")
+    monkeypatch.setattr(tap, "final_rows", boom)
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0   # the page stands
+    assert "Today_Action_Plan" in book.tabs and "Final_Decisions" not in book.tabs
+    assert "Final_Decisions not written: RuntimeError" in capsys.readouterr().out
+    monkeypatch.setattr(tap, "final_rows", real)
+    assert tap.run_once(True, book=_final_book(), now=NOW, capture=plan_capture()) == 0     # a dry run writes nothing

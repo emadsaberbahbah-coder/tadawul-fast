@@ -1,7 +1,25 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.3.1 (2026-11-11)
+ * Version: 1.4.0 (2026-11-16)
+ *   1.4.0: ONE DECISION PER STOCK (owner, Mon 16 Nov 2026 01:01 Riyadh: "different pages ... in the end they should
+ *          provide the same recommendations ... the final decision should be one decision buy hold sale or watchlist or
+ *          don't invest"). On 16 Nov this page read SELL NOW on SUPN.US ('stop 33.76 hit') while the Exit Plan and
+ *          the Today Action Plan read HOLD: the trailing rule here ran on prices not adjusted for the 8.13 USD special
+ *          dividend of 3 Nov (the 1.2.33 adjustment was off by default). Now:
+ *          (a) [ONE-DECISION] both pages read the Final_Decisions tab that the Today Action Plan (today_action_plan
+ *              1.6.0) writes on every run - one decision per stock: SELL / BUY / HOLD / WATCH / DO NOT INVEST. The
+ *              holdings' 'Exit signal' cell reads 'FINAL: <decision> (Today Action Plan) . v2 rule: <this page's own
+ *              rule>'; ACTIONS TODAY lists the final decision's step, and the page's own exit, SWITCH and CHECK lines
+ *              are no longer actions (they stay in the row as analysis). A SELL e-mail goes out only when the final
+ *              decision is SELL. On Top_10_Investments_v2 the 'Seat status' starts with the final decision; 'Alloc
+ *              SAR' / 'Buy qty' show the plan's order on a BUY and are empty otherwise (the engine sizing moves to
+ *              Flags as analysis). A Final_Decisions table older than DP2_FINAL_MAX_H hours (6; 1-48), missing or
+ *              unreadable reads 'FINAL: n/a (why)' and still gives no order. Script Property DP2_FINAL = 0 / off /
+ *              false / no restores the 1.3.1 pages exactly.
+ *          (b) the 1.2.33 history checks (DP2_EXIT_SANITY) are ON unless the property reads 0 / off / false / no, so
+ *              an ex-dividend gap is no longer a stop hit by default.
+ *          Rollback: Project History -> 1.3.1, or DP2_FINAL = off and DP2_EXIT_SANITY = off.
  *   1.3.1: A SLOT LEFT UNFINISHED GOES ON IN THE NEXT HOUR (first slot, Wed 11 Nov 2026 17:00 Riyadh): the main page did
  *          not render in the 17:00 hour (its last render 15:31), so the slot waited for minute 40 and its ticks had room
  *          for one page: Portfolio_Decision_v2 was built at 17:50, Top_10_Investments_v2 not at all. [SLOT-CARRY]: in an
@@ -416,7 +434,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.3.1';   // lockstep with the header
+var DP2_VERSION = '1.4.0';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2194,7 +2212,7 @@ function dp2EngineNaWhy_(xb, entryDate) {
   return 'exit engine n/a';
 }
 /* ========================================================= v1.2.33 [EXIT-SANITY]: the lot's own prices, dividends */
-var DP2_EXIT_SANITY_PROP = 'DP2_EXIT_SANITY';   // 1 / on / true / yes = on; default OFF (the 1.2.32 engine)
+var DP2_EXIT_SANITY_PROP = 'DP2_EXIT_SANITY';   // v1.4.0: default ON; 0 / off / false / no = the 1.2.32 engine
 var DP2_EXIT_ANCHOR_PCT = 8;                    // the entry may sit at most 8 % outside the entry day's low-high range
 var DP2_EXIT_ANCHOR_GAP_D = 5;                  // a first bar more than 5 days after the entry cannot judge the fill
 var DP2_EXIT_DIV_MAX = 0.6;                     // a distribution above 60 % of the close before it is not adjusted
@@ -2203,8 +2221,94 @@ var DP2_DIVIDEND_SHEET = 'Dividend_Events';     // calendar_sync TFB_CAL_DIVIDEN
 var DP2_EXIT_SUBUNIT_ = { GBp: true, GBX: true, ZAc: true, ZAC: true, ILA: true, ILa: true };   // quote units the upper-cased tab cannot match
 var DP2X_SAN_ = null;                           // the gate, read once per execution
 function dp2ExitSanityOn_() {
-  if (DP2X_SAN_ === null) DP2X_SAN_ = /^(1|on|true|yes)$/i.test(dp2Str_(dp2Prop_(DP2_EXIT_SANITY_PROP)).trim());
+  if (DP2X_SAN_ === null) DP2X_SAN_ = !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_EXIT_SANITY_PROP)).trim());   // v1.4.0: default on
   return DP2X_SAN_;
+}
+/* v1.4.0 [ONE-DECISION]: the Today Action Plan's Final_Decisions tab - one decision per stock - read by both pages. */
+var DP2_FINAL_SHEET = 'Final_Decisions';
+var DP2_FINAL_PROP = 'DP2_FINAL';               // 0 / off / false / no = the 1.3.1 pages; default on
+var DP2_FINAL_MAX_H_PROP = 'DP2_FINAL_MAX_H';   // hours the table counts as current (default 6, 1-48)
+var DP2_FINAL_DECISIONS = ['SELL', 'BUY', 'HOLD', 'WATCH', 'DO NOT INVEST'];
+function dp2FinalOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_FINAL_PROP)).trim()); }
+/* PURE: Final_Decisions values -> { ok, at 'yyyy-MM-dd HH:mm', rows: { SYMBOL: { decision, todo, qty, limit, stop, cost,
+ * differs } } }. The header row is found by name; a row with a decision outside DP2_FINAL_DECISIONS is skipped. */
+function dp2FinalFromValues_(vals) {
+  var out = { ok: false, at: '', rows: {} }, hdr = -1, col = {}, r, c;
+  vals = vals || [];
+  for (r = 0; r < vals.length && hdr < 0; r++) {
+    var names = {};
+    for (c = 0; c < (vals[r] || []).length; c++) names[dp2Str_(vals[r][c]).trim()] = c;
+    if (names.hasOwnProperty('Symbol') && names.hasOwnProperty('Decision') && names.hasOwnProperty('Do today')) { hdr = r; col = names; }
+  }
+  if (hdr < 0) return out;
+  out.ok = true;
+  var get = function (row, name) { return col.hasOwnProperty(name) ? row[col[name]] : ''; };
+  for (r = hdr + 1; r < vals.length; r++) {
+    var row = vals[r] || [], sym = dp2Str_(get(row, 'Symbol')).trim().toUpperCase(), dec = dp2Str_(get(row, 'Decision')).trim().toUpperCase();
+    if (!sym) continue;
+    if (DP2_FINAL_DECISIONS.indexOf(dec) < 0) continue;
+    out.rows[sym] = { decision: dec, todo: dp2Str_(get(row, 'Do today')), qty: dp2Num_(get(row, 'Qty')), limit: dp2Str_(get(row, 'Limit')),
+      stop: dp2Num_(get(row, 'Stop')), cost: dp2Num_(get(row, 'Cost SAR')), differs: dp2Str_(get(row, 'Analysis differs on')) };
+    if (!out.at) out.at = dp2Str_(get(row, 'Decided At (Riyadh)')).trim();
+  }
+  return out;
+}
+/* PURE: hours from a 'yyyy-MM-dd HH:mm' Riyadh (UTC+3) stamp to nowMs; null when the stamp is not read. */
+function dp2FinalAgeH_(at, nowMs) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(dp2Str_(at).trim());
+  if (!m) return null;
+  return Math.max(0, (nowMs - Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5])) / 3600000);
+}
+/* PURE: the reader's verdict from parsed values -> { on, ok, at, ageH, maxH, rows, why } (ok = current and usable). */
+function dp2FinalState_(parsed, nowMs, maxH, on) {
+  var out = { on: on !== false, ok: false, at: '', ageH: null, maxH: maxH, rows: {}, why: '' };
+  if (!out.on) { out.why = 'off (Script Property ' + DP2_FINAL_PROP + ')'; return out; }
+  if (!parsed || !parsed.ok) { out.why = DP2_FINAL_SHEET + ' has no decisions table'; return out; }
+  out.at = parsed.at; out.ageH = dp2FinalAgeH_(parsed.at, nowMs);
+  if (out.ageH === null) out.why = DP2_FINAL_SHEET + ' time not read';
+  else if (out.ageH > maxH) out.why = DP2_FINAL_SHEET + ' is ' + dp2Fmt_(out.ageH, 1) + ' h old (limit ' + maxH + ' h)';
+  else { out.ok = true; out.rows = parsed.rows; }
+  return out;
+}
+function dp2ReadFinal_() {
+  var on = dp2FinalOn_();
+  var mh = dp2Num_(dp2Prop_(DP2_FINAL_MAX_H_PROP)); if (mh === null || mh < 1 || mh > 48) mh = 6;
+  if (!on) return dp2FinalState_(null, 0, mh, false);
+  try {
+    var sh = dp2Sheet_(DP2_FINAL_SHEET, false);
+    if (!sh || sh.getLastRow() < 2) { var miss = dp2FinalState_(null, 0, mh, true); miss.why = DP2_FINAL_SHEET + ' tab missing or empty'; return miss; }
+    return dp2FinalState_(dp2FinalFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), 400), Math.min(Math.max(sh.getLastColumn(), 1), 13)).getValues()), new Date().getTime(), mh, true);
+  } catch (e) { var bad = dp2FinalState_(null, 0, mh, true); bad.why = DP2_FINAL_SHEET + ' not read: ' + String(e && e.message || e).slice(0, 80); return bad; }
+}
+/* PURE: what a page shows for one symbol -> { text, kind, row }. Off: the page's own text, unchanged. */
+function dp2FinalCell_(fin, sym, ownText) {
+  var own = dp2Str_(ownText);
+  if (!fin || !fin.on) return { text: own, kind: null, row: null };
+  var r = fin.ok ? (fin.rows[dp2Str_(sym).trim().toUpperCase()] || null) : null;
+  if (!r) return { text: 'FINAL: n/a (' + (fin.ok ? 'not on ' + DP2_FINAL_SHEET : fin.why) + ') \u00b7 v2 rule: ' + own, kind: 'grey', row: null };
+  var kind = (r.decision === 'SELL' || r.decision === 'DO NOT INVEST') ? 'red' : (r.decision === 'BUY' ? 'green' : (r.decision === 'HOLD' ? 'navy' : 'amber'));
+  return { text: 'FINAL: ' + r.decision + ' (Today Action Plan) \u00b7 v2 rule: ' + own, kind: kind, row: r };
+}
+/* PURE: the ACTIONS TODAY line of a final decision, or null when it asks nothing beyond holding at the stop. */
+function dp2FinalAction_(sym, r) {
+  if (!r) return null;
+  if (r.decision === 'HOLD' && /^Hold(; stop [^;]*)?\.?$/.test(dp2Str_(r.todo).trim())) return null;
+  return { p: r.decision === 'SELL' ? 0 : 2, t: r.decision + ' ' + sym + ' (Today Action Plan): ' + dp2Str_(r.todo) };
+}
+/* The dp2SelfTest core (pure): the reader, the stale rule, the cell and the action. */
+function dp2FinalCoreOk_() {
+  try {
+    var v = [['Symbol', 'Decision', 'Do today', 'Qty', 'Limit', 'Stop', 'Cost SAR', 'Why', 'Rule of record', 'Other', 'Analysis differs on', 'Decided At (Riyadh)', 'Version'],
+             ['SUPN.US', 'HOLD', 'Hold; stop 24.25.', 95, '', 24.25, '', '', 'Exit Plan', '', 'Portfolio_Decision_v2', '2026-11-16 00:41', '1.6.0'],
+             ['NMM.US', 'BUY', 'Buy 24 shares', 24, '84.50 - 88.01', 80.17, 7920, '', 'Daily Plan', '', 'none', '2026-11-16 00:41', '1.6.0'],
+             ['X.US', 'MAYBE', 'x', '', '', '', '', '', '', '', '', '2026-11-16 00:41', '1.6.0']];
+    var p = dp2FinalFromValues_(v), now = Date.UTC(2026, 10, 15, 22, 41);
+    var f = dp2FinalState_(p, now, 6, true), old = dp2FinalState_(p, now + 7 * 3600000, 6, true);
+    var c = dp2FinalCell_(f, 'supn.us', 'SELL NOW'), n = dp2FinalCell_(old, 'SUPN.US', 'SELL NOW');
+    return p.ok && !p.rows['X.US'] && f.ok && f.ageH === 1 && !old.ok && c.row && c.text === 'FINAL: HOLD (Today Action Plan) \u00b7 v2 rule: SELL NOW' &&
+      n.row === null && /^FINAL: n\/a \(Final_Decisions is 8\.0 h old/.test(n.text) && dp2FinalAction_('SUPN.US', p.rows['SUPN.US']) === null &&
+      dp2FinalAction_('NMM.US', p.rows['NMM.US']).p === 2 && dp2FinalCell_(dp2FinalState_(p, now, 6, false), 'SUPN.US', 'SELL NOW').text === 'SELL NOW';
+  } catch (e) { return false; }
 }
 /* v1.2.35 [STOP-RULE]: Script Property DP2_STOP_RULE = 'fixed' or 'fixed:YYYY-MM-DD' (any case; default OFF = the
  * 1.2.34 trailing engine). Read once per execution. Lots entered on/after the start date (default DP2X_SR_FROM_) and
@@ -3474,6 +3578,7 @@ function buildPortfolioDecisionV2() {
   var s1 = dp2ReadS1_();
   var switches = dp2ReadShadowSwitch_();
   var t10 = dp2ReadTop10_();
+  var fin = dp2ReadFinal_();   // v1.4.0 [ONE-DECISION]
 
   var fx = dp2Num_(ib.account['fx_usd_sar']) || pd.fx || DP2.FX_DEFAULT;
   // v1.2.2: the same cash basis as Top_10_Investments_v2 (dp2CashBasis_), so NAV, floor, deployable and the shared allocation agree
@@ -3556,6 +3661,7 @@ function buildPortfolioDecisionV2() {
   dp2Header_(sh, row, 'PORTFOLIO DECISION — v2', stateChip[0], stateChip[1], 'page built ' + dp2Today_() + ' \u00b7 decision (Portfolio_Decision run) ' + (pd.lastRun || 'n/a') + (evExp ? ' \u00b7 IBKR capture ' + evExp.capture + (evExp.live ? ' valid to ' : ' expired ') + evExp.hm : '') + ' \u00b7 FX ' + fx);
   row++;
   dp2Line_(sh, row, reason, { color: DP2C.ink, size: 9.5, bg: DP2C.surface, height: 30 }); row++;
+  if (fin.on) { dp2Line_(sh, row, 'ONE DECISION PER STOCK: the Exit signal column and ACTIONS TODAY show the Today Action Plan\'s final decision (' + DP2_FINAL_SHEET + (fin.ok ? ' of ' + fin.at + ' Riyadh' : ': ' + fin.why) + '). This page\'s own trailing rule is analysis ("v2 rule") and gives no order.', { color: fin.ok ? DP2C.navyText : DP2C.amber, size: 9.5, bg: fin.ok ? DP2C.surface : DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.0
   dp2Line_(sh, row, 'Sources: ledger ' + (led.status ? led.status.split('|')[0].replace('Last refresh', '').trim() : 'n/a') + ' · cash ' + cashSource + (ib.capture ? ' · IBKR cash and working orders from the read-only capture ' + dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ' (' + dp2Fmt_(ib.ageH, 0) + ' h old' + (ib.stale ? ', STALE' : '') + ')' : '') + '; trades and TWR from the _IBKR_* tabs' : ' · IBKR orders/trades/TWR from the _IBKR_* tabs (' + (ib.tabs.account ? dp2Str_(ib.account['as_of'] || 'n/a') + (ib.ageH !== null ? ', ' + dp2Fmt_(ib.ageH, 0) + ' h old' : '') + (ib.stale ? ' — STALE manual snapshot' : '') : 'MISSING — no broker snapshot; cash from ' + cashSource) + ')' + (ib.captureNote ? ' — capture: ' + ib.captureNote : '')) + ' · My_Portfolio quotes', { size: 8.5, bg: DP2C.surface, height: 20 }); row++;
   sh.setFrozenRows(row - 1);
   row++;
@@ -3698,6 +3804,7 @@ function buildPortfolioDecisionV2() {
     else if (br.state === 'inactive') { ostat = 'no active sell order — ' + br.n + ' listed (' + br.statuses.join(', ') + ') → verify at the broker'; actions.push({ p: 1, t: l.symbol + ': every sell order in _IBKR_Orders is ' + br.statuses.join(' / ') + ' — nothing active protects ' + dp2Fmt_(l.mvSar) + ' SAR' + (x ? '; the rule\'s stop is ' + dp2Fmt_(x.stop, 2) : '') + '. Verify at the broker.' }); }
     else if (br.state === 'none') { ostat = ib.ordersKnown ? 'no orders in _IBKR_Orders' : 'broker orders unknown — ' + ib.unknownWhy + ' (🌱 Seed IBKR Tabs, or paste the connector read)'; }
     else { ostat = 'partial — ' + (brokerStop ? 'stop working, no take-profit' : 'take-profit working, NO STOP') + ' (' + br.active + ' active of ' + br.n + ')'; }
+    var actLen0 = actions.length;   // v1.4.0 [ONE-DECISION]: the page's own exit lines below are analysis when the final decision is on
     // actions from the exit signal
     var item = { symbol: l.symbol, lotKey: lotKey, name: l.name, qty: l.shares, entry: cost, entryDate: entryDate, x: x, sig: sig, brokerStop: brokerStop, brokerTp: brokerTp, fx: lfx, mvSar: l.mvSar, source: xb ? xb.source : '', barsAsOf: x ? x.lastDate : '' };
     exitItems.push(item);
@@ -3735,12 +3842,20 @@ function buildPortfolioDecisionV2() {
     }
     var decision = sig.text;
     if (sig.code === 'HOLD' && !certified) decision = 'HOLD · ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' · uncertified';
-    sigKinds.push(sig.kind);
+    var fc = dp2FinalCell_(fin, l.symbol, decision);   // v1.4.0 [ONE-DECISION]
+    if (fin.on) {
+      decision = fc.text;
+      actions.length = actLen0;
+      if (!(fc.row && fc.row.decision === 'SELL')) { sig.alert = false; sig.advisory = false; }
+      var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);
+    }
+    sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);
     trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
   // v1.2.21 (review finding on 736ccd6): the unfunded-plans / capital-call action is computed once per page (dp2UnfundedAction_)
   var unfundedAct = dp2UnfundedAction_(alloc);
-  if (unfundedAct) actions.push(unfundedAct);
+  if (unfundedAct && !fin.on) actions.push(unfundedAct);   // v1.4.0: funding plans are the Top 10 page's analysis
+  if (fin.on && !fin.ok) actions.unshift({ p: 0, t: 'Final decisions not available (' + fin.why + '): take orders from the Today_Action_Plan page only; nothing on this page is an order.' });   // v1.4.0
   for (i = 0; i < fi.length; i++) {
     var f = fi[i];
     sigKinds.push('grey');
@@ -3808,10 +3923,11 @@ function buildPortfolioDecisionV2() {
   // actions + limits
   if (!evFresh) actions.push({ p: 0, t: 'Portfolio_Decision carries no fresh IBKR evidence (' + evState + (pd.evidence && pd.evidence.age ? ', ' + pd.evidence.age : '') + '): it certifies only when it runs within 14 min of the morning capture — install the capture watcher once (Apps Script editor: run pdInstallCaptureWatcher; Script Property PD_IBKR_EVIDENCE = observe or enforce), or refresh Portfolio_Decision right after the 08:40 capture. The figures above come from the ledger and ' + (ib.capture ? 'the IBKR capture ' : 'the _IBKR_* tabs ') + '(' + dp2Str_(ib.account['as_of'] || 'n/a') + ').' });   // v1.2.22
   var boardAct = dp2BoardTicketsAction_(t10, feed, s1);   // v1.2.31: action 3 follows the feed (null = the 1.2.28 wording below)
-  if (s1.verdict !== 'PASS' && boardAct) actions.push(boardAct);
+  if (fin.on) { /* v1.4.0 [ONE-DECISION]: new buys and switches are the Today Action Plan's (Final_Decisions) */ }
+  else if (s1.verdict !== 'PASS' && boardAct) actions.push(boardAct);
   else   // the 1.2.28 wording: DP2_COHORT_LEGACY, a feed that is not a live EXECUTABLE release, or no engine ticket on the board
   if (s1.verdict !== 'PASS') actions.push({ p: 4, t: 'No board-originated capital: S-1 gate ' + (s1.verdict || 'n/a') + (s1.criteria.length ? ' (' + s1.criteria.filter(function (c) { return c.status !== 'PASS'; }).map(function (c) { return c.n + ' ' + c.status; }).join(', ') + ')' : '') + '; deployable ' + dp2Fmt_(deploySar) + ' SAR (after the 10% PF cash floor) stays Tranche 0.' });
-  for (i = 0; i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory (Shadow_Board, research only): sell ' + switches[i].sell + ' → buy ' + switches[i].buy + ' Δ ' + dp2Pct_(switches[i].delta, 1) + ' vs hurdle ' + dp2PctPlain_(switches[i].hurdle, 1) + '; not executable while the feed is ' + (feed.state || 'n/a') + '.' });
+  for (i = 0; !fin.on && i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory (Shadow_Board, research only): sell ' + switches[i].sell + ' → buy ' + switches[i].buy + ' Δ ' + dp2Pct_(switches[i].delta, 1) + ' vs hurdle ' + dp2PctPlain_(switches[i].hurdle, 1) + '; not executable while the feed is ' + (feed.state || 'n/a') + '.' });
   // v1.2.12: two lots of one symbol can raise the identical position-level action — show it once
   (function () { var seen = {}, u = []; for (var ai = 0; ai < actions.length; ai++) { if (!seen[actions[ai].t]) { seen[actions[ai].t] = true; u.push(actions[ai]); } } actions = u; })();
   actions.sort(function (a, b) { return a.p - b.p; });
@@ -3881,6 +3997,7 @@ function buildTop10V2() {
   var s1 = dp2ReadS1_();
   var led = dp2ReadLedger_();
   var ib = dp2ReadIbkr_();
+  var fin = dp2ReadFinal_();   // v1.4.0 [ONE-DECISION]
   var fx = dp2Num_(ib.account['fx_usd_sar']) || DP2.FX_DEFAULT;
   // v1.2.2: the same cash basis as Portfolio_Decision_v2 (dp2CashBasis_); the allocation memo is keyed on it
   var cb = dp2CashBasis_(t, ib, fx);
@@ -3925,6 +4042,7 @@ function buildTop10V2() {
   dp2Line_(sh, row, (fv.label === 'SYNC RUNNING' || fv.label === 'EXPIRED' || fv.label === 'EXECUTABLE') ? 'Feed: ' + fv.note : 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
   var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';   // v1.2.34 [RENDER-PRIORITY] (gate on only)
   dp2Line_(sh, row, 'Status: ' + t.status + (rpNote ? ' \u2014 ' + rpNote : ''), { size: 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : 20 }); row++;
+  if (fin.on) { dp2Line_(sh, row, 'ONE DECISION PER STOCK: each seat\'s status starts with the Today Action Plan\'s final decision (' + DP2_FINAL_SHEET + (fin.ok ? ' of ' + fin.at + ' Riyadh' : ': ' + fin.why) + '). Alloc SAR / Buy qty show the plan\'s order on a BUY only; the engine sizing is analysis (Flags).', { color: fin.ok ? DP2C.navyText : DP2C.amber, size: 9.5, bg: fin.ok ? DP2C.surface : DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.0
   sh.setFrozenRows(row - 1);
   row++;
 
@@ -4047,6 +4165,14 @@ function buildTop10V2() {
     if (riskSar !== null && navSar && riskSar / navSar * 100 > DP2X.RISK_WARN_PCT_NAV) flags.push('risk ' + dp2PctPlain_(riskSar / navSar * 100, 2) + ' NAV > ' + DP2X.RISK_WARN_PCT_NAV + '%');
     if (xb && xb.stale && xatr !== null) flags.push('ATR from cached bars');
     if (xb && !xb.bars.length) flags.push('no price history');
+    if (fin.on) {   // v1.4.0 [ONE-DECISION]
+      var tfc = dp2FinalCell_(fin, sym, stability), tfr = tfc.row;
+      if (tfr && tfr.decision === 'BUY' && tfr.qty !== null) { shares = tfr.qty; allocSar = tfr.cost; flags.unshift('the Today Action Plan\'s order: ' + tfr.todo); }
+      else { if (shares !== null) flags.unshift('engine sizing ' + dp2Fmt_(shares) + ' sh / ' + dp2Fmt_(allocSar) + ' SAR \u2014 analysis, not today\'s order'); shares = null; allocSar = null; }
+      riskSar = (stop0 !== null && shares !== null && fxUse !== null) ? shares * (entry - stop0) * fxUse : null;
+      gain3 = (allocSar !== null && roi3 !== null) ? allocSar * roi3 / 100 : null;
+      stability = tfc.text.replace(' \u00b7 v2 rule: ', ' \u00b7 seat: ');
+    }
     if (pvWhy && shares !== null) flags.unshift('preview \u00b7 not a ticket');   // v1.2.32: a sized seat on a page that cannot be acted on
     sRisk.push(riskSar); sState.push(ar ? ar.state : (isPlan ? '' : 'GRACE'));
     sRows.push([dp2Num_(s['Rank']) !== null ? dp2Num_(s['Rank']) : '—', sym + ' · ' + dp2Str_(s['Name']) + '\n' + sec + ' · ' + dp2Str_(s['Market']), dp2SparkFormula_(sym), stability, entry !== null ? dp2Fmt_(entry, 2) + ' ' + ccy : '—', allocSar !== null ? allocSar : (isPlan ? '—' : ''), shares !== null ? shares : (isPlan ? '—' : ''), stop0 !== null ? dp2Fmt_(stop0, 2) + ' (' + dp2Pct_((stop0 / entry - 1) * 100, 1) + ')\nATR ' + dp2Fmt_(xatr, 2) : 'n/a', riskSar !== null ? riskSar : '—', gain3 !== null ? gain3 : '—', roi3 !== null ? roi3 / 100 : null, roi12 !== null ? roi12 / 100 : null, dp2Fmt_(dp2Num_(s['Rel']), 1) + ' · ' + dp2Fmt_(dp2Num_(s['DQ']), 0) + ' · ' + dp2Fmt_(dp2Num_(s['Sm Score']), 1), flags.join(' · ')]);
@@ -4247,6 +4373,7 @@ function dp2SelfTest() {
   checks.push({ name: 'production configuration: ' + cfgS.summary, ok: true });
   var gfOk = dp2GfKey_('AZN.L') === 'LON:AZN' && dp2GfKey_('1120.SR') === 'TADAWUL:1120' && dp2GfKey_('DDI.US') === 'DDI' && dp2YahooKey_('DDI.US') === 'DDI' && dp2YahooKey_('AZN.L') === 'AZN.L';
   checks.push({ name: 'symbol keys (GOOGLEFINANCE / chart API)', ok: gfOk });
+  var fOk = dp2FinalCoreOk_(), fNow = dp2ReadFinal_(); checks.push({ name: 'one decision per stock (DP2_FINAL): ' + (fNow.on ? 'on' : 'off') + ' \u00b7 core ' + (fOk ? 'ok' : 'FAIL') + ' \u00b7 ' + (fNow.ok ? DP2_FINAL_SHEET + ' of ' + fNow.at + ' (' + Object.keys(fNow.rows).length + ' stocks)' : fNow.why), ok: fOk && (!fNow.on || fNow.ok) });   // v1.4.0
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
   if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
   if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
