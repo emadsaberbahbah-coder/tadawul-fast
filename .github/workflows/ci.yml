@@ -1155,6 +1155,7 @@ jobs:
             tests/test_coherent_staging.py \
             tests/test_bq_views.py \
             tests/test_trial_c1_rule.py \
+            tests/test_hold_vs_switch_rule.py \
             tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
