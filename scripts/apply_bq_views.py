@@ -2,8 +2,16 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.9.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.9.1 (program register C8, Phase 2)
 ================================================================================
+v1.9.1 (15 Nov 2026, review of #991). v_hold_vs_switch scaled the 1M forecast
+to one and two weeks by 0.16 and 0.27, the ratio of two averages taken over
+different record sets. The performance tracker records its 1W and 2W
+forecasts as the 1M price forecast x days/30 (track_performance
+_derive_checkpoint_target), and v_switch_calibration measured what a gap is
+worth in those units. The view now uses x 7/30 and x 14/30. Read on 15 Nov:
+no verdict changes (no horizon is proven; every holding reads KEEP).
+
 v1.9.0 (15 Nov 2026, hold or switch). WHY (owner, 15 Nov 2026: a holding
 should be kept only while it is better than the best available opportunity
 over the same period - 1 week, 2 weeks, 1 month or more - after the
@@ -199,7 +207,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

@@ -142,6 +142,25 @@ A name without a 12-month forecast is not judged here. Today's frozen picks
 are not touched: the rule applies from the next cut. Every other gate is
 unchanged.
 
+1.9.0 (2026-11-15): THE CUT WAITS FOR THE BROKER'S CASH FIGURE (owner, 11:42
+Riyadh: the recommendation must be consistent; 14:44: review and improve).
+Sunday 15 Nov, run 43676720706: the plan was cut at 07:36 Riyadh. The newest
+IBKR capture was Friday's 23:06 one, 32.5 h old (limit 30 h; no capture is
+written on Saturday and the daily one lands at 08:41), so the cut sized from
+the cash ledger instead of the broker's figure and the plan froze for the day.
+A usable capture arrived an hour later and was never used. All day the Top 10
+pages carried a sized ticket that the Today Action Plan held back (PAGES
+DISAGREE). The same gap opens every Sunday.
+TFB_PLAN_IBKR_WAIT_UNTIL_H = 11 (default; 0 = off = 1.8.0 byte for byte):
+with TFB_PLAN_CASH_SOURCE=ibkr, a run that READ the capture folder and could
+not use the newest capture cuts nothing before that hour (Riyadh); the page
+says what it waits for. The hourly run cuts as soon as a usable capture is
+there. From that hour the cut goes ahead on the 1.6.0 rule as before, and the
+plan says so: every pick carries the label, and every name waiting for cash
+the words, "cash from the cash ledger | typed cash cell, not the broker
+(<why>)". A plan that
+exists is never cut again; nothing else changes.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -155,7 +174,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -258,6 +277,7 @@ def knobs() -> Dict[str, Any]:
         "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
         "cash_source": cash_source_mode(),                                        # 1.6.0; 1.7.0 adds ibkr
         "ibkr_max_h": _env_num("TFB_PLAN_IBKR_MAX_AGE_H", 30, 0.5, 96),
+        "ibkr_wait_h": _env_num("TFB_PLAN_IBKR_WAIT_UNTIL_H", 11, 0, 23),        # 1.9.0: 0 = the cut never waits
         "stable_enter": _env_num("TFB_PLAN_STABLE_ENTER", 72, 0, 100),
         "stable_exit": _env_num("TFB_PLAN_STABLE_EXIT", 67, 0, 100),
         "div_tax": _env("TFB_PLAN_DIV_TAX", "on").lower() in ("on", "1", "true", "yes"),
@@ -1050,7 +1070,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                     snap, snap_at = snapshot_cash(_read(book, "_Cash_Snapshot", "A1:G2000"))
                 except Exception as e:  # noqa: BLE001 - the panel figure stands
                     _out("cash snapshot not read (%s): sizing from the panel" % type(e).__name__)
-            ibkr_cash, ibkr_why = None, ""
+            ibkr_cash, ibkr_why, cap = None, "", None
             if k.get("cash_source", "ibkr") == "ibkr":                       # 1.7.0: the broker's own figure
                 cap = capture
                 if cap is None and own_book:
@@ -1059,12 +1079,31 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                 ibkr_cash, ibkr_why = capture_cash(cap, k.get("ibkr_max_h", 30.0))
                 if ibkr_cash is None:
                     _out("IBKR capture not used for sizing: %s" % ibkr_why)
+            # 1.9.0: the capture folder was read and gave no usable figure (cap is None when nothing was read)
+            no_broker = cap is not None and ibkr_cash is None and k.get("ibkr_wait_h", 0) > 0
             cash, cash_from = sizing_cash(panel_cash, snap, k.get("cash_source", "ibkr"), ibkr_cash)
-            _out("cash for sizing: from the %s | snapshot %s" % (                 # no amount in the run log
-                cash_from, snap_at if snap is not None else "not read"))
             mps = int(num(panel_value(board, "T10: Max Per Sector")) or 2)
-            plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
-            if not qualified:
+            waits = no_broker and hour < k["ibkr_wait_h"]
+            plan = None
+            if waits:
+                info["no_picks"] = ("No plan yet today: waiting for the broker's cash figure (%s). The plan is cut "
+                                    "when an IBKR capture arrives, or from %02d:00 Riyadh without it."
+                                    % (ibkr_why, int(k["ibkr_wait_h"])))
+            else:
+                _out("cash for sizing: from the %s | snapshot %s" % (             # no amount in the run log
+                    cash_from, snap_at if snap is not None else "not read"))
+                plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
+                if no_broker:                              # cut on the 1.6.0 rule: the plan says so
+                    note = "cash from the %s, not the broker (%s)" % (
+                        "cash ledger" if cash_from.startswith("snapshot") else "typed cash cell", ibkr_why)
+                    for c in plan["picks"]:
+                        c["labels"].append(note)
+                    for c in plan["pipeline"]:
+                        if text(c.get("waiting")).startswith("cash:"):
+                            c["waiting"] = "%s · %s" % (c["waiting"], note)
+            if plan is None:
+                pass
+            elif not qualified:
                 info["no_picks"] = "No plan yet today: the main page lists no qualified name."
             else:
                 rows = ledger_rows(plan, day, stamp, state["run_at"], quality)

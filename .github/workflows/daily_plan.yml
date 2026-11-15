@@ -1,7 +1,14 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.7.0 (2026-11-15)
+# VERSION 1.8.0 (2026-11-15)
+#
+# 1.8.0: THE CUT WAITS FOR THE BROKER'S CASH FIGURE (daily_plan 1.9.0). On
+# Sunday 15 Nov the 07:36 cut found the newest IBKR capture 32.5 h old, sized
+# without the broker's figure and froze; a usable capture arrived an hour
+# later. TFB_PLAN_IBKR_WAIT_UNTIL_H (11): before that hour (Riyadh)
+# a cut without a usable capture waits; the hourly run cuts once one arrives.
+# Rollback: repository variable TFB_PLAN_IBKR_WAIT_UNTIL_H=0.
 #
 # 1.7.0: NO NEW MONEY AT THE FORECAST CAP (daily_plan 1.8.0). A name whose
 # 12-month forecast is at or above 34% waits in the pipeline:
@@ -150,6 +157,7 @@ jobs:
           TFB_PLAN_STABLE: ${{ vars.TFB_PLAN_STABLE || 'prefer' }}
           TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}
           TFB_PLAN_IBKR_MAX_AGE_H: ${{ vars.TFB_PLAN_IBKR_MAX_AGE_H || '30' }}
+          TFB_PLAN_IBKR_WAIT_UNTIL_H: ${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}

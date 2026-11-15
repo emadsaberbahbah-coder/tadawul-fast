@@ -170,6 +170,9 @@ def _env(monkeypatch):
     # 1.8.0: the 10-11 Nov fixtures carry names at the forecast cap (ITRN.US 34.7%); the suites written before
     # the cap rule pin it off. test_c1-c5 at the end test the rule itself.
     monkeypatch.setenv("TFB_PLAN_ROI_CAP", "off")
+    # 1.9.0: the suites written before the wait rule cut at 10:00 Riyadh with whatever capture they pass;
+    # test_w1-w7 at the end test the rule itself.
+    monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", "0")
 
 
 def lots():
@@ -946,4 +949,136 @@ def test_c5_the_10_nov_board_with_the_rule_on(monkeypatch):
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_ROI_CAP"] == "${{ vars.TFB_PLAN_ROI_CAP || 'on' }}"
     assert env["TFB_PLAN_ROI_CAP_PCT"] == "${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}"
+
+
+# ----------------------------------------------------------------------------- W (1.9.0) the cut waits for the broker
+W_OLD = "the newest capture is 40 h old (limit 30 h)"
+W_WAIT = ("No plan yet today: waiting for the broker's cash figure (%s). The plan is cut when an IBKR capture "
+          "arrives, or from 11:00 Riyadh without it.")
+
+
+def _ledger(b):
+    tab = b.tabs.get("_Daily_Plan")
+    return [r for r in (tab.values[1:] if tab else []) if r and r[0] == "2026-11-10"]
+
+
+def _cut(b):
+    return [(r[4], r[6], r[14], r[22], r[23]) for r in _ledger(b)]
+
+
+def test_w1_the_reader_and_its_default(monkeypatch):
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    assert dp.knobs()["ibkr_wait_h"] == 11
+    for value, hour in (("0", 0), ("9", 9), ("23", 23), ("24", 11), ("-1", 11), ("x", 11), ("", 11)):
+        monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", value)
+        assert dp.knobs()["ibkr_wait_h"] == hour, value
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
+    assert dp.__version__ == "1.9.0"
+
+
+def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
+    """Run 43676720706: the newest capture was 32.5 h old at the 07:36 cut, so the plan was sized without the
+    broker's figure and froze; a usable capture arrived an hour later."""
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    b = book()
+    assert dp.main([], book=b, now=NOW, capture=cap_of(age_h=40.0)) == 0            # 10:00 Riyadh, before 11:00
+    out = capsys.readouterr().out
+    assert _ledger(b) == [] and W_WAIT % W_OLD in out and "CUT " not in out and "cash for sizing" not in out
+    assert any(W_WAIT % W_OLD in str(c) for r in b.tabs["Daily_Plan"].values for c in r)   # the page says why
+    assert dp.main([], book=b, now=NOW + dt.timedelta(minutes=30), capture=cap_of(age_h=0.6)) == 0
+    out = capsys.readouterr().out
+    assert "| cash from the IBKR capture" in out and [r for r in _cut(b) if r[0] == "PICK"]
+    assert not any("not the broker" in str(c) for r in _ledger(b) for c in r)
+    same = book()
+    monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", "0")
+    assert dp.main([], book=same, now=NOW + dt.timedelta(minutes=30), capture=cap_of(age_h=0.6)) == 0
+    assert _cut(same) == _cut(b)                                                     # a usable capture: the rule adds nothing
+    frozen = _cut(b)
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    assert dp.main([], book=b, now=NOW + dt.timedelta(minutes=45), capture=cap_of(age_h=40.0)) == 0
+    assert _cut(b) == frozen                                                         # a plan that exists is never cut again
+
+
+def test_w3_from_the_hour_the_cut_goes_ahead_and_says_where_the_cash_came_from(monkeypatch, capsys):
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    at_11 = NOW + dt.timedelta(hours=1)
+    b = book()
+    assert dp.main([], book=b, now=at_11, capture=cap_of(age_h=40.0)) == 0
+    out = capsys.readouterr().out
+    assert "IBKR capture not used for sizing: " + W_OLD in out and "| cash from the panel" in out
+    note = "cash from the typed cash cell, not the broker (%s)" % W_OLD
+    picks = [r for r in _cut(b) if r[0] == "PICK"]
+    assert picks and all(note in r[3] for r in picks)
+    assert not any("not the broker" in r[4] for r in _cut(b) if r[0] == "PIPELINE")  # nothing waits for cash here
+    before = book()
+    monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", "0")
+    assert dp.main([], book=before, now=at_11, capture=cap_of(age_h=40.0)) == 0
+    strip = lambda rows: [(k, sym, q, lab.replace(" · " + note, "").replace(note, ""), w) for k, sym, q, lab, w in rows]
+    assert strip(_cut(b)) == _cut(before)                                            # the label is the only difference
+    # a fallback figure that leaves nothing above the floor (invented): every fundable name waits for cash
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    poor = book(Top_10_Investments=Sheet(board(cash="2,500 SAR")))
+    assert dp.main([], book=poor, now=at_11, capture=cap_of(age_h=40.0)) == 0
+    rows = _cut(poor)
+    waits = [r[4] for r in rows if r[0] == "PIPELINE" and r[4].startswith("cash:")]
+    assert not [r for r in rows if r[0] == "PICK"] and waits and all(w.endswith(" · " + note) for w in waits)
+    assert all("not the broker" not in r[4] for r in rows if not r[4].startswith("cash:"))
+
+
+def test_w3b_the_cash_ledger_is_named_when_it_was_the_source(monkeypatch, capsys):
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    b = book(_Cash_Snapshot=Sheet(SNAP))
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=1), capture=cap_of(age_h=40.0)) == 0
+    assert "| cash from the snapshot (lower than the panel)" in capsys.readouterr().out
+    note = "cash from the cash ledger, not the broker (%s)" % W_OLD
+    rows = _cut(b)
+    assert rows and all(note in r[3] for r in rows if r[0] == "PICK")
+    assert all(r[4].endswith(" · " + note) for r in rows if r[0] == "PIPELINE" and r[4].startswith("cash:"))
+    assert any(note in r[3] or note in r[4] for r in rows) and not any("typed cash cell" in str(c) for r in rows for c in r)
+
+
+def test_w4_off_is_the_previous_behaviour(monkeypatch, capsys):
+    b, ref = book(), book()                                                          # the fixture pins the rule off
+    assert dp.main([], book=b, now=NOW, capture=cap_of(age_h=40.0)) == 0
+    out = capsys.readouterr().out
+    assert "waiting for the broker" not in out and "CUT 2026-11-10" in out
+    assert dp.main([], book=ref, now=NOW) == 0
+    assert _cut(b) == _cut(ref) and not any("not the broker" in str(c) for r in _ledger(b) for c in r)
+
+
+def test_w5_only_a_capture_that_was_read_and_refused_makes_the_cut_wait(monkeypatch, capsys):
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    nothing_read = book()
+    assert dp.main([], book=nothing_read, now=NOW) == 0                              # no capture object at all
+    assert [r for r in _cut(nothing_read) if r[0] == "PICK"]
+    assert not any("not the broker" in str(c) for r in _ledger(nothing_read) for c in r)
+    for bad in (cap_of(ok=False, reason="capture is not JSON"), cap_of(buys={"X.US": [(None, 5.0)]})):
+        b = book()
+        assert dp.main([], book=b, now=NOW, capture=bad) == 0 and _ledger(b) == []
+    out = capsys.readouterr().out
+    assert W_WAIT % "capture is not JSON" in out
+    assert W_WAIT % "a working buy order has no limit price, so the cash it holds is not known" in out
+    monkeypatch.setenv("TFB_PLAN_CASH_SOURCE", "lower")                              # the broker is not the source
+    other = book()
+    assert dp.main([], book=other, now=NOW, capture=cap_of(age_h=40.0)) == 0
+    assert [r for r in _cut(other) if r[0] == "PICK"] and "waiting for the broker" not in capsys.readouterr().out
+
+
+def test_w6_the_hour_is_a_knob_and_the_boundary_is_exact(monkeypatch):
+    monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", "10")
+    b = book()
+    assert dp.main([], book=b, now=NOW - dt.timedelta(minutes=1), capture=cap_of(age_h=40.0)) == 0   # 09:59 Riyadh
+    assert _ledger(b) == []
+    assert dp.main([], book=b, now=NOW, capture=cap_of(age_h=40.0)) == 0                              # 10:00: the cut
+    assert [r for r in _cut(b) if r[0] == "PICK"]
+
+
+def test_w7_the_wait_log_line_carries_no_amount(monkeypatch, capsys):
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    assert dp.main([], book=book(), now=NOW, capture=cap_of(age_h=40.0)) == 0
+    out = capsys.readouterr().out
+    assert "SAR" not in out and str(cap_of()["cash_usd"])[:4] not in out
+    assert not __import__("re").search(r"\d,\d{3}", out)                              # no amount of any kind
 

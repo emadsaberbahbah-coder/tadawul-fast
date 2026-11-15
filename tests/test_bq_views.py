@@ -279,9 +279,10 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
-    # apply_bq_views 1.9.0 (15 Nov 2026): hold or switch
+    # apply_bq_views 1.9.0 (15 Nov 2026): hold or switch; 1.9.1: 1W / 2W = the 1M figure x days/30
+    # (installed body replaced: v_hold_vs_switch 1abc9858278c, 1.9.0)
     "v_switch_calibration": "488ca50f38bfbbb96d235e27eba75cc562d77c68a272b1455a564e5d84a7f292",
-    "v_hold_vs_switch": "1abc9858278c550c3b42639557036415482edeb1bec54754d1f444a5794c1617",
+    "v_hold_vs_switch": "b98c5ac8e6bf0c3c25416a6957a4a4f5741f75ecbfc2709331861cbb8c51a339",
     # apply_bq_views 1.8.0 (14 Nov 2026): the first controlled trial, C-1
     "v_trial_c1": "fd4bf8b9a0dbb95f5e8394dec7d873a1deb693402020e1e3bd0a8e3a91f0a507",
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
