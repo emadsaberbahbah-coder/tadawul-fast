@@ -133,6 +133,28 @@ def _pf_custody_tier_scope(request, monkeypatch):
     yield
 
 
+# opportunity_builder 1.31.0 [CAP-NO-NEW-MONEY] defaults to enforce. These suites were written before it and use
+# invented names whose 12-month forecasts sit above the 34% line (50-60%); their contracts (sizing, research
+# diversification, the board-funding route) are pinned with the rule off. tests/test_ob_cap_no_new_money.py tests
+# the rule. Several of these suites clear every TFB_OPP_* variable in their own fixtures, so the reader itself is
+# pinned rather than the environment.
+_OB_PRE_CAP_RULE_SUITES = frozenset({
+    "test_board_funding_route", "test_ob_conviction_sizing", "test_ob_research_diversify", "test_ob_risk_sizing",
+})
+
+
+@pytest.fixture(autouse=True)
+def _ob_cap_rule_scope(request, monkeypatch):
+    name = getattr(getattr(request, "module", None), "__name__", "")
+    if name.rsplit(".", 1)[-1] in _OB_PRE_CAP_RULE_SUITES:
+        module = sys.modules.get("core.analysis.opportunity_builder")
+        if module is None:
+            import importlib
+            module = importlib.import_module("core.analysis.opportunity_builder")
+        monkeypatch.setattr(module, "_env_cap_no_new_money", lambda: "off")
+    yield
+
+
 # Example placeholder -- uncomment and expand when shared fixtures are needed:
 #
 # import pytest

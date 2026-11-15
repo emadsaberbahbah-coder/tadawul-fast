@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.30.0  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.31.0  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.31.0 (2026-11-15): no new money for a name at the forecast cap,
+TFB_OPP_CAP_NO_NEW_MONEY = enforce (default) | observe | off. A name whose
+engine 12-month ROI is at or above RANK_CAP_ENGINE_ROI_PCT (34, fixed on 27 Oct)
+stays on the board as a research seat but is never sized: on the US board those
+names finished up in 39% / 28% of 20-day checks (Jul-Aug / Sep-Nov) against
+63% / 52% below the line. See the dated WHY block above the version constant.
 
 v1.30.0 (2026-11-15): the RESEARCH stage keeps a name whose price is the
 latest session's price, TFB_T10_RESEARCH_QUOTE = on (default) | off. Which
@@ -1769,7 +1776,45 @@ from typing import Optional
 #   _quote_research_assessment). Removed: 0.
 #   Rollback: TFB_T10_RESEARCH_QUOTE=off (read per call), or git revert.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.30.0"
+# -----------------------------------------------------------------------------
+# v1.31.0 (2026-11-15) [CAP-NO-NEW-MONEY] - THE MODEL'S HIGHEST FORECASTS ARE
+# NOT FUNDED
+# EVIDENCE (v_board_episodes, US names, 10 Jul - 15 Nov 2026), split at the
+#   pre-registered line RANK_CAP_ENGINE_ROI_PCT = 34 (fixed 27 Oct with the
+#   ranking challenger, before any data; not chosen on this split):
+#                      up after 20 days          up after 5 days
+#     Jul-Aug  cap     39% of 28 (avg -0.1%)     36% of 28
+#              below   63% of 32 (avg +2.0%)     47% of 32
+#     Sep-Nov  cap     28% of 46 (avg -3.5%)     32% of 73
+#              below   52% of 75 (avg -1.0%)     60% of 199
+#   The owner's own fills agree: purchases matched to a board row at the cap
+#   won 2 of 7. The engine's forecast is capped near 35%, so "at the cap" is
+#   the model's most optimistic call, and the board ranked those names first
+#   (rank by engine ROI).
+# OWNER (15 Nov 13:25 Riyadh): "go with the best option and beneficial for the
+#   project as overall".
+# CHANGE: in the single pass and the allocate replay, a candidate whose engine
+#   12-month ROI is at or above RANK_CAP_ENGINE_ROI_PCT is deferred before any
+#   ledger moves: "Forecast at the cap (X% >= 34%) - no new money". The
+#   research stage is untouched, so the name keeps its board seat as research
+#   and its stability clock; it comes back from the allocate replay unfunded
+#   and the cockpit prints it as a research seat. The near-miss row names the
+#   gate "Forecast cap". meta.cap_no_new_money = {mode, line_pct, deferred,
+#   would_defer, symbols}.
+#   observe: nothing is deferred; would_defer counts and lists the names.
+#   off: meta absent, byte-identical 1.30.0.
+# NOT CHANGED: gates, verdicts, scores, ranking, the research stage, the
+#   snapshot contract (TFB_OPP_* is in the policy fingerprint), the held-target
+#   and issuer rules. The Daily Plan (daily_plan 1.8.0, TFB_PLAN_ROI_CAP) applies
+#   the same line to the day's picks.
+#   The conviction and risk sizing cohorts (_sizing_cohort) leave capped names
+#   out under enforce, so the names that replace them are given a target
+#   (review on PR #992).
+#   Functions added: 2 (_env_cap_no_new_money, _cap_blocks). Changed:
+#   _sizing_cohort (skip_cap, default False). Removed: 0.
+#   Rollback: TFB_OPP_CAP_NO_NEW_MONEY=off (read per call), or git revert.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.31.0"
 
 # Final board allocation is an explicit, two-pass contract. A frozen snapshot
 # prevents the stability pass from reserving cash for research/grace seats and
@@ -3362,6 +3407,16 @@ def _env_fx_sanity():
 def _env_fx_usx_subunit():
     """v1.26.0: USD-cent quote support and unit-safe peg checking; DEFAULT OFF."""
     return _env_flag01("TFB_OPP_FX_USX_SUBUNIT", "0")
+
+
+def _env_cap_no_new_money():
+    """v1.31.0 [CAP-NO-NEW-MONEY]: enforce (default) | observe | off; any
+    other word is enforce. Read per call."""
+    try:
+        v = str(_env_str("TFB_OPP_CAP_NO_NEW_MONEY", "enforce")).strip().lower()
+    except Exception:  # noqa: BLE001
+        return "enforce"
+    return v if v in ("enforce", "observe", "off") else "enforce"
 
 
 def _env_held_target_no_new_money():
@@ -6075,6 +6130,7 @@ def _size_one(cand, criteria, budget_base, remaining):
 # v1.27.0 [CONVICTION SIZING] ---------------------------------------------------
 _SIZING_RISK_MULT = {"Low": 1.0, "Medium": 0.7, "High": 0.4}
 _LAST_SIZING: dict = {"mode": "cap"}
+_LAST_CAP_NNM: dict = {}   # v1.31.0 [CAP-NO-NEW-MONEY] per-build read-back
 
 
 def _env_sizing_mode():
@@ -6244,17 +6300,29 @@ def _conviction_targets(weights, budget, cap_sar, floor_sar=0.0):
     return {}
 
 
-def _sizing_cohort(invest_cands, criteria, replay, eligible, canon_market):
+def _cap_blocks(cand):
+    """v1.31.0: True when the candidate's engine 12-month ROI is at or above
+    RANK_CAP_ENGINE_ROI_PCT. A missing forecast is never at the cap. PURE."""
+    roi = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+    return roi is not None and roi >= RANK_CAP_ENGINE_ROI_PCT
+
+
+def _sizing_cohort(invest_cands, criteria, replay, eligible, canon_market, skip_cap=False):
     """PURE: the seats the allocator loop will consider, in rank order:
     replay eligibility, then the sector / market diversification caps,
     stopping at max_selected. Mirrors the loop's cheap pre-sizing deferrals
-    so a released slot is not pre-assigned budget."""
+    so a released slot is not pre-assigned budget. v1.31.0: skip_cap mirrors
+    the enforced forecast-cap deferral the same way (review on PR #992: the
+    conviction cohort pre-assigned the budget to capped seats, leaving the
+    names that replace them with no target)."""
     out, sectors, markets = [], {}, {}
     norm = _env_sector_normalize()
     for cand in invest_cands:
         if len(out) >= criteria["max_selected"]:
             break
         if replay and cand["symbol"].upper() not in eligible:
+            continue
+        if skip_cap and _cap_blocks(cand):
             continue
         sec, mkt = cand["sector"], cand["market"]
         key = _market_cap_key(mkt) if canon_market else mkt
@@ -6645,6 +6713,13 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
+    # v1.31.0 [CAP-NO-NEW-MONEY]: the research stage sizes nothing and is left alone.
+    _cap_mode = ("off" if criteria.get("board_funding_stage") == "research"
+                 else _env_cap_no_new_money())
+    _LAST_CAP_NNM.clear()
+    if _cap_mode != "off":
+        _LAST_CAP_NNM.update({"mode": _cap_mode, "line_pct": RANK_CAP_ENGINE_ROI_PCT,
+                              "deferred": 0, "would_defer": 0, "symbols": []})
     # v1.27.0 [CONVICTION SIZING]: cap (default) runs none of this.
     _sz_mode = _env_sizing_mode()
     _sz_targets, _sz_weights, _sz_cohort, _sz_stops = {}, {}, set(), {}
@@ -6654,7 +6729,8 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         _sz_tilt = _env_sizing_tilt()
         _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
         _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
-                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+                                  set(criteria.get("board_funding_symbols") or []), canon_market,
+                                  skip_cap=_cap_mode == "enforce")
         _sz_weights = {c["symbol"]: _conviction_weight(c, criteria, _sz_tilt) for c in _sz_rows}
         _sz_cohort = set(_sz_weights)
         _sz_targets = _conviction_targets(_sz_weights, remaining, _sz_cap,
@@ -6673,7 +6749,8 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         _sz_risk = _env_risk_budget_pct()
         _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
         _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
-                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+                                  set(criteria.get("board_funding_symbols") or []), canon_market,
+                                  skip_cap=_cap_mode == "enforce")
         _sz_cohort = {c["symbol"] for c in _sz_rows}
         # targets for every INVEST seat (they do not depend on each other),
         # so a seat the loop reaches after a release is sized on its own stop
@@ -6727,6 +6804,15 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                     "Held target (" + _ht + ") \u2014 no new money until the "
                     "provider leg returns")
                 continue
+        if _cap_mode != "off" and _cap_blocks(cand):
+            _LAST_CAP_NNM["symbols"].append(cand["symbol"])
+            if _cap_mode == "enforce":
+                _LAST_CAP_NNM["deferred"] += 1
+                deferrals[cand["symbol"]] = (
+                    "Forecast at the cap (%.1f%% >= %g%%) \u2014 no new money"
+                    % (_engine_roi_to_pct(cand.get("engine_roi_12m_pct")), RANK_CAP_ENGINE_ROI_PCT))
+                continue
+            _LAST_CAP_NNM["would_defer"] += 1
         # v1.0.16: issuer-level cross-listing dedup (default OFF). Once an issuer
         # is FUNDED, a later listing of the SAME issuer (e.g. Takeda 4502.T then
         # TAK.US, or BMW.DE then BMW.XETRA) is deferred rather than taking a
@@ -7304,6 +7390,13 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
                                 "ticket uneconomic); add Cash Available or accept the "
                                 "venue floor \u2014 lowering the operator floor "
                                 "does not unblock it.")
+            elif _reason.startswith("Forecast at the cap"):
+                # v1.31.0: its own gate, never a diversification cap.
+                gate, cur, req = "Forecast cap", _reason, (
+                    "engine 12-month ROI below %g%%" % RANK_CAP_ENGINE_ROI_PCT)
+                note = ("Qualified (INVEST) \u2014 the model's highest forecasts "
+                        "(at the cap) have finished up less often than the rest; "
+                        "kept on the board as research, no new money.")
             elif "Duplicate issuer" in _reason:
                 # v1.0.17: the v1.0.16 issuer-dedup adds a "Duplicate issuer"
                 # deferral to the same dict — classify it distinctly so it is
@@ -8153,6 +8246,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     if _XCHECK_STATE.get("mode") in ("observe", "enforce"):
         meta["price_xcheck"] = dict(_XCHECK_STATE)
     meta["sizing"] = dict(_LAST_SIZING)   # v1.27.0 (mode cap => {"mode": "cap"})
+    if _LAST_CAP_NNM:                      # v1.31.0 [CAP-NO-NEW-MONEY]
+        meta["cap_no_new_money"] = dict(_LAST_CAP_NNM, symbols=list(_LAST_CAP_NNM["symbols"]))
     if _LAST_CASH_FLOOR.get("mode") in ("observe", "enforce"):
         meta["cash_floor"] = dict(_LAST_CASH_FLOOR)  # v1.22.0 read-back
     if _TIMING_STATE.get("mode") in ("observe", "enforce"):

@@ -81,6 +81,7 @@ def main():
     os.environ["TFB_OPP_ENABLED"] = "1"
     os.environ["TFB_OPP_FUNDING_PLAN"] = "1"
     os.environ["APP_TOKEN"] = "synthetic-a2-test"
+    os.environ["TFB_OPP_CAP_NO_NEW_MONEY"] = "off"   # opportunity_builder 1.31.0: this golden predates the cap rule
     os.environ.pop("RENDER_GIT_COMMIT", None)
 
     @contextlib.contextmanager
