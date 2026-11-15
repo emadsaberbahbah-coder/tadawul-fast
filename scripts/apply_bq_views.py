@@ -2,8 +2,25 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.8.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.9.0 (program register C8, Phase 2)
 ================================================================================
+v1.9.0 (15 Nov 2026, hold or switch). WHY (owner, 15 Nov 2026: a holding
+should be kept only while it is better than the best available opportunity
+over the same period - 1 week, 2 weeks, 1 month or more - after the
+transaction cost of both trades, "accurate and intelligent"). Two research
+views. v_switch_calibration: per market group and horizon, what one point of
+forecast gap has been worth in outcome points on the matured records (pooled
+within-day slope), the spread of outcomes across names, and the fixed
+v_signal_edge verdict on the daily forecast/outcome correlation; k_used is 0
+unless the verdict is 'proven'. v_hold_vs_switch: each holding against the
+best INVESTABLE candidate of its market per horizon - forecast gap, what such
+a gap has been worth, the cost of both trades (0.10 commission + 0.15 spread
+per side; the commission measured on the owner's own fills), the net, the
+chance the switch ends ahead, and a verdict that reads SWITCH CANDIDATE only
+when the signal is proven, the net is positive and the chance is 60% or more.
+On 15 Nov no horizon is proven in any market (US: 1W and 2W 'no edge', 1M
+and 3M 'thin'), so every holding reads KEEP with indicative figures.
+Research views: the live system never reads BigQuery; never an order.
 v1.8.0 (14 Nov 2026, the first controlled trial). WHY (owner, 14 Nov 2026:
 "make full review ... which area still least improved ... let's work to
 improve it"; the full review of that day found the project's HIGH
@@ -182,7 +199,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

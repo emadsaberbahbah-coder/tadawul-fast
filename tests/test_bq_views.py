@@ -279,6 +279,9 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.9.0 (15 Nov 2026): hold or switch
+    "v_switch_calibration": "488ca50f38bfbbb96d235e27eba75cc562d77c68a272b1455a564e5d84a7f292",
+    "v_hold_vs_switch": "1abc9858278c550c3b42639557036415482edeb1bec54754d1f444a5794c1617",
     # apply_bq_views 1.8.0 (14 Nov 2026): the first controlled trial, C-1
     "v_trial_c1": "fd4bf8b9a0dbb95f5e8394dec7d873a1deb693402020e1e3bd0a8e3a91f0a507",
     "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
@@ -305,9 +308,10 @@ EXPECTED_ORDER = [
     "v_signal_edge_daily", "v_signal_edge",
     "v_outcome_excess", "v_market_regime", "v_seat_regime", "v_regime_outcomes",
     "v_trial_c1",
+    "v_switch_calibration", "v_hold_vs_switch",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 20)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 22)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
