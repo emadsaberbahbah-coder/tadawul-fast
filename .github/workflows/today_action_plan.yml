@@ -1,9 +1,14 @@
 # =============================================================================
 # ✅ Today Action Plan - one page that says what to do today, and why
 # -----------------------------------------------------------------------------
-# VERSION 1.4.0 (2026-11-15)
+# VERSION 1.5.0 (2026-11-16)
 #
-# 1.4.0: ONE ANSWER PER HOLDING (today_action_plan 1.5.0). The page also reads
+# 1.5.0: ONE DECISION PER STOCK (today_action_plan 1.6.0). Each run also
+#        writes the Final_Decisions tab: one row per stock named on any page,
+#        one decision (SELL / BUY / HOLD / WATCH / DO NOT INVEST) from the
+#        rules of record, read by the other pages. TFB_TAP_FINAL on (default)
+#        | off. Rollback: the variable = off.
+#   1.4.0: ONE ANSWER PER HOLDING (today_action_plan 1.5.0). The page also reads
 #        Portfolio_Decision and Portfolio_Decision_v2 and names every holding
 #        on which one of them gives another exit reading than the Exit Plan:
 #        TFB_TAP_HOLD_ALIGN on (default) | off. Rollback: the variable = off.
@@ -119,6 +124,7 @@ jobs:
           TFB_TAP_RETRIES: ${{ vars.TFB_TAP_RETRIES || '3' }}
           TFB_TAP_ALIGN: ${{ vars.TFB_TAP_ALIGN || 'on' }}
           TFB_TAP_HOLD_ALIGN: ${{ vars.TFB_TAP_HOLD_ALIGN || 'on' }}
+          TFB_TAP_FINAL: ${{ vars.TFB_TAP_FINAL || 'on' }}
           TFB_TAP_NEWS_MAX_H: ${{ vars.TFB_TAP_NEWS_MAX_H || '24' }}
           TFB_TAP_IBKR_MAX_AGE_H: ${{ vars.TFB_TAP_IBKR_MAX_AGE_H || '30' }}
           TFB_TAP_BUY_CAPTURE_MARKET_H: ${{ vars.TFB_TAP_BUY_CAPTURE_MARKET_H || '2' }}
