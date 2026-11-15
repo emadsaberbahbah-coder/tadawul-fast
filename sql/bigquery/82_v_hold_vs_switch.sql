@@ -14,10 +14,11 @@
 --              is at most 3 days old and is not already held; same market
 --              group as the holding (US, Tadawul, Other markets)
 --   forecasts  1M and 3M are the engine's own columns. The pages carry no
---              1W or 2W forecast, so those are 0.16 x and 0.27 x the 1M
---              figure: the ratio of the average recorded 1W / 2W forecast to
---              the average 1M forecast in Performance_Log (0.46 / 0.77 /
---              2.84 pp). The best candidate is the highest forecast for that
+--              1W or 2W forecast, so those are the 1M figure x 7/30 and
+--              x 14/30: the scaling the performance tracker records its
+--              1W and 2W forecasts with (track_performance
+--              _derive_checkpoint_target), so the gap is in the units
+--              v_switch_calibration measured. The best candidate is the highest forecast for that
 --              horizon (ties: higher overall score, then symbol).
 -- ARITHMETIC (all in percentage points of the amount switched):
 --   gap_pp        candidate forecast - holding forecast
@@ -92,14 +93,14 @@ cand AS (
 hold_h AS (
   SELECT
     h.*, z.horizon, z.horizon_order,
-    CASE z.horizon WHEN '1W' THEN h.f_1m * 0.16 WHEN '2W' THEN h.f_1m * 0.27
+    CASE z.horizon WHEN '1W' THEN h.f_1m * 7 / 30 WHEN '2W' THEN h.f_1m * 14 / 30
                    WHEN '1M' THEN h.f_1m ELSE h.f_3m END AS f
   FROM hold AS h CROSS JOIN hz AS z
 ),
 cand_h AS (
   SELECT
     c.*, z.horizon,
-    CASE z.horizon WHEN '1W' THEN c.f_1m * 0.16 WHEN '2W' THEN c.f_1m * 0.27
+    CASE z.horizon WHEN '1W' THEN c.f_1m * 7 / 30 WHEN '2W' THEN c.f_1m * 14 / 30
                    WHEN '1M' THEN c.f_1m ELSE c.f_3m END AS f
   FROM cand AS c CROSS JOIN hz AS z
 ),

@@ -60,8 +60,12 @@ def test_candidates_are_investable_fresh_not_held_and_of_the_same_market():
                    "ON c.market_group = h.market_group AND c.horizon = h.horizon"):
         assert clause in HVS, clause
     assert "ORDER BY f DESC, overall_score DESC, symbol" in HVS
-    assert HVS.count("h.f_1m * 0.16") == 1 and HVS.count("h.f_1m * 0.27") == 1
-    assert HVS.count("c.f_1m * 0.16") == 1 and HVS.count("c.f_1m * 0.27") == 1
+    # 1.9.1: 1W and 2W are the 1M figure x days/30, the tracker's own scaling (_derive_checkpoint_target)
+    assert HVS.count("h.f_1m * 7 / 30") == 1 and HVS.count("h.f_1m * 14 / 30") == 1
+    assert HVS.count("c.f_1m * 7 / 30") == 1 and HVS.count("c.f_1m * 14 / 30") == 1
+    assert "0.16" not in HVS and "0.27" not in HVS
+    tracker = (ROOT / "scripts/track_performance.py").read_text(encoding="utf-8")
+    assert "_CHECKPOINT_BASE_DAYS = 30.0" in tracker and "float(horizon.days) / self._CHECKPOINT_BASE_DAYS" in tracker
 
 
 def test_the_arithmetic_of_a_worked_example():
