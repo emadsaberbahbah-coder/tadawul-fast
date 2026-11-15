@@ -52,6 +52,20 @@ v1.4.0 (2026-11-13)
          PAGE. A row of five tiles under the title (cash at the broker, today's buys, cash after them, the news gate,
          page alignment); the tab is coloured; section B says where its broker stops come from.
          Nothing here prints a cash amount: the run log names the capture file, its age and two counts.
+  1.5.0: ONE ANSWER PER HOLDING (review of 15 Nov, P0 "one holding, several instructions"; owner, 15 Nov: the
+         recommendation must be consistent). On 15 Nov this page said "nothing to do today" and PAGES ALIGNED while
+         Portfolio_Decision_v2 read "SELL SUPN.US (95 sh)" from an exit latched under its own 2xATR rule, and asked
+         for three other stops than the Exit Plan's. The alignment test covered new buys only. Now, with
+         TFB_TAP_HOLD_ALIGN = on (default; off = 1.4.0 byte for byte, the two pages are not read):
+           - Portfolio_Decision and Portfolio_Decision_v2 are read (optional: a page that cannot be read changes no
+             step and is named "not read");
+           - a holding the Exit Plan does not sell while another page says SELL or EXIT is an OTHER PAGE step that
+             names both readings, the PAGES tile reads DISAGREE and the summary line names the holding;
+           - a holding for which Portfolio_Decision_v2 asks for another stop than the Exit Plan's (beyond
+             TFB_TAP_STOP_TOL_PCT) reads THIS PAGE LEADS;
+           - HOLDINGS ON THE OTHER PAGES (new table under PAGE ALIGNMENT): each such holding with the three readings.
+         A TRIM to the position cap stays what 1.3.1 made it: a control exception, not a difference. The Exit Plan
+         stays the exit rule of record; nothing here sells, raises or changes an order.
   1.2.0: ALIGNED WITH THE TOP 10 PAGES, THE NEWS GATE AND THE CASH LEDGER (owner, 13 Nov 11:05: "between top investment
          and V2 top investment and today action misalignment need to be matching and aligned to avoid mistake").
          On 13 Nov three pages gave three answers: this page said buy EFC, INSW and AX; Top_10_Investments_v2 read
@@ -135,7 +149,7 @@ ENV
     TFB_TAP_HIDE_TABS (_Daily_Plan,_Exit_Plan,_Evidence_Log; "none" = hide none),
     TFB_TAP_RETRIES (3; tries after a Sheets quota answer, 0 = none),
     TFB_TAP_STYLE (on | off = plain grid), TFB_TAP_PREVIEW (false | true = write the preview tab),
-    TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_NEWS_MAX_H (24),
+    TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_HOLD_ALIGN (on | off; 1.5.0), TFB_TAP_NEWS_MAX_H (24),
     TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
     TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2), TFB_TAP_BQ (off | on; 1.4.0), TFB_TAP_BQ_TABLE (today_action_plan),
     TFB_BQ_PROJECT, TFB_BQ_DATASET.
@@ -152,7 +166,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -596,6 +610,111 @@ def align(plan: Dict[str, Any], t10: Dict[str, Any], v2: Dict[str, Any]) -> List
 
 
 # ----------------------------------------------------------------------------- #
+# 1.5.0 [HOLD-ALIGN]: what the two portfolio pages say about each holding (pure)
+# ----------------------------------------------------------------------------- #
+PFD_TAB, PF2_TAB = "Portfolio_Decision", "Portfolio_Decision_v2"
+# the v2 table starts under the tiles and charts and has one row per lot: read well past a full book (Codex P2, #998)
+PFD_RANGE, PF2_RANGE = "A1:AA150", "A1:P200"
+_SELL_WORDS = ("SELL", "EXIT")
+_V2_RANK = {"SELL": 3, "RAISE STOP": 2, "HOLD": 1, "": 0}
+_RAISE_RE = re.compile(r"(?:\u2192|->)\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
+
+
+def hold_align_on() -> bool:
+    return _env("TFB_TAP_HOLD_ALIGN", "on").lower() not in ("off", "0", "false", "no")
+
+
+def read_pf_main(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    """Portfolio_Decision: {read, built, rows: {SYMBOL: ACTION}} from its ACTIONS table."""
+    rows = [list(r) for r in values]
+    out: Dict[str, Any] = {"read": False, "built": "", "rows": {}}
+    h, col = _header(rows, ("Action", "Symbol"))
+    if h is None:
+        return out
+    out["read"] = True
+    out["built"] = _stamp(" ".join(text(c) for r in rows[:3] for c in r), "Last run")
+    for r in rows[h + 1:]:
+        sym = text(cell(r, col["Symbol"])).upper()
+        if not sym or " " in sym:
+            break
+        act = _squash(cell(r, col["Action"])).upper()
+        if sym not in out["rows"] or any(act.startswith(w) for w in _SELL_WORDS):   # a repeated symbol: a sale stands
+            out["rows"][sym] = act
+    return out
+
+
+def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    """Portfolio_Decision_v2: {read, built, rows: {SYMBOL: {verb, signal, level}}} from its "Exit signal" column.
+    verb is SELL (SELL NOW / SELL - rule exit), RAISE STOP (level = the stop it asks for), HOLD, or "" for any
+    other text (a row the page excludes). The page has one row per ledger lot (Codex P2, #998): for a symbol with
+    several lots a SELL on any lot stands, then the highest stop asked for, then HOLD."""
+    rows = [list(r) for r in values]
+    out: Dict[str, Any] = {"read": False, "built": "", "rows": {}}
+    h, col = _header(rows, ("Symbol", "Exit signal"))
+    if h is None:
+        return out
+    out["read"] = True
+    out["built"] = _stamp(" ".join(text(c) for r in rows[:2] for c in r), "page built")
+    for r in rows[h + 1:]:
+        sym = text(cell(r, col["Symbol"])).upper()
+        if not sym or " " in sym:
+            break
+        sig = _squash(cell(r, col["Exit signal"]))
+        up = sig.upper()
+        verb = "SELL" if up.startswith("SELL") else "RAISE STOP" if up.startswith("RAISE STOP") else \
+            "HOLD" if up.startswith("HOLD") else ""
+        m = _RAISE_RE.search(sig) if verb == "RAISE STOP" else None
+        new = {"verb": verb, "signal": sig, "level": num(m.group(1)) if m else None}
+        old = out["rows"].get(sym)
+        if old is None or _V2_RANK[verb] > _V2_RANK[old["verb"]] or (
+                verb == old["verb"] == "RAISE STOP" and (new["level"] or 0.0) > (old["level"] or 0.0)):
+            out["rows"][sym] = new
+    return out
+
+
+def align_holdings(holdings: Sequence[Dict[str, Any]], main: Dict[str, Any], v2: Dict[str, Any],
+                   tol_pct: float) -> List[Dict[str, Any]]:
+    """One row for every holding on which a portfolio page gives another exit reading than the Exit Plan, the exit
+    rule of record: {symbol, plan, main, v2, reading, level, pages, shown}. level hard = another page says SELL or
+    EXIT and the Exit Plan does not sell; soft = Portfolio_Decision_v2 asks for another stop (beyond tol_pct).
+    A TRIM on Portfolio_Decision is a position size, not a price exit: it is shown and never a difference."""
+    out: List[Dict[str, Any]] = []
+    for h in holdings:
+        sym, act, stop = h["symbol"], h["action"], h.get("stop")
+        if act == "NO RULE":
+            continue
+        m = (main.get("rows") or {}).get(sym, "") if main.get("read") else ""
+        y = ((v2.get("rows") or {}).get(sym) or {}) if v2.get("read") else {}
+        sells = act in ("SELL", "TAKE PROFIT")
+        pages, shown = [], []
+        if not sells and any(m.startswith(w) for w in _SELL_WORDS):
+            pages.append(PFD_TAB)
+            shown.append("%s: %s" % (PFD_TAB, m))
+        if not sells and y.get("verb") == "SELL":
+            pages.append(PF2_TAB)
+            shown.append("%s: %s" % (PF2_TAB, y["signal"]))
+        other_stop = bool(y.get("verb") == "RAISE STOP" and y.get("level") and stop
+                          and abs(y["level"] - stop) / stop * 100.0 > tol_pct)
+        if not pages and not other_stop:
+            continue
+        mine = "%s%s%s" % (act, " · stop %s" % fmt(stop) if stop else "",
+                           " (broker %s)" % fmt(h["broker_stop"]) if h.get("broker_stop") else "")
+        if pages:
+            level = "hard"
+            reading = "NOT A STEP HERE: %s read%s SELL under %s own rule; the Exit Plan reads %s." % (
+                " and ".join(pages), "s" if len(pages) == 1 else "", "its" if len(pages) == 1 else "their", act)
+        else:
+            level = "soft"
+            reading = "FOLLOW THIS PAGE: %s asks for the stop %s under its own rule; the Exit Plan's stop is %s." % (
+                PF2_TAB, fmt(y["level"]), fmt(stop))
+        out.append({"symbol": sym, "plan": mine, "level": level, "reading": reading, "pages": pages, "shown": shown,
+                    "main": (m or "not listed") if main.get("read") else "page not read",
+                    "v2": (y.get("signal") or "not listed") if v2.get("read") else "page not read"})
+    out.sort(key=lambda r: r["level"] != "hard")                    # a page that says sell first; the order holds otherwise
+    return out
+
+
+# ----------------------------------------------------------------------------- #
 # 1.3.0 [IBKR]: the broker's own cash and working orders, from the read-only capture (pure)
 # ----------------------------------------------------------------------------- #
 def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Optional[Dict[str, Any]],
@@ -888,6 +1007,18 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
                           "levels": "shown there: %s shares, %s SAR" % (fmt(seat["shares"], 0), fmt(seat["ticket"], 0)),
                           "why": "Orders come from this page only. The Top 10 pages size from their own rules and "
                                  "times; the Daily Plan is the one cut for the day."})
+    hold_rows = (align_holdings(holdings, x.get("pf") or {}, x.get("pf2") or {}, k["stop_tol"])
+                 if x.get("hold_align") else [])
+    for a in hold_rows:
+        if a["level"] == "hard":
+            steps.append({"urgency": 4.7, "symbol": a["symbol"], "kind": "other", "source": " / ".join(a["pages"]),
+                          "do": "%s: %s read%s SELL; the Exit Plan, which this page follows, reads %s. No sale is "
+                                "asked for here." % (a["symbol"], " and ".join(a["pages"]),
+                                                     "s" if len(a["pages"]) == 1 else "", a["plan"]),
+                          "levels": "shown there: %s" % " · ".join(a["shown"])[:300],
+                          "why": "Orders come from this page only. The portfolio pages apply their own rules; the "
+                                 "Exit Plan is the exit rule of record. To let the other rule decide, change the "
+                                 "rule of record, not one page."})
     news = x.get("news") or {}
     news_live = bool(news.get("read") and news.get("verdict") not in ("", "GO") and news.get("age_h") is not None
                      and news["age_h"] <= k.get("news_max_h", 24.0))
@@ -904,6 +1035,8 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
             "missing": sorted(missing), "broker_note": broker_note, "align": rows, "news": news,
             "news_live": news_live, "cash": x.get("cash"), "cash_at": x.get("cash_at", ""), "cash_left": cash_left,
             "t10": x.get("t10") or {}, "v2": x.get("v2") or {}, "aligned": bool(x), "broker": broker,
+            "align_hold": hold_rows, "hold_align": bool(x.get("hold_align")),
+            "pf": x.get("pf") or {}, "pf2": x.get("pf2") or {},
             "cash_src": x.get("cash_src", ""), "funding_reason": funding_reason}
 
 
@@ -959,7 +1092,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
 CHIP = {"sell": ("C62828", "SELL"), "profit": ("2E7D32", "TAKE PROFIT"), "stop": ("EF6C00", "RAISE STOP"),
         "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY"),
         "skip": ("7B1F1F", "DO NOT BUY"), "news": ("8E5A00", "READ FIRST"), "nofund": ("5F6B7A", "NOT FUNDED"),
-        "placed": ("00695C", "PLACED"), "verify": ("B26A00", "VERIFY")}
+        "placed": ("00695C", "PLACED"), "verify": ("B26A00", "VERIFY"), "other": ("7B1F1F", "OTHER PAGE")}
 for _k, (_bg, _label) in CHIP.items():                         # the step number, and the kind's name under it
     STYLES["chip_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 15, "align": "CENTER", "valign": "BOTTOM"}
     STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
@@ -1060,10 +1193,21 @@ def day_tiles(d: Dict[str, Any], n_buy: int, hard: Sequence[str], unfunded: Sequ
         t.append(("NEWS GATE", news["verdict"].replace("_", " "), "%s Riyadh · observe-only" % (news.get("at") or "-"),
                   "bad" if d.get("news_live") else ("good" if news["verdict"] == "GO" else "plain")))
     soft = [a["symbol"] for a in d.get("align") or [] if a["level"] == "soft"]
-    t.append(("PAGES", "DISAGREE" if hard else ("THIS PAGE LEADS" if soft else "ALIGNED"),
-              ("do not buy: " + ", ".join(hard)) if hard else
-              ("Top 10 pages size no ticket for " + ", ".join(soft) if soft else "no page sizes anything else"),
-              "bad" if hard else ("warn" if soft else "good")))
+    h_hard = [a["symbol"] for a in d.get("align_hold") or [] if a["level"] == "hard"]      # 1.5.0
+    h_soft = [a["symbol"] for a in d.get("align_hold") or [] if a["level"] == "soft"]
+    if not h_hard and not h_soft:                                   # 1.4.0, word for word
+        t.append(("PAGES", "DISAGREE" if hard else ("THIS PAGE LEADS" if soft else "ALIGNED"),
+                  ("do not buy: " + ", ".join(hard)) if hard else
+                  ("Top 10 pages size no ticket for " + ", ".join(soft) if soft else "no page sizes anything else"),
+                  "bad" if hard else ("warn" if soft else "good")))
+        return t
+    bad = bool(hard or h_hard)
+    notes = ((["do not buy: " + ", ".join(hard)] if hard else []) +
+             (["another page says sell: " + ", ".join(h_hard)] if h_hard else []))
+    if not bad:
+        notes = ((["Top 10 pages size no ticket for " + ", ".join(soft)] if soft else []) +
+                 ["another stop on Portfolio v2: " + ", ".join(h_soft)])
+    t.append(("PAGES", "DISAGREE" if bad else "THIS PAGE LEADS", " · ".join(notes), "bad" if bad else "warn"))
     return t
 
 
@@ -1071,7 +1215,8 @@ def day_counts(d: Dict[str, Any]) -> Dict[str, Any]:
     """The counts the summary line and the tiles are made of (1.4.0: shared by the page and the plan archive)."""
     hard = [a["symbol"] for a in d.get("align") or [] if a["level"] == "hard"]
     unfunded = [p["symbol"] for p in d["picks"] if p.get("unfunded")]
-    flags = ((" · PAGES DISAGREE: " + ", ".join(hard) if hard else "") +
+    h_hard = [a["symbol"] for a in d.get("align_hold") or [] if a["level"] == "hard"]      # 1.5.0
+    flags = ((" · PAGES DISAGREE: " + ", ".join(hard + h_hard) if hard or h_hard else "") +
              (" · NOT FUNDED: " + ", ".join(unfunded) if unfunded else "") +
              (" · NEWS GATE: " + d["news"]["verdict"].replace("_", " ") if d.get("news_live") else ""))
     return {"n_hold": sum(1 for s in d["steps"] if s["source"] == "Exit_Plan"),
@@ -1161,6 +1306,23 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
                    [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
         if not d["align"]:
             pg.add(["", "No pick today and no sized ticket on either Top 10 page."], ["", "msg"], [(1, WIDTH)])
+        if d.get("hold_align"):                                     # 1.5.0: the same holdings on the portfolio pages
+            pf, pf2 = d.get("pf") or {}, d.get("pf2") or {}
+            pg.add(height=6)
+            pg.full("HOLDINGS ON THE OTHER PAGES - the Exit Plan is the exit rule of record", "band", 30)
+            for label, page in ((PFD_TAB, pf), (PF2_TAB, pf2)):
+                pg.add([label, "", ("built %s" % (page.get("built") or "time not read")) if page.get("read")
+                        else "page not read"], ["cell_b", "", "cell"], [(0, 2), (2, WIDTH)])
+            if d.get("align_hold"):
+                pg.add(["Symbol", "Exit Plan (rule of record)", "", PFD_TAB, "", PF2_TAB, "", "", "Reading"], "head",
+                       [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
+                for a in d["align_hold"]:
+                    pg.add([a["symbol"], a["plan"], "", a["main"], "", a["v2"], "", "", a["reading"]],
+                           ["cell_b", "cell", "", "cell", "", "cell", "", "", {"hard": "bad", "soft": "warn"}[a["level"]]],
+                           [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
+            else:
+                pg.add(["", "No holding has another exit reading on a portfolio page that was read. A trim to the "
+                            "position cap is a control exception, listed under the checks."], ["", "msg"], [(1, WIDTH)])
 
     # ---- B. holdings
     pg.add(height=10)
@@ -1471,6 +1633,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
          "ibkr_max_h": _env_num("TFB_TAP_IBKR_MAX_AGE_H", 30, 0.5, 96),
          "buy_market_h": _env_num("TFB_TAP_BUY_CAPTURE_MARKET_H", 2, 0.25, 48)}
     aligned = _env("TFB_TAP_ALIGN", "on").lower() not in ("off", "0", "false", "no")
+    hold_align = aligned and hold_align_on()                        # 1.5.0
     retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep
     held = {"book": book}
 
@@ -1484,8 +1647,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                "Evidence_Board": _read(b, "Evidence_Board", "A1:L120"),
                "Consistency_Check": _read(b, "Consistency_Check", "A1:G60")}
         more: Dict[str, List[List[Any]]] = {}
-        for tab, rng in (((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000"))
-                         if aligned else ()):
+        tabs = ((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000")) if aligned else ()
+        if aligned and hold_align:                                  # 1.5.0
+            tabs = tabs + ((PFD_TAB, PFD_RANGE), (PF2_TAB, PF2_RANGE))
+        for tab, rng in tabs:
             try:                                                    # optional: a tab that cannot be read changes no step
                 more[tab] = _read(b, tab, rng)
             except Exception as e:  # noqa: BLE001
@@ -1520,6 +1685,9 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         extra = {"t10": read_top10(more.get(T10_TAB) or []), "v2": read_top10_v2(more.get(V2_TAB) or []),
                  "news": read_news_gate(more.get(NEWS_TAB) or [], now), "cash": cash, "cash_at": cash_at,
                  "cash_src": "ledger" if cash is not None else ""}
+        if hold_align:                                              # 1.5.0
+            extra.update(hold_align=True, pf=read_pf_main(more.get(PFD_TAB) or []),
+                         pf2=read_pf_v2(more.get(PF2_TAB) or []))
     holdings, broker_note = read_holdings(pages["Exit_Plan"]), broker_unknown(pages["Exit_Plan"])
     if aligned:                                                     # 1.3.0: the broker's own cash and orders
         if capture is None and own_book:

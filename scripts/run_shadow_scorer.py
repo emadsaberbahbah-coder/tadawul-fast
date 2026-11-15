@@ -1,6 +1,15 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.7 (2026-11-15) — A CORPORATE-ACTION CHECK THAT COULD NOT RUN IS NOT A PASS
+WHY (review of 15 Nov, "remaining gap in the CA gate"): two inputs still answered clean without a check having
+run. (1) A register holding only unconfirmed proposals (AUTO_DETECT): the repair index is built from confirmed
+actions only, so the plan was empty and ca_is_clean() said True. (2) A confirmed action with a Performance_Log
+whose header or needed columns cannot be found: plan_repairs() returns an empty plan there too. Both now answer
+None (not evaluable), which evaluate_s1() already files as PENDING. A register with at least one confirmed action
+and a readable log is judged exactly as in 1.9.6 (the live case: one confirmed action, 15 proposals). Under
+TFB_S1_CA_EVIDENCE=legacy the None cases answer True, as before.
+
 VERSION 1.9.6 (2026-11-14) — NO CORPORATE-ACTION EVIDENCE IS NOT A PASS
 WHY (review of 14 Nov, P1 "vacuous corporate-action PASS"): ca_is_clean()
 returned True when _Corporate_Actions held no action at all and when the read
@@ -516,7 +525,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.6"
+SCRIPT_VERSION = "1.9.7"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -1984,11 +1993,16 @@ def _ca_evidence_mode() -> str:
     return "legacy" if raw == "legacy" else "strict"
 
 
+_CA_LOG_COLUMNS = ("Symbol", "Date Recorded (Riyadh)", "Entry Price", "Notes")   # 1.9.7: what plan_repairs reads
+
+
 def ca_is_clean(sh) -> Optional[bool]:
     """Criterion 5a: no CONFIRMED action lacking repair in Performance_Log.
     v1.9.6: True = a register with rows, every confirmed action repaired; False = one is not; None = not
     evaluable (the register has no row, or it cannot be read). Under TFB_S1_CA_EVIDENCE=legacy the
-    None cases answer True, as in 1.9.5."""
+    None cases answer True, as in 1.9.5.
+    v1.9.7: also None when the register holds proposals only, or the Performance_Log header or a column the
+    check reads cannot be found."""
     vacuous: Optional[bool] = True if _ca_evidence_mode() == "legacy" else None
     try:
         from core import corporate_actions as ca
@@ -1998,6 +2012,8 @@ def ca_is_clean(sh) -> Optional[bool]:
         acts = ca.parse_actions(values)
         if not acts:
             return True              # rows, but no split, reverse split or rename to repair
+        if not any(a.confirmed for a in acts):
+            return vacuous           # 1.9.7: proposals only - nothing was confirmed, so nothing was checked
         rp_path = os.path.join(_ROOT, "scripts", "repair_corporate_actions.py")
         spec = importlib.util.spec_from_file_location("tfb_ca_repair", rp_path)
         rp = importlib.util.module_from_spec(spec)
@@ -2005,6 +2021,8 @@ def ca_is_clean(sh) -> Optional[bool]:
         idx = ca.build_adjustment_index(acts, confirmed_only=True)
         plan, _hdr, _cols = rp.plan_repairs(
             sh.worksheet("Performance_Log").get_all_values(), idx)
+        if _hdr is None or any(_cols.get(c) is None for c in _CA_LOG_COLUMNS):
+            return vacuous           # 1.9.7: the log could not be evaluated, so an empty plan proves nothing
         return len(plan) == 0
     except Exception:  # noqa: BLE001
         return vacuous               # an unreadable register certifies nothing
