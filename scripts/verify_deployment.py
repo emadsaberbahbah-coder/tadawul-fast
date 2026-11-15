@@ -211,7 +211,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-08 (post-mortem item 3; manifest pin only): 1.28.0 -> 1.29.0
     # (TFB_OPP_SIZING_MODE=risk + TFB_OPP_RISK_BUDGET_PCT, default cap).
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.30.0", "opportunity builder"),
+     "1.31.0", "opportunity builder"),
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
@@ -358,7 +358,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.7.0", "daily plan"),
+    ("daily_plan", "1.8.0", "daily plan"),
     ("exit_plan", "1.3.2", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),

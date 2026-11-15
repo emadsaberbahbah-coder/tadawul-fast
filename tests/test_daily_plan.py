@@ -167,6 +167,9 @@ def _env(monkeypatch):
         if name.startswith("TFB_PLAN_") or name == "TFB_DAILY_PLAN":
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TFB_DAILY_PLAN", "on")
+    # 1.8.0: the 10-11 Nov fixtures carry names at the forecast cap (ITRN.US 34.7%); the suites written before
+    # the cap rule pin it off. test_c1-c5 at the end test the rule itself.
+    monkeypatch.setenv("TFB_PLAN_ROI_CAP", "off")
 
 
 def lots():
@@ -879,3 +882,68 @@ def test_h7_the_cut_sizes_from_the_ibkr_capture(monkeypatch, capsys):
     assert "IBKR" not in capsys.readouterr().out
     raw = (ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8")
     assert "TFB_PLAN_CASH_SOURCE: ${{ vars.TFB_PLAN_CASH_SOURCE || 'ibkr' }}" in raw and "TFB_IBKR_CAPTURE_FOLDER_ID" in raw
+
+
+# ----------------------------------------------------------------------------- C (1.8.0) the forecast cap
+def test_c1_the_rule_reader_and_its_defaults(monkeypatch):
+    monkeypatch.delenv("TFB_PLAN_ROI_CAP", raising=False)
+    assert dp.roi_cap_mode() == "on" and dp.knobs()["roi_cap"] == "on" and dp.knobs()["roi_cap_pct"] == 34
+    for value, mode in (("observe", "observe"), (" OFF ", "off"), ("on", "on"), ("junk", "on"), ("", "on")):
+        monkeypatch.setenv("TFB_PLAN_ROI_CAP", value)
+        assert dp.roi_cap_mode() == mode, value
+    for value, pct in (("30", 30), ("20", 20), ("100", 100), ("5", 34), ("500", 34), ("x", 34)):   # house rule: out of range reads the default
+        monkeypatch.setenv("TFB_PLAN_ROI_CAP_PCT", value)
+        assert dp.knobs()["roi_cap_pct"] == pct, value
+
+
+def _caps():
+    q = [dict(_cand("CAP.US", 1, 75.0, "S1"), roi12=34.7), dict(_cand("EDGE.US", 2, 75.0, "S2"), roi12=34.0),
+         dict(_cand("UNDER.US", 3, 75.0, "S3"), roi12=33.9), dict(_cand("NONE.US", 4, 75.0, "S4"), roi12=None),
+         dict(_cand("LOW.US", 5, 75.0, "S5"), roi12=12.0)]
+    src = {c["symbol"]: {"price": 10.0, "ccy": "USD"} for c in q}
+    return q, src, {"held": {}, "recent": {}, "mv_sar": 0.0}
+
+
+def test_c2_on_a_name_at_the_cap_waits_and_the_next_names_are_picked():
+    q, src, lots_ = _caps()
+    plan_ = dp.decide([dict(c) for c in q], dict(src), {}, lots_, 100000.0, 5, K(picks=3, roi_cap="on"))
+    assert [p["symbol"] for p in plan_["picks"]] == ["UNDER.US", "NONE.US", "LOW.US"]
+    waits = {c["symbol"]: c["waiting"] for c in plan_["pipeline"]}
+    assert waits["CAP.US"] == "12-month forecast 34.7% is at the cap (34%+): no new money"
+    assert waits["EDGE.US"] == "12-month forecast 34.0% is at the cap (34%+): no new money"   # the line itself counts
+    assert all("cap" not in x for p in plan_["picks"] for x in p["labels"])
+    assert "no 12-month target" in [p for p in plan_["picks"] if p["symbol"] == "NONE.US"][0]["labels"]
+
+
+def test_c3_observe_labels_and_off_changes_nothing():
+    q, src, lots_ = _caps()
+    run = lambda mode: dp.decide([dict(c) for c in q], dict(src), {}, lots_, 100000.0, 5, K(picks=3, roi_cap=mode))
+    off, seen = run("off"), run("observe")
+    assert [p["symbol"] for p in off["picks"]] == [p["symbol"] for p in seen["picks"]] == ["CAP.US", "EDGE.US", "UNDER.US"]
+    assert "[observe] 12-month forecast 34.7% is at the cap (34%+): no new money" in seen["picks"][0]["labels"]
+    assert not any("cap" in x for p in off["picks"] for x in p["labels"])
+    assert [p["qty"] for p in off["picks"]] == [p["qty"] for p in seen["picks"]]
+
+
+def test_c4_another_gate_keeps_its_own_reason_and_the_line_is_a_knob():
+    q, src, lots_ = _caps()
+    held = dict(lots_, held={"CAP.US": dt.date(2026, 11, 2)})
+    plan_ = dp.decide([dict(c) for c in q], dict(src), {}, held, 100000.0, 5, K(picks=3, roi_cap="on"))
+    waits = {c["symbol"]: c["waiting"] for c in plan_["pipeline"]}
+    assert waits["CAP.US"] == "already held"                                            # the first reason stands
+    plan_ = dp.decide([dict(c) for c in q], dict(src), {}, lots_, 100000.0, 5, K(picks=3, roi_cap="on", roi_cap_pct=30))
+    waits = {c["symbol"]: c["waiting"] for c in plan_["pipeline"]}
+    assert waits["UNDER.US"] == "12-month forecast 33.9% is at the cap (30%+): no new money"
+
+
+def test_c5_the_10_nov_board_with_the_rule_on(monkeypatch):
+    monkeypatch.setenv("TFB_PLAN_ROI_CAP", "on")
+    p = plan()
+    assert "ITRN.US" not in [c["symbol"] for c in p["picks"]]
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["ITRN.US"] == "12-month forecast 34.7% is at the cap (34%+): no new money"
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_ROI_CAP"] == "${{ vars.TFB_PLAN_ROI_CAP || 'on' }}"
+    assert env["TFB_PLAN_ROI_CAP_PCT"] == "${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}"
+

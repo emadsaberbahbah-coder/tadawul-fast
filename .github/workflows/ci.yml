@@ -1172,6 +1172,7 @@ jobs:
             tests/test_portfolio_reconciliation_cli.py \
             tests/test_ob_quote_evidence.py \
             tests/test_ob_research_quote.py \
+            tests/test_ob_cap_no_new_money.py \
             tests/test_executable_quote_conflicts.py \
             tests/test_ob_portfolio_certification.py \
             tests/test_sheet_presentation_contract.py \

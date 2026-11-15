@@ -283,7 +283,7 @@ def test_b5_the_switch_is_part_of_the_snapshot_policy(monkeypatch):
 
 
 def test_v1_version_and_inventory():
-    assert ob.OPPORTUNITY_BUILDER_VERSION == "1.30.0"
+    assert ob.OPPORTUNITY_BUILDER_VERSION in ("1.30.0", "1.31.0")   # 1.31.0 adds the cap rule
     for name in ("_env_research_quote", "_env_research_quote_session_h", "_quote_research_assessment"):
         assert callable(getattr(ob, name))
-    assert "Version: 1.30.0" in ob.__doc__
+    assert "v1.30.0 (2026-11-15)" in ob.__doc__

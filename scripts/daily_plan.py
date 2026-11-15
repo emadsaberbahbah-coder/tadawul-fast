@@ -120,6 +120,28 @@ new default): the cut sizes from the newest read-only IBKR capture
 at the 3.75 peg. Without a usable capture the 1.6.0 rule stands (the smaller of
 the typed cell and the cash ledger). The run log no longer prints a cash amount.
 
+1.8.0 (2026-11-15): NO NEW MONEY AT THE FORECAST CAP (owner, 13:25 Riyadh:
+"go with the best option and beneficial for the project as overall").
+Board episodes of US names, 10 Jul - 15 Nov 2026 (v_board_episodes), split at
+the engine's pre-registered cap line (opportunity_builder
+RANK_CAP_ENGINE_ROI_PCT = 34, fixed on 27 Oct before any data):
+                     up after 20 days        up after 5 days
+  Jul-Aug  cap 34+   39% (28, avg -0.1%)     36% (28)
+           below     63% (32, avg +2.0%)     47% (32)
+  Sep-Nov  cap 34+   28% (46, avg -3.5%)     32% (73)
+           below     52% (75, avg -1.0%)     60% (199)
+The owner's own fills agree: of the purchases matched to a board row, the
+ones at the cap won 2 of 7. The forecast is capped near 35%, so "at the cap"
+means the model's highest forecast, and those names have done worst.
+TFB_PLAN_ROI_CAP = on (default) | observe | off:
+  on       a name whose Engine ROI % (12M) is at or above TFB_PLAN_ROI_CAP_PCT
+           (34; a value outside 20..100 reads 34) is not picked; it waits in the pipeline with
+           "12-month forecast X% is at the cap (34%+): no new money".
+  observe  the same words as a label; picks are chosen as before.
+A name without a 12-month forecast is not judged here. Today's frozen picks
+are not touched: the rule applies from the next cut. Every other gate is
+unchanged.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -133,7 +155,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -188,6 +210,12 @@ def ev_mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def roi_cap_mode() -> str:
+    """1.8.0: on (default) | observe | off; any other word is on."""
+    v = _env("TFB_PLAN_ROI_CAP", "on").lower()
+    return v if v in ("on", "observe", "off") else "on"
+
+
 def stable_mode() -> str:
     """1.5.0 [TWO-LEVEL]: off | prefer (default: names at or above the entry level are picked first) | strict (a new
     name under the entry level waits in the pipeline)."""
@@ -240,6 +268,8 @@ def knobs() -> Dict[str, Any]:
         "live": _env("TFB_PLAN_LIVE_PRICE", "off").lower() in ("on", "1", "true", "yes"),
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
         "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
+        "roi_cap": roi_cap_mode(),                                                # 1.8.0
+        "roi_cap_pct": _env_num("TFB_PLAN_ROI_CAP_PCT", 34, 20, 100),
     }
 
 
@@ -632,6 +662,14 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             c["labels"].append(ev_label)
             if k["ev_mode"] == "on" and c["ev"] != "PASS" and not reason:
                 reason = "evidence rule not met"
+        cap_mode, roi12 = k.get("roi_cap", "off"), q.get("roi12")
+        if cap_mode != "off" and roi12 is not None and roi12 >= k.get("roi_cap_pct", 34):
+            words = "12-month forecast %s%% is at the cap (%s%%+): no new money" % (fmt(roi12, 1),
+                                                                                 fmt(k.get("roi_cap_pct", 34), 0))
+            if cap_mode == "on" and not reason:
+                reason = words
+            elif cap_mode == "observe":
+                c["labels"].append("[observe] " + words)
         if reason:
             c["waiting"] = reason
             pipeline.append(c)

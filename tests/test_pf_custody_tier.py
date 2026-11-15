@@ -774,7 +774,7 @@ def test_v1_versions_and_pins():
     assert pa.PORTFOLIO_ACTIONS_VERSION == "1.18.1" and pr.__version__ == "1.1.0"
     manifest = (root / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '"1.18.1", "portfolio actions")' in manifest
-    assert '"1.30.0", "opportunity builder")' in manifest
+    assert '"1.31.0", "opportunity builder")' in manifest
     assert """("core.portfolio_reconciliation", "__version__", '1.1.0'""" in manifest
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "tests/test_pf_custody_tier.py" in ci

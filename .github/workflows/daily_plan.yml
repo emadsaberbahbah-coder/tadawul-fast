@@ -1,7 +1,12 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.6.0 (2026-11-13)
+# VERSION 1.7.0 (2026-11-15)
+#
+# 1.7.0: NO NEW MONEY AT THE FORECAST CAP (daily_plan 1.8.0). A name whose
+# 12-month forecast is at or above 34% waits in the pipeline:
+# TFB_PLAN_ROI_CAP on (default) | observe | off; TFB_PLAN_ROI_CAP_PCT (34).
+# Rollback: repository variable TFB_PLAN_ROI_CAP=off.
 #
 # 1.6.0: CASH FROM THE BROKER (daily_plan 1.7.0). TFB_PLAN_CASH_SOURCE = ibkr
 # (default): the newest read-only IBKR capture on Drive, at most
@@ -150,6 +155,8 @@ jobs:
           TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}
           TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
+          TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
+          TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
