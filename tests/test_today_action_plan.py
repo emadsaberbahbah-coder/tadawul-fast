@@ -1340,6 +1340,30 @@ def test_t15_readers_of_the_two_portfolio_pages():
     assert tap.hold_align_on() is True
 
 
+def test_t15_several_lots_of_one_symbol_and_a_long_table():
+    """Codex P2, #998: the v2 page has one row per lot; the last lot must not hide a sale on an earlier one."""
+    hdr = ["Symbol", "Exit signal"]
+    lots = lambda *sigs: tap.read_pf_v2([hdr] + [["AAA.US", s] for s in sigs])["rows"]["AAA.US"]   # noqa: E731
+    assert lots("SELL \u2014 rule exit 2026-11-06 not acted", "HOLD \u2014 trailing")["verb"] == "SELL"
+    assert lots("HOLD \u2014 trailing", "SELL NOW \u2014 stop 9.00 hit", "RAISE STOP 9.00 \u2192 9.50")["signal"].startswith("SELL NOW")
+    assert lots("RAISE STOP 9.00 \u2192 9.50", "HOLD \u2014 trailing") == {
+        "verb": "RAISE STOP", "signal": "RAISE STOP 9.00 \u2192 9.50", "level": 9.5}
+    assert lots("RAISE STOP 9.00 \u2192 9.50", "RAISE STOP 9.00 \u2192 9.80", "RAISE STOP 9.00 \u2192 9.20")["level"] == 9.8
+    assert lots("EXCLUDED (PD_EXECUTION_EXCLUDE)", "HOLD \u2014 trailing")["verb"] == "HOLD"
+    assert lots("HOLD \u2014 trailing", "HOLD \u2014 breakeven locked")["signal"] == "HOLD \u2014 trailing"      # the first of equals
+    two = [_h("AAA.US", "HOLD", 8.0)]
+    y = tap.read_pf_v2([hdr, ["AAA.US", "SELL \u2014 rule exit 2026-11-06 not acted"], ["AAA.US", "HOLD \u2014 trailing"]])
+    assert [r["level"] for r in tap.align_holdings(two, {"read": False}, y, 1.0)] == ["hard"]
+    m = tap.read_pf_main([["Action", "Symbol"], ["EXIT", "AAA.US"], ["HOLD", "AAA.US"], ["HOLD", "BBB.US"], ["TRIM", "BBB.US"]])
+    assert m["rows"] == {"AAA.US": "EXIT", "BBB.US": "HOLD"}
+    # the table starts under the charts: a sale on the 30th lot, 60 rows down, is still read
+    long = [["PORTFOLIO DECISION v2"]] + [[""]] * 25 + [hdr] + [["L%02d.US" % i, "HOLD \u2014 trailing"] for i in range(29)] + [
+        ["LAST.US", "SELL NOW \u2014 stop 9.00 hit"]]
+    assert tap.read_pf_v2(long)["rows"]["LAST.US"]["verb"] == "SELL" and len(long) > 40
+    row = lambda rng: int(rng.split(":")[1].lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))                  # noqa: E731
+    assert row(tap.PF2_RANGE) >= 200 and row(tap.PFD_RANGE) >= 150 and tap.PF2_RANGE.startswith("A1:P")
+
+
 def test_t15_which_holdings_differ_and_how():
     m, y = tap.read_pf_main(PFM), tap.read_pf_v2(PF2)
     hs = [_h("SUPN.US", "HOLD", 24.28, 24.25), _h("GLPI.US", "HOLD", 35.74, 35.74), _h("DDI.US", "RAISE STOP", 14.80, 14.24),

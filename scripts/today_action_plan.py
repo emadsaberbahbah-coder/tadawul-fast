@@ -613,7 +613,10 @@ def align(plan: Dict[str, Any], t10: Dict[str, Any], v2: Dict[str, Any]) -> List
 # 1.5.0 [HOLD-ALIGN]: what the two portfolio pages say about each holding (pure)
 # ----------------------------------------------------------------------------- #
 PFD_TAB, PF2_TAB = "Portfolio_Decision", "Portfolio_Decision_v2"
+# the v2 table starts under the tiles and charts and has one row per lot: read well past a full book (Codex P2, #998)
+PFD_RANGE, PF2_RANGE = "A1:AA150", "A1:P200"
 _SELL_WORDS = ("SELL", "EXIT")
+_V2_RANK = {"SELL": 3, "RAISE STOP": 2, "HOLD": 1, "": 0}
 _RAISE_RE = re.compile(r"(?:\u2192|->)\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
 
 
@@ -634,14 +637,17 @@ def read_pf_main(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
         sym = text(cell(r, col["Symbol"])).upper()
         if not sym or " " in sym:
             break
-        out["rows"][sym] = _squash(cell(r, col["Action"])).upper()
+        act = _squash(cell(r, col["Action"])).upper()
+        if sym not in out["rows"] or any(act.startswith(w) for w in _SELL_WORDS):   # a repeated symbol: a sale stands
+            out["rows"][sym] = act
     return out
 
 
 def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     """Portfolio_Decision_v2: {read, built, rows: {SYMBOL: {verb, signal, level}}} from its "Exit signal" column.
     verb is SELL (SELL NOW / SELL - rule exit), RAISE STOP (level = the stop it asks for), HOLD, or "" for any
-    other text (a row the page excludes)."""
+    other text (a row the page excludes). The page has one row per ledger lot (Codex P2, #998): for a symbol with
+    several lots a SELL on any lot stands, then the highest stop asked for, then HOLD."""
     rows = [list(r) for r in values]
     out: Dict[str, Any] = {"read": False, "built": "", "rows": {}}
     h, col = _header(rows, ("Symbol", "Exit signal"))
@@ -658,7 +664,11 @@ def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
         verb = "SELL" if up.startswith("SELL") else "RAISE STOP" if up.startswith("RAISE STOP") else \
             "HOLD" if up.startswith("HOLD") else ""
         m = _RAISE_RE.search(sig) if verb == "RAISE STOP" else None
-        out["rows"][sym] = {"verb": verb, "signal": sig, "level": num(m.group(1)) if m else None}
+        new = {"verb": verb, "signal": sig, "level": num(m.group(1)) if m else None}
+        old = out["rows"].get(sym)
+        if old is None or _V2_RANK[verb] > _V2_RANK[old["verb"]] or (
+                verb == old["verb"] == "RAISE STOP" and (new["level"] or 0.0) > (old["level"] or 0.0)):
+            out["rows"][sym] = new
     return out
 
 
@@ -1639,7 +1649,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         more: Dict[str, List[List[Any]]] = {}
         tabs = ((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000")) if aligned else ()
         if aligned and hold_align:                                  # 1.5.0
-            tabs = tabs + ((PFD_TAB, "A1:AA40"), (PF2_TAB, "A1:P40"))
+            tabs = tabs + ((PFD_TAB, PFD_RANGE), (PF2_TAB, PF2_RANGE))
         for tab, rng in tabs:
             try:                                                    # optional: a tab that cannot be read changes no step
                 more[tab] = _read(b, tab, rng)
