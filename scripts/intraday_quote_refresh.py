@@ -23,7 +23,8 @@ v1.0.5 (2026-11-15) — BATCHES, ONLY THE SYMBOLS A PAGE HOLDS, HOLDINGS FIRST
         and the others still run. A page has failed to fetch only when
         every batch it sent failed;
       * no new batch starts after TFB_IQR_BUDGET_SEC seconds (300, 30..3600)
-        from the start of the run; what was skipped is printed;
+        from the start of the run; what was skipped is printed, and a run
+        that could send no batch at all is a failed run (exit 3);
       * My_Portfolio is harvested first, so the holdings are inside the
         ceiling and in the first batches;
       * one [FETCH] line per page: wanted, batches, failed, skipped, rows
@@ -852,6 +853,7 @@ def main() -> int:
     fetch_failures: List[str] = []   # v1.0.4
     fetched_pages = 0
     partial = False                  # 1.0.5: a batch failed or was skipped, and the run still read quotes
+    asked_pages = 0                  # 1.0.5: pages with a decision symbol to ask for
     for page in tgt_pages:
         try:
             ws = sh.worksheet(page)
@@ -866,6 +868,7 @@ def main() -> int:
             print("  %-16s rows=%-6d no decision symbol has a row on this page - nothing asked"
                   % (page, max(0, len(values) - 1)))
             continue
+        asked_pages += 1
         quotes, failure, ages, info = fetch_page_quotes(base, page, wanted, timeout=timeout, batch=batch,
                                                         deadline=deadline)
         print("  [FETCH] %-16s wanted=%d batches=%d failed=%d skipped=%d returned=%d usable=%d no_evidence=%d "
@@ -914,7 +917,12 @@ def main() -> int:
         print("     wrote %d cell(s)" % written)
 
     all_failed = bool(fetched_pages) and len(fetch_failures) == fetched_pages   # v1.0.4
-    if all_failed:
+    unsent = bool(asked_pages) and not fetched_pages     # 1.0.5 (Codex P2, #999): the budget was gone before any request
+    if unsent:
+        all_failed = True
+        print("[IQR v%s] NO REQUEST WAS SENT: the %d s request budget was used up before the first batch - no quote"
+              " was read" % (SCRIPT_VERSION, budget))
+    elif all_failed:
         print("[IQR v%s] FETCH FAILED on every target page (%s) - no quote was read; a 401 means the"
               " backend token (BACKEND_TOKEN) is missing or wrong" % (SCRIPT_VERSION, "; ".join(fetch_failures)))
     if args.apply:

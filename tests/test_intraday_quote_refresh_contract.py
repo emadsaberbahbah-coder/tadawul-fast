@@ -611,6 +611,29 @@ def test_v105_a_failed_batch_on_every_page_is_not_a_run_failure_and_a_skipped_pa
     assert "FETCH FAILED on every target page (Market_Leaders HTTPError 503)" in capsys.readouterr().out
 
 
+def test_v105_a_run_that_could_send_no_batch_at_all_is_a_failed_run(monkeypatch, capsys):
+    """Codex P2, #999: the budget gone before the first batch is not a partial success."""
+    monkeypatch.setenv("TFB_IQR_BUDGET_SEC", "60")
+    for mode in ("--scan", "--apply"):
+        ticks = iter([0.0])                                          # the start; every later reading is past the limit
+        monkeypatch.setattr(iqr, "_mono", lambda: next(ticks, 999.0))
+        book = Wide()
+        calls = _wire(monkeypatch, book, mode=mode)
+        assert iqr.main() == 3 and calls == [], mode
+        out = capsys.readouterr().out
+        assert "NO REQUEST WAS SENT: the 60 s request budget was used up before the first batch" in out
+        assert "FETCH FAILED on every target page" not in out and out.count("[BUDGET]") == 2
+        if mode == "--apply":
+            assert book.pages["_Run_Log"].appends[-1][1] == "ERROR" and book.pages["_Run_Log"].appends[-1][4] == "FETCH_FAILED"
+    # no decision symbol on any page is not this case: nothing was wanted, nothing failed
+    monkeypatch.setattr(iqr, "_mono", lambda: 999.0)
+    quiet = Wide()
+    quiet.pages["Market_Leaders"] = Worksheet([HEADER, target("ELSE.SR")])
+    quiet.pages["Global_Markets"] = Worksheet([HEADER, target("ELSE.SR")])
+    calls = _wire(monkeypatch, quiet, mode="--apply")
+    assert iqr.main() == 0 and calls == [] and quiet.pages["_Run_Log"].appends[-1][4] == "OK"
+
+
 def test_v105_no_request_starts_after_the_budget(monkeypatch, capsys):
     monkeypatch.setenv("TFB_IQR_BATCH", "1")
     monkeypatch.setenv("TFB_IQR_BUDGET_SEC", "60")
