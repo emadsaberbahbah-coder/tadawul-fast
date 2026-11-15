@@ -1297,3 +1297,174 @@ def test_t14_the_archived_summary_keeps_the_page_alert(monkeypatch):
     assert tap.run_once(False, book=full_book(), now=NOW, capture=plan_capture(), bq_session=bq) == 0
     summary = [r["json"] for r in bq.inserts[0]["rows"] if r["json"]["row_type"] == "summary"][0]
     assert seen["fresh"] and summary["tone"] == "alert" and summary["instruction"].endswith("NEWS GATE: RISK OFF")
+
+
+# ----------------------------------------------------------------------------- T15 (1.5.0) one answer per holding
+PFM = [["MY PORTFOLIO - DECISION"], ["Status:", "Last run 2026-11-12 08:19:50 | status: ok | holdings 5 rows"], [],
+       ["ACTIONS - one per holding (4)"],
+       ["Action", "Symbol", "Name", "Sector", "Ccy"],
+       ["TRIM", "DDI.US", "DoubleDown", "Communication Services", "USD"],
+       ["HOLD", "GLPI.US", "Gaming & Leisure", "Real Estate", "USD"],
+       ["HOLD", "IBOC.US", "Intl Bancshares", "Financials", "USD"],
+       ["HOLD", "SUPN.US", "Supernus", "Healthcare", "USD"],
+       [], ["SECTOR SUMMARY (4)"]]
+PF2 = [["PORTFOLIO DECISION — v2", "UNCERTIFIED", "page built 2026-11-12 08:16 · decision 2026-11-12 08:19"], [],
+       ["Symbol", "Name · sector", "", "3-month\nclose", "", "Avg cost", "", "", "NAV %", "Unreal. %", "Broker TP / stop",
+        "Dyn. stop (trail)", "Exit engine", "", "Order status (IBKR)", "Exit signal"],
+       ["GLPI.US", "Gaming", "", "", "79", "38.88", "", "", "", "", "", "", "", "", "partial", "RAISE STOP 35.74 → 38.27"],
+       ["SUPN.US", "Supernus", "", "", "95", "35.45", "", "", "", "", "", "", "", "", "working",
+        "SELL — rule exit 2026-11-06 (stop 26.19 touched) not acted · last 29.72"],
+       ["DDI.US", "DoubleDown", "", "", "240", "13.44", "", "", "", "", "", "", "", "", "partial", "RAISE STOP 14.24 → 14.85"],
+       ["IBOC.US", "Intl Bancshares", "", "", "52", "68.74", "", "", "", "", "", "", "", "", "partial", "HOLD — trailing"],
+       ["5023.SR", "Sukuk", "", "", "100", "", "", "", "", "", "", "", "", "", "", "EXCLUDED (PD_EXECUTION_EXCLUDE)"],
+       [], ["1. SELL SUPN.US (95 sh)"]]
+
+
+def _h(sym, action, stop, broker=None):
+    return {"symbol": sym, "action": action, "stop": stop, "broker_stop": broker}
+
+
+def test_t15_readers_of_the_two_portfolio_pages():
+    m, y = tap.read_pf_main(PFM), tap.read_pf_v2(PF2)
+    assert m == {"read": True, "built": "2026-11-12 08:19", "rows": {
+        "DDI.US": "TRIM", "GLPI.US": "HOLD", "IBOC.US": "HOLD", "SUPN.US": "HOLD"}}
+    assert y["read"] and y["built"] == "2026-11-12 08:16" and list(y["rows"]) == ["GLPI.US", "SUPN.US", "DDI.US", "IBOC.US", "5023.SR"]
+    assert y["rows"]["GLPI.US"] == {"verb": "RAISE STOP", "signal": "RAISE STOP 35.74 → 38.27", "level": 38.27}
+    assert y["rows"]["SUPN.US"]["verb"] == "SELL" and y["rows"]["SUPN.US"]["level"] is None
+    assert y["rows"]["IBOC.US"]["verb"] == "HOLD" and y["rows"]["5023.SR"]["verb"] == ""
+    assert tap.read_pf_v2([["Symbol", "Exit signal"], ["A.US", "SELL NOW — stop 9.00 hit"], ["B.US", "RAISE STOP 1,005.5 -> 1,010.25"]])[
+        "rows"] == {"A.US": {"verb": "SELL", "signal": "SELL NOW — stop 9.00 hit", "level": None},
+                    "B.US": {"verb": "RAISE STOP", "signal": "RAISE STOP 1,005.5 -> 1,010.25", "level": 1010.25}}
+    for empty in ([], [["x"]], [["Symbol", "Name"]], [["Action", "Name"]]):
+        assert tap.read_pf_main(empty)["read"] is False and tap.read_pf_v2(empty)["read"] is False
+    assert tap.hold_align_on() is True
+
+
+def test_t15_which_holdings_differ_and_how():
+    m, y = tap.read_pf_main(PFM), tap.read_pf_v2(PF2)
+    hs = [_h("SUPN.US", "HOLD", 24.28, 24.25), _h("GLPI.US", "HOLD", 35.74, 35.74), _h("DDI.US", "RAISE STOP", 14.80, 14.24),
+          _h("IBOC.US", "HOLD", 63.20), _h("5023.SR", "NO RULE", None)]
+    rows = tap.align_holdings(hs, m, y, 1.0)
+    assert [(r["symbol"], r["level"]) for r in rows] == [("SUPN.US", "hard"), ("GLPI.US", "soft")]   # DDI: 14.85 is within 1% of 14.80
+    s, g = rows
+    assert s["pages"] == ["Portfolio_Decision_v2"] and s["plan"] == "HOLD · stop 24.28 (broker 24.25)"
+    assert s["reading"] == "NOT A STEP HERE: Portfolio_Decision_v2 reads SELL under its own rule; the Exit Plan reads HOLD."
+    assert s["main"] == "HOLD" and s["v2"].startswith("SELL — rule exit 2026-11-06") and s["shown"] == ["Portfolio_Decision_v2: " + s["v2"]]
+    assert g["pages"] == [] and g["plan"] == "HOLD · stop 35.74 (broker 35.74)"
+    assert g["reading"] == ("FOLLOW THIS PAGE: Portfolio_Decision_v2 asks for the stop 38.27 under its own rule; the Exit "
+                            "Plan's stop is 35.74.")
+    assert [r["symbol"] for r in tap.align_holdings(hs, m, y, 0.1)] == ["SUPN.US", "GLPI.US", "DDI.US"]   # the tolerance is the knob
+    # a trim to the cap is a position size: never a difference (1.3.1)
+    assert not [r for r in rows if r["symbol"] in ("DDI.US", "IBOC.US")]
+    # the Exit Plan already sells: the other page is not a difference
+    for act in ("SELL", "TAKE PROFIT"):
+        assert tap.align_holdings([_h("SUPN.US", act, 24.28)], m, y, 1.0) == []
+    # both pages say sell
+    both = tap.align_holdings([_h("SUPN.US", "HOLD", 24.28)], dict(m, rows={"SUPN.US": "EXIT"}), y, 1.0)[0]
+    assert both["pages"] == ["Portfolio_Decision", "Portfolio_Decision_v2"] and both["level"] == "hard"
+    assert both["reading"] == ("NOT A STEP HERE: Portfolio_Decision and Portfolio_Decision_v2 read SELL under their own "
+                               "rule; the Exit Plan reads HOLD.")
+    only_main = tap.align_holdings([_h("SUPN.US", "HOLD", 24.28)], dict(m, rows={"SUPN.US": "EXIT"}), {"read": False}, 1.0)[0]
+    assert only_main["pages"] == ["Portfolio_Decision"] and only_main["v2"] == "page not read" and only_main["main"] == "EXIT"
+    # a page that was not read says nothing; a holding a page does not list is not a difference
+    assert tap.align_holdings(hs, {"read": False}, {"read": False}, 1.0) == []
+    assert tap.align_holdings([_h("NEW.US", "HOLD", 10.0)], m, y, 1.0) == []
+    stale = dict(y, read=False)                                      # rows are ignored once the page is not read
+    assert tap.align_holdings(hs, m, stale, 1.0) == []
+    assert tap.align_holdings([_h("SUPN.US", "HOLD", 24.28)], {"read": False, "rows": {"SUPN.US": "EXIT"}}, {"read": False}, 1.0) == []
+    # a holding without an exit rule (fixed income) is never compared
+    assert tap.align_holdings([_h("SUPN.US", "NO RULE", None)], dict(m, rows={"SUPN.US": "EXIT"}), y, 1.0) == []
+
+
+def _hold_exit():
+    rows = [list(r) for r in EXIT]
+    i = [n for n, r in enumerate(rows) if r and r[0] == "SUPN.US"][0]
+    rows[i][13], rows[i][14], rows[i][15] = "HOLD", "+0.7R at the high", "24.25"
+    return rows
+
+
+def test_t15_the_page_names_the_holding_another_page_sells(capsys):
+    """15 Nov: this page said nothing to do and PAGES ALIGNED while Portfolio_Decision_v2 read SELL SUPN.US."""
+    book = aligned_book(Exit_Plan=Sheet(_hold_exit()), Portfolio_Decision=Sheet(PFM), Portfolio_Decision_v2=Sheet(PF2))
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    flat = [" | ".join(str(c) for c in r if c != "") for r in page]
+    card = [c for c in cards(page) if c[1] == "SUPN.US" and c[3] == "Portfolio_Decision_v2"]
+    assert len(card) == 1
+    assert card[0][2] == ("SUPN.US: Portfolio_Decision_v2 reads SELL; the Exit Plan, which this page follows, reads HOLD "
+                          "· stop 24.25 (broker 23.00). No sale is asked for here.")
+    assert card[0][4].startswith("shown there: Portfolio_Decision_v2: SELL — rule exit 2026-11-06")
+    assert card[0][5].startswith("Orders come from this page only.")
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    assert "OTHER PAGE" in [page[a + 3 + 2 * i][0] for i in range(len(cards(page)))]
+    t = tiles_of(page)["PAGES"]
+    assert t[0] == "DISAGREE" and "another page says sell: SUPN.US" in t[1] and "do not buy: ZTO.US, TEN.US" in t[1]
+    assert any("PAGES DISAGREE: ZTO.US, TEN.US, SUPN.US" in x for x in flat[:4])
+    i = flat.index("HOLDINGS ON THE OTHER PAGES - the Exit Plan is the exit rule of record")
+    assert flat[i + 1] == "Portfolio_Decision | built 2026-11-12 08:19" and flat[i + 2] == "Portfolio_Decision_v2 | built 2026-11-12 08:16"
+    assert flat[i + 3].startswith("Symbol | Exit Plan (rule of record) | Portfolio_Decision | Portfolio_Decision_v2 | Reading")
+    assert flat[i + 4].startswith("SUPN.US | HOLD · stop 24.25 (broker 23.00) | HOLD | SELL — rule exit")
+    assert flat[i + 5].startswith("GLPI.US | HOLD · stop 35.74 (broker 35.74) | HOLD | RAISE STOP 35.74 → 38.27 | FOLLOW THIS PAGE")
+
+
+def test_t15_another_stop_only_reads_this_page_leads_and_agreement_reads_aligned():
+    quiet_v2 = [list(r) for r in PF2]
+    quiet_v2[4][15] = "HOLD — trailing"                              # SUPN no longer latched
+    no_tickets = [list(r) for r in T10[:3]]
+    book = full_book(Exit_Plan=Sheet(_hold_exit()), Top_10_Investments=Sheet(no_tickets), Top_10_Investments_v2=Sheet([["x"]]),
+                     _News_Gate=Sheet(NEWS), _Cash_Snapshot=Sheet(CASH), Portfolio_Decision=Sheet(PFM),
+                     Portfolio_Decision_v2=Sheet(quiet_v2), _Daily_Plan=Sheet([HDR]))
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    t = tiles_of(page)["PAGES"]
+    assert t == ("THIS PAGE LEADS", "another stop on Portfolio v2: GLPI.US")
+    assert not [c for c in cards(page) if "No sale is asked for here" in c[2]]          # another stop is not a step
+    only = Book(dict(book.tabs, Portfolio_Decision_v2=Sheet(PF2)))                      # no buy differs, one holding does
+    assert tap.run_once(False, book=only, now=NOW, capture=plan_capture()) == 0
+    assert tiles_of(only.tabs["Today_Action_Plan"].values)["PAGES"] == ("DISAGREE", "another page says sell: SUPN.US")
+    assert len([c for c in cards(only.tabs["Today_Action_Plan"].values) if "No sale is asked for here" in c[2]]) == 1
+    calm = [list(r) for r in quiet_v2]
+    calm[3][15] = "HOLD — trailing"
+    book.tabs["Portfolio_Decision_v2"] = Sheet(calm)
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert tiles_of(page)["PAGES"][0] == "ALIGNED"
+    flat = [" | ".join(str(c) for c in r if c != "") for r in page]
+    i = flat.index("HOLDINGS ON THE OTHER PAGES - the Exit Plan is the exit rule of record")
+    assert flat[i + 3].startswith("No holding has another exit reading on a portfolio page that was read.")
+
+
+def test_t15_off_reads_neither_page_and_a_missing_page_changes_no_step(monkeypatch, capsys):
+    class Counted(Sheet):
+        reads = 0
+
+        def get(self, rng):
+            Counted.reads += 1
+            return super().get(rng)
+
+    def run(**tabs):
+        book = aligned_book(Exit_Plan=Sheet(_hold_exit()), **tabs)
+        assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+        return book.tabs["Today_Action_Plan"].values
+
+    monkeypatch.setenv("TFB_TAP_HOLD_ALIGN", "off")
+    assert tap.hold_align_on() is False
+    with_tabs = run(Portfolio_Decision=Counted(PFM), Portfolio_Decision_v2=Counted(PF2))
+    assert Counted.reads == 0 and with_tabs == run()
+    flat = [" | ".join(str(c) for c in r if c != "") for r in with_tabs]
+    assert not any("HOLDINGS ON THE OTHER PAGES" in x or "OTHER PAGE" in x for x in flat)
+    assert tiles_of(with_tabs)["PAGES"] == ("DISAGREE", "do not buy: ZTO.US, TEN.US")          # the 1.4.0 words
+    capsys.readouterr()
+    monkeypatch.delenv("TFB_TAP_HOLD_ALIGN")
+    missing = run()                                                  # neither page exists: no step, both named
+    assert cards(missing) == cards(with_tabs) and tiles_of(missing)["PAGES"] == tiles_of(with_tabs)["PAGES"]
+    flat = [" | ".join(str(c) for c in r if c != "") for r in missing]
+    i = flat.index("HOLDINGS ON THE OTHER PAGES - the Exit Plan is the exit rule of record")
+    assert flat[i + 1:i + 3] == ["Portfolio_Decision | page not read", "Portfolio_Decision_v2 | page not read"]
+    monkeypatch.setenv("TFB_TAP_ALIGN", "off")                       # the parent switch off: nothing of 1.5.0 either
+    Counted.reads = 0
+    parent_off = run(Portfolio_Decision=Counted(PFM), Portfolio_Decision_v2=Counted(PF2))
+    assert Counted.reads == 0 and not any("OTHER PAGES" in " ".join(str(c) for c in r) for r in parent_off)
+    wf = yaml.safe_load((ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8"))
+    envs = [s.get("env", {}) for j in wf["jobs"].values() for s in j["steps"] if "today_action_plan.py" in str(s.get("run", ""))]
+    assert envs and envs[0]["TFB_TAP_HOLD_ALIGN"] == "${{ vars.TFB_TAP_HOLD_ALIGN || 'on' }}"
