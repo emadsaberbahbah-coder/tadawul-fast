@@ -363,6 +363,16 @@ const FINAL_ROWS = [
   ['CRC.US', 'DO NOT INVEST', 'Do not buy: the plan invalidated it today (earnings in 2 day(s)).']
 ];
 function withFinal(rows, at) { const b = makeBook(); return b; }
+function frstYahoo() {   // a live FRST.US history: about 15.20 until the entry day (26 Oct), then 13.00 - a fresh stop hit
+  const ts = [], o = [], h = [], l = [], c = [];
+  for (let d = Date.UTC(2026, 8, 1, 14, 30); d <= Date.UTC(2026, 9, 30, 14, 30); d += 86400000) {
+    const wd = new Date(d).getUTCDay(); if (wd === 0 || wd === 6) continue;
+    const after = d > Date.UTC(2026, 9, 26, 23, 0), base = after ? 13.0 : 15.2 + ((ts.length % 3) - 1) * 0.05;
+    ts.push(d / 1000); o.push(base); h.push(base + 0.15); l.push(base - 0.15); c.push(base);
+  }
+  const body = JSON.stringify({ chart: { result: [{ meta: { regularMarketPrice: 13.0, currency: 'USD', exchangeTimezoneName: 'America/New_York' }, timestamp: ts, indicators: { quote: [{ open: o, high: h, low: l, close: c }] } }] } });
+  return { fetch(url) { return /chart\/FRST\b/.test(url) ? { getResponseCode: () => 200, getContentText: () => body } : { getResponseCode: () => 404, getContentText: () => '{}' }; } };
+}
 function buildWith(source, which, opts) {
   opts = Object.assign({ fetch: NO_NET }, opts || {});
   const env = makeEnv(source, opts);
@@ -380,7 +390,7 @@ function actionLines(sh) { return cellsWith(sh, /^\d\. /).map(x => x[1]); }
 test('P0 oracle: the reversal of the v1.4.0 hunks is the v1.3.1 file; versions; both compile', () => {
   ok(OLD !== null, 'the hunks reverse');
   eq(sha256(OLD), V1301_SHA256, 'v1.3.1 SHA-256');
-  eq(EDITS.length, 15, 'fifteen hunks');
+  eq(EDITS.length, 16, 'sixteen hunks');
   ok(/ \* Version: 1\.4\.0 \(2026-11-16\)/.test(NEW) && /var DP2_VERSION = '1\.4\.0';/.test(NEW), 'version lockstep');
   new vm.Script(NEW, { filename: '27_Decision_Pages_v2.gs' }); new vm.Script(OLD, { filename: 'old.gs' });
   for (const name of ['dp2FinalFromValues_', 'dp2FinalAgeH_', 'dp2FinalState_', 'dp2ReadFinal_', 'dp2FinalCell_', 'dp2FinalAction_', 'dp2FinalCoreOk_', 'dp2FinalOn_'])
@@ -426,6 +436,16 @@ test('P2 Portfolio_Decision_v2 shows the final decision; its own rule is analysi
   const acts2 = actionLines(sheet(r2, PDV));
   eq(acts2[0], '1. SELL FRST.US (Today Action Plan): Sell all 100 shares.', 'the final SELL is action 1');
   ok(cellsWith(sheet(r2, PDV), /^FINAL: SELL \(Today Action Plan\)/).length >= 1, 'the cell reads FINAL: SELL');
+  // the e-mail of a final SELL carries the plan's instruction, never the v2 rule's own liquidation (Codex P1, #1000)
+  const LIVE = frstYahoo();
+  const baseMail = JSON.stringify(buildWith(OLD, 'pd', { fetch: LIVE }).mails);
+  ok(/FRST\.US/.test(baseMail) && /Sell now \(market/.test(baseMail), 'the 1.3.1 page e-mails its own sale: ' + baseMail.slice(0, 300));
+  const half = FINAL_ROWS.map(x => x[0] === 'FRST.US' ? ['FRST.US', 'SELL', 'Sell half (50 shares); keep a stop at 14.00 on the rest.', 100, '', 14] : x);
+  const r3 = buildWith(NEW, 'pd', { final: finalGrid(half), fetch: LIVE });
+  const mail = JSON.stringify(r3.mails);
+  ok(/FINAL DECISION SELL \(Today Action Plan\): Sell half \(50 shares\); keep a stop at 14\.00 on the rest\./.test(mail), 'the half sale is mailed: ' + mail.slice(0, 400));
+  ok(!/Sell now \(market/.test(mail) && /v2 rule \(analysis\): /.test(mail), 'no own liquidation instruction');
+  eq(buildWith(NEW, 'pd', { final: finalGrid(FINAL_ROWS), fetch: LIVE }).mails.length, 0, 'a final HOLD sends no sale e-mail on the same live stop hit');
   // a hold that asks for something (a raised stop) is an action
   const raise = FINAL_ROWS.map(x => x[0] === 'FRST.US' ? ['FRST.US', 'HOLD', 'Hold; raise the stop to 14.50 for all 100 shares.', 100, '', 14.5] : x);
   ok(actionLines(sheet(buildWith(NEW, 'pd', { final: finalGrid(raise), bars: FALL }), PDV)).some(t => /HOLD FRST\.US \(Today Action Plan\): Hold; raise the stop to 14\.50/.test(t)), 'raise');

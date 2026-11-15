@@ -28,7 +28,7 @@
 "    // actions from the exit signal\n    var item = {"
 ],
 [
-"    var decision = sig.text;\n    if (sig.code === 'HOLD' && !certified) decision = 'HOLD · ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' · uncertified';\n    var fc = dp2FinalCell_(fin, l.symbol, decision);   // v1.4.0 [ONE-DECISION]\n    if (fin.on) {\n      decision = fc.text;\n      actions.length = actLen0;\n      if (!(fc.row && fc.row.decision === 'SELL')) { sig.alert = false; sig.advisory = false; }\n      var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);\n    }\n    sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);\n",
+"    var decision = sig.text;\n    if (sig.code === 'HOLD' && !certified) decision = 'HOLD · ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' · uncertified';\n    var fc = dp2FinalCell_(fin, l.symbol, decision);   // v1.4.0 [ONE-DECISION]\n    if (fin.on) {\n      decision = fc.text;\n      actions.length = actLen0;\n      item.rotation = null;   // a switch is the Today Action Plan's call\n      if (fc.row && fc.row.decision === 'SELL') { item.finalTodo = fc.row.todo; sig.advisory = false; }   // the e-mail carries the plan's words (Codex P1, #1000)\n      else { sig.alert = false; sig.advisory = false; }\n      var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);\n    }\n    sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);\n",
 "    var decision = sig.text;\n    if (sig.code === 'HOLD' && !certified) decision = 'HOLD · ' + (x && x.rule === 'fixed' ? 'fixed stop' : 'trailing') + ' · uncertified';\n    sigKinds.push(sig.kind);\n"
 ],
 [
@@ -42,6 +42,10 @@
 [
 "  for (i = 0; !fin.on && i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory",
 "  for (i = 0; i < switches.length && i < 1; i++) actions.push({ p: 5, t: 'Switch advisory"
+],
+[
+"  if (it.finalTodo) {   // v1.4.0 [ONE-DECISION]: a final SELL - the Today Action Plan's instruction, the v2 rule as analysis\n    why = 'v2 rule (analysis): ' + why;\n    action = 'FINAL DECISION SELL (Today Action Plan): ' + it.finalTodo + ' Follow the Today_Action_Plan page; the v2 rule above is analysis.';\n  }\n  if (it.rotation && it.rotation.plan) {\n    var rp = it.rotation.plan",
+"  if (it.rotation && it.rotation.plan) {\n    var rp = it.rotation.plan"
 ],
 [
 "  var ib = dp2ReadIbkr_();\n  var fin = dp2ReadFinal_();   // v1.4.0 [ONE-DECISION]\n  var fx = dp2Num_(ib.account['fx_usd_sar']) || DP2.FX_DEFAULT;",

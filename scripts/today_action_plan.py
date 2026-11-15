@@ -855,8 +855,16 @@ def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, A
                      "why": why, "rule": rule, "views": views, "held": held,
                      "differs": _differs(dec, held, h, views, tol_pct, pf2)}
 
+    # the steps section A already gives (Codex P1 x2, #1000): a stop to place or repair, a verification, a working buy's
+    # stop and funding - the final row carries them word for word, so no page drops an instruction the plan gives
+    own_steps: Dict[str, List[str]] = {}
+    for st in d.get("steps") or []:
+        if st.get("source") in ("Exit_Plan", "Daily_Plan") and st.get("symbol") not in (None, "ALL"):
+            own_steps.setdefault(st["symbol"], []).append(st["do"])
     for h in d.get("holdings") or []:
         dec, do = _holding_decision(h)
+        if own_steps.get(h["symbol"]):
+            do = " ".join(own_steps[h["symbol"]])
         if pf.get("read") and (pf.get("rows") or {}).get(h["symbol"], "").startswith("TRIM") and dec == "HOLD":
             do += " Above the position cap: no new buys of it (a trim is the owner's call)."
         put(h["symbol"], dec, do, "Exit Plan", h.get("why", ""), True, h, qty=h.get("qty"), stop=h.get("stop"))
@@ -870,6 +878,8 @@ def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, A
             why = p.get("reason") or ""
         else:
             dec, do = _pick_decision(p)
+            if own_steps.get(sym):
+                do = " ".join(own_steps[sym])
             why = (p.get("reason") or "") + (news_note if dec == "BUY" else "")
         put(sym, dec, do, "Daily Plan", why.strip("; "), False,
             qty=p.get("qty") if dec == "BUY" else None,

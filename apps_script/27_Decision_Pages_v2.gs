@@ -2674,6 +2674,10 @@ function dp2ExitLine_(it, fx) {
   else action = s.text + ' — no stop change.';
   // v1.2.10 (review finding): on STALE bars no liquidation instruction leaves this page — verification wording only.
   if (s.staleBars) action = 'VERIFY ONLY — the price history is stale (fetch failed; cached bars to ' + (x ? x.lastDate : 'n/a') + '), so this signal was computed on the cockpit quote ' + dp2Fmt_(lastPx, 2) + '. Check the live price and the working stop at the broker; no sale or stop change is instructed by this message. The next successful fetch re-evaluates the rule.';
+  if (it.finalTodo) {   // v1.4.0 [ONE-DECISION]: a final SELL - the Today Action Plan's instruction, the v2 rule as analysis
+    why = 'v2 rule (analysis): ' + why;
+    action = 'FINAL DECISION SELL (Today Action Plan): ' + it.finalTodo + ' Follow the Today_Action_Plan page; the v2 rule above is analysis.';
+  }
   if (it.rotation && it.rotation.plan) {
     var rp = it.rotation.plan, rr = rp.rotation;
     var rtxt = ' SWITCH (research): ' + rr.action.toLowerCase() + ' ' + dp2Fmt_(rr.proceeds) + ' SAR to fund ' + rp.sym + ' — ' + (rp.basis === '3m' ? 'plan 3M' : 'engine 12M') + ' ' + dp2PctPlain_(rp.oppRoi, 1) + ' vs this holding ' + dp2PctPlain_(rr.roi, 1) + ' (edge +' + dp2Fmt_(rr.edge, 1) + ' pp after ' + (rp.cost !== undefined ? rp.cost : DP2A.ROT_COST_PCT) + '% cost).';
@@ -3846,7 +3850,9 @@ function buildPortfolioDecisionV2() {
     if (fin.on) {
       decision = fc.text;
       actions.length = actLen0;
-      if (!(fc.row && fc.row.decision === 'SELL')) { sig.alert = false; sig.advisory = false; }
+      item.rotation = null;   // a switch is the Today Action Plan's call
+      if (fc.row && fc.row.decision === 'SELL') { item.finalTodo = fc.row.todo; sig.advisory = false; }   // the e-mail carries the plan's words (Codex P1, #1000)
+      else { sig.alert = false; sig.advisory = false; }
       var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);
     }
     sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);

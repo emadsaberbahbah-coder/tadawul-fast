@@ -1531,7 +1531,7 @@ def test_t16_every_stock_on_any_page_gets_one_decision(capsys):
     assert d["Decision"] == "HOLD" and "no new buys of it" in d["Do today"] and d["Analysis differs on"] == "none"
     # today's funded pick: the only BUY, with its levels; the Top 10 pages that do not size it are analysis
     n = rows["NMM.US"]
-    assert n["Decision"] == "BUY" and n["Do today"].startswith("Buy 24 shares with a limit between 84.50 and 88.01")
+    assert n["Decision"] == "BUY" and n["Do today"].startswith("Buy 24 NMM.US with a limit between 84.50 and 88.01")
     assert n["Qty"] == 24 and n["Stop"] == 80.17 and n["Cost SAR"] > 0 and n["Limit"] == "84.50 - 88.01"
     assert [k for k, r in rows.items() if r["Decision"] == "BUY"] == ["NMM.US"]
     # a Top 10 ticket that is not today's pick: WATCH, never a buy
@@ -1545,8 +1545,13 @@ def test_t16_every_stock_on_any_page_gets_one_decision(capsys):
     flat = [" | ".join(str(c) for c in r if c != "") for r in book.tabs["Today_Action_Plan"].values]
     i = [n for n, x in enumerate(flat) if x.startswith("ONE DECISION PER STOCK")][0]
     assert flat[i + 2] == "Symbol | Decision | Do today | Rule of record | Analysis differs on"
-    assert flat[i + 3].startswith("NMM.US | BUY | Buy 24 shares")
-    assert "SUPN.US | HOLD | Hold; stop 24.25. | Exit Plan | Portfolio_Decision_v2" in flat
+    assert flat[i + 3].startswith("NMM.US | BUY | Buy 24 NMM.US")
+    assert ("SUPN.US | HOLD | The broker stop on SUPN.US (23.00) is below the plan's stop (24.25): raise it for all 95 shares. "
+            "| Exit Plan | Portfolio_Decision_v2") in flat
+    # section A's own instruction rides in the row (Codex P1, #1000): the stop repair, the unread stop
+    assert rows["SUPN.US"]["Do today"] == "The broker stop on SUPN.US (23.00) is below the plan's stop (24.25): raise it for all 95 shares."
+    assert rows["IBOC.US"]["Do today"].startswith("Check the stop on IBOC.US at IBKR")
+    assert rows["GLPI.US"]["Do today"] == "Hold; stop 35.74."                   # nothing to do: the plain hold
     out = capsys.readouterr().out
     assert "FINAL SUPN.US   HOLD" in out and "wrote the Final_Decisions tab (" in out and " SAR" not in out.split("FINAL")[1]
 
@@ -1613,3 +1618,22 @@ def test_t16_off_preview_and_a_refused_tab_write(monkeypatch, capsys):
     assert "Final_Decisions not written: RuntimeError" in capsys.readouterr().out
     monkeypatch.setattr(tap, "final_rows", real)
     assert tap.run_once(True, book=_final_book(), now=NOW, capture=plan_capture()) == 0     # a dry run writes nothing
+
+
+def test_t16_the_final_row_keeps_every_instruction_section_a_gives():
+    """Codex P1 x2, #1000: a HOLD with a stop to place or repair, and a working buy with no stop attached or a check,
+    keep that instruction in the final row - no page that shows the row drops it."""
+    h = _h("AAA.US", "HOLD", 9.0) | {"qty": 10}
+    p = {"symbol": "BBB.US", "status": "OPEN", "qty": 5, "zone_low": 1.0, "zone_high": 1.1, "stop": 0.9, "placed": [(1.05, 5)]}
+    steps = [{"symbol": "AAA.US", "source": "Exit_Plan", "do": "No stop order is working at IBKR for AAA.US: place one at 9.00 for all 10 shares."},
+             {"symbol": "BBB.US", "source": "Daily_Plan", "do": "The buy order for BBB.US is working at IBKR: 5 shares at 1.05. After it fills, place the stop at 0.90."},
+             {"symbol": "ALL", "source": "Exit_Plan", "do": "Confirm every stop."},
+             {"symbol": "BBB.US", "source": "Top_10_Investments", "kind": "skip", "do": "Do not buy BBB.US from Top 10."}]
+    rows = {r["symbol"]: r for r in tap.final_decisions({"holdings": [h], "picks": [p], "pipeline": [], "steps": steps})}
+    assert rows["AAA.US"]["decision"] == "HOLD" and rows["AAA.US"]["do"] == steps[0]["do"]
+    assert rows["BBB.US"]["decision"] == "BUY" and rows["BBB.US"]["do"] == steps[1]["do"]      # the placed-stop text kept
+    assert "ALL" not in rows
+    # a verified sale keeps the plan's own words; two steps on one holding are both kept
+    two = steps[:1] + [{"symbol": "AAA.US", "source": "Exit_Plan", "do": "Second."}]
+    r = tap.final_decisions({"holdings": [h], "picks": [], "pipeline": [], "steps": two})[0]
+    assert r["do"] == steps[0]["do"] + " Second."
