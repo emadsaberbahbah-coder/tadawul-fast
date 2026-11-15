@@ -123,6 +123,31 @@ def test_n5_a_name_without_a_forecast_is_not_judged_and_the_switch_is_policy(mon
     assert changed["status"] == "board_funding_mismatch" and changed["selected"] == []
 
 
+@pytest.mark.parametrize("sizing", ["conviction", "risk"])
+def test_n6_the_names_that_replace_a_capped_seat_are_sized_in_every_sizing_mode(monkeypatch, sizing):
+    # Review on PR #992: the conviction cohort was formed before the deferral, so the two capped names took the
+    # whole budget and the two names below the line were sized at zero.
+    monkeypatch.setenv("TFB_OPP_SIZING_MODE", sizing)
+    payload = build()
+    assert [t["symbol"] for t in payload["selected"]] == ["UNDER.SR", "LOW.SR"], payload["meta"].get("sizing")
+    assert all(t["suggested_sar"] > 0 for t in payload["selected"])
+    cohort = payload["meta"]["sizing"].get("cohort")
+    if cohort is not None:
+        assert "CAP.SR" not in cohort and "EDGE.SR" not in cohort
+    monkeypatch.setenv("TFB_OPP_CAP_NO_NEW_MONEY", "observe")                   # observe leaves the cohort as before
+    seen = build()
+    monkeypatch.setenv("TFB_OPP_CAP_NO_NEW_MONEY", "off")
+    off = build()
+    assert [t["symbol"] for t in seen["selected"]] == [t["symbol"] for t in off["selected"]]
+    assert [t["suggested_sar"] for t in seen["selected"]] == [t["suggested_sar"] for t in off["selected"]]
+    assert seen["meta"]["sizing"].get("cohort") == off["meta"]["sizing"].get("cohort")
+
+
+def test_n7_the_cap_test_itself():
+    assert ob._cap_blocks({"engine_roi_12m_pct": 34.0}) is True and ob._cap_blocks({"engine_roi_12m_pct": 33.99}) is False
+    assert ob._cap_blocks({"engine_roi_12m_pct": None}) is False and ob._cap_blocks({}) is False
+
+
 def test_v1_version_and_inventory():
     assert ob.OPPORTUNITY_BUILDER_VERSION == "1.31.0" and "Version: 1.31.0" in ob.__doc__
-    assert callable(ob._env_cap_no_new_money)
+    assert callable(ob._env_cap_no_new_money) and callable(ob._cap_blocks)

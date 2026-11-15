@@ -1807,7 +1807,11 @@ from typing import Optional
 #   snapshot contract (TFB_OPP_* is in the policy fingerprint), the held-target
 #   and issuer rules. The Daily Plan (daily_plan 1.8.0, TFB_PLAN_ROI_CAP) applies
 #   the same line to the day's picks.
-#   Functions added: 1 (_env_cap_no_new_money). Removed: 0.
+#   The conviction and risk sizing cohorts (_sizing_cohort) leave capped names
+#   out under enforce, so the names that replace them are given a target
+#   (review on PR #992).
+#   Functions added: 2 (_env_cap_no_new_money, _cap_blocks). Changed:
+#   _sizing_cohort (skip_cap, default False). Removed: 0.
 #   Rollback: TFB_OPP_CAP_NO_NEW_MONEY=off (read per call), or git revert.
 # -----------------------------------------------------------------------------
 OPPORTUNITY_BUILDER_VERSION = "1.31.0"
@@ -6296,17 +6300,29 @@ def _conviction_targets(weights, budget, cap_sar, floor_sar=0.0):
     return {}
 
 
-def _sizing_cohort(invest_cands, criteria, replay, eligible, canon_market):
+def _cap_blocks(cand):
+    """v1.31.0: True when the candidate's engine 12-month ROI is at or above
+    RANK_CAP_ENGINE_ROI_PCT. A missing forecast is never at the cap. PURE."""
+    roi = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+    return roi is not None and roi >= RANK_CAP_ENGINE_ROI_PCT
+
+
+def _sizing_cohort(invest_cands, criteria, replay, eligible, canon_market, skip_cap=False):
     """PURE: the seats the allocator loop will consider, in rank order:
     replay eligibility, then the sector / market diversification caps,
     stopping at max_selected. Mirrors the loop's cheap pre-sizing deferrals
-    so a released slot is not pre-assigned budget."""
+    so a released slot is not pre-assigned budget. v1.31.0: skip_cap mirrors
+    the enforced forecast-cap deferral the same way (review on PR #992: the
+    conviction cohort pre-assigned the budget to capped seats, leaving the
+    names that replace them with no target)."""
     out, sectors, markets = [], {}, {}
     norm = _env_sector_normalize()
     for cand in invest_cands:
         if len(out) >= criteria["max_selected"]:
             break
         if replay and cand["symbol"].upper() not in eligible:
+            continue
+        if skip_cap and _cap_blocks(cand):
             continue
         sec, mkt = cand["sector"], cand["market"]
         key = _market_cap_key(mkt) if canon_market else mkt
@@ -6713,7 +6729,8 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         _sz_tilt = _env_sizing_tilt()
         _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
         _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
-                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+                                  set(criteria.get("board_funding_symbols") or []), canon_market,
+                                  skip_cap=_cap_mode == "enforce")
         _sz_weights = {c["symbol"]: _conviction_weight(c, criteria, _sz_tilt) for c in _sz_rows}
         _sz_cohort = set(_sz_weights)
         _sz_targets = _conviction_targets(_sz_weights, remaining, _sz_cap,
@@ -6732,7 +6749,8 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         _sz_risk = _env_risk_budget_pct()
         _sz_cap = max(0.0, criteria["max_weight_pct"] / 100.0 * budget_base)
         _sz_rows = _sizing_cohort(invest_cands, criteria, criteria.get("board_funding_stage") == "allocate",
-                                  set(criteria.get("board_funding_symbols") or []), canon_market)
+                                  set(criteria.get("board_funding_symbols") or []), canon_market,
+                                  skip_cap=_cap_mode == "enforce")
         _sz_cohort = {c["symbol"] for c in _sz_rows}
         # targets for every INVEST seat (they do not depend on each other),
         # so a seat the loop reaches after a release is sized on its own stop
@@ -6786,17 +6804,15 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                     "Held target (" + _ht + ") \u2014 no new money until the "
                     "provider leg returns")
                 continue
-        if _cap_mode != "off":
-            _cap_roi = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
-            if _cap_roi is not None and _cap_roi >= RANK_CAP_ENGINE_ROI_PCT:
-                _LAST_CAP_NNM["symbols"].append(cand["symbol"])
-                if _cap_mode == "enforce":
-                    _LAST_CAP_NNM["deferred"] += 1
-                    deferrals[cand["symbol"]] = (
-                        "Forecast at the cap (%.1f%% >= %g%%) \u2014 no new money"
-                        % (_cap_roi, RANK_CAP_ENGINE_ROI_PCT))
-                    continue
-                _LAST_CAP_NNM["would_defer"] += 1
+        if _cap_mode != "off" and _cap_blocks(cand):
+            _LAST_CAP_NNM["symbols"].append(cand["symbol"])
+            if _cap_mode == "enforce":
+                _LAST_CAP_NNM["deferred"] += 1
+                deferrals[cand["symbol"]] = (
+                    "Forecast at the cap (%.1f%% >= %g%%) \u2014 no new money"
+                    % (_engine_roi_to_pct(cand.get("engine_roi_12m_pct")), RANK_CAP_ENGINE_ROI_PCT))
+                continue
+            _LAST_CAP_NNM["would_defer"] += 1
         # v1.0.16: issuer-level cross-listing dedup (default OFF). Once an issuer
         # is FUNDED, a later listing of the SAME issuer (e.g. Takeda 4502.T then
         # TAK.US, or BMW.DE then BMW.XETRA) is deferred rather than taking a
