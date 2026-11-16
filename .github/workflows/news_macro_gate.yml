@@ -1,6 +1,8 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.0.1 (2026-11-16) -- ISSUER LINK: TFB_NEWS_ISSUER_LINK reaches the script (repository Variable;
+#       default on; observe counts only; off = news_macro_gate 1.0.2 behaviour).
 # VERSION 1.0.0 (2026-10-28) -- NEW WORKFLOW (program register A7, news layer)
 # WHY (owner request 28 Oct 2026): every GO/NO-GO has needed a hand-made
 #       macro and news check (war news, energy, the Fed, each name's own
@@ -96,6 +98,7 @@ jobs:
           TFB_NEWS_GATE_SOURCES: ${{ github.event.inputs.sources || vars.TFB_NEWS_GATE_SOURCES || '' }}
           TFB_NEWS_GATE_SYMBOLS: ${{ github.event.inputs.symbols || vars.TFB_NEWS_GATE_SYMBOLS || '' }}
           TFB_NEWS_GATE_EVIDENCE_DIR: news-gate-evidence
+          TFB_NEWS_ISSUER_LINK: ${{ vars.TFB_NEWS_ISSUER_LINK || 'on' }}   # 1.0.1: news_macro_gate 1.1.0 [ISSUER-LINK]; on | observe | off
         run: |
           # Schedule always writes; a manual dispatch writes ONLY when
           # write=true was explicitly ticked (dry run otherwise).
