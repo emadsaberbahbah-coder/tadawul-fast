@@ -1,7 +1,25 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.0 (2026-11-16)
+ * Version: 1.4.1 (2026-11-16)
+ *   1.4.1: TOP_10_INVESTMENTS_v2 NEVER EMPTY, AND IT LEADS WITH TODAY'S DECISIONS (owner, Mon 16 Nov 2026 09:55 Riyadh:
+ *          "Top_10_Investments_v2 is not ok, please review and improve"). Read at 09:56: the page built at 09:53 showed
+ *          SEATS 0, MERIT-QUALIFIED 0, EXECUTABLE 0 under a green EXECUTABLE chip, and no word of the three buys of the
+ *          day. Cause: the cockpit render of Top_10_Investments that started 08:44 was stopped by Google at the 6-minute
+ *          limit after it had cleared the board, so the main page held only its panel and KPIs ('status: running...')
+ *          and this page mirrored the empty board. Now:
+ *          (a) [LAST-GOOD] every read of a finished render (seats present, status not 'running') keeps a copy of
+ *              Top_10_Investments in the hidden tab _DP2_T10_LastGood; when the main page holds no seats, both v2 pages
+ *              read that copy and say so in an amber line ('SEATS FROM THE LAST FINISHED RENDER ...'), naming the
+ *              render that did not finish. Script Property DP2_T10_LAST_GOOD = 0 / off / false / no = the 1.4.0 reader.
+ *          (b) [TODAY] with the final decisions on (DP2_FINAL), the header chip reads the day's decision - 'BUY n TODAY'
+ *              or 'NO NEW BUY TODAY' - instead of the feed state (which moves to the right of the title bar), and a
+ *              TODAY'S DECISIONS block under the status lines lists every BUY and SELL of Final_Decisions with its
+ *              instruction, and the HOLD / WATCH / DO NOT INVEST names. A buy that is not a Top 10 seat (16 Nov: GTY.US)
+ *              is on the page.
+ *          (c) a seat whose final decision is BUY is the plan's order: its columns read 'Alloc SAR' / 'Buy qty' and it is
+ *              not flagged 'preview . not a ticket' (16 Nov: MBIN.US read FINAL: BUY and 'preview only, not a ticket').
+ *          Rollback: Project History -> 1.4.0, or DP2_T10_LAST_GOOD = off (a) and DP2_FINAL = off (b, c).
  *   1.4.0: ONE DECISION PER STOCK (owner, Mon 16 Nov 2026 01:01 Riyadh: "different pages ... in the end they should
  *          provide the same recommendations ... the final decision should be one decision buy hold sale or watchlist or
  *          don't invest"). On 16 Nov this page read SELL NOW on SUPN.US ('stop 33.76 hit') while the Exit Plan and
@@ -434,7 +452,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.0';   // lockstep with the header
+var DP2_VERSION = '1.4.1';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1406,11 +1424,48 @@ function dp2FeedView_(feed, nowMs) {
   }
   return { label: st || 'n/a', kind: 'amber', color: DP2C.amber, live: false, note: '' };
 }
+/* v1.4.1 [LAST-GOOD]: a finished render of Top_10_Investments is kept in a hidden tab; a page with no seats (a render
+ * stopped by Google after it cleared the board) is read from that copy. */
+var DP2_T10_LAST_GOOD_PROP = 'DP2_T10_LAST_GOOD';   // 0 / off / false / no = the 1.4.0 reader; default on
+var DP2_T10_LAST_GOOD_SHEET = '_DP2_T10_LastGood';
+var DP2_T10_LG_MEMO_ = null;   // one read (and at most one copy) per execution
+function dp2T10LastGoodOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_T10_LAST_GOOD_PROP)).trim()); }
+/* PURE: what to do with a read of the main page -> 'keep' (copy it), 'use' (read the copy instead) or 'live'. */
+function dp2T10LastGoodAction_(parsed) {
+  if (!parsed || !parsed.ok) return 'live';
+  if (parsed.seats.length > 0 && !/running/i.test(parsed.status)) return 'keep';
+  if (parsed.seats.length === 0) return 'use';
+  return 'live';
+}
 function dp2ReadTop10_() {
   var sh = dp2Sheet_(DP2.SRC_T10, false);
-  var out = { ok: false, status: '', kpi: {}, panel: {}, seats: [], qualified: [], gaps: [], banner: '', alerts: {} };
-  if (!sh) return out;
+  if (!sh) return dp2ParseTop10_(null);
   var vals = sh.getDataRange().getValues();
+  var live = dp2ParseTop10_(vals);
+  if (!dp2T10LastGoodOn_()) return live;
+  if (DP2_T10_LG_MEMO_ && DP2_T10_LG_MEMO_.liveStatus === live.status && DP2_T10_LG_MEMO_.liveSeats === live.seats.length) return DP2_T10_LG_MEMO_.out;
+  var act = dp2T10LastGoodAction_(live), out = live;
+  try {
+    var lg = dp2Sheet_(DP2_T10_LAST_GOOD_SHEET, act === 'keep');
+    if (act === 'keep' && lg) {
+      var w = 0; for (var r0 = 0; r0 < vals.length; r0++) w = Math.max(w, vals[r0].length);
+      var grid = vals.map(function (row) { var o = row.slice(); while (o.length < w) o.push(''); return o; });
+      lg.clear();
+      if (lg.getMaxColumns() < w) lg.insertColumnsAfter(lg.getMaxColumns(), w - lg.getMaxColumns());   // a new tab has 26 columns, the board 30 (Codex P1, #1002)
+      if (lg.getMaxRows() < grid.length) lg.insertRowsAfter(lg.getMaxRows(), grid.length - lg.getMaxRows());
+      if (grid.length && w) lg.getRange(1, 1, grid.length, w).setValues(grid);
+      try { lg.hideSheet(); } catch (eH) {}
+    } else if (act === 'use' && lg && lg.getLastRow() > 1) {
+      var kept = dp2ParseTop10_(lg.getDataRange().getValues());
+      if (kept.ok && kept.seats.length > 0) { out = kept; out.fromLastGood = { liveStatus: live.status, liveRun: live.lastRun, keptRun: kept.lastRun }; }
+    }
+  } catch (eLg) { out = live; }
+  DP2_T10_LG_MEMO_ = { liveStatus: live.status, liveSeats: live.seats.length, out: out };
+  return out;
+}
+function dp2ParseTop10_(vals) {   // v1.4.1: the 1.4.0 reader, on given values
+  var out = { ok: false, status: '', kpi: {}, panel: {}, seats: [], qualified: [], gaps: [], banner: '', alerts: {} };
+  if (!vals) return out;
   out.ok = true;
   // v1.2.15: the engine's ALERTS table (type · count · required action) — the cash_floor row states the reserve the engine took
   (function () {
@@ -2294,6 +2349,26 @@ function dp2FinalAction_(sym, r) {
   if (!r) return null;
   if (r.decision === 'HOLD' && /^Hold(; stop [^;]*)?\.?$/.test(dp2Str_(r.todo).trim())) return null;
   return { p: r.decision === 'SELL' ? 0 : 2, t: r.decision + ' ' + sym + ' (Today Action Plan): ' + dp2Str_(r.todo) };
+}
+/* PURE (v1.4.1 [TODAY]): the day's decisions for the Top_10_Investments_v2 header -> null (final off or not current) |
+ * { chip, kind, lines: [{ t, color, bold }] }. Every BUY and SELL with its instruction; the other decisions by name. */
+function dp2FinalToday_(fin) {
+  if (!fin || !fin.on || !fin.ok) return null;
+  var by = { 'SELL': [], 'BUY': [], 'HOLD': [], 'WATCH': [], 'DO NOT INVEST': [] };
+  for (var k in fin.rows) if (fin.rows.hasOwnProperty(k) && by[fin.rows[k].decision]) by[fin.rows[k].decision].push(k);
+  var nb = by.BUY.length, ns = by.SELL.length, lines = [];
+  lines.push({ t: 'TODAY\'S DECISIONS \u2014 Today Action Plan ' + fin.at + ' Riyadh: ' + nb + ' BUY \u00b7 ' + ns + ' SELL \u00b7 ' + by.HOLD.length + ' HOLD \u00b7 ' + by.WATCH.length + ' WATCH \u00b7 ' + by['DO NOT INVEST'].length + ' DO NOT INVEST. Orders come from the Today_Action_Plan page; the seats below are the engine\'s research.', color: DP2C.navyText, bold: true });
+  var each = function (d, color) { for (var i = 0; i < by[d].length; i++) { var r = fin.rows[by[d][i]]; lines.push({ t: d + '  ' + by[d][i] + ' \u2014 ' + r.todo + (r.cost ? ' (\u2248 ' + dp2Fmt_(r.cost) + ' SAR)' : ''), color: color, bold: true }); } };
+  each('SELL', DP2C.red); each('BUY', DP2C.green);
+  var names = function (d) { var n = by[d]; return n.length ? d + ' (' + n.length + '): ' + n.slice(0, 14).join(', ') + (n.length > 14 ? ' +' + (n.length - 14) : '') : ''; };
+  var rest = [names('HOLD'), names('WATCH'), names('DO NOT INVEST')].filter(function (x) { return !!x; }).join('  \u00b7  ');
+  if (rest) lines.push({ t: rest, color: DP2C.ink2, bold: false });
+  return { chip: nb ? 'BUY ' + nb + ' TODAY' : 'NO NEW BUY TODAY', kind: nb ? 'green' : 'navy', lines: lines };
+}
+/* PURE (v1.4.1 [LAST-GOOD]): the amber line of a page read from the kept copy. */
+function dp2LastGoodLine_(t) {
+  var f = t.fromLastGood || {};
+  return 'SEATS FROM THE LAST FINISHED RENDER (' + (f.keptRun || 'time n/a') + '): Top_10_Investments holds no seats now - its render' + (f.liveRun ? ' of ' + f.liveRun : '') + ' did not finish (' + dp2Str_(f.liveStatus).replace(/^Last run [0-9: -]+\| /, '').slice(0, 60) + '). Re-run the Top 10 refresh from the menu to rebuild it.';
 }
 /* The dp2SelfTest core (pure): the reader, the stale rule, the cell and the action. */
 function dp2FinalCoreOk_() {
@@ -3581,7 +3656,7 @@ function buildPortfolioDecisionV2() {
   var ib = dp2ReadIbkr_();
   var s1 = dp2ReadS1_();
   var switches = dp2ReadShadowSwitch_();
-  var t10 = dp2ReadTop10_();
+  var t10 = dp2ReadTop10_();   // v1.4.1: the last finished render when the main page holds no seats
   var fin = dp2ReadFinal_();   // v1.4.0 [ONE-DECISION]
 
   var fx = dp2Num_(ib.account['fx_usd_sar']) || pd.fx || DP2.FX_DEFAULT;
@@ -4042,12 +4117,17 @@ function buildTop10V2() {
   dp2ResetSheet_(sh);
   dp2ChartsBegin_(DP2.SHEET_CHARTS_T10);
   var row = 1;
+  var today = dp2FinalToday_(fin);   // v1.4.1 [TODAY]
+  if (today) dp2Header_(sh, row, 'TOP 10 INVESTMENTS — DECISION v2', today.chip, today.kind, 'feed ' + state + ' \u00b7 run ' + (feed.run || 'n/a') + ' \u00b7 cockpit ' + (t.lastRun || 'n/a'));
+  else
   dp2Header_(sh, row, 'TOP 10 INVESTMENTS — DECISION v2', state, chipKind, 'run ' + (feed.run || 'n/a') + ' · epoch ' + (t.epoch || 'n/a') + ' · cockpit ' + (t.lastRun || 'n/a'));
   if (dp2RpOn_()) { var rpHr = sh.getRange(row, 13); rpHr.setValue(dp2Str_(rpHr.getValues()[0][0]) + ' \u00b7 page built ' + dp2Today_()); }   // v1.2.34 [RENDER-PRIORITY]
   row++;
   dp2Line_(sh, row, (fv.label === 'SYNC RUNNING' || fv.label === 'EXPIRED' || fv.label === 'EXECUTABLE') ? 'Feed: ' + fv.note : 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
   var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';   // v1.2.34 [RENDER-PRIORITY] (gate on only)
   dp2Line_(sh, row, 'Status: ' + t.status + (rpNote ? ' \u2014 ' + rpNote : ''), { size: 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : 20 }); row++;
+  if (t.fromLastGood) { dp2Line_(sh, row, dp2LastGoodLine_(t), { color: DP2C.amber, size: 9.5, bg: DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.1 [LAST-GOOD]
+  if (today) { for (var td = 0; td < today.lines.length; td++) { dp2Line_(sh, row, today.lines[td].t, { color: today.lines[td].color, size: td === 0 ? 11 : 9.5, bg: td === 0 ? DP2C.headerBg : DP2C.surface, height: td === 0 ? 26 : 22, bold: td === 0 || today.lines[td].bold }); row++; } }   // v1.4.1 [TODAY]
   if (fin.on) { dp2Line_(sh, row, 'ONE DECISION PER STOCK: each seat\'s status starts with the Today Action Plan\'s final decision (' + DP2_FINAL_SHEET + (fin.ok ? ' of ' + fin.at + ' Riyadh' : ': ' + fin.why) + '). Alloc SAR / Buy qty show the plan\'s order on a BUY only; the engine sizing is analysis (Flags).', { color: fin.ok ? DP2C.navyText : DP2C.amber, size: 9.5, bg: fin.ok ? DP2C.surface : DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.0
   sh.setFrozenRows(row - 1);
   row++;
@@ -4110,7 +4190,7 @@ function buildTop10V2() {
   else   // the 1.2.30 wording (DP2_COHORT_LEGACY)
   row = dp2Section_(sh, row, 1, 16, 'SEATS — ' + seats.length + ' · ' + fast.length + ' plans · ' + grace.length + ' grace-held', 'Alloc / Buy qty = research allocation of the deployable cash across the FAST-TRACK plans, mirroring the engine\'s conviction sizing (weight = plan ROI × risk × reliability, per-seat cap ' + (alloc && alloc.cfg ? alloc.cfg.maxWeightPct : DP2A.MAX_WEIGHT_PCT) + '% of portfolio + cash (pre-reserve, the engine\'s budget_base), minimum ticket ' + (alloc && alloc.cfg && alloc.cfg.envPresent ? dp2Fmt_(alloc.cfg.opFloor) + ' SAR' + (alloc.cfg.venueOn ? ' raised to the venue floor' : '') : dp2Fmt_(DP2A.MIN_TICKET_SAR) + ' SAR research floor (DP2_ENGINE_ENV unset)') + ', the engine\'s own cash reserve). GRACE seats are not sized. Dyn. stop = entry − 2 × ATR14; Risk SAR = loss if that stop is hit; Exp. gain 3M = allocation × plan ROI. The engine\'s own tickets (when the feed is released) are the executable ones.');
   var sHdr = ['#', 'Symbol · name', '3-month close', 'Seat status', 'Price', 'Alloc SAR', 'Buy qty', 'Dyn. stop (2×ATR)', 'Risk SAR', 'Exp. gain 3M', 'ROI 3M plan', 'ROI 12M eng.', 'Rel · DQ · score', 'Flags'];
-  if (pvWhy) { sHdr[5] = 'Preview SAR'; sHdr[6] = 'Preview qty'; }   // v1.2.32
+  if (pvWhy && !fin.on) { sHdr[5] = 'Preview SAR'; sHdr[6] = 'Preview qty'; }   // v1.2.32; v1.4.1: with the final decisions the columns are the plan's order
   var sSp = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2];
   var sRows = [], sRisk = [], sState = [];
   var sCl = [];   // v1.2.31: each seat's class (dp2SeatClass_)
@@ -4179,7 +4259,7 @@ function buildTop10V2() {
       gain3 = (allocSar !== null && roi3 !== null) ? allocSar * roi3 / 100 : null;
       stability = tfc.text.replace(' \u00b7 v2 rule: ', ' \u00b7 seat: ');
     }
-    if (pvWhy && shares !== null) flags.unshift('preview \u00b7 not a ticket');   // v1.2.32: a sized seat on a page that cannot be acted on
+    if (pvWhy && shares !== null && !fin.on) flags.unshift('preview \u00b7 not a ticket');   // v1.4.1: on, only a final BUY carries a quantity   // v1.2.32: a sized seat on a page that cannot be acted on
     sRisk.push(riskSar); sState.push(ar ? ar.state : (isPlan ? '' : 'GRACE'));
     sRows.push([dp2Num_(s['Rank']) !== null ? dp2Num_(s['Rank']) : '—', sym + ' · ' + dp2Str_(s['Name']) + '\n' + sec + ' · ' + dp2Str_(s['Market']), dp2SparkFormula_(sym), stability, entry !== null ? dp2Fmt_(entry, 2) + ' ' + ccy : '—', allocSar !== null ? allocSar : (isPlan ? '—' : ''), shares !== null ? shares : (isPlan ? '—' : ''), stop0 !== null ? dp2Fmt_(stop0, 2) + ' (' + dp2Pct_((stop0 / entry - 1) * 100, 1) + ')\nATR ' + dp2Fmt_(xatr, 2) : 'n/a', riskSar !== null ? riskSar : '—', gain3 !== null ? gain3 : '—', roi3 !== null ? roi3 / 100 : null, roi12 !== null ? roi12 / 100 : null, dp2Fmt_(dp2Num_(s['Rel']), 1) + ' · ' + dp2Fmt_(dp2Num_(s['DQ']), 0) + ' · ' + dp2Fmt_(dp2Num_(s['Sm Score']), 1), flags.join(' · ')]);
   }
@@ -4192,7 +4272,7 @@ function buildTop10V2() {
     sh.getRange(srr, 9).setFontSize(8.5).setFontColor(DP2C.ink2);
     var rk = sRisk[i]; if (rk !== null && navSar && rk / navSar * 100 > DP2X.RISK_WARN_PCT_NAV) sh.getRange(srr, 10).setFontColor(DP2C.red).setFontWeight('bold');
     var ac = sh.getRange(srr, 7, 1, 2).setFontWeight('bold');
-    if (sState[i] === 'FUNDED' && pvWhy) ac.setFontColor(DP2C.grey).setFontWeight('normal').setFontStyle('italic');   // v1.2.32: a preview, not cash
+    if (sState[i] === 'FUNDED' && pvWhy && !fin.on) ac.setFontColor(DP2C.grey).setFontWeight('normal').setFontStyle('italic');   // v1.2.32: a preview, not cash
     else if (sState[i] === 'FUNDED') ac.setFontColor(DP2C.green); else if (sState[i] === 'NEED') ac.setFontColor(DP2C.amber);
   }
   dp2Line_(sh, row, 'Price history for the stops: ' + seatFresh + ' of ' + seats.length + ' seats on fresh bars (' + (Object.keys(seatSources).join(', ') || 'none') + ') · prices = live last when available, else the cockpit price · dynamic stops for HELD names run on Portfolio_Decision_v2 with e-mail alerts.', { size: 8.5, color: DP2C.ink2, bg: DP2C.surface, height: 22 });
