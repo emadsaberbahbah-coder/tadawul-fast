@@ -1510,6 +1510,32 @@ def _final(book):
     return head, {r[0]: dict(zip(head, r)) for r in vals[1:]}
 
 
+def test_t16_the_archive_keeps_the_final_decisions(monkeypatch):
+    """1.6.3: the run's final decisions go to the plan archive as row_type "final" rows (plan_archive 1.1.0), so the
+    IBKR dashboard can show the same one decision per stock as the workbook."""
+    from scripts import plan_archive
+    kept = []
+    monkeypatch.setattr(plan_archive, "archive", lambda rows, out, session=None: kept.extend(rows))
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    _, rows = _final(book)
+    fin = [r for r in kept if r["row_type"] == "final"]
+    assert [r["seq"] for r in fin] == list(range(1, len(rows) + 1)) and [r["symbol"] for r in fin] == list(rows)
+    for r in fin:
+        t = rows[r["symbol"]]
+        assert (r["label"], r["instruction"], r["source"]) == (t["Decision"], t["Do today"], t["Rule of record"])
+        assert r["tone"] == ("ok" if t["Analysis differs on"] == "none" else "warn")
+        assert ("stop=" in r["levels"]) == (t["Stop"] != "") and r["version"] == tap.__version__
+    s = next(r for r in fin if r["symbol"] == "SUPN.US")
+    assert s["kind"] == "hold" and s["levels"].endswith("differs=Portfolio_Decision_v2")
+    assert {"summary", "tile"} <= set(r["row_type"] for r in kept)        # the other rows are still there
+    # with the final decisions switched off, the archive keeps the other rows and no final row
+    kept.clear()
+    monkeypatch.setenv("TFB_TAP_FINAL", "off")
+    assert tap.run_once(False, book=_final_book(), now=NOW, capture=plan_capture()) == 0
+    assert kept and not [r for r in kept if r["row_type"] == "final"]
+
+
 def test_t16_every_stock_on_any_page_gets_one_decision(capsys):
     """Owner, 16 Nov 01:01: the pages may use different rules, but each stock gets ONE final decision."""
     book = _final_book()

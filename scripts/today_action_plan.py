@@ -4,7 +4,11 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.6.2 (2026-11-16)
+v1.6.3 (2026-11-16)
+  1.6.3: THE FINAL DECISIONS GO TO THE PLAN ARCHIVE TOO (plan_archive 1.1.0). The IBKR dashboard reads the archive and
+         showed the plan's steps only, so a holding whose decision is "hold, nothing to change" was not on it at all.
+         archive_rows now passes the run's final decisions; each is kept as a row_type "final" row of the same run.
+         The page, the Final_Decisions tab and every decision are the 1.6.2 ones.
   1.6.2: A RAISE THE BROKER ALREADY CARRIES IS NOT AN INSTRUCTION (16 Nov 13:43 Riyadh run, read on the sheet at 14:25:
          the Final_Decisions row of one holding said "Hold; raise the stop to <plan stop> for all <n> shares" while
          section A had no step for it and the summary read "0 step(s) on holdings" - the stop working at IBKR was
@@ -204,7 +208,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1463,14 +1467,15 @@ def summary_line(d: Dict[str, Any]) -> Tuple[str, bool]:
 
 
 def archive_rows(d: Dict[str, Any], now: _dt.datetime, rid: str) -> List[Dict[str, Any]]:
-    """1.4.0: the run as rows for the plan archive - the steps with their chip, the five tiles, the summary line."""
+    """1.4.0: the run as rows for the plan archive - the steps with their chip, the five tiles, the summary line;
+    1.6.3: and the final decisions, one per stock."""
     from scripts import plan_archive  # noqa: PLC0415
     c = day_counts(d)
     steps = [dict(s, kind=step_kind(s), label=CHIP[step_kind(s)][1]) for s in d["steps"]]
     tiles = day_tiles(d, c["n_buy"], c["hard"], c["unfunded"]) if d.get("aligned") else []
     line, alert = summary_line(d)
     return plan_archive.plan_rows(steps, tiles, line, d["stale"], d.get("missing") or [], now, rid, __version__,
-                                  alert=alert)
+                                  alert=alert, finals=d.get("final") or [])
 
 
 def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) -> _Page:

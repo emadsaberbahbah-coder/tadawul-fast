@@ -4,8 +4,16 @@ scripts/plan_archive.py
 ================================================================================
 TFB plan archive - each Today Action Plan run, kept as rows in BigQuery
 --------------------------------------------------------------------------------
-v1.0.0 (2026-11-13)
-  Owner, 13 Nov 22:44 Riyadh: "add action plan to the IBKR Dashboard". The
+v1.1.0 (2026-11-16)
+  1.1.0: THE FINAL DECISIONS, KEPT TOO (owner, 16 Nov: "each stock must end with ONE final decision shown the same on
+         every page"; the IBKR dashboard is one of those pages and reads this archive). plan_rows takes `finals` - the
+         run's Final_Decisions rows (today_action_plan.final_decisions) - and adds one row per stock with
+         row_type "final": kind = the decision in lower case, label = the decision, symbol, instruction = what to do,
+         levels = "qty=.. · limit=.. · stop=.. · cost_sar=.. · differs=.." (only the parts the row has), why = the
+         reason, source = the rule of record, tone = warn when another page's own rule differs, else ok. No column is
+         added, so the table and every reader of the other row types are unchanged. Without `finals` the rows are the
+         1.0.0 ones.
+  1.0.0 (2026-11-13): Owner, 13 Nov 22:44 Riyadh: "add action plan to the IBKR Dashboard". The
   dashboard reads BigQuery, and the plan was written only to its workbook tab.
   After the Today_Action_Plan page is written, its steps, its five day tiles
   and one summary row are appended to <dataset>.<TFB_TAP_BQ_TABLE> (default
@@ -35,7 +43,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -47,7 +55,7 @@ SCHEMA: List[Dict[str, str]] = [
     {"name": "plan_date", "type": "DATE", "mode": "REQUIRED", "description": "the Riyadh day the page is for"},
     {"name": "run_id", "type": "STRING", "description": "the workflow run that built it"},
     {"name": "version", "type": "STRING", "description": "today_action_plan version"},
-    {"name": "row_type", "type": "STRING", "description": "step | tile | summary"},
+    {"name": "row_type", "type": "STRING", "description": "step | tile | summary | final (1.1.0: one per stock)"},
     {"name": "seq", "type": "INTEGER", "description": "the step's number on the page, or the tile's place (1-5)"},
     {"name": "kind", "type": "STRING", "description": "a step's kind: sell, profit, stop, broker, review, buy, skip, news, nofund, placed, verify"},
     {"name": "label", "type": "STRING", "description": "the step's chip (SELL, BUY ...) or the tile's label"},
@@ -80,9 +88,10 @@ def run_id(now: _dt.datetime) -> str:
 
 def plan_rows(steps: Sequence[Dict[str, Any]], tiles: Sequence[Sequence[str]], summary: str, stale: Sequence[str],
               missing: Sequence[str], now: _dt.datetime, rid: str, version: str,
-              alert: Optional[bool] = None) -> List[Dict[str, Any]]:
+              alert: Optional[bool] = None, finals: Optional[Sequence[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """The run as rows. `steps` carry "kind" and "label" (the page's chip); `tiles` are (label, value, note, tone).
-    `alert` is the page's own alert state (its summary band); without it, a stale or unread source is the alert."""
+    `alert` is the page's own alert state (its summary band); without it, a stale or unread source is the alert.
+    1.1.0: `finals` are the run's final decisions, one per stock (see final_levels)."""
     base = {"run_at": now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "plan_date": now.astimezone(RIYADH).strftime("%Y-%m-%d"), "run_id": rid, "version": version}
     out: List[Dict[str, Any]] = [dict(base, row_type="summary", seq=0, kind="", label="", symbol="",
@@ -96,7 +105,34 @@ def plan_rows(steps: Sequence[Dict[str, Any]], tiles: Sequence[Sequence[str]], s
         lab, val, note, tone = (list(t) + ["", "", "", ""])[:4]
         out.append(dict(base, row_type="tile", seq=i, kind="", label=_t(lab), symbol="", instruction=_t(val),
                         levels=_t(note), why="", source="", tone=_t(tone)))
+    for i, f in enumerate(finals or [], 1):                         # 1.1.0: the one decision per stock
+        dec = _t(f.get("decision"))
+        out.append(dict(base, row_type="final", seq=i, kind=dec.lower().replace(" ", "_"), label=dec,
+                        symbol=_t(f.get("symbol")), instruction=_t(f.get("do")), levels=_t(final_levels(f)),
+                        why=_t(f.get("why")), source=_t(f.get("rule")), tone="warn" if f.get("differs") else "ok"))
     return out
+
+
+def _num(v: Any) -> str:
+    """A number as short text ("" when it is not one): 120.0 -> 120, 9.5000 -> 9.5."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if x != x or x in (float("inf"), float("-inf")):
+        return ""
+    return ("%.4f" % x).rstrip("0").rstrip(".")
+
+
+def final_levels(f: Dict[str, Any]) -> str:
+    """1.1.0: a final decision's levels as "name=value" parts joined by " · " - only the parts the row has."""
+    parts = []
+    for name, val in (("qty", _num(f.get("qty"))), ("limit", str(f.get("limit") or "").strip()),
+                      ("stop", _num(f.get("stop"))), ("cost_sar", _num(f.get("cost"))),
+                      ("differs", ", ".join(str(x) for x in (f.get("differs") or [])))):
+        if val:
+            parts.append("%s=%s" % (name, val.replace(" · ", " - ")))
+    return " · ".join(parts)
 
 
 def _err(resp: Any) -> str:
