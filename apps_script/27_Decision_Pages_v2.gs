@@ -1,7 +1,18 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.1 (2026-11-16)
+ * Version: 1.4.2 (2026-11-16)
+ *   1.4.2: [STATUS-LINE] THE STATUS ROW OF TOP_10_INVESTMENTS_v2 IS ONE SHORT LINE (owner, Mon 16 Nov 2026 11:23 Riyadh:
+ *          "review and improve"). Row 3 copied the main page's whole status line - 600 to 900 characters of tokens
+ *          (pool, route, builder, epoch, earnings, SelLog ...) in 8-point type - so the facts that matter (when the board
+ *          was rendered, did it finish, is the source verified, how many tickets) were not readable. Now
+ *          dp2StatusShortCore_ (pure) reads them out of that line: 'Status: Last run <time> . status <x> . output <X> .
+ *          source verified | withheld (<reason>) . <n> executable . <n> held by the ticket guard . <s> s', plus, when the
+ *          main page kept its board after a render that ran out of time (16_Decision_Top10 1.30.0), ' - a later render
+ *          (<HH:MM>) ran out of time at <s> s; this board was kept'. The full line goes to the cell's note. The row still
+ *          starts 'Status: Last run <time>', so readers keyed on that text (scripts/consistency_check.py C3) read the same
+ *          time. A line that does not start 'Last run <time> | status:' is shown whole, as before. Script Property
+ *          DP2_STATUS_SHORT = 0 / off / false / no = the 1.4.1 row.
  *   1.4.1: TOP_10_INVESTMENTS_v2 NEVER EMPTY, AND IT LEADS WITH TODAY'S DECISIONS (owner, Mon 16 Nov 2026 09:55 Riyadh:
  *          "Top_10_Investments_v2 is not ok, please review and improve"). Read at 09:56: the page built at 09:53 showed
  *          SEATS 0, MERIT-QUALIFIED 0, EXECUTABLE 0 under a green EXECUTABLE chip, and no word of the three buys of the
@@ -452,7 +463,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.1';   // lockstep with the header
+var DP2_VERSION = '1.4.2';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2284,6 +2295,29 @@ var DP2_FINAL_SHEET = 'Final_Decisions';
 var DP2_FINAL_PROP = 'DP2_FINAL';               // 0 / off / false / no = the 1.3.1 pages; default on
 var DP2_FINAL_MAX_H_PROP = 'DP2_FINAL_MAX_H';   // hours the table counts as current (default 6, 1-48)
 var DP2_FINAL_DECISIONS = ['SELL', 'BUY', 'HOLD', 'WATCH', 'DO NOT INVEST'];
+var DP2_STATUS_SHORT_PROP = 'DP2_STATUS_SHORT';   // 1.4.2: 0 / off / false / no = the 1.4.1 status row; default on
+function dp2StatusShortOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_STATUS_SHORT_PROP)).trim()); }
+/* PURE (1.4.2 [STATUS-LINE]): the main page's status line as one short line ('' = not a 'Last run <time> | status:' line). */
+function dp2StatusShortCore_(raw) {
+  var s = dp2Str_(raw).replace(/^\s+|\s+$/g, '');
+  var m = /^Last run (\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\s*\|\s*status:\s*([^|]+?)\s*(?:\||$)/.exec(s);
+  if (!m) return '';
+  var parts = ['Status: Last run ' + m[1], 'status ' + m[2]];
+  var out = /\|\s*output:\s*([A-Z_]+)/.exec(s);
+  if (out) parts.push('output ' + out[1]);
+  var src = /source readiness (VERIFIED|WITHHELD)(?::\s*([^|]{1,80}))?/.exec(s);
+  if (src) parts.push('source ' + (src[1] === 'VERIFIED' ? 'verified' : 'withheld' + (src[2] ? ' (' + src[2].replace(/\s+$/, '') + ')' : '')));
+  var ex = /funding=final\/(\d+)exec/.exec(s);
+  if (ex) parts.push(ex[1] + ' executable');
+  var tg = /tguard: held (\d+)/.exec(s);
+  if (tg) parts.push(tg[1] + ' held by the ticket guard');
+  var sec = /\|\s*(\d+(?:\.\d+)?)s\s*(?:\||$)/.exec(s), ms = /\|\s*(\d+)ms\s*(?:\||$)/.exec(s);
+  if (sec) parts.push(sec[1] + ' s'); else if (ms) parts.push(Math.round(+ms[1] / 100) / 10 + ' s');
+  var line = parts.join(' \u00b7 ');
+  var sk = /\| SKIPPED render \d{4}-\d{2}-\d{2} (\d{2}:\d{2})(?::\d{2})? \(out of time: t\+([\d.]+)s/.exec(s);
+  if (sk) line += ' \u2014 a later render (' + sk[1] + ') ran out of time at ' + sk[2] + ' s; this board was kept';
+  return line + ' (full status line in this cell\'s note)';
+}
 function dp2FinalOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_FINAL_PROP)).trim()); }
 /* PURE: Final_Decisions values -> { ok, at 'yyyy-MM-dd HH:mm', rows: { SYMBOL: { decision, todo, qty, limit, stop, cost,
  * differs } } }. The header row is found by name; a row with a decision outside DP2_FINAL_DECISIONS is skipped. */
@@ -4125,7 +4159,10 @@ function buildTop10V2() {
   row++;
   dp2Line_(sh, row, (fv.label === 'SYNC RUNNING' || fv.label === 'EXPIRED' || fv.label === 'EXECUTABLE') ? 'Feed: ' + fv.note : 'Blocker: ' + (feed.blocker || 'none') + (feed.reasons ? ' → ' + feed.reasons : '') + (feed.reasons && /coverage_failed/.test(feed.reasons) ? ' (' + dp2CoverageNote_() + ')' : '') + (feed.reasons && /decision_failed/.test(feed.reasons) ? ' (decision pages ran before the sync landed: receipt run ≠ sync run)' : ''), { color: DP2C.ink, bg: DP2C.surface, height: 30 }); row++;
   var rpNote = dp2RpOn_() ? dp2RpRunningNoteCore_(t.status, t.lastRun, new Date().getTime()) : '';   // v1.2.34 [RENDER-PRIORITY] (gate on only)
-  dp2Line_(sh, row, 'Status: ' + t.status + (rpNote ? ' \u2014 ' + rpNote : ''), { size: 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : 20 }); row++;
+  var stShort = dp2StatusShortOn_() ? dp2StatusShortCore_(t.status) : '';   // 1.4.2 [STATUS-LINE]: '' = the 1.4.1 row
+  dp2Line_(sh, row, (stShort || 'Status: ' + t.status) + (rpNote ? ' \u2014 ' + rpNote : ''), { size: stShort ? 9 : 8, bg: rpNote ? DP2C.amberBg : DP2C.surface, height: rpNote ? 30 : (stShort ? 22 : 20) });
+  if (stShort) { try { sh.getRange(row, 1).setNote(dp2Str_(t.status)); } catch (eNt) {} }   // the full line, on the row's first cell
+  row++;
   if (t.fromLastGood) { dp2Line_(sh, row, dp2LastGoodLine_(t), { color: DP2C.amber, size: 9.5, bg: DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.1 [LAST-GOOD]
   if (today) { for (var td = 0; td < today.lines.length; td++) { dp2Line_(sh, row, today.lines[td].t, { color: today.lines[td].color, size: td === 0 ? 11 : 9.5, bg: td === 0 ? DP2C.headerBg : DP2C.surface, height: td === 0 ? 26 : 22, bold: td === 0 || today.lines[td].bold }); row++; } }   // v1.4.1 [TODAY]
   if (fin.on) { dp2Line_(sh, row, 'ONE DECISION PER STOCK: each seat\'s status starts with the Today Action Plan\'s final decision (' + DP2_FINAL_SHEET + (fin.ok ? ' of ' + fin.at + ' Riyadh' : ': ' + fin.why) + '). Alloc SAR / Buy qty show the plan\'s order on a BUY only; the engine sizing is analysis (Flags).', { color: fin.ok ? DP2C.navyText : DP2C.amber, size: 9.5, bg: fin.ok ? DP2C.surface : DP2C.amberBg, height: 30, bold: true }); row++; }   // v1.4.0
