@@ -74,7 +74,7 @@ function makeEnv(sheets, opts) {
   const ctx = {
     Date: FakeDate,
     SpreadsheetApp: { getActive: () => book, newConditionalFormatRule: ruleBuilder },
-    PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); } }) },
+    PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); }, deleteProperty: k => { delete props[k]; } }) },
     LockService: { getScriptLock: () => ({ tryLock: () => !opts.busy, releaseLock() {} }) },
     ScriptApp: {
       getProjectTriggers: () => triggers.slice(),
@@ -249,6 +249,10 @@ test('S8 (1.1.0) the today line in Top_10_Investments!A3: written when empty, ke
   const w3 = world(); delete w3.Final_Decisions;
   const e3 = makeEnv(w3); e3.ctx.fdcTick();
   ok(!e3.book.getSheetByName('Top_10_Investments')._cells.get('3:1'), 'nothing without the decisions');
+  // a written line goes when Final_Decisions is removed or renamed (Codex P2, #1003)
+  env.book._s.delete('Final_Decisions');
+  ok(/A3: cleared \(Final_Decisions missing\)/.test(env.ctx.fdcTick()), 'reported');
+  eq(t10._cells.get('3:1').v, '', 'no old decisions left on screen');
   // the readers' landmarks stay: row 2 status, row 4 panel, the seats header
   eq(t10._cells.get('2:2').v, 'Last run 2026-11-16 08:30'); eq(t10._cells.get('4:1').v, 'CONTROL PANEL');
 });
@@ -271,6 +275,13 @@ test('S9 (1.1.0) a render stopped by Google is re-run once, in its own execution
   }
   const c = makeEnv(world()).ctx;
   ok(!c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 6, true) && !c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 23, true) && c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 22, true), 'only 07:00-23:00 Riyadh');
+  // a scheduling failure clears the reservation, so the next tick tries again (Codex P2, #1003)
+  const f = mk(stuck); let fail = true; const realNew = f.ctx.ScriptApp.newTrigger;
+  f.ctx.ScriptApp.newTrigger = h => { if (fail) throw new Error('quota'); return realNew(h); };
+  f.ctx.fdcTick();
+  ok(!('FDC_RERUN_FOR' in f.props) && reruns(f).length === 0 && f.book.toasts.some(t => /could not be scheduled \(the next tick tries again\): quota/.test(t)), 'released');
+  fail = false; f.ctx.fdcTick();
+  eq(reruns(f).length, 1, 'scheduled on the next tick'); eq(f.props.FDC_RERUN_FOR, '2026-11-16 08:30:00');
   // the 10-minute trigger is never touched by the re-run bookkeeping
   const t = mk(stuck); t.ctx.fdcInstallTrigger(); eq(t.triggers.filter(x => x.h === 'fdcTick').length, 1); eq(reruns(t).length, 1);
 });

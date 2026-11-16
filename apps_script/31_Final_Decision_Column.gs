@@ -245,7 +245,10 @@ function fdcTick() {
   } finally { if (lock) { try { lock.releaseLock(); } catch (e2) {} } }
   if (rerun) {   // 1.1.0 [RE-RUN]: its own execution one minute on, so the render has the whole 6 minutes
     try { fdcRemoveRerunTriggers_(); ScriptApp.newTrigger(FDC.RERUN_HANDLER).timeBased().after(60 * 1000).create(); }
-    catch (eR) { fdcNotify_('FINAL DECISION column: the re-run of the stopped ' + rerun + ' render could not be scheduled: ' + String(eR && eR.message || eR).slice(0, 160)); }
+    catch (eR) {
+      try { PropertiesService.getScriptProperties().deleteProperty(FDC.PROP_RERUN_FOR); } catch (eP) {}   // Codex P2, #1003: the next tick tries again
+      fdcNotify_('FINAL DECISION column: the re-run of the stopped ' + rerun + ' render could not be scheduled (the next tick tries again): ' + String(eR && eR.message || eR).slice(0, 160));
+    }
   }
   return line;
 }
@@ -263,9 +266,10 @@ function fdcRerunTop10() {
 /* 1.1.0 [TODAY-LINE]: Top_10_Investments!A3, only while it is empty or already this line. */
 function fdcStampToday_(ss, src, staleH) {
   var sh = ss.getSheetByName(FDC.T10), fd = ss.getSheetByName(FDC.SOURCE);
-  if (!sh || !fd) return 'A3: skipped';
+  if (!sh) return 'A3: skipped';
   var cell = sh.getRange(3, 1), cur = fdcTrim_(cell.getValues()[0][0]);
   if (cur && cur.indexOf('TODAY (') !== 0) return 'A3: not empty, left';
+  if (!fd) { if (cur) cell.setValue(''); return 'A3: cleared (' + FDC.SOURCE + ' missing)'; }   // Codex P2, #1003: never an old line
   var vals = fd.getLastRow() > 1 ? fd.getRange(1, 1, Math.min(fd.getLastRow(), 400), 2).getValues() : [];
   var line = fdcTodayLine_(vals, src, staleH);
   if (!line) { if (cur) cell.setValue(''); return 'A3: cleared (no current decisions)'; }
