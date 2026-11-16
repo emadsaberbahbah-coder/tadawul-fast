@@ -1,7 +1,23 @@
 /**
  * 31_Final_Decision_Column.gs
  * Emad Bahbah Financial Advisor - the FINAL DECISION column on the engine pages
- * Version: 1.0.0 (2026-11-16)
+ * Version: 1.1.0 (2026-11-16)
+ *   1.1.0: TOP_10_INVESTMENTS REVIEW (owner, Mon 16 Nov 2026 11:23 Riyadh: "Top_10_Investments, what about this page,
+ *          review and improve or is it ok?"). Read at 11:24: the page works (render 10:16, status ok) but (1) its render of
+ *          08:44 - the one after the 08:41 IBKR capture, stopped by Google on 9, 10 and 16 Nov - left the board empty with
+ *          'status: running...' for 90 minutes until the owner re-ran it by hand; (2) the FINAL DECISION column sits in
+ *          column AF, 30 columns to the right, so the day's decision is not on screen. Two additions, both on the same
+ *          10-minute tick:
+ *          (a) [TODAY-LINE] cell A3 of Top_10_Investments (an empty spacer row inside the frozen header, so always on
+ *              screen) reads the day's decisions: "TODAY (Today Action Plan HH:MM): BUY ... . SELL ... . The FINAL
+ *              DECISION of every seat is in column AF; orders come from Today_Action_Plan." Written only while A3 is
+ *              empty or already holds this line; no reader uses row 3 (the panel is read from row 4 on, the banner from
+ *              the KPI row on).
+ *          (b) [RE-RUN] a render whose status has read 'running' for FDC_STUCK_MIN minutes (20) was stopped by Google
+ *              (a finished render takes 2-4 minutes): the tick schedules refreshDecisionTop10 once for that stopped run,
+ *              in its own execution one minute later (fdcRerunTop10, a one-off trigger that removes itself), so the
+ *              render has the whole 6 minutes; between 07:00 and 23:00 Riyadh only. Script Property FDC_RERUN = off turns
+ *              it off; FDC_RERUN_FOR records the stopped run it was done for (never twice for the same run).
  *   1.0.0: ONE DECISION ON EVERY PAGE (owner, Mon 16 Nov 2026 01:01 and 08:49 Riyadh: "in the end they should provide
  *          the same recommendations ... the final decision should be one decision"; "let's complete the remaining").
  *          The Today Action Plan writes the Final_Decisions tab (today_action_plan 1.6.0): one decision per stock -
@@ -29,7 +45,7 @@
  * CONVENTIONS: ES5 only; no onOpen here.
  */
 'use strict';
-var FDC_VERSION = '1.0.0';   // lockstep with the header
+var FDC_VERSION = '1.1.0';   // lockstep with the header
 
 var FDC = {
   SOURCE: 'Final_Decisions',
@@ -41,6 +57,13 @@ var FDC = {
   WIDTH_PX: 330,
   PROP_STALE: 'FDC_STALE_H',
   PROP_LAST: 'FDC_LAST_TICK',
+  PROP_RERUN: 'FDC_RERUN',
+  PROP_RERUN_FOR: 'FDC_RERUN_FOR',
+  STUCK_MIN: 20,
+  RERUN_HANDLER: 'fdcRerunTop10',
+  RERUN_FROM_H: 7,
+  RERUN_TO_H: 23,
+  T10: 'Top_10_Investments',
   PAGES: [
     { name: 'Top_10_Investments', need: ['Rank', 'Symbol', 'Ticket SAR', 'Shares'], until: 'blank' },
     { name: 'Portfolio_Decision', need: ['Action', 'Symbol'], until: 'blank' },
@@ -123,6 +146,34 @@ function fdcStaleH_() {
   return (v >= 1 && v <= 48) ? v : 6;
 }
 
+/* PURE (1.1.0 [TODAY-LINE]): Final_Decisions values -> the line for Top_10_Investments!A3, or '' when not read. */
+function fdcTodayLine_(vals, src, staleH) {
+  if (!src || !src.ok) return '';
+  var buy = [], sell = [];
+  for (var r = 1; r < (vals || []).length; r++) {
+    var sym = fdcTrim_(vals[r][0]), dec = fdcTrim_(vals[r][1]).toUpperCase();
+    if (!sym) continue;
+    if (dec === 'BUY') buy.push(sym); else if (dec === 'SELL') sell.push(sym);
+  }
+  var old = src.ageH !== null && src.ageH > staleH;
+  return 'TODAY (Today Action Plan ' + src.at + (old ? ', OLD' : '') + '): BUY ' + (buy.length ? buy.join(', ') : 'none') +
+    ' \u00b7 SELL ' + (sell.length ? sell.join(', ') : 'none') + '. The FINAL DECISION of every seat is in the FINAL DECISION ' +
+    'column at the right; orders come from Today_Action_Plan - this page is the engine\'s research.';
+}
+/* PURE (1.1.0 [RE-RUN]): the Top 10 status cell -> { run: 'yyyy-MM-dd HH:mm:ss', minutes } when it reads running, else null. */
+function fdcStuck_(status, nowMs) {
+  var t = fdcTrim_(status);
+  if (!/status:\s*running/i.test(t)) return null;
+  var m = /Last run (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(t);
+  if (!m) return null;
+  var ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5], +m[6]);
+  return { run: m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6], minutes: Math.max(0, (nowMs - ms) / 60000) };
+}
+/* PURE (1.1.0 [RE-RUN]): whether to re-run now. */
+function fdcRerunDue_(stuck, rerunFor, riyadhHour, on) {
+  return !!(on && stuck && stuck.minutes >= FDC.STUCK_MIN && rerunFor !== stuck.run && riyadhHour >= FDC.RERUN_FROM_H && riyadhHour < FDC.RERUN_TO_H);
+}
+
 /* ------------------------------------------------------------ the workbook */
 function fdcReadSource_(ss) {
   var sh = ss.getSheetByName(FDC.SOURCE);
@@ -178,7 +229,7 @@ function fdcStampPage_(ss, cfg, src, staleH) {
 }
 /* The time trigger's handler (and the manual refresh). */
 function fdcTick() {
-  var lock = null;
+  var lock = null, rerun = '', line = '';
   try { lock = LockService.getScriptLock(); if (!lock.tryLock(5000)) return 'busy: another script holds the lock'; } catch (e0) { lock = null; }
   try {
     var ss = SpreadsheetApp.getActive(), src = fdcReadSource_(ss), staleH = fdcStaleH_(), out = [];
@@ -186,10 +237,52 @@ function fdcTick() {
       try { out.push(fdcStampPage_(ss, FDC.PAGES[i], src, staleH)); }
       catch (e) { out.push(FDC.PAGES[i].name + ': ' + String(e && e.message || e).slice(0, 120)); }
     }
-    var line = new Date().toISOString().slice(0, 16) + 'Z \u00b7 ' + (src.ok ? FDC.SOURCE + ' ' + src.at : FDC.SOURCE + ' not read') + ' \u00b7 ' + out.join(' \u00b7 ');
+    try { out.push(fdcStampToday_(ss, src, staleH)); } catch (eT) { out.push('A3: ' + String(eT && eT.message || eT).slice(0, 80)); }   // 1.1.0
+    rerun = fdcRerunCheck_(ss);   // 1.1.0: decided under the lock, run after it is released
+    if (rerun) out.push('re-run of the stopped ' + rerun + ' render started');
+    line = new Date().toISOString().slice(0, 16) + 'Z \u00b7 ' + (src.ok ? FDC.SOURCE + ' ' + src.at : FDC.SOURCE + ' not read') + ' \u00b7 ' + out.join(' \u00b7 ');
     try { PropertiesService.getScriptProperties().setProperty(FDC.PROP_LAST, line); } catch (e1) {}
-    return line;
   } finally { if (lock) { try { lock.releaseLock(); } catch (e2) {} } }
+  if (rerun) {   // 1.1.0 [RE-RUN]: its own execution one minute on, so the render has the whole 6 minutes
+    try { fdcRemoveRerunTriggers_(); ScriptApp.newTrigger(FDC.RERUN_HANDLER).timeBased().after(60 * 1000).create(); }
+    catch (eR) { fdcNotify_('FINAL DECISION column: the re-run of the stopped ' + rerun + ' render could not be scheduled: ' + String(eR && eR.message || eR).slice(0, 160)); }
+  }
+  return line;
+}
+function fdcRemoveRerunTriggers_() {
+  var ts = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < ts.length; i++) if (ts[i].getHandlerFunction() === FDC.RERUN_HANDLER) ScriptApp.deleteTrigger(ts[i]);
+}
+/* 1.1.0 [RE-RUN]: the one-off trigger's handler - removes itself, then runs the Top 10 refresh. */
+function fdcRerunTop10() {
+  try { fdcRemoveRerunTriggers_(); } catch (e0) {}
+  if (typeof refreshDecisionTop10 !== 'function') { fdcNotify_('FINAL DECISION column: refreshDecisionTop10 is not in this project.'); return 'missing'; }
+  refreshDecisionTop10();
+  return 'ran';
+}
+/* 1.1.0 [TODAY-LINE]: Top_10_Investments!A3, only while it is empty or already this line. */
+function fdcStampToday_(ss, src, staleH) {
+  var sh = ss.getSheetByName(FDC.T10), fd = ss.getSheetByName(FDC.SOURCE);
+  if (!sh || !fd) return 'A3: skipped';
+  var cell = sh.getRange(3, 1), cur = fdcTrim_(cell.getValues()[0][0]);
+  if (cur && cur.indexOf('TODAY (') !== 0) return 'A3: not empty, left';
+  var vals = fd.getLastRow() > 1 ? fd.getRange(1, 1, Math.min(fd.getLastRow(), 400), 2).getValues() : [];
+  var line = fdcTodayLine_(vals, src, staleH);
+  if (!line) { if (cur) cell.setValue(''); return 'A3: cleared (no current decisions)'; }
+  cell.setValue(line).setFontWeight('bold').setFontColor('#0f5c63').setWrap(false);
+  return 'A3: today line';
+}
+/* 1.1.0 [RE-RUN]: the stopped render to re-run now ('' = none); records it so it is done once. */
+function fdcRerunCheck_(ss) {
+  var props = PropertiesService.getScriptProperties();
+  var on = !/^(0|off|false|no)$/i.test(fdcTrim_(props.getProperty(FDC.PROP_RERUN)));
+  var sh = ss.getSheetByName(FDC.T10);
+  if (!sh) return '';
+  var stuck = fdcStuck_(sh.getRange(2, 2).getValues()[0][0], new Date().getTime());
+  var hour = (new Date().getUTCHours() + 3) % 24;
+  if (!fdcRerunDue_(stuck, fdcTrim_(props.getProperty(FDC.PROP_RERUN_FOR)), hour, on)) return '';
+  props.setProperty(FDC.PROP_RERUN_FOR, stuck.run);
+  return stuck.run;
 }
 function fdcRemoveTrigger_() {
   var n = 0, ts = ScriptApp.getProjectTriggers();
@@ -221,6 +314,10 @@ function fdcRemoveColumn() {
     sh.getRange(t.hdr, t.col, lastRow - t.hdr + 1, 1).clear();
     out.push(cfg.name + ': removed from column ' + fdcColLetter_(t.col));
   }
+  try {   // 1.1.0: the today line goes with it
+    var t10 = ss.getSheetByName(FDC.T10);
+    if (t10 && fdcTrim_(t10.getRange(3, 1).getValues()[0][0]).indexOf('TODAY (') === 0) { t10.getRange(3, 1).setValue(''); out.push('A3 today line removed'); }
+  } catch (eA) {}
   fdcNotify_(out.join(' \u00b7 '));
   return out;
 }
@@ -247,6 +344,10 @@ function fdcCoreOk_() {
     return !!t && t.hdr === 4 && t.symCol === 2 && t.col === 7 && t.rows.join(',') === '5,6' && !t.existing &&
       t2.rows.join(',') === '2,4' && t2.col === 5 && src.ok && src.at === '2026-11-16 08:41' &&
       fdcFormula_(2).indexOf('INDIRECT("R"&ROW()&"C2",FALSE)') > 0 && fdcAgeH_('2026-11-16 08:41', Date.UTC(2026, 10, 16, 6, 41)) === 1 &&
-      fdcHeader_({ ok: true, at: '2026-11-16 08:41', ageH: 7 }, 6).indexOf('OLD (7 h)') > 0;
+      fdcHeader_({ ok: true, at: '2026-11-16 08:41', ageH: 7 }, 6).indexOf('OLD (7 h)') > 0 &&
+      fdcStuck_('Last run 2026-11-16 08:44:11 | status: running\u2026', Date.UTC(2026, 10, 16, 6, 44, 11)).minutes === 60 &&
+      fdcStuck_('Last run 2026-11-16 10:16:20 | status: ok', 0) === null &&
+      fdcRerunDue_({ run: 'r', minutes: 25 }, '', 9, true) && !fdcRerunDue_({ run: 'r', minutes: 25 }, 'r', 9, true) &&
+      fdcTodayLine_([['Symbol', 'Decision'], ['AX.US', 'BUY'], ['DDI.US', 'HOLD']], { ok: true, at: 'x', ageH: 0 }, 6).indexOf('BUY AX.US \u00b7 SELL none') > 0;
   } catch (e) { return false; }
 }

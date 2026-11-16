@@ -27,4 +27,4 @@ def test_fdc_v100_final_decision_column_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("PASS 7/7"), result.stdout[-2000:]
+    assert result.stdout.rstrip().endswith("PASS 9/9"), result.stdout[-2000:]
