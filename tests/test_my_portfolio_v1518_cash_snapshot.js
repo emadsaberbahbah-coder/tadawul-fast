@@ -49,7 +49,9 @@ const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '10_My_Portfolio.gs');
 const BASE_SHA = 'd1927aeb25306ad5e8c34621800ee08f6492a8aef35754593793e043b0ea6a57';   // v1.5.17 (origin/main 953f84e2)
 const BASE_COMMIT = '953f84e2';
-const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-16: v1.5.20 [EXIT-PLAN-STOP] delivered -- this harness runs on the v1.5.19 file rebuilt from it
+// (tests/js/pd_history.js v1519Source: the v1.5.20 hunks reversed, SHA-256 pinned).
+const newSource = require(path.join(__dirname, 'js', 'pd_history.js')).v1519Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 // 2026-11-03: v1.5.19 (plain block reasons, PD_PLAIN_REASONS default off) stacked on this change; pins moved.
 // Behaviour runs on the delivered file (its version token is NV; its one PD_PLAIN_REASONS read per refresh is
