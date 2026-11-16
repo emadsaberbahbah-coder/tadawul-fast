@@ -1,7 +1,19 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.2 (2026-11-16)
+ * Version: 1.4.3 (2026-11-16)
+ *   1.4.3: [STOP-OF-RECORD] ONE STOP PER HOLDING ON PORTFOLIO_DECISION_v2 (owner, Mon 16 Nov 2026 14:19 Riyadh: "check
+ *          ... consistent outcome and recommendations ... or still some alignments need to be done"). Read at 14:25: the
+ *          Exit signal cell of a holding read 'FINAL: HOLD' while the 'Dyn stop' cell beside it showed this page's own
+ *          trailing stop with an arrow telling the owner to raise the broker stop to a level the decision of record
+ *          (the Exit Plan's stop, already working at IBKR) does not ask for; another holding showed three stops on
+ *          three pages. With the final decisions on and a stop on the symbol's Final_Decisions row, the cell now reads
+ *          (dp2StopOfRecordText_, pure; invented figures):
+ *            '9.50 (-5.0%) stop of record' / 'broker 9.50 - in place' (or 'broker 9.20 - raise to 9.50', 'no broker
+ *            stop - place 9.50', 'broker orders not read') / 'v2 rule 9.80 (analysis)'.
+ *          The arrow appears only when the broker stop is below the stop of record. No final row or no stop on it (or
+ *          DP2_FINAL off) = the 1.4.2 cell. Also: a final HOLD whose words end 'nothing to change.' (today_action_plan
+ *          1.6.2: the broker already carries the raised stop) is not listed under ACTIONS TODAY.
  *   1.4.2: [STATUS-LINE] THE STATUS ROW OF TOP_10_INVESTMENTS_v2 IS ONE SHORT LINE (owner, Mon 16 Nov 2026 11:23 Riyadh:
  *          "review and improve"). Row 3 copied the main page's whole status line - 600 to 900 characters of tokens
  *          (pool, route, builder, epoch, earnings, SelLog ...) in 8-point type - so the facts that matter (when the board
@@ -463,7 +475,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.2';   // lockstep with the header
+var DP2_VERSION = '1.4.3';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2378,10 +2390,23 @@ function dp2FinalCell_(fin, sym, ownText) {
   var kind = (r.decision === 'SELL' || r.decision === 'DO NOT INVEST') ? 'red' : (r.decision === 'BUY' ? 'green' : (r.decision === 'HOLD' ? 'navy' : 'amber'));
   return { text: 'FINAL: ' + r.decision + ' (Today Action Plan) \u00b7 v2 rule: ' + own, kind: kind, row: r };
 }
+/* PURE (1.4.3 [STOP-OF-RECORD]): the 'Dyn stop' cell of a holding whose final row carries a stop.
+ * recStop: the stop of record; last: the price; brokerStop: the working stop (null = none or unknown); known: the broker
+ * orders were read; lastStop: a stop listed but not working; v2Stop: this page's own stop (null = none). */
+function dp2StopOfRecordText_(recStop, last, brokerStop, known, lastStop, v2Stop) {
+  var pct = (recStop && last) ? ' (' + dp2Pct_((recStop / last - 1) * 100, 1) + ')' : '';
+  var line2;
+  if (brokerStop) line2 = 'broker ' + dp2Fmt_(brokerStop, 2) + (brokerStop >= recStop - 0.005 ? ' \u2014 in place' : ' \u2191 raise to ' + dp2Fmt_(recStop, 2));
+  else if (!known) line2 = 'broker orders not read';
+  else if (lastStop) line2 = 'broker ' + dp2Fmt_(lastStop, 2) + ' not working \u2014 place ' + dp2Fmt_(recStop, 2);
+  else line2 = 'no broker stop \u2014 place ' + dp2Fmt_(recStop, 2);
+  return dp2Fmt_(recStop, 2) + pct + ' stop of record\n' + line2 + (v2Stop ? '\nv2 rule ' + dp2Fmt_(v2Stop, 2) + ' (analysis)' : '');
+}
 /* PURE: the ACTIONS TODAY line of a final decision, or null when it asks nothing beyond holding at the stop. */
 function dp2FinalAction_(sym, r) {
   if (!r) return null;
   if (r.decision === 'HOLD' && /^Hold(; stop [^;]*)?\.?$/.test(dp2Str_(r.todo).trim())) return null;
+  if (r.decision === 'HOLD' && /^Hold; the stop working at IBKR [^;]* nothing to change\.$/.test(dp2Str_(r.todo).trim())) return null;   // 1.4.3
   return { p: r.decision === 'SELL' ? 0 : 2, t: r.decision + ' ' + sym + ' (Today Action Plan): ' + dp2Str_(r.todo) };
 }
 /* PURE (v1.4.1 [TODAY]): the day's decisions for the Top_10_Investments_v2 header -> null (final off or not current) |
@@ -3963,6 +3988,7 @@ function buildPortfolioDecisionV2() {
       if (fc.row && fc.row.decision === 'SELL') { item.finalTodo = fc.row.todo; sig.advisory = false; }   // the e-mail carries the plan's words (Codex P1, #1000)
       else { sig.alert = false; sig.advisory = false; }
       var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);
+      if (fc.row && fc.row.stop) dynTxt = dp2StopOfRecordText_(fc.row.stop, last, brokerStop, ib.ordersKnown, br.lastStop, x ? x.stop : null);   // 1.4.3 [STOP-OF-RECORD]
     }
     sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);
     trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
