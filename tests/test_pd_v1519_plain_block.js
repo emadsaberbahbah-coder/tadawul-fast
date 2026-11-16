@@ -41,7 +41,9 @@ const vm = require('node:vm');
 
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '10_My_Portfolio.gs');
-const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-16: v1.5.20 [EXIT-PLAN-STOP] delivered -- this harness runs on the v1.5.19 file rebuilt from it
+// (tests/js/pd_history.js v1519Source: the v1.5.20 hunks reversed, SHA-256 pinned).
+const newSource = require(path.join(__dirname, 'js', 'pd_history.js')).v1519Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'pd_edits_v1519.json'), 'utf8'));
 const V1518_SHA = '62b15eaa5eda541b867cd5fd667b71bbcd15c53732a730636ce0056d70f7f973';   // v1.5.18 (origin/main 8478029d)

@@ -1,7 +1,54 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.19
+ * Version: 1.5.20
+ *
+ * v1.5.20 (2026-11-16)  (EXIT-PLAN-STOP: THE STOP SAR COLUMN OF
+ *                        PORTFOLIO_DECISION SHOWS THE EXIT PLAN'S STOP, THE
+ *                        STOP OF RECORD -- PD_EXIT_PLAN_STOP, default ON; ALL
+ *                        v1.5.19 logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (owner, 16 Nov 2026: 'pages may use different scripts and factors,
+ * but each stock must end with ONE final decision shown the same on every
+ * page'; 14:41 Riyadh: 'for any approval required from me take the best
+ * available option'). The internal control Consistency_Check C9 has read
+ * MISMATCH every hour since it exists: the Stop SAR column here is the
+ * backend engine's stop, while the stop the owner places is the Exit Plan's
+ * (per stock, reviewed daily, never lowered - the owner's rule of 11 Nov).
+ * On 16 Nov one holding showed three stops on three pages. The Today Action
+ * Plan, the FINAL DECISION column and Decision Pages v2 1.4.3 already lead
+ * with the Exit Plan's stop; this page was the last one showing another.
+ * WHAT (Script Property PD_EXIT_PLAN_STOP; 0 / off / false / no = every
+ * cell byte-identical to v1.5.19, apart from that one property read per
+ * rendered refresh; anything else, absent or a property fault = on):
+ *  (1) pdExitStopsFromValues_ (pure): the _Exit_Plan ledger (written by
+ *      scripts/exit_plan.py: Date | Run At | Symbol | Lot | ... | Stop) ->
+ *      {SYMBOL: {stop, day}} from each symbol's newest day, no older than
+ *      PD_EXIT_STOP_MAX_DAYS (4) and not in the future; a symbol whose lots
+ *      carry different stops that day is left out (the engine's stop stays).
+ *  (2) pdExitStopsApply_ (pure): on the RENDERED rows only, a holding with
+ *      an entry gets Stop SAR = stop x (Price SAR / Price) (x 1 for a SAR
+ *      row without both prices), 2 decimals, and its Advisor Note gains
+ *      ' | Stop SAR: Exit Plan <stop> <ccy> of <day>; engine stop <x> SAR'.
+ *      A row without an entry, or without a usable rate, is unchanged.
+ *  (3) pdRenderPayload_ applies it between building the rows and writing
+ *      the table. The payload is NOT changed: the POST body, B2, the KPIs,
+ *      the action log (_Portfolio_Action_Log keeps the engine's own stop for
+ *      tracking), the evidence publication and every other cell are the
+ *      v1.5.19 ones. No row is added, so every reader finds the header where
+ *      it was.
+ * GATES: PD_EXIT_PLAN_STOP (display only; nothing is sent, weighted,
+ * blocked or unblocked by it).
+ * Functions added (0 removed): pdExitStopOn_, pdExitStopDay_ (pure),
+ * pdExitStopsFromValues_ (pure), pdExitStopsApply_ (pure),
+ * pdExitStopsRead_, pdExitStopCoreOk_ (pure). Vars added:
+ * PD_EXIT_STOP_PROP, PD_EXIT_STOP_SHEET, PD_EXIT_STOP_MAX_DAYS. Changed:
+ * pdRenderPayload_ (the overlay), pdSelfTest (one line).
+ * Harness: tests/test_pd_v1520_exit_plan_stop.js (REAL file; golden negative
+ * on the v1.5.19 base rebuilt by reversing these edits, SHA-256 pinned).
+ * ROLLBACK: PD_EXIT_PLAN_STOP = off (no re-paste); or re-paste v1.5.19.
+ * ES5; ASCII; all prior WHYs verbatim; PD_VERSION and the header version
+ * bumped in lockstep.
  *
  * v1.5.19 (2026-11-03)  (PLAIN BLOCK REASONS + TICKER-CHANGE HINT: ONE LINE
  *                        ABOVE THE ACTIONS TABLE SAYS WHY EVERY HOLDING IS
@@ -2872,7 +2919,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.19';
+var PD_VERSION = '1.5.20';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3982,6 +4029,133 @@ function pdPlainLine_(info, drift) {
 }
 
 /** v1.5.19: the plain line, merged across the page and wrapped. */
+/* ----- v1.5.20 [EXIT-PLAN-STOP] ------------------------------------------ */
+var PD_EXIT_STOP_PROP = 'PD_EXIT_PLAN_STOP';   // 0 / off / false / no = the engine's stop (v1.5.19); default on
+var PD_EXIT_STOP_SHEET = '_Exit_Plan';
+var PD_EXIT_STOP_MAX_DAYS = 4;
+
+/** On unless PD_EXIT_PLAN_STOP is 0 / off / false / no (trimmed, any case).
+ * A property fault reads on: the overlay itself fails soft. Never throws. */
+function pdExitStopOn_() {
+  try {
+    return !/^(0|off|false|no)$/i.test(String(PropertiesService.getScriptProperties()
+        .getProperty(PD_EXIT_STOP_PROP) || '').replace(/^\s+|\s+$/g, ''));
+  } catch (eEo) {}
+  return true;
+}
+
+/** PURE: a ledger Date cell -> 'yyyy-MM-dd' ('' when it is not a day). A
+ * Date object is a Riyadh (UTC+3) day; text starts with the day. */
+function pdExitStopDay_(v) {
+  if (v && typeof v === 'object' && typeof v.getTime === 'function') {
+    var ms = v.getTime();
+    return isFinite(ms) ? new Date(ms + 3 * 3600000).toISOString().slice(0, 10) : '';
+  }
+  var m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v === null || v === undefined ? '' : v).replace(/^\s+/, ''));
+  return m ? m[1] : '';
+}
+
+/** PURE: the _Exit_Plan ledger values -> {SYMBOL: {stop, day}}: each symbol's
+ * newest day, at most maxDays before todayIso and never after it; a symbol
+ * whose rows of that day carry different stops (lots) is left out. */
+function pdExitStopsFromValues_(values, todayIso, maxDays) {
+  var out = {}, hdr = -1, cD = -1, cS = -1, cP = -1, r, c;
+  values = values || [];
+  for (r = 0; r < values.length && hdr < 0; r++) {
+    var names = {};
+    for (c = 0; c < (values[r] || []).length; c++) names[String(values[r][c]).replace(/^\s+|\s+$/g, '')] = c;
+    if (names.hasOwnProperty('Date') && names.hasOwnProperty('Symbol') && names.hasOwnProperty('Stop')) {
+      hdr = r; cD = names['Date']; cS = names['Symbol']; cP = names['Stop'];
+    }
+  }
+  var t0 = Date.parse(String(todayIso) + 'T00:00:00Z');
+  if (hdr < 0 || !isFinite(t0)) return out;
+  var by = {};
+  for (r = hdr + 1; r < values.length; r++) {
+    var row = values[r] || [];
+    var sym = String(row[cS] === null || row[cS] === undefined ? '' : row[cS]).replace(/^\s+|\s+$/g, '').toUpperCase();
+    var day = pdExitStopDay_(row[cD]);
+    var stop = (row[cP] === '' || row[cP] === null || row[cP] === undefined) ? NaN : Number(row[cP]);
+    if (!sym || !day || !isFinite(stop) || stop <= 0) continue;
+    if (!by[sym] || day > by[sym].day) by[sym] = { day: day, stops: [stop] };
+    else if (day === by[sym].day) by[sym].stops.push(stop);
+  }
+  for (var k in by) {
+    if (!by.hasOwnProperty(k)) continue;
+    var age = Math.round((t0 - Date.parse(by[k].day + 'T00:00:00Z')) / 86400000);
+    if (!(age >= 0 && age <= maxDays)) continue;
+    var same = true;
+    for (var i = 1; i < by[k].stops.length; i++) if (Math.abs(by[k].stops[i] - by[k].stops[0]) > 0.00005) same = false;
+    if (same) out[k] = { stop: by[k].stops[0], day: by[k].day };
+  }
+  return out;
+}
+
+/** PURE: put the Exit Plan's stop on the rendered ACTIONS rows (in place).
+ * -> {applied, of}. A row without an entry or a usable rate is unchanged. */
+function pdExitStopsApply_(rows, stops) {
+  var iSym = PD_ACTION_HEADERS.indexOf('Symbol'), iCcy = PD_ACTION_HEADERS.indexOf('Ccy'),
+      iPx = PD_ACTION_HEADERS.indexOf('Price'), iPxS = PD_ACTION_HEADERS.indexOf('Price SAR'),
+      iStop = PD_ACTION_HEADERS.indexOf('Stop SAR'), iNote = PD_ACTION_HEADERS.indexOf('Advisor Note');
+  var res = { applied: 0, of: (rows || []).length };
+  stops = stops || {};
+  for (var r = 0; r < (rows || []).length; r++) {
+    var row = rows[r];
+    var sym = String(row[iSym] === null || row[iSym] === undefined ? '' : row[iSym]).replace(/^\s+|\s+$/g, '').toUpperCase();
+    if (!sym || !stops.hasOwnProperty(sym)) continue;
+    var px = Number(row[iPx]), pxs = Number(row[iPxS]), ccy = String(row[iCcy] || '').toUpperCase();
+    var rate = (row[iPx] !== '' && row[iPxS] !== '' && px > 0 && pxs > 0) ? pxs / px : (ccy === 'SAR' ? 1 : null);
+    if (rate === null || !isFinite(rate)) continue;
+    var e = stops[sym], was = row[iStop];
+    row[iStop] = Math.round(e.stop * rate * 100) / 100;
+    var note = 'Stop SAR: Exit Plan ' + (Math.round(e.stop * 100) / 100).toFixed(2) + (ccy ? ' ' + ccy : '') + ' of ' + e.day +
+        ((was !== '' && was !== null && was !== undefined && isFinite(Number(was))) ? '; engine stop ' + (Math.round(Number(was) * 100) / 100).toFixed(2) + ' SAR' : '');
+    row[iNote] = (row[iNote] !== '' && row[iNote] !== null && row[iNote] !== undefined) ? String(row[iNote]) + ' | ' + note : note;
+    res.applied++;
+  }
+  return res;
+}
+
+/** I/O: the newest rows of the _Exit_Plan ledger as a stop map ({} on any
+ * fault: the engine's stops stay). Never throws. */
+function pdExitStopsRead_(ss) {
+  try {
+    var sh = ss.getSheetByName(PD_EXIT_STOP_SHEET);
+    if (!sh) return {};
+    var last = sh.getLastRow(), cols = Math.min(Math.max(sh.getLastColumn(), 1), 20);
+    if (last < 2) return {};
+    var n = Math.min(last - 1, 400);
+    var vals = sh.getRange(1, 1, 1, cols).getValues().concat(sh.getRange(last - n + 1, 1, n, cols).getValues());
+    var today = String(Utilities.formatDate(new Date(), 'Asia/Riyadh', 'yyyy-MM-dd')).slice(0, 10);
+    return pdExitStopsFromValues_(vals, today, PD_EXIT_STOP_MAX_DAYS);
+  } catch (eEr) {}
+  return {};
+}
+
+/** PURE battery for pdSelfTest (invented figures). */
+function pdExitStopCoreOk_() {
+  try {
+    var v = [['Date', 'Run At (Riyadh)', 'Symbol', 'Lot', 'Stop'],
+             ['2026-11-13', 'x', 'AAA.US', '', 9.2], ['2026-11-16', 'y', 'AAA.US', '', 9.5],
+             ['2026-11-16', 'y', 'BBB.US', 'a', 5], ['2026-11-16', 'y', 'BBB.US', 'b', 6],
+             ['2026-11-01', 'z', 'OLD.US', '', 3], ['2026-11-16', 'y', '1111.SR', '', 20]];
+    var m = pdExitStopsFromValues_(v, '2026-11-16', 4);
+    var row = function (sym, ccy, px, pxs, stop, note) {
+      var r = []; for (var i = 0; i < PD_ACTION_HEADERS.length; i++) r.push('');
+      r[1] = sym; r[4] = ccy; r[7] = px; r[8] = pxs; r[17] = stop; r[25] = note; return r;
+    };
+    var rows = [row('AAA.US', 'USD', 10, 37.5, 33.75, 'n'), row('BBB.US', 'USD', 10, 37.5, 30, ''),
+                row('1111.SR', 'SAR', '', '', '', ''), row('ZZZ.US', 'USD', '', '', 1, 'k')];
+    var res = pdExitStopsApply_(rows, m);
+    return m['AAA.US'].stop === 9.5 && m['AAA.US'].day === '2026-11-16' && !m.hasOwnProperty('BBB.US') &&
+        !m.hasOwnProperty('OLD.US') && res.applied === 2 && res.of === 4 && rows[0][17] === 35.63 &&
+        rows[0][25] === 'n | Stop SAR: Exit Plan 9.50 USD of 2026-11-16; engine stop 33.75 SAR' &&
+        rows[1][17] === 30 && rows[1][25] === '' && rows[2][17] === 20 &&
+        rows[2][25] === 'Stop SAR: Exit Plan 20.00 SAR of 2026-11-16' && rows[3][17] === 1 &&
+        pdExitStopDay_(new Date(Date.UTC(2026, 10, 15, 21, 0, 0))) === '2026-11-16' && pdExitStopDay_('n/a') === '';
+  } catch (eEc) { return false; }
+}
+
 function pdWritePlainLine_(sheet, row, text) {
   sheet.getRange(row, 1, 1, PD_LAST_COL).merge().setValue(text)
       .setWrap(true).setFontSize(9).setFontWeight('bold')
@@ -5676,6 +5850,12 @@ function pdRenderPayload_(sheet, payload, tokens, outOfScope, plainLine) {
   for (var a = 0; a < actions.length; a++) {
     aRows.push(pdActionToRow_(actions[a]));
   }
+  if (pdExitStopOn_()) {   /* v1.5.20 [EXIT-PLAN-STOP]: the rendered rows only; the payload is untouched */
+    try {
+      var esRes = pdExitStopsApply_(aRows, pdExitStopsRead_(sheet.getParent()));
+      Logger.log('[MP-DEC v' + PD_VERSION + '] exit plan stop on ' + esRes.applied + ' of ' + esRes.of + ' row(s)');
+    } catch (eEs) {}
+  }
   var aT = pdWriteTable_(sheet, row, PD_ACTION_HEADERS, aRows,
       'No holdings \u2014 refresh My_Portfolio first, or the portfolio is ' +
       'empty (an honest result, L13).');
@@ -6071,6 +6251,10 @@ function pdSelfTest() {
     report.push('plain block reasons (PD_PLAIN_REASONS): on | core: ' +
                 (pdPlainCoreOk_() ? 'ok' : 'FAIL'));
   }
+  /* v1.5.20 [EXIT-PLAN-STOP] */
+  report.push('exit plan stop (PD_EXIT_PLAN_STOP): ' + (pdExitStopOn_() ? 'on' : 'off') +
+      ' (the Stop SAR column shows the Exit Plan\'s stop; the engine\'s is in the Advisor Note) | core: ' +
+      (pdExitStopCoreOk_() ? 'ok' : 'FAIL'));
   var rtOk = pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 300000, false).arm === true &&
       pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660000, false).arm === true &&
       pdIbkrRetryCore_('on', PD_IBKR_RETRY_REASON, 660001, false).arm === false &&
