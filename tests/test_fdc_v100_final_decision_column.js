@@ -74,12 +74,12 @@ function makeEnv(sheets, opts) {
   const ctx = {
     Date: FakeDate,
     SpreadsheetApp: { getActive: () => book, newConditionalFormatRule: ruleBuilder },
-    PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); } }) },
+    PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); }, deleteProperty: k => { delete props[k]; } }) },
     LockService: { getScriptLock: () => ({ tryLock: () => !opts.busy, releaseLock() {} }) },
     ScriptApp: {
       getProjectTriggers: () => triggers.slice(),
       deleteTrigger(t) { const i = triggers.indexOf(t); if (i >= 0) triggers.splice(i, 1); },
-      newTrigger(h) { const t = { h, every: null, getHandlerFunction: () => h }; const b = { timeBased() { return b; }, everyMinutes(n) { t.every = n; return b; }, create() { triggers.push(t); return t; } }; return b; }
+      newTrigger(h) { const t = { h, every: null, after: null, getHandlerFunction: () => h }; const b = { timeBased() { return b; }, everyMinutes(n) { t.every = n; return b; }, after(ms) { t.after = ms; return b; }, create() { triggers.push(t); return t; } }; return b; }
     },
     Logger: { log(m) { logs.push(String(m)); } }
   };
@@ -130,7 +130,8 @@ test('S1 Top_10_Investments: one column right of the seats table, a formula per 
   eq(hr, 19, 'the header row'); eq(hc, 32, 'column AF: one empty column after the 30-column table');
   eq(formulaRows(t10, 32).join(','), '20,21,22', 'the three seat rows');
   ok(t10._cells.get('20:32').f.indexOf('INDIRECT("R"&ROW()&"C2",FALSE)') > 0, 'the formula reads its own row\'s Symbol (column B)');
-  eq(JSON.stringify(snapshot(t10, 30)), JSON.stringify(before), 'every cell of the page itself is unchanged');
+  const after = snapshot(t10, 30); delete after['3:1'];   // 1.1.0: A3 carries the today line (S8)
+  eq(JSON.stringify(after), JSON.stringify(before), 'every other cell of the page itself is unchanged');
   ok(hc > 31, 'outside A1:AE60, the range the Today Action Plan reads');
   eq(t10._widths[32], 330);
 });
@@ -213,8 +214,9 @@ test('S6 the lock, the trigger and the rollback', () => {
   ok(colOf(env.book.getSheetByName('Portfolio_Decision'), /^FINAL DECISION/), 'install stamps the pages now');
   ok(/trigger installed .* self-test ok .* last tick: 2026-11-16T06:00Z/.test(env.ctx.fdcStatus()), env.ctx.fdcStatus());
   const out = env.ctx.fdcRemoveColumn();
-  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB | My_Portfolio: 2 note(s) removed');
+  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB | My_Portfolio: 2 note(s) removed | A3 today line removed');
   ok(!env.book.getSheetByName('My_Portfolio')._cells.get('1:3').note, 'the note is gone');
+  eq(env.book.getSheetByName('Top_10_Investments')._cells.get('3:1').v, '', 'the today line is gone');
   ok(!colOf(env.book.getSheetByName('Top_10_Investments'), /^FINAL DECISION/) && formulaRows(env.book.getSheetByName('Top_10_Investments'), 32).length === 0, 'gone');
   eq(env.ctx.fdcRemoveTrigger(), 1); eq(env.triggers.length, 0);
   // a missing page or table is reported, the others are still stamped
@@ -228,7 +230,60 @@ test('S7 the self-test core, ES5 / ASCII, version lockstep', () => {
   ok(env.ctx.fdcCoreOk_() === true, 'core');
   ok(!/[^\x00-\x7F]/.test(SRC), 'ASCII');
   ok(!/\b(let|const)\s|=>|`/.test(SRC), 'ES5');
-  ok(/ \* Version: 1\.0\.0 \(2026-11-16\)/.test(SRC) && /var FDC_VERSION = '1\.0\.0';/.test(SRC), 'version lockstep');
+  ok(/ \* Version: 1\.1\.0 \(2026-11-16\)/.test(SRC) && /var FDC_VERSION = '1\.1\.0';/.test(SRC), 'version lockstep');
+});
+
+test('S8 (1.1.0) the today line in Top_10_Investments!A3: written when empty, kept current, never over other text', () => {
+  const env = makeEnv(world());
+  env.ctx.fdcTick();
+  const t10 = env.book.getSheetByName('Top_10_Investments');
+  eq(t10._cells.get('3:1').v, 'TODAY (Today Action Plan 2026-11-16 08:41): BUY AX.US \u00b7 SELL none. The FINAL DECISION of every seat is in the FINAL DECISION column at the right; orders come from Today_Action_Plan - this page is the engine\'s research.');
+  eq(t10._cells.get('3:1').setFontWeight, 'bold');
+  env.book.getSheetByName('Final_Decisions').getRange(2, 2).setValue('WATCH');   // the plan changes
+  env.ctx.fdcTick();
+  ok(/BUY none/.test(t10._cells.get('3:1').v), 'kept current');
+  const w = world(); w.Top_10_Investments[2][0] = 'something of the page';
+  const e2 = makeEnv(w); const line = e2.ctx.fdcTick();
+  eq(e2.book.getSheetByName('Top_10_Investments')._cells.get('3:1').v, 'something of the page', 'never over other text');
+  ok(/A3: not empty, left/.test(line), line);
+  const w3 = world(); delete w3.Final_Decisions;
+  const e3 = makeEnv(w3); e3.ctx.fdcTick();
+  ok(!e3.book.getSheetByName('Top_10_Investments')._cells.get('3:1'), 'nothing without the decisions');
+  // a written line goes when Final_Decisions is removed or renamed (Codex P2, #1003)
+  env.book._s.delete('Final_Decisions');
+  ok(/A3: cleared \(Final_Decisions missing\)/.test(env.ctx.fdcTick()), 'reported');
+  eq(t10._cells.get('3:1').v, '', 'no old decisions left on screen');
+  // the readers' landmarks stay: row 2 status, row 4 panel, the seats header
+  eq(t10._cells.get('2:2').v, 'Last run 2026-11-16 08:30'); eq(t10._cells.get('4:1').v, 'CONTROL PANEL');
+});
+
+test('S9 (1.1.0) a render stopped by Google is re-run once, in its own execution, in hours', () => {
+  const stuck = 'Last run 2026-11-16 08:30:00 | status: running…';   // NOW = 09:00 Riyadh: 30 min
+  const mk = (status, props, busy) => { const w = world(); w.Top_10_Investments[1][1] = status; return makeEnv(w, { props: props || {}, busy }); };
+  const reruns = e => e.triggers.filter(t => t.h === 'fdcRerunTop10');
+  let e = mk(stuck);
+  ok(/re-run of the stopped 2026-11-16 08:30:00 render started/.test(e.ctx.fdcTick()), 'due');
+  eq(reruns(e).length, 1, 'one one-off trigger'); eq(reruns(e)[0].after, 60000, 'a minute on'); eq(e.props.FDC_RERUN_FOR, '2026-11-16 08:30:00');
+  e.ctx.fdcTick(); eq(reruns(e).length, 1, 'never twice for the same stopped run');
+  // the handler removes its trigger, then runs the refresh
+  let calls = 0; e.ctx.refreshDecisionTop10 = () => { calls++; };
+  eq(e.ctx.fdcRerunTop10(), 'ran'); eq(calls, 1); eq(reruns(e).length, 0, 'removed itself');
+  const e0 = mk(stuck); eq(e0.ctx.fdcRerunTop10(), 'missing', 'no refresh function in the project: reported, nothing thrown');
+  for (const [status, props, busy, why] of [['Last run 2026-11-16 08:50:00 | status: running…', {}, false, '10 minutes is a render still going'],
+      ['Last run 2026-11-16 08:00:00 | status: ok', {}, false, 'a finished render'], [stuck, { FDC_RERUN: 'off' }, false, 'off'], [stuck, {}, true, 'a busy lock decides nothing']]) {
+    const x = mk(status, props, busy); x.ctx.fdcTick(); eq(reruns(x).length, 0, why);
+  }
+  const c = makeEnv(world()).ctx;
+  ok(!c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 6, true) && !c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 23, true) && c.fdcRerunDue_({ run: 'r', minutes: 90 }, '', 22, true), 'only 07:00-23:00 Riyadh');
+  // a scheduling failure clears the reservation, so the next tick tries again (Codex P2, #1003)
+  const f = mk(stuck); let fail = true; const realNew = f.ctx.ScriptApp.newTrigger;
+  f.ctx.ScriptApp.newTrigger = h => { if (fail) throw new Error('quota'); return realNew(h); };
+  f.ctx.fdcTick();
+  ok(!('FDC_RERUN_FOR' in f.props) && reruns(f).length === 0 && f.book.toasts.some(t => /could not be scheduled \(the next tick tries again\): quota/.test(t)), 'released');
+  fail = false; f.ctx.fdcTick();
+  eq(reruns(f).length, 1, 'scheduled on the next tick'); eq(f.props.FDC_RERUN_FOR, '2026-11-16 08:30:00');
+  // the 10-minute trigger is never touched by the re-run bookkeeping
+  const t = mk(stuck); t.ctx.fdcInstallTrigger(); eq(t.triggers.filter(x => x.h === 'fdcTick').length, 1); eq(reruns(t).length, 1);
 });
 
 console.log((failed ? 'FAIL ' : 'PASS ') + passed + '/' + (passed + failed));
