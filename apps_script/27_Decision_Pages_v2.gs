@@ -1451,6 +1451,8 @@ function dp2ReadTop10_() {
       var w = 0; for (var r0 = 0; r0 < vals.length; r0++) w = Math.max(w, vals[r0].length);
       var grid = vals.map(function (row) { var o = row.slice(); while (o.length < w) o.push(''); return o; });
       lg.clear();
+      if (lg.getMaxColumns() < w) lg.insertColumnsAfter(lg.getMaxColumns(), w - lg.getMaxColumns());   // a new tab has 26 columns, the board 30 (Codex P1, #1002)
+      if (lg.getMaxRows() < grid.length) lg.insertRowsAfter(lg.getMaxRows(), grid.length - lg.getMaxRows());
       if (grid.length && w) lg.getRange(1, 1, grid.length, w).setValues(grid);
       try { lg.hideSheet(); } catch (eH) {}
     } else if (act === 'use' && lg && lg.getLastRow() > 1) {

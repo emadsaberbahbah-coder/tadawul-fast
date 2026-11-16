@@ -99,6 +99,7 @@ function makeSheet(book, name) {
       if (typeof r !== 'number') throw new Error('A1 notation is not modelled');
       nr = nr === undefined ? 1 : nr; nc = nc === undefined ? 1 : nc;
       if (!(r >= 1 && c >= 1 && nr >= 1 && nc >= 1)) throw new Error('range shape ' + [r, c, nr, nc]);
+      if (c + nc - 1 > maxCols || r + nr - 1 > maxRows) throw new Error('beyond the sheet: ' + [r, c, nr, nc] + ' > ' + [maxRows, maxCols]);   // Codex P1, #1002: Sheets enforces the bounds
       return makeRange(r, c, nr, nc);
     },
     getDataRange() { return makeRange(1, 1, Math.max(1, sheet.getLastRow()), Math.max(1, sheet.getLastColumn())); },
@@ -434,6 +435,8 @@ test('P2 LAST-GOOD: a stopped render reads the kept copy; no copy or the switch 
   ok(nFull >= 6, 'the finished render shows its seats: ' + nFull);
   const lg = full.env.book.getSheetByName('_DP2_T10_LastGood');
   ok(lg && lg._state().hidden && lg.getLastRow() > 20, 'the copy is kept, hidden');
+  eq(lg.getMaxColumns(), 30, 'a new tab (26 columns) is widened to the 30-column board before the copy');
+  eq(lg.getLastColumn(), 30, 'every column copied');
   const r = chain({}, { top: stopped(FIX.top10) });
   eq(seatRows(r.sh), nFull, 'every seat of the last finished render');
   const amber = cellsWith(r.sh, /^SEATS FROM THE LAST FINISHED RENDER/);
