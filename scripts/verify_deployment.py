@@ -330,7 +330,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-08 (manifest pin only): 1.5.0 -> 1.6.0 (v_signal_edge_daily and
     # v_signal_edge) -> 1.7.0 (total-return engine, v_outcome_excess, the
     # regime views); research views, nothing live reads them.
-    ("apply_bq_views", "1.9.1", "bigquery looker views"),
+    ("apply_bq_views", "1.10.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -362,7 +362,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("exit_plan", "1.3.2", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.6.0", "today action plan"),
+    ("today_action_plan", "1.6.1", "today action plan"),
     ("plan_archive", "1.0.0", "plan archive"),
     ("ibkr_capture", "1.0.0", "ibkr capture"),
     ("cash_cells", "1.0.0", "cash cells"),

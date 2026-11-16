@@ -4,7 +4,14 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.6.0 (2026-11-16)
+v1.6.1 (2026-11-16)
+  1.6.1: A PAGE THAT SHOWS THE FINAL DECISION AGREES (16 Nov 08:41 Riyadh run: Portfolio_Decision_v2 1.4.0 reads
+         "FINAL: HOLD (Today Action Plan) . v2 rule: SELL ..." and this page still made it an OTHER PAGE step and a
+         PAGES DISAGREE tile, because it compared the v2 rule). A row that starts with FINAL shows this page's own
+         decision: its v2 rule is analysis - kept in Final_Decisions ("Analysis differs on"), never a step or a
+         disagreement. A page that still shows its own verb (1.3.1) is compared as before. Final_Decisions also feeds
+         the FINAL DECISION column of Top_10_Investments, Portfolio_Decision and My_Portfolio (31_Final_Decision_
+         Column.gs 1.0.0).
   1.6.0: ONE DECISION PER STOCK (owner, 16 Nov 01:01: "different pages ... in the end they should provide the same
          recommendations ... the final decision should be one decision: buy, hold, sell or watchlist or don't
          invest"). Until now each page wrote its own verb and this page listed where they differed: on 16 Nov
@@ -187,7 +194,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -682,6 +689,7 @@ def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
             break
         sig = _squash(cell(r, col["Exit signal"]))
         rule = re.search(r"v2 rule:\s*(.+)$", sig, re.I)            # 1.6.0: "FINAL: HOLD ... · v2 rule: SELL NOW ..."
+        shows_final = sig.upper().startswith("FINAL")              # 1.6.1: the page already shows the final decision
         if rule:
             sig = rule.group(1).strip()
         elif sig.upper().startswith("FINAL"):
@@ -690,7 +698,7 @@ def read_pf_v2(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
         verb = "SELL" if up.startswith("SELL") else "RAISE STOP" if up.startswith("RAISE STOP") else \
             "HOLD" if up.startswith("HOLD") else ""
         m = _RAISE_RE.search(sig) if verb == "RAISE STOP" else None
-        new = {"verb": verb, "signal": sig, "level": num(m.group(1)) if m else None}
+        new = {"verb": verb, "signal": sig, "level": num(m.group(1)) if m else None, "final": shows_final}
         old = out["rows"].get(sym)
         if old is None or _V2_RANK[verb] > _V2_RANK[old["verb"]] or (
                 verb == old["verb"] == "RAISE STOP" and (new["level"] or 0.0) > (old["level"] or 0.0)):
@@ -716,10 +724,10 @@ def align_holdings(holdings: Sequence[Dict[str, Any]], main: Dict[str, Any], v2:
         if not sells and any(m.startswith(w) for w in _SELL_WORDS):
             pages.append(PFD_TAB)
             shown.append("%s: %s" % (PFD_TAB, m))
-        if not sells and y.get("verb") == "SELL":
+        if not sells and y.get("verb") == "SELL" and not y.get("final"):   # 1.6.1: a page that shows FINAL agrees
             pages.append(PF2_TAB)
             shown.append("%s: %s" % (PF2_TAB, y["signal"]))
-        other_stop = bool(y.get("verb") == "RAISE STOP" and y.get("level") and stop
+        other_stop = bool(y.get("verb") == "RAISE STOP" and not y.get("final") and y.get("level") and stop
                           and abs(y["level"] - stop) / stop * 100.0 > tol_pct)
         if not pages and not other_stop:
             continue

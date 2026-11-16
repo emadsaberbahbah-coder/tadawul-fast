@@ -1331,12 +1331,12 @@ def test_t15_readers_of_the_two_portfolio_pages():
     assert m == {"read": True, "built": "2026-11-12 08:19", "rows": {
         "DDI.US": "TRIM", "GLPI.US": "HOLD", "IBOC.US": "HOLD", "SUPN.US": "HOLD"}}
     assert y["read"] and y["built"] == "2026-11-12 08:16" and list(y["rows"]) == ["GLPI.US", "SUPN.US", "DDI.US", "IBOC.US", "5023.SR"]
-    assert y["rows"]["GLPI.US"] == {"verb": "RAISE STOP", "signal": "RAISE STOP 35.74 → 38.27", "level": 38.27}
+    assert y["rows"]["GLPI.US"] == {"verb": "RAISE STOP", "signal": "RAISE STOP 35.74 → 38.27", "level": 38.27, "final": False}
     assert y["rows"]["SUPN.US"]["verb"] == "SELL" and y["rows"]["SUPN.US"]["level"] is None
     assert y["rows"]["IBOC.US"]["verb"] == "HOLD" and y["rows"]["5023.SR"]["verb"] == ""
     assert tap.read_pf_v2([["Symbol", "Exit signal"], ["A.US", "SELL NOW — stop 9.00 hit"], ["B.US", "RAISE STOP 1,005.5 -> 1,010.25"]])[
-        "rows"] == {"A.US": {"verb": "SELL", "signal": "SELL NOW — stop 9.00 hit", "level": None},
-                    "B.US": {"verb": "RAISE STOP", "signal": "RAISE STOP 1,005.5 -> 1,010.25", "level": 1010.25}}
+        "rows"] == {"A.US": {"verb": "SELL", "signal": "SELL NOW — stop 9.00 hit", "level": None, "final": False},
+                    "B.US": {"verb": "RAISE STOP", "signal": "RAISE STOP 1,005.5 -> 1,010.25", "level": 1010.25, "final": False}}
     for empty in ([], [["x"]], [["Symbol", "Name"]], [["Action", "Name"]]):
         assert tap.read_pf_main(empty)["read"] is False and tap.read_pf_v2(empty)["read"] is False
     assert tap.hold_align_on() is True
@@ -1349,7 +1349,7 @@ def test_t15_several_lots_of_one_symbol_and_a_long_table():
     assert lots("SELL \u2014 rule exit 2026-11-06 not acted", "HOLD \u2014 trailing")["verb"] == "SELL"
     assert lots("HOLD \u2014 trailing", "SELL NOW \u2014 stop 9.00 hit", "RAISE STOP 9.00 \u2192 9.50")["signal"].startswith("SELL NOW")
     assert lots("RAISE STOP 9.00 \u2192 9.50", "HOLD \u2014 trailing") == {
-        "verb": "RAISE STOP", "signal": "RAISE STOP 9.00 \u2192 9.50", "level": 9.5}
+        "verb": "RAISE STOP", "signal": "RAISE STOP 9.00 \u2192 9.50", "level": 9.5, "final": False}
     assert lots("RAISE STOP 9.00 \u2192 9.50", "RAISE STOP 9.00 \u2192 9.80", "RAISE STOP 9.00 \u2192 9.20")["level"] == 9.8
     assert lots("EXCLUDED (PD_EXECUTION_EXCLUDE)", "HOLD \u2014 trailing")["verb"] == "HOLD"
     assert lots("HOLD \u2014 trailing", "HOLD \u2014 breakeven locked")["signal"] == "HOLD \u2014 trailing"      # the first of equals
@@ -1590,7 +1590,7 @@ def test_t16_a_v2_page_that_shows_the_final_decision_keeps_its_own_rule_as_analy
     y = tap.read_pf_v2([hdr, ["SUPN.US", "FINAL: HOLD (Today Action Plan) · v2 rule: SELL NOW — stop 33.76 hit"],
                         ["GLPI.US", "FINAL: HOLD (Today Action Plan) · v2 rule: RAISE STOP 35.74 → 38.27"],
                         ["IBOC.US", "FINAL: HOLD (Today Action Plan)"]])["rows"]
-    assert y["SUPN.US"] == {"verb": "SELL", "signal": "SELL NOW — stop 33.76 hit", "level": None}
+    assert y["SUPN.US"] == {"verb": "SELL", "signal": "SELL NOW — stop 33.76 hit", "level": None, "final": True}
     assert y["GLPI.US"]["verb"] == "RAISE STOP" and y["GLPI.US"]["level"] == 38.27
     assert y["IBOC.US"]["verb"] == ""
 
@@ -1637,3 +1637,22 @@ def test_t16_the_final_row_keeps_every_instruction_section_a_gives():
     two = steps[:1] + [{"symbol": "AAA.US", "source": "Exit_Plan", "do": "Second."}]
     r = tap.final_decisions({"holdings": [h], "picks": [], "pipeline": [], "steps": two})[0]
     assert r["do"] == steps[0]["do"] + " Second."
+
+
+def test_t16_a_page_that_shows_the_final_decision_is_never_a_step_or_a_disagreement(capsys):
+    """16 Nov 08:41 run: Portfolio_Decision_v2 1.4.0 showed FINAL: HOLD on SUPN.US and this page still made it an
+    OTHER PAGE step (1.6.1). The v2 rule stays analysis in Final_Decisions."""
+    v2 = [list(r) for r in PF2]
+    for r in v2[3:7]:
+        r[15] = "FINAL: HOLD (Today Action Plan) \u00b7 v2 rule: " + r[15]
+    y = tap.read_pf_v2(v2)
+    assert y["rows"]["SUPN.US"]["final"] is True and y["rows"]["SUPN.US"]["verb"] == "SELL"
+    hs = [_h("SUPN.US", "HOLD", 24.28), _h("GLPI.US", "HOLD", 35.74)]
+    assert tap.align_holdings(hs, {"read": False}, y, 1.0) == []           # neither the sale nor the other stop
+    book = _final_book(Portfolio_Decision_v2=Sheet(v2))
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert not [c for c in cards(page) if c[1] == "SUPN.US" and "No sale is asked for here" in c[2]]
+    assert "SUPN.US" not in tiles_of(page)["PAGES"][1]
+    _, rows = _final(book)
+    assert rows["SUPN.US"]["Decision"] == "HOLD" and rows["SUPN.US"]["Analysis differs on"] == "Portfolio_Decision_v2"
