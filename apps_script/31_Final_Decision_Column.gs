@@ -1,7 +1,15 @@
 /**
  * 31_Final_Decision_Column.gs
  * Emad Bahbah Financial Advisor - the FINAL DECISION column on the engine pages
- * Version: 1.1.0 (2026-11-16)
+ * Version: 1.2.0 (2026-11-16)
+ *   1.2.0: A SKIPPED RENDER IS RE-RUN TOO (16_Decision_Top10 1.30.0 [PAINT-BUDGET], same day). A render that reaches the
+ *          paint later than its budget (300 s; Google stops an execution at 360 s) no longer clears the board: it puts
+ *          the previous status line back with ' | SKIPPED render <time> (...)' at its end. fdcStuck_ reads that tail as
+ *          a stopped run keyed 'skipped <time>' (the line no longer says 'running', so the 1.1.0 rule alone would never
+ *          re-run it) and fdcRerunDue_ re-runs it on the next tick, without the 20-minute wait; once per skipped run,
+ *          07:00-23:00 Riyadh, FDC_RERUN = off as before. New: at most FDC.RERUN_MAX_DAY (4) re-runs a Riyadh day, in
+ *          Script Property FDC_RERUN_DAY ('YYYY-MM-DD|n'), counted when the trigger is scheduled, so a busy day cannot
+ *          chain re-runs. The toast and the tick line name the skipped run; fdcStatus shows the day's count.
  *   1.1.0: TOP_10_INVESTMENTS REVIEW (owner, Mon 16 Nov 2026 11:23 Riyadh: "Top_10_Investments, what about this page,
  *          review and improve or is it ok?"). Read at 11:24: the page works (render 10:16, status ok) but (1) its render of
  *          08:44 - the one after the 08:41 IBKR capture, stopped by Google on 9, 10 and 16 Nov - left the board empty with
@@ -45,7 +53,7 @@
  * CONVENTIONS: ES5 only; no onOpen here.
  */
 'use strict';
-var FDC_VERSION = '1.1.0';   // lockstep with the header
+var FDC_VERSION = '1.2.0';   // lockstep with the header
 
 var FDC = {
   SOURCE: 'Final_Decisions',
@@ -59,6 +67,8 @@ var FDC = {
   PROP_LAST: 'FDC_LAST_TICK',
   PROP_RERUN: 'FDC_RERUN',
   PROP_RERUN_FOR: 'FDC_RERUN_FOR',
+  PROP_RERUN_DAY: 'FDC_RERUN_DAY',   // 1.2.0: 'YYYY-MM-DD|n' re-runs scheduled that Riyadh day
+  RERUN_MAX_DAY: 4,
   STUCK_MIN: 20,
   RERUN_HANDLER: 'fdcRerunTop10',
   RERUN_FROM_H: 7,
@@ -163,6 +173,12 @@ function fdcTodayLine_(vals, src, staleH) {
 /* PURE (1.1.0 [RE-RUN]): the Top 10 status cell -> { run: 'yyyy-MM-dd HH:mm:ss', minutes } when it reads running, else null. */
 function fdcStuck_(status, nowMs) {
   var t = fdcTrim_(status);
+  var sk = /\| SKIPPED render (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(t);   // 1.2.0: 16 v1.30.0 [PAINT-BUDGET]
+  if (sk) {
+    var skMs = Date.UTC(+sk[1], +sk[2] - 1, +sk[3], +sk[4] - 3, +sk[5], +sk[6]);
+    return { run: 'skipped ' + sk[1] + '-' + sk[2] + '-' + sk[3] + ' ' + sk[4] + ':' + sk[5] + ':' + sk[6],
+             minutes: Math.max(0, (nowMs - skMs) / 60000), skipped: true };
+  }
   if (!/status:\s*running/i.test(t)) return null;
   var m = /Last run (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(t);
   if (!m) return null;
@@ -171,8 +187,18 @@ function fdcStuck_(status, nowMs) {
 }
 /* PURE (1.1.0 [RE-RUN]): whether to re-run now. */
 function fdcRerunDue_(stuck, rerunFor, riyadhHour, on) {
-  return !!(on && stuck && stuck.minutes >= FDC.STUCK_MIN && rerunFor !== stuck.run && riyadhHour >= FDC.RERUN_FROM_H && riyadhHour < FDC.RERUN_TO_H);
+  return !!(on && stuck && (stuck.skipped === true || stuck.minutes >= FDC.STUCK_MIN) && rerunFor !== stuck.run &&
+            riyadhHour >= FDC.RERUN_FROM_H && riyadhHour < FDC.RERUN_TO_H);
 }
+/* PURE (1.2.0): re-runs already scheduled on Riyadh day 'day' from FDC_RERUN_DAY ('YYYY-MM-DD|n'; another day = 0). */
+function fdcRerunCount_(raw, day) {
+  var m = /^(\d{4}-\d{2}-\d{2})\|(\d{1,3})$/.exec(fdcTrim_(raw));
+  return m && m[1] === day ? +m[2] : 0;
+}
+/* PURE (1.2.0): 'stopped 2026-11-16 08:30:00' / 'skipped 2026-11-16 08:49:57' for the tick line and the toast. */
+function fdcRunLabel_(run) { return /^skipped /.test(String(run)) ? String(run) : 'stopped ' + run; }
+/* The Riyadh calendar day of an instant ('YYYY-MM-DD'). */
+function fdcRiyadhDay_(ms) { return new Date(ms + 3 * 3600000).toISOString().slice(0, 10); }
 
 /* ------------------------------------------------------------ the workbook */
 function fdcReadSource_(ss) {
@@ -239,15 +265,21 @@ function fdcTick() {
     }
     try { out.push(fdcStampToday_(ss, src, staleH)); } catch (eT) { out.push('A3: ' + String(eT && eT.message || eT).slice(0, 80)); }   // 1.1.0
     rerun = fdcRerunCheck_(ss);   // 1.1.0: decided under the lock, run after it is released
-    if (rerun) out.push('re-run of the stopped ' + rerun + ' render started');
+    if (rerun) out.push('re-run of the ' + fdcRunLabel_(rerun) + ' render started');
     line = new Date().toISOString().slice(0, 16) + 'Z \u00b7 ' + (src.ok ? FDC.SOURCE + ' ' + src.at : FDC.SOURCE + ' not read') + ' \u00b7 ' + out.join(' \u00b7 ');
     try { PropertiesService.getScriptProperties().setProperty(FDC.PROP_LAST, line); } catch (e1) {}
   } finally { if (lock) { try { lock.releaseLock(); } catch (e2) {} } }
   if (rerun) {   // 1.1.0 [RE-RUN]: its own execution one minute on, so the render has the whole 6 minutes
-    try { fdcRemoveRerunTriggers_(); ScriptApp.newTrigger(FDC.RERUN_HANDLER).timeBased().after(60 * 1000).create(); }
+    try {
+      fdcRemoveRerunTriggers_(); ScriptApp.newTrigger(FDC.RERUN_HANDLER).timeBased().after(60 * 1000).create();
+      try {   // 1.2.0: counted once the trigger exists
+        var dp = PropertiesService.getScriptProperties(), day = fdcRiyadhDay_(new Date().getTime());
+        dp.setProperty(FDC.PROP_RERUN_DAY, day + '|' + (fdcRerunCount_(dp.getProperty(FDC.PROP_RERUN_DAY), day) + 1));
+      } catch (eD) {}
+    }
     catch (eR) {
       try { PropertiesService.getScriptProperties().deleteProperty(FDC.PROP_RERUN_FOR); } catch (eP) {}   // Codex P2, #1003: the next tick tries again
-      fdcNotify_('FINAL DECISION column: the re-run of the stopped ' + rerun + ' render could not be scheduled (the next tick tries again): ' + String(eR && eR.message || eR).slice(0, 160));
+      fdcNotify_('FINAL DECISION column: the re-run of the ' + fdcRunLabel_(rerun) + ' render could not be scheduled (the next tick tries again): ' + String(eR && eR.message || eR).slice(0, 160));
     }
   }
   return line;
@@ -285,6 +317,7 @@ function fdcRerunCheck_(ss) {
   var stuck = fdcStuck_(sh.getRange(2, 2).getValues()[0][0], new Date().getTime());
   var hour = (new Date().getUTCHours() + 3) % 24;
   if (!fdcRerunDue_(stuck, fdcTrim_(props.getProperty(FDC.PROP_RERUN_FOR)), hour, on)) return '';
+  if (fdcRerunCount_(props.getProperty(FDC.PROP_RERUN_DAY), fdcRiyadhDay_(new Date().getTime())) >= FDC.RERUN_MAX_DAY) return '';   // 1.2.0
   props.setProperty(FDC.PROP_RERUN_FOR, stuck.run);
   return stuck.run;
 }
@@ -330,7 +363,10 @@ function fdcStatus() {
   try { last = PropertiesService.getScriptProperties().getProperty(FDC.PROP_LAST) || 'never run'; } catch (e) { last = 'n/a'; }
   var n = 0, ts = ScriptApp.getProjectTriggers();
   for (var i = 0; i < ts.length; i++) if (ts[i].getHandlerFunction() === FDC.HANDLER) n++;
-  var msg = 'FINAL DECISION column ' + FDC_VERSION + ' \u00b7 trigger ' + (n ? 'installed' : 'NOT installed (run fdcInstallTrigger)') + ' \u00b7 self-test ' + (fdcCoreOk_() ? 'ok' : 'FAIL') + ' \u00b7 last tick: ' + last;
+  var rr = 0;
+  try { rr = fdcRerunCount_(PropertiesService.getScriptProperties().getProperty(FDC.PROP_RERUN_DAY), fdcRiyadhDay_(new Date().getTime())); } catch (eC) {}
+  var msg = 'FINAL DECISION column ' + FDC_VERSION + ' \u00b7 trigger ' + (n ? 'installed' : 'NOT installed (run fdcInstallTrigger)') + ' \u00b7 self-test ' + (fdcCoreOk_() ? 'ok' : 'FAIL') +
+            ' \u00b7 re-runs today ' + rr + '/' + FDC.RERUN_MAX_DAY + ' \u00b7 last tick: ' + last;
   fdcNotify_(msg);
   return msg;
 }
@@ -352,6 +388,9 @@ function fdcCoreOk_() {
       fdcStuck_('Last run 2026-11-16 08:44:11 | status: running\u2026', Date.UTC(2026, 10, 16, 6, 44, 11)).minutes === 60 &&
       fdcStuck_('Last run 2026-11-16 10:16:20 | status: ok', 0) === null &&
       fdcRerunDue_({ run: 'r', minutes: 25 }, '', 9, true) && !fdcRerunDue_({ run: 'r', minutes: 25 }, 'r', 9, true) &&
+      fdcStuck_('Last run 2026-11-16 08:10:08 | status: ok | SKIPPED render 2026-11-16 08:49:57 (out of time: t+331.9s, paint budget 300s) - x', Date.UTC(2026, 10, 16, 5, 50, 57)).run === 'skipped 2026-11-16 08:49:57' &&
+      fdcRerunDue_({ run: 's', minutes: 1, skipped: true }, '', 9, true) && fdcRerunCount_('2026-11-16|3', '2026-11-16') === 3 &&
+      fdcRerunCount_('2026-11-15|3', '2026-11-16') === 0 && fdcRiyadhDay_(Date.UTC(2026, 10, 15, 21, 30)) === '2026-11-16' &&
       fdcTodayLine_([['Symbol', 'Decision'], ['AX.US', 'BUY'], ['DDI.US', 'HOLD']], { ok: true, at: 'x', ageH: 0 }, 6).indexOf('BUY AX.US \u00b7 SELL none') > 0;
   } catch (e) { return false; }
 }

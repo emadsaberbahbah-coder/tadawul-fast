@@ -1,11 +1,50 @@
 /**
  * ============================================================================
  * 16_Decision_Top10.gs — Top_10_Investments DECISION page (frontend renderer)
- * Version: 1.29.0 (see DT10_VERSION; header kept in lockstep — restored
+ * Version: 1.30.0 (see DT10_VERSION; header kept in lockstep — restored
  *                  again at v1.6.6 after drifting to 1.6.4 while
  *                  DT10_VERSION read 1.6.5)
  * Runtime: ES5 ONLY (V8 exceptions are 01_Menu.gs / 03_Schema.gs only).
  * ============================================================================
+ *
+ * v1.30.0 (2026-11-16) [PAINT-BUDGET] -- A RENDER THAT REACHES THE PAINT TOO LATE KEEPS THE PREVIOUS BOARD
+ *   (DEFAULT ON, 300 s)
+ * WHY (owner, Mon 16 Nov 2026 11:23 Riyadh: "Top_10_Investments, review and improve or is it ok?"): the 08:44
+ *   render - the one that follows the 08:41 IBKR capture - was stopped by Google on 9, 10 and 16 Nov and each time
+ *   left Top_10_Investments empty below the KPI strip until a later render. DT10_CLEAR_LATE (v1.28.0, armed 9 Nov)
+ *   moved the clear to just before the paint, but on 16 Nov the run only got there at t+331.9 s (_Run_Log
+ *   ABORTED_PREV 10:14:15: 'last phase reached: r_kpi at t+331.9s'), cleared the zones and was stopped 28 s later,
+ *   inside the paint. Finished renders reach the same point at 95-290 s and paint in 10-30 s; the 6-minute limit is
+ *   360 s. A clear that starts with too little time left cannot finish, so the board must not be cleared at all.
+ * WHAT: Script Property DT10_PAINT_BUDGET_S: absent / blank / junk = 300; an integer = that many seconds (clamped
+ *   120..345); off / 0 / false / no = off (the v1.29.0 render byte for byte, apart from one property read and one
+ *   status-cell read). On:
+ *   (a) the refresh reads the status line it is about to replace (B2) before writing 'running...', and attaches
+ *       payload._dt10_budget = {limit_s, t0}; the board-zone clear then always runs late (as DT10_CLEAR_LATE = on);
+ *   (b) right before that clear, dt10RenderPayload_ measures the seconds this execution has run
+ *       (dt10ExecElapsedS_: from DT10_EXEC_T0_, set by this file's global code when the execution starts, so a
+ *       render called by the morning job or the decision chain counts their time too; from the refresh start when
+ *       that clock is not plausible). Past the budget nothing is cleared or painted: the render returns
+ *       {skipped: {at_s, limit_s}} and the refresh (dt10PaintSkipped_) puts the previous status line back with
+ *       ' | SKIPPED render <time> (out of time: t+<s>s, paint budget <s>s) - the board below is the previous
+ *       render, unchanged; nothing was cleared' at its end (dt10SkipLineCore_, pure; an older SKIPPED tail is
+ *       replaced; a previous line that is missing or still 'running' becomes 'Last run <now> | status: SKIPPED'),
+ *       writes ONE _Run_Log row (WARN, PAINT_SKIPPED) and clears the P-195 marker. The selection, exit and shadow
+ *       logs, the _Status row and the last-success memory are not written: no new board exists.
+ *   The kept line still describes the board on screen, so every reader stays right: the Daily Plan and Decision
+ *   Pages v2 read that board's own 'status: ok' and time; the decision chain and the feed-release receipts see no
+ *   new stamp (the same as a stopped render: they retry). 31_Final_Decision_Column 1.2.0 re-runs a SKIPPED render
+ *   once, on its next 10-minute tick. Steps before the paint (the stability state included) are unchanged; they
+ *   already ran in the same order when Google stopped a render inside the paint.
+ * Functions added (0 removed): dt10PaintBudgetCore_ (pure), dt10PaintBudgetS_, dt10ExecElapsedS_ (pure),
+ *   dt10SkipLineCore_ (pure), dt10PaintSkipped_. Changed: dt10RefreshDecisionTop10Run_ (the status-line read, the
+ *   attach, the skip return), dt10RenderPayload_ (late clear under the budget; the check), dt10SelfTest (two
+ *   lines). Vars added: DT10_PAINT_BUDGET_PROP, DT10_PAINT_BUDGET_DEFAULT_S, DT10_PAINT_BUDGET_MIN_S,
+ *   DT10_PAINT_BUDGET_MAX_S, DT10_EXEC_T0_.
+ * Harness: tests/test_dt10_v1300_paint_budget.js (REAL file; golden negative on the v1.29.0 base rebuilt by
+ *   reversing these edits, SHA-256 pinned).
+ * ROLLBACK: Script Property DT10_PAINT_BUDGET_S = off (no re-paste); or re-paste v1.29.0.
+ * ES5; ASCII; all prior WHYs verbatim; DT10_VERSION and the header bumped in lockstep.
  *
  * v1.29.0 (2026-11-09) [VERDICT-REUSE] -- ONE SOURCE CHECK FEWER BEFORE THE POST AND ONE FEWER AFTER STABILITY
  *   (ONE KNOB, DEFAULT OFF)
@@ -2772,7 +2811,7 @@
  * board is preserved instead of wiped. A genuine empty scan (scanned = 0 /
  * status "no_candidates") still renders exactly as before.
  */
-var DT10_VERSION = '1.29.0';
+var DT10_VERSION = '1.30.0';
 
 /** A reversible rollout brake with no fallback to the old funding bug.
  * DT10_BOARD_FUNDING_MODE=research keeps research/stability but allocates zero.
@@ -3748,6 +3787,11 @@ var DT10_RENDER_TIMING_MARKER_MS = 5000;   // v1.28.0: marker rewrite at most ev
 var DT10_PH_ = null;   // v1.28.0: this execution's phase clock (null = off)
 var DT10_CLEAR_LATE_PROP = 'DT10_CLEAR_LATE';   // v1.28.0 [CLEAR-LATE]
 var DT10_VERDICT_REUSE_PROP = 'DT10_VERDICT_REUSE';   // v1.29.0 [VERDICT-REUSE]
+var DT10_PAINT_BUDGET_PROP = 'DT10_PAINT_BUDGET_S';   // v1.30.0 [PAINT-BUDGET]
+var DT10_PAINT_BUDGET_DEFAULT_S = 300;   // v1.30.0: absent / blank / junk
+var DT10_PAINT_BUDGET_MIN_S = 120;
+var DT10_PAINT_BUDGET_MAX_S = 345;   // Google stops an execution at 360 s
+var DT10_EXEC_T0_ = new Date().getTime();   // v1.30.0: global code runs when the execution starts
 // v1.11.12 [SYNC-INFLIGHT]: first/last legs of a daily_sync run and the bound.
 var DT10_INFLIGHT_PROP = 'DT10_SYNC_INFLIGHT';   // off | observe (default) | enforce
 var DT10_INFLIGHT_FIRST_KEY = 'TFB Feed Market_Leaders';
@@ -6569,6 +6613,78 @@ function dt10VerdictReuseOn_() {
         .replace(/^\s+|\s+$/g, '').toLowerCase() === 'on';
   } catch (eVr) {}
   return false;
+}
+/** v1.30.0 [PAINT-BUDGET] PURE: the DT10_PAINT_BUDGET_S value -> seconds
+ * (0 = off). Absent / blank / junk = DT10_PAINT_BUDGET_DEFAULT_S; an integer
+ * is clamped to DT10_PAINT_BUDGET_MIN_S..DT10_PAINT_BUDGET_MAX_S. */
+function dt10PaintBudgetCore_(raw) {
+  var s = String(raw === null || raw === undefined ? '' : raw)
+      .replace(/^\s+|\s+$/g, '').toLowerCase();
+  if (s === 'off' || s === '0' || s === 'false' || s === 'no') return 0;
+  if (!/^\d{1,6}$/.test(s)) return DT10_PAINT_BUDGET_DEFAULT_S;
+  return Math.max(DT10_PAINT_BUDGET_MIN_S,
+                  Math.min(DT10_PAINT_BUDGET_MAX_S, parseInt(s, 10)));
+}
+/** v1.30.0 [PAINT-BUDGET]: one property read; a PropertiesService fault =
+ * the default (on: keeping a board is the safe side). Never throws. */
+function dt10PaintBudgetS_() {
+  try {
+    return dt10PaintBudgetCore_(PropertiesService.getScriptProperties()
+        .getProperty(DT10_PAINT_BUDGET_PROP));
+  } catch (ePb) {}
+  return DT10_PAINT_BUDGET_DEFAULT_S;
+}
+/** v1.30.0 [PAINT-BUDGET] PURE: seconds this execution has run at nowMs.
+ * From execT0 (this file's global start) when it is a number no later than
+ * the refresh start and at most 15 minutes before it; otherwise from runT0. */
+function dt10ExecElapsedS_(execT0, runT0, nowMs) {
+  var base = Number(runT0);
+  if (typeof execT0 === 'number' && isFinite(execT0) && execT0 <= base &&
+      base - execT0 <= 900000) {
+    base = execT0;
+  }
+  var d = (Number(nowMs) - base) / 1000;
+  return isFinite(d) && d > 0 ? d : 0;
+}
+/** v1.30.0 [PAINT-BUDGET] PURE: the status line a skipped paint writes back.
+ * The previous line (the board still on screen) keeps its own stamp and
+ * status; an older SKIPPED tail is replaced; a missing or 'running' line
+ * becomes 'Last run <stamp> | status: SKIPPED'. */
+function dt10SkipLineCore_(prevLine, stamp, atS, limitS) {
+  var prev = String(prevLine || '').replace(/\s*\| SKIPPED render [\s\S]*$/, '');
+  if (!/^Last run \d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(prev) ||
+      /\|\s*status:\s*running/i.test(prev)) {
+    prev = 'Last run ' + stamp + ' | status: SKIPPED';
+  }
+  return prev + ' | SKIPPED render ' + stamp + ' (out of time: t+' + atS +
+         's, paint budget ' + limitS + 's) - the board below is the previous ' +
+         'render, unchanged; nothing was cleared';
+}
+/** v1.30.0 [PAINT-BUDGET] I/O: a render that reached the paint past its
+ * budget. Puts the previous status line back (with the SKIPPED tail), writes
+ * ONE _Run_Log row and clears this run's P-195 marker. Never throws. */
+function dt10PaintSkipped_(statusCell, prevLine, sk) {
+  var stamp = '';
+  try {
+    stamp = Utilities.formatDate(new Date(),
+        Session.getScriptTimeZone() || 'Asia/Riyadh', 'yyyy-MM-dd HH:mm:ss');
+  } catch (eSt) {
+    stamp = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  }
+  try {
+    statusCell.setValue(dt10SkipLineCore_(prevLine, stamp, sk.at_s, sk.limit_s));
+  } catch (eSc) {}
+  dt10RunLogRow_('WARN', 'PAINT_SKIPPED',
+      'render reached the paint at t+' + sk.at_s + 's, past the paint budget of ' +
+      sk.limit_s + 's (Google stops an execution at 360 s): the previous board ' +
+      'was kept - nothing cleared or painted',
+      { version: DT10_VERSION, at_s: sk.at_s, limit_s: sk.limit_s });
+  try {
+    Logger.log('[DT10 v' + DT10_VERSION + '] paint skipped at t+' + sk.at_s +
+               's (budget ' + sk.limit_s + 's); previous board kept');
+  } catch (eLg) {}
+  dt10RunMarkerClear_();
+  try { SpreadsheetApp.flush(); } catch (eFl) {}
 }
 /** v1.28.0 [RENDER-TIMING] I/O: start this execution's phase clock when
  * armed (one property read); off => DT10_PH_ stays null and every mark is a
@@ -10555,6 +10671,12 @@ function dt10RefreshDecisionTop10Run_(run) {
   var tokens = dt10Tokens_(ss);
   var statusCell = sheet.getRange(DT10_ROW_STATUS, 2);
   run.statusCell = statusCell;                              // v1.13.10
+  // v1.30.0 [PAINT-BUDGET]: the line a skipped paint puts back (the board on screen)
+  var paintBudgetS = dt10PaintBudgetS_();
+  var prevStatusLine = '';
+  if (paintBudgetS > 0) {
+    try { prevStatusLine = String(statusCell.getValue() || ''); } catch (ePs) {}
+  }
   statusCell.setValue(dt10StatusLine_('running\u2026', ''));
   SpreadsheetApp.flush();
   dt10PhaseMark_('setup');   // v1.28.0
@@ -10756,6 +10878,7 @@ function dt10RefreshDecisionTop10Run_(run) {
   if (kpiPlanMode === 'on') dt10KpiPlanLabelMark_(true);
   if (venueOn) payload._dt10_venue = { mode: 'on' };
   if (clearLate) payload._dt10_clear_late = 1;   // v1.28.0 [CLEAR-LATE]: rides only when armed
+  if (paintBudgetS > 0) payload._dt10_budget = { limit_s: paintBudgetS, t0: t0 };   // v1.30.0
   dt10PhaseMark_('attach');   // v1.28.0
   payload._dt10_uv = dt10BoardVerdict_(ss, sourceContext);
   dt10PhaseMark_('verdict1');   // v1.28.0
@@ -10777,6 +10900,10 @@ function dt10RefreshDecisionTop10Run_(run) {
   // v1.8.0 (S-6): reconcile funded-pick KPI vs the board's executable set.
   var seatNote;
   var earn = dt10RenderPayload_(sheet, payload, tokens);
+  if (earn && earn.skipped) {   // v1.30.0 [PAINT-BUDGET]: nothing cleared or painted
+    dt10PaintSkipped_(statusCell, prevStatusLine, earn.skipped);
+    return;
+  }
   dt10PhaseMark_('render');   // v1.28.0
   // v1.13.4 [WP-8]: status tokens the render stored ('' when a gate is off).
   var itNote = payload._dt10_it_note || '';
@@ -11063,7 +11190,9 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   // only while DT10_CLEAR_LATE is on) moves this clear after the pre-paint
   // steps below, so a render Google stops inside them keeps the previous
   // board on screen. No key = the v1.27.0 order.
-  var clearLate = !!(payload && payload._dt10_clear_late === 1);
+  // v1.30.0 [PAINT-BUDGET]: under a budget the clear always runs late.
+  var paintBudget = payload ? payload._dt10_budget : null;
+  var clearLate = !!(payload && (payload._dt10_clear_late === 1 || paintBudget));
   if (!clearLate) dt10ClearZones_(sheet);
   dt10PhaseMark_('r_clear');   // v1.28.0 [RENDER-TIMING]
   // Recheck after sheet preparation and before any financial values are
@@ -11093,6 +11222,14 @@ function dt10RenderPayload_(sheet, payload, tokens) {
   var tguardNote = dt10TicketGuard_(payload, earn && earn.map, sheet.getParent());
   if (tguardNote) payload._dt10_tguard_note = tguardNote;
   dt10PhaseMark_('r_guard');   // v1.28.0
+  if (paintBudget) {   // v1.30.0 [PAINT-BUDGET]: too late to clear and paint -> keep the board
+    var pbAt = dt10ExecElapsedS_(DT10_EXEC_T0_, paintBudget.t0, new Date().getTime());
+    if (pbAt > paintBudget.limit_s) {
+      dt10PhaseMark_('r_skip');
+      return { skipped: { at_s: Math.round(pbAt * 10) / 10, limit_s: paintBudget.limit_s },
+               note: earn && earn.note ? earn.note : '', map: earn ? earn.map : null };
+    }
+  }
   if (clearLate) {   // v1.28.0 [CLEAR-LATE]: the zones clear here, right before the first paint
     dt10ClearZones_(sheet);
     dt10PhaseMark_('r_clear_late');
@@ -13140,6 +13277,26 @@ function dt10SelfTest() {
       'render keeps the previous board); verdict reuse (DT10_VERDICT_REUSE): ' +
       (dt10VerdictReuseOn_() ? 'on' : 'off') + ' (no log-only source check before the POST; verdict 1 stands ' +
       'for verdict 2; the pre-paint and selection-log rechecks stay)');
+  var pbS = dt10PaintBudgetS_();   // v1.30.0 [PAINT-BUDGET]
+  report.push('paint budget (DT10_PAINT_BUDGET_S): ' + (pbS > 0 ? pbS + ' s' : 'off') +
+      ' (a render that reaches the paint later keeps the previous board and its status line, ' +
+      'with a SKIPPED tail)');
+  var pbLine = dt10SkipLineCore_('Last run 2026-11-16 08:10:08 | status: ok | output: EXECUTABLE',
+      '2026-11-16 08:49:57', 331.9, 300);
+  report.push('paint budget core: ' +
+      ((dt10PaintBudgetCore_(null) === 300 && dt10PaintBudgetCore_('off') === 0 &&
+        dt10PaintBudgetCore_(' 280 ') === 280 && dt10PaintBudgetCore_('9999') === 345 &&
+        dt10PaintBudgetCore_('60') === 120 && dt10PaintBudgetCore_('x') === 300 &&
+        dt10ExecElapsedS_(1000, 61000, 361000) === 360 &&
+        dt10ExecElapsedS_(null, 61000, 361000) === 300 &&
+        dt10ExecElapsedS_(1000, 2000000, 2001000) === 1 &&
+        pbLine.indexOf('Last run 2026-11-16 08:10:08 | status: ok | output: EXECUTABLE | SKIPPED render ' +
+            '2026-11-16 08:49:57 (out of time: t+331.9s, paint budget 300s)') === 0 &&
+        dt10SkipLineCore_(pbLine, '2026-11-16 09:00:00', 310, 300).split('SKIPPED render').length === 2 &&
+        dt10SkipLineCore_('Last run 2026-11-16 08:44:11 | status: running\u2026', '2026-11-16 08:50:00', 330, 300)
+            .indexOf('Last run 2026-11-16 08:50:00 | status: SKIPPED | SKIPPED render') === 0)
+       ? 'ok (default 300 s, off, clamp 120..345; execution clock; the kept line and one SKIPPED tail)'
+       : 'FAIL [' + pbLine + ']'));
   var rtClock = { t0: 1000, last: 4300, marks: [['setup', 1200], ['pool', 2100]] };
   var rtLine = dt10PhaseLine_(rtClock);
   var rtTrail = dt10PhaseTrailNote_('{"started":"2026-11-09T05:44:28.522Z","v":"1.28.0",' +

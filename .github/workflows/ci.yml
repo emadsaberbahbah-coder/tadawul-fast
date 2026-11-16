@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.80 (2026-11-16) -- PAINT-BUDGET HARNESS
+#
+# v1.1.80: run tests/test_dt10_v1300_paint_budget.js (16_Decision_Top10.gs
+# v1.30.0: a render that reaches the paint past DT10_PAINT_BUDGET_S, 300 s by
+# default, keeps the previous board and its status line instead of clearing
+# it) in the blocking lean lane after the v1.29.0 verdict-reuse harness.
+#
 # VERSION 1.1.79 (2026-11-11) -- CONSISTENCY CHECK SUITE
 #
 # v1.1.79: run tests/test_consistency_check.py (scripts/consistency_check.py
@@ -1365,6 +1372,7 @@ jobs:
           node tests/test_dt10_v1270_corp_guard.js
           node tests/test_dt10_v1280_render_timing.js
           node tests/test_dt10_v1290_verdict_reuse.js
+          node tests/test_dt10_v1300_paint_budget.js
           node tests/test_pd_evidence_publish.js
           node tests/test_pd_post_earn_inputs.js
           node tests/js/decision_input_truth.test.js

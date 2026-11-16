@@ -40,7 +40,9 @@ const history = require(path.join(ROOT, 'tests', 'js', 'dt10_cash_utc_history.js
 const EDITS = require(path.join(ROOT, 'tests', 'js', 'dt10_edits_v1290.json'));
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '16_Decision_Top10.gs');
 const BASE_PATH = process.argv[3] || '';
-const newSource = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-16: v1.30.0 delivered -- this harness runs on the v1.29.0 file rebuilt from the delivered file
+// (tests/js/dt10_cash_utc_history.js v1290Source: the v1.30.0 edits reversed, SHA-256 pinned).
+const newSource = history.v1290Source(fs.readFileSync(NEW_PATH, 'utf8'));
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
 let baseSource;
 try {

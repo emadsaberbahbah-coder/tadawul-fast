@@ -230,7 +230,7 @@ test('S7 the self-test core, ES5 / ASCII, version lockstep', () => {
   ok(env.ctx.fdcCoreOk_() === true, 'core');
   ok(!/[^\x00-\x7F]/.test(SRC), 'ASCII');
   ok(!/\b(let|const)\s|=>|`/.test(SRC), 'ES5');
-  ok(/ \* Version: 1\.1\.0 \(2026-11-16\)/.test(SRC) && /var FDC_VERSION = '1\.1\.0';/.test(SRC), 'version lockstep');
+  ok(/ \* Version: 1\.2\.0 \(2026-11-16\)/.test(SRC) && /var FDC_VERSION = '1\.2\.0';/.test(SRC), 'version lockstep');
 });
 
 test('S8 (1.1.0) the today line in Top_10_Investments!A3: written when empty, kept current, never over other text', () => {
@@ -284,6 +284,32 @@ test('S9 (1.1.0) a render stopped by Google is re-run once, in its own execution
   eq(reruns(f).length, 1, 'scheduled on the next tick'); eq(f.props.FDC_RERUN_FOR, '2026-11-16 08:30:00');
   // the 10-minute trigger is never touched by the re-run bookkeeping
   const t = mk(stuck); t.ctx.fdcInstallTrigger(); eq(t.triggers.filter(x => x.h === 'fdcTick').length, 1); eq(reruns(t).length, 1);
+});
+
+test('S10 (1.2.0) a SKIPPED render (16 v1.30.0 [PAINT-BUDGET]) is re-run on the next tick, once, at most 4 a Riyadh day', () => {
+  const PREV = 'Last run 2026-11-16 08:10:08 | status: ok | output: EXECUTABLE';
+  const skipped = PREV + ' | SKIPPED render 2026-11-16 08:55:00 (out of time: t+331.9s, paint budget 300s) - the board below is the previous render, unchanged; nothing was cleared';
+  const mk = (status, props) => { const w = world(); w.Top_10_Investments[1][1] = status; return makeEnv(w, { props: props || {} }); };
+  const reruns = e => e.triggers.filter(t => t.h === 'fdcRerunTop10');
+  const e = mk(skipped);   // NOW = 09:00 Riyadh: 5 minutes after the skip, no 20-minute wait
+  ok(/re-run of the skipped 2026-11-16 08:55:00 render started/.test(e.ctx.fdcTick()), 'due at once');
+  eq(reruns(e).length, 1, 'one one-off trigger'); eq(e.props.FDC_RERUN_FOR, 'skipped 2026-11-16 08:55:00'); eq(e.props.FDC_RERUN_DAY, '2026-11-16|1', 'counted');
+  e.ctx.fdcTick(); eq(reruns(e).length, 1, 'never twice for the same skipped run'); eq(e.props.FDC_RERUN_DAY, '2026-11-16|1');
+  const n = mk(skipped, { FDC_RERUN_DAY: '2026-11-16|3' }); n.ctx.fdcTick(); eq(reruns(n).length, 1, 'the 4th of the day runs'); eq(n.props.FDC_RERUN_DAY, '2026-11-16|4');
+  for (const [props, why] of [[{ FDC_RERUN_DAY: '2026-11-16|4' }, 'the day cap'], [{ FDC_RERUN: 'off' }, 'off'], [{ FDC_RERUN_FOR: 'skipped 2026-11-16 08:55:00' }, 'already done']]) {
+    const x = mk(skipped, props); x.ctx.fdcTick(); eq(reruns(x).length, 0, why);
+  }
+  const y = mk(skipped, { FDC_RERUN_DAY: '2026-11-15|4' }); y.ctx.fdcTick(); eq(reruns(y).length, 1, 'yesterday\'s count does not hold today'); eq(y.props.FDC_RERUN_DAY, '2026-11-16|1');
+  // the stopped-run rule counts against the same cap
+  const st = mk('Last run 2026-11-16 08:30:00 | status: running\u2026', { FDC_RERUN_DAY: '2026-11-16|4' }); st.ctx.fdcTick(); eq(reruns(st).length, 0, 'cap covers stopped runs');
+  // a scheduling failure is not counted
+  const f = mk(skipped); f.ctx.ScriptApp.newTrigger = () => { throw new Error('quota'); }; f.ctx.fdcTick();
+  ok(!('FDC_RERUN_DAY' in f.props) && !('FDC_RERUN_FOR' in f.props), 'not counted, released');
+  ok(f.book.toasts.some(t => /re-run of the skipped 2026-11-16 08:55:00 render could not be scheduled/.test(t)), 'toast names the skipped run');
+  const c = makeEnv(world()).ctx;
+  eq(c.fdcStuck_('Last run 2026-11-16 08:44:11 | status: running\u2026 | SKIPPED render 2026-11-16 08:50:00 (x)', Date.UTC(2026, 10, 16, 6, 0)).run, 'skipped 2026-11-16 08:50:00', 'the tail wins over running');
+  ok(!c.fdcRerunDue_({ run: 's', minutes: 0, skipped: true }, '', 23, true), 'still 07:00-23:00 only');
+  ok(/re-runs today 1\/4/.test(e.ctx.fdcStatus()), 'fdcStatus shows the count');
 });
 
 console.log((failed ? 'FAIL ' : 'PASS ') + passed + '/' + (passed + failed));
