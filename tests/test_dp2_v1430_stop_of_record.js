@@ -7,12 +7,12 @@
  * as analysis. Shims copied from tests/test_dp2_v1420_status_line.js. The v1.4.2 file (OLD, SHA-256 pinned fc90004f =
  * origin/main 2b66b51) is rebuilt by reversing the enumerated v1.4.3 hunks (tests/js/dp2_edits_v1430.json).
  * Every Final_Decisions row is synthetic.
- *   R0  oracle: reversal = v1.4.2; versions; both compile; +1 function, 0 removed; ES5 / ASCII of the new lines
+ *   R0  oracle: reversal = v1.4.2; versions; both compile; +2 functions, 0 removed; ES5 / ASCII of the new lines
  *   R1  GOLDEN NEGATIVE: DP2_FINAL off, or final rows without a stop -> both pages equal the v1.4.2 build
  *   R2  a final row with a stop: only the holding's 'Dyn stop' cell changes; it starts with the stop of record and
  *       keeps the page's own stop as 'v2 rule ... (analysis)'; no raise arrow unless the broker stop is below it
  *   R3  ACTIONS TODAY: a final HOLD ending 'nothing to change.' is not listed; a real raise is
- *   R4  the pure helper
+ *   R4  the pure helpers (a stop on part of the position is never 'in place'; a verify-only row never instructs)
  *   R5  mutants
  * The battery runs three times and the digests must match; the last line is 'PASS k/k' (exit 1 on any failure).
  */
@@ -417,7 +417,7 @@ function checkOracle() {
   new vm.Script(NEW, { filename: '27_Decision_Pages_v2.gs' }); new vm.Script(OLD, { filename: 'old.gs' });
   const fns = s => new Set((s.match(/^function\s+([A-Za-z_$][\w$]*)/mg) || []).map(x => x.split(/\s+/)[1]));
   const fo = fns(OLD), fn = fns(NEW);
-  deq([...fo].filter(k => !fn.has(k)), [], 'functions removed'); deq([...fn].filter(k => !fo.has(k)), ['dp2StopOfRecordText_'], 'functions added');
+  deq([...fo].filter(k => !fn.has(k)), [], 'functions removed'); deq([...fn].filter(k => !fo.has(k)).sort(), ['dp2FinalVerifyOnly_', 'dp2StopOfRecordText_'], 'functions added');
   for (const [cur, prev] of EDITS) {
     const na = s => s.split('').filter(ch => ch.charCodeAt(0) > 127).sort().join('');
     eq(na(cur), na(prev), 'no new non-ASCII character: ' + cur.split('\n')[0].slice(0, 70));
@@ -460,6 +460,16 @@ function checkCell(out) {
   const nc = buildWith(NEW, 'pd', { final: finalGrid(FINAL_ROWS), capture: null });
   ok(/stop of record\n/.test(cellOf(nc)), 'without a capture the stop of record still leads: ' + JSON.stringify(cellOf(nc)));
   if (out) out.push(cellOf(hi), cellOf(nc));
+  // Codex P2 x2 (#1007): a stop on part of the position is never 'in place'; a verify-only row gets no raise / place
+  const part = clone(FIX.ibkr_capture);
+  for (const o of part.json.orders.orders) if (/STP/.test(o.order_type)) { o.total_shares_qty = 40; o.remaining_shares_qty = 40; o.primary_description = 'SELL 40 FRST STP 14.56'; }
+  const pc = cellOf(buildWith(NEW, 'pd', { final: finalGrid(FINAL_ROWS), capture: part }));
+  ok(/\nbroker 14\.56 on 40 of 174 sh only/.test(pc) && pc.indexOf('in place') < 0, 'partial cover: ' + JSON.stringify(pc));
+  const vr = cellOf(buildWith(NEW, 'pd', { final: finalGrid(rowsWith('Hold. Verify at IBKR before any change: the quantity differs.', 14.9)) }));
+  ok(/\nbroker 14\.56 below the stop of record \u2014 verify first/.test(vr) && vr.indexOf('raise') < 0 && vr.indexOf('place') < 0, 'verify-only: ' + JSON.stringify(vr));
+  const vs = cellOf(buildWith(NEW, 'pd', { final: finalGrid(rowsWith('Verify FRST.US at IBKR before acting: the quantity differs.', 14.9)) }));
+  eq(vs, vr, 'the step form of a verification is verify-only too');
+  if (out) out.push(pc, vr);
 }
 function checkActions() {
   const quiet = "Hold; the stop working at IBKR (14.56) already covers the plan's 14.00 on all 100 shares - nothing to change.";
@@ -479,12 +489,28 @@ function checkPure() {   // invented figures
   eq(f(9.5, 10, null, false, 9.0, null), '9.50 (\u22125.0%) stop of record\nbroker orders not read');
   eq(f(9.5, 10, null, true, 9.0, null), '9.50 (\u22125.0%) stop of record\nbroker 9.00 not working \u2014 place 9.50');
   eq(f(9.5, null, 9.6, true, null, null), '9.50 stop of record\nbroker 9.60 \u2014 in place');
+  const L2 = (...a) => f(...a).split('\n')[1];
+  eq(L2(9.5, 10, 9.6, true, null, null, { covered: 40, shares: 100 }), 'broker 9.60 on 40 of 100 sh only');
+  eq(L2(9.5, 10, 9.2, true, null, null, { covered: 40, shares: 100 }), 'broker 9.20 on 40 of 100 sh only, below the stop of record');
+  eq(L2(9.5, 10, 9.2, true, null, null, { covered: 40, shares: 100, verifyOnly: true }), 'broker 9.20 on 40 of 100 sh only, below the stop of record \u2014 verify first');
+  eq(L2(9.5, 10, 9.6, true, null, null, { covered: 100, shares: 100 }), 'broker 9.60 \u2014 in place');
+  eq(L2(9.5, 10, 9.6, true, null, null, { covered: null, shares: 100 }), 'broker 9.60 \u2014 in place', 'coverage unknown: the price decides');
+  eq(L2(9.5, 10, 9.2, true, null, null, { covered: 100, shares: 100, verifyOnly: true }), 'broker 9.20 below the stop of record \u2014 verify first');
+  eq(L2(9.5, 10, 9.6, true, null, null, { covered: 100, shares: 100, verifyOnly: true }), 'broker 9.60 \u2014 in place');
+  eq(L2(9.5, 10, null, true, null, null, { verifyOnly: true }), 'no broker stop \u2014 verify first');
+  eq(L2(9.5, 10, null, true, 9.0, null, { verifyOnly: true }), 'broker 9.00 not working \u2014 verify first');
+  const v = makeEnv(NEW, { fetch: NO_NET }).ctx.dp2FinalVerifyOnly_;
+  ok(v({ todo: 'Hold. Verify at IBKR before any change: quantity differs.' }) && v({ todo: 'Verify A.US at IBKR before acting: x.' }) &&
+     v({ todo: 'Verify A.US before any new buy or stop change: x.' }), 'the three verify forms');
+  ok(!v({ todo: 'Hold; stop 9.50.' }) && !v({ todo: 'Hold; raise the stop to 9.50 for all 100 shares.' }) && !v(null) && !v({}), 'ordinary rows');
 }
 const MUTANTS = [
   ['the cell not replaced', "      if (fc.row && fc.row.stop) dynTxt = dp2StopOfRecordText_(", "      if (false) dynTxt = dp2StopOfRecordText_("],
-  ['an arrow at an equal stop', "(brokerStop >= recStop - 0.005 ? ' \\u2014 in place'", "(brokerStop > recStop + 1 ? ' \\u2014 in place'"],
+  ['a low broker stop reads in place', "    var low = brokerStop < recStop - 0.005;", "    var low = brokerStop < recStop - 1;"],
   ['the v2 rule dropped', "(v2Stop ? '\\nv2 rule ' + dp2Fmt_(v2Stop, 2) + ' (analysis)' : '')", "''"],
   ['nothing-to-change listed', "nothing to change\\.$/.test(dp2Str_(r.todo).trim())) return null;", "nothing to change\\.$/.test(dp2Str_(r.todo).trim())) r = r;"],
+  ['a partial stop reads in place', "  var partial = typeof cov.covered === 'number' && typeof cov.shares === 'number' && cov.covered > 0 && cov.covered < cov.shares - 1e-9;", "  var partial = false;"],
+  ['verify-only still instructs', "  var verify = cov.verifyOnly === true,", "  var verify = false,"],
   ['unknown orders read as none', "  else if (!known) line2 = 'broker orders not read';", "  else if (known) line2 = 'broker orders not read';"]
 ];
 function signature(src) {
@@ -492,15 +518,19 @@ function signature(src) {
   const a = buildWith(src, 'pd', { final: finalGrid(FINAL_ROWS), fetch: frstYahoo() }), b = buildWith(src, 'pd', { final: finalGrid(rowsWith('Hold; stop 14.90.', 14.9)) });
   const c = buildWith(src, 'pd', { final: finalGrid(rowsWith(quiet, 14)) }), d = buildWith(src, 'pd', { props: { DP2_FINAL: 'off' }, final: finalGrid(FINAL_ROWS) });
   const e = buildWith(src, 'pd', { final: finalGrid(FINAL_ROWS), capture: null });
-  return sha256(JSON.stringify([cellOf(a), cellOf(b), actionLines(sheet(c, PDV)), cellOf(d), cellOf(e)]));
+  const part = clone(FIX.ibkr_capture);
+  for (const o of part.json.orders.orders) if (/STP/.test(o.order_type)) { o.total_shares_qty = 40; o.remaining_shares_qty = 40; o.primary_description = 'SELL 40 FRST STP 14.56'; }
+  const g = buildWith(src, 'pd', { final: finalGrid(FINAL_ROWS), capture: part });
+  const h = buildWith(src, 'pd', { final: finalGrid(rowsWith('Hold. Verify at IBKR before any change: the quantity differs.', 14.9)) });
+  return sha256(JSON.stringify([cellOf(a), cellOf(b), actionLines(sheet(c, PDV)), cellOf(d), cellOf(e), cellOf(g), cellOf(h)]));
 }
 function battery() {
   passed = 0; failed = 0; const out = [];
-  test('R0 oracle: the reversal of the v1.4.3 hunks is the v1.4.2 file (SHA-256 pinned, history chain); versions; both compile; +1 function; ES5 / ASCII', () => checkOracle());
+  test('R0 oracle: the reversal of the v1.4.3 hunks is the v1.4.2 file (SHA-256 pinned, history chain); versions; both compile; +2 functions; ES5 / ASCII', () => checkOracle());
   test('R1 GOLDEN NEGATIVE: DP2_FINAL off, no stop on the final row, or no Final_Decisions tab -> the v1.4.2 pages; Top 10 v2 unchanged', () => checkGolden());
   test('R2 a final row with a stop: only the Dyn stop cell changes - stop of record first, broker against it, own stop as analysis; arrow only when the broker is below', () => checkCell(out));
   test('R3 ACTIONS TODAY: "nothing to change." is not listed (1.4.2 listed it); a real raise is', () => checkActions());
-  test('R4 the pure helper', () => checkPure());
+  test('R4 the pure helpers: coverage, verify-only', () => checkPure());
   test('R5 mutants: ' + MUTANTS.length + ' one-line mutations are each caught', () => {
     const want = signature(NEW);
     for (const [label, from, to] of MUTANTS) {
