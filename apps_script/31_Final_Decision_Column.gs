@@ -10,7 +10,10 @@
  *          each page's own table (one empty column between):
  *            Top_10_Investments   the seats table (Rank / Symbol / Ticket SAR / Shares)
  *            Portfolio_Decision   the ACTIONS table (Action / Symbol)
- *            My_Portfolio         the holdings table (Symbol / Position Qty)
+ *          My_Portfolio is a schema-checked data page: its refresh writer and validator count every column (Codex
+ *          P2 x2, #1001), so it gets no column - its engine decision headers (Recommendation, Final Action, Investor
+ *          Decision) carry a cell note instead, pointing to the final decision. A note changes no value, header or
+ *          width.
  *          The column's header reads "FINAL DECISION . Today Action Plan <time>"; each cell is a formula that looks up
  *          the symbol of ITS OWN ROW in Final_Decisions (INDIRECT on ROW()), so a sort, a refresh or a rebuilt table
  *          can never show one stock's decision on another stock's row, and the cells follow every new Final_Decisions
@@ -41,8 +44,12 @@ var FDC = {
   PAGES: [
     { name: 'Top_10_Investments', need: ['Rank', 'Symbol', 'Ticket SAR', 'Shares'], until: 'blank' },
     { name: 'Portfolio_Decision', need: ['Action', 'Symbol'], until: 'blank' },
-    { name: 'My_Portfolio', need: ['Symbol', 'Position Qty'], until: 'last' }
+    { name: 'My_Portfolio', need: ['Symbol', 'Position Qty'], until: 'last', mode: 'note',
+      notes: ['Recommendation', 'Final Action', 'Investor Decision'] }
   ],
+  NOTE: 'Engine field (analysis), not the decision. The one decision per stock is on Today_Action_Plan and in the ' +
+        'Final_Decisions tab (SELL / BUY / HOLD / WATCH / DO NOT INVEST); Portfolio_Decision and Top_10_Investments ' +
+        'show it in their FINAL DECISION column.',
   COLORS: [['SELL', '#fdecea', '#b3261e'], ['BUY', '#e6f4ea', '#2e7d32'], ['HOLD', '#eef1f5', '#1b2a41'],
            ['WATCH', '#fff3e0', '#b45309'], ['DO NOT INVEST', '#f3dede', '#7b1f1f'], ['n/a', '#f7f7f7', '#6b7785']]
 };
@@ -125,9 +132,20 @@ function fdcReadSource_(ss) {
   return src;
 }
 /* Puts the column on one page; returns a short status. */
+/* A data page that must keep its width: a note on its engine decision headers, nothing else. */
+function fdcNotePage_(sh, cfg) {
+  var lastCol = Math.min(sh.getLastColumn(), FDC.MAX_COLS);
+  if (lastCol < 1) return cfg.name + ': empty';
+  var head = sh.getRange(1, 1, 1, lastCol).getValues()[0], n = 0;
+  for (var c = 0; c < head.length; c++) {
+    if (cfg.notes.indexOf(fdcTrim_(head[c])) >= 0) { sh.getRange(1, c + 1).setNote(FDC.NOTE); n++; }
+  }
+  return cfg.name + ': ' + n + ' header note(s), no column';
+}
 function fdcStampPage_(ss, cfg, src, staleH) {
   var sh = ss.getSheetByName(cfg.name);
   if (!sh) return cfg.name + ': tab missing';
+  if (cfg.mode === 'note') return fdcNotePage_(sh, cfg);
   var lastRow = Math.min(sh.getLastRow(), FDC.MAX_ROWS), lastCol = Math.min(sh.getLastColumn(), FDC.MAX_COLS);
   if (lastRow < 2 || lastCol < 1) return cfg.name + ': empty';
   var t = fdcFindTable_(sh.getRange(1, 1, lastRow, lastCol).getValues(), cfg.need, cfg.until);
@@ -192,6 +210,11 @@ function fdcRemoveColumn() {
   for (var i = 0; i < FDC.PAGES.length; i++) {
     var cfg = FDC.PAGES[i], sh = ss.getSheetByName(cfg.name);
     if (!sh || sh.getLastRow() < 1) { out.push(cfg.name + ': nothing'); continue; }
+    if (cfg.mode === 'note') {
+      var head = sh.getRange(1, 1, 1, Math.min(sh.getLastColumn(), FDC.MAX_COLS)).getValues()[0], k = 0;
+      for (var c = 0; c < head.length; c++) if (cfg.notes.indexOf(fdcTrim_(head[c])) >= 0) { sh.getRange(1, c + 1).setNote(''); k++; }
+      out.push(cfg.name + ': ' + k + ' note(s) removed'); continue;
+    }
     var lastRow = Math.min(sh.getLastRow(), FDC.MAX_ROWS), lastCol = Math.min(sh.getLastColumn(), FDC.MAX_COLS);
     var t = fdcFindTable_(sh.getRange(1, 1, lastRow, lastCol).getValues(), cfg.need, cfg.until);
     if (!t || !t.existing) { out.push(cfg.name + ': no column'); continue; }

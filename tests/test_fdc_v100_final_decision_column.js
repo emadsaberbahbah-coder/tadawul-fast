@@ -6,7 +6,7 @@
  *   S1  Top_10_Investments: the column sits one column right of the seats table; a formula on every seat row and
  *       nowhere else; every other cell is unchanged; outside the range the Today Action Plan reads (A1:AE60)
  *   S2  Portfolio_Decision: only the ACTIONS table rows; outside A1:AA150
- *   S3  My_Portfolio: every symbol row to the end, gaps and label rows left empty
+ *   S3  My_Portfolio: no column (its refresh and validator count the columns), a note on its engine decision headers
  *   S4  a second tick reuses the column (no second header), keeps the page's own colour rules, replaces its own
  *   S5  the header: the time, OLD past FDC_STALE_H, "not read" without the tab; formulas look up their own row
  *   S6  the lock: a busy lock writes nothing; install / status / remove trigger; fdcRemoveColumn rolls back
@@ -55,7 +55,8 @@ function makeSheet(name, grid) {
         setValue(v) { const x = cell(r, c); x.v = v; delete x.f; return self; },
         setFormulas(g) { if (g.length !== nr || g.some(row => row.length !== nc)) throw new Error('shape'); g.forEach((row, i) => row.forEach((f, j) => { const x = cell(r + i, c + j); if (f) { x.f = f; x.v = ''; } else { delete x.f; x.v = ''; } })); return self; },
         clearContent() { for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) { const x = cells.get(key(r + i, c + j)); if (x) { delete x.f; x.v = ''; } } return self; },
-        clear() { for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) cells.delete(key(r + i, c + j)); return self; }
+        clear() { for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) cells.delete(key(r + i, c + j)); return self; },
+        setNote(t) { const x = cell(r, c); if (t) x.note = t; else delete x.note; return self; }
       };
       ['setFontWeight', 'setFontColor', 'setBackground', 'setWrap', 'setVerticalAlignment', 'setFontSize'].forEach(m => { self[m] = v => { for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) cell(r + i, c + j)[m] = v; return self; }; });
       return self;
@@ -143,14 +144,19 @@ test('S2 Portfolio_Decision: only the ACTIONS rows, outside A1:AA150', () => {
   eq(formulaRows(sh, 28).join(','), '6,7,8', 'the three action rows, not the sector table');
 });
 
-test('S3 My_Portfolio: every symbol row to the end; gaps and label rows empty', () => {
+test('S3 My_Portfolio: no column (schema-checked width), a note on its engine decision headers (Codex P2 x2, #1001)', () => {
   const env = makeEnv(world());
-  env.ctx.fdcTick();
   const sh = env.book.getSheetByName('My_Portfolio');
-  const [hr, hc] = colOf(sh, /^FINAL DECISION/);
-  eq(hr, 1); eq(hc, 8, 'one empty column after the six');
-  eq(formulaRows(sh, 8).join(','), '2,3,5', 'symbols only: the blank row and the TOTAL ROW label are left empty');
-  eq(sh._cells.get('5:6').v, 'mine', 'a manual column is untouched');
+  const before = JSON.stringify(Array.from(sh._cells.entries()).map(([k, x]) => [k, x.v, x.f]));
+  const line = env.ctx.fdcTick();
+  ok(/My_Portfolio: 2 header note\(s\), no column/.test(line), line);
+  eq(JSON.stringify(Array.from(sh._cells.entries()).map(([k, x]) => [k, x.v, x.f])), before, 'no value, formula or header changes');
+  eq(sh.getLastColumn(), 6, 'the width the validator expects');
+  ok(/^Engine field \(analysis\), not the decision/.test(sh._cells.get('1:3').note) && sh._cells.get('1:5').note === sh._cells.get('1:3').note, 'Recommendation and Final Action');
+  ok(!sh._cells.get('1:1').note && !sh._cells.get('1:4').note, 'no other header');
+  // the finding's two writers: a refresh that rewrites every row by its values, then a sort, cannot misplace anything
+  env.ctx.fdcTick();
+  eq(sh.getLastColumn(), 6, 'a second tick adds nothing');
 });
 
 test('S4 a second tick reuses the column and replaces only its own colour rules', () => {
@@ -207,13 +213,14 @@ test('S6 the lock, the trigger and the rollback', () => {
   ok(colOf(env.book.getSheetByName('Portfolio_Decision'), /^FINAL DECISION/), 'install stamps the pages now');
   ok(/trigger installed .* self-test ok .* last tick: 2026-11-16T06:00Z/.test(env.ctx.fdcStatus()), env.ctx.fdcStatus());
   const out = env.ctx.fdcRemoveColumn();
-  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB | My_Portfolio: removed from column H');
+  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB | My_Portfolio: 2 note(s) removed');
+  ok(!env.book.getSheetByName('My_Portfolio')._cells.get('1:3').note, 'the note is gone');
   ok(!colOf(env.book.getSheetByName('Top_10_Investments'), /^FINAL DECISION/) && formulaRows(env.book.getSheetByName('Top_10_Investments'), 32).length === 0, 'gone');
   eq(env.ctx.fdcRemoveTrigger(), 1); eq(env.triggers.length, 0);
   // a missing page or table is reported, the others are still stamped
   const w = world(); delete w.Portfolio_Decision; w.My_Portfolio = [['no table here'], ['x']];
   const line = makeEnv(w).ctx.fdcTick();
-  ok(/Portfolio_Decision: tab missing/.test(line) && /My_Portfolio: table not found/.test(line) && /Top_10_Investments: 3 row/.test(line), line);
+  ok(/Portfolio_Decision: tab missing/.test(line) && /My_Portfolio: 0 header note\(s\), no column/.test(line) && /Top_10_Investments: 3 row/.test(line), line);
 });
 
 test('S7 the self-test core, ES5 / ASCII, version lockstep', () => {
