@@ -1,5 +1,7 @@
 'use strict';
 /* tests/js/dp2_history.js - the reviewed 27_Decision_Pages_v2.gs files rebuilt from the delivered one.
+ * 2026-11-16: v1.4.1 [LAST-GOOD / TODAY] is delivered; the v1.4.0 harness reads the v1.4.0 file rebuilt by reversing the
+ * enumerated v1.4.1 hunks (tests/js/dp2_edits_v1410.json), SHA-256 pinned; the older harnesses chain through it.
  * 2026-11-16: v1.4.0 [ONE-DECISION] is delivered; the v1.3.1 harness reads the v1.3.1 file rebuilt by reversing the
  * enumerated v1.4.0 hunks (tests/js/dp2_edits_v1400.json), SHA-256 pinned; the older harnesses chain through it.
  * 2026-11-11: v1.3.1 [SLOT-CARRY] is delivered; the v1.3.0 harness reads the v1.3.0 file rebuilt by reversing the
@@ -17,11 +19,13 @@
  */
 const crypto = require('crypto');
 const assert = require('assert');
+const V1400_SHA256 = '6db804640810b023219d69dcda1043cc1b53aed5c7b1f5aabd94e559fb623597';   // v1.4.0 (origin/main b255102)
 const V1301_SHA256 = 'adffdfeddf59ecdfafcb8ad8e13a72454ba42bc99afd7381b8e89df9efd041e6';   // v1.3.1 (origin/main c8c0d51)
 const V1300_SHA256 = 'f670ad1cd2ccadfbd4a4b60028ceaeacf0939f51a6ea4407d0bbe4a03330c4c9';   // v1.3.0 (origin/main 53f2abd)
 const V1236_SHA256 = '487c0778e1f509eb9ee60e91d4603ed884367719af1b065e6231b723bb1f10f3';   // v1.2.36 (origin/main 58910af)
 const V1235_SHA256 = 'dc88cfab7cc706b391f6288dcc44d8e9e0cf6479015b22a725f134c6fd694abf';   // v1.2.35 (origin/main 772a497)
 const V1234_SHA256 = '992fb7f77e0d4c4c59f1eb6fb42b7b45be41e1ffaa47957797222662246811c0';   // v1.2.34 (origin/main bdf2da2)
+const EDITS_V1410 = require('./dp2_edits_v1410.json');
 const EDITS_V1400 = require('./dp2_edits_v1400.json');
 const EDITS_V1301 = require('./dp2_edits_v1301.json');
 const EDITS_V1300 = require('./dp2_edits_v1300.json');
@@ -37,10 +41,15 @@ function reverse(source, edits, label, pin) {
   assert.equal(sha(prior), pin, label + ' may change only its enumerated hunks');
   return prior;
 }
+function v1400Source(source) {
+  const h = sha(source);
+  if (h === V1400_SHA256 || h === V1301_SHA256 || h === V1300_SHA256 || h === V1236_SHA256 || h === V1235_SHA256 || h === V1234_SHA256) return source;
+  return reverse(source, EDITS_V1410, 'v1.4.1', V1400_SHA256);
+}
 function v1301Source(source) {
   const h = sha(source);
   if (h === V1301_SHA256 || h === V1300_SHA256 || h === V1236_SHA256 || h === V1235_SHA256 || h === V1234_SHA256) return source;
-  return reverse(source, EDITS_V1400, 'v1.4.0', V1301_SHA256);
+  return reverse(v1400Source(source), EDITS_V1400, 'v1.4.0', V1301_SHA256);
 }
 function v1300Source(source) {
   const h = sha(source);
@@ -60,4 +69,4 @@ function v1234Source(source) {
   if (sha(source) === V1234_SHA256) return source;
   return reverse(v1235Source(source), EDITS_V1235, 'v1.2.35', V1234_SHA256);
 }
-module.exports = { v1301Source, V1301_SHA256, EDITS_V1400, v1300Source, v1236Source, v1235Source, v1234Source, V1300_SHA256, V1236_SHA256, V1235_SHA256, V1234_SHA256, EDITS_V1301, EDITS_V1300, EDITS_V1236, EDITS_V1235 };
+module.exports = { v1400Source, V1400_SHA256, EDITS_V1410, v1301Source, V1301_SHA256, EDITS_V1400, v1300Source, v1236Source, v1235Source, v1234Source, V1300_SHA256, V1236_SHA256, V1235_SHA256, V1234_SHA256, EDITS_V1301, EDITS_V1300, EDITS_V1236, EDITS_V1235 };
