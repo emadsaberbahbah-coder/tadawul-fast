@@ -1562,6 +1562,23 @@ def test_t16_the_decision_words_for_each_rule():
     assert hd(_h("A", "TAKE PROFIT", 9.0) | {"qty": 10}) == ("SELL", "Sell half (5 shares); keep a stop at 9.00 on the rest.")
     assert hd(_h("A", "RAISE STOP", 9.5) | {"qty": 10})[0] == "HOLD"
     assert hd(_h("A", "REVIEW", 9.0))[0] == "HOLD" and hd(_h("A", "NO RULE", None))[0] == "HOLD"
+    # 1.6.2: a raise the broker already carries on every share is not an instruction (invented figures)
+    raised = _h("A", "RAISE STOP", 9.50) | {"qty": 100}
+    assert hd(raised) == ("HOLD", "Hold; raise the stop to 9.50 for all 100 shares.")
+    assert hd(raised | {"broker_stop": 9.6, "broker_cover": 100}) == (
+        "HOLD", "Hold; the stop working at IBKR (9.60) already covers the plan's 9.50 on all 100 shares - nothing to change.")
+    assert hd(raised | {"broker_stop": 9.50, "broker_cover": 100})[1].startswith("Hold; the stop working at IBKR (9.50)")
+    for part in ({"broker_stop": 9.2, "broker_cover": 100}, {"broker_stop": 9.6, "broker_cover": 40},
+                 {"broker_stop": None, "broker_cover": 100}, {"broker_stop": 9.6}):
+        assert hd(raised | part)[1] == "Hold; raise the stop to 9.50 for all 100 shares.", part
+    # the same rule as section A: no step exactly when the final row says nothing to change
+    for part in ({"broker_stop": 9.6, "broker_cover": 100}, {"broker_stop": 9.2, "broker_cover": 100},
+                 {"broker_stop": 9.6, "broker_cover": 40}):
+        hh = raised | part
+        assert (not [s for s in tap.holding_steps(hh, 1.0) if "Raise the stop" in s["do"]]) == tap.raise_covered(hh), part
+    d3 = {"holdings": [raised | {"broker_stop": 9.6, "broker_cover": 100}], "picks": [], "pipeline": [], "t10": {}, "v2": {},
+          "steps": tap.holding_steps(raised | {"broker_stop": 9.6, "broker_cover": 100}, 1.0)}
+    assert tap.final_decisions(d3)[0]["do"].endswith("nothing to change.")
     assert hd(_h("A", "SELL", 9.0) | {"review_reason": "quantity differs"}) == (
         "HOLD", "Hold. Verify at IBKR before any change: quantity differs.")      # never a sale on an unverified book
     pd = tap._pick_decision

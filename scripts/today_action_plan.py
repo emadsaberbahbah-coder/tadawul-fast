@@ -4,7 +4,17 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.6.1 (2026-11-16)
+v1.6.2 (2026-11-16)
+  1.6.2: A RAISE THE BROKER ALREADY CARRIES IS NOT AN INSTRUCTION (16 Nov 13:43 Riyadh run, read on the sheet at 14:25:
+         the Final_Decisions row of one holding said "Hold; raise the stop to <plan stop> for all <n> shares" while
+         section A had no step for it and the summary read "0 step(s) on holdings" - the stop working at IBKR was
+         already a cent above the plan's, on every share. Since 1.3.0 section A gives no raise step when the broker's
+         stop is at or above the plan's on every share; the final row did not know that and repeated the Exit Plan's
+         RAISE STOP as a to-do, which the FINAL DECISION column, both v2 pages and the Top 10 line then showed.
+         Followed to the letter it would have LOWERED the stop). Now the final row of such a holding reads "Hold; the
+         stop working at IBKR (9.60) already covers the plan's 9.50 on all 100 shares - nothing to change." (invented
+         figures). One rule for both places: raise_covered(h) (pure). A raise the broker does not carry is unchanged
+         (section A's own words).
   1.6.1: A PAGE THAT SHOWS THE FINAL DECISION AGREES (16 Nov 08:41 Riyadh run: Portfolio_Decision_v2 1.4.0 reads
          "FINAL: HOLD (Today Action Plan) . v2 rule: SELL ..." and this page still made it an OTHER PAGE step and a
          PAGES DISAGREE tile, because it compared the v2 rule). A row that starts with FINAL shows this page's own
@@ -194,7 +204,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -762,6 +772,12 @@ def final_on() -> bool:
     return _env("TFB_TAP_FINAL", "on").lower() not in ("off", "0", "false", "no")
 
 
+def raise_covered(h: Dict[str, Any]) -> bool:
+    """1.6.2: the broker's working stop is at or above the plan's stop on every share (so a RAISE STOP asks nothing)."""
+    cover, qty, stop, bs = h.get("broker_cover"), h.get("qty") or 0, h.get("stop"), h.get("broker_stop")
+    return bool(cover is not None and qty and cover >= qty - 1e-6 and bs is not None and stop and bs >= stop - 0.005)
+
+
 def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
     """(decision, what it means today) for one holding, from the Exit Plan's action - the exit rule of record."""
     act, qty, stop = h["action"], h.get("qty") or 0, h.get("stop")
@@ -775,6 +791,9 @@ def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
         return "SELL", "Sell half (%s); keep a stop at %s on the rest." % (
             "%d shares" % half if half else "half the position", fmt(stop))
     if act == "RAISE STOP":
+        if raise_covered(h):                        # 1.6.2: never an instruction the broker already carries
+            return "HOLD", "Hold; the stop working at IBKR (%s) already covers the plan's %s on all %s - nothing to change." % (
+                fmt(h.get("broker_stop")), fmt(stop), shares)
         return "HOLD", "Hold; raise the stop to %s for all %s." % (fmt(stop), shares)
     if act in ("REVIEW", "CHECK"):
         return "HOLD", "Hold; review today: the exit rule could not decide on its own."
@@ -1009,7 +1028,7 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
         step(1, do, "last %s · next target %s" % (fmt(h.get("last")), fmt(h.get("target"))))
     elif act == "RAISE STOP":
         cover = h.get("broker_cover")
-        if cover is not None and qty and cover >= qty - 1e-6 and bs is not None and stop and bs >= stop - 0.005:
+        if raise_covered(h):
             pass                                    # 1.3.0: the broker already carries this stop on every share
         else:
             at_ib = "" if cover is None else " on %s of %s shares" % (fmt(cover, 0), fmt(qty, 0))
