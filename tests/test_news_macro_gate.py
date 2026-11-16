@@ -824,7 +824,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.0.2")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.1.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -849,9 +849,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.0.2"
+    assert ng.__version__ == "1.1.0"   # 2026-11-16: v1.1.0 [ISSUER-LINK]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.0.2", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.1.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -870,3 +870,105 @@ def test_g9_ascii_module_version_pin_and_workflow():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ----------------------------------------------------------------------------- G8 (v1.1.0 [ISSUER-LINK])
+# Headlines seen under the wrong name in v_symbol_news, 25 Oct - 16 Nov 2026 (owner reviews of 15 and 16 Nov), and
+# headlines that are about the issuer.
+ISSUER_CASES = [
+    ("Farmers & Merchants Bancorp stock: Q3 profit rises 30.3%", "MBIN.US", "Merchants Bancorp", False),
+    ("TransAct Technologies Incorporated (TACT) Reports Q3 Loss, Beats Revenue Estimates", "MBIN.US", "Merchants Bancorp", False),
+    ("Regional banks stocks Q3 recap: Benchmarking Columbia Banking System", "MBIN.US", "Merchants Bancorp", False),
+    ("Q3 rundown: Axos Financial (NYSE:AX) vs other regional banks stocks", "MBIN.US", "Merchants Bancorp", False),
+    ("Q3 earnings recap: Merchants Bancorp (NASDAQ:MBIN) tops regional banks stocks", "MBIN.US", "Merchants Bancorp", True),
+    ("Merchants Bancorp stock: Q3 profit rises 92% to USD 105.2 million", "MBIN.US", "Merchants Bancorp", True),
+    ("Basic earnings per share hit $2.07 as Q3 profit climbs at Merchants Bancorp (MBIN).", "MBIN.US", "Merchants Bancorp", True),
+    ("Inter & Co, Inc. Q3 2026 Earnings Call Summary", "IFS.US", "Intercorp Financial Services Inc.", False),
+    ("Inflection Point Q3 2026 Earnings Results and Report", "IFS.US", "Intercorp Financial Services Inc.", False),
+    ("Intercorp Financial Services: Soft Q3, But Clear Signs Of An Inflection Point (NYSE:IFS)", "IFS.US", "Intercorp Financial Services Inc.", True),
+    ("Intercorp Financial Services Q3FY26 Results: Net income 457m soles, ROE 14%", "IFS.US", "Intercorp Financial Services Inc.", True),
+    ("KMB Maintained by BNP Paribas -- Price Target Raised to $112", "BNP.PA", "BNP Paribas SA", False),
+    ("BNP Paribas raises price target for DNB to 410 Norwegian kroner (390), reiterates outperform", "BNP.PA", "BNP Paribas SA", False),
+    ("Sanofi Shares Rise After Upgrade From BNP Paribas", "BNP.PA", "BNP Paribas SA", False),
+    ("BNP Paribas stock enters buyback week as wealth unit targets growth", "BNP.PA", "BNP Paribas SA", True),
+    ("BNP Paribas (ENXTPA:BNP) Stock May Be 14% Undervalued On Buyback Launch", "BNP.PA", "BNP Paribas SA", True),
+    ("Barclays maintains Coty at Underweight, raises price target to $3 from $2", "BARC.L", "Barclays PLC", False),
+    ("Barclays Opens Riyadh Office, Appoints Majed Al Hassoun As CEO Of Saudi Unit", "BARC.L", "Barclays PLC", True),
+    ("Tritax Big Box (LSE:BBOX) Goes Ex-Dividend: FTSE 100 Watch", "BBOX.L", "Tritax Big Box Ord", True),
+    ("UK dividends calendar - next 7 days", "BBOX.L", "Tritax Big Box Ord", False),
+    ("FedEx Corp. stock outperforms competitors on strong trading day", "ZTO.US", "ZTO Express (Cayman) Inc.", False),
+    ("ZTO Express Q3 2026 Preview: Macro Headwinds Vs. Micro Execution (NYSE:ZTO)", "ZTO.US", "ZTO Express (Cayman) Inc.", True),
+    ("PENN Entertainment, Inc. Reports Third Quarter Results", "GLPI.US", "Gaming and Leisure Properties, Inc.", False),
+    ("Gaming and Leisure Properties (NASDAQ:GLPI) Given New $49.00 Price Target at Citigroup", "GLPI.US", "Gaming and Leisure Properties, Inc.", True),
+    ("Supernus and Indivior Complete Merger to form 11-product CNS company", "SUPN.US", "Supernus, Inc.", True),
+    ("Meridian Bank (MRBK) Lags Q3 Earnings and Revenue Estimates", "CFBK.US", "CF Bankshares Inc.", False),
+    ("What DRI Healthcare Trust (DHT.UN) Said on Its Q3 Earnings Call", "DHT.US", "DHT Holdings, Inc.", False),
+    ("DHT Holdings: Q3 Earnings Snapshot", "DHT.US", "DHT Holdings, Inc.", True),
+    ("STAR BULK CARRIERS ($SBLK) Releases Q1 2026 Earnings, Stock Rises", "SBLK.US", "Star Bulk Carriers Corp.", True),
+    ("Al Rajhi Bank (1120) profit rises", "1120.SR", "Al Rajhi Bank", True),
+    ("Banco Santander (SAN.MC) cuts capital", "SAN.MC", "Banco Santander, S.A.", True),
+    ("Some headline", "GLE.PA", "", None),
+    ("Zed Trust (ZED.UN) cuts its distribution", "ZED.US", "Acme Holdings Inc.", False),   # another listing of the ticker
+    ("Acme (ZED.US) raises guidance", "ZED.US", "Acme Holdings Inc.", True),
+]
+
+
+@pytest.mark.parametrize("title,symbol,name,want", ISSUER_CASES)
+def test_g8_issuer_linked(title, symbol, name, want):
+    assert ng.issuer_linked(title, symbol, name) is want
+
+
+def test_g8_apply_modes_and_scope():
+    items = [{"source": "gdelt", "scope": "MBIN.US", "title": "Farmers & Merchants Bancorp stock: Q3 profit rises"},
+             {"source": "google_news", "scope": "MBIN.US", "title": "Merchants Bancorp stock: Q3 profit rises 92%"},
+             {"source": "edgar", "scope": "MBIN.US", "title": "8-K 2.02 results of operations"},
+             {"source": "gdelt", "scope": "MACRO", "title": "Farmers & Merchants Bancorp"},
+             {"source": "gdelt", "scope": "XYZ.US", "title": "anything"}]
+    names = {"MBIN.US": "Merchants Bancorp"}
+    kept, info = ng.apply_issuer_link(items, names, "on")
+    assert [i["title"] for i in kept] == [items[1]["title"], items[2]["title"], items[3]["title"], items[4]["title"]]
+    assert info == {"mode": "on", "checked": 2, "unlinked": 1,
+                    "examples": ["MBIN.US: Farmers & Merchants Bancorp stock: Q3 profit rises"]}
+    kept, info = ng.apply_issuer_link(items, names, "observe")
+    assert kept == items and info["unlinked"] == 1 and info["mode"] == "observe"
+    kept, info = ng.apply_issuer_link(items, names, "off")
+    assert kept == items and info == {"mode": "off", "checked": 0, "unlinked": 0, "examples": []}
+
+
+class _WrongNameHTTP(FakeHTTP):
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url == ng.GDELT_API and "Primis" in (params or {}).get("query", ""):
+            return Resp(200, gdelt_articles([
+                ("https://www.marketbeat.com/p1", "Primis Financial shares fall after earnings miss", "20261027T150000Z", "marketbeat.com"),
+                ("https://www.example.com/x", "Regional banks stocks Q3 recap: benchmarking First Busey", "20261027T160000Z", "example.com"),
+            ]))
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+def _link_run(monkeypatch, mode):
+    monkeypatch.setenv("TFB_NEWS_ISSUER_LINK", mode)
+    (rc, rep), _sh = _run(http=_WrongNameHTTP(), write=False)
+    assert rc == 0
+    return rep
+
+
+@pytest.mark.parametrize("mode", ["on", "junk", "observe"])
+def test_g8_run_drops_a_headline_about_another_company(monkeypatch, armed, mode):
+    rep, off = _link_run(monkeypatch, mode), _link_run(monkeypatch, "off")
+    li = rep["issuer_link"]
+    assert li["mode"] == ("observe" if mode == "observe" else "on")
+    assert li["unlinked"] == 1 and li["examples"] == ["FRST.US: Regional banks stocks Q3 recap: benchmarking First Busey"]
+    assert li["checked"] >= 2
+    dropped = 0 if mode == "observe" else 1
+    assert rep["counts"]["collected"] == off["counts"]["collected"] - dropped
+    assert rep["gate"]["verdict"] == off["gate"]["verdict"]
+    digest = ng.render_digest(rep)
+    assert ("not about the issuer 1 of %d (%s)" % (li["checked"], "kept, observe" if mode == "observe" else "dropped")) in digest
+    assert off["issuer_link"] == {"mode": "off", "checked": 0, "unlinked": 0, "examples": []}
+    assert "not about the issuer" not in ng.render_digest(off)
+
+
+def test_g8_default_is_on(monkeypatch, armed):
+    monkeypatch.delenv("TFB_NEWS_ISSUER_LINK", raising=False)
+    (rc, rep), _sh = _run(http=_WrongNameHTTP(), write=False)
+    assert rc == 0 and rep["issuer_link"]["mode"] == "on" and rep["issuer_link"]["unlinked"] == 1

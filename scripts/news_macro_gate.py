@@ -2,8 +2,31 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.0.2 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.1.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.1.0 (2026-11-16) -- [ISSUER-LINK] A HEADLINE COUNTS FOR A NAME ONLY IF IT IS ABOUT THAT ISSUER
+WHY (owner reviews of 15 and 16 Nov: "news under the wrong company (MBIN, IFS)"; news design phase 0, issuer
+  linking): a name's GDELT / Google-News query is its cleaned company name, and every article the search
+  returned was filed under that symbol. v_symbol_news, 25 Oct - 16 Nov: MBIN.US (Merchants Bancorp) held
+  "Farmers & Merchants Bancorp" results (another bank, FMCB), "TransAct Technologies (TACT) Reports Q3 Loss" and
+  ten peer recaps ("Q3 rundown: Axos Financial (NYSE:AX) vs other regional banks stocks"); IFS.US (Intercorp
+  Financial Services) held "Inter & Co, Inc. Q3 2026 Earnings Call Summary" and "Inflection Point Q3 2026
+  Earnings"; BARC.L and BNP.PA held 60 analyst notes in which the bank is the broker ("KMB Maintained by
+  Barclays -- Price Target Raised"). Those items enter the clusters, so a wrong company's results or a broker
+  note could flag a name (Names Flagged) and colour its sentiment.
+WHAT: issuer_linked(title, symbol, name) (pure) keeps a GDELT / Google-News item for a name only when the
+  headline names the issuer: (a) the ticker in a ticker form - '(MBIN)', '$MBIN', 'NASDAQ:MBIN', 'NYSE: IFS',
+  'LSE:BBOX' (exchange prefixes in _TICKER_PREFIXES), the number of a .SR name in brackets; or (b) the cleaned
+  company name as a whole phrase (case-insensitive) that is not the tail of another company's name ('Farmers &
+  Merchants Bancorp') and not the broker of an analyst note ('... by Barclays', 'at BNP Paribas', 'Barclays
+  maintains / raises / lowers / adjusts / upgrades / downgrades / initiates / reiterates / cuts / sees'). A
+  ticker form always links. EDGAR filings (matched by CIK), the Fed feed, macro items and a name without a
+  known company name are kept as before. Fresh items and items carried from memory both pass the check.
+  Script Property-free; env TFB_NEWS_ISSUER_LINK: on (default) drops unlinked items; observe keeps them and only
+  counts them; off = v1.0.2. The run report and the digest line count them ('unlinked N dropped' / 'would
+  drop'), with up to 5 examples in the evidence file.
+ROLLBACK: TFB_NEWS_ISSUER_LINK=off, or revert this file to v1.0.2.
+
 v1.0.2 (2026-10-28) -- A STABLE VERDICT: 24 h MEMORY + ENGLISH WIRES
 WHY (the first two runs on main 2f8ead9f, 27 Oct 23:03 and 23:11 UTC, eight
   minutes apart): the dry run read NO_NEW_ENTRY - a Hormuz cluster from 5
@@ -142,7 +165,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1110,6 +1133,78 @@ GNEWS_EN_QUERIES: Tuple[Tuple[str, str], ...] = (
 )
 
 
+# v1.1.0 [ISSUER-LINK]
+_TICKER_PREFIXES = ("NASDAQ", "NASDAQGS", "NASDAQGM", "NASDAQCM", "NDQ", "NYSE", "NYSEAMERICAN", "NYSEARCA", "AMEX",
+                    "OTC", "OTCMKTS", "LSE", "LON", "ENXTPA", "ENXTAM", "ENXTBR", "EPA", "AMS", "BME", "HKG", "HKEX",
+                    "TSX", "ASX", "BMV", "TADAWUL", "XETRA", "ETR", "FRA")
+_BROKER_VERBS = ("maintains", "maintained", "raises", "raised", "lowers", "lowered", "adjusts", "upgrades",
+                 "downgrades", "initiates", "reiterates", "cuts", "sees", "flags", "turns", "rates", "resumes",
+                 "reinstates", "lifts", "trims", "boosts", "names")
+
+
+def _name_core(name: str) -> str:
+    cleaned = re.sub(r"\b(inc|corp|corporation|co|company|ltd|plc|holdings?|group|sa|nv|ag|se|ord|l\.?p|s\.a)\b\.?",
+                     " ", name or "", flags=re.I)
+    return " ".join(cleaned.replace(",", " ").replace(".", " ").split())
+
+
+def issuer_linked(title: str, symbol: str, name: str) -> Optional[bool]:
+    """v1.1.0 [ISSUER-LINK] PURE: is this headline about the issuer of `symbol`? None = cannot judge (no name)."""
+    t = " ".join(str(title or "").split())
+    parts = str(symbol or "").upper().split(".")
+    base, venue = parts[0], (parts[1] if len(parts) > 1 else "")
+    if base:
+        tick = re.escape(base)
+        prefixes = "|".join(_TICKER_PREFIXES)
+        own = (r"(?:\." + re.escape(venue) + r")?") if venue else ""
+        # 'DHT.UN' is another listing: a ticker followed by a different '.XX' does not link
+        if re.search(r"(?:\(|\$|\b(?:" + prefixes + r")\s*:\s*)" + tick + own + r"(?![A-Za-z0-9]|\.[A-Za-z])", t):
+            return True
+    core = _name_core(name)
+    if not core:
+        return None
+    words = [re.escape(w) for w in core.split()]
+    pat = re.compile(r"(?<![A-Za-z0-9])" + r"[\s\-]+".join(words) + r"(?![A-Za-z0-9]|\.[A-Za-z])", re.I)
+    for m in pat.finditer(t):
+        before, after = t[:m.start()], t[m.end():]
+        if re.search(r"&\s*$", before):
+            continue                                   # 'Farmers & Merchants Bancorp': another company
+        if re.search(r"\b(?:by|at|from)\s*$", before, re.I):
+            continue                                   # '... Maintained by Barclays': the broker
+        if re.match(r"\s*(?:" + "|".join(_BROKER_VERBS) + r")\b", after, re.I):
+            continue                                   # 'BNP Paribas raises price target for ...'
+        return True
+    return False
+
+
+def _issuer_link_mode() -> str:
+    v = _env("TFB_NEWS_ISSUER_LINK", "on").strip().lower()
+    return v if v in ("on", "observe", "off") else "on"
+
+
+def apply_issuer_link(items: List[Dict[str, Any]], names: Dict[str, str], mode: str
+                      ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """v1.1.0 [ISSUER-LINK]: (kept items, report). Only GDELT / Google-News items about a name are judged."""
+    info: Dict[str, Any] = {"mode": mode, "checked": 0, "unlinked": 0, "examples": []}
+    if mode == "off":
+        return items, info
+    kept = []
+    for it in items:
+        scope = str(it.get("scope") or "")
+        if scope and scope != "MACRO" and it.get("source") in ("gdelt", "google_news"):
+            verdict = issuer_linked(it.get("title", ""), scope, names.get(scope, ""))
+            if verdict is not None:
+                info["checked"] += 1
+                if verdict is False:
+                    info["unlinked"] += 1
+                    if len(info["examples"]) < 5:
+                        info["examples"].append(f"{scope}: {str(it.get('title', ''))[:120]}")
+                    if mode == "on":
+                        continue
+        kept.append(it)
+    return kept, info
+
+
 def _name_query(name: str) -> str:
     cleaned = re.sub(r"\b(inc|corp|corporation|co|company|ltd|plc|holdings?|group|sa|nv|ag|se)\b\.?",
                      " ", name, flags=re.I)
@@ -1423,7 +1518,10 @@ def render_digest(rep: Dict[str, Any]) -> str:
     lines.append("")
     c = rep["counts"]
     lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}, "
-                 f"carried from earlier runs {c.get('carried', 0)}. "
+                 f"carried from earlier runs {c.get('carried', 0)}"
+                 + (lambda li: (f", not about the issuer {li['unlinked']} of {li['checked']} "
+                                f"({'dropped' if li['mode'] == 'on' else 'kept, observe'})")
+                    if li and li.get("mode") != "off" else "")(rep.get("issuer_link")) + ". "
                  f"Sources OK: {', '.join(f'{k}={v}' for k, v in sorted(rep['sources_ok'].items())) or 'none'}. "
                  f"Failed: {'; '.join(f'{k}: {v}' for k, v in sorted(rep['sources_failed'].items())) or 'none'}.")
     lines.append("")
@@ -1494,7 +1592,13 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         _out(f"[news_gate v{__version__}] memory: {len(memory)} items within 24 h / 72 h in "
              f"{col.clock() - t0:.0f}s" + (f" | {memory_error}" if memory_error else ""))
 
-    items = classify_all(raw + memory, clf, now)
+    link_mode = _issuer_link_mode()   # v1.1.0 [ISSUER-LINK]
+    linked, link_info = apply_issuer_link(raw + memory, {s["symbol"]: s.get("name") or "" for s in scope}, link_mode)
+    if link_mode != "off":
+        _out(f"[news_gate v{__version__}] issuer link ({link_mode}): {link_info['unlinked']} of "
+             f"{link_info['checked']} name items not about the issuer"
+             + (" dropped" if link_mode == "on" else " (kept, observe)"))
+    items = classify_all(linked, clf, now)
     fresh_items = [i for i in items if not i.get("memory")]
     classified = [i for i in items if i.get("event_type") and i["event_type"] != "law_firm_noise"]
     carried = [i for i in classified if i.get("memory")]
@@ -1507,6 +1611,7 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         "counts": {"collected": len(fresh_items), "classified": len(classified) - len(carried),
                    "new": 0, "carried": len(carried)},
         "econ": econ,
+        "issuer_link": link_info,
     }
     if memory_error:
         rep["memory_error"] = memory_error
