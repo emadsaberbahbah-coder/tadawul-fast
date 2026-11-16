@@ -4,7 +4,32 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.6.3 (2026-11-16)
+v1.7.0 (2026-11-17)
+  1.7.0: THE DECISION, ITS CONTROL STATUS AND ITS ORDER STATUS ARE THREE THINGS (review of 16 Nov; owner, 17 Nov
+         00:10: "if you need to make any update or revised please do that"). Read on the 16 Nov 23:42 Riyadh run:
+           - a holding's final row read HOLD with "Verify ... plan quantity 14 differs from broker quantity 15" and
+             was archived with tone ok: one label carried the assessment and an open reconciliation;
+           - a pick's final row read "the buy order is working at IBKR: 30 shares" beside Qty 25: the plan's
+             quantity and the order's were one unlabelled figure;
+           - that order was a DAY order. It expired unfilled at the US close (00:00 Riyadh). The session's last
+             capture (23:05) still listed it, and the next capture is at 08:40: for those hours the newest capture
+             says "working" about an order that no longer exists.
+         Now:
+           (a) Final_Decisions has two more columns, written last so every reader of the first thirteen is
+               unchanged: "Control status" - OK | VERIFY: <what to check> | n/a - and "Order status" - what the
+               capture shows at IBKR: a holding's working stop and the shares it covers, a pick's working buy with
+               its own shares (and the plan's, when they differ), NOT PLACED, or FILLED. The decision words are
+               the 1.6.3 ones. A row whose control status is VERIFY is archived with tone warn (plan_archive
+               1.1.1), and its levels carry "order_qty" when the order's shares are not the plan's.
+           (b) TFB_TAP_DAY_ORDER = on (default) | off. A working BUY read from a capture that is a day order
+               (ibkr_capture 1.1.0, "day_buys") is no longer called working once a US session close lies between
+               the capture and now (us_close_between; the session table is consistency_check's, so a holiday
+               counts as a session: the rule errs toward asking). The pick then reads VERIFY - "the day order read
+               at IBKR at <time> was for a US session that has since closed - confirm at IBKR whether it filled or
+               expired before placing it again" - its final decision is WATCH, it is not counted as placed, and its
+               cash stays reserved until a capture shows otherwise. Nothing is called expired without a broker
+               read. A capture without "day_buys", a GTC buy, or off = 1.6.3.
+         Sections A to E of the page are the 1.6.3 ones except for that pick's own words.
   1.6.3: THE FINAL DECISIONS GO TO THE PLAN ARCHIVE TOO (plan_archive 1.1.0). The IBKR dashboard reads the archive and
          showed the plan's steps only, so a holding whose decision is "hold, nothing to change" was not on it at all.
          archive_rows now passes the run's final decisions; each is kept as a row_type "final" row of the same run.
@@ -193,7 +218,7 @@ ENV
     TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_HOLD_ALIGN (on | off; 1.5.0), TFB_TAP_NEWS_MAX_H (24),
     TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
     TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2), TFB_TAP_BQ (off | on; 1.4.0), TFB_TAP_BQ_TABLE (today_action_plan),
-    TFB_TAP_FINAL (on | off; 1.6.0),
+    TFB_TAP_FINAL (on | off; 1.6.0), TFB_TAP_DAY_ORDER (on | off; 1.7.0),
     TFB_BQ_PROJECT, TFB_BQ_DATASET.
 ================================================================================
 """
@@ -208,7 +233,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.3"
+__version__ = "1.7.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -767,7 +792,8 @@ def align_holdings(holdings: Sequence[Dict[str, Any]], main: Dict[str, Any], v2:
 # ----------------------------------------------------------------------------- #
 FINAL_TAB = "Final_Decisions"
 FINAL_HEAD = ["Symbol", "Decision", "Do today", "Qty", "Limit", "Stop", "Cost SAR", "Why", "Rule of record",
-              "Other pages' own rules", "Analysis differs on", "Decided At (Riyadh)", "Version"]
+              "Other pages' own rules", "Analysis differs on", "Decided At (Riyadh)", "Version",
+              "Control status", "Order status"]         # 1.7.0: the last two; the readers of the first 13 are unchanged
 DECISIONS = ("SELL", "BUY", "HOLD", "WATCH", "DO NOT INVEST")
 _DEC_ORDER = {d: i for i, d in enumerate(DECISIONS)}
 
@@ -810,7 +836,7 @@ def _pick_decision(p: Dict[str, Any]) -> Tuple[str, str]:
     """(decision, what it means today) for a pick of today's plan - the buy rule of record."""
     st = p.get("status") or ""
     if st == "OPEN" and p.get("qty"):
-        if p.get("placed"):
+        if p.get("placed") and not p.get("placed_stale"):
             return "BUY", "The buy order is working at IBKR (%s shares); nothing new to place." % fmt(
                 sum(q for _, q in p["placed"]), 0)
         if p.get("review_reason"):
@@ -827,6 +853,57 @@ def _pick_decision(p: Dict[str, Any]) -> Tuple[str, str]:
     if st == "EXECUTED":
         return "HOLD", "Bought; the Exit Plan takes it over from the next run."
     return "WATCH", "Do not buy yet: %s%s." % (st or "pick", " - " + p["reason"] if p.get("reason") else "")
+
+
+def _holding_control(h: Dict[str, Any]) -> str:
+    """1.7.0: OK | VERIFY: <reason> | n/a - whether the holding's figures were checked against the broker capture."""
+    if h.get("action") == "NO RULE":
+        return "n/a"                                                # no exit rule: nothing here is checked at IBKR
+    return "VERIFY: %s" % h["review_reason"] if h.get("review_reason") else "OK"
+
+
+def _holding_order(h: Dict[str, Any], tol_pct: float) -> str:
+    """1.7.0: what the capture shows working at IBKR for a holding - its stop, and the shares it covers."""
+    if h.get("action") == "NO RULE":
+        return ""
+    if h.get("at_broker") is False:
+        return "not in the IBKR capture"
+    state = stop_state(h, tol_pct)
+    if not state:
+        return "broker orders not read" if h.get("broker_cover") is None else ""
+    if state == "none":
+        return "NO STOP WORKING at IBKR"
+    cover, qty, bs = h.get("broker_cover") or 0, h.get("qty") or 0, h.get("broker_stop")
+    out = "stop %s working on %s share(s)" % (fmt(bs) if bs is not None else "(price not read)", fmt(cover, 0))
+    if state == "partial":
+        out += " of %s" % fmt(qty, 0)
+    elif state == "low":
+        out += ", below the plan's %s" % fmt(h.get("stop"))
+    return out
+
+
+def _pick_control(p: Dict[str, Any], dec: str) -> str:
+    """1.7.0: OK | VERIFY: <reason> | n/a for a pick of today's plan (n/a: no order is asked for, so none is checked)."""
+    if p.get("review_reason"):
+        return "VERIFY: %s" % p["review_reason"]
+    return "OK" if dec == "BUY" else "n/a"
+
+
+def _pick_order(p: Dict[str, Any], dec: str) -> Tuple[str, Optional[float]]:
+    """1.7.0: (what the capture shows at IBKR for a pick, the shares of its working order or None)."""
+    st = p.get("status") or ""
+    if st == "EXECUTED":
+        return "FILLED (bought today)", None
+    if st != "OPEN" or not p.get("qty"):
+        return "", None
+    if p.get("placed"):
+        o_qty = sum(q for _, q in p["placed"])
+        o_px = ", ".join(sorted(set(fmt(px) if px is not None else "no limit" for px, _ in p["placed"])))
+        plan = "" if abs(o_qty - p["qty"]) < 1e-6 else " (the plan sized %s)" % fmt(p["qty"], 0)
+        if p.get("placed_stale"):
+            return "DAY ORDER read before a US close: %s share(s) at %s%s - not confirmed since" % (fmt(o_qty, 0), o_px, plan), o_qty
+        return "WORKING at IBKR: %s share(s) at %s%s" % (fmt(o_qty, 0), o_px, plan), o_qty
+    return ("NOT PLACED" if dec == "BUY" else ""), None
 
 
 def _page_views(sym: str, d: Dict[str, Any]) -> List[Tuple[str, str, str]]:
@@ -880,11 +957,13 @@ def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, A
                  d["news"]["verdict"].replace("_", " ")) if d.get("news_live") else ""
 
     def put(sym: str, dec: str, do: str, rule: str, why: str, held: bool, h: Optional[Dict[str, Any]] = None,
-            qty: Any = None, limit: str = "", stop: Any = None, cost: Optional[float] = None) -> None:
+            qty: Any = None, limit: str = "", stop: Any = None, cost: Optional[float] = None,
+            control: str = "n/a", order: str = "", order_qty: Optional[float] = None) -> None:
         views = _page_views(sym, d)
         rows[sym] = {"symbol": sym, "decision": dec, "do": do, "qty": qty, "limit": limit, "stop": stop, "cost": cost,
                      "why": why, "rule": rule, "views": views, "held": held,
-                     "differs": _differs(dec, held, h, views, tol_pct, pf2)}
+                     "differs": _differs(dec, held, h, views, tol_pct, pf2),
+                     "control": control, "order": order, "order_qty": order_qty}             # 1.7.0
 
     # the steps section A already gives (Codex P1 x2, #1000): a stop to place or repair, a verification, a working buy's
     # stop and funding - the final row carries them word for word, so no page drops an instruction the plan gives
@@ -898,12 +977,14 @@ def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, A
             do = " ".join(own_steps[h["symbol"]])
         if pf.get("read") and (pf.get("rows") or {}).get(h["symbol"], "").startswith("TRIM") and dec == "HOLD":
             do += " Above the position cap: no new buys of it (a trim is the owner's call)."
-        put(h["symbol"], dec, do, "Exit Plan", h.get("why", ""), True, h, qty=h.get("qty"), stop=h.get("stop"))
+        put(h["symbol"], dec, do, "Exit Plan", h.get("why", ""), True, h, qty=h.get("qty"), stop=h.get("stop"),
+            control=_holding_control(h), order=_holding_order(h, tol_pct))
     plan_rows = [(p, False) for p in d.get("picks") or []] + [(p, True) for p in d.get("pipeline") or []]
     for p, in_pipe in plan_rows:
         sym = p["symbol"]
         if sym in rows:
             continue                                                # a holding, or a pick listed before: decided
+        control, order, o_qty = "n/a", "", None
         if in_pipe:
             dec, do = "WATCH", "Not today's pick: waiting for %s." % (p.get("waiting") or "the plan")
             why = p.get("reason") or ""
@@ -912,11 +993,14 @@ def final_decisions(d: Dict[str, Any], tol_pct: float = 1.0) -> List[Dict[str, A
             if own_steps.get(sym):
                 do = " ".join(own_steps[sym])
             why = (p.get("reason") or "") + (news_note if dec == "BUY" else "")
+            control = _pick_control(p, dec)
+            order, o_qty = _pick_order(p, dec)
         put(sym, dec, do, "Daily Plan", why.strip("; "), False,
             qty=p.get("qty") if dec == "BUY" else None,
             limit="%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))) if dec == "BUY" else "",
             stop=p.get("stop") if dec == "BUY" else None,
-            cost=commit_cost(p) if dec == "BUY" else None)
+            cost=commit_cost(p) if dec == "BUY" else None,
+            control=control, order=order, order_qty=o_qty)
     for tab, page in ((T10_TAB, d.get("t10") or {}), (V2_TAB, d.get("v2") or {})):
         for sym in sorted((page.get("seats") or {}) if page.get("read") else {}):
             if sym in rows:
@@ -938,13 +1022,38 @@ def final_rows(decisions: Sequence[Dict[str, Any]], stamp: str) -> List[List[Any
                     "" if r["stop"] is None else round(float(r["stop"]), 4),
                     "" if r["cost"] is None else round(float(r["cost"])),
                     r["why"][:400], r["rule"], " · ".join("%s: %s" % (p, w) for p, w, _ in r["views"])[:600],
-                    ", ".join(r["differs"]) or "none", stamp, __version__])
+                    ", ".join(r["differs"]) or "none", stamp, __version__,
+                    (r.get("control") or "n/a")[:300], (r.get("order") or "")[:300]])                 # 1.7.0
     return out
 
 
 # ----------------------------------------------------------------------------- #
 # 1.3.0 [IBKR]: the broker's own cash and working orders, from the read-only capture (pure)
 # ----------------------------------------------------------------------------- #
+def day_order_on() -> bool:
+    return _env("TFB_TAP_DAY_ORDER", "on").lower() not in ("off", "0", "false", "no")
+
+
+def us_close_between(a: _dt.datetime, b: _dt.datetime) -> bool:
+    """1.7.0: a US session close lies in (a, b]. The session table is consistency_check.SESSIONS (weekdays, 16:00
+    New York), so a holiday counts as a session and a half day closes at 16:00 here: the answer errs toward True
+    on a holiday and toward False for three hours of a half day."""
+    if b <= a:
+        return False
+    from scripts.consistency_check import SESSIONS, _NEW_YORK  # noqa: PLC0415
+    for tz, days, _, closes in SESSIONS:
+        if tz is not _NEW_YORK:                                     # the capture is the IBKR (US) account's
+            continue
+        d, last = a.astimezone(tz).date(), b.astimezone(tz).date()
+        while d <= last:
+            if d.weekday() in days:
+                close = _dt.datetime(d.year, d.month, d.day, closes[0], closes[1], tzinfo=tz)
+                if a < close <= b:
+                    return True
+            d += _dt.timedelta(days=1)
+    return False
+
+
 def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Optional[Dict[str, Any]],
                   max_age_h: float, now: Optional[_dt.datetime] = None) -> Dict[str, Any]:
     """Put the capture's working stops on the holdings and return the broker view:
@@ -978,6 +1087,9 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
     if now is not None:                                             # 1.3.2: market-open hours since the capture
         from scripts.consistency_check import open_hours  # noqa: PLC0415
         out["market_h"] = open_hours(cap["as_of"], now)
+        # 1.7.0: the working buys that are day orders, and whether their session has closed since the capture
+        out["day_buys"] = dict((sym, q) for sym, q in (cap.get("day_buys") or {}).items() if sym in picks)
+        out["us_closed"] = us_close_between(cap["as_of"], now)
     for h in holdings:
         h["at_broker"] = h["symbol"] in cap["positions"]
         if h["at_broker"]:
@@ -1116,9 +1228,13 @@ def pick_step(p: Dict[str, Any], ev: Dict[str, Any], verified: bool) -> Optional
         return None
     if p.get("review_reason"):
         working = ""
-        if p.get("placed"):
+        if p.get("placed") and p.get("placed_stale"):               # 1.7.0: not called working, not called expired
+            working = "A day order for %s shares was read at IBKR before the US close. " % fmt(
+                sum(q for _, q in p["placed"]), 0)
+        elif p.get("placed"):
             working = "An order for %s shares is already working at IBKR. " % fmt(sum(q for _, q in p["placed"]), 0)
-        return {"urgency": 4.8, "symbol": p["symbol"], "kind": "placed" if working else "verify", "source": "Daily_Plan",
+        return {"urgency": 4.8, "symbol": p["symbol"],
+                "kind": "placed" if working and not p.get("placed_stale") else "verify", "source": "Daily_Plan",
                 "do": working + "Verify %s before any new buy or stop change: %s." % (p["symbol"], p["review_reason"]),
                 "levels": "research: %s shares · limit %s - %s · stop %s" % (
                     fmt(p["qty"], 0), fmt(p.get("zone_low")), fmt(p.get("zone_high")), fmt(p.get("stop"))),
@@ -1212,12 +1328,21 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
         p.pop("placed", None)
         p.pop("unfunded", None)
         p.pop("placed_stop", None)
+        p.pop("placed_stale", None)
         if p["status"] == "OPEN" and (broker.get("open_orders") or {}).get(p["symbol"]):
             p["placed"] = broker["open_orders"][p["symbol"]]
             if (broker.get("open_stops") or {}).get(p["symbol"]):   # 1.3.3
                 p["placed_stop"] = broker["open_stops"][p["symbol"]]
+            # 1.7.0: every working buy on it is a day order, and a US session has closed since the capture
+            day_q = (broker.get("day_buys") or {}).get(p["symbol"]) or 0.0
+            if (k.get("day_order", True) and broker.get("us_closed") and day_q > 0
+                    and day_q >= sum(q for _, q in p["placed"]) - 1e-6):
+                p["placed_stale"] = True
         p["stop_tol"] = k["stop_tol"]
-        reason = plan_reason or custody_reason or (funding_reason if not p.get("placed") else "")
+        day_reason = ("the day order read at IBKR at %s Riyadh was for a US session that has since closed - confirm "
+                      "at IBKR whether it filled or expired before placing it again" % (broker.get("at") or "?")
+                      ) if p.get("placed_stale") else ""
+        reason = plan_reason or custody_reason or day_reason or (funding_reason if not p.get("placed") else "")
         if reason and p["status"] == "OPEN" and p.get("qty"):
             p["review_reason"] = reason
     cash_left = fund([p for p in picks if not p.get("review_reason") or p.get("placed")], None if funding_reason else x.get("cash"))
@@ -1403,7 +1528,7 @@ def day_tiles(d: Dict[str, Any], n_buy: int, hard: Sequence[str], unfunded: Sequ
     """Five (label, value, note, tone) tiles; tone is plain | good | warn | bad."""
     cash, src = d.get("cash"), d.get("cash_src") or "ledger"
     open_cost = sum(commit_cost(p) or 0.0 for p in d["picks"] if p["status"] == "OPEN" and p.get("qty") and not p.get("unfunded") and not p.get("review_reason"))
-    placed = sum(1 for p in d["picks"] if p.get("placed"))
+    placed = sum(1 for p in d["picks"] if p.get("placed") and not p.get("placed_stale"))     # 1.7.0
     news = d.get("news") or {}
     where = {"ibkr": "CASH AT IBKR", "ledger": "CASH (LEDGER)"}.get(src, "CASH")
     t: List[Tuple[str, str, str, str]] = []
@@ -1605,7 +1730,7 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     for p in d["picks"]:
         e = (ev.get("names") or {}).get(p["symbol"]) or {}
         # 1.3.0: the status says what section A says (an OPEN pick that is not funded, or whose order is working)
-        shown = "PLACED" if p.get("placed") else ("VERIFY" if p.get("review_reason") and p["status"] == "OPEN" and p.get("qty") else ("NOT FUNDED" if p.get("unfunded") else p["status"]))
+        shown = "PLACED" if p.get("placed") and not p.get("placed_stale") else ("VERIFY" if p.get("review_reason") and p["status"] == "OPEN" and p.get("qty") else ("NOT FUNDED" if p.get("unfunded") else p["status"]))
         pg.add([p["symbol"], shown, fmt(p.get("qty"), 0),
                 "%s - %s" % (fmt(p.get("zone_low")), fmt(p.get("zone_high"))), fmt(p.get("price")), fmt(p.get("stop")),
                 fmt(p.get("tp1")), e.get("chance", ""), e.get("shadow", ""), p.get("review_reason") or p.get("reason", "")],
@@ -1875,7 +2000,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
          "stale_ev": _env_num("TFB_TAP_STALE_EVIDENCE_H", 18, 0.25, 96),
          "news_max_h": _env_num("TFB_TAP_NEWS_MAX_H", 24, 1, 168),
          "ibkr_max_h": _env_num("TFB_TAP_IBKR_MAX_AGE_H", 30, 0.5, 96),
-         "buy_market_h": _env_num("TFB_TAP_BUY_CAPTURE_MARKET_H", 2, 0.25, 48)}
+         "buy_market_h": _env_num("TFB_TAP_BUY_CAPTURE_MARKET_H", 2, 0.25, 48),
+         "day_order": day_order_on()}                               # 1.7.0
     aligned = _env("TFB_TAP_ALIGN", "on").lower() not in ("off", "0", "false", "no")
     hold_align = aligned and hold_align_on()                        # 1.5.0
     retries, sleep = int(_env_num("TFB_TAP_RETRIES", 3, 0, 5)), sleep or time.sleep

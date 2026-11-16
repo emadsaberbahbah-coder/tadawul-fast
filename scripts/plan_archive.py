@@ -4,7 +4,13 @@ scripts/plan_archive.py
 ================================================================================
 TFB plan archive - each Today Action Plan run, kept as rows in BigQuery
 --------------------------------------------------------------------------------
-v1.1.0 (2026-11-16)
+v1.1.1 (2026-11-17)
+  1.1.1: A ROW THAT ASKS TO VERIFY IS NOT "ok" (16 Nov 23:42 Riyadh run: the final row of a holding read "Verify ...
+         at IBKR before acting: plan quantity 14 differs from broker quantity 15" with tone ok, because the tone
+         looked only at the other pages' rules). A final row whose control status (today_action_plan 1.7.0,
+         "control") starts with VERIFY has tone warn. Its levels carry two more parts when the row has them, before
+         "differs": "order_qty=.." (the shares of the order working at IBKR, when they are not the plan's "qty") and
+         "control=verify". "qty", "limit", "stop", "cost_sar" and "differs" are written as before. No column is added.
   1.1.0: THE FINAL DECISIONS, KEPT TOO (owner, 16 Nov: "each stock must end with ONE final decision shown the same on
          every page"; the IBKR dashboard is one of those pages and reads this archive). plan_rows takes `finals` - the
          run's Final_Decisions rows (today_action_plan.final_decisions) - and adds one row per stock with
@@ -43,7 +49,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -109,7 +115,8 @@ def plan_rows(steps: Sequence[Dict[str, Any]], tiles: Sequence[Sequence[str]], s
         dec = _t(f.get("decision"))
         out.append(dict(base, row_type="final", seq=i, kind=dec.lower().replace(" ", "_"), label=dec,
                         symbol=_t(f.get("symbol")), instruction=_t(f.get("do")), levels=_t(final_levels(f)),
-                        why=_t(f.get("why")), source=_t(f.get("rule")), tone="warn" if f.get("differs") else "ok"))
+                        why=_t(f.get("why")), source=_t(f.get("rule")),
+                        tone="warn" if f.get("differs") or _verify(f) else "ok"))     # 1.1.1
     return out
 
 
@@ -124,11 +131,19 @@ def _num(v: Any) -> str:
     return ("%.4f" % x).rstrip("0").rstrip(".")
 
 
+def _verify(f: Dict[str, Any]) -> bool:
+    """1.1.1: the row's control status asks for a verification before anything is done."""
+    return str(f.get("control") or "").strip().upper().startswith("VERIFY")
+
+
 def final_levels(f: Dict[str, Any]) -> str:
-    """1.1.0: a final decision's levels as "name=value" parts joined by " · " - only the parts the row has."""
+    """1.1.0: a final decision's levels as "name=value" parts joined by " · " - only the parts the row has.
+    1.1.1: "order_qty" (an order working at IBKR for another share count than the plan's) and "control=verify"."""
     parts = []
-    for name, val in (("qty", _num(f.get("qty"))), ("limit", str(f.get("limit") or "").strip()),
+    qty, oq = _num(f.get("qty")), _num(f.get("order_qty"))
+    for name, val in (("qty", qty), ("limit", str(f.get("limit") or "").strip()),
                       ("stop", _num(f.get("stop"))), ("cost_sar", _num(f.get("cost"))),
+                      ("order_qty", oq if oq and oq != qty else ""), ("control", "verify" if _verify(f) else ""),
                       ("differs", ", ".join(str(x) for x in (f.get("differs") or [])))):
         if val:
             parts.append("%s=%s" % (name, val.replace(" · ", " - ")))

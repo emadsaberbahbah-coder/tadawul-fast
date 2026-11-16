@@ -173,6 +173,9 @@ def _env(monkeypatch):
     # 1.9.0: the suites written before the wait rule cut at 10:00 Riyadh with whatever capture they pass;
     # test_w1-w7 at the end test the rule itself.
     monkeypatch.setenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", "0")
+    # 1.9.1: the source pages of the suites written before the quote-time rule carry no 'Last Updated (UTC)'
+    # column; test_q1-q3 at the end test the rule itself.
+    monkeypatch.setenv("TFB_PLAN_QUOTE_TIME", "optional")
 
 
 def lots():
@@ -975,7 +978,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.9.0"
+    assert dp.__version__ == "1.9.1"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1112,4 +1115,60 @@ def test_w8_a_live_run_with_the_reader_off_or_not_set_up_does_not_wait(monkeypat
     monkeypatch.setattr(ic, "latest", lambda now=None, **kw: cap_of(age_h=40.0))
     assert dp.main([], now=NOW) == 0
     assert _ledger(on) == [] and W_WAIT % W_OLD in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------------- Q (1.9.1) a price without a quote time
+def test_q1_a_price_without_a_quote_time_reads_check_and_never_opens_or_invalidates():
+    """Review of 16 Nov: a replay of the status refresh returned OPEN for a price whose quote time was missing."""
+    row = {"symbol": "A.US", "stop": 9.0, "zone_low": 9.7, "zone_high": 10.1}
+    now = dt.datetime(2026, 11, 17, 9, 0, tzinfo=UTC)
+    base = (row, 10.0, {}, dt.date(2026, 11, 17), None, 7, "VERIFIED")
+    assert dp.pick_status(*base, None, now, 96)[0] == "OPEN"                         # the function's default: 1.9.0
+    st, why = dp.pick_status(*base, None, now, 96, True)
+    assert st == "CHECK" and why == "the price 10.00 has no quote time: not shown to be current"
+    under = (row, 8.0, {}, dt.date(2026, 11, 17), None, 7, "VERIFIED")
+    assert dp.pick_status(*under, None, now, 96, True)[0] == "CHECK"                 # no time: it cannot invalidate either
+    assert dp.pick_status(*under, now - dt.timedelta(hours=1), now, 96, True)[0] == "INVALIDATED"
+    assert dp.pick_status(*base, now - dt.timedelta(hours=1), now, 96, True)[0] == "OPEN"   # a timed, fresh price opens
+    assert dp.pick_status(*base, now - dt.timedelta(hours=200), now, 96, True)[1].startswith("the price 10.00 is 8 days old")
+    assert dp.pick_status(*base, None, now, 0, True)[0] == "OPEN"                    # age limit off: no time is asked for
+    assert dp.pick_status(*base, None, None, 96, True)[0] == "OPEN"                  # no clock given: nothing to compare
+    # the rules that come first keep their place
+    assert dp.pick_status(row, 10.0, {"A.US": dt.date(2026, 11, 17)}, dt.date(2026, 11, 17), None, 7, "VERIFIED",
+                          None, now, 96, True)[0] == "EXECUTED"
+    assert dp.pick_status(row, 10.0, {}, dt.date(2026, 11, 17), 3, 7, "VERIFIED", None, now, 96, True)[0] == "INVALIDATED"
+    assert dp.pick_status(row, None, {}, dt.date(2026, 11, 17), None, 7, "VERIFIED", None, now, 96, True)[1] == "no current price"
+
+
+def test_q2_the_knob_its_default_and_the_workflow(monkeypatch):
+    monkeypatch.delenv("TFB_PLAN_QUOTE_TIME", raising=False)
+    assert dp.knobs()["quote_time"] is True
+    for value, want in (("required", True), ("REQUIRED", True), ("", True), ("x", True), ("optional", False),
+                        ("Optional", False), ("off", False), ("0", False)):
+        monkeypatch.setenv("TFB_PLAN_QUOTE_TIME", value)
+        assert dp.knobs()["quote_time"] is want, value
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_QUOTE_TIME"] == "${{ vars.TFB_PLAN_QUOTE_TIME || 'required' }}"
+
+
+def test_q3_the_status_refresh_of_a_frozen_plan(monkeypatch):
+    """A whole run: the page price of a pick has no time. Required: CHECK, levels untouched. Optional: 1.9.0."""
+    def statuses(b):
+        return dict((r[6], (r[24], r[25])) for r in _ledger(b) if r[4] == "PICK")
+
+    b = book()
+    assert dp.main([], book=b, now=NOW) == 0                                         # the cut (fixture: optional)
+    before = [r[:24] for r in _ledger(b)]
+    assert all(st == "OPEN" for st, _ in statuses(b).values())
+    monkeypatch.setenv("TFB_PLAN_QUOTE_TIME", "required")
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=1)) == 0
+    got = statuses(b)
+    assert got and all(st == "CHECK" and why.endswith("has no quote time: not shown to be current") for st, why in got.values())
+    assert [r[:24] for r in _ledger(b)] == before                                    # the frozen plan never moves
+    timed = [SRC[0] + ["Last Updated (UTC)"]] + [r + [(NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")] for r in SRC[1:]]
+    b.tabs["Global_Markets"] = Sheet(timed)
+    assert dp.main([], book=b, now=NOW + dt.timedelta(hours=2)) == 0                 # the time is there again: OPEN again
+    assert all(st == "OPEN" for st, _ in statuses(b).values())
+    assert [r[:24] for r in _ledger(b)] == before
 
