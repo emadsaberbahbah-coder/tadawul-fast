@@ -279,6 +279,8 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.10.0 (16 Nov 2026): the news layer's scoreboard
+    "v_news_signal_eval": "807584d412eb19347775641e22e8016d9d56da94e19ca89464663a5da6f16621",
     # apply_bq_views 1.9.0 (15 Nov 2026): hold or switch; 1.9.1: 1W / 2W = the 1M figure x days/30
     # (installed body replaced: v_hold_vs_switch 1abc9858278c, 1.9.0)
     "v_switch_calibration": "488ca50f38bfbbb96d235e27eba75cc562d77c68a272b1455a564e5d84a7f292",
@@ -310,9 +312,10 @@ EXPECTED_ORDER = [
     "v_outcome_excess", "v_market_regime", "v_seat_regime", "v_regime_outcomes",
     "v_trial_c1",
     "v_switch_calibration", "v_hold_vs_switch",
+    "v_news_signal_eval",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 22)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 23)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -872,9 +875,11 @@ def case_v18():
         "v_symbol_candles": {"symbol_bars_daily"}, "v_symbol_analyst": {"symbol_analyst_daily"},
         "v_symbol_news": {"symbol_news"},
         "v_outcome_engine": {"symbol_bars_daily"},           # v1.5.0: the engine reads the bars too
-        "v_trial_c1": {"symbol_bars_daily"}}, used            # v1.8.0: the trial reads each call's 1-month price
+        "v_trial_c1": {"symbol_bars_daily"},                  # v1.8.0: the trial reads each call's 1-month price
+        "v_news_signal_eval": {"symbol_bars_daily"}}, used    # v1.10.0: each name's next 5 sessions
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
+    assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
               "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):

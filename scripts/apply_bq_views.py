@@ -2,8 +2,20 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.9.1 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.10.0 (program register C8, Phase 2)
 ================================================================================
+v1.10.0 (16 Nov 2026, the news layer's scoreboard). WHY (owner, 16 Nov 2026:
+read all news, measure every recommendation against what happened, learn and
+correct itself; design TFB_News_Scenarios_and_Continuous_Learning_Design,
+phase 0). New v_news_signal_eval: the News & Macro Gate verdict against the
+next 1 and 5 SPY sessions, and each name's news sentiment against its own next
+5 sessions (total return), with a reading per signal: NOT MEASURABLE (one
+class), BIASED (one class > 90 %), NO EDGE, THIN, or CANDIDATE (forward test).
+Read on 16 Nov: gate NO EDGE (NO_NEW_ENTRY 14 days, CAUTION 3, GO none);
+sentiment BIASED (98 % positive), correlation -0.10. No news signal moves a
+decision until this view shows it adds something. Research view: the live
+system never reads BigQuery.
+
 v1.9.1 (15 Nov 2026, review of #991). v_hold_vs_switch scaled the 1M forecast
 to one and two weeks by 0.16 and 0.27, the ratio of two averages taken over
 different record sets. The performance tracker records its 1W and 2W
@@ -207,7 +219,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
