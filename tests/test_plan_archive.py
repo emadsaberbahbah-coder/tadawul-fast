@@ -102,6 +102,24 @@ def test_p1_final_decisions_are_kept_one_row_per_stock():
     assert pa.final_levels({"qty": float("nan"), "stop": "x", "cost": float("inf")}) == ""
 
 
+def test_p1_a_row_that_asks_to_verify_is_warn_and_the_orders_shares_ride_along():
+    """1.1.1: 16 Nov 23:42 - "Verify ... plan quantity 14 differs from broker quantity 15" was archived with tone ok."""
+    base = dict(FINALS[0])
+    rows = lambda f: [r for r in pa.plan_rows([], [], "s", [], [], NOW, "1-1", "1.7.0", finals=[f]) if r["row_type"] == "final"][0]
+    assert rows(base)["tone"] == "ok" and rows(dict(base, control="OK"))["tone"] == "ok"
+    assert rows(dict(base, control="n/a"))["tone"] == "ok" and rows(dict(base, control=None))["tone"] == "ok"
+    v = rows(dict(base, control="VERIFY: plan quantity 120 differs from broker quantity 121"))
+    assert v["tone"] == "warn" and v["levels"] == "qty=120 · stop=9.5 · control=verify" and v["label"] == "HOLD"
+    assert rows(dict(base, control=" verify: x"))["tone"] == "warn"
+    # an order for another share count than the plan's; the same count adds nothing
+    b = dict(FINALS[1], control="OK")
+    assert rows(dict(b, order_qty=10))["levels"] == rows(FINALS[1])["levels"]
+    assert rows(dict(b, order_qty=None))["levels"] == rows(FINALS[1])["levels"]
+    assert rows(dict(b, order_qty=12.0))["levels"] == (
+        "qty=10 · limit=19.40-20.10 · stop=18.6037 · cost_sar=754 · order_qty=12 · differs=Top_10_Investments, Page - Two")
+    assert set(v) == {f["name"] for f in pa.SCHEMA} and pa.__version__ == "1.1.1"   # still no column added
+
+
 def test_p1_run_id_from_the_workflow_or_the_clock(monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")

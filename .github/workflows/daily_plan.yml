@@ -1,7 +1,12 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.8.0 (2026-11-15)
+# VERSION 1.8.1 (2026-11-17)
+#
+# 1.8.1: A PRICE WITHOUT A QUOTE TIME NEVER OPENS A PICK (daily_plan 1.9.1).
+# TFB_PLAN_QUOTE_TIME required (default) | optional. With the age limit on, a
+# price whose quote time is not known reads CHECK. Rollback: repository
+# variable TFB_PLAN_QUOTE_TIME=optional.
 #
 # 1.8.0: THE CUT WAITS FOR THE BROKER'S CASH FIGURE (daily_plan 1.9.0). On
 # Sunday 15 Nov the 07:36 cut found the newest IBKR capture 32.5 h old, sized
@@ -163,6 +168,7 @@ jobs:
           TFB_PLAN_STABLE_ENTER: ${{ vars.TFB_PLAN_STABLE_ENTER || '72' }}
           TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
+          TFB_PLAN_QUOTE_TIME: ${{ vars.TFB_PLAN_QUOTE_TIME || 'required' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |

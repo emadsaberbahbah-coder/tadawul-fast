@@ -168,3 +168,30 @@ def test_c3_latest_reads_the_newest_file_and_never_raises(monkeypatch):
     assert ic.latest(NOW)["reason"].startswith("capture read failed (")                           # no credentials: no raise
     src = (ROOT / "scripts/ibkr_capture.py").read_text(encoding="utf-8")
     assert "drive.readonly" in src and "auth/drive\"" not in src and ".post(" not in src and ".patch(" not in src and ".delete(" not in src
+
+
+# ----------------------------------------------------------------------------- C4 (1.1.0) which working buys are day orders
+def test_c4_the_working_buys_that_are_day_orders():
+    """16 Nov: a day order to buy expired at the US close and the session's last capture still listed it. The plan
+    pages need to know which working buys end with their session."""
+    p = ic.parse(capture(), CREATED, NOW)
+    assert p["day_buys"] == {"INSW.US": 20.0, "AX.US": 5.0}                           # "Limit 99.40, Day", "Market, Day"
+    assert set(p["day_buys"]) <= set(p["buys"]) and p["buys"]["INSW.US"] == [(99.4, 20.0)]   # the 1.0.0 keys as they were
+
+    def day(second, **kw):
+        c = capture(orders={"orders": [order("Buy 30 GTY", "LIMIT", "BUY", second, total="30", limit="28.2", **kw)]})
+        return ic.parse(c, CREATED, NOW)["day_buys"]
+
+    assert day("Limit 28.20, Day") == {"GTY.US": 30.0} and day("Limit 28.20, DAY ") == {"GTY.US": 30.0}
+    assert day("Limit 28.20, Day", rem="12") == {"GTY.US": 12.0}                     # a part fill: what is left
+    for other in ("Limit 28.20, GTC", "Limit 28.20, Good Till Cancel", "Limit 28.20", "", "Limit 28.20, Immediate or Cancel",
+                  "Limit 28.20, Day+Ext", "Limit 28.20, Today"):
+        assert day(other) == {}, other                                               # only a read "Day" counts
+    assert day("Limit 28.20, Day", status="EXPIRED") == {} and day("Limit 28.20, Day", status="FILLED") == {}
+    two = capture(orders={"orders": [order("Buy 10 GTY", "LIMIT", "BUY", "Limit 28.20, Day", total="10", limit="28.2"),
+                                     order("Buy 14 GTY", "LIMIT", "BUY", "Limit 28.00, GTC", total="14", limit="28.0"),
+                                     order("Sell 5 GTY", "LIMIT", "SELL", "Limit 31.25, Day", total="5", limit="31.25")]})
+    q = ic.parse(two, CREATED, NOW)
+    assert q["day_buys"] == {"GTY.US": 10.0} and q["buys"]["GTY.US"] == [(28.2, 10.0), (28.0, 14.0)]   # a sell is never one
+    assert ic.parse({"schema": "x"}, CREATED, NOW)["day_buys"] == {} and ic.__version__ == "1.1.0"
+

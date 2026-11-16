@@ -162,6 +162,19 @@ the words, "cash from the cash ledger | typed cash cell, not the broker
 (<why>)". A plan that
 exists is never cut again; nothing else changes.
 
+1.9.1 (2026-11-17): A PRICE WITHOUT A QUOTE TIME NEVER OPENS A PICK (review of
+16 Nov: an isolated replay of the status refresh returned OPEN for a price
+whose quote time was missing; confirmed in pick_status, where the 1.5.0 age
+test ran only when a time was there). A price whose time is not known cannot
+be shown to be current. With the age limit on (TFB_PLAN_QUOTE_MAX_AGE_H > 0)
+and TFB_PLAN_QUOTE_TIME = required (default), such a price reads CHECK - "the
+price X has no quote time: not shown to be current" - and can neither open
+nor invalidate a pick, exactly like a price past the age limit. A live quote
+(TFB_PLAN_LIVE_PRICE) always carries its time, so this bites only when the
+live quote failed AND the source page's row has no 'Last Updated (UTC)'.
+TFB_PLAN_QUOTE_TIME = optional restores 1.9.0 byte for byte. The cut itself,
+the picks, their sizes and levels are unchanged.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -175,7 +188,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -275,6 +288,7 @@ def knobs() -> Dict[str, Any]:
         "unverified_h": _env_num("TFB_PLAN_UNVERIFIED_AFTER_H", 15, 0, 24),
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "quote_max_h": _env_num("TFB_PLAN_QUOTE_MAX_AGE_H", 96, 0, 720),          # 1.5.0: 0 = no age check
+        "quote_time": _env("TFB_PLAN_QUOTE_TIME", "required").lower() not in ("optional", "off", "0", "false", "no"),  # 1.9.1
         "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
         "cash_source": cash_source_mode(),                                        # 1.6.0; 1.7.0 adds ibkr
         "ibkr_max_h": _env_num("TFB_PLAN_IBKR_MAX_AGE_H", 30, 0.5, 96),
@@ -787,9 +801,10 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
 def pick_status(row: Dict[str, Any], price: Optional[float], held: Dict[str, _dt.date], plan_date: _dt.date,
                 earn_days: Optional[float], earn_guard: int, quality: str,
                 quote_at: Optional[_dt.datetime] = None, now: Optional[_dt.datetime] = None,
-                max_age_h: float = 0.0) -> Tuple[str, str]:
+                max_age_h: float = 0.0, need_time: bool = False) -> Tuple[str, str]:
     """Status of a frozen pick now. Order: EXECUTED, INVALIDATED, WAIT, CHECK, OPEN.
-    1.5.0 [QUOTE-AGE]: a price older than max_age_h reads CHECK - it can neither open nor invalidate a pick."""
+    1.5.0 [QUOTE-AGE]: a price older than max_age_h reads CHECK - it can neither open nor invalidate a pick.
+    1.9.1 [QUOTE-TIME]: with need_time and the age limit on, a price whose quote time is not known reads CHECK too."""
     bd = held.get(row["symbol"])
     if bd is not None and bd >= plan_date:
         return "EXECUTED", "bought %s" % bd.isoformat()
@@ -797,6 +812,8 @@ def pick_status(row: Dict[str, Any], price: Optional[float], held: Dict[str, _dt
         return "INVALIDATED", "earnings in %d day(s)" % earn_days
     if price is None or price <= 0:
         return "CHECK", "no current price"
+    if need_time and max_age_h > 0 and now is not None and quote_at is None:      # 1.9.1: no time, no proof it is current
+        return "CHECK", "the price %s has no quote time: not shown to be current" % fmt(price)
     if max_age_h > 0 and quote_at is not None and now is not None:
         age = (now - quote_at).total_seconds() / 3600.0
         if age > max_age_h:
@@ -876,7 +893,7 @@ def live_overlay(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, An
 def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]],
                    cal: Dict[str, Dict[str, Any]], held: Dict[str, _dt.date], plan_date: _dt.date,
                    earn_guard: int, stamp: str, live: Optional[Dict[str, str]] = None,
-                   now: Optional[_dt.datetime] = None, max_age_h: float = 0.0) -> None:
+                   now: Optional[_dt.datetime] = None, max_age_h: float = 0.0, need_time: bool = False) -> None:
     for d in day_rows:
         if text(d["Kind"]) != "PICK":
             continue
@@ -887,7 +904,8 @@ def refresh_status(day_rows: List[Dict[str, Any]], sources: Dict[str, Dict[str, 
         row = {"symbol": sym, "stop": num(d["Stop"]) or 0.0, "zone_low": num(d["Zone Low"]) or 0.0,
                "zone_high": num(d["Zone High"]) or 0.0}
         st, why = pick_status(row, price, held, plan_date, (cal.get(sym) or {}).get("earn_days"), earn_guard,
-                              text(d["Cut Quality"]), (sources.get(sym) or {}).get("quote_at"), now, max_age_h)
+                              text(d["Cut Quality"]), (sources.get(sym) or {}).get("quote_at"), now, max_age_h,
+                              need_time)
         if live and sym in live and price is not None:
             why += " (live %s Riyadh)" % live[sym]
         d["Status"], d["Status Reason"], d["Status At (Riyadh)"] = st, why, stamp
@@ -1131,7 +1149,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
                                                   for s in sorted(live)))
         refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live,
-                       now=now, max_age_h=k["quote_max_h"])
+                       now=now, max_age_h=k["quote_max_h"], need_time=k["quote_time"])
         first = today_rows[0]
         info["headline"] = "Plan of %s · cut %s Riyadh from the main page's render of %s (%s) · status " \
                            "checked %s" % (day, text(first["Cut At (Riyadh)"]), text(first["Source Render"]),

@@ -1524,7 +1524,8 @@ def test_t16_the_archive_keeps_the_final_decisions(monkeypatch):
     for r in fin:
         t = rows[r["symbol"]]
         assert (r["label"], r["instruction"], r["source"]) == (t["Decision"], t["Do today"], t["Rule of record"])
-        assert r["tone"] == ("ok" if t["Analysis differs on"] == "none" else "warn")
+        assert r["tone"] == ("ok" if t["Analysis differs on"] == "none" and not t["Control status"].startswith("VERIFY")
+                             else "warn")                              # 1.7.0: a row that asks to verify is not ok
         assert ("stop=" in r["levels"]) == (t["Stop"] != "") and r["version"] == tap.__version__
     s = next(r for r in fin if r["symbol"] == "SUPN.US")
     assert s["kind"] == "hold" and s["levels"].endswith("differs=Portfolio_Decision_v2")
@@ -1699,3 +1700,186 @@ def test_t16_a_page_that_shows_the_final_decision_is_never_a_step_or_a_disagreem
     assert "SUPN.US" not in tiles_of(page)["PAGES"][1]
     _, rows = _final(book)
     assert rows["SUPN.US"]["Decision"] == "HOLD" and rows["SUPN.US"]["Analysis differs on"] == "Portfolio_Decision_v2"
+
+
+# ----------------------------------------------------------------------------- T17 (1.7.0) control, order, day orders
+_T17_STOPS = [("Sell 240 DDI", "STP 14.24, GTC", 240), ("Sell 79 GLPI", "STP 35.74, GTC", 79),
+              ("Sell 52 IBOC", "STP 63.20, GTC", 52), ("Sell 95 SUPN", "STP 24.25, GTC", 95)]
+_T17_AGES = {"Exit_Plan": 0.5, "Daily_Plan": 0.3}
+
+
+def _t17(buys, at, now, positions=None, **k):
+    """One build on the 12 Nov fixtures with the capture taken at `at` (Riyadh) and read at `now`."""
+    orders = [ib_order(d, "STOP", "SELL", sec, q) for d, sec, q in _T17_STOPS] + list(buys)
+    holdings, plan = tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 12))
+    cap = ib_capture(orders, positions=positions, at=at.isoformat(), now=now)
+    broker = tap.apply_capture(holdings, plan, cap, 30, now)
+    d = tap.build(holdings, plan, {}, [], _T17_AGES, dict(K, buy_market_h=2.0, **k),
+                  extra={"broker": broker, "cash": broker["cash"]})
+    d["final"] = tap.final_decisions(d, 1.0)
+    return broker, d, dict((r["symbol"], r) for r in d["final"])
+
+
+def test_t17_a_us_close_between_two_times():
+    U, f = UTC, tap.us_close_between
+    cap = dt.datetime(2026, 11, 16, 20, 5, tzinfo=U)                                 # Mon 23:05 Riyadh; the close is 21:00Z
+    assert not f(cap, dt.datetime(2026, 11, 16, 20, 42, tzinfo=U))                   # 23:42 Riyadh: the session is open
+    assert f(cap, dt.datetime(2026, 11, 16, 21, 0, tzinfo=U))                        # at the close
+    assert f(cap, dt.datetime(2026, 11, 17, 4, 30, tzinfo=U))                        # Tue 07:30 Riyadh
+    after = dt.datetime(2026, 11, 16, 21, 10, tzinfo=U)                              # a capture taken after the close
+    assert not f(after, dt.datetime(2026, 11, 17, 5, 40, tzinfo=U)) and f(after, dt.datetime(2026, 11, 17, 21, 0, tzinfo=U))
+    assert not f(dt.datetime(2026, 11, 14, 5, 40, tzinfo=U), dt.datetime(2026, 11, 16, 14, 0, tzinfo=U))   # Sat -> Mon 17:00
+    assert f(dt.datetime(2026, 11, 13, 20, 5, tzinfo=U), dt.datetime(2026, 11, 14, 5, 40, tzinfo=U))       # Fri's close
+    assert f(dt.datetime(2026, 7, 13, 19, 5, tzinfo=U), dt.datetime(2026, 7, 13, 20, 1, tzinfo=U))         # summer: 20:00Z
+    assert not f(dt.datetime(2026, 7, 13, 19, 5, tzinfo=U), dt.datetime(2026, 7, 13, 19, 59, tzinfo=U))
+    assert not f(cap, cap) and not f(cap, cap - dt.timedelta(hours=1))
+
+
+def test_t17_a_day_order_read_before_a_us_close_is_not_called_working():
+    """16 Nov: a day order to buy expired unfilled at the US close; the 23:05 capture still listed it and the next
+    capture is at 08:40. On the next morning's plan the newest capture must not make it "working"."""
+    R = tap.RIYADH
+    at, morning = dt.datetime(2026, 11, 11, 23, 5, tzinfo=R), dt.datetime(2026, 11, 12, 9, 0, tzinfo=R)
+    day = [ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9),
+           ib_order("Sell 24 NMM", "STOP", "SELL", "STP 80.17, GTC", 24)]
+    broker, d, fin = _t17(day, at, morning)
+    assert broker["day_buys"] == {"NMM.US": 24.0} and broker["us_closed"] is True
+    nmm = next(s for s in d["steps"] if s["symbol"] == "NMM.US")
+    reason = ("the day order read at IBKR at 2026-11-11 23:05 Riyadh was for a US session that has since closed - "
+              "confirm at IBKR whether it filled or expired before placing it again")
+    assert tap.step_kind(nmm) == "verify" and nmm["do"] == (
+        "A day order for 24 shares was read at IBKR before the US close. Verify NMM.US before any new buy or stop "
+        "change: %s." % reason)
+    assert "working" not in nmm["do"] and "expired before" in nmm["do"]              # neither claimed
+    f = fin["NMM.US"]
+    assert f["decision"] == "WATCH" and f["do"] == nmm["do"] and f["control"] == "VERIFY: " + reason
+    assert f["order"] == "DAY ORDER read before a US close: 24 share(s) at 87.90 - not confirmed since"
+    assert f["qty"] is None and f["cost"] is None                                    # not a buy: no levels of one
+    c = tap.day_counts(d)
+    tiles = dict((t[0], t) for t in tap.day_tiles(d, c["n_buy"], c["hard"], c["unfunded"]))
+    assert tiles["BUYS TODAY"][1:3] == ("0 of 1", "no open buy")                     # not counted as placed
+    assert d["cash_left"] == pytest.approx(broker["cash"] - 24 * 87.9 * tap.PEG)     # its cash stays reserved
+    # the same capture read while that session is still open: working, as in 1.6.3
+    broker, d, fin = _t17(day, at, dt.datetime(2026, 11, 11, 23, 42, tzinfo=R))
+    assert broker["us_closed"] is False
+    # (11 Nov is not the plan's day in LEDGER, so the working order is a reservation there; the rule itself:)
+    broker, d, fin = _t17(day, dt.datetime(2026, 11, 12, 8, 41, tzinfo=R), morning)  # captured this morning
+    assert broker["us_closed"] is False and fin["NMM.US"]["decision"] == "BUY" and fin["NMM.US"]["control"] == "OK"
+    assert fin["NMM.US"]["order"] == "WORKING at IBKR: 24 share(s) at 87.90"
+    assert next(s for s in d["steps"] if s["symbol"] == "NMM.US")["do"].startswith("The buy order for NMM.US is working at IBKR")
+    # a GTC buy outlives the close; so does a symbol with a GTC buy beside a day one
+    gtc = [ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, GTC", 24, limit=87.9)]
+    broker, d, fin = _t17(gtc, at, morning)
+    assert broker["day_buys"] == {} and fin["NMM.US"]["decision"] == "BUY" and "placed_stale" not in d["picks"][0]
+    mixed = [ib_order("Buy 10 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 10, limit=87.9),
+             ib_order("Buy 14 NMM", "LIMIT", "BUY", "Limit 87.00, GTC", 14, limit=87.0)]
+    broker, d, fin = _t17(mixed, at, morning)
+    assert broker["day_buys"] == {"NMM.US": 10.0} and fin["NMM.US"]["decision"] == "BUY"
+    # off: 1.6.3 - the order reads working
+    broker, d, fin = _t17(day, at, morning, day_order=False)
+    assert fin["NMM.US"]["decision"] == "BUY" and "placed_stale" not in d["picks"][0]
+    assert next(s for s in d["steps"] if s["symbol"] == "NMM.US")["do"].startswith("The buy order for NMM.US is working at IBKR")
+    # a build run twice drops the mark with the other annotations (as 1.3.1 does for placed / review_reason)
+    holdings, plan = tap.read_holdings(EXIT), tap.read_plan(LEDGER, dt.date(2026, 11, 12))
+    cap = ib_capture([ib_order(x, "STOP", "SELL", sec, q) for x, sec, q in _T17_STOPS] + day, at=at.isoformat(), now=morning)
+    stale = tap.apply_capture(holdings, plan, cap, 30, morning)
+    k = dict(K, buy_market_h=2.0)
+    assert tap.build(holdings, plan, {}, [], _T17_AGES, k, extra={"broker": stale, "cash": stale["cash"]})["picks"][0]["placed_stale"]
+    fresh = dict(stale, us_closed=False)
+    assert "placed_stale" not in tap.build(holdings, plan, {}, [], _T17_AGES, k, extra={"broker": fresh, "cash": stale["cash"]})["picks"][0]
+    assert "day_buys" not in tap.apply_capture(holdings, plan, cap, 30)             # no clock given: not computed
+
+
+def test_t17_control_status_and_order_status_per_stock():
+    """Review of 16 Nov: HOLD with "Verify ... plan quantity 14 differs from broker quantity 15" was archived as ok,
+    and a 30-share order stood beside the plan's quantity of 25 with no label."""
+    R = tap.RIYADH
+    at, now = dt.datetime(2026, 11, 12, 8, 41, tzinfo=R), dt.datetime(2026, 11, 12, 9, 0, tzinfo=R)
+    over = [ib_order("Buy 30 NMM", "LIMIT", "BUY", "Limit 87.90, GTC", 30, limit=87.9)]
+    broker, d, fin = _t17(over, at, now, positions=[("DDI", 239), ("GLPI", 79), ("IBOC", 52), ("SUPN", 95)])
+    # the order's own shares, beside the plan's
+    n = fin["NMM.US"]
+    assert n["decision"] == "BUY" and n["qty"] == 24 and n["order_qty"] == 30 and n["control"] == "OK"
+    assert n["order"] == "WORKING at IBKR: 30 share(s) at 87.90 (the plan sized 24)"
+    # a quantity that does not reconcile: the decision is still the Exit Plan's HOLD; the control says VERIFY
+    x = fin["DDI.US"]
+    assert x["decision"] == "HOLD" and x["control"] == "VERIFY: plan quantity 240 differs from broker quantity 239"
+    assert x["do"].startswith("Verify DDI.US at IBKR before acting")
+    assert x["order"] == "stop 14.24 working on 240 share(s), below the plan's 14.80"
+    assert (fin["GLPI.US"]["control"], fin["GLPI.US"]["order"]) == ("OK", "stop 35.74 working on 79 share(s)")
+    assert (fin["5023.SR"]["control"], fin["5023.SR"]["order"]) == ("n/a", "")       # no exit rule: nothing checked
+    assert (fin["EFC.US"]["control"], fin["EFC.US"]["order"]) == ("n/a", "")         # a pick that waits: no order asked
+    assert (fin["MBIN.US"]["control"], fin["MBIN.US"]["order"]) == ("n/a", "")       # the pipeline
+    # the stop states
+    ho = tap._holding_order
+    h = {"action": "HOLD", "qty": 100, "stop": 9.5}
+    assert ho(dict(h), 1.0) == "broker orders not read"
+    assert ho(dict(h, at_broker=False), 1.0) == "not in the IBKR capture"
+    assert ho(dict(h, broker_cover=0.0, broker_stop=None), 1.0) == "NO STOP WORKING at IBKR"
+    assert ho(dict(h, broker_cover=40.0, broker_stop=9.5), 1.0) == "stop 9.50 working on 40 share(s) of 100"
+    assert ho(dict(h, broker_cover=100.0, broker_stop=None), 1.0) == "stop (price not read) working on 100 share(s)"
+    assert ho(dict(h, broker_cover=100.0, broker_stop=9.6), 1.0) == "stop 9.60 working on 100 share(s)"
+    assert ho(dict(h, action="NO RULE"), 1.0) == "" and tap._holding_control(dict(h, action="NO RULE", review_reason="x")) == "n/a"
+    assert tap._pick_order({"status": "EXECUTED", "qty": 5}, "HOLD") == ("FILLED (bought today)", None)
+    assert tap._pick_order({"status": "OPEN", "qty": 5}, "BUY") == ("NOT PLACED", None)
+    assert tap._pick_order({"status": "OPEN", "qty": 5, "unfunded": (1, 0)}, "WATCH") == ("", None)
+    assert tap._pick_order({"status": "WAIT", "qty": 5}, "WATCH") == ("", None)
+    assert tap._pick_control({"review_reason": "r"}, "WATCH") == "VERIFY: r" and tap._pick_control({}, "WATCH") == "n/a"
+    # the tab: the two columns are the last two, and the first thirteen are the 1.6.3 ones
+    assert tap.FINAL_HEAD[:13] == ["Symbol", "Decision", "Do today", "Qty", "Limit", "Stop", "Cost SAR", "Why", "Rule of record",
+                                   "Other pages' own rules", "Analysis differs on", "Decided At (Riyadh)", "Version"]
+    assert tap.FINAL_HEAD[13:] == ["Control status", "Order status"]
+    rows = tap.final_rows(d["final"], "2026-11-12 09:00")
+    assert all(len(r) == 15 for r in rows) and rows[0] == tap.FINAL_HEAD
+    by = dict((r[0], r) for r in rows[1:])
+    assert by["DDI.US"][1] == "HOLD" and by["DDI.US"][13].startswith("VERIFY: plan quantity 240") and by["NMM.US"][3] == 24
+    assert by["NMM.US"][14] == "WORKING at IBKR: 30 share(s) at 87.90 (the plan sized 24)" and by["NMM.US"][12] == tap.__version__
+    # the archive: verify is warn; the order's shares ride in the levels; the 1.6.3 parts are where they were
+    from scripts import plan_archive
+    arch = dict((r["symbol"], r) for r in plan_archive.plan_rows([], [], "s", [], [], now, "1-1", tap.__version__, finals=d["final"])
+                if r["row_type"] == "final")
+    assert arch["DDI.US"]["tone"] == "warn" and arch["DDI.US"]["levels"] == "qty=240 · stop=14.8 · control=verify"
+    assert arch["NMM.US"]["tone"] == "ok" and arch["NMM.US"]["levels"].startswith("qty=24 · limit=84.50 - 88.01 · stop=80.17 · cost_sar=")
+    assert arch["NMM.US"]["levels"].endswith(" · order_qty=30") and arch["GLPI.US"]["levels"] == "qty=79 · stop=35.74"
+
+
+def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeypatch, capsys):
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    head, rows = _final(book)
+    assert head == tap.FINAL_HEAD and len(head) == 15
+    assert all(r["Control status"] in ("OK", "n/a") or r["Control status"].startswith("VERIFY: ") for r in rows.values())
+    assert rows["GLPI.US"]["Control status"] == "OK" and rows["GLPI.US"]["Order status"] == "stop 35.74 working on 79 share(s)"
+    assert rows["NMM.US"]["Decision"] == "BUY" and rows["NMM.US"]["Order status"] == "NOT PLACED"
+    assert rows["5023.SR"]["Control status"] == "n/a" and rows["ZTO.US"]["Control status"] == "n/a"
+    monkeypatch.delenv("TFB_TAP_DAY_ORDER", raising=False)
+    assert tap.day_order_on() is True
+    for value, want in (("off", False), ("0", False), ("on", True), ("", True), ("x", True)):
+        monkeypatch.setenv("TFB_TAP_DAY_ORDER", value)
+        assert tap.day_order_on() is want, value
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
+    assert tap.__version__ == "1.7.0"
+
+
+def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
+    """The whole run, the morning after: the newest capture is last night's 23:05 one and lists a day order to buy."""
+    R = tap.RIYADH
+    orders = [ib_order(x, "STOP", "SELL", sec, q) for x, sec, q in _T17_STOPS] + [
+        ib_order("Buy 24 NMM", "LIMIT", "BUY", "Limit 87.90, Day", 24, limit=87.9)]
+    cap = ib_capture(orders, at=dt.datetime(2026, 11, 11, 23, 5, tzinfo=R).isoformat(), now=NOW)
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=cap) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    nmm = next(c for c in cards(page) if c[1] == "NMM.US")
+    assert nmm[2].startswith("A day order for 24 shares was read at IBKR before the US close. Verify NMM.US")
+    flat = [" | ".join(str(c) for c in r if c != "") for r in page]
+    assert any(x.startswith("NMM.US | VERIFY | 24 | ") for x in flat) and not any(x.startswith("NMM.US | PLACED") for x in flat)
+    assert tiles_of(page)["BUYS TODAY"][0] == "0 of 1"
+    _, rows = _final(book)
+    n = rows["NMM.US"]
+    assert n["Decision"] == "WATCH" and n["Control status"].startswith("VERIFY: the day order read at IBKR at 2026-11-11 23:05 Riyadh")
+    assert n["Order status"] == "DAY ORDER read before a US close: 24 share(s) at 87.90 - not confirmed since"
+    assert [k for k, r in rows.items() if r["Decision"] == "BUY"] == []              # no page is told the order works
+    assert "FINAL NMM.US    WATCH" in capsys.readouterr().out
+

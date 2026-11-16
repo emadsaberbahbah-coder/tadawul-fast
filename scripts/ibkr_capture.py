@@ -2,7 +2,16 @@
 """
 scripts/ibkr_capture.py - the latest read-only IBKR capture, for the plan pages
 ================================================================================
-VERSION 1.0.0 (2026-11-13) - NEW MODULE
+VERSION 1.1.0 (2026-11-17) - first written 2026-11-13 (1.0.0)
+
+1.1.0: WHICH WORKING BUYS ARE DAY ORDERS. On 16 Nov a day order to buy (limit,
+"Day") expired unfilled at the US close; the last capture of the session
+(23:05 Riyadh) still listed it, and the plan pages read it as working until
+the next capture. parse() now also returns "day_buys": {SYM: shares} - the
+remaining shares of the working BUY orders whose time in force reads Day
+(IBKR's "..., Day" in secondary_description). Every other key is unchanged,
+so every reader of 1.0.0 reads the same values. An order whose time in force
+cannot be read is not counted as a day order.
 
 WHY (owner, 13 Nov 2026 11:51 Riyadh: "the action plan should be as per the cash
 available on IBKR")
@@ -45,7 +54,7 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -60,6 +69,7 @@ _FOLDER_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 _DONE_RE = re.compile(r"^(FILLED|(API_?)?CANCELL?ED|EXPIRED|INACTIVE|REJECTED)$", re.I)
 _DESC_RE = re.compile(r"^(buy|sell)\s+[\d,\.]+\s+(\S+)", re.I)
 _STP_RE = re.compile(r"STP\s+(?:LMT\s+)?([\d,]*\.?\d+)", re.I)
+_DAY_RE = re.compile(r"(?:^|[,;\s])day\s*$", re.I)        # 1.1.0: "Limit 28.20, Day" - the time in force comes last
 
 
 def _env(name: str, default: str = "") -> str:
@@ -106,10 +116,11 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
     """The capture as the plan pages use it. PURE.
     {"ok", "reason", "name", "as_of", "age_h", "cash_usd", "settled_usd", "nav_usd", "stock_usd",
      "positions": {SYM: qty}, "stops": {SYM: [(price, qty)]}, "limits": {SYM: [(price, qty)]},
-     "buys": {SYM: [(limit or None, qty)]}, "n_orders"}"""
+     "buys": {SYM: [(limit or None, qty)]}, "day_buys": {SYM: qty} (1.1.0: the working buys that are day orders),
+     "n_orders"}"""
     out: Dict[str, Any] = {"ok": False, "reason": "", "name": name, "as_of": None, "age_h": None, "cash_usd": None,
                            "settled_usd": None, "nav_usd": None, "stock_usd": None, "positions": {}, "stops": {},
-                           "limits": {}, "buys": {}, "n_orders": 0}
+                           "limits": {}, "buys": {}, "day_buys": {}, "n_orders": 0}
     if not isinstance(capture, dict) or str(capture.get("schema")) != SCHEMA:
         out["reason"] = "capture schema not recognised"
         return out
@@ -176,6 +187,8 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
         out["n_orders"] += 1
         if side == "BUY":
             out["buys"].setdefault(sym, []).append((_num(o.get("limit_price")), qty))
+            if _DAY_RE.search(str(o.get("secondary_description") or "").strip()):       # 1.1.0
+                out["day_buys"][sym] = out["day_buys"].get(sym, 0.0) + qty
         elif "STOP" in typ or "STP" in typ:
             ms = _STP_RE.search(str(o.get("secondary_description") or ""))
             out["stops"].setdefault(sym, []).append((_num(ms.group(1)) if ms else None, qty))
