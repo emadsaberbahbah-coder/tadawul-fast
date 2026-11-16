@@ -1,4 +1,4 @@
-"""scripts/plan_archive.py v1.0.0 - each Today Action Plan run, kept as rows in BigQuery for the IBKR dashboard
+"""scripts/plan_archive.py v1.1.0 - each Today Action Plan run, kept as rows in BigQuery for the IBKR dashboard
 (owner, 13 Nov 2026). Figures and tickers here are invented."""
 from __future__ import annotations
 
@@ -69,6 +69,37 @@ def test_p1_rows_copy_the_run_and_carry_the_riyadh_day():
     assert pa.plan_rows([], [], "", [], [], NOW, "x", "v", alert=False)[0]["tone"] == "ok"
     long = pa.plan_rows([dict(STEPS[0], why="w" * 5000)], [], "", [], [], NOW, "x", "v")
     assert len(long[1]["why"]) == pa.MAX_TEXT and long[1]["why"].endswith("…")
+
+
+FINALS = [{"symbol": "AAA.US", "decision": "HOLD", "do": "Hold; stop 9.50.", "qty": 120.0, "limit": "", "stop": 9.5,
+           "cost": None, "why": "above its stop", "rule": "Exit Plan", "views": [], "differs": []},
+          {"symbol": "BBB.US", "decision": "BUY", "do": "Buy 10 BBB.US with a limit between 19.40 and 20.10.", "qty": 10,
+           "limit": "19.40-20.10", "stop": 18.6037, "cost": 754.0, "why": "rank 1", "rule": "Daily Plan", "views": [],
+           "differs": ["Top_10_Investments", "Page · Two"]},
+          {"symbol": "CCC.SR", "decision": "DO NOT INVEST", "do": "Do not buy.", "qty": None, "limit": "", "stop": None,
+           "cost": None, "why": "w" * 5000, "rule": "Evidence Board", "views": [], "differs": []}]
+
+
+def test_p1_final_decisions_are_kept_one_row_per_stock():
+    """1.1.0: the run's final decisions, in the table's own columns; without them the rows are the 1.0.0 ones."""
+    base = pa.plan_rows(STEPS, TILES, "s", [], [], NOW, "77-1", "1.6.3")
+    rows = pa.plan_rows(STEPS, TILES, "s", [], [], NOW, "77-1", "1.6.3", finals=FINALS)
+    assert rows[:len(base)] == base and pa.plan_rows(STEPS, TILES, "s", [], [], NOW, "77-1", "1.6.3", finals=[]) == base
+    fin = rows[len(base):]
+    assert [(r["row_type"], r["seq"], r["symbol"]) for r in fin] == [("final", 1, "AAA.US"), ("final", 2, "BBB.US"),
+                                                                     ("final", 3, "CCC.SR")]
+    assert all(set(r) == {f["name"] for f in pa.SCHEMA} and r["run_id"] == "77-1" for r in fin)
+    a, b, c = fin
+    assert (a["kind"], a["label"], a["instruction"], a["source"], a["tone"]) == ("hold", "HOLD", "Hold; stop 9.50.", "Exit Plan", "ok")
+    assert a["levels"] == "qty=120 · stop=9.5" and a["why"] == "above its stop"
+    assert (b["kind"], b["label"], b["tone"]) == ("buy", "BUY", "warn")
+    assert b["levels"] == "qty=10 · limit=19.40-20.10 · stop=18.6037 · cost_sar=754 · differs=Top_10_Investments, Page - Two"
+    assert (c["kind"], c["label"], c["levels"]) == ("do_not_invest", "DO NOT INVEST", "")
+    assert len(c["why"]) == pa.MAX_TEXT
+    # the insert ids stay unique per run: a final row never collides with a step or a tile of the same number
+    ids = ["%s-%s-%s" % (r["run_id"], r["row_type"], r["seq"]) for r in rows]
+    assert len(ids) == len(set(ids))
+    assert pa.final_levels({"qty": float("nan"), "stop": "x", "cost": float("inf")}) == ""
 
 
 def test_p1_run_id_from_the_workflow_or_the_clock(monkeypatch):
