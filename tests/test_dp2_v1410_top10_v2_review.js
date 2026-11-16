@@ -26,7 +26,9 @@ const crypto = require('crypto');
 const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
-const NEW = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-16: v1.4.2 [STATUS-LINE] delivered -- this harness runs on the v1.4.1 file rebuilt from it (tests/js/dp2_history.js
+// v1410Source: the v1.4.2 hunks reversed, SHA-256 pinned).
+const NEW = require(path.join(ROOT, 'tests', 'js', 'dp2_history.js')).v1410Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1410.json'), 'utf8'));
 const V1400_SHA256 = '6db804640810b023219d69dcda1043cc1b53aed5c7b1f5aabd94e559fb623597';   // v1.4.0 (origin/main b255102)
