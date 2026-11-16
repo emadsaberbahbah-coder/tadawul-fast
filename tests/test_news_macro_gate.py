@@ -910,6 +910,12 @@ ISSUER_CASES = [
     ("Some headline", "GLE.PA", "", None),
     ("Zed Trust (ZED.UN) cuts its distribution", "ZED.US", "Acme Holdings Inc.", False),   # another listing of the ticker
     ("Acme (ZED.US) raises guidance", "ZED.US", "Acme Holdings Inc.", True),
+    # Codex P2 (#1006): without analyst-note words the issuer is the subject, not a broker
+    ("Barclays raises dividend after earnings beat", "BARC.L", "Barclays PLC", True),
+    ("Profit falls at Merchants Bancorp", "MBIN.US", "Merchants Bancorp", True),
+    ("Barclays upgraded to Overweight at JPMorgan", "BARC.L", "Barclays PLC", True),
+    ("Fresenius Medical downgraded by Barclays", "BARC.L", "Barclays PLC", False),
+    ("Barclays downgrades Michelin", "BARC.L", "Barclays PLC", False),
 ]
 
 

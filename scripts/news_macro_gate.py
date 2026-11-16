@@ -19,7 +19,8 @@ WHAT: issuer_linked(title, symbol, name) (pure) keeps a GDELT / Google-News item
   'LSE:BBOX' (exchange prefixes in _TICKER_PREFIXES), the number of a .SR name in brackets; or (b) the cleaned
   company name as a whole phrase (case-insensitive) that is not the tail of another company's name ('Farmers &
   Merchants Bancorp') and not the broker of an analyst note ('... by Barclays', 'at BNP Paribas', 'Barclays
-  maintains / raises / lowers / adjusts / upgrades / downgrades / initiates / reiterates / cuts / sees'). A
+  maintains / raises / lowers / adjusts / upgrades / downgrades / initiates / reiterates / cuts / sees' - only
+  when the headline carries analyst-note words: price target, rating, upgrade, overweight, coverage ...). A
   ticker form always links. EDGAR filings (matched by CIK), the Fed feed, macro items and a name without a
   known company name are kept as before. Fresh items and items carried from memory both pass the check.
   Script Property-free; env TFB_NEWS_ISSUER_LINK: on (default) drops unlinked items; observe keeps them and only
@@ -1137,9 +1138,13 @@ GNEWS_EN_QUERIES: Tuple[Tuple[str, str], ...] = (
 _TICKER_PREFIXES = ("NASDAQ", "NASDAQGS", "NASDAQGM", "NASDAQCM", "NDQ", "NYSE", "NYSEAMERICAN", "NYSEARCA", "AMEX",
                     "OTC", "OTCMKTS", "LSE", "LON", "ENXTPA", "ENXTAM", "ENXTBR", "EPA", "AMS", "BME", "HKG", "HKEX",
                     "TSX", "ASX", "BMV", "TADAWUL", "XETRA", "ETR", "FRA")
-_BROKER_VERBS = ("maintains", "maintained", "raises", "raised", "lowers", "lowered", "adjusts", "upgrades",
-                 "downgrades", "initiates", "reiterates", "cuts", "sees", "flags", "turns", "rates", "resumes",
-                 "reinstates", "lifts", "trims", "boosts", "names")
+_BROKER_VERBS = ("maintains", "raises", "lowers", "adjusts", "upgrades", "downgrades", "initiates", "reiterates",
+                 "cuts", "sees", "turns", "rates", "resumes", "reinstates", "lifts", "trims", "boosts")
+# Codex P2 (#1006): a broker role needs analyst-note words in the headline; 'Profit falls at Merchants Bancorp'
+# and 'Barclays raises dividend' are about the issuer.
+_ANALYST_NOTE = re.compile(r"\b(?:price target|target price|PT|ratings?|upgrade[sd]?|downgrade[sd]?|overweight|"
+                           r"underweight|equal[- ]weight|outperform|underperform|market perform|sector perform|"
+                           r"neutral|buy|sell|hold|initiat\w*|coverage|reiterat\w*)\b", re.I)
 
 
 def _name_core(name: str) -> str:
@@ -1165,13 +1170,14 @@ def issuer_linked(title: str, symbol: str, name: str) -> Optional[bool]:
         return None
     words = [re.escape(w) for w in core.split()]
     pat = re.compile(r"(?<![A-Za-z0-9])" + r"[\s\-]+".join(words) + r"(?![A-Za-z0-9]|\.[A-Za-z])", re.I)
+    note = bool(_ANALYST_NOTE.search(t))
     for m in pat.finditer(t):
         before, after = t[:m.start()], t[m.end():]
         if re.search(r"&\s*$", before):
             continue                                   # 'Farmers & Merchants Bancorp': another company
-        if re.search(r"\b(?:by|at|from)\s*$", before, re.I):
-            continue                                   # '... Maintained by Barclays': the broker
-        if re.match(r"\s*(?:" + "|".join(_BROKER_VERBS) + r")\b", after, re.I):
+        if note and re.search(r"\b(?:by|at|from)\s*$", before, re.I):
+            continue                                   # '... Price Target Raised by Barclays': the broker
+        if note and re.match(r"\s*(?:" + "|".join(_BROKER_VERBS) + r")\b", after, re.I):
             continue                                   # 'BNP Paribas raises price target for ...'
         return True
     return False
