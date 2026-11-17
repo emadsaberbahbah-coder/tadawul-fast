@@ -277,7 +277,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
     # vars.TFB_RELEASE_RENDER_HOLD default off; workflow-scoped, never on Render;
     # 1.3.1 is claimed by open PR #831).
-    ("release_decision_feed", "1.4.0", "gated audited decision-feed release (P0-1)"),
+    ("release_decision_feed", "1.4.1", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.5", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
@@ -301,11 +301,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # BigQuery bar archive (TRACK_HIST_CLOSE_SOURCE, default yfinance) and
     # due-only audit pricing (TRACK_AUDIT_DUE_ONLY, default 0); 6.51.0 and
     # 6.52.0 are claimed by open PRs #845 / #857 (pin only).
-    ("track_performance", "6.55.0", "track performance"),
+    ("track_performance", "6.55.1", "track performance"),
     # v1.0.15: the production workbook writer — every market page and the
     # My_Portfolio rebuild pass through this script. Verified import-safe
     # (stdlib+asyncio at module level) before being added here.
-    ("run_dashboard_sync", "6.72.0", "dashboard sync"),
+    ("run_dashboard_sync", "6.73.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.2.0", "shariah refresh"),
     ("backup_workbook", "1.5.1", "workbook backup"),
     ("pit_snapshot", "1.1.1", "pit snapshot"),
@@ -360,7 +360,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.9.2", "daily plan"),
     ("exit_plan", "1.4.0", "exit plan"),
-    ("consistency_check", "1.2.0", "consistency check"),
+    ("consistency_check", "1.3.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
     ("today_action_plan", "1.7.0", "today action plan"),
     ("plan_archive", "1.1.1", "plan archive"),

@@ -1,5 +1,12 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# VERSION 1.0.15 (2026-11-18) -- PORTFOLIO ROUTE AND 20M CAPACITY MAPPING
+# (run_dashboard_sync 6.73.0). Both page-writing jobs map
+# TFB_SYNC_PORTFOLIO_ROUTES (default 'safe': My_Portfolio asks the enrichment
+# route only; 'legacy' restores the full fallback chain) and
+# TFB_SYNC_CAPACITY_LIMIT (default '20000000', Google's cell cap since 10 Sep
+# 2026). Rollback: set the repository variable TFB_SYNC_PORTFOLIO_ROUTES=legacy.
+#
 # VERSION 1.0.14 (2026-11-12) -- A LOG UPLOAD IS TRIED TWICE
 # WHY (run 43086606380, 11 Nov 22:22 Riyadh): the global-markets job wrote its
 # page, then its "Upload Logs" step failed. The run went red, the outcome audit
@@ -559,6 +566,8 @@ jobs:
       # (budget below, seconds, clamped 60..900). Rollback: 0.
       TFB_SYNC_STAMP_REPAIR: ${{ vars.TFB_SYNC_STAMP_REPAIR || '0' }}
       TFB_SYNC_STAMP_REPAIR_BUDGET_S: ${{ vars.TFB_SYNC_STAMP_REPAIR_BUDGET_S || '480' }}
+      TFB_SYNC_PORTFOLIO_ROUTES: ${{ vars.TFB_SYNC_PORTFOLIO_ROUTES || 'safe' }}
+      TFB_SYNC_CAPACITY_LIMIT: ${{ vars.TFB_SYNC_CAPACITY_LIMIT || '20000000' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
@@ -1912,6 +1921,8 @@ jobs:
       # (budget below, seconds, clamped 60..900). Rollback: 0.
       TFB_SYNC_STAMP_REPAIR: ${{ vars.TFB_SYNC_STAMP_REPAIR || '0' }}
       TFB_SYNC_STAMP_REPAIR_BUDGET_S: ${{ vars.TFB_SYNC_STAMP_REPAIR_BUDGET_S || '480' }}
+      TFB_SYNC_PORTFOLIO_ROUTES: ${{ vars.TFB_SYNC_PORTFOLIO_ROUTES || 'safe' }}
+      TFB_SYNC_CAPACITY_LIMIT: ${{ vars.TFB_SYNC_CAPACITY_LIMIT || '20000000' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
       TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
       TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}

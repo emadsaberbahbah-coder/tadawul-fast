@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.81 (2026-11-18) -- PORTFOLIO ROUTE AND CAPACITY SUITE
+#
+# v1.1.81: run tests/test_sync_portfolio_route_capacity.py (run_dashboard_sync
+# 6.73.0: My_Portfolio asks the enrichment route only; the grid capacity status
+# counts against 20,000,000 cells) in the blocking lean lane.
+#
 # VERSION 1.1.80 (2026-11-16) -- PAINT-BUDGET HARNESS
 #
 # v1.1.80: run tests/test_dt10_v1300_paint_budget.js (16_Decision_Top10.gs
@@ -1188,6 +1194,7 @@ jobs:
             tests/test_sync_klg_read_retry.py \
             tests/test_sync_status_stamp_retry.py \
             tests/test_sync_stamp_repair.py \
+            tests/test_sync_portfolio_route_capacity.py \
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
             tests/test_today_action_plan.py \

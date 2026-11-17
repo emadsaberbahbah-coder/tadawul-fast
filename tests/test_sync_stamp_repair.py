@@ -49,7 +49,7 @@ from scripts import run_dashboard_sync as sync  # noqa: E402
 from tests.test_sync_status_stamp_retry import FakeSheets  # noqa: E402
 
 PAYLOAD = ["Global_Markets", "2026-11-09 17:01:00+03:00", "SUCCESS",
-           "[STATUS-STAMP v6.72.0] leg=success run=42621566901", "backend:run_dashboard_sync",
+           "[STATUS-STAMP v6.73.0] leg=success run=42621566901", "backend:run_dashboard_sync",
            "", 6601, 115, 3885711, 0]
 GRID = [["Page"], ["Market_Leaders"], ["Global_Markets"], ["Mutual_Funds"]]
 RES = object()
@@ -103,9 +103,9 @@ def test_r2_gate_on_queues_the_exact_payload(env, monkeypatch, capsys):
     _exhaust(api)
     assert sync._STAMP_REPAIR_QUEUE == [("Global_Markets", PAYLOAD)]
     out = capsys.readouterr().out
-    assert ("::warning::[STATUS-STAMP v6.72.0] stamp FAILED for Global_Markets after 4 attempt(s)"
+    assert ("::warning::[STATUS-STAMP v6.73.0] stamp FAILED for Global_Markets after 4 attempt(s)"
             in out)
-    assert "::notice::[STAMP-REPAIR v6.72.0] Global_Markets stamp queued for the end-of-run repair" in out
+    assert "::notice::[STAMP-REPAIR v6.73.0] Global_Markets stamp queued for the end-of-run repair" in out
 
 
 def test_r3_repair_writes_the_same_payload_after_waits(env, monkeypatch, capsys):
@@ -124,7 +124,7 @@ def test_r3_repair_writes_the_same_payload_after_waits(env, monkeypatch, capsys)
     assert out_map["Global_Markets"]["attempts"] == 2
     assert out_map["Global_Markets"]["where"] == "row 3"
     out = capsys.readouterr().out
-    assert ("::notice::[STAMP-REPAIR v6.72.0] Global_Markets _Status stamp written (row 3) "
+    assert ("::notice::[STAMP-REPAIR v6.73.0] Global_Markets _Status stamp written (row 3) "
             "after 2 repair attempt(s)") in out
     assert "still NOT written" not in out
     assert sync._STAMP_REPAIR_QUEUE == []
@@ -151,7 +151,7 @@ def test_r5_budget_ends_the_pass_with_nothing_written(env, monkeypatch, capsys):
     assert api.grid[2] == ["Global_Markets"]           # untouched
     assert out_map["Global_Markets"]["repaired"] is False
     out = capsys.readouterr().out
-    assert ("::warning::[STAMP-REPAIR v6.72.0] Global_Markets _Status stamp still NOT written "
+    assert ("::warning::[STAMP-REPAIR v6.73.0] Global_Markets _Status stamp still NOT written "
             "after 2 repair attempt(s)") in out
     assert "cohort mismatch" in out
 
@@ -210,9 +210,9 @@ def test_r9_end_of_run_call_order():
 
 
 def test_r10_version_pins():
-    assert sync.SCRIPT_VERSION == "6.72.0"
+    assert sync.SCRIPT_VERSION == "6.73.0"
     src = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("run_dashboard_sync", "6.72.0", "dashboard sync")' in src
+    assert '("run_dashboard_sync", "6.73.0", "dashboard sync")' in src
     head = (_REPO / "scripts" / "run_dashboard_sync.py").read_text(encoding="utf-8")[:4000]
     assert "v6.72.0 - a _Status stamp that times out is written again at the end of the" in head
     assert "v6.71.0 - FW-2 keeps a witnessed row whose P/E is only stale (2026-10-29)" in head
