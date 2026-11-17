@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tests/test_consistency_check.py - scripts/consistency_check.py 1.2.0: the same figure on every page.
+"""tests/test_consistency_check.py - scripts/consistency_check.py 1.3.0: the same figure on every page.
 
   K1  a workbook shaped like 11 Nov 2026 11:30: every mismatch of that morning is reported
   K2  an aligned workbook reads MATCH on every check (NAV as a named INFO)
@@ -345,7 +345,7 @@ def test_k7_the_13_nov_differences():
     assert [r for r in got if r[0] == "C10 actions"][0][1] == "MATCH"
     # the page: its own count and place
     page = cc.page_rows(cc.run_checks(wb13(), today, cc.knobs(), now), "2026-11-13 11:50")
-    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.2.0" in page[1][0]
+    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.3.0" in page[1][0]
     order = [r[1] for r in page[4:]]
     assert order.index("OVER CAP") > max(i for i, s in enumerate(order) if s in ("MISMATCH", "STALE"))
     assert order.index("OVER CAP") < min(i for i, s in enumerate(order) if s in ("INFO", "MATCH"))
@@ -379,3 +379,20 @@ def test_k8_market_open_hours():
     assert cc.knobs()["idle_h"] == 26.0 and cc.knobs()["page_h"] == 2.0
     raw = (ROOT / ".github/workflows/consistency_check.yml").read_text(encoding="utf-8")
     assert "TFB_CONS_PAGE_IDLE_MAX_H: ${{ vars.TFB_CONS_PAGE_IDLE_MAX_H || '26' }}" in raw
+
+
+def test_k9_a_plan_with_no_pick_is_a_plan():
+    """1.3.0 (external audit of 17 Nov): a plan cut with zero picks is not 'no Daily Plan yet'."""
+    zero = [["Plan Date", "Kind", "Symbol", "Status"], ["2026-11-10", "PICK", "OLD.US", "OPEN"],
+            ["2026-11-11", "PIPELINE", "EFC.US", ""], ["2026-11-11", "PIPELINE", "NMM.US", ""]]
+    c1 = by(wb(_Daily_Plan=zero), "C1 decision")[0]           # the main page holds a ZTO.US ticket
+    assert c1[1] == "MISMATCH" and "cut with no pick (2 in the pipeline)" in c1[2] and "ZTO.US" in c1[2]
+    assert "no Daily Plan" not in c1[2]
+    g = wb(_Daily_Plan=zero)
+    g["Top_10_Investments"][6] = [2, "ZTO.US", "ZTO", "0 SAR", 0, "Cash"]
+    c1 = by(g, "C1 decision")[0]
+    assert c1[1] == "MATCH" and "the main page has sized nothing" in c1[2]
+    # no row of any Kind for today: still 'not cut yet'
+    c1 = by(wb(_Daily_Plan=zero[:2]), "C1 decision")[0]
+    assert c1[1] == "INFO" and "no Daily Plan for 2026-11-11 yet" in c1[2]
+    assert cc.__version__ == "1.3.0"

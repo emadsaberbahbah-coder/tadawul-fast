@@ -2,7 +2,7 @@
 """
 scripts/consistency_check.py - TFB cross-page consistency check
 ===============================================================
-VERSION 1.2.0 (2026-11-13) - first written 2026-11-11 (1.0.0)
+VERSION 1.3.0 (2026-11-18) - first written 2026-11-11 (1.0.0)
 
 WHY (owner, Wed 11 Nov 2026 11:24 Riyadh): "improve and accurate output data
 matching in all pages". Read on the live workbook at 11:30 the same day:
@@ -73,6 +73,11 @@ C1, C2, C3 and C11 only (names and times). Every row that can carry cash, a
 total, a quantity, a weight or a stop prints its status alone; the figures are
 on the Consistency_Check page.
 
+1.3.0 (2026-11-18): A PLAN WITH NO PICK IS A PLAN (external audit of 17 Nov). C1 read 'no Daily Plan for
+<date> yet' on days the plan was cut with zero picks, because it looked for PICK rows only. Today's rows of any
+Kind now prove the plan exists: zero PICK with PIPELINE rows reads 'Daily Plan for <date> was cut with no pick
+(N in the pipeline)' - MATCH when the main page holds no ticket, MISMATCH when it does.
+
 GATE: TFB_CONSISTENCY = off (default) | observe (print only) | on.
 Rollback: repository variable TFB_CONSISTENCY=off.
 """
@@ -91,7 +96,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -260,12 +265,23 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
     seats = table_rows(t10, ("Rank", "Symbol", "Ticket SAR", "Shares"), "Symbol")
     tickets = {text(s["Symbol"]).upper(): s for s in seats if (num(s.get("Ticket SAR")) or 0) > 0
                and (num(s.get("Shares")) or 0) > 0}
-    plan = [d for d in table_rows(g.get("_Daily_Plan") or [], ("Plan Date", "Kind", "Symbol", "Status"), "Plan Date")
-            if text(d["Plan Date"]) == today.isoformat() and text(d["Kind"]) == "PICK"]
+    day = [d for d in table_rows(g.get("_Daily_Plan") or [], ("Plan Date", "Kind", "Symbol", "Status"), "Plan Date")
+           if text(d["Plan Date"]) == today.isoformat()]
+    plan = [d for d in day if text(d["Kind"]) == "PICK"]
+    pipeline = [d for d in day if text(d["Kind"]) == "PIPELINE"]
     open_picks = {text(d["Symbol"]).upper(): d for d in plan if text(d["Status"]).upper() not in (
         "INVALIDATED", "EXECUTED")}
     # C1
-    if not plan:
+    if not plan and pipeline:
+        # 1.3.0: a plan cut with no pick is a plan (its rows are PIPELINE only). No ticket on the main page agrees
+        # with it; a ticket would be a buy the plan of record did not make.
+        out.append(row("C1 decision", "MISMATCH" if tickets else "MATCH",
+                       "Daily Plan for %s was cut with no pick (%d in the pipeline)%s" % (
+                           today.isoformat(), len(pipeline),
+                           "; main page tickets the plan does not hold: %s" % ", ".join(sorted(tickets))
+                           if tickets else "; the main page has sized nothing"),
+                       ", ".join(sorted(tickets)) or "none", "none", "Top_10_Investments / Daily_Plan"))
+    elif not plan:
         out.append(row("C1 decision", "INFO", "no Daily Plan for %s yet; main page tickets: %s" % (
             today.isoformat(), ", ".join(sorted(tickets)) or "none"), pages="Top_10_Investments / Daily_Plan"))
     else:

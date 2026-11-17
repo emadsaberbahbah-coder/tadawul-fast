@@ -31,6 +31,9 @@ SYNC_DEFAULTS = {
     # daily_sync.yml 1.0.12 (2026-11-10): run_dashboard_sync 6.72.0 STAMP-REPAIR.
     "TFB_SYNC_STAMP_REPAIR": "0",
     "TFB_SYNC_STAMP_REPAIR_BUDGET_S": "480",
+    # daily_sync.yml 1.0.15 (2026-11-18): run_dashboard_sync 6.73.0 portfolio route + 20M capacity.
+    "TFB_SYNC_PORTFOLIO_ROUTES": "safe",
+    "TFB_SYNC_CAPACITY_LIMIT": "20000000",
 }
 SYNC_JOBS = ("sync-dashboard", "recover-missing-market-pages")
 

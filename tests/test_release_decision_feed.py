@@ -184,6 +184,7 @@ def setup(mp, tmp_path, *, coverage="clean", grids=None, feed=W0_VETO, absent=Fa
     mp.setenv("GITHUB_ACTIONS", "true")
     mp.setenv("GITHUB_RUN_ID", RELEASE_RUN)
     mp.setenv("GITHUB_RUN_ATTEMPT", "1")
+    mp.setenv(R.READ_RETRY_ENV, "0")          # v1.4.1: the one read retry does not wait in tests
     full, _decision = reports(coverage_failure=coverage == "failed", warning=coverage == "warning")
     ctx = Ctx(scope=scope, clock={"now": NOW}, captured={"coverage": [], "decision": []},
               grids=grids or current_publication_grids, probe_calls=[], probe_results=[],
@@ -1350,6 +1351,55 @@ def case_n28_supersede_identity_zero_io(mp, tmp_path):
     assert ctx.service.calls == [] and ctx.service.rows[3][12] == W2_VALUE
     result = R.supersede("synthetic-sheet", CURRENT_RUN, service=ctx.service, now_utc=ctx.clock["now"])
     assert result["downgrade"].endswith("superseded_by_run=90002.3")
+
+
+def case_n30_one_transient_read_fault_is_retried(mp, tmp_path):
+    """v1.4.1 (18 Nov 00:18 Riyadh: layout_or_read_failed on one Sheets read timeout)."""
+    class Flaky(GoogleValues):
+        def __init__(self, *a, fault=TimeoutError("The read operation timed out"), times=1, **k):
+            super().__init__(*a, **k)
+            self.fault, self.left = fault, times
+
+        def get(self, **kwargs):
+            if kwargs["range"] == final.KEY_RANGE and self.left > 0:
+                self.left -= 1
+                raise self.fault
+            return super().get(**kwargs)
+
+    ctx = setup(mp, tmp_path)
+    mp.setenv("TFB_DECISION_RELEASE", "1")
+    service = Flaky()
+    service.rows[3][11:13] = [final.KEY, W0_VETO]
+    result = ctx.release(service=service)
+    assert result["outcome"] == "released" and "timed out" in result["read_retried"]
+    # supersede: a 503 then a clean read downgrades exactly once
+    ctx, _ = released(mp, tmp_path / "s")
+    service = Flaky(fault=ConnectionError("synthetic 503"))
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    slept = []
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
+                         now_utc=ctx.clock["now"], read_sleep=slept.append)
+    assert result["exit_code"] == 0 and result["read_retried"] and slept == [0.0]
+    # two faults in a row still fail closed, zero writes
+    service = Flaky(times=2)
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    result = supersede(ctx, service=service)
+    assert result["exit_code"] == 3 and result["reasons"] == ["layout_or_read_failed"]
+    assert ctx.updates(service) == []
+    # a fault that is not transient is not retried
+    service = Flaky(fault=PermissionError("403 caller does not have permission"))
+    service.rows[3][11:13] = [final.KEY, W0_VETO]
+    result = ctx.release(service=service)
+    assert result["reasons"] == ["layout_or_read_failed"] and "read_retried" not in result and service.left == 0
+    # the classifier and the knob
+    http = Exception("HttpError 503")
+    http.resp = SimpleNamespace(status=503)
+    assert R.is_transient_read_fault(http)
+    assert not R.is_transient_read_fault(ValueError("key block layout"))
+    for raw, want in (("", 5.0), ("abc", 5.0), ("-3", 0.0), ("99", 30.0), ("nan", 5.0), ("2", 2.0)):
+        mp.setenv(R.READ_RETRY_ENV, raw)
+        assert R.read_retry_seconds() == want, raw
+    assert R.SCRIPT_VERSION == "1.4.1"
 
 
 def case_n29_supersede_faults_fail_closed(mp, tmp_path):

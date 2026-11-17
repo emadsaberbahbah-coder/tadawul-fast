@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.4.1 (2026-11-18) -- ONE TRANSIENT READ FAULT IS RETRIED ONCE. The
+release run of 18 Nov 00:18 Riyadh ended layout_fault / layout_or_read_failed
+on a single Sheets read timeout of the key block; the next scheduled run read
+it cleanly. The first read of the key block (release and supersede) is now
+tried a second time after TFB_RELEASE_READ_RETRY_S seconds (default 5, 0..30)
+when the fault is a timeout, a dropped connection, HTTP 429 or a 5xx. A
+layout fault, any other error, or a second failure still fails closed exactly
+as before (exit 3, zero writes). Reads only; no write is ever retried here.
+
 VERSION 1.4.0 (2026-11-03) -- A LIVE RELEASE IS HELD, NOT WITHDRAWN, WHILE A
 COCKPIT IS STILL MID-RENDER (gate TFB_RELEASE_RENDER_HOLD, default OFF =
 v1.3.0 byte-identical apart from script_version). Nothing removed; every
@@ -293,6 +302,7 @@ import math
 import os
 import re
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -306,7 +316,11 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.4.1"
+# v1.4.1: one retry of the first key-block read on a transient fault.
+READ_RETRY_ENV = "TFB_RELEASE_READ_RETRY_S"
+READ_RETRY_DEFAULT_S = 5.0
+_TRANSIENT_HTTP = (408, 429, 500, 502, 503, 504)
 RELEASE_ENV = "TFB_DECISION_RELEASE"
 # v1.4.0: a live release whose re-verification fails only on a recent render
 # is held (deferred, zero writes) instead of withdrawn (default off).
@@ -911,6 +925,34 @@ def _finish(out: dict, code: int, outcome: str, *reasons: str) -> dict:
     return out
 
 
+def read_retry_seconds() -> float:
+    """v1.4.1: seconds before the one retry of a transient key-block read (0..30)."""
+    try:
+        v = float(str(os.getenv(READ_RETRY_ENV) or READ_RETRY_DEFAULT_S).strip())
+    except (TypeError, ValueError):
+        return READ_RETRY_DEFAULT_S
+    if not math.isfinite(v):
+        return READ_RETRY_DEFAULT_S
+    return min(30.0, max(0.0, v))
+
+
+def is_transient_read_fault(exc: BaseException) -> bool:
+    """PURE (v1.4.1). A timeout, a dropped connection, HTTP 408/429/5xx. Never a
+    layout fault (ValueError, KeyError, ...) and never an auth/permission error."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    try:
+        if status is not None and int(status) in _TRANSIENT_HTTP:
+            return True
+    except (TypeError, ValueError):
+        pass
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return ("timeout" in name or "timed out" in msg or "read timeout" in msg
+            or "connection reset" in msg or "remote end closed" in msg)
+
+
 async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reader=None,
               registry=None, service=None, now_utc: Any = None,
               inflight: Optional[Callable[[], Any]] = None,
@@ -972,9 +1014,18 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
         if service is None:
             from integrations.google_sheets_service import get_sheets_service
             service = get_sheets_service()
-        grid = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=fin.KEY_RANGE,
-            valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
+        try:
+            grid = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=fin.KEY_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
+        except Exception as first:  # noqa: BLE001 - v1.4.1: one retry on a transient fault
+            if not is_transient_read_fault(first):
+                raise
+            out["read_retried"] = safe_error_text(first)
+            await (settle_sleep or asyncio.sleep)(read_retry_seconds())
+            grid = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=fin.KEY_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
         slot = fin.publication_slot(grid)
     except Exception as exc:  # noqa: BLE001 - layout or transport fault
         out["fatal"] = safe_error_text(exc)
@@ -1204,7 +1255,8 @@ def _read_feed(service: Any, sheet_id: str, fin: Any) -> tuple[int, Optional[str
 
 
 def supersede(sheet_id: str, current_run_id: Any, *, attempt: Any = None, service: Any = None,
-              now_utc: Any = None, finalize: Any = None) -> dict:
+              now_utc: Any = None, finalize: Any = None,
+              read_sleep: Optional[Callable[[float], Any]] = None) -> dict:
     """v1.1.0 writer-start supersede. Downgrade-only, never promotes.
 
     Run at the start of every page-writing production job, before its first
@@ -1245,7 +1297,14 @@ def supersede(sheet_id: str, current_run_id: Any, *, attempt: Any = None, servic
         if service is None:
             from integrations.google_sheets_service import get_sheets_service
             service = get_sheets_service()
-        slot, prior = _read_feed(service, sheet_id, fin)
+        try:
+            slot, prior = _read_feed(service, sheet_id, fin)
+        except Exception as first:  # noqa: BLE001 - v1.4.1: one retry on a transient fault
+            if not is_transient_read_fault(first):
+                raise
+            out["read_retried"] = safe_error_text(first)
+            (read_sleep or time.sleep)(read_retry_seconds())
+            slot, prior = _read_feed(service, sheet_id, fin)
     except Exception as exc:  # noqa: BLE001 - layout or transport fault: fail closed
         out["fatal"] = safe_error_text(exc)
         return _finish(out, 3, "layout_fault", "layout_or_read_failed")

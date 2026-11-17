@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.55.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.55.1)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1991,8 +1991,18 @@ from urllib.error import HTTPError, URLError
 #   rebased again. Untagged records are unchanged. The bars-units refusal of a historical close after a later
 #   action is untouched. ZERO functions removed, none added.
 #   ROLLBACK: revert this build.
+# -----------------------------------------------------------------------------
+# v6.55.1 (2026-11-18) [CAPACITY-20M]: Google raised the Sheets cap from 10 to
+#   20 million cells (generally available 10 Sep 2026, existing files
+#   included). The capacity guard still read 10,000,000, so on 17 Nov it logged
+#   allocated=8,821,292 used=88.21% breach=True; with
+#   TFB_TP_CAPACITY_GUARD_MODE=enforce every Performance_Log and Signal_History
+#   append would have been refused at 44% of the real limit. The default of
+#   TFB_TP_CAPACITY_LIMIT is now 20000000 (the override and its 1,000,000
+#   floor are unchanged). ZERO functions removed, none added.
+#   ROLLBACK: set TFB_TP_CAPACITY_LIMIT=10000000.
 _CA_REBASED_TAG = "ca_adjusted"     # core.corporate_actions.APPLIED_TAG
-SCRIPT_VERSION = "6.55.0"
+SCRIPT_VERSION = "6.55.1"
 # -----------------------------------------------------------------------------
 # v6.39.0 (2026-09-21) - P-158 TARGET-UNIT SENTRY (S-1 criterion 4 measures
 # the forecast again)
@@ -6800,13 +6810,14 @@ def _capacity_guard_mode() -> str:
 
 
 def _capacity_limit() -> int:
-    """Google hard cap is 10,000,000 cells per spreadsheet. Overridable for
-    drills (TFB_TP_CAPACITY_LIMIT); floor 1,000,000 so a typo cannot set a
-    zero/absurd limit that refuses every append under enforce."""
+    """Google hard cap is 20,000,000 cells per spreadsheet (v6.55.1; 10,000,000
+    before 10 Sep 2026). Overridable for drills (TFB_TP_CAPACITY_LIMIT); floor
+    1,000,000 so a typo cannot set a zero/absurd limit that refuses every
+    append under enforce."""
     try:
-        v = int((os.getenv("TFB_TP_CAPACITY_LIMIT") or "10000000").strip())
+        v = int((os.getenv("TFB_TP_CAPACITY_LIMIT") or "20000000").strip())
     except Exception:
-        v = 10_000_000
+        v = 20_000_000
     return max(1_000_000, v)
 
 

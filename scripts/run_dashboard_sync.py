@@ -3,9 +3,26 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.72.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.73.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.73.0 - My_Portfolio is served by the enrichment route only; the grid
+capacity status counts against 20 million cells (2026-11-18)
+================================================================================
+Run 44072218739 (17 Nov 14:15 Riyadh): /v1/enriched/sheet-rows did not answer
+within its three tries, the chain fell through two retired routes (404) to
+/v1/advanced/sheet-rows, which answered in two seconds with nine rows of
+which none was a fresh acquisition (PAGE-VERDICT fresh_rows=0
+requested_rows=9). Those rows replaced the good 08:01 rows and the page was
+stamped SUCCESS; every release that day refused the feed until the 22:24 run
+(served by /v1/enriched, 9/9 fresh). In each of the six runs read, a healthy
+My_Portfolio was served by /v1/enriched. TFB_SYNC_PORTFOLIO_ROUTES = safe
+(default) | legacy: safe asks /v1/enriched/sheet-rows only, so an outage
+fails the task with the prior portfolio kept (the existing all-routes-failed
+path); legacy = the v6.72.0 chain. Google raised the Sheets limit to 20
+million cells (GA 10 Sep 2026): the CAPACITY-STATUS line reads against
+TFB_SYNC_CAPACITY_LIMIT (default 20000000; floor 1000000).
 
 v6.72.0 - a _Status stamp that times out is written again at the end of the
 run (2026-11-10)
@@ -2181,7 +2198,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # Zero functions removed; additive only; every new behavior ENV-gated with
 # defaults preserving v6.44.1 byte-identically.
 # =============================================================================
-SCRIPT_VERSION = "6.72.0"
+SCRIPT_VERSION = "6.73.0"
 # v6.72.0 (2026-11-10) - STAMP-REPAIR [_Status stamp, sustained Sheets timeouts]:
 #   WHY: run 42621566901 (9 Nov, 15:59 Riyadh) wrote all 6,601 Global_Markets
 #   rows, but its _Status stamp read timed out on all 4 v6.70.2 attempts
@@ -10551,7 +10568,7 @@ def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
 
 
 _CAP_STATUS_KEY = "TFB Grid Capacity"          # v6.53.0
-_CAP_LIMIT = 10_000_000                        # Google Sheets allocation cap
+_CAP_LIMIT = 20_000_000                        # v6.73.0: Google Sheets cap (20M since 10 Sep 2026)
 _CAP_NEAR_PCT = 85.0
 _CAP_AT_PCT = 99.5
 _CAP_TAG = "[CAPACITY-STATUS v6.53.0]"
@@ -10586,11 +10603,22 @@ def _capacity_allocated(svc: Any, spreadsheet_id: str) -> Optional[int]:
         return None
 
 
+def _capacity_limit() -> int:
+    """v6.73.0: the allocation limit the status is read against. Google raised the Sheets cap from 10 to 20
+    million cells (generally available 10 Sep 2026, existing files included). TFB_SYNC_CAPACITY_LIMIT overrides
+    it (an integer; below 1,000,000 or unreadable -> the default)."""
+    try:
+        v = int(str(os.getenv("TFB_SYNC_CAPACITY_LIMIT") or _CAP_LIMIT).strip())
+    except (TypeError, ValueError):
+        return _CAP_LIMIT
+    return v if v >= 1_000_000 else _CAP_LIMIT
+
+
 def _capacity_state(alloc: Optional[int]) -> tuple:
-    """v6.53.0 PURE: (state, pct). UNKNOWN when alloc is None."""
+    """v6.53.0 PURE: (state, pct). UNKNOWN when alloc is None. v6.73.0: against _capacity_limit()."""
     if alloc is None:
         return "UNKNOWN", None
-    pct = 100.0 * float(alloc) / float(_CAP_LIMIT)
+    pct = 100.0 * float(alloc) / float(_capacity_limit())
     if pct >= _CAP_AT_PCT:
         return "AT-LIMIT", pct
     if pct >= _CAP_NEAR_PCT:
@@ -10604,7 +10632,7 @@ def _capacity_value(alloc: Optional[int], run_id: str, ts: str) -> str:
     if pct is None:
         return f"UNKNOWN | allocated=n/a | run={run_id} | {ts}"
     return (f"{state} | allocated={int(alloc):,} ({pct:.2f}%) | "
-            f"free={max(0, _CAP_LIMIT - int(alloc)):,} | run={run_id} | {ts}")
+            f"free={max(0, _capacity_limit() - int(alloc)):,} | run={run_id} | {ts}")
 
 
 def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
@@ -11519,6 +11547,26 @@ def _safe_gateways_enabled() -> bool:
     chains byte-identically (market pages may then serve from the
     unfirewalled enriched/ai routes again — not recommended)."""
     return (os.getenv("TFB_SYNC_SAFE_GATEWAYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+_PF_ROUTE_TAG = "[PORTFOLIO-ROUTES v6.73.0]"
+_PF_SAFE_ROUTE = "/v1/enriched/sheet-rows"
+
+
+def _portfolio_routes_mode() -> str:
+    """v6.73.0: TFB_SYNC_PORTFOLIO_ROUTES = safe (default) | legacy. Anything but 'legacy' reads safe."""
+    return "legacy" if (os.getenv("TFB_SYNC_PORTFOLIO_ROUTES") or "").strip().lower() == "legacy" else "safe"
+
+
+def _task_endpoint_candidates(task: Any, gateway: str) -> List[str]:
+    """v6.73.0 PURE apart from the env read: the request chain for one task. My_Portfolio under 'safe' asks the
+    enrichment route only - the one that served every healthy run - so a backend that cannot answer it fails the
+    task and the prior portfolio stays on the page, instead of rows from a route that does not acquire. Every
+    other page, and My_Portfolio under 'legacy', gets _endpoint_candidates_for_gateway(gateway) unchanged."""
+    chain = _endpoint_candidates_for_gateway(gateway)
+    if _guard_norm(getattr(task, "sheet_name", "")) == _guard_norm("My_Portfolio") and _portfolio_routes_mode() == "safe":
+        return [_PF_SAFE_ROUTE]
+    return chain
 
 
 def _batch_identity_enabled() -> bool:
@@ -14111,7 +14159,7 @@ async def _run_one_task(
                     backend, task, headers, rows_matrix, payload, eff_gw, res
                 )
 
-        for ep in ([] if _use_batching else _endpoint_candidates_for_gateway(eff_gw)):
+        for ep in ([] if _use_batching else _task_endpoint_candidates(task, eff_gw)):   # v6.73.0
             data, err, _code = await backend.post_json(ep, payload)
             if err:
                 last_err = f"{ep} -> {err}"
@@ -14191,6 +14239,12 @@ async def _run_one_task(
         if not headers:
             res.status = "failed"
             res.error = last_err or "All endpoints failed"
+            if (_guard_norm(task.sheet_name) == _guard_norm("My_Portfolio") and not _use_batching
+                    and _portfolio_routes_mode() == "safe"):                       # v6.73.0
+                res.error = ("%s %s did not answer (%s); no other route is asked for the portfolio, so the prior "
+                             "portfolio rows stay on the page" % (_PF_ROUTE_TAG, _PF_SAFE_ROUTE, res.error))
+                res.warnings.append(res.error)
+                logger.warning(res.error)
             return res
 
         res.gateway_used = f"{eff_gw}:{used_endpoint}" if used_endpoint else eff_gw
