@@ -1,7 +1,13 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.8.1 (2026-11-17)
+# VERSION 1.8.2 (2026-11-17)
+#
+# 1.8.2: A DAY ORDER READ BEFORE THE US CLOSE DOES NOT SIZE THE CUT
+# (daily_plan 1.9.2). TFB_PLAN_DAY_ORDER on (default) | off. A capture that
+# lists a working day order to buy and was read before a US close that has
+# since passed gives no cash figure; the cut waits for the next capture as in
+# 1.8.0. Rollback: repository variable TFB_PLAN_DAY_ORDER=off.
 #
 # 1.8.1: A PRICE WITHOUT A QUOTE TIME NEVER OPENS A PICK (daily_plan 1.9.1).
 # TFB_PLAN_QUOTE_TIME required (default) | optional. With the age limit on, a
@@ -169,6 +175,7 @@ jobs:
           TFB_PLAN_STABLE_EXIT: ${{ vars.TFB_PLAN_STABLE_EXIT || '67' }}
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
           TFB_PLAN_QUOTE_TIME: ${{ vars.TFB_PLAN_QUOTE_TIME || 'required' }}
+          TFB_PLAN_DAY_ORDER: ${{ vars.TFB_PLAN_DAY_ORDER || 'on' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |
