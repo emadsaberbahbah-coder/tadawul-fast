@@ -162,6 +162,22 @@ the words, "cash from the cash ledger | typed cash cell, not the broker
 (<why>)". A plan that
 exists is never cut again; nothing else changes.
 
+1.9.2 (2026-11-17): A DAY ORDER READ BEFORE THE US CLOSE DOES NOT SIZE THE CUT
+(owner, 17 Nov 09:44 Riyadh: "there is no recommendation for investment - is
+that correct, or a system deficiency?"). The cut of 17 Nov ran at 07:31 Riyadh
+on the capture of 23:05 the evening before. That capture listed a day order
+to buy that expired unfilled at the US close an hour later; capture_cash still
+took its amount off the broker's cash, the figure fell under the cash floor
+and every candidate read "cash: 0 SAR per pick". The capture of 08:41 showed
+the full cash, and the plan was already frozen. With TFB_PLAN_DAY_ORDER = on
+(default; off = 1.9.1 byte for byte) a capture that lists a working day order
+to buy (ibkr_capture 1.1.0 "day_buys") and was read before a US session close
+that has since passed gives no cash figure: the order may have filled or
+expired, so the free cash is not known. The 1.9.0 rule then applies unchanged:
+the cut waits for the next capture until TFB_PLAN_IBKR_WAIT_UNTIL_H, and from
+that hour cuts from the cash ledger and says so. A capture without "day_buys",
+a GTC buy, or a capture read after the close is used as before.
+
 1.9.1 (2026-11-17): A PRICE WITHOUT A QUOTE TIME NEVER OPENS A PICK (review of
 16 Nov: an isolated replay of the status refresh returned OPEN for a price
 whose quote time was missing; confirmed in pick_status, where the 1.5.0 age
@@ -188,7 +204,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -289,6 +305,7 @@ def knobs() -> Dict[str, Any]:
         "cut_h": _env_num("TFB_PLAN_CUT_FROM_H", 7, 0, 23),
         "quote_max_h": _env_num("TFB_PLAN_QUOTE_MAX_AGE_H", 96, 0, 720),          # 1.5.0: 0 = no age check
         "quote_time": _env("TFB_PLAN_QUOTE_TIME", "required").lower() not in ("optional", "off", "0", "false", "no"),  # 1.9.1
+        "day_order": _env("TFB_PLAN_DAY_ORDER", "on").lower() not in ("off", "0", "false", "no"),                    # 1.9.2
         "stable": stable_mode(),                                                  # 1.5.0 [TWO-LEVEL]
         "cash_source": cash_source_mode(),                                        # 1.6.0; 1.7.0 adds ibkr
         "ibkr_max_h": _env_num("TFB_PLAN_IBKR_MAX_AGE_H", 30, 0.5, 96),
@@ -416,15 +433,24 @@ def snapshot_cash(values: Sequence[Sequence[Any]]) -> Tuple[Optional[float], str
     return best
 
 
-def capture_cash(cap: Optional[Dict[str, Any]], max_age_h: float) -> Tuple[Optional[float], str]:
+def capture_cash(cap: Optional[Dict[str, Any]], max_age_h: float, now: Optional[_dt.datetime] = None,
+                 day_rule: bool = False) -> Tuple[Optional[float], str]:
     """(SAR the broker shows as free for new buys, why not) from a parsed IBKR capture: the smaller of cash and
-    settled cash, less every working BUY order, at the peg. (None, reason) when the capture cannot be used."""
+    settled cash, less every working BUY order, at the peg. (None, reason) when the capture cannot be used.
+    1.9.2: with day_rule and now, a capture that lists a working day order to buy and was read before a US
+    session close that has since passed cannot be used - the order may have filled or expired."""
     if not cap:
         return None, "no capture"
     if not cap.get("ok"):
         return None, cap.get("reason") or "capture not read"
     if cap["age_h"] > max_age_h:
         return None, "the newest capture is %.0f h old (limit %.0f h)" % (cap["age_h"], max_age_h)
+    day = sorted(sym for sym, q in (cap.get("day_buys") or {}).items() if q and q > 0)
+    if day_rule and now is not None and day and cap.get("as_of") is not None:
+        from scripts.today_action_plan import us_close_between  # noqa: PLC0415 - the one session table
+        if us_close_between(cap["as_of"], now):
+            return None, ("the newest capture was read before the last US close and lists a day order to buy "
+                          "(%s) that may have filled or expired" % ", ".join(day))
     from scripts.ibkr_capture import reserved_usd  # noqa: PLC0415
     usd = min(x for x in (cap.get("cash_usd"), cap.get("settled_usd")) if x is not None)
     held, complete = reserved_usd(cap)
@@ -1106,7 +1132,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                 if cap is None and own_book:
                     from scripts import ibkr_capture  # noqa: PLC0415
                     cap = ibkr_capture.latest(now, out=_out)
-                ibkr_cash, ibkr_why = capture_cash(cap, k.get("ibkr_max_h", 30.0))
+                ibkr_cash, ibkr_why = capture_cash(cap, k.get("ibkr_max_h", 30.0), now, k.get("day_order", False))
                 if ibkr_cash is None:
                     _out("IBKR capture not used for sizing: %s" % ibkr_why)
             # 1.9.0: a capture was looked for and gave no usable figure. cap is None when nothing was looked for;
