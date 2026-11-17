@@ -359,7 +359,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.9.2", "daily plan"),
-    ("exit_plan", "1.3.2", "exit plan"),
+    ("exit_plan", "1.4.0", "exit plan"),
     ("consistency_check", "1.2.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
     ("today_action_plan", "1.7.0", "today action plan"),
