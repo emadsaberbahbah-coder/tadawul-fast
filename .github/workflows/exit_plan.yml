@@ -1,7 +1,10 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.3.0 (2026-11-11)
+# VERSION 1.4.0 (2026-11-17)
+#
+# 1.4.0: a dividend whose tax is recorded in _Dividend_Log is counted net of
+# that tax in the entry and the stop (exit_plan 1.4.0; TFB_EXIT_DIV_NET on).
 #
 # 1.3.0: DIVIDEND TAX note on a holding with an ex-dividend inside 10 days
 # (exit_plan 1.2.0; TFB_EXIT_DIV_WARN_DAYS, TFB_EXIT_WHT_PCT).
@@ -124,6 +127,7 @@ jobs:
           TFB_EXIT_EARN_WARN_DAYS: ${{ vars.TFB_EXIT_EARN_WARN_DAYS || '5' }}
           TFB_EXIT_DIV_WARN_DAYS: ${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}
           TFB_EXIT_WHT_PCT: ${{ vars.TFB_EXIT_WHT_PCT || '30' }}
+          TFB_EXIT_DIV_NET: ${{ vars.TFB_EXIT_DIV_NET || 'on' }}
           TFB_EXIT_IBKR_MAX_AGE_H: ${{ vars.TFB_EXIT_IBKR_MAX_AGE_H || '30' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
