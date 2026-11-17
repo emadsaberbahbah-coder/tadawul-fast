@@ -19,6 +19,8 @@
   X14 the workflow, the manifest pin and the CI lane (1.1.0: hourly, the e-mail only after the 07:30 run)
   X15 (1.1.0) an open session's bar is set aside: levels on completed closes, its price shown as Live;
       TAKE PROFIT stays for the day it was issued; live_quote for the Daily Plan
+  X16 (1.4.0) a dividend whose tax is recorded in _Dividend_Log is counted net of that tax: the log parser, the
+      rescaled bars, the entry and the rebased stop, the run with the gate on and off
 
 Run: pytest -q tests/test_exit_plan.py
 """
@@ -503,6 +505,7 @@ def test_x14_workflow_manifest_ci():
     step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_PLAN"] == "${{ vars.TFB_EXIT_PLAN || 'on' }}"
     assert step["env"]["TFB_EXIT_MAIL"] == "${{ vars.TFB_EXIT_MAIL || '1' }}"
+    assert step["env"]["TFB_EXIT_DIV_NET"] == "${{ vars.TFB_EXIT_DIV_NET || 'on' }}"      # 1.4.0
     assert "--send" in step["run"] and "--dry-run" in step["run"]
     src = (ROOT / "scripts/exit_plan.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_EXIT_[A-Z_]+): \$\{\{", raw):
@@ -762,3 +765,139 @@ def test_x18_law_firm_notices_and_unconfirmed_items_never_tighten_a_stop():
     assert "brodsky & smith" in flat and "shareholder update" in flat and "notifying investors" in flat
     assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------- X16 (1.4.0)
+DIVLOG = [["Logged At", "Type", "Symbol", "Lot Buy Date", "Ex-Date", "Amount/Share", "Shares", "Amount", "Ccy", "Note"],
+          ["2026-10-14 07:00:00", "AUTO", "TAX.US", "2026-10-12", "2026-10-13", 10, 40, 400, "USD", "yahoo"],
+          ["2026-10-20 09:00:00", "MANUAL", "TAX.US", "2026-10-12", "2026-10-13", -3, 40, "(120.00)", "USD", "tax"],
+          ["2026-10-14 07:00:00", "AUTO", "GROSS.US", "2026-10-12", "2026-10-13", 1, 50, 50, "USD", "yahoo"],
+          ["2026-10-14 07:00:00", "AUTO", "ODD.US", "2026-10-12", "2026-10-13", 2, 50, 100, "USD", "yahoo"],
+          ["2026-10-15 07:00:00", "MANUAL", "ODD.US", "2026-10-12", "2026-10-13", -1.6, 50, -80, "USD", "typing error"],
+          ["2026-10-14 07:00:00", "AUTO", "TWO.US", "2026-08-03", "2026-09-10", 1, 10, 10, "USD", "yahoo"],
+          ["2026-10-14 07:00:00", "AUTO", "TWO.US", "2026-08-03", "2026-10-13", 2, 10, 20, "USD", "yahoo"],
+          ["2026-10-15 07:00:00", "MANUAL", "two.us", "2026-08-03", "2026-10-13", -0.3, 10, -3, "USD", "tax"],
+          ["2026-10-15 07:00:00", "MANUAL", "", "2026-08-03", "2026-10-13", -0.3, 10, -3, "USD", "no symbol"],
+          ["2026-10-15 07:00:00", "MANUAL", "TAX.US", "2026-10-12", "no date", -1, 40, -40, "USD", "no ex-date"]]
+
+
+def test_x16_dividend_log_parser():
+    t = ep.read_dividend_tax(DIVLOG)
+    assert set(t) == {"TAX.US", "TWO.US"}                                          # no tax row = gross; 20% kept = not applied
+    assert t["TAX.US"] == {dt.date(2026, 10, 13): pytest.approx(0.7)}
+    assert t["TWO.US"] == {dt.date(2026, 10, 13): pytest.approx(0.85)}             # per ex-date; the symbol's case folded
+    assert ep.read_dividend_tax([]) == {} and ep.read_dividend_tax([["Symbol", "Amount"], ["TAX.US", -5]]) == {}
+    full = [DIVLOG[0], DIVLOG[1], ["", "MANUAL", "TAX.US", "", "2026-10-13", "", "", -2, "", ""]]
+    assert ep.read_dividend_tax(full) == {}                                        # 99.5% kept: rounding, not a tax
+
+
+def _div_bars(raw=50.0, div=10.0, n_pre=30, n_post=6, post=40.0):
+    """A stock at `raw` that pays `div`: Yahoo's adjusted bars before the ex-date carry the factor 1 - div / raw."""
+    f = 1 - div / raw
+    ds = days(n_pre + n_post)
+    pre = [(d, raw * f, raw * f * 1.01, raw * f * 0.99, raw * f, f) for d in ds[:n_pre]]
+    return pre + [(d, post, post * 1.01, post * 0.99, post, 1.0) for d in ds[n_pre:]], ds[n_pre]
+
+
+def test_x16_bars_net_of_the_tax():
+    bars, ex = _div_bars()
+    buy_day = bars[25][0]
+    net, applied = ep.net_of_tax(bars, {ex: 0.7}, buy_day)
+    assert applied == [pytest.approx(30.0)]
+    assert net[0][5] == pytest.approx(0.86) and net[29][4] == pytest.approx(43.0)   # 50 less 70% of 10
+    assert net[0][2] == pytest.approx(43.0 * 1.01) and net[0][3] == pytest.approx(43.0 * 0.99)
+    assert net[30:] == bars[30:] and bars[0][5] == pytest.approx(0.8)               # after the ex-date; the input kept
+    assert ep.net_of_tax(bars, {ex: 0.7}, ex) == (bars, [])                         # bought on the ex-date: no dividend
+    assert ep.net_of_tax(bars, {ex: 0.7}, ex + dt.timedelta(days=3)) == (bars, [])
+    assert ep.net_of_tax(bars, None, buy_day) == (bars, []) and ep.net_of_tax(bars, {}, buy_day) == (bars, [])
+    assert ep.net_of_tax(bars, {ex: 0.2}, buy_day) == (bars, [])                    # an implausible share
+    assert ep.net_of_tax(bars, {ex: 1.0}, buy_day) == (bars, [])
+    flat = mk([40.0] * 36, 0.01)
+    assert ep.net_of_tax(flat, {ex: 0.7}, flat[25][0]) == (flat, [])                # no dividend step in the history
+    assert ep.net_of_tax(bars, {ex - dt.timedelta(days=30): 0.7}, bars[2][0]) == (bars, [])   # a week from any step
+    assert ep.net_of_tax(bars, {bars[0][0] - dt.timedelta(days=1): 0.7}, dt.date(2026, 1, 1)) == (bars, [])
+    assert ep.net_of_tax(bars, {bars[-1][0] + dt.timedelta(days=1): 0.7}, buy_day) == (bars, [])
+    weekend, _ = ep.net_of_tax(bars, {ex - dt.timedelta(days=1): 0.7}, buy_day)     # ex-date on a day with no bar
+    assert weekend[0][5] == pytest.approx(0.86 if (ex - dt.timedelta(days=1)) > bars[29][0] else 0.8)
+    gap = bars[:20] + bars[30:]                                                     # a halt: no bar for two weeks
+    far = bars[30][0] - dt.timedelta(days=10)
+    assert far > gap[19][0] and ep.net_of_tax(gap, {far: 0.7}, gap[5][0]) == (gap, [])   # the step is not that date's
+    near, hit = ep.net_of_tax(gap, {bars[30][0] - dt.timedelta(days=6): 0.7}, gap[5][0])
+    assert hit == [pytest.approx(30.0)] and near[19][5] == pytest.approx(0.86)
+    short = [b[:5] for b in bars]
+    assert ep.net_of_tax(short, {ex: 0.7}, buy_day) == (short, [])                  # bars without a factor
+
+
+def test_x16_entry_stop_and_reason_net_of_the_tax():
+    bars, ex = _div_bars()
+    buy_day = bars[25][0]
+    gross = ep.exit_levels("TAX.US", 50.0, buy_day, bars, {}, {}, K(), TODAY)
+    net_bars, pct = ep.net_of_tax(bars, {ex: 0.7}, buy_day)
+    net = ep.exit_levels("TAX.US", 50.0, buy_day, net_bars, {"div_tax_pct": pct}, {}, K(), TODAY)
+    assert gross["entry"] == pytest.approx(40.0) and net["entry"] == pytest.approx(43.0)
+    assert net["basis"] == pytest.approx(0.86) and net["stop"] == pytest.approx(gross["stop"] * 0.86 / 0.8)
+    assert net["dist_pct"] == pytest.approx(gross["dist_pct"])                     # the same percent of a higher entry
+    assert net["pl_pct"] == pytest.approx((40.0 / 43.0 - 1) * 100) and gross["pl_pct"] == pytest.approx(0.0)
+    assert any(w.endswith("adjusted for the dividends paid since, net of the 30% tax withheld (dividend log)")
+               for w in net["why"])
+    assert any(w.endswith("adjusted for the dividends paid since") for w in gross["why"])
+    # a stop recorded on the gross basis is rebased to the net one, and back when the gate is turned off
+    bars2, ex2 = _div_bars(post=42.0)
+    net2, _ = ep.net_of_tax(bars2, {ex2: 0.7}, buy_day)
+    led = [{"Date": "2026-11-10", "Lot": "L", "Stop": 38.0, "TP1 Reached": "no", "Basis": 0.8}]
+    reb = ep.exit_levels("TAX.US", 50.0, buy_day, net2, {}, ep.prior_row(led, "L", TODAY), K(), TODAY)
+    assert reb["prev_stop"] == pytest.approx(38.0 / 0.8 * 0.86) and reb["stop"] == pytest.approx(40.85)
+    assert reb["action"] == "HOLD"                                                 # rebased, not a RAISE STOP
+    led2 = [{"Date": "2026-11-10", "Lot": "L", "Stop": 40.85, "TP1 Reached": "no", "Basis": 0.86}]
+    back = ep.exit_levels("TAX.US", 50.0, buy_day, bars2, {}, ep.prior_row(led2, "L", TODAY), K(), TODAY)
+    assert back["stop"] == pytest.approx(38.0) and back["action"] == "HOLD"
+    low = ep.exit_levels("TAX.US", 50.0, buy_day, net_bars, {}, ep.prior_row(led, "L", TODAY), K(), TODAY)
+    assert low["action"] == "SELL"                                                 # last close 40 under the net stop 40.85
+
+
+def _div_opener(req, timeout):
+    bars, _ = _div_bars()
+    ts = [int(dt.datetime(b[0].year, b[0].month, b[0].day, 14, 30, tzinfo=UTC).timestamp()) for b in bars]
+    raw = [b[4] / b[5] for b in bars]
+    p = chart(ts, raw, [c * 1.01 for c in raw], [c * 0.99 for c in raw], raw, adj=[b[4] for b in bars], off=0)
+    return Resp(json.dumps(p).encode())
+
+
+def _div_book(log=True):
+    bars, ex = _div_bars()
+    lots = [["Symbol", "Name", "Ccy", "Status", "Buy Date", "Buy Price", "Shares"],
+            ["TAX.US", "Tax Co", "USD", "Active", bars[25][0].isoformat(), "50", "40"]]
+    port = [["Symbol", "Name", "Asset Class", "Current Price"], ["TAX.US", "Tax Co", "Equity", 40]]
+    rows = [DIVLOG[0], ["", "AUTO", "TAX.US", "", ex.isoformat(), 10, 40, 400, "USD", ""],
+            ["", "MANUAL", "TAX.US", "", ex.isoformat(), -3, 40, -120, "USD", "tax"]]
+    tabs = {"_Portfolio_CostBasis": Sheet(lots), "My_Portfolio": Sheet(port)}
+    if log:
+        tabs["_Dividend_Log"] = Sheet(rows)
+    return Book(tabs)
+
+
+def test_x16_run_gate_on_off_and_missing_log(monkeypatch, capsys):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    b = _div_book()
+    assert ep.run(False, False, book=b, now=NOW, opener=_div_opener) == 0
+    led = b.tabs["_Exit_Plan"].values
+    assert led[1][2] == "TAX.US" and led[1][4] == pytest.approx(43.0) and led[1][16] == pytest.approx(0.86)
+    assert "net of the 30% tax withheld (dividend log)" in capsys.readouterr().out
+    stop_net = led[1][10]
+    monkeypatch.setenv("TFB_EXIT_DIV_NET", "off")                                   # the gate: the 1.3.2 behaviour
+    assert ep.knobs()["div_net"] is False
+    assert ep.run(False, False, book=b, now=NOW, opener=_div_opener) == 0
+    led = b.tabs["_Exit_Plan"].values
+    assert led[1][4] == pytest.approx(40.0) and led[1][16] == pytest.approx(0.8)
+    assert led[1][10] == pytest.approx(stop_net * 0.8 / 0.86, abs=1e-3)             # the stop of record returns
+    assert "tax withheld" not in capsys.readouterr().out
+    monkeypatch.delenv("TFB_EXIT_DIV_NET")
+    assert ep.knobs()["div_net"] is True
+    for off in ("0", "false", "no", "OFF"):
+        monkeypatch.setenv("TFB_EXIT_DIV_NET", off)
+        assert ep.knobs()["div_net"] is False
+    monkeypatch.delenv("TFB_EXIT_DIV_NET")
+    nolog = _div_book(log=False)                                                    # no dividend log: gross, no failure
+    assert ep.run(False, False, book=nolog, now=NOW, opener=_div_opener) == 0
+    assert nolog.tabs["_Exit_Plan"].values[1][4] == pytest.approx(40.0)
+

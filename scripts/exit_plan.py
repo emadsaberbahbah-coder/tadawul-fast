@@ -2,7 +2,24 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.3.2 (2026-11-14) - first written 2026-11-11 (1.0.0)
+VERSION 1.4.0 (2026-11-17) - first written 2026-11-11 (1.0.0)
+1.4.0 (2026-11-17): DIVIDEND NET OF THE TAX WITHHELD (owner, 17 Nov 10:33
+    Riyadh: "go with the best option"). The entry was lowered by the whole
+    dividend, as Yahoo's adjusted close does. A Saudi resident does not receive
+    the whole dividend of a US company: tax is withheld. On a large special
+    dividend the difference is material - the page counted the gain and the
+    break-even from a price the owner's cash never reached, and a stop placed
+    from that entry allowed a larger loss of capital than the rule states.
+    Now, when the dividend log (_Dividend_Log, written by the portfolio ledger)
+    carries a tax row for a holding's dividend - a negative Amount for the same
+    symbol and ex-date - the bars before that ex-date are rescaled so the step
+    is the dividend the owner kept (net_of_tax). The entry, the stop of record
+    (rebased through its Basis, as after any dividend), the target and the
+    R figures follow. A dividend with no tax row stays gross: nothing is
+    guessed from the listing (a foreign company listed in New York may carry
+    no US tax at all). Only a kept share from 50% up to 99.5% is applied.
+    Gate: TFB_EXIT_DIV_NET = on (default) | off (the 1.3.2 behaviour; the stop
+    of record returns to its gross basis because it is stored normalised).
 1.3.2 (2026-11-14): ONLY TODAY'S PLAN PICKS. On 14 Nov the Daily Plan was cut
     with pipeline rows and no pick, and this page still listed INSW 18, EFC 180
     and AX 21 - the picks of 13 Nov - as today's plan picks, because the newest
@@ -71,12 +88,14 @@ THE RULE (per holding, recomputed after every close):
     entry (the buy price times the adjustment factor on the buy date), so a
     dividend - 10 Nov: SUPN's 8.13 special dividend - neither reads as a loss
     nor leaves a pre-dividend high that would put the stop above the price.
+    1.4.0: a dividend whose tax is recorded in _Dividend_Log is counted net of
+    that tax (TFB_EXIT_DIV_NET), so the tax does read as the loss it is.
 TODAY'S PLAN PICKS: the same initial stop and first target for the Daily
 Plan's open picks, beside the plan's fixed stop.
 
 Reads only: _Portfolio_CostBasis, My_Portfolio, Global_Markets,
-Market_Leaders, Calendar_Events, Dividend_Events, _News_Items, _IBKR_Account,
-_IBKR_Orders, _Daily_Plan and its own ledger. Daily bars from the Yahoo chart
+Market_Leaders, Calendar_Events, Dividend_Events, _Dividend_Log, _News_Items,
+_IBKR_Account, _IBKR_Orders, _Daily_Plan and its own ledger. Daily bars from the Yahoo chart
 API. Writes only its own two tabs: _Exit_Plan (the ledger) and Exit_Plan (the
 page). Sends one e-mail when TFB_EXIT_MAIL=1. Never calls a broker, places,
 changes or cancels no order.
@@ -135,7 +154,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -196,6 +215,7 @@ def knobs() -> Dict[str, Any]:
         "wht": _env_num("TFB_EXIT_WHT_PCT", 30.0, 0.0, 100.0),
         "mail": _env("TFB_EXIT_MAIL", "0") in ("1", "true", "on", "yes"),
         "ibkr_max_h": _env_num("TFB_EXIT_IBKR_MAX_AGE_H", 30.0, 1.0, 240.0),      # 1.3.2
+        "div_net": _env("TFB_EXIT_DIV_NET", "on").lower() not in ("off", "0", "false", "no"),   # 1.4.0
     }
     k["min_pct"] = min(k["min_pct"], k["max_pct"])
     k["trail_tight"] = min(k["trail_tight"], k["trail"])
@@ -259,6 +279,58 @@ def split_open_session(payload: Dict[str, Any], bars: List[Bar], now_ts: float) 
     if bars and start <= now_ts < end and bars[-1][0] == _dt.datetime.fromtimestamp(start + off, UTC).date():
         return bars[:-1], bars[-1][4]
     return bars, None
+
+
+DIV_KEEP_MIN, DIV_KEEP_MAX = 0.5, 0.995      # 1.4.0: the kept share of a dividend that is applied
+
+
+def read_dividend_tax(values: Sequence[Sequence[Any]]) -> Dict[str, Dict[_dt.date, float]]:
+    """1.4.0 [DIV-NET]: {SYMBOL: {ex-date: kept share}} from _Dividend_Log. Rows with a positive Amount are the
+    dividend; rows with a negative Amount are the tax recorded against the same symbol and ex-date. Listed only when
+    the kept share (net / gross) lies in [DIV_KEEP_MIN, DIV_KEEP_MAX): a dividend with no tax row stays gross, and an
+    implausible ratio (a typing error, a reversal) is not applied."""
+    h, col = table_index(values, ("Symbol", "Ex-Date", "Amount"))
+    if h is None:
+        return {}
+    sums: Dict[Tuple[str, _dt.date], List[float]] = {}
+    for r in list(values)[h + 1:]:
+        sym, ex, amt = text(cell(r, col.get("Symbol"))).upper(), parse_date(cell(r, col.get("Ex-Date"))), num(
+            cell(r, col.get("Amount")))
+        if not sym or ex is None or amt is None or not math.isfinite(amt) or amt == 0:
+            continue
+        g = sums.setdefault((sym, ex), [0.0, 0.0])           # [gross, net]
+        g[0] += max(0.0, amt)
+        g[1] += amt
+    out: Dict[str, Dict[_dt.date, float]] = {}
+    for (sym, ex), (gross, net) in sums.items():
+        if gross > 0 and DIV_KEEP_MIN <= net / gross < DIV_KEEP_MAX:
+            out.setdefault(sym, {})[ex] = net / gross
+    return out
+
+
+def net_of_tax(bars: Sequence[Bar], kept: Optional[Dict[_dt.date, float]],
+               after: _dt.date) -> Tuple[List[Bar], List[float]]:
+    """1.4.0 [DIV-NET]: (the bars with each listed dividend counted net of its tax, [tax percent of each one
+    applied]). Across an ex-date Yahoo's factor steps by g = 1 - dividend / previous close; the bars before it are
+    rescaled so the step is 1 - kept x dividend / previous close. Only an ex-date after `after` (the purchase)
+    counts - the lot received nothing of an earlier dividend - and only where the history shows the step on the
+    first bar at or within a week after that date."""
+    out = list(bars)
+    applied: List[float] = []
+    for ex in sorted(kept or {}):
+        keep = (kept or {})[ex]
+        if ex <= after or not DIV_KEEP_MIN <= keep < DIV_KEEP_MAX:
+            continue
+        idx = next((i for i, b in enumerate(out) if b[0] >= ex), None)
+        if not idx or (out[idx][0] - ex).days > 7 or len(out[idx]) <= 5 or len(out[idx - 1]) <= 5:
+            continue
+        g = out[idx - 1][5] / out[idx][5]
+        if not 0.2 <= g < 1 - 1e-6:
+            continue                                          # the history carries no dividend step there
+        m = (1 - keep * (1 - g)) / g
+        out[:idx] = [(b[0], b[1] * m, b[2] * m, b[3] * m, b[4] * m, b[5] * m) if len(b) > 5 else b for b in out[:idx]]
+        applied.append((1 - keep) * 100.0)
+    return out, applied
 
 
 def atr(bars: Sequence[Bar], end: int, n: int = 14) -> Optional[float]:
@@ -391,7 +463,10 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
         res["why"].append("the first target %s was touched on %s (high %s) and the price is back under it" % (
             fmt(entry + r), touch[0].isoformat(), fmt(touch[2])))
     if f_e < 0.995:
-        res["why"].append("entry %s is the buy price %s adjusted for the dividends paid since" % (fmt(entry), fmt(buy)))
+        tax = info.get("div_tax_pct") or []                # 1.4.0 [DIV-NET]
+        res["why"].append("entry %s is the buy price %s adjusted for the dividends paid since%s" % (
+            fmt(entry), fmt(buy), (", net of the %s%% tax withheld (dividend log)" % "/".join(
+                "%g" % round(t, 1) for t in tax)) if tax else ""))
     if res["tighten"]:
         res["why"].append("trail tightened to %gxATR: %s" % (trail_k, "; ".join(res["tighten"])))
     ed = info.get("earn_days")
@@ -870,6 +945,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
                         raise
             cal = read_calendar(_read(book, "Calendar_Events", "A1:J4000"), _read(book, "Dividend_Events", "A1:J4000"),
                                 today)
+            taxes = read_dividend_tax(_read(book, "_Dividend_Log", "A1:J3000")) if k["div_net"] else {}   # 1.4.0
             news = read_news(_read(book, "_News_Items", "A1:M12000"), now, k["news_days"])
             stops, broker_note = read_broker_stops(_read(book, "_IBKR_Account", "A1:B40"),
                                                    _read(book, "_IBKR_Orders", "A1:H200"), now)
@@ -919,6 +995,8 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         inf["broker_stop"] = stops.get(sym)
         inf["live"] = fetched(sym)[1]
         sym_bars = bars_for(sym)
+        if taxes.get(sym):                                                             # 1.4.0 [DIV-NET]
+            sym_bars, inf["div_tax_pct"] = net_of_tax(sym_bars, taxes[sym], lot["date"])
         prev = prior_row(ledger, lot_key(sym, lot), today, sym_bars[-1][0] if sym_bars else None)
         res = exit_levels(sym, lot["entry"], lot["date"], sym_bars, inf, prev, k, today)
         res.update({"name": inf.get("name") or lot["name"], "shares": lot["shares"], "lot": lot_key(sym, lot),
