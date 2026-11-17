@@ -25,7 +25,9 @@ const crypto = require('crypto');
 const vm = require('vm');
 const ROOT = path.join(__dirname, '..');
 const NEW_PATH = process.argv[2] || path.join(ROOT, 'apps_script', '27_Decision_Pages_v2.gs');
-const NEW = fs.readFileSync(NEW_PATH, 'utf8');
+// 2026-11-17: v1.4.5 [DIV-NET] is delivered; this harness proves the v1.4.4 diff, so it reads the v1.4.4 file rebuilt from
+// the delivered one (tests/js/dp2_history.js: the v1.4.5 hunks reversed, SHA-256 pinned).
+const NEW = require(path.join(__dirname, 'js', 'dp2_history.js')).v1440Source(fs.readFileSync(NEW_PATH, 'utf8'));
 const FIX = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', 'dp2_board_2026-11-02.json'), 'utf8'));
 const EDITS = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'js', 'dp2_edits_v1440.json'), 'utf8'));
 const HISTORY = require(path.join(ROOT, 'tests', 'js', 'dp2_history.js'));
