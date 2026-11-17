@@ -1,7 +1,27 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.3 (2026-11-16)
+ * Version: 1.4.4 (2026-11-17)
+ *   1.4.4: [PLAN-ACCEPT / TOTAL-RETURN / EVIDENCE-RECENT] THREE CELLS THAT MISLED (owner, Tue 17 Nov 2026 09:44 Riyadh:
+ *          "be sure that correct information is provided ... avoid misleading and inconsistent recommendation
+ *          delivery"). Read that morning on one holding's row and on the Model evidence tile:
+ *          (a) the Exit signal cell read 'FINAL: HOLD' and the Today Action Plan asked for nothing, while the 'Dyn stop'
+ *              cell read 'broker <x> - raise to <y>' for a broker stop a few cents under the stop of record. The plan
+ *              accepts a broker stop inside its own tolerance; this page compared to half a cent. When the final row is
+ *              a HOLD that asks for no stop change (dp2FinalHoldsStop_, pure: no 'raise', 'place' or 'verify' in its
+ *              words), a working broker stop under the stop of record now reads 'broker <x> - accepted by the plan
+ *              (<p>% under the stop of record)'. A row that says raise, place or verify, a stop on part of the position
+ *              and a missing stop read as in 1.4.3.
+ *          (b) the 'Unreal.' cell showed the price loss of a lot that had been paid a large cash dividend, with no sign
+ *              of the dividend. A lot whose ledger row carries Dividends Recv now adds to its name cell ' . total return
+ *              <p>% with dividends <amount> <ccy> (ledger)' (dp2TotalReturnTxt_, pure: the ledger's Total Return SAR
+ *              over the lot's cost). The figure is the ledger's own; the 'Unreal.' cell is unchanged.
+ *          (c) the Model evidence tile is an all-time average, so it could not show why it falls day after day. It adds
+ *              ' . targets of the last <N> days: <rate> (n <records>)' - the same WIN / LOSS count for the INVESTABLE
+ *              records whose 'Target Date (Riyadh)' lies in the last N days. Script Property DP2_EVIDENCE_RECENT_DAYS:
+ *              absent or unreadable = 30; 1 to 365 = that many days; 0 / off / false / no = the 1.4.3 tile.
+ *          With DP2_EVIDENCE_RECENT_DAYS = off, no lot with dividends and no broker stop under the stop of record, every
+ *          cell is the 1.4.3 one. No gate, ticket, sizing, order or broker call reads any of it.
  *   1.4.3: [STOP-OF-RECORD] ONE STOP PER HOLDING ON PORTFOLIO_DECISION_v2 (owner, Mon 16 Nov 2026 14:19 Riyadh: "check
  *          ... consistent outcome and recommendations ... or still some alignments need to be done"). Read at 14:25: the
  *          Exit signal cell of a holding read 'FINAL: HOLD' while the 'Dyn stop' cell beside it showed this page's own
@@ -477,7 +497,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.3';   // lockstep with the header
+var DP2_VERSION = '1.4.4';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1779,6 +1799,51 @@ function dp2EvidenceSinceCoreOk_() {
     return okP && okK && okT;
   } catch (e) { return false; }
 }
+/* v1.4.4 [EVIDENCE-RECENT]: Script Property DP2_EVIDENCE_RECENT_DAYS -> days (absent, blank or unreadable = 30; 1 to 365 =
+ * that many; 0 / off / false / no = 0 = the 1.4.3 tile). Read once per execution. */
+var DP2_EVIDENCE_RECENT_PROP = 'DP2_EVIDENCE_RECENT_DAYS';
+var DP2_ER_ = 0, DP2_ER_READ_ = false;
+/* PURE */
+function dp2EvidenceRecentParse_(raw) {
+  var t = dp2Str_(raw).replace(/^\s+|\s+$/g, '').toLowerCase();
+  if (t === '') return 30;
+  if (/^(0|off|false|no)$/.test(t)) return 0;
+  var n = /^\d{1,3}$/.test(t) ? parseInt(t, 10) : 30;
+  return n >= 1 && n <= 365 ? n : 30;
+}
+function dp2EvidenceRecentDays_() {
+  if (!DP2_ER_READ_) { DP2_ER_ = dp2EvidenceRecentParse_(dp2Prop_(DP2_EVIDENCE_RECENT_PROP)); DP2_ER_READ_ = true; }
+  return DP2_ER_;
+}
+/* PURE: '' (off) | ' . targets of the last <N> days: <rate> (n <records>)' | '... none matured' |
+ * '... n/a (no Target Date column)' */
+function dp2EvidenceRecentTxt_(s) {
+  if (!s || !s.days) return '';
+  var head = ' \u00b7 targets of the last ' + s.days + ' days: ';
+  if (!s.col) return head + 'n/a (no Target Date column)';
+  return s.n ? head + dp2PctPlain_(s.wins / s.n * 100, 1) + ' (n ' + dp2Fmt_(s.n) + ')' : head + 'none matured';
+}
+/* PURE (v1.4.4 [PLAN-ACCEPT]): the final row is a HOLD that asks for no change to the stop ('Hold; stop 9.50.', 'Hold;
+ * the stop working at IBKR ... nothing to change.'). A row that says raise, place or verify is not. */
+function dp2FinalHoldsStop_(r) {
+  return !!r && r.decision === 'HOLD' && !/\b(raise|place|verify)\b/i.test(dp2Str_(r.todo));
+}
+/* PURE (v1.4.4 [TOTAL-RETURN]): '' unless the ledger lot carries dividends received; else ' . total return <p>% with
+ * dividends <amount> <ccy> (ledger)' - the lot's Total Return SAR over its cost in SAR (cost x fx). */
+function dp2TotalReturnTxt_(l, fx) {
+  if (!l || !(l.dividends > 0) || typeof l.totalReturnSar !== 'number' || !(l.costBasis > 0) || !(fx > 0)) return '';
+  return ' \u00b7 total return ' + dp2Pct_(l.totalReturnSar / (l.costBasis * fx) * 100, 1) + ' with dividends ' + dp2Fmt_(l.dividends, 2) + ' ' + dp2Str_(l.ccy) + ' (ledger)';
+}
+function dp2V144CoreOk_() {
+  try {
+    var a = dp2EvidenceRecentParse_('') === 30 && dp2EvidenceRecentParse_(' OFF ') === 0 && dp2EvidenceRecentParse_('0') === 0 && dp2EvidenceRecentParse_('14') === 14 && dp2EvidenceRecentParse_('999') === 30 && dp2EvidenceRecentParse_('x') === 30;
+    var b = dp2EvidenceRecentTxt_(null) === '' && dp2EvidenceRecentTxt_({ days: 30, col: true, wins: 3, n: 5 }) === ' \u00b7 targets of the last 30 days: 60.0% (n 5)' && dp2EvidenceRecentTxt_({ days: 7, col: true, wins: 0, n: 0 }) === ' \u00b7 targets of the last 7 days: none matured' && dp2EvidenceRecentTxt_({ days: 7, col: false, wins: 0, n: 0 }) === ' \u00b7 targets of the last 7 days: n/a (no Target Date column)';
+    var c = dp2FinalHoldsStop_({ decision: 'HOLD', todo: 'Hold; stop 9.50.' }) === true && dp2FinalHoldsStop_({ decision: 'HOLD', todo: 'Hold; raise the stop to 9.50 for all 100 shares.' }) === false && dp2FinalHoldsStop_({ decision: 'HOLD', todo: 'Hold. Verify at IBKR before any change: x' }) === false && dp2FinalHoldsStop_({ decision: 'SELL', todo: 'Sell.' }) === false && dp2FinalHoldsStop_(null) === false;
+    var d = dp2TotalReturnTxt_({ dividends: 0, totalReturnSar: 5, costBasis: 100, ccy: 'USD' }, 3.75) === '' && dp2TotalReturnTxt_({ dividends: 12.5, totalReturnSar: 18.75, costBasis: 100, ccy: 'USD' }, 3.75) === ' \u00b7 total return +5.0% with dividends 12.50 USD (ledger)' && dp2TotalReturnTxt_({ dividends: 12.5, totalReturnSar: null, costBasis: 100, ccy: 'USD' }, 3.75) === '';
+    var e = dp2StopOfRecordText_(9.5, 10, 9.47, true, null, null, { covered: 100, shares: 100, planHolds: true }).indexOf('broker 9.47 \u2014 accepted by the plan (0.3% under the stop of record)') > 0 && dp2StopOfRecordText_(9.5, 10, 9.47, true, null, null, { covered: 100, shares: 100 }).indexOf('raise to 9.50') > 0;
+    return a && b && c && d && e;
+  } catch (x) { return false; }
+}
 function dp2ReadHitRates_() {
   var sh = dp2Sheet_(DP2.SRC_PERF, false);
   var out = { ok: false, labels: [] };
@@ -1790,6 +1855,8 @@ function dp2ReadHitRates_() {
   var cStatus = h['Status'], cOut = h['Outcome'], cInv = h['Entry Investability'], cReco = h['Entry Recommendation'], cHor = h['Horizon'];
   var agg = { 'INVESTABLE': [0, 0], 'WATCHLIST': [0, 0], 'ACCUMULATE / 1M': [0, 0], 'ALL': [0, 0] };
   var es = dp2EvidenceSince_(), cRec = es ? (h['Date Recorded (Riyadh)'] !== undefined ? h['Date Recorded (Riyadh)'] : h['Date Recorded']) : undefined, esW = 0, esN = 0;   // v1.2.36
+  var rd = dp2EvidenceRecentDays_(), cTgt = rd ? (h['Target Date (Riyadh)'] !== undefined ? h['Target Date (Riyadh)'] : h['Target Date']) : undefined, rW = 0, rN = 0;   // v1.4.4
+  var rFrom = rd ? Utilities.formatDate(new Date(new Date().getTime() - rd * 86400000), DP2.TZ, 'yyyy-MM-dd HH:mm:ss') : '';
   for (var r = hr + 1; r < vals.length; r++) {
     if (dp2Str_(vals[r][cStatus]).toLowerCase() !== 'matured') continue;
     var o = dp2Str_(vals[r][cOut]).toUpperCase();
@@ -1799,12 +1866,14 @@ function dp2ReadHitRates_() {
     var inv = dp2Str_(vals[r][cInv]).toUpperCase();
     if (agg[inv]) { agg[inv][0] += win; agg[inv][1]++; }
     if (es && inv === 'INVESTABLE' && cRec !== undefined && dp2RecordedKey_(vals[r][cRec]) >= es.key) { esW += win; esN++; }   // v1.2.36
+    if (rd && inv === 'INVESTABLE' && cTgt !== undefined && dp2RecordedKey_(vals[r][cTgt]) >= rFrom) { rW += win; rN++; }   // v1.4.4
     if (/ACCUMULATE/.test(dp2Str_(vals[r][cReco]).toUpperCase()) && dp2Str_(vals[r][cHor]) === '1M') { agg['ACCUMULATE / 1M'][0] += win; agg['ACCUMULATE / 1M'][1]++; }
   }
   out.ok = true;
   var order = ['INVESTABLE', 'WATCHLIST', 'ACCUMULATE / 1M', 'ALL'];
   for (var i = 0; i < order.length; i++) { var a = agg[order[i]]; out.labels.push({ label: order[i], wins: a[0], n: a[1], rate: a[1] ? a[0] / a[1] : null }); }
   if (es) out.since = { label: es.label, key: es.key, col: cRec !== undefined, wins: esW, n: esN, rate: esN ? esW / esN : null };   // v1.2.36
+  if (rd) out.recent = { days: rd, col: cTgt !== undefined, wins: rW, n: rN };   // v1.4.4
   return out;
 }
 function dp2ReadS1_() {
@@ -2408,6 +2477,7 @@ function dp2StopOfRecordText_(recStop, last, brokerStop, known, lastStop, v2Stop
     line2 = 'broker ' + dp2Fmt_(brokerStop, 2);
     if (partial) line2 += ' on ' + dp2Fmt_(cov.covered) + ' of ' + dp2Fmt_(cov.shares) + ' sh only' + (low ? ', below the stop of record' : '') + (verify ? ' \u2014 verify first' : '');
     else if (!low) line2 += ' \u2014 in place';
+    else if (cov.planHolds === true && !verify) line2 += ' \u2014 accepted by the plan (' + dp2PctPlain_((1 - brokerStop / recStop) * 100, 1) + ' under the stop of record)';   // 1.4.4
     else line2 += verify ? ' below the stop of record \u2014 verify first' : ' \u2191 raise to ' + rec;
   }
   else if (!known) line2 = 'broker orders not read';
@@ -4007,10 +4077,10 @@ function buildPortfolioDecisionV2() {
       else { sig.alert = false; sig.advisory = false; }
       var fAct = dp2FinalAction_(l.symbol, fc.row); if (fAct) actions.push(fAct);
       if (fc.row && fc.row.stop) dynTxt = dp2StopOfRecordText_(fc.row.stop, last, brokerStop, ib.ordersKnown, br.lastStop, x ? x.stop : null,
-          { covered: ib.ordersKnown ? br.stopQty : null, shares: posShares, verifyOnly: dp2FinalVerifyOnly_(fc.row) });   // 1.4.3 [STOP-OF-RECORD]
+          { covered: ib.ordersKnown ? br.stopQty : null, shares: posShares, verifyOnly: dp2FinalVerifyOnly_(fc.row), planHolds: dp2FinalHoldsStop_(fc.row) });   // 1.4.3 [STOP-OF-RECORD]; 1.4.4 planHolds
     }
     sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);
-    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : ''), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
+    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : '') + dp2TotalReturnTxt_(l, lfx), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
   // v1.2.21 (review finding on 736ccd6): the unfunded-plans / capital-call action is computed once per page (dp2UnfundedAction_)
   var unfundedAct = dp2UnfundedAction_(alloc);
@@ -4222,7 +4292,7 @@ function buildTop10V2() {
     { label: 'Executable', value: dp2Fmt_(executable), sub: 'of ' + seats.length + ' · ' + (t.output || ''), color: executable > 0 ? DP2C.green : DP2C.red },
     { label: 'Entered cash', value: dp2Fmt_(cashSar) + ' SAR', sub: cashSource + ' · deployable after the engine\'s reserve ' + dp2Fmt_(alloc ? alloc.deployable : deploy) + (alloc && alloc.reserve ? ' (' + (alloc.floorSar > 0 ? 'reserve ' + dp2Fmt_(alloc.floorSar) : 'no reserve') + ')' : '') },
     { label: executable > 0 ? 'Allocated (research)' : 'Sizing preview only', value: alloc ? dp2Fmt_(alloc.allocated) + ' SAR' : 'n/a', sub: alloc ? ((executable > 0 ? '' : 'preview only - nothing executable today - ') + 'of deployable ' + dp2Fmt_(alloc.deployable) + ' - ' + alloc.rows.filter(function (r) { return r.state === 'FUNDED'; }).length + ' of ' + alloc.plans.length + ' plans ' + (executable > 0 ? 'funded' : 'sized') + ' - cap ' + dp2Fmt_(alloc.cap) + '/seat') : 'allocation unavailable', color: alloc && alloc.allocated > 0 && executable > 0 ? DP2C.green : DP2C.grey },
-    { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records' + dp2EvidenceSinceTxt_(hit.since), color: DP2C.amber }
+    { label: 'Model evidence', value: (function () { for (var i = 0; i < hit.labels.length; i++) if (hit.labels[i].label === 'INVESTABLE' && hit.labels[i].rate !== null) return dp2PctPlain_(hit.labels[i].rate * 100, 1); return 'n/a'; })(), sub: 'INVESTABLE hit rate, matured records' + dp2EvidenceSinceTxt_(hit.since) + dp2EvidenceRecentTxt_(hit.recent), color: DP2C.amber }
   ];
   // v1.2.31: the Held seats tile splits the seats by their Stability (active / fast-track / grace-held); an engine board's allocation tile is the
   // engine's, grey and prefixed with the feed state once the release is no longer live (expired, superseded or withdrawn)
@@ -4545,6 +4615,7 @@ function dp2SelfTest() {
   if (dp2ExitSanityOn_()) { var xsOk = dp2ExitSanityCoreOk_(); checks.push({ name: 'exit sanity (DP2_EXIT_SANITY): on \u00b7 core ' + (xsOk ? 'ok' : 'FAIL') + ' (a history of another listing gives no signal; an ex-dividend gap is not a stop)', ok: xsOk }); }   // v1.2.33
   if (dp2StopRule_()) { var srOk = dp2StopRuleCoreOk_(); checks.push({ name: 'stop rule (DP2_STOP_RULE): fixed from ' + dp2StopRule_().from + ' \u00b7 core ' + (srOk ? 'ok' : 'FAIL') + ' (' + DP2X.FIXED_STOP_PCT + '% under the entry, time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions)', ok: srOk }); }   // v1.2.35
   if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
+  checks.push({ name: 'v1.4.4 cores: plan accept, total return, evidence recent (DP2_EVIDENCE_RECENT_DAYS: ' + (dp2EvidenceRecentDays_() ? dp2EvidenceRecentDays_() + ' d' : 'off') + ')', ok: dp2V144CoreOk_() });
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var slotN = 0; try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) slotN++; }); } catch (eSl) { slotN = 0; }
   if (slotN) { var slOk = dp2SlotCoreOk_(); checks.push({ name: 'refresh slots (' + DP2_SLOT_HANDLER_ + ' every ' + DP2_SLOT_EVERY_MIN_ + ' min): ' + dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_)).join(',') + ' \u00b7 core ' + (slOk ? 'ok' : 'FAIL') + ' (one page per execution, after the main-page render of the hour)', ok: slOk }); }   // v1.3.0
