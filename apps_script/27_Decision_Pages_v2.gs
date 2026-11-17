@@ -2727,18 +2727,23 @@ function dp2DivTax_() {
   } catch (e) { return {}; }
 }
 /* PURE: the dividends with each amount net of the tax recorded for it. A dividend is scaled only when the lot was paid
- * it (its ex-date is after entryDate) and the log lists a kept share for an ex-date within DP2_EXIT_DIV_NEAR_D days.
- * The scaled entry carries gross (the whole dividend) and taxPct. Nothing to scale -> the input itself. */
+ * it (its ex-date is after entryDate) and the log lists a kept share for an ex-date within DP2_EXIT_DIV_NEAR_D days:
+ * the same ex-date first, else the nearest one (the earlier of two equally near), so two distributions a few days apart
+ * each take their own record (Codex P2 on #1014). The scaled entry carries gross (the whole dividend) and taxPct.
+ * Nothing to scale -> the input itself. */
 function dp2ExitDivsNet_(divs, tax, entryDate) {
   if (!divs || !divs.length || !tax || !entryDate) return divs;
   var out = [], hit = false, i, k;
   for (i = 0; i < divs.length; i++) {
-    var d = divs[i], keep = null;
+    var d = divs[i], keep = null, best = '', bestGap = -1;
     if (d && d.date && d.amount > 0 && d.date > entryDate) {
       for (k in tax) {
-        if (!Object.prototype.hasOwnProperty.call(tax, k) || keep !== null) continue;
-        if (Math.abs(dp2DayMs_(k) - dp2DayMs_(d.date)) <= DP2_EXIT_DIV_NEAR_D * 86400000 && tax[k] >= DP2_DIV_KEEP_MIN && tax[k] < DP2_DIV_KEEP_MAX) keep = tax[k];
+        if (!Object.prototype.hasOwnProperty.call(tax, k) || !(tax[k] >= DP2_DIV_KEEP_MIN) || !(tax[k] < DP2_DIV_KEEP_MAX)) continue;
+        var gap = Math.abs(dp2DayMs_(k) - dp2DayMs_(d.date));
+        if (!(gap <= DP2_EXIT_DIV_NEAR_D * 86400000)) continue;
+        if (bestGap < 0 || gap < bestGap || (gap === bestGap && k < best)) { best = k; bestGap = gap; }
       }
+      if (bestGap >= 0) keep = tax[best];
     }
     if (keep === null) out.push(d);
     else { hit = true; out.push({ date: d.date, amount: d.amount * keep, source: d.source, gross: d.amount, taxPct: (1 - keep) * 100 }); }
@@ -2759,7 +2764,7 @@ function dp2V145CoreOk_() {
     var a = Math.abs(t['AAA.US']['2026-03-10'] - 0.7) < 1e-9 && !t.hasOwnProperty('BBB.US') && !t.hasOwnProperty('CCC.US') && JSON.stringify(dp2DivTaxFromValues_([['Symbol', 'Amount']])) === '{}';
     var divs = [{ date: '2026-03-10', amount: 2, source: 'chart' }];
     var n = dp2ExitDivsNet_(divs, t['AAA.US'], '2026-03-02');
-    var b = n !== divs && Math.abs(n[0].amount - 1.4) < 1e-9 && n[0].gross === 2 && Math.abs(n[0].taxPct - 30) < 1e-9 && dp2ExitDivsNet_(divs, t['AAA.US'], '2026-03-10') === divs && dp2ExitDivsNet_(divs, null, '2026-03-02') === divs && dp2ExitDivsNet_(divs, { '2026-03-20': 0.7 }, '2026-03-02') === divs;
+    var b = n !== divs && Math.abs(n[0].amount - 1.4) < 1e-9 && n[0].gross === 2 && Math.abs(n[0].taxPct - 30) < 1e-9 && dp2ExitDivsNet_(divs, t['AAA.US'], '2026-03-10') === divs && dp2ExitDivsNet_(divs, null, '2026-03-02') === divs && dp2ExitDivsNet_(divs, { '2026-03-20': 0.7 }, '2026-03-02') === divs && Math.abs(dp2ExitDivsNet_(divs, { '2026-03-08': 0.9, '2026-03-10': 0.7, '2026-03-12': 0.8 }, '2026-03-02')[0].amount - 1.4) < 1e-9 && Math.abs(dp2ExitDivsNet_(divs, { '2026-03-12': 0.8, '2026-03-08': 0.9 }, '2026-03-02')[0].amount - 1.8) < 1e-9;
     var c = dp2ExitDivTxt_(n[0]) === '2.00 ex 2026-03-10, net of 30% tax (dividend log)' && dp2ExitDivTxt_(divs[0]) === '2.00 ex 2026-03-10';
     var bars = [{ date: '2026-03-09', o: 10, h: 10, l: 10, c: 10 }, { date: '2026-03-10', o: 8, h: 8, l: 8, c: 8 }];
     var adj = dp2ExitDivAdjust_(bars, 10, '2026-03-02', n, '2026-03-10');

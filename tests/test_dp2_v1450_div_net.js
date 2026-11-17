@@ -14,7 +14,7 @@
  *   S3  scope: bought on the ex-date, an implausible share, a log ex-date a week away -> the 1.4.4 cells; an ex-date one
  *       day off and a dividend that only Dividend_Events lists -> net
  *   S4  the pure helpers, the gate spellings, the self-test line
- *   S5  mutants (the page cells of seven shapes and four pure calls are the oracle)
+ *   S5  mutants (the page cells of seven shapes and eight pure calls are the oracle)
  * The battery runs three times and the digests must match; the last line is 'PASS k/k' (exit 1 on any failure).
  */
 'use strict';
@@ -572,6 +572,19 @@ function checkPure() {   // invented figures
   }
   ok(c.dp2ExitDivsNet_(null, { [EX_DAY]: 0.7 }, BUY_DAY) === null && plain(c.dp2ExitDivsNet_([], { [EX_DAY]: 0.7 }, BUY_DAY)).length === 0, 'no dividends');
   near(plain(c.dp2ExitDivsNet_(divs, { '2026-10-16': 0.7 }, BUY_DAY))[1].amount, 7, 1e-12, 'three days off is that dividend');
+  // Codex P2 on #1014: two distributions a few days apart each take their own record, whatever the order of the log
+  const pair = [{ date: EX_DAY, amount: 10, source: 'chart' }, { date: '2026-10-16', amount: 2, source: 'chart' }];
+  for (const tax of [{ [EX_DAY]: 0.7, '2026-10-16': 0.85 }, { '2026-10-16': 0.85, [EX_DAY]: 0.7 }]) {
+    const p2 = plain(c.dp2ExitDivsNet_(pair, tax, BUY_DAY));
+    near(p2[0].amount, 7, 1e-12, 'the first takes its own share'); near(p2[1].amount, 1.7, 1e-12, 'the second takes its own share, not the first one listed');
+  }
+  for (const tax of [{ '2026-10-12': 0.9, '2026-10-15': 0.8 }, { '2026-10-15': 0.8, '2026-10-12': 0.9 }]) {
+    near(plain(c.dp2ExitDivsNet_(divs, tax, '2026-10-01'))[1].amount, 9, 1e-12, 'no record on the ex-date: the nearest one');
+  }
+  for (const tax of [{ '2026-10-12': 0.9, '2026-10-14': 0.8 }, { '2026-10-14': 0.8, '2026-10-12': 0.9 }]) {
+    near(plain(c.dp2ExitDivsNet_(divs, tax, '2026-10-01'))[1].amount, 9, 1e-12, 'two equally near: the earlier date, in either order');
+  }
+  near(plain(c.dp2ExitDivsNet_(divs, { '2026-10-12': 0.2, '2026-10-15': 0.8 }, '2026-10-01'))[1].amount, 8, 1e-12, 'an implausible nearer record is passed over');
   eq(c.dp2ExitDivTxt_({ date: EX_DAY, amount: 7, gross: 10, taxPct: 30 }), '10.00 ex ' + EX_DAY + ', net of 30% tax (dividend log)');
   eq(c.dp2ExitDivTxt_({ date: EX_DAY, amount: 10 }), '10.00 ex ' + EX_DAY);
   const adj = plain(c.dp2ExitDivAdjust_(PRE.concat(POST), 50, BUY_DAY, n, '2026-10-30'));
@@ -592,9 +605,11 @@ const MUTANTS = [
   ['the tax rows not netted', "    sums[k].net += amt;", "    sums[k].net += Math.abs(amt);"],
   ['tax rows counted as dividends', "    if (amt > 0) sums[k].gross += amt;", "    sums[k].gross += Math.abs(amt);"],
   ['an implausible share applied', "!(keep >= DP2_DIV_KEEP_MIN) || !(keep < DP2_DIV_KEEP_MAX)) continue;", "false) continue;"],
-  ['an implausible share scaled', " && tax[k] >= DP2_DIV_KEEP_MIN && tax[k] < DP2_DIV_KEEP_MAX) keep = tax[k];", ") keep = tax[k];"],
+  ['an implausible share scaled', "call(tax, k) || !(tax[k] >= DP2_DIV_KEEP_MIN) || !(tax[k] < DP2_DIV_KEEP_MAX)) continue;", "call(tax, k)) continue;"],
+  ['the first record listed wins', "        if (bestGap < 0 || gap < bestGap || (gap === bestGap && k < best)) { best = k; bestGap = gap; }", "        if (bestGap < 0) { best = k; bestGap = gap; }"],
+  ['a tie follows the log order', "(gap === bestGap && k < best)) { best = k; bestGap = gap; }", "false) { best = k; bestGap = gap; }"],
   ['a dividend before the purchase netted', "    if (d && d.date && d.amount > 0 && d.date > entryDate) {", "    if (d && d.date && d.amount > 0) {"],
-  ['any log date matches', "<= DP2_EXIT_DIV_NEAR_D * 86400000 && tax[k] >= DP2_DIV_KEEP_MIN", "<= 30 * 86400000 && tax[k] >= DP2_DIV_KEEP_MIN"],
+  ['any log date matches', "        if (!(gap <= DP2_EXIT_DIV_NEAR_D * 86400000)) continue;", "        if (!(gap <= 30 * 86400000)) continue;"],
   ['the amount not scaled', "amount: d.amount * keep, source: d.source, gross: d.amount", "amount: d.amount, source: d.source, gross: d.amount"],
   ['the engine not handed the net list', "dp2ExitDivsNet_(dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), divTax ? divTax[dp2Str_(l.symbol).trim().toUpperCase()] : null, entryDate), xToday);", "dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), xToday);"],
   ['the log never read', "divTax = xSan ? dp2DivTax_() : null, xToday", "divTax = null, xToday"],
@@ -606,7 +621,10 @@ function signature(src) {
   const h = extra => { const x = holding(shape(src, 'pd', extra)); return [x.dyn, x.engine, x.signal]; };
   const fifteen = logGrid([logRow(SYM, EX_DAY, 400), logRow(SYM, EX_DAY, -60)]);
   const c = makeEnv(src, { fetch: NO_NET }).ctx, one = [{ date: EX_DAY, amount: 10, source: 'chart' }];
-  const pure = [plain(c.dp2DivTaxFromValues_(logGrid([logRow(SYM, EX_DAY, 400), logRow(SYM, EX_DAY, -320)]))), plain(c.dp2DivTaxFromValues_(logGrid([logRow(SYM, EX_DAY, 400), logRow(SYM, EX_DAY, -1)]))),
+  const pair = [{ date: EX_DAY, amount: 10, source: 'chart' }, { date: '2026-10-16', amount: 2, source: 'chart' }];
+  const pick = [plain(c.dp2ExitDivsNet_(pair, { [EX_DAY]: 0.7, '2026-10-16': 0.85 }, BUY_DAY)), plain(c.dp2ExitDivsNet_(one, { '2026-10-12': 0.9, '2026-10-15': 0.8 }, '2026-10-01')),
+                plain(c.dp2ExitDivsNet_(one, { '2026-10-14': 0.8, '2026-10-12': 0.9 }, '2026-10-01')), plain(c.dp2ExitDivsNet_(one, { '2026-10-12': 0.2, '2026-10-15': 0.8 }, '2026-10-01'))];
+  const pure = [pick, plain(c.dp2DivTaxFromValues_(logGrid([logRow(SYM, EX_DAY, 400), logRow(SYM, EX_DAY, -320)]))), plain(c.dp2DivTaxFromValues_(logGrid([logRow(SYM, EX_DAY, 400), logRow(SYM, EX_DAY, -1)]))),
                 plain(c.dp2ExitDivsNet_(one, { [EX_DAY]: 0.2 }, BUY_DAY)), plain(c.dp2ExitDivsNet_(one, { [EX_DAY]: 0.999 }, BUY_DAY))];
   return sha256(JSON.stringify([pure, h({ log: LOG_TAX }), h({ log: LOG_TAX, props: NET_OFF }), h({ log: LOG_GROSS }), h({ log: fifteen }),
     h({ log: logGrid([[ '', 'AUTO', SYM, EX_DAY, EX_DAY, 10, 40, 400, 'USD', ''], ['', 'MANUAL', SYM, EX_DAY, EX_DAY, -3, 40, -120, 'USD', '']]), buy: EX_DAY, px: 44 }),
