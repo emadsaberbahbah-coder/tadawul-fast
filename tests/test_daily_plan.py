@@ -978,7 +978,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.9.1"
+    assert dp.__version__ == "1.9.2"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1172,3 +1172,79 @@ def test_q3_the_status_refresh_of_a_frozen_plan(monkeypatch):
     assert all(st == "OPEN" for st, _ in statuses(b).values())
     assert [r[:24] for r in _ledger(b)] == before
 
+
+
+# ----------------------------------------------------------------------------- D (1.9.2) a day order read before the US close
+D_SEEN = NOW - dt.timedelta(hours=11)                                    # 23:00 Riyadh the evening before: the US session is open
+D_WHY = ("the newest capture was read before the last US close and lists a day order to buy (GGG.US) that may have "
+         "filled or expired")
+
+
+def day_cap(**over):
+    """An evening capture with one working day order to buy 40 GGG.US at 19.50 (invented figures)."""
+    c = cap_of(age_h=11.0, buys={"GGG.US": [(19.5, 40.0)]})
+    c.update({"as_of": D_SEEN, "day_buys": {"GGG.US": 40.0}})
+    c.update(over)
+    return c
+
+
+def test_d1_the_reader_its_default_and_the_workflow(monkeypatch):
+    monkeypatch.delenv("TFB_PLAN_DAY_ORDER", raising=False)
+    assert dp.knobs()["day_order"] is True
+    for value, on in (("off", False), (" OFF ", False), ("0", False), ("false", False), ("no", False), ("on", True),
+                      ("junk", True), ("", True)):
+        monkeypatch.setenv("TFB_PLAN_DAY_ORDER", value)
+        assert dp.knobs()["day_order"] is on, value
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_DAY_ORDER"] == "${{ vars.TFB_PLAN_DAY_ORDER || 'on' }}"
+
+
+def test_d2_a_day_order_read_before_a_close_that_has_passed_gives_no_cash_figure():
+    held = (4679.15 - 19.5 * 40.0) * 3.75
+    assert dp.capture_cash(day_cap(), 30, NOW, True) == (None, D_WHY)
+    # the same capture while that session is still open: the order holds its cash, as before
+    assert dp.capture_cash(day_cap(), 30, D_SEEN + dt.timedelta(minutes=30), True)[0] == pytest.approx(held)
+    # read after the close, a GTC buy, no "day_buys" key, a zero quantity, no capture time: used as in 1.9.1
+    assert dp.capture_cash(day_cap(as_of=NOW - dt.timedelta(hours=2)), 30, NOW, True)[0] == pytest.approx(held)
+    assert dp.capture_cash(day_cap(day_buys={}), 30, NOW, True)[0] == pytest.approx(held)
+    gtc = day_cap()
+    del gtc["day_buys"]
+    assert dp.capture_cash(gtc, 30, NOW, True)[0] == pytest.approx(held)
+    assert dp.capture_cash(day_cap(day_buys={"GGG.US": 0.0}), 30, NOW, True)[0] == pytest.approx(held)
+    assert dp.capture_cash(day_cap(as_of=None), 30, NOW, True)[0] == pytest.approx(held)
+    # the rule off, or a caller of 1.9.1 that passes neither argument: the 1.9.1 figure
+    assert dp.capture_cash(day_cap(), 30, NOW, False)[0] == pytest.approx(held)
+    assert dp.capture_cash(day_cap(), 30)[0] == pytest.approx(held)
+    # the older refusals keep their own words and come first
+    assert dp.capture_cash(day_cap(age_h=31.0), 30, NOW, True) == (None, "the newest capture is 31 h old (limit 30 h)")
+    two = day_cap(day_buys={"ZZZ.US": 5.0, "GGG.US": 40.0})
+    assert "(GGG.US, ZZZ.US)" in dp.capture_cash(two, 30, NOW, True)[1]
+    # a weekend: Friday evening's capture, read again on Sunday morning - Friday's close lies between
+    fri = dt.datetime(2026, 11, 13, 20, 0, tzinfo=UTC)
+    assert dp.capture_cash(day_cap(as_of=fri, age_h=29.0), 30, dt.datetime(2026, 11, 15, 4, 30, tzinfo=UTC), True)[0] is None
+
+
+def test_d3_the_cut_waits_for_the_next_capture_and_then_sizes_from_it(monkeypatch, capsys):
+    """17 Nov: the 07:31 cut sized from the 23:05 capture, whose day order had expired at the close an hour later;
+    every candidate read 'cash: 0 SAR per pick' and the plan froze before the 08:41 capture."""
+    monkeypatch.delenv("TFB_PLAN_DAY_ORDER", raising=False)
+    monkeypatch.delenv("TFB_PLAN_IBKR_WAIT_UNTIL_H", raising=False)
+    b = book()
+    assert dp.main([], book=b, now=NOW, capture=day_cap()) == 0
+    out = capsys.readouterr().out
+    assert _ledger(b) == [] and W_WAIT % D_WHY in out and "CUT " not in out
+    assert any(W_WAIT % D_WHY in str(c) for r in b.tabs["Daily_Plan"].values for c in r)      # the page says why
+    assert dp.main([], book=b, now=NOW + dt.timedelta(minutes=40), capture=cap_of(age_h=0.2)) == 0
+    assert "| cash from the IBKR capture" in capsys.readouterr().out
+    fresh = book()
+    assert dp.main([], book=fresh, now=NOW + dt.timedelta(minutes=40), capture=cap_of(age_h=0.2)) == 0
+    assert _cut(b) == _cut(fresh) and [r for r in _cut(b) if r[0] == "PICK"]                  # the full cash sized it
+    # GOLDEN NEGATIVE: the rule off = 1.9.1 - the cut goes ahead at once on the cash net of the day order
+    monkeypatch.setenv("TFB_PLAN_DAY_ORDER", "off")
+    old = book()
+    assert dp.main([], book=old, now=NOW, capture=day_cap()) == 0
+    out = capsys.readouterr().out
+    assert "| cash from the IBKR capture" in out and "waiting for the broker" not in out and _ledger(old)
+    qty = lambda bk: sum(float(r[14] or 0) * float(r[11] or 0) for r in bk.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK")
+    assert qty(old) < qty(b)                                                                  # smaller: the order held cash
