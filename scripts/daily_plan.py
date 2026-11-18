@@ -230,8 +230,8 @@ use the data provider's names ("Financial Services", "Healthcare",
 "Technology", "Basic Materials", "Consumer Cyclical", "Consumer Defensive"),
 while a candidate's comes from the Top 10 board, which uses the GICS names
 ("Financials", "Health Care", "Information Technology", ...). On 18 Nov 32 of
-the pages' 46 INVESTABLE names read "Financial Services" and 39 of the board's
-80 rows "Financials". The sector limit with holdings (1.10.0 b) therefore never
+the pages' 46 INVESTABLE names read "Financial Services" and 6 of the board's
+10 rows "Financials". The sector limit with holdings (1.10.0 b) therefore never
 counted the three banks held (IBOC, AX, MBIN) against a fourth bank on the
 board - the concentration it was built to stop. The day's own sector cap could
 split one sector in two the same way when a board row had no sector.
