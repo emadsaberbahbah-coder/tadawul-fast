@@ -2,8 +2,33 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.10.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.11.0 (program register C8, Phase 2)
 ================================================================================
+v1.11.0 (18 Nov 2026, the shadow score). WHY (owner, 18 Nov 2026, after two
+weeks of market shocks: do the risk and confidence parameters or the Scoring
+need adjusting; forecast "on a scientific basis with continuous learning";
+then "let us start building"). On 18 Nov v_signal_edge read overall_score,
+confidence and reliability as carrying no edge in any market at any horizon;
+the analyst target upside and the engine's 1M forecast ROI were the two
+signals ranking the next month in the right direction (both still 'thin').
+v_signal_edge_daily gains one feature, shadow_v2 = 0.6 x day rank of the
+target upside + 0.4 x day rank of the 1M engine ROI, ranked within the signal
+day and market group among the names carrying both inputs, so it is measured
+every day beside overall_score by the same method. New v_trial_shadow_v2: the
+daily rank-IC difference shadow - current with its overlap-adjusted t, each
+score's top-third excess return and a reading. Both sides are taken over the
+SAME names (the features shadow_v2_matched / overall_score_matched keep each
+score only on the names carrying both; Codex P2 on #1023: the plain
+overall_score also covers names with no analyst target). The rule and the
+promotion test were fixed on 18 Nov before any forward day; only signal days
+from 19 Nov 2026 are evidence (a reading needs the larger of 20 days and two
+horizon lengths). In-sample read on 18 Nov (US, 1M, 34 days, 23.6 names a
+day): shadow IC 0.32, every day positive, top third +3.9 pp; overall_score
+on the same names -0.22, top third -2.1 pp - one six-week stretch, the days
+the weights were chosen on, not evidence.
+Nothing on a page, in a score or in a pick changes. Research views: the live
+system never reads BigQuery.
+
 v1.10.0 (16 Nov 2026, the news layer's scoreboard). WHY (owner, 16 Nov 2026:
 read all news, measure every recommendation against what happened, learn and
 correct itself; design TFB_News_Scenarios_and_Continuous_Learning_Design,
@@ -219,7 +244,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

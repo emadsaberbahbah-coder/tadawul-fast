@@ -279,6 +279,9 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.11.0 (18 Nov 2026): the shadow score and its forward trial
+    # (pending body replaced: v_signal_edge_daily ccf6ea331773, 1.7.0)
+    "v_trial_shadow_v2": "5b6d94462ff998a3ef9cce7af91552d34f7c960ba10529740295aa69068e8cdc",
     # apply_bq_views 1.10.0 (16 Nov 2026): the news layer's scoreboard
     "v_news_signal_eval": "807584d412eb19347775641e22e8016d9d56da94e19ca89464663a5da6f16621",
     # apply_bq_views 1.9.0 (15 Nov 2026): hold or switch; 1.9.1: 1W / 2W = the 1M figure x days/30
@@ -287,7 +290,7 @@ PENDING = {
     "v_hold_vs_switch": "b98c5ac8e6bf0c3c25416a6957a4a4f5741f75ecbfc2709331861cbb8c51a339",
     # apply_bq_views 1.8.0 (14 Nov 2026): the first controlled trial, C-1
     "v_trial_c1": "fd4bf8b9a0dbb95f5e8394dec7d873a1deb693402020e1e3bd0a8e3a91f0a507",
-    "v_signal_edge_daily": "ccf6ea3317731f049be57f1f007c7d63b75dbd29050c65b048cbe8aa789d39ba",
+    "v_signal_edge_daily": "10fd1f5ac63c5c0cc5b8a159b93640b1bbfb99b50c13da5835d43c0ec32e2b38",
     "v_signal_edge": "14dbbb5db61c4a0a92e51b8c4068244105d92f34355a4613264581d50a6e74ce",
     "v_outcome_engine": "85d51279fdaa42b351c5ab8c277b507923005c6395fbf9b866aab01deed64c5e",
     "v_outcome_excess": "6a085d68f0862f1bae7d32c8ed29ae3c9c370931c6e924c98ddf52a5b61f6fc7",
@@ -313,9 +316,10 @@ EXPECTED_ORDER = [
     "v_trial_c1",
     "v_switch_calibration", "v_hold_vs_switch",
     "v_news_signal_eval",
+    "v_trial_shadow_v2",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 23)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 24)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -1634,6 +1638,23 @@ def _edge_day(xs, rs, min_n=20, average=True):
             sum(bot) / len(bot) if bot else None)
 
 
+def _shadow_v2(target_upside, engine_roi_1m, w=(0.6, 0.4)):
+    """v_signal_edge_daily's shadow_v2 for one day and market group: PERCENT_RANK (the share of
+    the other names strictly below, 0 when alone) of each input among the names that carry
+    both, values tied at 4 decimals; None for a name missing either."""
+    idx = [i for i, (t, e) in enumerate(zip(target_upside, engine_roi_1m)) if t is not None and e is not None]
+    tk = {i: int(round(target_upside[i] * 10000)) for i in idx}
+    ek = {i: int(round(engine_roi_1m[i] * 10000)) for i in idx}
+
+    def pr(keys, i):
+        return sum(1 for j in idx if keys[j] < keys[i]) / (len(idx) - 1) if len(idx) > 1 else 0.0
+
+    out = [None] * len(target_upside)
+    for i in idx:
+        out[i] = round(w[0] * pr(tk, i) + w[1] * pr(ek, i), 10)
+    return out
+
+
 def _own_run_signal(signals, rec_at, after=60.0, days=3):
     """The signal v_signal_edge_daily joins (times in seconds): the earliest
     (recorded_at, value) 0-`after` s after the forecast - the snapshot its own
@@ -1684,10 +1705,28 @@ def case_v28():
     assert [f.strip() for f in feats.split(",")] == [
         "engine_roi_1w", "engine_roi_2w", "engine_roi_1m", "engine_roi_3m", "reliability", "data_quality",
         "confidence", "recommendation", "investability", "stance", "overall_score", "risk_score",
-        "target_upside"], feats
+        "target_upside", "shadow_v2", "shadow_v2_matched", "overall_score_matched"], feats
+    # shadow_v2 (1.11.0): the challenger score, ranked within the day and market group among the
+    # names that carry BOTH inputs; no confidence, reliability or overall_score term; no outcome
+    for frag in (
+            "WHERE target_upside IS NOT NULL AND engine_roi_1m IS NOT NULL",
+            "CAST(ROUND(target_upside * 10000) AS INT64) AS tk",
+            "CAST(ROUND(engine_roi_1m * 10000) AS INT64) AS ek",
+            "0.6 * PERCENT_RANK() OVER (PARTITION BY d, market_group ORDER BY tk)",
+            "+ 0.4 * PERCENT_RANK() OVER (PARTITION BY d, market_group ORDER BY ek) AS shadow_v2",
+            "LEFT JOIN sh AS s ON s.d = g.d AND s.market_group = g.market_group AND s.symbol = g.symbol",
+            # the matched pair v_trial_shadow_v2 compares: each score only on the names carrying both
+            # (Codex P2 on #1023)
+            "IF(g.overall_score IS NOT NULL, s.shadow_v2, NULL) AS shadow_v2_matched",
+            "IF(s.shadow_v2 IS NOT NULL, g.overall_score, NULL) AS overall_score_matched",
+            "FROM g2\n  UNPIVOT (x FOR feature IN ("):
+        assert frag in code, frag
+    shadow = code[code.index("both AS ("):code.index("g2 AS (")]
+    for word in ("confidence", "reliability", "overall_score", "r_1w", "r_2w", "r_1m", "r_3m", "roi_1"):
+        assert word not in shadow.replace("engine_roi_1m", ""), word
     # BigQuery refuses a window partitioned by a FLOAT64: no window partitions by the raw x or r
     parts = re.findall(r"PARTITION BY ([a-z_, .]+?)(?:\s+ORDER BY|\))", code)
-    assert len(parts) == 8, parts                       # the as-of pick + the seven rank windows
+    assert len(parts) == 10, parts                      # the as-of pick, the two shadow ranks, the seven rank windows
     for part in parts:
         keys = [k.strip() for k in part.split(",")]
         assert "x" not in keys and "r" not in keys, part
@@ -1698,6 +1737,13 @@ def case_v28():
     assert n == 20 and abs(ic - 1.0) < 1e-12 and top > 0 > bot
     assert abs(_edge_day(xs, [-x for x in xs])[1] + 1.0) < 1e-12
     assert _edge_day(xs[:19], xs[:19]) is None                               # 19 names: no IC that day
+    # shadow_v2: 0.6 x day rank of the target upside + 0.4 x day rank of the 1M engine ROI
+    sv = _shadow_v2([10.0, 20.0, 30.0, None, 40.0], [3.0, 1.0, 2.0, 9.0, None])
+    assert sv == [0.4, 0.3, 0.8, None, None], sv            # a name missing either input has no score
+    assert _shadow_v2([5.0], [1.0]) == [0.0]                 # alone on its day: the lowest
+    assert _shadow_v2([1.0, 1.0, 2.0], [7.0, 7.0, 7.0]) == [0.0, 0.0, 0.6]   # ties share the lower rank
+    assert _shadow_v2([1.0, 2.0, 3.0], [3.0, 2.0, 1.0], w=(0.5, 0.5)) == [0.5, 0.5, 0.5], "equal weights erase the order"
+    assert _shadow_v2([1.0, 2.0, 3.0], [3.0, 2.0, 1.0]) == [0.4, 0.5, 0.6]   # 0.6 / 0.4: the target upside leads
     assert _edge_day([5.0] * 20, xs) is None                                 # one distinct value
     assert _edge_day(xs + [21.0], xs + [400.0])[0] == 20                     # a 400 % "return" is a data error
     x21 = [float(i) for i in range(1, 22)]
@@ -2026,10 +2072,90 @@ def case_v33():
     assert o[("USD", "weak")] == (1, 1, 0, None, "small sample")
     assert ("ALL", "crash_day") in o and ("EUR", "calm") not in o
 
+def _matched_pair(shadow, overall):
+    """shadow_v2_matched / overall_score_matched: each score only on the names carrying both."""
+    keep = [s is not None and o is not None for s, o in zip(shadow, overall)]
+    return ([s if k else None for s, k in zip(shadow, keep)], [o if k else None for o, k in zip(overall, keep)])
+
+
+def _shadow_reading(period, days, horizon_days, m_s, dm, dsd, top_s, top_o):
+    """v_trial_shadow_v2's t_adj and reading, arm for arm."""
+    t = dm / dsd * (days / horizon_days) ** 0.5 if dsd else None
+    need = max(20, 2 * horizon_days)
+    if period != "forward from 2026-11-19":
+        return "in-sample: the weights were chosen on these days, not evidence", t
+    if days < need:
+        return f"collecting: {days} of {need} days", t
+    if t is not None and t >= 2 and m_s > 0 and top_s > top_o:
+        return "shadow ahead: the owner may consider it", t
+    if dm <= 0:
+        return "shadow not ahead: keep the current score", t
+    return "shadow ahead but not yet clear (t under 2): keep collecting", t
+
+
+def case_v34():
+    objs = {o.name: o for o in bv.load_objects()}
+    o = objs["v_trial_shadow_v2"]
+    assert o.path.name == "84_v_trial_shadow_v2.sql" and o.kind == "VIEW"
+    names = [x.name for x in bv.load_objects()]
+    assert names.index("v_trial_shadow_v2") > names.index("v_signal_edge_daily")      # applies after its source
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_trial_shadow_v2"} == {"v_signal_edge_daily"}
+    for frag in ("WHERE feature IN ('shadow_v2_matched', 'overall_score_matched')",   # the same names on both sides
+                 "MAX(IF(feature = 'shadow_v2_matched', n, NULL)) AS n_s",
+                 "MAX(IF(feature = 'overall_score_matched', n, NULL)) AS n_o",
+                 "MAX(IF(feature = 'shadow_v2_matched', ic, NULL)) AS ic_s",
+                 "MAX(IF(feature = 'overall_score_matched', ic, NULL)) AS ic_o",
+                 "MAX(IF(feature = 'shadow_v2_matched', top_ex_pp, NULL)) AS top_s",
+                 "MAX(IF(feature = 'overall_score_matched', top_ex_pp, NULL)) AS top_o",
+                 "WHERE ic_s IS NOT NULL AND ic_o IS NOT NULL AND n_s = n_o",          # the same days, the same count
+                 "IF(signal_day >= DATE '2026-11-19', 'forward from 2026-11-19', 'in-sample, not evidence') AS period",
+                 "AVG(ic_s - ic_o) AS dm",
+                 "STDDEV_SAMP(ic_s - ic_o) AS dsd",
+                 "SAFE_DIVIDE(dm, dsd) * SQRT(days / horizon_days) AS t_x",
+                 "GREATEST(20, 2 * horizon_days) AS need",
+                 "WHEN days < need THEN CONCAT('collecting: ', CAST(days AS STRING), ' of ', CAST(need AS STRING), ' days')",
+                 "WHEN t_x >= 2 AND m_s > 0 AND top_s > top_o THEN 'shadow ahead: the owner may consider it'",
+                 "WHEN dm <= 0 THEN 'shadow not ahead: keep the current score'"):
+        assert frag in code, frag
+    assert "the live system never reads BigQuery" in o.template
+    fwd, old = "forward from 2026-11-19", "in-sample, not evidence"
+    # the 18 Nov read of the archive (US, 1M): strong in-sample, and still not evidence
+    r, t = _shadow_reading(old, 34, 30, 0.3198, 0.5383, 0.2851, 3.91, -2.12)
+    assert r.startswith("in-sample") and round(t, 2) == 2.01                 # t 2 in-sample is still not evidence
+    # matched cohort (Codex P2 on #1023): on a day where a third of the names have no analyst
+    # target, the plain overall_score is ranked over 30 names and the shadow over 20 - a different
+    # day mean and a different top third. The matched pair keeps the 20 on both sides.
+    tu = [float(i) for i in range(20)] + [None] * 10
+    er = [float(i % 7) for i in range(30)]
+    ov = [float(30 - i) for i in range(30)]
+    sv = _shadow_v2(tu, er)
+    sm, om = _matched_pair(sv, ov)
+    assert sum(v is not None for v in sm) == sum(v is not None for v in om) == 20
+    assert sum(v is not None for v in ov) == 30 and om[:20] == ov[:20] and set(om[20:]) == {None}
+    ov_gap = ov[:5] + [None] + ov[6:]                                        # a name with no overall_score
+    sm2, om2 = _matched_pair(sv, ov_gap)
+    assert sm2[5] is None and om2[5] is None and sum(v is not None for v in sm2) == 19
+    # forward: collecting until the larger of 20 days and two horizon lengths
+    assert _shadow_reading(fwd, 19, 7, 0.2, 0.2, 0.1, 1.0, 0.0)[0] == "collecting: 19 of 20 days"
+    assert _shadow_reading(fwd, 27, 14, 0.2, 0.2, 0.1, 1.0, 0.0)[0] == "collecting: 27 of 28 days"
+    assert _shadow_reading(fwd, 59, 30, 0.2, 0.2, 0.1, 1.0, 0.0)[0] == "collecting: 59 of 60 days"
+    assert _shadow_reading(fwd, 181, 91, 0.2, 0.2, 0.1, 1.0, 0.0)[0] == "collecting: 181 of 182 days"
+    # ahead needs all three: t >= 2, a positive IC of its own, and the better top third
+    assert _shadow_reading(fwd, 60, 30, 0.2, 0.2, 0.1, 1.0, 0.0)[0] == "shadow ahead: the owner may consider it"
+    assert _shadow_reading(fwd, 60, 30, 0.2, 0.2, 0.1, 0.0, 1.0)[0].startswith("shadow ahead but not yet clear")
+    assert _shadow_reading(fwd, 60, 30, -0.05, 0.2, 0.1, 1.0, 0.0)[0].startswith("shadow ahead but not yet clear")
+    assert _shadow_reading(fwd, 60, 30, 0.2, 0.1, 0.1, 1.0, 0.0)[0].startswith("shadow ahead but not yet clear")   # t 1.41
+    assert _shadow_reading(fwd, 60, 30, 0.2, 0.0, 0.1, 1.0, 0.0)[0] == "shadow not ahead: keep the current score"
+    assert _shadow_reading(fwd, 60, 30, 0.2, -0.2, 0.1, 1.0, 0.0)[0] == "shadow not ahead: keep the current score"
+    # the overlap correction: 20 one-week days are 20 / 7 independent weeks, not 20
+    assert round(_shadow_reading(fwd, 20, 7, 0.2, 0.1, 0.1, 1.0, 0.0)[1], 3) == round((20 / 7) ** 0.5, 3)
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34]
 
 
 def test_v1(): case_v1()
@@ -2065,6 +2191,7 @@ def test_v30(): case_v30()
 def test_v31(): case_v31()
 def test_v32(): case_v32()
 def test_v33(): case_v33()
+def test_v34(): case_v34()
 
 
 if __name__ == "__main__":
