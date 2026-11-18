@@ -11,6 +11,11 @@
  *   S5  the header: the time, OLD past FDC_STALE_H, "not read" without the tab; formulas look up their own row
  *   S6  the lock: a busy lock writes nothing; install / status / remove trigger; fdcRemoveColumn rolls back
  *   S7  the self-test core, ES5 / ASCII, version lockstep
+ *   S11 (1.3.0) Portfolio_Decision: the two Holding_Read columns directly right of FINAL DECISION, a formula pair on
+ *       every holding row and nowhere else; the page's own cells unchanged; Top_10_Investments gets neither
+ *   S12 (1.3.0) the Holding_Read columns are found by header name; the header carries the session, OLD past 5 days,
+ *       "not read" without the tab or the table; a holding not on the page reads n/a
+ *   S13 (1.3.0) a second tick reuses the columns; colour rules; a header left elsewhere is cleared; rebuild; rollback
  * The last line is 'PASS k/k' (exit 1 on any failure).
  */
 'use strict';
@@ -214,7 +219,8 @@ test('S6 the lock, the trigger and the rollback', () => {
   ok(colOf(env.book.getSheetByName('Portfolio_Decision'), /^FINAL DECISION/), 'install stamps the pages now');
   ok(/trigger installed .* self-test ok .* last tick: 2026-11-16T06:00Z/.test(env.ctx.fdcStatus()), env.ctx.fdcStatus());
   const out = env.ctx.fdcRemoveColumn();
-  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB | My_Portfolio: 2 note(s) removed | A3 today line removed');
+  eq(out.join(' | '), 'Top_10_Investments: removed from column AF | Portfolio_Decision: removed from column AB and 2 Holding Read column(s) | My_Portfolio: 2 note(s) removed | A3 today line removed');
+  ok(!colOf(env.book.getSheetByName('Portfolio_Decision'), /^(LAST SESSION|NEXT SESSION READ)/), 'the Holding Read columns are gone too');
   ok(!env.book.getSheetByName('My_Portfolio')._cells.get('1:3').note, 'the note is gone');
   eq(env.book.getSheetByName('Top_10_Investments')._cells.get('3:1').v, '', 'the today line is gone');
   ok(!colOf(env.book.getSheetByName('Top_10_Investments'), /^FINAL DECISION/) && formulaRows(env.book.getSheetByName('Top_10_Investments'), 32).length === 0, 'gone');
@@ -230,7 +236,7 @@ test('S7 the self-test core, ES5 / ASCII, version lockstep', () => {
   ok(env.ctx.fdcCoreOk_() === true, 'core');
   ok(!/[^\x00-\x7F]/.test(SRC), 'ASCII');
   ok(!/\b(let|const)\s|=>|`/.test(SRC), 'ES5');
-  ok(/ \* Version: 1\.2\.0 \(2026-11-16\)/.test(SRC) && /var FDC_VERSION = '1\.2\.0';/.test(SRC), 'version lockstep');
+  ok(/ \* Version: 1\.3\.0 \(2026-11-18\)/.test(SRC) && /var FDC_VERSION = '1\.3\.0';/.test(SRC), 'version lockstep');
 });
 
 test('S8 (1.1.0) the today line in Top_10_Investments!A3: written when empty, kept current, never over other text', () => {
@@ -310,6 +316,129 @@ test('S10 (1.2.0) a SKIPPED render (16 v1.30.0 [PAINT-BUDGET]) is re-run on the 
   eq(c.fdcStuck_('Last run 2026-11-16 08:44:11 | status: running\u2026 | SKIPPED render 2026-11-16 08:50:00 (x)', Date.UTC(2026, 10, 16, 6, 0)).run, 'skipped 2026-11-16 08:50:00', 'the tail wins over running');
   ok(!c.fdcRerunDue_({ run: 's', minutes: 0, skipped: true }, '', 23, true), 'still 07:00-23:00 only');
   ok(/re-runs today 1\/4/.test(e.ctx.fdcStatus()), 'fdcStatus shows the count');
+});
+
+const HR_HEAD = ['Symbol', 'Name', 'Last session', 'Stock %', 'Market %', 'Sector %', 'Driver', 'Main news (last session)', 'Next session read', 'Up after similar days', 'Why', 'After the close'];
+function hread(session, head) {
+  head = head || HR_HEAD;
+  const row = o => head.map(h => (h in o ? o[h] : ''));
+  return [['HOLDING READ - what moved each holding last session, and the read for the next one'], ['Written 2026-11-18 00:40 Riyadh'], ['How to read: ...'], ['Score: 0 of 0'], [],
+    head.slice(),
+    row({ Symbol: 'DDI.US', Name: 'DoubleDown', 'Last session': session || '2026-11-17', 'Stock %': '+0.06%', 'Market %': '-1.00%', 'Sector %': '-0.80%', Driver: 'NORMAL RANGE',
+          'Main news (last session)': 'No company item; market -1.00%', 'Next session read': 'PINNED BY AN OFFER', 'Up after similar days': '' }),
+    row({ Symbol: 'GLPI.US', Name: 'Gaming', 'Last session': session || '2026-11-17', 'Stock %': '-1.84%', 'Market %': '-1.00%', 'Sector %': '-1.50%', Driver: 'SECTOR',
+          'Main news (last session)': 'No company item; real estate -1.50%', 'Next session read': 'FURTHER FALL MORE LIKELY', 'Up after similar days': '39% of 77 (any day 52%)' })];
+}
+const worldR = o => world(Object.assign({ Holding_Read: hread() }, o || {}));
+const KEY = 'TRIM(INDIRECT("R"&ROW()&"C2",FALSE))';
+const at = L => 'INDEX(Holding_Read!$' + L + ':$' + L + ',MATCH(' + KEY + ',Holding_Read!$A:$A,0))';
+
+test('S11 (1.3.0) Portfolio_Decision: the two Holding_Read columns right of FINAL DECISION, one formula pair per holding row', () => {
+  const env = makeEnv(worldR());
+  const sh = env.book.getSheetByName('Portfolio_Decision');
+  const before = snapshot(sh, 27);
+  const line = env.ctx.fdcTick();
+  ok(/Portfolio_Decision: 3 row\(s\) in column AB · read: session 2026-11-17 in columns AC-AD/.test(line), line);
+  eq(sh._cells.get('5:28').v, 'FINAL DECISION · Today Action Plan 2026-11-16 08:41', 'the FINAL DECISION column is where it was');
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, session 2026-11-17 · analysis, not an order');
+  eq(sh._cells.get('5:30').v, 'NEXT SESSION READ · after the session of 2026-11-17 · a count from its own history, not a forecast of size');
+  eq(sh._cells.get('5:29').setBackground, '#1b2a41');
+  eq(formulaRows(sh, 29).join(','), '6,7,8', 'what moved it: the three holding rows, not the sector table');
+  eq(formulaRows(sh, 30).join(','), '6,7,8', 'next session read: the same rows');
+  eq(sh._cells.get('6:29').f, '=IFERROR(' + at('D') + '&" · "&' + at('G') + '&" — "&' + at('H') + ',"n/a — not on Holding_Read")');
+  eq(sh._cells.get('6:30').f, '=IFERROR(' + at('I') + '&IF(' + at('J') + '="",""," — closed up after similar days: "&' + at('J') + '),"n/a — not on Holding_Read")');
+  eq(sh._cells.get('7:29').f, sh._cells.get('6:29').f, 'every row carries the same formula: it reads its own row\'s symbol');
+  eq(JSON.stringify(snapshot(sh, 27)), JSON.stringify(before), 'every cell of the page itself (A:AA) is unchanged');
+  eq(sh._widths[29], 430); eq(sh._widths[30], 300); eq(sh._cells.get('6:29').setFontSize, 9); ok(sh._cells.get('6:30').setWrap === true, 'wrapped');
+  // Top_10_Investments holds candidates, not holdings: no Holding Read column there
+  const t10 = env.book.getSheetByName('Top_10_Investments');
+  ok(!colOf(t10, /^(LAST SESSION|NEXT SESSION READ)/) && formulaRows(t10, 33).length === 0 && formulaRows(t10, 34).length === 0, 'none on the Top 10');
+  ok(/Top_10_Investments: 3 row\(s\) in column AF(?! · read)/.test(line), line);
+  ok(!colOf(env.book.getSheetByName('My_Portfolio'), /^(LAST SESSION|NEXT SESSION READ)/) && env.book.getSheetByName('My_Portfolio').getLastColumn() === 6, 'My_Portfolio keeps its width');
+});
+
+test('S12 (1.3.0) columns by header name; session, OLD, not read; never a stale formula', () => {
+  // a column added on the left of Holding_Read moves every letter; the tick follows the names
+  const moved = ['Rank'].concat(HR_HEAD);
+  let env = makeEnv(worldR({ Holding_Read: hread('2026-11-17', moved).map((r, i) => (i < 5 ? r : r)) }));
+  env.ctx.fdcTick();
+  let sh = env.book.getSheetByName('Portfolio_Decision');
+  const at2 = L => 'INDEX(Holding_Read!$' + L + ':$' + L + ',MATCH(' + KEY + ',Holding_Read!$B:$B,0))';
+  eq(sh._cells.get('6:29').f, '=IFERROR(' + at2('E') + '&" · "&' + at2('H') + '&" — "&' + at2('I') + ',"n/a — not on Holding_Read")', 'one column to the right');
+  // NOW is 16 Nov 09:00 Riyadh. A session 6 days back is OLD; 5 days is not (a long weekend)
+  env = makeEnv(worldR({ Holding_Read: hread('2026-11-10') })); env.ctx.fdcTick();
+  sh = env.book.getSheetByName('Portfolio_Decision');
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, session 2026-11-10 · OLD (6 days) · analysis, not an order');
+  eq(sh._cells.get('5:29').setBackground, '#b45309'); ok(/OLD \(6 days\)/.test(sh._cells.get('5:30').v), 'both headers say so');
+  eq(formulaRows(sh, 29).length, 3, 'the cells still read the page: the header is the warning');
+  env = makeEnv(worldR({ Holding_Read: hread('2026-11-11') })); env.ctx.fdcTick();
+  ok(!/OLD/.test(env.book.getSheetByName('Portfolio_Decision')._cells.get('5:29').v), '5 days is not old');
+  // a date cell instead of text (a hand edit) is read as its day
+  const dated = hread(); dated[6][2] = new Date(Date.UTC(2026, 10, 12, 21, 0)); dated[7][2] = dated[6][2];   // 13 Nov 00:00 Riyadh
+  env = makeEnv(worldR({ Holding_Read: dated })); env.ctx.fdcTick();
+  ok(/session 2026-11-13 /.test(env.book.getSheetByName('Portfolio_Decision')._cells.get('5:29').v), env.book.getSheetByName('Portfolio_Decision')._cells.get('5:29').v);
+  // no tab: headers say so, no formula is written, and formulas of an earlier tick are removed
+  env = makeEnv(worldR()); env.ctx.fdcTick();
+  sh = env.book.getSheetByName('Portfolio_Decision');
+  eq(formulaRows(sh, 29).length, 3);
+  env.book._s.delete('Holding_Read');
+  const line = env.ctx.fdcTick();
+  ok(/Portfolio_Decision: 3 row\(s\) in column AB · read: headers only \(tab missing or empty\)/.test(line), line);
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding_Read not read (tab missing or empty)');
+  eq(sh._cells.get('5:30').v, 'NEXT SESSION READ · Holding_Read not read (tab missing or empty)');
+  eq(formulaRows(sh, 29).length + formulaRows(sh, 30).length, 0, 'no formula pointing at a missing tab');
+  eq(formulaRows(sh, 28).join(','), '6,7,8', 'the FINAL DECISION column is not affected');
+  // a page without the read table, or with no holding rows
+  for (const [grid, why] of [[[['HOLDING READ'], ['Symbol', 'Name']], 'no read table on the page'], [hread().slice(0, 6), 'no holding rows']]) {
+    const e = makeEnv(worldR({ Holding_Read: grid }));
+    ok(e.ctx.fdcTick().indexOf('read: headers only (' + why + ')') > 0, why);
+    eq(formulaRows(e.book.getSheetByName('Portfolio_Decision'), 29).length, 0, why);
+  }
+  // pure: the day count is in Riyadh calendar days
+  const c = makeEnv(worldR()).ctx;
+  eq(c.fdcSessionAgeD_('2026-11-17', Date.UTC(2026, 10, 17, 21, 30)), 1, '00:30 Riyadh on the 18th');
+  eq(c.fdcSessionAgeD_('2026-11-17', Date.UTC(2026, 10, 17, 20, 30)), 0, '23:30 Riyadh on the 17th');
+  eq(c.fdcSessionAgeD_('17 Nov', 0), null);
+});
+
+test('S13 (1.3.0) a second tick reuses the columns; colours; a header left elsewhere is cleared; rebuild; rollback', () => {
+  const env = makeEnv(worldR());
+  const sh = env.book.getSheetByName('Portfolio_Decision');
+  const other = { spec: { text: 'theirs' }, getRanges: () => [sh.getRange(6, 1, 3, 1)] };
+  sh.setConditionalFormatRules([other]);
+  env.ctx.fdcTick(); env.ctx.fdcTick();
+  const heads = []; for (const [k, x] of sh._cells) if (typeof x.v === 'string' && /^(FINAL DECISION|LAST SESSION|NEXT SESSION READ)/.test(x.v)) heads.push(k);
+  eq(heads.sort().join(','), '5:28,5:29,5:30', 'one header each after two ticks');
+  const rules = sh._rules();
+  eq(rules.length, 1 + 6 + 11, 'the page\'s own rule, six for FINAL DECISION, eleven for the read');
+  ok(rules[0] === other, 'the page\'s rule kept first');
+  eq(rules.slice(7).map(r => r.spec.text).join('|'), 'REBOUND MORE LIKELY|RISE MORE LIKELY|UP MORE LIKELY|FURTHER FALL MORE LIKELY|PULLBACK MORE LIKELY|DOWN MORE LIKELY|PINNED BY AN OFFER|EARNINGS DUE|NO EDGE|NOT ENOUGH HISTORY|n/a');
+  ok(rules.slice(7).every(r => r.spec.ranges[0].getColumn() === 30 && r.spec.ranges[0].getRow() === 6 && r.spec.ranges[0].getNumRows() === 3), 'on the NEXT SESSION READ cells only');
+  ok(rules.slice(1, 7).every(r => r.spec.ranges[0].getColumn() === 28), 'the FINAL DECISION rules stay on their column');
+  // a Holding Read header left further right by another layout is cleared, with its cells
+  sh.insertColumnsAfter(sh.getMaxColumns(), 6);
+  sh.getRange(5, 33).setValue('NEXT SESSION READ · old place'); sh.getRange(6, 33).setValue('stale text');
+  env.ctx.fdcTick();
+  ok(!sh._cells.get('5:33') && !sh._cells.get('6:33'), 'cleared');
+  eq(sh._cells.get('5:28').v.indexOf('FINAL DECISION'), 0, 'our own headers never push FINAL DECISION to the right');
+  // a rebuilt page (cleared by its own script) gets all three columns back in the same place
+  sh.getRange(1, 1, 40, 34).clear();
+  pd().forEach((row, i) => row.forEach((v, j) => { if (v !== '') sh.getRange(i + 1, j + 1).setValue(v); }));
+  env.ctx.fdcTick();
+  eq(formulaRows(sh, 28).join(',') + ';' + formulaRows(sh, 29).join(',') + ';' + formulaRows(sh, 30).join(','), '6,7,8;6,7,8;6,7,8', 'back after a rebuild');
+  // a page rebuilt with only the read headers left behind: FINAL DECISION goes back to its own column
+  const e2 = makeEnv(worldR()); e2.ctx.fdcTick();
+  const s2 = e2.book.getSheetByName('Portfolio_Decision');
+  s2.getRange(5, 28, 4, 1).clear();
+  e2.ctx.fdcTick();
+  eq(colOf(s2, /^FINAL DECISION/).join(':'), '5:28'); eq(colOf(s2, /^LAST SESSION/).join(':'), '5:29');
+  // rollback
+  eq(env.ctx.fdcRemoveColumn()[1], 'Portfolio_Decision: removed from column AB and 2 Holding Read column(s)');
+  eq(formulaRows(sh, 29).length + formulaRows(sh, 30).length + formulaRows(sh, 28).length, 0, 'all three gone');
+  // a holding table with no rows: headers only
+  const w = worldR(); w.Portfolio_Decision = [['MY PORTFOLIO - DECISION'], [''], PD_HEAD, [''], ['SECTOR SUMMARY']].map(r => pad(r, 26));
+  const e3 = makeEnv(w);
+  ok(/Portfolio_Decision: header only \(no rows\) · read: headers only \(no rows\)/.test(e3.ctx.fdcTick()), 'no rows');
 });
 
 console.log((failed ? 'FAIL ' : 'PASS ') + passed + '/' + (passed + failed));

@@ -196,7 +196,9 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-11-02: v1.5.18 (cash snapshot writer, last-known cash, follow-up retry) stacks on top; pin moved
     # 2026-11-03: v1.5.19 (plain block reasons, PD_PLAIN_REASONS default off) stacks on top; pin moved
     # 2026-11-16: v1.5.20 (Exit Plan stop on the rendered rows, PD_EXIT_PLAN_STOP default on) stacks on top; pin moved
-    assert " * Version: 1.5.20\n" in text and "var PD_VERSION = '1.5.20';" in text
+    # 2026-11-18: v1.5.21 (dividends received sent with the row, no Script Property) stacks on top; pin moved
+    assert " * Version: 1.5.21\n" in text and "var PD_VERSION = '1.5.21';" in text
+    assert "var PD_VERSION = '1.5.20';" not in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "var PD_VERSION = '1.5.16';" not in text and "var PD_VERSION = '1.5.17';" not in text
     assert "var PD_VERSION = '1.5.18';" not in text and "var PD_VERSION = '1.5.19';" not in text
@@ -216,7 +218,10 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     v1520 = {"pdExitStopOn_", "pdExitStopDay_", "pdExitStopsFromValues_", "pdExitStopsApply_", "pdExitStopsRead_",
              "pdExitStopCoreOk_"}
     assert v1520 <= now, sorted(v1520 - now)
-    assert sorted(now - base - v1519 - v1520) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
+    # 2026-11-18: v1.5.21 adds one pure function
+    v1521 = {"pdDivRecvApply_"}
+    assert v1521 <= now, sorted(v1521 - now)
+    assert sorted(now - base - v1519 - v1520 - v1521) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
                                   "pdCashSnapCoreOk_", "pdCashSnapHeaderMap_", "pdCashSnapLastKnownNote_",
                                   "pdCashSnapMode_", "pdCashSnapRead_", "pdCashSnapRiyadh_", "pdCashSnapRow_",
                                   "pdCashSnapSheetState_", "pdCashSnapStampMs_", "pdCashSnapTailScan_",
@@ -232,7 +237,8 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-11-02: + 708 lines for v1.5.18 (cash snapshot writer, last-known cash, follow-up retry)
     # 2026-11-03: + 275 lines for v1.5.19 (plain block reasons, ticker-change hint)
     # 2026-11-16: + 184 lines for v1.5.20 (Exit Plan stop on the rendered rows)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275 + 184
+    # 2026-11-18: + 84 lines for v1.5.21 (dividends received on the posted row)
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275 + 184 + 84
 
 
 def test_added_lines_are_es5_and_ascii(base_source):
