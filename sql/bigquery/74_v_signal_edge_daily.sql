@@ -61,14 +61,18 @@
 -- uses only what was recorded with the forecast, never an outcome. Signal
 -- days up to 18 Nov 2026 are in-sample (the weights were chosen on them);
 -- only days from 19 Nov 2026 are evidence. Promotion is the owner's decision
--- after at least 4 weeks, and only if v_signal_edge reads shadow_v2 ahead of
--- overall_score on those forward days.
+-- and only if v_trial_shadow_v2 reads the shadow ahead on those forward days.
+-- shadow_v2_matched and overall_score_matched are the SAME two scores kept
+-- only on the names that carry both (a name without an analyst target has an
+-- overall_score and no shadow score): the pair v_trial_shadow_v2 compares, so
+-- both sides are ranked over the same names against the same day mean (Codex
+-- P2 on #1023: the plain features cover different names on the same day).
 -- Values are rank-tied when equal to 4 decimals (BigQuery cannot partition a
 -- window by FLOAT64, so ties are keyed on the value x 10,000 as INT64).
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_signal_edge_daily`
-OPTIONS (description = "TFB Looker v6: per signal day, market group, feature and horizon - the Spearman rank IC between each live signal (engine ROI forecasts, reliability, data quality, confidence, recommendation, investability, stance, overall/risk score, target upside, and the shadow_v2 challenger score = 0.6 x day rank of target upside + 0.4 x day rank of the 1M engine ROI) and the realized 1W/2W/1M/3M return, with top/bottom-third excess returns")
+OPTIONS (description = "TFB Looker v6: per signal day, market group, feature and horizon - the Spearman rank IC between each live signal (engine ROI forecasts, reliability, data quality, confidence, recommendation, investability, stance, overall/risk score, target upside, the shadow_v2 challenger score = 0.6 x day rank of target upside + 0.4 x day rank of the 1M engine ROI, and the shadow / overall score pair matched on the same names) and the realized 1W/2W/1M/3M return, with top/bottom-third excess returns")
 AS
 WITH first_rec AS (
   SELECT symbol, recorded_date, MIN(recorded_at) AS first_at
@@ -144,7 +148,11 @@ sh AS (
   FROM both
 ),
 g2 AS (
-  SELECT g.*, s.shadow_v2
+  SELECT
+    g.*,
+    s.shadow_v2,
+    IF(g.overall_score IS NOT NULL, s.shadow_v2, NULL) AS shadow_v2_matched,
+    IF(s.shadow_v2 IS NOT NULL, g.overall_score, NULL) AS overall_score_matched
   FROM grp AS g
   LEFT JOIN sh AS s ON s.d = g.d AND s.market_group = g.market_group AND s.symbol = g.symbol
 ),
@@ -153,7 +161,7 @@ feat AS (
   FROM g2
   UNPIVOT (x FOR feature IN (engine_roi_1w, engine_roi_2w, engine_roi_1m, engine_roi_3m, reliability,
     data_quality, confidence, recommendation, investability, stance, overall_score, risk_score, target_upside,
-    shadow_v2))
+    shadow_v2, shadow_v2_matched, overall_score_matched))
 ),
 lng AS (
   SELECT

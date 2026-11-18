@@ -14,10 +14,18 @@
 --   shadow_v2 = 0.6 x day rank of target upside + 0.4 x day rank of the
 --   engine's 1M forecast ROI (v_signal_edge_daily computes it; no confidence,
 --   reliability or overall_score term).
+-- SAME NAMES ON BOTH SIDES: the view reads the matched pair
+-- shadow_v2_matched / overall_score_matched, each score kept only on the
+-- names that carry both, so the two rank ICs and the two top thirds are
+-- taken over one set of names against one day mean. A day counts only when
+-- both sides were ranked over the same number of names (Codex P2 on #1023:
+-- the plain overall_score also covers names without an analyst target, which
+-- the shadow cannot score).
 -- Per signal day, market group and horizon where BOTH scores have a rank IC
--- (at least 20 names that day), the daily difference ic_shadow - ic_current.
+-- (at least 20 such names that day), the daily difference ic_shadow - ic_current.
 -- period: 'forward from 2026-11-19' (evidence) or 'in-sample, not evidence'.
 -- COLUMNS: period, market_group, horizon, days, first_day, last_day,
+--   avg_n                     mean names per day carrying both scores
 --   ic_shadow / ic_current    mean daily rank IC of each score
 --   ic_diff                   mean daily difference (shadow - current)
 --   t_adj                     ic_diff / its standard deviation x
@@ -41,7 +49,7 @@
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_trial_shadow_v2`
-OPTIONS (description = "TFB trial shadow_v2 (fixed 18 Nov 2026): the challenger score 0.6 x day rank of target upside + 0.4 x day rank of the 1M engine ROI against overall_score - mean daily rank IC of each, the daily difference with its overlap-adjusted t, top-third excess returns and a reading - only signal days from 19 Nov 2026 are evidence")
+OPTIONS (description = "TFB trial shadow_v2 (fixed 18 Nov 2026): the challenger score 0.6 x day rank of target upside + 0.4 x day rank of the 1M engine ROI against overall_score on the same names - mean daily rank IC of each, the daily difference with its overlap-adjusted t, top-third excess returns and a reading - only signal days from 19 Nov 2026 are evidence")
 AS
 WITH d AS (
   SELECT
@@ -49,12 +57,14 @@ WITH d AS (
     market_group,
     horizon,
     MIN(horizon_days) AS horizon_days,
-    MAX(IF(feature = 'shadow_v2', ic, NULL)) AS ic_s,
-    MAX(IF(feature = 'overall_score', ic, NULL)) AS ic_o,
-    MAX(IF(feature = 'shadow_v2', top_ex_pp, NULL)) AS top_s,
-    MAX(IF(feature = 'overall_score', top_ex_pp, NULL)) AS top_o
+    MAX(IF(feature = 'shadow_v2_matched', n, NULL)) AS n_s,
+    MAX(IF(feature = 'overall_score_matched', n, NULL)) AS n_o,
+    MAX(IF(feature = 'shadow_v2_matched', ic, NULL)) AS ic_s,
+    MAX(IF(feature = 'overall_score_matched', ic, NULL)) AS ic_o,
+    MAX(IF(feature = 'shadow_v2_matched', top_ex_pp, NULL)) AS top_s,
+    MAX(IF(feature = 'overall_score_matched', top_ex_pp, NULL)) AS top_o
   FROM `{{DS}}.v_signal_edge_daily`
-  WHERE feature IN ('shadow_v2', 'overall_score')
+  WHERE feature IN ('shadow_v2_matched', 'overall_score_matched')
   GROUP BY signal_day, market_group, horizon
 ),
 p AS (
@@ -62,7 +72,7 @@ p AS (
     *,
     IF(signal_day >= DATE '2026-11-19', 'forward from 2026-11-19', 'in-sample, not evidence') AS period
   FROM d
-  WHERE ic_s IS NOT NULL AND ic_o IS NOT NULL
+  WHERE ic_s IS NOT NULL AND ic_o IS NOT NULL AND n_s = n_o
 ),
 s AS (
   SELECT
@@ -73,6 +83,7 @@ s AS (
     COUNT(*) AS days,
     MIN(signal_day) AS first_day,
     MAX(signal_day) AS last_day,
+    AVG(n_s) AS avg_n,
     AVG(ic_s) AS m_s,
     AVG(ic_o) AS m_o,
     AVG(ic_s - ic_o) AS dm,
@@ -96,6 +107,7 @@ SELECT
   days,
   first_day,
   last_day,
+  ROUND(avg_n, 1) AS avg_n,
   ROUND(m_s, 4) AS ic_shadow,
   ROUND(m_o, 4) AS ic_current,
   ROUND(dm, 4) AS ic_diff,

@@ -16,12 +16,16 @@ target upside + 0.4 x day rank of the 1M engine ROI, ranked within the signal
 day and market group among the names carrying both inputs, so it is measured
 every day beside overall_score by the same method. New v_trial_shadow_v2: the
 daily rank-IC difference shadow - current with its overlap-adjusted t, each
-score's top-third excess return and a reading. The rule and the promotion
-test were fixed on 18 Nov before any forward day; only signal days from 19
-Nov 2026 are evidence (a reading needs the larger of 20 days and two horizon
-lengths). In-sample read on 18 Nov (US, 1M, 34 days): shadow IC 0.32, every
-day positive, top third +3.9 pp; overall_score -0.13, top third -1.6 pp -
-one six-week stretch, the days the weights were chosen on, not evidence.
+score's top-third excess return and a reading. Both sides are taken over the
+SAME names (the features shadow_v2_matched / overall_score_matched keep each
+score only on the names carrying both; Codex P2 on #1023: the plain
+overall_score also covers names with no analyst target). The rule and the
+promotion test were fixed on 18 Nov before any forward day; only signal days
+from 19 Nov 2026 are evidence (a reading needs the larger of 20 days and two
+horizon lengths). In-sample read on 18 Nov (US, 1M, 34 days, 23.6 names a
+day): shadow IC 0.32, every day positive, top third +3.9 pp; overall_score
+on the same names -0.22, top third -2.1 pp - one six-week stretch, the days
+the weights were chosen on, not evidence.
 Nothing on a page, in a score or in a pick changes. Research views: the live
 system never reads BigQuery.
 

@@ -41,13 +41,24 @@ def test_the_score_reads_no_outcome_and_none_of_the_signals_it_challenges():
 def test_it_is_measured_by_the_same_method_as_the_current_score():
     feats = re.search(r"UNPIVOT \(x FOR feature IN \(([^)]*)\)\)", EDGE_CODE).group(1)
     names = [f.strip() for f in feats.split(",")]
-    assert "shadow_v2" in names and "overall_score" in names and len(names) == len(set(names)) == 14
+    assert "shadow_v2" in names and "overall_score" in names and len(names) == len(set(names)) == 16
+
+
+def test_the_trial_compares_both_scores_on_the_same_names():
+    # A name without an analyst target has an overall_score and no shadow score. Ranking the current
+    # score over those extra names would compare two different sets (Codex P2 on #1023).
+    assert "IF(g.overall_score IS NOT NULL, s.shadow_v2, NULL) AS shadow_v2_matched" in EDGE_CODE
+    assert "IF(s.shadow_v2 IS NOT NULL, g.overall_score, NULL) AS overall_score_matched" in EDGE_CODE
+    assert "WHERE feature IN ('shadow_v2_matched', 'overall_score_matched')" in TRIAL_CODE
+    assert not re.search(r"feature = '(shadow_v2|overall_score)'", TRIAL_CODE)        # never the unmatched features
+    assert TRIAL_CODE.count("feature = 'shadow_v2_matched'") == TRIAL_CODE.count("feature = 'overall_score_matched'") == 3
+    assert "AND n_s = n_o" in TRIAL_CODE
 
 
 def test_only_forward_days_are_evidence_and_the_promotion_test_is_fixed():
     assert TRIAL_CODE.count("DATE '2026-11-19'") == 1
     assert "WHEN period != 'forward from 2026-11-19' THEN 'in-sample: the weights were chosen on these days, not evidence'" in TRIAL_CODE
-    assert "WHERE ic_s IS NOT NULL AND ic_o IS NOT NULL" in TRIAL_CODE                # the same days for both scores
+    assert "WHERE ic_s IS NOT NULL AND ic_o IS NOT NULL AND n_s = n_o" in TRIAL_CODE  # the same days for both scores
     assert "GREATEST(20, 2 * horizon_days) AS need" in TRIAL_CODE and "WHEN days < need THEN" in TRIAL_CODE
     assert "WHEN t_x >= 2 AND m_s > 0 AND top_s > top_o THEN 'shadow ahead: the owner may consider it'" in TRIAL_CODE
     assert "SAFE_DIVIDE(dm, dsd) * SQRT(days / horizon_days) AS t_x" in TRIAL_CODE    # overlapping windows count once
