@@ -2,8 +2,34 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.11.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.12.0 (program register C8, Phase 2)
 ================================================================================
+v1.12.0 (19 Nov 2026, the second trial and outcomes by sector). WHY (owner,
+19 Nov 2026 01:18 Riyadh: full review - compare the calls with what the market
+did, how many investable names gained or lost, how to improve forecasting and
+recommendations, check the data for alignment; then 01:49, verbatim: "start
+building the plan that helps outperform and make sure the recommendations
+beat the market by a much bigger margin"). The review found the champion (all
+buy calls) level with its markets, HIGH-confidence buy calls losing 5.3% in a
+month, Tadawul buy calls losing to TASI at every horizon, the analyst target
+upside the only input ranking the next month the right way, and no view able
+to read outcomes by sector because Performance_Log records carry no sector.
+New v_symbol_sector: one GICS sector per symbol (the market pages' latest,
+else the Top 10 board's; the six provider spellings folded as in
+core/sectors.py). New v_outcome_sector: buy calls by market group, sector and
+horizon against the market benchmark, with a fixed reading (100-call floor).
+New v_trial_c2: C-2 keeps a buy call that is not HIGH confidence or
+reliability 80+, not a Tadawul call, and in the top half of its day by analyst
+target upside; it is measured against the champion like C-1, with the
+overlap-adjusted t of v_trial_shadow_v2. Rule and promotion test fixed on
+19 Nov before any forward day; only calls from 20 Nov 2026 are evidence.
+C-2 membership is decided over every buy call of the day, scored or not, and
+only scored calls enter the statistics (Codex P2 on #1026). In-sample (not
+evidence): one month, C-2 +3.8 points a call against the market (215 calls,
+76% ahead), the champion +0.7 (980 calls); overlap-adjusted t 0.35. Nothing on
+a page, in a score or in a pick changes. Research views: the live system never
+reads BigQuery.
+
 v1.11.0 (18 Nov 2026, the shadow score). WHY (owner, 18 Nov 2026, after two
 weeks of market shocks: do the risk and confidence parameters or the Scoring
 need adjusting; forecast "on a scientific basis with continuous learning";
@@ -244,7 +270,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

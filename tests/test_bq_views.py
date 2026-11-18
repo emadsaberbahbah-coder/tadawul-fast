@@ -196,6 +196,7 @@ library is imported.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -279,6 +280,10 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.12.0 (19 Nov 2026): one sector per symbol, outcomes by sector, and trial C-2
+    "v_symbol_sector": "f5018131ba52c2884030e246d759214473ba3ad30c5263288e9ff27575cbde64",
+    "v_outcome_sector": "2a160aee50920fd78e1a89fcdac055d14abd30eb893523fbadbdc6f06f7fd04e",
+    "v_trial_c2": "a1af0a9b476971b078d159c9bfe1c19169bb9936295eecc0dbd6fd80e29056db",
     # apply_bq_views 1.11.0 (18 Nov 2026): the shadow score and its forward trial
     # (pending body replaced: v_signal_edge_daily ccf6ea331773, 1.7.0)
     "v_trial_shadow_v2": "5b6d94462ff998a3ef9cce7af91552d34f7c960ba10529740295aa69068e8cdc",
@@ -317,9 +322,10 @@ EXPECTED_ORDER = [
     "v_switch_calibration", "v_hold_vs_switch",
     "v_news_signal_eval",
     "v_trial_shadow_v2",
+    "v_symbol_sector", "v_outcome_sector", "v_trial_c2",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 24)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 27)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -2152,10 +2158,123 @@ def case_v34():
     assert round(_shadow_reading(fwd, 20, 7, 0.2, 0.1, 0.1, 1.0, 0.0)[1], 3) == round((20 / 7) ** 0.5, 3)
 
 
+def _c2_keep(rows):
+    """v_trial_c2's membership, row for row: rows are (record_id, mg, confidence, rel, market, tup)."""
+    elig = {r[0]: (str(r[2] or "").upper() != "HIGH" and (r[3] or 0) < 80 and (r[4] or "") != "Tadawul"
+                   and r[5] is not None) for r in rows}
+    keep = {}
+    for mg in {r[1] for r in rows}:
+        grp = sorted([r for r in rows if r[1] == mg and elig[r[0]]], key=lambda r: (-r[5], r[0]))
+        n = len(grp)
+        for i, r in enumerate(grp, start=1):
+            keep[r[0]] = i <= math.ceil(n / 2)
+    return {r[0]: keep.get(r[0], False) for r in rows}
+
+
+def _c2_reading(period, days, calls, horizon_days, dm, dsd):
+    """v_trial_c2's t_adj and reading for the C2_MINUS_CHAMPION arm."""
+    t = (dm / dsd) * math.sqrt(days / horizon_days) if dsd else None
+    need = max(20, 2 * horizon_days)
+    if period != "forward from 2026-11-20":
+        return "in-sample: shows why the rule was chosen, not evidence", t
+    if days < need or calls < 40:
+        return "collecting: %d of %d days, %d of 40 calls" % (days, need, calls), t
+    if t is not None and t >= 2 and dm > 0:
+        return "C-2 ahead: the owner may consider it", t
+    if dm <= 0:
+        return "C-2 not ahead: keep the champion", t
+    return "C-2 ahead but not yet clear (t under 2): keep collecting", t
+
+
+def _sector_reading(calls, edge, ahead):
+    if calls < 100:
+        return "too few calls"
+    if edge >= 0.5 and ahead >= 0.55:
+        return "beats its market"
+    if edge <= -0.5 and ahead <= 0.45:
+        return "loses to its market"
+    return "no clear edge"
+
+
+def case_v35():
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [x.name for x in bv.load_objects()]
+    # v_symbol_sector: the pages first, the board second, the six provider spellings folded to GICS
+    s = objs["v_symbol_sector"]
+    assert s.path.name == "85_v_symbol_sector.sql" and s.kind == "VIEW"
+    code = bv._code(s.template)
+    assert set(bv._REF.findall(code)) - {"v_symbol_sector"} == {"v_universe", "v_top10_board"}
+    from core.sectors import YAHOO_TO_GICS_SECTOR
+    for yahoo, gics in YAHOO_TO_GICS_SECTOR.items():
+        assert "WHEN '%s' THEN '%s'" % (yahoo, gics) in code, yahoo
+    assert code.count("    WHEN '") == len(YAHOO_TO_GICS_SECTOR)                  # no other name is renamed
+    assert "ORDER BY pri, last_seen DESC, sector) = 1" in code and "IF(pri = 1, 'market pages', 'top 10 board')" in code
+    # v_outcome_sector: buy calls against the benchmark, by sector, with the 100-call floor
+    o = objs["v_outcome_sector"]
+    assert o.path.name == "86_v_outcome_sector.sql" and o.kind == "VIEW"
+    code = bv._code(o.template)
+    assert set(bv._REF.findall(code)) - {"v_outcome_sector"} == {"v_outcome_excess", "v_symbol_sector"}
+    assert names.index("v_outcome_sector") > names.index("v_symbol_sector") > names.index("v_universe")
+    for frag in ("UPPER(IFNULL(e.entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')",
+                 "LEFT JOIN `{{DS}}.v_symbol_sector` AS s ON s.symbol = UPPER(TRIM(e.symbol))",
+                 "IFNULL(s.sector, '(no sector)') AS sector",
+                 "WHEN calls < 100 THEN 'too few calls'",
+                 "WHEN m_edge >= 0.5 AND ahead >= 0.55 THEN 'beats its market'",
+                 "WHEN m_edge <= -0.5 AND ahead <= 0.45 THEN 'loses to its market'"):
+        assert frag in code, frag
+    # the 19 Nov read: US financials at one month, 147 calls, -1.56 points, 46.3% ahead
+    assert _sector_reading(147, -1.56, 0.463) == "no clear edge"
+    assert _sector_reading(416, 0.91, 0.611) == "beats its market"
+    assert _sector_reading(99, 9.0, 0.9) == "too few calls"
+    assert _sector_reading(100, -0.5, 0.45) == "loses to its market"
+    # v_trial_c2: the fixed rule
+    c = objs["v_trial_c2"]
+    assert c.path.name == "87_v_trial_c2.sql" and c.kind == "VIEW"
+    code = bv._code(c.template)
+    assert set(bv._REF.findall(code)) - {"v_trial_c2"} == {"v_outcome_excess", "v_signal_history"}
+    assert names.index("v_trial_c2") > names.index("v_outcome_excess")
+    # membership over every call of the day, scored or not; only scored calls enter the statistics (Codex P2 on #1026)
+    assert "WHERE recorded_at IS NOT NULL\n    AND horizon IN" in code and "WHERE in_engine_cohort" not in code
+    assert code.index("AS c2_keep") < code.index("WHERE scored")
+    for frag in ("IFNULL(in_engine_cohort, FALSE) AND excess_pp IS NOT NULL AS scored",
+                 "  FROM k\n  WHERE scored\n  GROUP BY period, horizon, recorded_date",
+                 "UPPER(IFNULL(entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')",   # the C-1 champion
+                 "s.recorded_at <= TIMESTAMP_ADD(b.recorded_at, INTERVAL 60 SECOND)",              # no look-ahead
+                 "s.recorded_at >= TIMESTAMP_SUB(b.recorded_at, INTERVAL 3 DAY)",
+                 "NOT (UPPER(IFNULL(b.confidence, '')) = 'HIGH' OR IFNULL(b.rel, 0) >= 80)",
+                 "AND IFNULL(b.market, '') != 'Tadawul'",
+                 "AND g.tup IS NOT NULL AS eligible",
+                 "ROW_NUMBER() OVER (PARTITION BY recorded_date, horizon, mg, eligible ORDER BY tup DESC, record_id) AS pos",
+                 "eligible AND pos <= CAST(CEIL(n_el / 2) AS INT64) AS c2_keep",
+                 "IF(b.recorded_date >= DATE '2026-11-20', 'forward from 2026-11-20', 'in-sample, not evidence') AS period",
+                 "SAFE_DIVIDE(dm, dsd) * SQRT(d_c2 / horizon_days)",
+                 "GREATEST(20, 2 * horizon_days) AS need",
+                 "WHEN t_x >= 2 AND edge_x > 0 THEN 'C-2 ahead: the owner may consider it'",
+                 "WHEN edge_x <= 0 THEN 'C-2 not ahead: keep the champion'"):
+        assert frag in code, frag
+    for tmpl in (s.template, o.template, c.template):
+        assert "the live system never reads BigQuery" in tmpl
+    # membership: HIGH, reliability 80+, Tadawul and an unknown upside are out; the top half by upside stays
+    rows = [(1, "US", "MEDIUM", 70, "US", 40.0), (2, "US", "MEDIUM", 70, "US", 10.0), (3, "US", "MEDIUM", 70, "US", 25.0),
+            (4, "US", "HIGH", 70, "US", 90.0), (5, "US", "MEDIUM", 85, "US", 90.0), (6, "US", "MEDIUM", 70, "US", None),
+            (7, "Other markets", "MEDIUM", 60, "Tadawul", 50.0), (8, "Other markets", "LOW", 60, "Hong Kong", 5.0)]
+    k = _c2_keep(rows)
+    assert [i for i, v in sorted(k.items()) if v] == [1, 3, 8]        # US: 3 eligible -> top 2; a lone call is kept
+    # readings
+    fwd, old = "forward from 2026-11-20", "in-sample, not evidence"
+    r, t = _c2_reading(old, 43, 214, 30, 1.88, 9.0)
+    assert r.startswith("in-sample") and round(t, 2) == 0.25
+    assert _c2_reading(fwd, 19, 50, 7, 1.0, 1.0)[0] == "collecting: 19 of 20 days, 50 of 40 calls"
+    assert _c2_reading(fwd, 60, 39, 30, 1.0, 1.0)[0] == "collecting: 60 of 60 days, 39 of 40 calls"
+    assert _c2_reading(fwd, 60, 40, 30, 1.5, 1.0)[0] == "C-2 ahead: the owner may consider it"            # t 2.12
+    assert _c2_reading(fwd, 60, 40, 30, 1.0, 1.0)[0].startswith("C-2 ahead but not yet clear")         # t 1.41
+    assert _c2_reading(fwd, 60, 40, 30, -0.1, 1.0)[0] == "C-2 not ahead: keep the champion"
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35]
 
 
 def test_v1(): case_v1()
@@ -2192,6 +2311,7 @@ def test_v31(): case_v31()
 def test_v32(): case_v32()
 def test_v33(): case_v33()
 def test_v34(): case_v34()
+def test_v35(): case_v35()
 
 
 if __name__ == "__main__":

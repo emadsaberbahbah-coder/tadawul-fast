@@ -330,7 +330,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-08 (manifest pin only): 1.5.0 -> 1.6.0 (v_signal_edge_daily and
     # v_signal_edge) -> 1.7.0 (total-return engine, v_outcome_excess, the
     # regime views); research views, nothing live reads them.
-    ("apply_bq_views", "1.11.0", "bigquery looker views"),
+    ("apply_bq_views", "1.12.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -345,7 +345,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-02 (same rule): 1.0.0 -> 1.1.0 (the symbols with an active
     # Performance_Log record join the bars load for the BigQuery outcome
     # engine; TFB_DEEP_OUTCOME_BARS, default off).
-    ("archive_symbol_deep", "1.1.0", "bigquery symbol deep data"),
+    ("archive_symbol_deep", "1.2.0", "bigquery symbol deep data"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.1.0", "news macro gate"),   # 2026-11-16: v1.1.0 [ISSUER-LINK]

@@ -1,6 +1,9 @@
 # =============================================================================
 # 🔬 BigQuery Symbol Deep Data — candles, analyst consensus, per-symbol news
 # =============================================================================
+# VERSION 1.2.0 (2026-11-19) -- the outcome set also reads matured / expired
+#       buy and sell calls (TFB_DEEP_OUTCOME_MATURED, default on), so a call
+#       keeps its bars after it matures and the outcome engine can score it.
 # VERSION 1.1.0 (2026-11-02) -- OUTCOME BARS (OWNER OPT-IN, default off)
 # WHY (owner, 2 Nov 00:13 Riyadh: "improve today, results tomorrow"): the
 #       BigQuery outcome engine (views 1.5.0) scores every overdue forecast
@@ -128,6 +131,9 @@ jobs:
           # 1.1.0: a dispatch with outcome_bars=true arms the outcome set for
           # that run; the schedule follows the repository Variable (default off).
           TFB_DEEP_OUTCOME_BARS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.outcome_bars == 'true' && 'on' || vars.TFB_DEEP_OUTCOME_BARS || 'off' }}
+          # 1.2.0: the outcome set also reads matured / expired buy and sell calls (default on;
+          # rollback: repository Variable TFB_DEEP_OUTCOME_MATURED=off)
+          TFB_DEEP_OUTCOME_MATURED: ${{ vars.TFB_DEEP_OUTCOME_MATURED || 'on' }}
           TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: "US"
