@@ -978,7 +978,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.9.2"
+    assert dp.__version__ == "1.10.0"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1248,3 +1248,124 @@ def test_d3_the_cut_waits_for_the_next_capture_and_then_sizes_from_it(monkeypatc
     assert "| cash from the IBKR capture" in out and "waiting for the broker" not in out and _ledger(old)
     qty = lambda bk: sum(float(r[14] or 0) * float(r[11] or 0) for r in bk.tabs["_Daily_Plan"].values[1:] if r[4] == "PICK")
     assert qty(old) < qty(b)                                                                  # smaller: the order held cash
+
+
+# ----------------------------------------------------------------------------- G (1.10.0) market regime and held sectors
+STRESS = {"ok": True, "label": "stress", "date": dt.date(2026, 11, 17),
+          "text": "STRESS as of 2026-11-17 (S&P 500 fund -1.0% on the day, 4.0% under its 50-day average, VIX 25.5)"}
+CALM = {"ok": True, "label": "calm", "date": dt.date(2026, 11, 17), "text": "CALM as of 2026-11-17 (VIX 15.0)"}
+BLOCK = ["weak", "stress", "drawdown", "crash_day"]
+
+
+def test_g1_regime_rule_is_pure_and_never_blocks_unread():
+    assert dp.regime_rule(STRESS, "off", BLOCK, ["USD"]) == {"mode": "off", "blocks": False, "ccy": ("USD",),
+                                                             "words": "", "note": ""}
+    r = dp.regime_rule(STRESS, "enforce", BLOCK, ["USD"])
+    assert r["blocks"] and r["words"] == ("US market is STRESS as of 2026-11-17 (S&P 500 fund -1.0% on the day, 4.0% "
+                                          "under its 50-day average, VIX 25.5): no new US buy until the market is calm")
+    assert r["note"].startswith("US market regime: STRESS as of 2026-11-17")
+    assert not dp.regime_rule(CALM, "enforce", BLOCK, ["USD"])["blocks"]
+    assert not dp.regime_rule(STRESS, "enforce", ["crash_day"], ["USD"])["blocks"]     # the label is not on the list
+    for unread in (None, {}, {"ok": False, "why": "URLError"}):
+        u = dp.regime_rule(unread, "enforce", BLOCK, ["USD"])
+        assert not u["blocks"] and u["note"].startswith("market regime not read (") and "not applied" in u["note"]
+    assert dp.regime_rule({"ok": False, "why": "URLError"}, "enforce", BLOCK, ["USD"])["note"] == \
+        "market regime not read (URLError): the rule is not applied"
+
+
+def _g_decide(k):
+    q = [qrow(1, "AAA.US", "Technology", 30, ""), qrow(2, "1120.SR", "Financials", 30, ""),
+         qrow(3, "BBB.US", "Energy", 30, ""), qrow(4, "DDI.US", "Technology", 30, "")]
+    src = [SRC[0], ["AAA.US", "", "USD", "", "10", ""], ["1120.SR", "", "SAR", "", "90", ""],
+           ["BBB.US", "", "USD", "", "20", ""], ["DDI.US", "", "USD", "", "15.7", ""]]
+    return dp.decide(dp.read_qualified(board(qual=q)), dp.read_sources([src]), {}, lots(), 33125.0, 2, k)
+
+
+def test_g2_enforce_holds_new_us_buys_only(monkeypatch):
+    base = _g_decide(K())
+    assert [c["symbol"] for c in base["picks"]] == ["AAA.US", "1120.SR", "BBB.US"]     # the gate is off by default
+    k = K(regime=dp.regime_rule(STRESS, "enforce", BLOCK, ["USD"]))
+    p = _g_decide(k)
+    assert [c["symbol"] for c in p["picks"]] == ["1120.SR"]                         # a SAR name is not a US buy
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["AAA.US"].startswith("US market is STRESS as of 2026-11-17") and wait["AAA.US"].endswith(
+        "no new US buy until the market is calm") and wait["BBB.US"] == wait["AAA.US"]
+    assert wait["DDI.US"] == "already held"                                         # an earlier reason keeps its words
+    # observe: the same words as a label, every pick unchanged
+    o = _g_decide(K(regime=dp.regime_rule(STRESS, "observe", BLOCK, ["USD"])))
+    assert [c["symbol"] for c in o["picks"]] == [c["symbol"] for c in base["picks"]]
+    us = [c for c in o["picks"] if c["symbol"] == "AAA.US"][0]
+    assert any(lab.startswith("[observe] US market is STRESS") for lab in us["labels"])
+    assert not any("US market" in lab for c in o["picks"] if c["symbol"] == "1120.SR" for lab in c["labels"])
+    # calm, or a regime that was not read: nothing changes
+    for reg in (CALM, None):
+        same = _g_decide(K(regime=dp.regime_rule(reg, "enforce", BLOCK, ["USD"])))
+        assert [c["symbol"] for c in same["picks"]] == [c["symbol"] for c in base["picks"]]
+    # the currencies are a setting
+    both = _g_decide(K(regime=dp.regime_rule(STRESS, "enforce", BLOCK, ["USD", "SAR"])))
+    assert both["picks"] == []
+    # knobs
+    assert dp.knobs()["regime_mode"] == "off" and dp.knobs()["regime_block"] == BLOCK and dp.knobs()["regime_ccy"] == ["USD"]
+    monkeypatch.setenv("TFB_PLAN_REGIME", "Enforce")
+    monkeypatch.setenv("TFB_PLAN_REGIME_BLOCK", "stress, calm, nonsense ,CRASH_DAY")
+    monkeypatch.setenv("TFB_PLAN_REGIME_CCY", "usd, sar")
+    k = dp.knobs()
+    assert (k["regime_mode"], k["regime_block"], k["regime_ccy"]) == ("enforce", ["stress", "crash_day"], ["USD", "SAR"])
+    monkeypatch.setenv("TFB_PLAN_REGIME", "maybe")
+    assert dp.knobs()["regime_mode"] == "off"
+
+
+def test_g3_sector_limit_counts_what_is_held(monkeypatch):
+    q = [qrow(1, "TEC1.US", "Technology", 30, ""), qrow(2, "ENE1.US", "Energy", 30, ""),
+         qrow(3, "TEC2.US", "Technology", 30, "")]
+    src = [SRC[0], ["TEC1.US", "", "USD", "", "10", ""], ["ENE1.US", "", "USD", "", "20", ""],
+           ["TEC2.US", "", "USD", "", "30", ""], ["DDI.US", "", "USD", "Technology", "15.7", ""]]
+    args = (dp.read_qualified(board(qual=q)), dp.read_sources([src]), {}, lots(), 33125.0, 2)
+    assert "DDI.US" in lots()["held"]
+    assert [c["symbol"] for c in dp.decide(*args, K())["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]   # off (0)
+    p = dp.decide(*args, K(sector_held_max=2))                                     # one held + one picked = 2
+    assert [c["symbol"] for c in p["picks"]] == ["TEC1.US", "ENE1.US"]
+    assert {c["symbol"]: c["waiting"] for c in p["pipeline"]}["TEC2.US"] == \
+        "sector limit with holdings (Technology: 1 held + 1 picked; the limit is 2)"
+    p = dp.decide(*args, K(sector_held_max=1))                                     # the held name alone fills it
+    assert [c["symbol"] for c in p["picks"]] == ["ENE1.US"]
+    assert {c["symbol"]: c["waiting"] for c in p["pipeline"]}["TEC1.US"] == \
+        "sector limit with holdings (Technology: 1 held + 0 picked; the limit is 1)"
+    assert [c["symbol"] for c in dp.decide(*args, K(sector_held_max=3))["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]
+    # a held name the source pages do not list is not counted
+    nosec = (args[0], dp.read_sources([src[:4]]), *args[2:])
+    assert [c["symbol"] for c in dp.decide(*nosec, K(sector_held_max=1))["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]
+    monkeypatch.setenv("TFB_PLAN_SECTOR_HELD_MAX", "3")
+    assert dp.knobs()["sector_held_max"] == 3
+    monkeypatch.setenv("TFB_PLAN_SECTOR_HELD_MAX", "x")
+    assert dp.knobs()["sector_held_max"] == 0
+
+
+def test_g4_the_run_reads_the_regime_once_and_says_what_it_did(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_PLAN_REGIME", "enforce")
+    b = book()
+    assert dp.main([], book=b, now=NOW, regime=STRESS) == 0
+    out = capsys.readouterr().out
+    assert "US market regime: STRESS as of 2026-11-17" in out and out.count("US market regime:") == 1
+    rows = dp.parse_ledger(b.tabs["_Daily_Plan"].values)
+    us = [d for d in rows if text_ccy(d) == "USD"]
+    assert us and all(d["Kind"] == "PIPELINE" and "no new US buy until the market is calm" in d["Waiting For"] for d in us
+                      if d["Waiting For"].startswith("US market"))
+    assert not [d for d in rows if d["Kind"] == "PICK" and text_ccy(d) == "USD"]
+    # a regime that cannot be read does not stop the plan: the picks say the rule was not applied
+    b2 = book()
+    assert dp.main([], book=b2, now=NOW, regime={"ok": False, "why": "URLError"}) == 0
+    rows2 = dp.parse_ledger(b2.tabs["_Daily_Plan"].values)
+    picks2 = [d for d in rows2 if d["Kind"] == "PICK"]
+    assert picks2 and all("market regime not read (URLError): the rule is not applied" in d["Labels"] for d in picks2)
+    # the workflow turns both rules on
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_REGIME"] == "${{ vars.TFB_PLAN_REGIME || 'enforce' }}"
+    assert env["TFB_PLAN_REGIME_BLOCK"] == "${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}"
+    assert env["TFB_PLAN_REGIME_CCY"] == "${{ vars.TFB_PLAN_REGIME_CCY || 'USD' }}"
+    assert env["TFB_PLAN_SECTOR_HELD_MAX"] == "${{ vars.TFB_PLAN_SECTOR_HELD_MAX || '3' }}"
+
+
+def text_ccy(d):
+    return str(d.get("Ccy", "")).strip().upper()

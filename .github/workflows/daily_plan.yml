@@ -1,7 +1,14 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.8.2 (2026-11-17)
+# VERSION 1.9.0 (2026-11-18)
+#
+# 1.9.0: NO NEW US BUY IN A WEAK MARKET, AND A SECTOR LIMIT THAT COUNTS WHAT IS
+# HELD (daily_plan 1.10.0, owner 18 Nov: "let's start building and
+# activating"). TFB_PLAN_REGIME enforce (here) | observe | off; the labels that
+# hold a buy are TFB_PLAN_REGIME_BLOCK and the currencies TFB_PLAN_REGIME_CCY.
+# TFB_PLAN_SECTOR_HELD_MAX 3 (here) | 0 = off. Rollback: repository variables
+# TFB_PLAN_REGIME=off and TFB_PLAN_SECTOR_HELD_MAX=0.
 #
 # 1.8.2: A DAY ORDER READ BEFORE THE US CLOSE DOES NOT SIZE THE CUT
 # (daily_plan 1.9.2). TFB_PLAN_DAY_ORDER on (default) | off. A capture that
@@ -176,6 +183,10 @@ jobs:
           TFB_PLAN_QUOTE_MAX_AGE_H: ${{ vars.TFB_PLAN_QUOTE_MAX_AGE_H || '96' }}
           TFB_PLAN_QUOTE_TIME: ${{ vars.TFB_PLAN_QUOTE_TIME || 'required' }}
           TFB_PLAN_DAY_ORDER: ${{ vars.TFB_PLAN_DAY_ORDER || 'on' }}
+          TFB_PLAN_REGIME: ${{ vars.TFB_PLAN_REGIME || 'enforce' }}
+          TFB_PLAN_REGIME_BLOCK: ${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
+          TFB_PLAN_REGIME_CCY: ${{ vars.TFB_PLAN_REGIME_CCY || 'USD' }}
+          TFB_PLAN_SECTOR_HELD_MAX: ${{ vars.TFB_PLAN_SECTOR_HELD_MAX || '3' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |

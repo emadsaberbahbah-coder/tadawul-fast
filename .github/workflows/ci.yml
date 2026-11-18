@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.83 (2026-11-18) -- MARKET REGIME SUITE
+#
+# v1.1.83: run tests/test_market_regime.py (scripts/market_regime.py 1.0.0:
+# the US market regime the Daily Plan 1.10.0 reads before a cut) in the
+# blocking lean lane.
+#
 # VERSION 1.1.82 (2026-11-18) -- HOLDING READ SUITE
 #
 # v1.1.82: run tests/test_holding_read.py (scripts/holding_read.py 1.0.0 and
@@ -1203,6 +1209,7 @@ jobs:
             tests/test_sync_portfolio_route_capacity.py \
             tests/test_sync_watchdog.py \
             tests/test_daily_plan.py \
+            tests/test_market_regime.py \
             tests/test_today_action_plan.py \
             tests/test_plan_archive.py \
             tests/test_ibkr_capture.py \
