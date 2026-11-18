@@ -1,7 +1,10 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.4.0 (2026-11-17)
+# VERSION 1.5.0 (2026-11-18)
+#
+# 1.5.0: the stop of record is never below the stop working at the broker
+# (exit_plan 1.5.0; TFB_EXIT_BROKER_FLOOR on, off = the 1.4.0 levels).
 #
 # 1.4.0: a dividend whose tax is recorded in _Dividend_Log is counted net of
 # that tax in the entry and the stop (exit_plan 1.4.0; TFB_EXIT_DIV_NET on).
@@ -128,6 +131,7 @@ jobs:
           TFB_EXIT_DIV_WARN_DAYS: ${{ vars.TFB_EXIT_DIV_WARN_DAYS || '10' }}
           TFB_EXIT_WHT_PCT: ${{ vars.TFB_EXIT_WHT_PCT || '30' }}
           TFB_EXIT_DIV_NET: ${{ vars.TFB_EXIT_DIV_NET || 'on' }}
+          TFB_EXIT_BROKER_FLOOR: ${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}
           TFB_EXIT_IBKR_MAX_AGE_H: ${{ vars.TFB_EXIT_IBKR_MAX_AGE_H || '30' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
