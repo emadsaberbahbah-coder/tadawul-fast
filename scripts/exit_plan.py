@@ -21,6 +21,10 @@ VERSION 1.5.0 (2026-11-18) - first written 2026-11-11 (1.0.0)
     never reads RAISE STOP on that account (the broker already carries it);
     its note says "the stop of record is the stop working at IBKR (x), above
     the rule's y". A broker stop under the rule's is the 1.0.0 note, unchanged.
+    The floor is taken from the IBKR capture only (its lowest working stop for
+    the symbol); the workbook's older broker tabs never set it. A raise the
+    broker already carries is not a RAISE STOP on a re-run of the same close
+    either (review of #1021).
     Gate: TFB_EXIT_BROKER_FLOOR = on (default) | off (the 1.4.0 levels).
 1.4.0 (2026-11-17): DIVIDEND NET OF THE TAX WITHHELD (owner, 17 Nov 10:33
     Riyadh: "go with the best option"). The entry was lowered by the whole
@@ -435,9 +439,15 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     if prev_stop is not None and prev_stop > stop:
         stop = prev_stop                                   # the stop never moves down
     bs = info.get("broker_stop")                           # 1.5.0 [BROKER-FLOOR]
+    # The floor is the LOWEST working stop of the IBKR capture ("broker_stop_floor", set by run()); the workbook's
+    # older broker tabs keep the highest per symbol and never set it. A direct caller's broker_stop is its floor.
+    fl = info.get("broker_stop_floor", bs) if k.get("broker_floor") else None
     rule_stop, floored = stop, False
-    if k.get("broker_floor") and bs is not None and stop * 1.0025 < bs < last[4]:
-        stop, floored = bs, True                           # never below the stop working at the broker
+    if fl is not None and stop * 1.0025 < fl < last[4]:
+        stop, floored = fl, True                           # never below the stop working at the broker
+    # the broker already carries the stop of record (on a re-run of the same close the ledger holds the floor, so
+    # `floored` is False while the earlier stop is still the one "before this close"): never a RAISE STOP to-do
+    carried = floored or (fl is not None and fl >= stop * 0.9975 and fl < last[4])
     step = max(1, int(math.floor(r_high)) + 1)
     target = entry + step * r
     tp1 = hh >= entry + r
@@ -470,10 +480,10 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
         res["action"] = "TAKE PROFIT"
         res["why"].append("first target %s reached (+1R): sell half; the stop rises to at least the entry"
                           % fmt(entry + r))
-    elif was_stop is not None and stop > was_stop * 1.0025 and not floored:
+    elif was_stop is not None and stop > was_stop * 1.0025 and not carried:
         res["action"] = "RAISE STOP"
         res["why"].append("raise the stop %s -> %s" % (fmt(was_stop), fmt(stop)))
-    elif was_stop is None and r_high >= 1 and not floored:
+    elif was_stop is None and r_high >= 1 and not carried:
         res["action"] = "RAISE STOP"
         res["why"].append("the stop belongs at %s (+%.1fR at the high)" % (fmt(stop), r_high))
     elif sessions >= k["time_sessions"] and r_high < 1:
@@ -504,7 +514,10 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
                           "the close)" % (fmt(live), fmt(stop)))
     if floored:                                           # 1.5.0 [BROKER-FLOOR]
         res["why"].append("the stop of record is the stop working at IBKR (%s), above the rule's %s: a stop never "
-                          "falls back" % (fmt(bs), fmt(rule_stop)))
+                          "falls back" % (fmt(fl), fmt(rule_stop)))
+    elif carried and was_stop is not None and stop > was_stop * 1.0025:
+        res["why"].append("the stop working at IBKR (%s) already carries the stop of record %s: nothing to raise"
+                          % (fmt(fl), fmt(stop)))
     if bs is not None and bs < stop * 0.9975:
         res["why"].append("broker stop %s is under the plan's %s" % (fmt(bs), fmt(stop)))
     return res
@@ -1019,6 +1032,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         inf["news_neg"] = (news.get(sym) or {}).get("n", 0)
         inf["earn_days"] = (cal.get(sym) or {}).get("earn_days")
         inf["broker_stop"] = stops.get(sym)
+        inf["broker_stop_floor"] = stops.get(sym) if from_capture is not None else None   # 1.5.0: capture only
         inf["live"] = fetched(sym)[1]
         sym_bars = bars_for(sym)
         if taxes.get(sym):                                                             # 1.4.0 [DIV-NET]

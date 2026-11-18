@@ -938,6 +938,17 @@ def test_x17_the_stop_of_record_is_never_below_the_brokers(monkeypatch):
     assert cov["stop"] == 105.0 and cov["action"] == "HOLD"
     under = lv(up, info={"broker_stop": 95.0}, prev=took)                          # the broker is behind: still a raise
     assert under["action"] == "RAISE STOP" and under["stop"] == rule["stop"]
+    # a re-run of the same close (review of #1021): the ledger already holds the floor and "Was" is still the stop
+    # before that close - the row stays HOLD, with a note, and is not a RAISE STOP to-do
+    again = lv(flat, info={"broker_stop": 93.0}, prev={"Stop": 93.0, "StopNorm": 93.0, "Was": 91.0, "WasNorm": 91.0})
+    assert again["stop"] == 93.0 and again["action"] == "HOLD"
+    assert any("the stop working at IBKR (93.00) already carries the stop of record 93.00" in w for w in again["why"])
+    gone = lv(flat, prev={"Stop": 93.0, "StopNorm": 93.0, "Was": 91.0, "WasNorm": 91.0})   # no broker stop read
+    assert gone["action"] == "RAISE STOP"                                          # then the raise is a to-do
+    # the workbook's older broker tabs (the highest stop per symbol) never set the floor: only the capture does
+    fb = lv(flat, info={"broker_stop": 94.0, "broker_stop_floor": None})
+    assert round(fb["stop"], 6) == 91.0 and not any("working at IBKR" in w for w in fb["why"])
+    assert lv(flat, info={"broker_stop": 94.0, "broker_stop_floor": 93.0})["stop"] == 93.0
     # once stored it holds, whatever happens to the order
     kept = lv(flat, prev={"Stop": 93.0, "StopNorm": 93.0})
     assert kept["stop"] == 93.0 and kept["action"] == "HOLD"
@@ -956,6 +967,20 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     assert row["Symbol"] == "DDI.US" and row["Stop"] == 93.0 and row["Action"] == "HOLD"   # the lowest working stop
     page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
     assert "the stop of record is the stop working at IBKR (93.00), above the rule's 91.00" in page
+    # the same close again, an hour later: still HOLD, one row for the day, the same stop
+    assert ep.run(False, False, book=b, now=NOW + dt.timedelta(hours=1), opener=opener,
+                  capture=dict(cap, as_of=NOW + dt.timedelta(hours=1))) == 0
+    rows = ep.parse_ledger(b.tabs["_Exit_Plan"].values)
+    assert len(rows) == 1 and rows[0]["Stop"] == 93.0 and rows[0]["Action"] == "HOLD"
+    # no usable capture: the workbook's broker tabs are read, and they never set the floor
+    b2 = wbook()
+    b2.tabs["_IBKR_Account"] = Sheet([["as_of", "2026-11-11 07:30"]])              # Riyadh time = NOW
+    b2.tabs["_IBKR_Orders"] = Sheet([["symbol", "side", "type", "price", "status"],
+                                     ["DDI", "SELL", "STOP", 93.0, "Submitted"], ["DDI", "SELL", "STOP", 94.0, "Submitted"]])
+    assert ep.run(False, False, book=b2, now=NOW, opener=opener, capture={"ok": False, "reason": "none"}) == 0
+    assert round(ep.parse_ledger(b2.tabs["_Exit_Plan"].values)[0]["Stop"], 6) == 91.0
+    page2 = "\n".join(" | ".join(str(c) for c in r) for r in b2.tabs["Exit_Plan"].values)
+    assert "94.00" in page2 and "working at IBKR" not in page2                      # the tabs' stop was read, as a note only
     # the next day the order is gone from the capture: the stop of record stays
     assert ep.run(False, False, book=b, now=NOW + dt.timedelta(days=1), opener=opener,
                   capture={"ok": True, "as_of": NOW + dt.timedelta(days=1), "stops": {}}) == 0
