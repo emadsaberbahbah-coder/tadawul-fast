@@ -1,7 +1,55 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.20
+ * Version: 1.5.21
+ *
+ * v1.5.21 (2026-11-18)  (DIV-BASIS: THE DIVIDENDS A HOLDING HAS RECEIVED GO
+ *                        TO THE BACKEND WITH ITS ROW, SO A LOSS RULE DOES
+ *                        NOT READ A PAID-OUT DIVIDEND AS A LOSS; ALL v1.5.20
+ *                        logic carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (owner, 18 Nov 2026 09:36 Riyadh: 'check all report data accuracy';
+ * 16:04: go to the next step). Portfolio_Decision printed
+ * '[dd-observe] drawdown -18.1% breaches -8.0% budget - would EXIT under
+ * enforce' on SUPN.US. The holding paid a special dividend of 8.13 a share
+ * after the purchase; the price fell by it on the ex-date and the owner
+ * kept it less the tax withheld, so his result was about -2.6%. The
+ * backend's two loss rules (the drawdown / time guard and the add-on-loser
+ * veto) see only what this file sends - quantity, buy price and the price -
+ * and so read the paid-out dividend as a loss. Armed to enforce, the guard
+ * would order the full sale of a holding that is roughly flat.
+ * WHAT: the ledger already keeps the answer. _Portfolio_CostBasis column
+ * 'Dividends Recv' is each lot's total from _Dividend_Log, in the
+ * instrument's own currency, a tax row counted as its negative amount.
+ *  (1) _myPortfolioLedgerMap_ sums that column over a symbol's ACTIVE lots
+ *      (the same lots whose shares and cost it already sums) into
+ *      map[SYMBOL].divRecv - set only when the sum is above zero, so a
+ *      symbol without dividends has the v1.5.20 entry key for key.
+ *  (2) pdDivRecvApply_ (pure) puts it on the row sent to
+ *      /sheet-rows/portfolio-actions as 'Dividends Recv' when the amount is
+ *      a finite number above zero and the position has a quantity.
+ *      pdCollectHoldings_ calls it where it applies the ledger's quantity
+ *      and buy price, so the three always come from the same lots.
+ *  portfolio_actions 1.19.0 (Render) counts it in the two loss rules only:
+ *  (P&L + dividends received) / cost. The page's own P&L columns, the
+ *  sizing, the funding and every other rule are unchanged. An older backend
+ *  ignores the field.
+ * NOT changed: the rendered page, B2, the KPIs, the action log, the evidence
+ * publication, the cash snapshot. A workbook whose ledger has no
+ * 'Dividends Recv' column, or no dividend on an active lot, sends the
+ * v1.5.20 body byte for byte.
+ * GATE: none in this file (no Script Property is read). The switch is the
+ * backend's TFB_PF_DD_DIV_BASIS (default on; off restores the price-only
+ * basis with the field still sent).
+ * Functions added (0 removed): pdDivRecvApply_ (pure). Changed:
+ * _myPortfolioLedgerMap_ (one column, one sum), pdCollectHoldings_ (one
+ * call).
+ * Harness: tests/test_pd_v1521_div_basis.js (REAL file; the v1.5.20 base is
+ * rebuilt by reversing these edits, SHA-256 pinned).
+ * ROLLBACK: backend TFB_PF_DD_DIV_BASIS = off (no re-paste); or re-paste
+ * v1.5.20.
+ * ES5; ASCII; all prior WHYs verbatim; PD_VERSION and the header version
+ * bumped in lockstep.
  *
  * v1.5.20 (2026-11-16)  (EXIT-PLAN-STOP: THE STOP SAR COLUMN OF
  *                        PORTFOLIO_DECISION SHOWS THE EXIT PLAN'S STOP, THE
@@ -2436,7 +2484,7 @@ function _myPortfolioLedgerMap_() {
     var lastCol = Math.max(1, sh.getLastColumn());
     var hdr = sh.getRange(4, 1, 1, lastCol).getValues()[0];
     var col = { symbol: 0, status: 0, buyDate: 0, buyPrice: 0, shares: 0,
-                buyFees: 0 };
+                buyFees: 0, divRecv: 0 };   // v1.5.21 [DIV-BASIS]
     for (var i = 0; i < hdr.length; i++) {
       var hName = String(hdr[i] == null ? '' : hdr[i])
           .replace(/^\s+|\s+$/g, '');
@@ -2449,6 +2497,9 @@ function _myPortfolioLedgerMap_() {
         col.shares = i + 1;
       }
       else if (hName === 'Buy Fees' && !col.buyFees) { col.buyFees = i + 1; }
+      else if (hName === 'Dividends Recv' && !col.divRecv) {   // v1.5.21
+        col.divRecv = i + 1;
+      }
     }
     if (!col.symbol) { return null; }
     var map = {};
@@ -2486,6 +2537,13 @@ function _myPortfolioLedgerMap_() {
               (fees !== null && fees > 0 ? fees : 0);
           wQty[sym] = wQty[sym] + qty;
         }
+        /* v1.5.21 [DIV-BASIS]: this ACTIVE lot's dividends received (own
+         * currency, a tax row already counted as its negative amount). */
+        var dv = col.divRecv
+            ? myPortfolioNumber_(row[col.divRecv - 1], null) : null;
+        if (dv !== null && isFinite(dv) && dv !== 0) {
+          agg.divSum = (agg.divSum || 0) + dv;
+        }
       }
       var d = col.buyDate ? row[col.buyDate - 1] : null;
       if (d instanceof Date && !isNaN(d.getTime())) {
@@ -2498,6 +2556,15 @@ function _myPortfolioLedgerMap_() {
     for (var k in map) {
       if (Object.prototype.hasOwnProperty.call(map, k) && wQty[k] > 0) {
         map[k].buyPrice = wSum[k] / wQty[k];
+      }
+      /* v1.5.21 [DIV-BASIS]: only a net amount above zero is kept, so an
+       * entry without dividends is the v1.5.20 entry key for key. */
+      if (Object.prototype.hasOwnProperty.call(map, k)) {
+        var ds = map[k].divSum;
+        delete map[k].divSum;
+        if (typeof ds === 'number' && isFinite(ds) && ds > 0) {
+          map[k].divRecv = ds;
+        }
       }
     }
     return map;
@@ -2919,7 +2986,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.20';
+var PD_VERSION = '1.5.21';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -5287,6 +5354,22 @@ function pdReadPanel_(sheet, ss) {
 
 /* ----- holdings pool (reads the 122-col My_Portfolio page) ----------------- */
 
+/** v1.5.21 [DIV-BASIS] PURE: puts the position's dividends received (the
+ * ledger's 'Dividends Recv' summed over its ACTIVE lots, in the instrument's
+ * own currency, net of any tax row) on the row sent to the backend, so its
+ * loss rules do not read a paid-out dividend as a loss. Only a finite amount
+ * above zero on a position with a quantity above zero is sent. Returns true
+ * when the field was set. */
+function pdDivRecvApply_(obj, cbInfo) {
+  if (!obj || !cbInfo) { return false; }
+  var d = cbInfo.divRecv;
+  var q = cbInfo.qty;
+  if (typeof d !== 'number' || !isFinite(d) || d <= 0) { return false; }
+  if (typeof q !== 'number' || !isFinite(q) || q <= 0) { return false; }
+  obj['Dividends Recv'] = Math.round(d * 10000) / 10000;
+  return true;
+}
+
 function pdCollectHoldings_(extraFields, wantStamps) {
   var sheet = ensureSheetExists_(MY_PORTFOLIO_PAGE_);
   var headers = readCurrentSheetHeaders_(sheet);
@@ -5367,6 +5450,7 @@ function pdCollectHoldings_(extraFields, wantStamps) {
         obj['Avg Cost'] = cbInfo.buyPrice;
         usedCb = true;
       }
+      pdDivRecvApply_(obj, cbInfo);   // v1.5.21 [DIV-BASIS]
       if (usedCb) { cbApplied = cbApplied + 1; }
     }
 

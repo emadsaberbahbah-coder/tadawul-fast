@@ -771,9 +771,9 @@ def test_p5_the_level_and_the_note_never_raise(monkeypatch):
 def test_v1_versions_and_pins():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.18.1" and pr.__version__ == "1.1.0"
+    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.19.0" and pr.__version__ == "1.1.0"
     manifest = (root / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '"1.18.1", "portfolio actions")' in manifest
+    assert '"1.19.0", "portfolio actions")' in manifest
     assert '"1.31.0", "opportunity builder")' in manifest
     assert """("core.portfolio_reconciliation", "__version__", '1.1.0'""" in manifest
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")

@@ -2,6 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.85 (2026-11-18) -- DIVIDEND BASIS AND HOLDING READ COLUMNS
+#
+# v1.1.85: run tests/test_pf_dd_div_basis.py (portfolio_actions 1.19.0: the
+# loss rules count the dividends received), tests/test_pd_v1521_div_basis.py
+# (10_My_Portfolio 1.5.21 sends them) and
+# tests/test_fdc_v100_final_decision_column.py (31_Final_Decision_Column
+# 1.3.0: the two Holding_Read columns on Portfolio_Decision) in the blocking
+# lean lane.
+#
 # VERSION 1.1.84 (2026-11-18) -- SHADOW SCORE RULE SUITE
 #
 # v1.1.84: run tests/test_trial_shadow_v2_rule.py (apply_bq_views 1.11.0: the
@@ -1199,6 +1208,9 @@ jobs:
             tests/test_portfolio_reconciliation.py \
             tests/test_portfolio_action_reconciliation.py \
             tests/test_pf_custody_tier.py \
+            tests/test_pf_dd_div_basis.py \
+            tests/test_pd_v1521_div_basis.py \
+            tests/test_fdc_v100_final_decision_column.py \
             tests/test_pf_research_view_p06.py \
             tests/test_portfolio_exact_funding.py \
             tests/test_portfolio_reconciliation_cli.py \

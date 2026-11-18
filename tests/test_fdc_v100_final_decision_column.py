@@ -1,5 +1,5 @@
-"""31_Final_Decision_Column v1.0.0 (the FINAL DECISION column on Top_10_Investments, Portfolio_Decision and
-My_Portfolio): run the native harness (the REAL Apps Script source in a vm) so the whole-suite CI job collects it."""
+"""31_Final_Decision_Column (the FINAL DECISION column on Top_10_Investments, Portfolio_Decision and My_Portfolio;
+since 1.3.0 the two Holding_Read columns on Portfolio_Decision): run the native harness (the REAL Apps Script source in a vm) so the whole-suite CI job collects it."""
 from __future__ import annotations
 
 import os
@@ -27,4 +27,4 @@ def test_fdc_v100_final_decision_column_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("PASS 10/10"), result.stdout[-2000:]
+    assert result.stdout.rstrip().endswith("PASS 13/13"), result.stdout[-2000:]

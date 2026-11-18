@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.17.1  (header synced to runtime; history below)
+Version: 1.19.0  (header synced to runtime; history below)
 Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
@@ -1004,7 +1004,48 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _custody_quote_ok (now: a level exists), _custody_tier_portfolio.
 #   Removed: 0. Tests: tests/test_pf_custody_tier.py (p1-p5).
 #   Rollback: TFB_T10_RESEARCH_QUOTE=off, TFB_PF_CUSTODY_TIER=off, or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.18.1"
+# ---------------------------------------------------------------------------
+# v1.19.0 (2026-11-18) [DIV-BASIS] A LOSS RULE COUNTS THE DIVIDENDS RECEIVED
+# WHY (owner, Wed 18 Nov 2026 09:36 Riyadh: "check all report data accuracy";
+#   16:04: go to the next step, the dividend basis of the drawdown note).
+#   Read that morning: Portfolio_Decision printed
+#     "[dd-observe] drawdown -18.1% breaches -8.0% budget - would EXIT"
+#   on SUPN.US. The holding paid a special dividend of 8.13 a share (ex 3
+#   Nov) after the purchase; the price fell by the dividend on the ex-date,
+#   as it must, and the owner kept the dividend less the tax withheld. His
+#   result was about -2.6%. The F-2 guard and the P-183 add-on-loser veto
+#   measure pnl_sar / cost_sar - price only - so a paid-out dividend reads
+#   as a loss: the v1.12.1 sukuk defect again, on an equity. Under the
+#   planned TFB_PF_DD_EXIT=enforce the guard would have ordered a FULL EXIT
+#   of a holding that is roughly flat.
+# WHAT: the caller may send, on a holding row, "Dividends Recv": the total
+#   the position has received since its purchase, in the instrument's own
+#   currency, net of any tax recorded (the ledger's _Portfolio_CostBasis
+#   column of that name, summed over the active lots; 10_My_Portfolio
+#   1.5.21 sends it). normalize_holding keeps it as dd_div_sar (x the same
+#   FX as the cost; internal, never emitted by _action_row). The two loss
+#   rules then judge
+#       (pnl_sar + dd_div_sar) / cost_sar
+#   through one helper, _loss_return_pct. A triggered tag names both
+#   figures ("drawdown -9.4% after dividends received (price only
+#   -18.1%)"). In observe mode a row that the price-only figure would have
+#   flagged and the full figure does not carries
+#   "[dd-observe] ok after dividends received: -2.6% (price only -18.1%)",
+#   so the read-back shows the rule at work.
+#   Fail-soft and bounded: a field that is absent, blank, unparseable, zero,
+#   negative, or larger than the position's cost is not counted (price-only
+#   basis, as before) - a dividend can lift a loss figure, never invent one.
+#   NOT changed: pnl_sar / pnl_pct on the row and in the KPIs stay price
+#   only (they are the page's P&L columns); sizing, funding, the action
+#   ladder, the sukuk exemption.
+# GATE: TFB_PF_DD_DIV_BASIS (default on; off / 0 / false / no restores
+#   1.18.1 exactly, with or without the field). With no "Dividends Recv" on
+#   the row every output is byte-identical to 1.18.1.
+# Functions added: 3 (_env_dd_div_basis, _dividends_from_row,
+#   _loss_return_pct). Changed: normalize_holding, _apply_drawdown_guard,
+#   _add_loser_eval. Removed: 0. Tests: tests/test_pf_dd_div_basis.py.
+#   Rollback: TFB_PF_DD_DIV_BASIS=off, or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.19.0"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -2218,6 +2259,50 @@ def _buy_date_from_row(row):
     return None
 
 
+_DIV_RECV_TOKENS = ("dividendsrecv", "dividendsreceived", "dividendsrecvd")
+
+
+def _env_dd_div_basis():
+    """v1.19.0 [DIV-BASIS]: on (default) | off (read at call time, the F-2
+    seam convention). Only an explicit off word restores the price-only
+    basis of 1.18.1."""
+    v = str(os.environ.get("TFB_PF_DD_DIV_BASIS", "")).strip().lower()
+    return v not in ("off", "0", "false", "no")
+
+
+def _dividends_from_row(row):
+    """v1.19.0 [DIV-BASIS]: the position's dividends received since its
+    purchase, in the instrument's own currency, off the RAW row (the
+    ledger's "Dividends Recv", header form tolerated). None when absent,
+    blank or unparseable (fail-soft: price-only basis)."""
+    for key, val in (row or {}).items():
+        tok = _ob._norm_token(key) if _ob is not None else str(key).lower()
+        if tok in _DIV_RECV_TOKENS:
+            return _to_float(val)
+    return None
+
+
+def _loss_return_pct(cand):
+    """v1.19.0 [DIV-BASIS] PURE: (return percent the loss rules judge,
+    price-only return percent, dividends counted in SAR). The first is
+    (pnl_sar + dd_div_sar) / cost_sar when dividends are counted, else the
+    price-only figure. (None, None, 0.0) without a cost basis. Never
+    raises."""
+    try:
+        pnl = _to_float((cand or {}).get("pnl_sar"))
+        cost = _to_float((cand or {}).get("cost_sar"))
+        if pnl is None or cost is None or cost <= 0:
+            return None, None, 0.0
+        price_only = pnl / cost * 100.0
+        div = (_to_float((cand or {}).get("dd_div_sar"))
+               if _env_dd_div_basis() else None)
+        if div is None or not (0.0 < div <= cost):
+            return price_only, price_only, 0.0
+        return (pnl + div) / cost * 100.0, price_only, div
+    except Exception:  # noqa: BLE001 - pure helper, never fatal
+        return None, None, 0.0
+
+
 def normalize_holding(row, fx_rates, controls):
     """opportunity_builder.normalize_candidate + position economics."""
     crit = _ob.make_criteria({"period_months": controls["period_months"]})
@@ -2251,6 +2336,15 @@ def normalize_holding(row, fx_rates, controls):
     else:
         cand["pnl_sar"] = None
         cand["pnl_pct"] = None
+    # v1.19.0 [DIV-BASIS]: dividends received since the purchase, x the same
+    # FX as the cost (internal key; never emitted by _action_row). Counted
+    # by the loss rules only; pnl_sar / pnl_pct above stay price only.
+    div_native = _dividends_from_row(row)
+    if (div_native is not None and div_native > 0 and fx is not None
+            and cand["cost_sar"]):
+        cand["dd_div_sar"] = div_native * fx
+    else:
+        cand["dd_div_sar"] = None
     # v1.0.3: internal-only trust detail (stale / thin / age / signals), shared
     # with opportunity_builder. Never surfaced by _action_row; drives step 1c
     # and the trust alerts/telemetry.
@@ -3522,17 +3616,19 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
               (b) return < 0 after  > TFB_PF_DD_TIME_D days  (default 45).
     Never overrides EXIT/BLOCK (a stronger verdict stands). Fail-soft on
     missing basis or unparseable buy_date: returns inputs unchanged.
-    Return basis is pnl_sar/cost_sar (both SAR => currency-safe)."""
+    Return basis is pnl_sar/cost_sar (both SAR => currency-safe); since
+    v1.19.0 [DIV-BASIS] the dividends the position received are counted
+    (_loss_return_pct), so a paid-out dividend is not read as a loss."""
     mode = _env_dd_guard_mode()
     if mode == "off":
         return action, reason, proceeds
     if action in (ACTION_EXIT, ACTION_BLOCK):
         return action, reason, proceeds
-    pnl = _to_float(cand.get("pnl_sar"))
-    cost = _to_float(cand.get("cost_sar"))
-    if pnl is None or cost is None or cost <= 0:
+    # v1.19.0 [DIV-BASIS]: the return the rule judges counts the dividends
+    # received; price_pct is the 1.18.1 figure (equal when none is counted).
+    ret_pct, price_pct, div_sar = _loss_return_pct(cand)
+    if ret_pct is None:
         return action, reason, proceeds
-    ret_pct = pnl / cost * 100.0
     dd_thr = abs(_env_float("TFB_PF_DD_EXIT_PCT", 8.0))
     time_d = _env_int("TFB_PF_DD_TIME_D", 45)
     days = None
@@ -3545,20 +3641,38 @@ def _apply_drawdown_guard(cand, action, reason, proceeds):
             days = None
     dd_hit = ret_pct <= -dd_thr
     time_hit = (days is not None and days > time_d and ret_pct < 0.0)
+    basis = ((" after dividends received (price only %.1f%%)" % price_pct)
+             if div_sar > 0 else "")
     if not (dd_hit or time_hit):
+        # v1.19.0: the price-only figure would have fired and the full one
+        # does not - observe says so (never for a sukuk: it was exempt).
+        if (mode == "observe" and div_sar > 0
+                and (price_pct <= -dd_thr or (days is not None
+                                              and days > time_d
+                                              and price_pct < 0.0))
+                and not (_protect_sukuk_enabled()
+                         and _is_sukuk_holding(cand))):
+            return (action,
+                    (reason or "") + (" | [dd-observe] ok after dividends "
+                                      "received: %.1f%% (price only %.1f%%)"
+                                      % (ret_pct, price_pct)),
+                    proceeds)
         return action, reason, proceeds
     if dd_hit:
-        trig = "drawdown %.1f%% breaches -%.1f%% budget" % (ret_pct, dd_thr)
+        trig = "drawdown %.1f%%%s breaches -%.1f%% budget" % (
+            ret_pct, basis, dd_thr)
     else:
-        trig = "still negative (%.1f%%) after %d d > %d d time budget" % (
-            ret_pct, days, time_d)
+        trig = "still negative (%.1f%%%s) after %d d > %d d time budget" % (
+            ret_pct, basis, days, time_d)
     # v1.12.1 [F-2 HONOURS D-9]: a sukuk is held for income; this basis is
     # price-only. Evaluated only after a trigger fired (see version WHY).
     if _protect_sukuk_enabled() and _is_sukuk_holding(cand):
         return (action,
                 (reason or "") + (" | [dd-exempt] sukuk / fixed income (D-9):"
-                                  " %s on a price-only basis - equity loss"
-                                  " budget not applied" % trig),
+                                  " %s on %s - equity loss"
+                                  " budget not applied"
+                                  % (trig, "a price-only basis" if div_sar <= 0
+                                     else "price and recorded income")),
                 proceeds)
     if mode == "observe":
         tag = " | [dd-observe] %s - would EXIT under enforce" % trig
@@ -3598,10 +3712,10 @@ def _add_loser_eval(cand, loser_pct, prox_pct):
     out = {"ret_pct": None, "prox_pct": None, "loser": False,
            "near_stop": False, "below_stop": False, "trig": ""}
     try:
-        pnl = _to_float((cand or {}).get("pnl_sar"))
-        cost = _to_float((cand or {}).get("cost_sar"))
-        if pnl is not None and cost is not None and cost > 0:
-            out["ret_pct"] = pnl / cost * 100.0
+        # v1.19.0 [DIV-BASIS]: the F-2 basis, dividends received counted.
+        ret, price_only, div_sar = _loss_return_pct(cand)
+        if ret is not None:
+            out["ret_pct"] = ret
             out["loser"] = out["ret_pct"] <= -abs(float(loser_pct))
         px = _to_float((cand or {}).get("price"))
         stop = _to_float((cand or {}).get("stop"))
@@ -3613,8 +3727,11 @@ def _add_loser_eval(cand, loser_pct, prox_pct):
                 out["near_stop"] = True
         bits = []
         if out["loser"]:
-            bits.append("position %.1f%% vs cost breaches the -%.1f%% loser floor"
-                        % (out["ret_pct"], abs(float(loser_pct))))
+            bits.append("position %.1f%% vs cost%s breaches the -%.1f%% loser floor"
+                        % (out["ret_pct"],
+                           (" after dividends received (price only %.1f%%)"
+                            % price_only) if div_sar > 0 else "",
+                           abs(float(loser_pct))))
         if out["below_stop"]:
             bits.append("price at/below the stop (%.2f <= %.2f)" % (px, stop))
         elif out["near_stop"]:
