@@ -15,9 +15,11 @@
  *          Each cell is a formula that looks up the symbol of ITS OWN ROW on Holding_Read (INDIRECT on ROW(), as the
  *          FINAL DECISION cell does), so a sort or a rebuilt table cannot show one stock's read on another's row, and
  *          the cells follow every new Holding_Read without a rewrite. The Holding_Read columns are found by their
- *          header names on every tick, so a column added to that page cannot shift what is shown. The header carries
- *          the session the read is for and says OLD when that session is more than FDC.READ.OLD_DAYS (5) days back;
- *          a holding not on the page reads "n/a - not on Holding_Read". Both columns are analysis: no order follows
+ *          header names on every tick, so a column added to that page cannot shift what is shown. Each cell starts
+ *          with the session of its own row (markets close on different days); the header carries the newest session
+ *          on the page and says OLD when that is more than FDC.READ.OLD_DAYS (5) days back. A holding row without a
+ *          session (a fixed-income holding) is shown like any other and never hides the rest. A holding not on the
+ *          page reads "n/a - not on Holding_Read". Both columns are analysis: no order follows
  *          from them, and the header says so. Top_10_Investments gets neither (its seats are candidates, not
  *          holdings; Holding_Read covers holdings). The same 10-minute tick (fdcTick) writes them: NO new trigger and
  *          no setup - paste the file and save. Columns AC and AD on today's page, outside A1:AA150, the range the
@@ -156,9 +158,11 @@ function fdcFindTable_(vals, need, until) {
   }
   return { hdr: hdr + 1, symCol: symCol + 1, rows: rows, col: existing >= 0 ? existing + 1 : last + 3, existing: existing >= 0, extras: extras };
 }
-/* PURE (1.3.0): Holding_Read values -> { ok, why, session ('yyyy-MM-dd' of the first holding row, '' when not read),
- * cols: { sym, stock, driver, news, next, up } (1-based) }. The header row is the first row holding every name in
- * FDC.READ.NEED, wherever the page puts it. */
+/* PURE (1.3.0): Holding_Read values -> { ok, why, session ('yyyy-MM-dd', the NEWEST session of any holding row; ''
+ * when no row carries one), cols: { sym, session, stock, driver, news, next, up } (1-based) }. The header row is the
+ * first row holding every name in FDC.READ.NEED, wherever the page puts it. A holding row without a session (a
+ * fixed-income holding, a name without enough price history) is a row like any other: it never hides the others
+ * (Codex P2 on #1024), and each cell carries the session of its own row. */
 function fdcReadFromValues_(vals) {
   vals = vals || [];
   var need = FDC.READ.NEED, hdr = -1, seen = null, r, c;
@@ -170,18 +174,19 @@ function fdcReadFromValues_(vals) {
     if (all) { hdr = r; seen = names; }
   }
   if (hdr < 0) return { ok: false, why: 'no read table on the page', session: '', cols: null };
-  var session = '';
-  for (r = hdr + 1; r < vals.length && !session; r++) {
+  var session = '', held = 0;
+  for (r = hdr + 1; r < vals.length; r++) {
     if (!fdcTrim_((vals[r] || [])[seen.Symbol - 1])) continue;
-    var v = vals[r][seen['Last session'] - 1];
-    if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) session = new Date(v.getTime() + 12 * 3600000).toISOString().slice(0, 10);
-    else { var m = /^(\d{4}-\d{2}-\d{2})/.exec(fdcTrim_(v)); session = m ? m[1] : ''; }
-    if (!session) break;
+    held++;
+    var v = vals[r][seen['Last session'] - 1], day = '';
+    if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) day = new Date(v.getTime() + 12 * 3600000).toISOString().slice(0, 10);
+    else { var m = /^(\d{4}-\d{2}-\d{2})/.exec(fdcTrim_(v)); day = m ? m[1] : ''; }
+    if (day > session) session = day;
   }
-  if (!session) return { ok: false, why: 'no holding rows', session: '', cols: null };
+  if (!held) return { ok: false, why: 'no holding rows', session: '', cols: null };
   return { ok: true, why: '', session: session,
-           cols: { sym: seen.Symbol, stock: seen['Stock %'], driver: seen.Driver, news: seen['Main news (last session)'],
-                   next: seen['Next session read'], up: seen['Up after similar days'] } };
+           cols: { sym: seen.Symbol, session: seen['Last session'], stock: seen['Stock %'], driver: seen.Driver,
+                   news: seen['Main news (last session)'], next: seen['Next session read'], up: seen['Up after similar days'] } };
 }
 /* PURE (1.3.0): whole days from a 'yyyy-MM-dd' session to nowMs (Riyadh calendar days); null when not read. */
 function fdcSessionAgeD_(session, nowMs) {
@@ -198,8 +203,9 @@ function fdcReadHeaders_(rs, nowMs) {
     return [R.MOVED_PREFIX + ' \u00b7 ' + why, R.NEXT_PREFIX + ' \u00b7 ' + why];
   }
   var age = fdcSessionAgeD_(rs.session, nowMs), old = age !== null && age > R.OLD_DAYS ? ' \u00b7 OLD (' + age + ' days)' : '';
-  return [R.MOVED_PREFIX + ' \u00b7 Holding Read, session ' + rs.session + old + ' \u00b7 analysis, not an order',
-          R.NEXT_PREFIX + ' \u00b7 after the session of ' + rs.session + old + ' \u00b7 a count from its own history, not a forecast of size'];
+  var when = rs.session ? 'newest session ' + rs.session : 'no dated session';
+  return [R.MOVED_PREFIX + ' \u00b7 Holding Read, ' + when + old + ' \u00b7 analysis, not an order',
+          R.NEXT_PREFIX + ' \u00b7 Holding Read, ' + when + old + ' \u00b7 a count from its own history, not a forecast of size'];
 }
 /* PURE (1.3.0): the two cell formulas for the row they sit in (its own symbol, looked up on Holding_Read). */
 function fdcReadFormulas_(symCol, cols) {
@@ -207,7 +213,7 @@ function fdcReadFormulas_(symCol, cols) {
   var col = function (n) { var L = fdcColLetter_(n); return S + '!$' + L + ':$' + L; };
   var at = function (n) { return 'INDEX(' + col(n) + ',MATCH(' + key + ',' + col(cols.sym) + ',0))'; };
   var miss = '"n/a \u2014 not on ' + S + '"';
-  return ['=IFERROR(' + at(cols.stock) + '&" \u00b7 "&' + at(cols.driver) + '&" \u2014 "&' + at(cols.news) + ',' + miss + ')',
+  return ['=IFERROR(IF(' + at(cols.session) + '="","",' + at(cols.session) + '&": ")&' + at(cols.stock) + '&" \u00b7 "&' + at(cols.driver) + '&" \u2014 "&' + at(cols.news) + ',' + miss + ')',
           '=IFERROR(' + at(cols.next) + '&IF(' + at(cols.up) + '="",""," \u2014 closed up after similar days: "&' + at(cols.up) + '),' + miss + ')'];
 }
 /* PURE: the cell formula for the row it sits in (its own symbol, looked up in Final_Decisions). */
@@ -326,7 +332,7 @@ function fdcStampRead_(sh, t, rs, lastRow) {
   var both = sh.getRange(first, c1, grid.length, 2);
   both.setFormulas(grid);
   both.setFontSize(9).setWrap(true).setVerticalAlignment('middle');
-  return { text: 'read: session ' + rs.session + ' in columns ' + fdcColLetter_(c1) + '-' + fdcColLetter_(c2),
+  return { text: 'read: session ' + (rs.session || '(none)') + ' in columns ' + fdcColLetter_(c1) + '-' + fdcColLetter_(c2),
            block: sh.getRange(first, c2, grid.length, 1), cols: [c1, c2] };
 }
 /* Puts the column on one page; returns a short status. */
@@ -517,7 +523,10 @@ function fdcCoreOk_() {
     var hr = fdcReadFromValues_([['HOLDING READ'], ['status'], [], ['Symbol', 'Name', 'Last session', 'Stock %', 'Market %', 'Sector %', 'Driver', 'Main news (last session)', 'Next session read', 'Up after similar days'],
       ['AX.US', 'Axos', '2026-11-17', '-1.20%', '-1.00%', '-1.90%', 'SECTOR', 'news', 'NO EDGE', '']]);
     var tx = fdcFindTable_([['Action', 'Symbol', 'Name', '', 'FINAL DECISION x', 'LAST SESSION \u00b7 what moved it y', 'NEXT SESSION READ z'], ['HOLD', 'A.US', 'a']], ['Action', 'Symbol'], 'blank');
-    return hr.ok && hr.session === '2026-11-17' && hr.cols.sym === 1 && hr.cols.news === 8 && hr.cols.up === 10 &&
+    var hu = fdcReadFromValues_([['Symbol', 'Last session', 'Stock %', 'Driver', 'Main news (last session)', 'Next session read', 'Up after similar days'],
+      ['5023.SR', '', '', 'n/a', 'fixed income', 'NO EDGE', ''], ['AX.US', '2026-11-16', '', '', '', '', ''], ['GLPI.US', '2026-11-17', '', '', '', '', '']]);
+    return hr.ok && hr.session === '2026-11-17' && hr.cols.sym === 1 && hr.cols.news === 8 && hr.cols.up === 10 && hr.cols.session === 3 &&
+      hu.ok && hu.session === '2026-11-17' &&
       fdcSessionAgeD_('2026-11-17', Date.UTC(2026, 10, 18, 6, 0)) === 1 && fdcSessionAgeD_('2026-11-17', Date.UTC(2026, 10, 17, 21, 30)) === 1 &&
       fdcReadHeaders_(hr, Date.UTC(2026, 10, 25, 6, 0))[0].indexOf('OLD (8 days)') > 0 && fdcReadHeaders_(hr, Date.UTC(2026, 10, 18, 6, 0))[1].indexOf('OLD') < 0 &&
       fdcReadFormulas_(2, hr.cols)[0].indexOf('MATCH(TRIM(INDIRECT("R"&ROW()&"C2",FALSE)),Holding_Read!$A:$A,0)') > 0 &&

@@ -340,12 +340,12 @@ test('S11 (1.3.0) Portfolio_Decision: the two Holding_Read columns right of FINA
   const line = env.ctx.fdcTick();
   ok(/Portfolio_Decision: 3 row\(s\) in column AB · read: session 2026-11-17 in columns AC-AD/.test(line), line);
   eq(sh._cells.get('5:28').v, 'FINAL DECISION · Today Action Plan 2026-11-16 08:41', 'the FINAL DECISION column is where it was');
-  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, session 2026-11-17 · analysis, not an order');
-  eq(sh._cells.get('5:30').v, 'NEXT SESSION READ · after the session of 2026-11-17 · a count from its own history, not a forecast of size');
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, newest session 2026-11-17 · analysis, not an order');
+  eq(sh._cells.get('5:30').v, 'NEXT SESSION READ · Holding Read, newest session 2026-11-17 · a count from its own history, not a forecast of size');
   eq(sh._cells.get('5:29').setBackground, '#1b2a41');
   eq(formulaRows(sh, 29).join(','), '6,7,8', 'what moved it: the three holding rows, not the sector table');
   eq(formulaRows(sh, 30).join(','), '6,7,8', 'next session read: the same rows');
-  eq(sh._cells.get('6:29').f, '=IFERROR(' + at('D') + '&" · "&' + at('G') + '&" — "&' + at('H') + ',"n/a — not on Holding_Read")');
+  eq(sh._cells.get('6:29').f, '=IFERROR(IF(' + at('C') + '="","",' + at('C') + '&": ")&' + at('D') + '&" · "&' + at('G') + '&" — "&' + at('H') + ',"n/a — not on Holding_Read")', 'the cell starts with the session of its own row');
   eq(sh._cells.get('6:30').f, '=IFERROR(' + at('I') + '&IF(' + at('J') + '="",""," — closed up after similar days: "&' + at('J') + '),"n/a — not on Holding_Read")');
   eq(sh._cells.get('7:29').f, sh._cells.get('6:29').f, 'every row carries the same formula: it reads its own row\'s symbol');
   eq(JSON.stringify(snapshot(sh, 27)), JSON.stringify(before), 'every cell of the page itself (A:AA) is unchanged');
@@ -364,11 +364,11 @@ test('S12 (1.3.0) columns by header name; session, OLD, not read; never a stale 
   env.ctx.fdcTick();
   let sh = env.book.getSheetByName('Portfolio_Decision');
   const at2 = L => 'INDEX(Holding_Read!$' + L + ':$' + L + ',MATCH(' + KEY + ',Holding_Read!$B:$B,0))';
-  eq(sh._cells.get('6:29').f, '=IFERROR(' + at2('E') + '&" · "&' + at2('H') + '&" — "&' + at2('I') + ',"n/a — not on Holding_Read")', 'one column to the right');
+  eq(sh._cells.get('6:29').f, '=IFERROR(IF(' + at2('D') + '="","",' + at2('D') + '&": ")&' + at2('E') + '&" · "&' + at2('H') + '&" — "&' + at2('I') + ',"n/a — not on Holding_Read")', 'one column to the right');
   // NOW is 16 Nov 09:00 Riyadh. A session 6 days back is OLD; 5 days is not (a long weekend)
   env = makeEnv(worldR({ Holding_Read: hread('2026-11-10') })); env.ctx.fdcTick();
   sh = env.book.getSheetByName('Portfolio_Decision');
-  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, session 2026-11-10 · OLD (6 days) · analysis, not an order');
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, newest session 2026-11-10 · OLD (6 days) · analysis, not an order');
   eq(sh._cells.get('5:29').setBackground, '#b45309'); ok(/OLD \(6 days\)/.test(sh._cells.get('5:30').v), 'both headers say so');
   eq(formulaRows(sh, 29).length, 3, 'the cells still read the page: the header is the warning');
   env = makeEnv(worldR({ Holding_Read: hread('2026-11-11') })); env.ctx.fdcTick();
@@ -377,6 +377,23 @@ test('S12 (1.3.0) columns by header name; session, OLD, not read; never a stale 
   const dated = hread(); dated[6][2] = new Date(Date.UTC(2026, 10, 12, 21, 0)); dated[7][2] = dated[6][2];   // 13 Nov 00:00 Riyadh
   env = makeEnv(worldR({ Holding_Read: dated })); env.ctx.fdcTick();
   ok(/session 2026-11-13 /.test(env.book.getSheetByName('Portfolio_Decision')._cells.get('5:29').v), env.book.getSheetByName('Portfolio_Decision')._cells.get('5:29').v);
+  // a holding without a session (a fixed-income holding sorts first; a name with too little history) never hides the
+  // others: the header takes the newest session of any row (Codex P2 on #1024)
+  const undated = hread(); undated.splice(6, 0, HR_HEAD.map(h => ({ Symbol: '5023.SR', Name: 'Sukuk', Driver: 'n/a', 'Main news (last session)': 'Fixed income: no session read', 'Next session read': 'NO EDGE' }[h] || '')));
+  undated[8][2] = '2026-11-16';   // the last row closed a day earlier (another market)
+  env = makeEnv(worldR({ Holding_Read: undated }));
+  ok(/read: session 2026-11-17 in columns AC-AD/.test(env.ctx.fdcTick()), 'the newest dated row, not the first row');
+  sh = env.book.getSheetByName('Portfolio_Decision');
+  ok(/newest session 2026-11-17 /.test(sh._cells.get('5:29').v), sh._cells.get('5:29').v);
+  eq(formulaRows(sh, 29).join(',') + ';' + formulaRows(sh, 30).join(','), '6,7,8;6,7,8', 'every holding row keeps its formulas');
+  eq(env.ctx.fdcReadFromValues_(undated).session, '2026-11-17');
+  // no row carries a session at all: still shown, and the header says so instead of a date
+  const none = hread().map((r, i) => (i > 5 ? r.map((v, j) => (j === 2 ? '' : v)) : r));
+  env = makeEnv(worldR({ Holding_Read: none }));
+  ok(/read: session \(none\) in columns AC-AD/.test(env.ctx.fdcTick()), 'no date to name');
+  sh = env.book.getSheetByName('Portfolio_Decision');
+  eq(sh._cells.get('5:29').v, 'LAST SESSION · what moved it · Holding Read, no dated session · analysis, not an order');
+  eq(formulaRows(sh, 29).length, 3, 'the cells are still written'); eq(sh._cells.get('5:29').setBackground, '#1b2a41');
   // no tab: headers say so, no formula is written, and formulas of an earlier tick are removed
   env = makeEnv(worldR()); env.ctx.fdcTick();
   sh = env.book.getSheetByName('Portfolio_Decision');
