@@ -191,6 +191,38 @@ live quote failed AND the source page's row has no 'Last Updated (UTC)'.
 TFB_PLAN_QUOTE_TIME = optional restores 1.9.0 byte for byte. The cut itself,
 the picks, their sizes and levels are unchanged.
 
+1.10.0 (2026-11-18): NO NEW US BUY IN A WEAK MARKET, AND A SECTOR LIMIT THAT
+COUNTS WHAT IS HELD (owner, 18 Nov 14:51 and 14:56 Riyadh, after two weeks of
+market shocks: "do we need to change the limits ... or the scoring?" - "yes,
+let's start building and activating"). Measured that day on the archive:
+  - a USD pick made while the US market was 'weak' closed higher five sessions
+    later 37.8% of the time, average -1.03% (143 picks); in a 'calm' market
+    54.1%, average +0.29% (229). Picks in other currencies did not show it.
+    The market was 'weak' or worse on every session since 30 Oct, and the four
+    buys of 12 and 16 Nov were all made in it;
+  - raising the score or the confidence limit would not have helped: neither
+    ranks outcomes (v_signal_edge: no edge at 1 week, 2 weeks or 1 month);
+  - five of the eight holdings sat in two groups (three banks, two shipping
+    names) and each group lost the same amount in two sessions. The sector
+    limit counted the day's picks only, never what was already held.
+(a) TFB_PLAN_REGIME = off (default) | observe | enforce. The US market regime
+    is read once per cut (scripts/market_regime.py: the same five labels and
+    rules as the archive's v_market_regime). Under enforce, while the label is
+    one of TFB_PLAN_REGIME_BLOCK (weak,stress,drawdown,crash_day) a candidate
+    priced in TFB_PLAN_REGIME_CCY (USD) is not picked: it waits in the pipeline
+    with "US market is <label> ...: no new US buy until the market is calm".
+    Under observe the same words are a label and every pick is unchanged. A
+    regime that cannot be read never blocks: the plan says "market regime not
+    read: the rule is not applied". Holdings, stops and sells are untouched.
+(b) TFB_PLAN_SECTOR_HELD_MAX = 0 (default: off) | n. With n > 0 a candidate is
+    not picked while the names already held in its sector plus the day's picks
+    in it reach n: "sector limit with holdings (<sector>: h held + p picked;
+    the limit is n)". A held name's sector is read from the source pages; one
+    that is not listed there is not counted. The day's own limit (the board's
+    Max Per Sector) is unchanged.
+Both are measured every week against outcomes (v_regime_outcomes); the words
+of each rule are on the page, so a blocked name always says why.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -204,7 +236,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.9.2"
+__version__ = "1.10.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -265,6 +297,31 @@ def roi_cap_mode() -> str:
     return v if v in ("on", "observe", "off") else "on"
 
 
+def regime_mode() -> str:
+    """1.10.0: off (default) | observe | enforce."""
+    v = _env("TFB_PLAN_REGIME", "off").lower()
+    return v if v in ("off", "observe", "enforce") else "off"
+
+
+REGIME_LABELS = ("crash_day", "drawdown", "stress", "weak", "calm")
+
+
+def regime_rule(reg: Optional[Dict[str, Any]], mode: str, block: Sequence[str], ccy: Sequence[str]) -> Dict[str, Any]:
+    """PURE (1.10.0). What the cut does with a market regime read: {"mode", "blocks", "ccy", "words", "note"}.
+    `reg` = scripts.market_regime.read() or None. A regime that was not read never blocks."""
+    out = {"mode": mode, "blocks": False, "ccy": tuple(ccy), "words": "", "note": ""}
+    if mode == "off":
+        return out
+    if not reg or not reg.get("ok"):
+        out["note"] = "market regime not read (%s): the rule is not applied" % ((reg or {}).get("why") or "no read")
+        return out
+    out["note"] = "US market regime: %s" % reg["text"]
+    if reg["label"] in block:
+        out["blocks"] = True
+        out["words"] = "US market is %s: no new US buy until the market is calm" % reg["text"]
+    return out
+
+
 def stable_mode() -> str:
     """1.5.0 [TWO-LEVEL]: off | prefer (default: names at or above the entry level are picked first) | strict (a new
     name under the entry level waits in the pipeline)."""
@@ -321,6 +378,11 @@ def knobs() -> Dict[str, Any]:
         "ev_risk_max": _env_num("TFB_PLAN_EV_RISK_MAX", 30, 1, 100),
         "ev_upside_min": _env_num("TFB_PLAN_EV_UPSIDE_MIN", 15, 0, 200),
         "roi_cap": roi_cap_mode(),                                                # 1.8.0
+        "regime_mode": regime_mode(),                                             # 1.10.0
+        "regime_block": [x for x in (p.strip().lower() for p in _env(
+            "TFB_PLAN_REGIME_BLOCK", "weak,stress,drawdown,crash_day").split(",")) if x in REGIME_LABELS and x != "calm"],
+        "regime_ccy": [c.strip().upper() for c in _env("TFB_PLAN_REGIME_CCY", "USD").split(",") if c.strip()],
+        "sector_held_max": int(_env_num("TFB_PLAN_SECTOR_HELD_MAX", 0, 0, 20)),   # 1.10.0: 0 = off
         "roi_cap_pct": _env_num("TFB_PLAN_ROI_CAP_PCT", 34, 20, 100),
     }
 
@@ -742,6 +804,12 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
                 reason = words
             elif cap_mode == "observe":
                 c["labels"].append("[observe] " + words)
+        rg = k.get("regime") or {}                                                # 1.10.0 [REGIME]
+        if rg.get("blocks") and c["ccy"] in rg.get("ccy", ()):
+            if rg.get("mode") == "enforce" and not reason:
+                reason = rg["words"]
+            elif rg.get("mode") == "observe":
+                c["labels"].append("[observe] " + rg["words"])
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -769,6 +837,13 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
     picks: List[Dict[str, Any]] = []
     per_sector: Dict[str, int] = {}
+    held_max = int(k.get("sector_held_max", 0) or 0)                              # 1.10.0 [SECTOR-HELD]
+    held_sec: Dict[str, int] = {}
+    if held_max > 0:
+        for sym in lots.get("held", {}):
+            hs = text((sources.get(sym) or {}).get("sector"))
+            if hs:
+                held_sec[hs] = held_sec.get(hs, 0) + 1
     for c in cands:
         sec = c["sector"] or "?"
         if len(picks) >= k["picks"]:
@@ -776,6 +851,10 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             pipeline.append(c)
         elif per_sector.get(sec, 0) >= max(1, max_per_sector):
             c["waiting"] = "sector cap (%s already has %d)" % (sec, per_sector[sec])
+            pipeline.append(c)
+        elif held_max > 0 and held_sec.get(sec, 0) + per_sector.get(sec, 0) >= held_max:
+            c["waiting"] = "sector limit with holdings (%s: %d held + %d picked; the limit is %d)" % (
+                sec, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
             pipeline.append(c)
         else:
             if kept(c):
@@ -1037,7 +1116,7 @@ def write_grid(book, tab: str, rows: List[List[Any]], width: int, min_rows: int)
 
 
 def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.datetime] = None,
-         sleep=None, capture: Optional[Dict[str, Any]] = None) -> int:
+         sleep=None, capture: Optional[Dict[str, Any]] = None, regime: Optional[Dict[str, Any]] = None) -> int:
     ap = argparse.ArgumentParser(description="Cut or refresh the frozen Daily Plan.")
     ap.add_argument("--dry-run", action="store_true", help="compute and print, write nothing")
     ap.add_argument("--wait-min", type=int, default=0,
@@ -1052,7 +1131,7 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.d
     waited = 0
     while True:
         t = (now + _dt.timedelta(minutes=waited)) if now is not None else None
-        code, has_plan = run_once(args.dry_run, book, t, capture)
+        code, has_plan = run_once(args.dry_run, book, t, capture, regime)
         if code != 0 or has_plan or waited + 5 > max(0, min(args.wait_min, 180)):
             return code
         _out("no plan yet - looking again in 5 minutes (%d of %d waited)" % (waited, args.wait_min))
@@ -1060,8 +1139,17 @@ def main(argv: Optional[Sequence[str]] = None, *, book=None, now: Optional[_dt.d
         waited += 5
 
 
+def _read_regime(now: _dt.datetime) -> Dict[str, Any]:  # pragma: no cover - network
+    """1.10.0: the live read; any failure is a regime that was not read (the rule is then not applied)."""
+    try:
+        from scripts import market_regime  # noqa: PLC0415
+        return market_regime.read(now)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "why": type(e).__name__}
+
+
 def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
-             capture: Optional[Dict[str, Any]] = None) -> Tuple[int, bool]:
+             capture: Optional[Dict[str, Any]] = None, regime: Optional[Dict[str, Any]] = None) -> Tuple[int, bool]:
     """One look at the workbook: cut today's plan if there is none, else refresh its status."""
     write = mode() == "on" and not dry_run
     now = now or _dt.datetime.now(UTC)
@@ -1150,7 +1238,14 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             else:
                 _out("cash for sizing: from the %s | snapshot %s" % (             # no amount in the run log
                     cash_from, snap_at if snap is not None else "not read"))
+                if k.get("regime_mode", "off") != "off":                 # 1.10.0 [REGIME]: one read per cut
+                    reg = regime if regime is not None else _read_regime(now)
+                    k["regime"] = regime_rule(reg, k["regime_mode"], k["regime_block"], k["regime_ccy"])
+                    _out(k["regime"]["note"] + (" - %s" % k["regime_mode"] if k["regime"]["blocks"] else ""))
                 plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
+                if text((k.get("regime") or {}).get("note")).startswith("market regime not read"):
+                    for c in plan["picks"]:                # 1.10.0: a rule that could not be applied is said
+                        c["labels"].append(k["regime"]["note"])
                 if no_broker:                              # cut on the 1.6.0 rule: the plan says so
                     note = "cash from the %s, not the broker (%s)" % (
                         "cash ledger" if cash_from.startswith("snapshot") else "typed cash cell", ibkr_why)
