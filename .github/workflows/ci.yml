@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.82 (2026-11-18) -- HOLDING READ SUITE
+#
+# v1.1.82: run tests/test_holding_read.py (scripts/holding_read.py 1.0.0 and
+# holding_read.yml 1.0.0: what moved each holding last session and the
+# next-session read from its own history) in the blocking lean lane.
+#
 # VERSION 1.1.81 (2026-11-18) -- PORTFOLIO ROUTE AND CAPACITY SUITE
 #
 # v1.1.81: run tests/test_sync_portfolio_route_capacity.py (run_dashboard_sync
@@ -1201,6 +1207,7 @@ jobs:
             tests/test_plan_archive.py \
             tests/test_ibkr_capture.py \
             tests/test_exit_plan.py \
+            tests/test_holding_read.py \
             tests/test_consistency_check.py \
             tests/test_cash_cells.py \
             tests/test_sheets_quota.py \
