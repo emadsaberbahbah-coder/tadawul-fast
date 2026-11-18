@@ -2,7 +2,29 @@
 # scripts/archive_symbol_deep.py
 """
 ================================================================================
-TFB Symbol Deep Data - v1.1.0 (program register C8, Phase 3)
+TFB Symbol Deep Data - v1.2.0 (program register C8, Phase 3)
+================================================================================
+v1.2.0 (2026-11-19) - OUTCOME BARS FOR MATURED FORECASTS TOO
+--------------------------------------------------------------------------------
+WHY (owner, 19 Nov 2026 01:18 Riyadh: "how to improve our forecasting and
+recommendation ... check data for better alignment"; 01:49: "start building
+the plan that helps outperform"). The review of that night found 1,413 matured
+buy and sell calls on 292 symbols that the outcome engine never scores
+(engine_state 'no_bar_for_symbol'): 279 of those symbols have no ACTIVE
+Performance_Log record left, so the 'outcome' set (status = 'active' only)
+dropped them, and the nightly WRITE_TRUNCATE removed their bars. A call is
+then learned from only while it is still open, never after it matures.
+WHAT: with TFB_DEEP_OUTCOME_MATURED on (default) the set query also lists,
+as 'outcome' rows, every symbol of a 'matured' or 'expired' record with a
+buy or sell stance (entry_stance bullish / bearish; neutral calls are never
+scored) recorded in the last MATURED_DAYS = 400 days. Nothing else changes:
+the same cap (1,600), the same order of reading (after the deep set), the same
+time budget, the same single load. On 18 Nov the outcome set read 523 symbols
+in about 3 minutes; about 280 more add 1-2 minutes.
+GATE: TFB_DEEP_OUTCOME_MATURED = on (default) | off. It acts only while the
+outcome set itself is on (TFB_DEEP_OUTCOME_BARS). Off: the set query is the
+v1.1.0 text, byte for byte. Rollback: the repository Variable
+TFB_DEEP_OUTCOME_MATURED=off.
 ================================================================================
 v1.1.0 (2026-11-02) - OUTCOME BARS: the symbols with an active forecast record
 --------------------------------------------------------------------------------
@@ -120,7 +142,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import archive_market_series as ams  # same folder: the Yahoo reader and the BigQuery session
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
@@ -132,6 +154,7 @@ CORE_CAP = 120
 OUTCOME_CAP = 1600              # v1.1.0: symbols with an active forecast record (bars only)
 OUTCOME_REASON = "outcome"
 OUTCOME_TIME_S = 1500.0         # v1.1.0: the outcome set stops asking Yahoo after 25 minutes
+MATURED_DAYS = 400              # v1.2.0: matured / expired buy and sell calls of the last 400 days
 MIN_BARS_SHARE = 0.8            # replace symbol_bars_daily only when this share answered
 MAX_EODHD_FAIL_SHARE = 0.2      # more failed EODHD calls than this share -> exit 1
 NEWS_DAYS = 30
@@ -230,6 +253,11 @@ def eodhd_enabled() -> bool:
 def outcome_bars_enabled() -> bool:
     """v1.1.0: TFB_DEEP_OUTCOME_BARS arms the outcome set (default off)."""
     return _env("TFB_DEEP_OUTCOME_BARS").lower() in ("on", "1", "true", "yes")
+
+
+def outcome_matured_enabled() -> bool:
+    """v1.2.0: TFB_DEEP_OUTCOME_MATURED adds the matured / expired calls to the outcome set (default on)."""
+    return _env("TFB_DEEP_OUTCOME_MATURED", "on").lower() not in ("off", "0", "false", "no")
 
 
 def max_share() -> float:
@@ -342,6 +370,19 @@ UNION ALL SELECT symbol, 'roi50' FROM roi WHERE rk > 25 AND rk <= 50
 UNION ALL SELECT symbol, 'leaders' FROM `{ds}.v_universe_latest` WHERE source_page = 'Market_Leaders'
 UNION ALL SELECT DISTINCT symbol, 'outcome' FROM `{ds}.v_performance_log` WHERE status = 'active'
 """
+
+# v1.2.0: the matured / expired buy and sell calls, appended to SET_SQL when TFB_DEEP_OUTCOME_MATURED is on
+MATURED_SQL = (
+    "UNION ALL SELECT DISTINCT symbol, 'outcome' FROM `{ds}.v_performance_log` "
+    "WHERE status IN ('matured', 'expired') AND entry_stance IN ('bullish', 'bearish') "
+    "AND recorded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)\n"
+)
+
+
+def set_query(ds: str, matured: bool) -> str:
+    """v1.2.0: the set query - the v1.1.0 text, plus the matured calls when asked."""
+    q = SET_SQL.format(ds=ds)
+    return q + MATURED_SQL.format(ds=ds, days=MATURED_DAYS) if matured else q
 
 
 # ----------------------------------------------------------------------- EODHD
@@ -661,7 +702,8 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
         if not ams.dataset_exists(session, project, dataset):
             _out(f"ERROR: dataset {project}.{dataset} not found")
             return 2
-        rows = run_query(session, project, location, SET_SQL.format(ds=f"{project}.{dataset}"))
+        matured_on = outcome_bars_enabled() and outcome_matured_enabled() and "bars" in stages   # v1.2.0
+        rows = run_query(session, project, location, set_query(f"{project}.{dataset}", matured_on))
     except Exception as exc:  # noqa: BLE001
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
@@ -672,7 +714,8 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
     captured_at = now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     sets_msg = f"sets: core {len(core)} (holdings, board, top-25 ROI, extra), deep {len(deep)}"
     if outcome_on:
-        sets_msg += f", outcome {len(outcome)} (active forecast records; bars only, best effort)"
+        sets_msg += f", outcome {len(outcome)} (" + ("active and matured" if matured_on else "active") + \
+            " forecast records; bars only, best effort)"
     _out(sets_msg)
     rc = 0
     if "bars" in stages:

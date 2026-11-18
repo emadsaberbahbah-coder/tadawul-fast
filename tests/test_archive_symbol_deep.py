@@ -449,7 +449,9 @@ def test_d10_workflow():
                                             "github.event.inputs.outcome_bars == 'true' && 'on' || "
                                             "vars.TFB_DEEP_OUTCOME_BARS || 'off' }}")
     assert wf["jobs"]["deep"]["timeout-minutes"] == 45
-    assert asd.__version__ == "1.1.0"
+    assert asd.__version__ == "1.2.0"
+    # 1.2.0: the matured calls follow their own Variable, on by default
+    assert env["TFB_DEEP_OUTCOME_MATURED"] == "${{ vars.TFB_DEEP_OUTCOME_MATURED || 'on' }}"
 
 
 # --------------------------------------------------------------------- D11
@@ -494,7 +496,7 @@ def test_d11b_gate_on_after_deep_one_load(env, capsys, monkeypatch):
                               fetch=bars_fetch(calls=calls), opener=make_opener(calls=eod))
     assert rc == 0
     assert "sets: core 7 (holdings, board, top-25 ROI, extra), deep 9, outcome 3 " \
-           "(active forecast records; bars only, best effort)\n" in err
+           "(active and matured forecast records; bars only, best effort)\n" in err   # 1.2.0: matured on by default
     assert "outcome bars: 3/3 symbols, 6 rows | in the bars load\n" in err
     assert "bars: 9/9 symbols, 18 rows | loaded 24 (deep + outcome rows)\n" in err
     # the deep set first, then the outcome set; AAPL.US (extra) is deep now;
@@ -618,3 +620,52 @@ def test_d11g_only_eodhd_stages_ignore_the_gate(env, capsys, monkeypatch):
     assert rc == 0 and calls == [] and "outcome" not in err
     assert "sets: core 6 (holdings, board, top-25 ROI, extra), deep 8\n" in err
     assert [ld["table"] for ld in bq.loads] == ["symbol_analyst_daily$20261101"]
+
+
+# --------------------------------------------------------------------- D12
+def test_d12_matured_calls_keep_their_bars(monkeypatch):
+    """1.2.0: with the matured gate on the set query adds one union - matured / expired buy and sell calls of the
+    last 400 days - and with it off the query is the v1.1.0 text byte for byte."""
+    ds = "p.d"
+    v110 = asd.SET_SQL.format(ds=ds)
+    assert asd.set_query(ds, False) == v110
+    q = asd.set_query(ds, True)
+    assert q.startswith(v110)
+    extra = q[len(v110):]
+    assert extra == ("UNION ALL SELECT DISTINCT symbol, 'outcome' FROM `p.d.v_performance_log` "
+                     "WHERE status IN ('matured', 'expired') AND entry_stance IN ('bullish', 'bearish') "
+                     "AND recorded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 400 DAY)\n")
+    assert asd.MATURED_DAYS == 400
+    for val in ("", "on", "1", "yes", "anything"):
+        monkeypatch.setenv("TFB_DEEP_OUTCOME_MATURED", val)
+        assert asd.outcome_matured_enabled(), val
+    for val in ("off", "0", "false", "no", " OFF "):
+        monkeypatch.setenv("TFB_DEEP_OUTCOME_MATURED", val)
+        assert not asd.outcome_matured_enabled(), val
+    monkeypatch.delenv("TFB_DEEP_OUTCOME_MATURED", raising=False)
+    assert asd.outcome_matured_enabled()
+    # the rows it adds are ordinary 'outcome' rows: the builder already dedups and caps them
+    rows = [{"symbol": "GM.US", "why": "outcome"}, {"symbol": "GM.US", "why": "outcome"}, {"symbol": "8309.T", "why": "outcome"}]
+    assert asd.build_outcome_set(rows, {}) == {"GM.US": "outcome", "8309.T": "outcome"}
+
+
+def test_d12b_matured_off_reads_the_v110_words(env, capsys, monkeypatch):
+    monkeypatch.setenv("TFB_DEEP_OUTCOME_BARS", "on")
+    monkeypatch.setenv("TFB_DEEP_OUTCOME_MATURED", "off")
+    bq = FakeBQ()
+    rc, err, _ = _run_capture(["--write", "--extra", "AAPL.US"], bq, capsys,
+                              fetch=bars_fetch(calls=[]), opener=make_opener(calls=[]))
+    assert rc == 0
+    assert "deep 9, outcome 3 (active forecast records; bars only, best effort)\n" in err
+    assert "status IN ('matured', 'expired')" not in bq.queries[0]
+    # matured on (default) adds the union to the query actually sent
+    monkeypatch.delenv("TFB_DEEP_OUTCOME_MATURED", raising=False)
+    bq2 = FakeBQ()
+    rc, err, _ = _run_capture(["--write", "--extra", "AAPL.US"], bq2, capsys,
+                              fetch=bars_fetch(calls=[]), opener=make_opener(calls=[]))
+    assert rc == 0 and "status IN ('matured', 'expired') AND entry_stance IN ('bullish', 'bearish')" in bq2.queries[0]
+    # the outcome set off: matured on changes nothing in the query
+    monkeypatch.setenv("TFB_DEEP_OUTCOME_BARS", "off")
+    bq3 = FakeBQ()
+    _run_capture(["--write", "--extra", "AAPL.US"], bq3, capsys, fetch=bars_fetch(calls=[]), opener=make_opener(calls=[]))
+    assert "status IN ('matured'" not in bq3.queries[0]
