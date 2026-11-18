@@ -223,6 +223,23 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.10.1 (2026-11-19): ONE SECTOR VOCABULARY FOR THE SECTOR LIMITS (owner, 19 Nov
+01:18 Riyadh: "make full review ... check data for better alignment").
+Found in that review: a held name's sector comes from the source pages, which
+use the data provider's names ("Financial Services", "Healthcare",
+"Technology", "Basic Materials", "Consumer Cyclical", "Consumer Defensive"),
+while a candidate's comes from the Top 10 board, which uses the GICS names
+("Financials", "Health Care", "Information Technology", ...). On 18 Nov 32 of
+the pages' 46 INVESTABLE names read "Financial Services" and 6 of the board's
+10 rows "Financials". The sector limit with holdings (1.10.0 b) therefore never
+counted the three banks held (IBOC, AX, MBIN) against a fourth bank on the
+board - the concentration it was built to stop. The day's own sector cap could
+split one sector in two the same way when a board row had no sector.
+FIX: both limits count sectors under one name, the GICS one (the six provider
+spellings folded as in core/sectors.py YAHOO_TO_GICS_SECTOR; every other name
+unchanged). The page and the waiting words still show each row's own sector.
+No knob: a wrong count is a fault, not a setting.
+
 GATE: TFB_DAILY_PLAN = off (default) | observe (compute and print, write
 nothing) | on. Rollback: set the repository variable TFB_DAILY_PLAN=off.
 """
@@ -236,7 +253,24 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
+
+# 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
+# (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
+SECTOR_FOLD: Dict[str, str] = {
+    "Basic Materials": "Materials",
+    "Healthcare": "Health Care",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Technology": "Information Technology",
+    "Financial Services": "Financials",
+}
+
+
+def sector_key(s: Any) -> str:
+    """The name a sector is counted under: the GICS spelling; '' for none."""
+    t = ("" if s is None else str(s)).strip()
+    return SECTOR_FOLD.get(t, t)
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -841,20 +875,21 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     held_sec: Dict[str, int] = {}
     if held_max > 0:
         for sym in lots.get("held", {}):
-            hs = text((sources.get(sym) or {}).get("sector"))
+            hs = sector_key(text((sources.get(sym) or {}).get("sector")))           # 1.10.1: GICS name
             if hs:
                 held_sec[hs] = held_sec.get(hs, 0) + 1
     for c in cands:
-        sec = c["sector"] or "?"
+        shown = c["sector"] or "?"
+        sec = sector_key(c["sector"]) or "?"                                        # 1.10.1: counted under GICS
         if len(picks) >= k["picks"]:
             c["waiting"] = "next in line (rank %d)" % c["rank"]
             pipeline.append(c)
         elif per_sector.get(sec, 0) >= max(1, max_per_sector):
-            c["waiting"] = "sector cap (%s already has %d)" % (sec, per_sector[sec])
+            c["waiting"] = "sector cap (%s already has %d)" % (shown, per_sector[sec])
             pipeline.append(c)
         elif held_max > 0 and held_sec.get(sec, 0) + per_sector.get(sec, 0) >= held_max:
             c["waiting"] = "sector limit with holdings (%s: %d held + %d picked; the limit is %d)" % (
-                sec, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
+                shown, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
             pipeline.append(c)
         else:
             if kept(c):

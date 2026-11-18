@@ -978,7 +978,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.10.0"
+    assert dp.__version__ == "1.10.1"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1374,3 +1374,30 @@ def test_g4_the_run_reads_the_regime_once_and_says_what_it_did(monkeypatch, caps
 
 def text_ccy(d):
     return str(d.get("Ccy", "")).strip().upper()
+
+
+def test_g4_sector_limits_count_one_vocabulary():
+    """1.10.1: a held bank listed as 'Financial Services' on the pages and a board candidate listed as 'Financials'
+    are one sector; so are a page-only 'Healthcare' row and a board 'Health Care' row for the day's own cap."""
+    q = [qrow(1, "BNK1.US", "Financials", 30, ""), qrow(2, "ENE1.US", "Energy", 30, ""),
+         qrow(3, "BNK2.US", "Financials", 30, "")]
+    src = [SRC[0], ["BNK1.US", "", "USD", "", "10", ""], ["ENE1.US", "", "USD", "", "20", ""],
+           ["BNK2.US", "", "USD", "", "30", ""], ["DDI.US", "", "USD", "Financial Services", "15.7", ""]]
+    args = (dp.read_qualified(board(qual=q)), dp.read_sources([src]), {}, lots(), 33125.0, 2)
+    p = dp.decide(*args, K(sector_held_max=2))                       # held bank (pages' name) + one picked = 2
+    assert [c["symbol"] for c in p["picks"]] == ["BNK1.US", "ENE1.US"]
+    assert {c["symbol"]: c["waiting"] for c in p["pipeline"]}["BNK2.US"] == \
+        "sector limit with holdings (Financials: 1 held + 1 picked; the limit is 2)"
+    p = dp.decide(*args, K(sector_held_max=1))                       # the held bank alone fills it
+    assert [c["symbol"] for c in p["picks"]] == ["ENE1.US"]
+    # the day's own cap: a board row without a sector takes the pages' spelling and still counts with its GICS twin
+    q2 = [qrow(1, "HC1.US", "Health Care", 30, ""), qrow(2, "HC2.US", "", 30, "")]
+    src2 = [SRC[0], ["HC1.US", "", "USD", "", "10", ""], ["HC2.US", "", "USD", "Healthcare", "20", ""]]
+    p2 = dp.decide(dp.read_qualified(board(qual=q2)), dp.read_sources([src2]), {}, lots(), 33125.0, 1, K())
+    assert [c["symbol"] for c in p2["picks"]] == ["HC1.US"]
+    assert {c["symbol"]: c["waiting"] for c in p2["pipeline"]}["HC2.US"] == "sector cap (Healthcare already has 1)"
+    # the fold is the shared one and leaves every other name alone
+    from core.sectors import YAHOO_TO_GICS_SECTOR
+    assert dp.SECTOR_FOLD == YAHOO_TO_GICS_SECTOR
+    assert dp.sector_key(" Financial Services ") == "Financials" and dp.sector_key("Real Estate") == "Real Estate"
+    assert dp.sector_key(None) == "" and dp.sector_key("") == ""

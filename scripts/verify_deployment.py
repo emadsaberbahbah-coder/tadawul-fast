@@ -358,7 +358,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.10.0", "daily plan"),
+    ("daily_plan", "1.10.1", "daily plan"),
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
     ("exit_plan", "1.5.0", "exit plan"),
