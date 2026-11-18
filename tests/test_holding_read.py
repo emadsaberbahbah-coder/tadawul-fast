@@ -182,6 +182,17 @@ def test_h4_the_next_session_read():
     # a market with no bar on the day (NA) uses the stock's own bucket
     hist = [("FLAT", "UP", 1.0)] * 40 + [("FLAT", "DOWN", -1.0)] * 40 + [("UP", "UP", 1.0)] * 30 + [("UP", "UP", -1.0)] * 30
     assert "with any market" in hr.next_read(_states(hist, ("FLAT", "NA")), k)["why"]
+    # a share that differs from any day's but stays on the other side of one half names no direction
+    # (review of #1020: 60% up against a 72% base must not read FURTHER FALL)
+    hist = ([("DOWN", "DOWN", 1.0)] * 60 + [("DOWN", "DOWN", -1.0)] * 40 + [("UP", "UP", 1.0)] * 600
+            + [("UP", "UP", -1.0)] * 217)
+    r = hr.next_read(_states(hist, ("DOWN", "DOWN")), k)
+    assert round(r["p"]) == 60 and round(r["base"]) == 72 and r["label"] == "NO EDGE"
+    assert "does not cross one half: no direction is named" in r["why"]
+    hist = ([("UP", "UP", 1.0)] * 40 + [("UP", "UP", -1.0)] * 60 + [("DOWN", "DOWN", -1.0)] * 600
+            + [("DOWN", "DOWN", 1.0)] * 217)
+    r = hr.next_read(_states(hist, ("UP", "UP")), k)
+    assert round(r["p"]) == 40 and round(r["base"]) == 28 and r["label"] == "NO EDGE"
     # buckets
     assert [hr.z_bucket(z) for z in (-1.0, -0.99, -0.35, -0.34, 0.34, 0.35, 0.99, 1.0)] == \
         ["BIG DOWN", "DOWN", "DOWN", "FLAT", "FLAT", "UP", "UP", "BIG UP"]
@@ -264,7 +275,15 @@ def test_h6_parsers_and_the_item_picked():
     session, prev = dt.date(2026, 11, 17), dt.date(2026, 11, 16)
     a, b = hr.close_utc("AAA.US", prev), hr.close_utc("AAA.US", session)
     assert (a.hour, b.hour) == (21, 21) and hr.close_utc("2222.SR", session).hour == 12
-    assert hr.close_utc("BBOX.L", session).minute == 30
+    assert hr.close_utc("BBOX.L", session) == dt.datetime(2026, 11, 17, 16, 30, tzinfo=UTC)
+    # daylight saving is followed (review of #1020): a summer close is an hour earlier in UTC
+    summer = dt.date(2026, 7, 15)
+    assert hr.close_utc("AAA.US", summer) == dt.datetime(2026, 7, 15, 20, 0, tzinfo=UTC)
+    assert hr.close_utc("BBOX.L", summer) == dt.datetime(2026, 7, 15, 15, 30, tzinfo=UTC)
+    assert hr.close_utc("2222.SR", summer) == dt.datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+    late = [item(dt.datetime(2026, 7, 15, 20, 30, tzinfo=UTC), -1, "H", head="After the summer close")]
+    assert hr.pick_item(late, hr.close_utc("AAA.US", dt.date(2026, 7, 14)), hr.close_utc("AAA.US", summer)) is None
+    assert hr.pick_item(late, hr.close_utc("AAA.US", summer), None)["headline"] == "After the summer close"
     picked = hr.pick_item(items["AAA.US"], a, b)
     assert picked["headline"] == "AAA profit falls on weak orders"                # never the law-firm notice or the rumour
     assert hr.pick_item(items["AAA.US"], b, None)["headline"] == "AAA upgraded after the close"
@@ -413,6 +432,20 @@ def test_h8_run(monkeypatch, capsys):
     assert led[2][12] == -2.0 and led[3][13] == ""
     assert "2 earlier read(s) marked" in capsys.readouterr().out
     assert out                                                                     # (kept for H9)
+    # a holding sold since its read is still marked (review of #1020): BBB's lot goes inactive, its bars are read
+    book.tabs["_Portfolio_CostBasis"].values[2][3] = "Inactive"
+    for sym, nxt in (("SPY", -0.3), ("AAA", -0.4), ("KRE", -0.2), ("BBB", 3.0)):
+        monkeypatch.setitem(SER, sym, SER[sym] + [nxt])
+    monkeypatch.setattr(sys.modules[__name__], "bars_from", lambda rets, end=dt.date(2026, 11, 19), start=100.0:
+                        real(rets, end, start))
+    CALLS.clear()
+    assert hr.run(False, book=book, now=NOW + dt.timedelta(days=2), opener=opener) == 0
+    led = book.tabs["_Holding_Read"].values
+    sold = [r for r in led[1:] if (r[0], r[1]) == ("2026-11-18", "BBB.US")][0]
+    assert sold[11] == "2026-11-19" and sold[12] == 3.0 and sold[13] == hr.result_of(sold[7], 3.0) != ""
+    assert [r[1] for r in led[1:] if r[0] == "2026-11-19"] == ["AAA.US"]          # no new read for the sold name
+    assert sum("/chart/BBB?" in u for u in CALLS) == 1
+    assert "BBB.US" not in [r[0] for r in book.tabs["Holding_Read"].values[5:]]
 
 
 def test_h8b_read_and_write_failures(monkeypatch, capsys):

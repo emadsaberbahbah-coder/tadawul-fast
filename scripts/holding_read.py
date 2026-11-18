@@ -82,6 +82,7 @@ PAGE_TAB = "Holding_Read"
 LEDGER_TAB = "_Holding_Read"
 PAGE_WIDTH = 12
 MAX_LEDGER_ROWS = 2000
+MAX_PENDING = 20                     # symbols no longer held whose open reads are still marked, per run
 LEDGER_HEADERS = ["Session", "Symbol", "Stock %", "Market %", "Sector %", "Driver", "Main news", "Read",
                   "Up share %", "Sample", "Base %", "Next session", "Next %", "Result", "Written (Riyadh)"]
 PAGE_HEAD = ["Symbol", "Name", "Last session", "Stock %", "Market %", "Sector %", "Driver",
@@ -310,15 +311,23 @@ def next_read(st: Sequence[Tuple[str, str, Optional[float]]], k: Dict[str, Any])
     z = (p - base) / se if se > 0 else 0.0
     edge = abs(p - base) * 100.0 >= k["edge_pts"] and abs(z) >= k["z"]
     last = "down" if zb in ("BIG DOWN", "DOWN") else ("up" if zb in ("UP", "BIG UP") else "flat")
+    # A direction is named only when the days like it agree with it themselves: more than half closed up for an
+    # up read, fewer than half for a down read. A share that differs from any day's but stays on the other side of
+    # one half (60% up against 72%) names nothing.
+    tail = ""
     if not edge:
         label = NO_EDGE
-    elif p > base:
+    elif p > base and p > 0.5:
         label = {"down": UP_READS[0], "up": UP_READS[1], "flat": UP_READS[2]}[last]
-    else:
+    elif p < base and p < 0.5:
         label = {"down": DOWN_READS[0], "up": DOWN_READS[1], "flat": DOWN_READS[2]}[last]
+    else:
+        label = NO_EDGE
+        tail = " The share differs from any day's but does not cross one half: no direction is named."
     out.update({"label": label, "p": p * 100.0, "mean": mean,
                 "why": "After %s with %s, the next session closed up %.0f%% of %d times (average %+.2f%%); "
-                       "on any day it is %.0f%%." % (_Z_WORDS[zb], scope, p * 100.0, len(same), mean, base * 100.0)})
+                       "on any day it is %.0f%%.%s" % (_Z_WORDS[zb], scope, p * 100.0, len(same), mean,
+                                                       base * 100.0, tail)})
     return out
 
 
@@ -386,11 +395,21 @@ def read_gate(values: Sequence[Sequence[Any]]) -> Dict[str, str]:
     return out
 
 
+VENUE_CLOSE = {".SR": ("Asia/Riyadh", 15, 0, 3), ".L": ("Europe/London", 16, 30, 0)}
+US_CLOSE = ("America/New_York", 16, 0, -5)
+
+
 def close_utc(symbol: str, day: _dt.date) -> _dt.datetime:
-    """The end of the regular session of `day`, in UTC, by listing (US 21:00, Tadawul 12:00, London 16:30)."""
+    """The end of the regular session of `day`, in UTC: 16:00 New York, 15:00 Riyadh, 16:30 London, each in the
+    venue's own time so daylight saving is followed. Without a time-zone database the standard-time offset is used."""
     s = symbol.upper()
-    hh, mm = (12, 0) if s.endswith(".SR") else ((16, 30) if s.endswith(".L") else (21, 0))
-    return _dt.datetime(day.year, day.month, day.day, hh, mm, tzinfo=UTC)
+    zone, hh, mm, std = next((v for suf, v in VENUE_CLOSE.items() if s.endswith(suf)), US_CLOSE)
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415
+        tz: _dt.tzinfo = ZoneInfo(zone)
+    except Exception:  # noqa: BLE001
+        tz = _dt.timezone(_dt.timedelta(hours=std))
+    return _dt.datetime(day.year, day.month, day.day, hh, mm, tzinfo=tz).astimezone(UTC)
 
 
 def material(i: Dict[str, Any]) -> bool:
@@ -647,6 +666,10 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         rets_by_symbol[sym] = returns(bars)
         results.append(read_holding(sym, name, bars, bars_of(mkt_sym), bars_of(fund), items.get(sym) or [],
                                     cal.get(sym) or {}, gate, inf.get("group", ""), fund, mkt_name, k))
+    # A read whose holding has since been sold is still marked: its bars are read too (at most MAX_PENDING symbols).
+    pending = sorted({text(d["Symbol"]).upper() for d in ledger if not text(d["Result"])} - set(rets_by_symbol))
+    for sym in pending[:MAX_PENDING]:
+        rets_by_symbol[sym] = returns(bars_of(yahoo_symbol(sym)))
     marked = settle(ledger, rets_by_symbol)
     ok = [r for r in results if r.get("ok")]
     keys = {(r["session"].isoformat(), r["symbol"]) for r in ok}
