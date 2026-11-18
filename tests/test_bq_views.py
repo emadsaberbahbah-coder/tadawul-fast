@@ -283,7 +283,7 @@ PENDING = {
     # apply_bq_views 1.12.0 (19 Nov 2026): one sector per symbol, outcomes by sector, and trial C-2
     "v_symbol_sector": "f5018131ba52c2884030e246d759214473ba3ad30c5263288e9ff27575cbde64",
     "v_outcome_sector": "2a160aee50920fd78e1a89fcdac055d14abd30eb893523fbadbdc6f06f7fd04e",
-    "v_trial_c2": "446abb4376c74f69a76fecab565464416889d9fabbd395a9d55df408b830b474",
+    "v_trial_c2": "a1af0a9b476971b078d159c9bfe1c19169bb9936295eecc0dbd6fd80e29056db",
     # apply_bq_views 1.11.0 (18 Nov 2026): the shadow score and its forward trial
     # (pending body replaced: v_signal_edge_daily ccf6ea331773, 1.7.0)
     "v_trial_shadow_v2": "5b6d94462ff998a3ef9cce7af91552d34f7c960ba10529740295aa69068e8cdc",
@@ -2233,7 +2233,12 @@ def case_v35():
     code = bv._code(c.template)
     assert set(bv._REF.findall(code)) - {"v_trial_c2"} == {"v_outcome_excess", "v_signal_history"}
     assert names.index("v_trial_c2") > names.index("v_outcome_excess")
-    for frag in ("UPPER(IFNULL(entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')",   # the C-1 champion
+    # membership over every call of the day, scored or not; only scored calls enter the statistics (Codex P2 on #1026)
+    assert "WHERE recorded_at IS NOT NULL\n    AND horizon IN" in code and "WHERE in_engine_cohort" not in code
+    assert code.index("AS c2_keep") < code.index("WHERE scored")
+    for frag in ("IFNULL(in_engine_cohort, FALSE) AND excess_pp IS NOT NULL AS scored",
+                 "  FROM k\n  WHERE scored\n  GROUP BY period, horizon, recorded_date",
+                 "UPPER(IFNULL(entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')",   # the C-1 champion
                  "s.recorded_at <= TIMESTAMP_ADD(b.recorded_at, INTERVAL 60 SECOND)",              # no look-ahead
                  "s.recorded_at >= TIMESTAMP_SUB(b.recorded_at, INTERVAL 3 DAY)",
                  "NOT (UPPER(IFNULL(b.confidence, '')) = 'HIGH' OR IFNULL(b.rel, 0) >= 80)",

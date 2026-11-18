@@ -20,10 +20,10 @@
 --       record id), the first CEIL(n / 2) are kept, so a lone call is kept. A
 --       call with no known upside is not kept.
 -- In-sample (the days the rule was chosen on, NOT evidence), one month: C-2's
--- 214 calls +3.8 points against their market on average (76% ahead), the
+-- 215 calls +3.8 points against their market on average (76% ahead), the
 -- champion's 980 calls +0.7; on the daily average C-2 +2.1, the champion +0.1,
--- with an overlap-adjusted t of only 0.4 (43 days of overlapping months).
--- Two weeks: C-2 +2.2 points (70% ahead), the champion +0.8. Eight variants
+-- with an overlap-adjusted t of only 0.35 (43 days of overlapping months).
+-- Two weeks: C-2 +2.25 points (70% ahead), the champion +0.8. Eight variants
 -- were looked at before this one was fixed, so the in-sample figures
 -- overstate what to expect.
 -- EVIDENCE: only calls recorded from 20 Nov 2026 (period 'forward from
@@ -35,7 +35,10 @@
 -- days), as v_trial_shadow_v2). Even then the owner decides; nothing here
 -- changes a page, a pick or an order.
 -- NO LOOK-AHEAD: membership uses only what the call carried and the analyst
--- target recorded up to 60 seconds after it.
+-- target recorded up to 60 seconds after it, and it is decided over EVERY buy
+-- call recorded that day, scored or not; only scored calls then enter the
+-- statistics (Codex P2 on #1026: ranking only the scored calls would let a
+-- missing bar or a breakeven outcome move another call into the top half).
 -- COLUMNS: period, horizon (1W / 2W / 1M / 3M), arm (CHAMPION / C2 /
 -- LEFT_OUT / C2_MINUS_CHAMPION), calls, days, edge_pp (mean return minus the
 -- market benchmark; for C2_MINUS_CHAMPION the mean daily difference),
@@ -56,9 +59,10 @@ WITH base AS (
     recorded_at,
     confidence,
     entry_forecast_reliability AS rel,
-    excess_pp AS edge
+    excess_pp AS edge,
+    IFNULL(in_engine_cohort, FALSE) AND excess_pp IS NOT NULL AS scored
   FROM `{{DS}}.v_outcome_excess`
-  WHERE in_engine_cohort AND excess_pp IS NOT NULL AND recorded_at IS NOT NULL
+  WHERE recorded_at IS NOT NULL
     AND horizon IN ('1W', '2W', '1M', '3M')
     AND UPPER(IFNULL(entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')
 ),
@@ -106,6 +110,7 @@ daily AS (
     COUNTIF(c2_keep) AS n_c2, SUM(IF(c2_keep, edge, 0)) AS s_c2, COUNTIF(c2_keep AND edge > 0) AS w_c2,
     COUNTIF(NOT c2_keep) AS n_out, SUM(IF(c2_keep, 0, edge)) AS s_out, COUNTIF(NOT c2_keep AND edge > 0) AS w_out
   FROM k
+  WHERE scored
   GROUP BY period, horizon, recorded_date
 ),
 agg AS (

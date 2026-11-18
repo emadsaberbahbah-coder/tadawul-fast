@@ -23,10 +23,12 @@ reliability 80+, not a Tadawul call, and in the top half of its day by analyst
 target upside; it is measured against the champion like C-1, with the
 overlap-adjusted t of v_trial_shadow_v2. Rule and promotion test fixed on
 19 Nov before any forward day; only calls from 20 Nov 2026 are evidence.
-In-sample (not evidence): one month, C-2 +3.8 points a call against the
-market (214 calls, 76% ahead), the champion +0.7 (980 calls); overlap-adjusted
-t 0.4. Nothing on a page, in a score or in a pick changes. Research views: the
-live system never reads BigQuery.
+C-2 membership is decided over every buy call of the day, scored or not, and
+only scored calls enter the statistics (Codex P2 on #1026). In-sample (not
+evidence): one month, C-2 +3.8 points a call against the market (215 calls,
+76% ahead), the champion +0.7 (980 calls); overlap-adjusted t 0.35. Nothing on
+a page, in a score or in a pick changes. Research views: the live system never
+reads BigQuery.
 
 v1.11.0 (18 Nov 2026, the shadow score). WHY (owner, 18 Nov 2026, after two
 weeks of market shocks: do the risk and confidence parameters or the Scoring
