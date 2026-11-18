@@ -1334,7 +1334,12 @@ def test_g3_sector_limit_counts_what_is_held(monkeypatch):
     assert [c["symbol"] for c in dp.decide(*args, K(sector_held_max=3))["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]
     # a held name the source pages do not list is not counted
     nosec = (args[0], dp.read_sources([src[:4]]), *args[2:])
-    assert [c["symbol"] for c in dp.decide(*nosec, K(sector_held_max=1))["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]
+    assert [c["symbol"] for c in dp.decide(*nosec, K(sector_held_max=2))["picks"]] == ["TEC1.US", "ENE1.US", "TEC2.US"]
+    # with nothing held the limit still counts the day's picks (review of #1022): 0 held + 1 picked reaches 1
+    one = dp.decide(*nosec, K(sector_held_max=1))
+    assert [c["symbol"] for c in one["picks"]] == ["TEC1.US", "ENE1.US"]
+    assert {c["symbol"]: c["waiting"] for c in one["pipeline"]}["TEC2.US"] == \
+        "sector limit with holdings (Technology: 0 held + 1 picked; the limit is 1)"
     monkeypatch.setenv("TFB_PLAN_SECTOR_HELD_MAX", "3")
     assert dp.knobs()["sector_held_max"] == 3
     monkeypatch.setenv("TFB_PLAN_SECTOR_HELD_MAX", "x")

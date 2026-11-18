@@ -852,9 +852,9 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         elif per_sector.get(sec, 0) >= max(1, max_per_sector):
             c["waiting"] = "sector cap (%s already has %d)" % (sec, per_sector[sec])
             pipeline.append(c)
-        elif held_max > 0 and held_sec.get(sec, 0) > 0 and held_sec[sec] + per_sector.get(sec, 0) >= held_max:
+        elif held_max > 0 and held_sec.get(sec, 0) + per_sector.get(sec, 0) >= held_max:
             c["waiting"] = "sector limit with holdings (%s: %d held + %d picked; the limit is %d)" % (
-                sec, held_sec[sec], per_sector.get(sec, 0), held_max)
+                sec, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
             pipeline.append(c)
         else:
             if kept(c):

@@ -136,7 +136,8 @@ def read(now: Optional[_dt.datetime] = None, opener: Optional[Callable[..., Any]
     if (now.date() - day).days > max_age_days:
         return {"ok": False, "why": "the last S&P 500 fund session read is %s" % day.isoformat()}
     vix_bars = _bars("%5EVIX", opener, now.timestamp())
-    vix = next((b[4] / (b[5] or 1.0) for b in reversed(vix_bars) if b[0] <= day), None) if vix_bars else None
+    # the VIX close of the SAME session, as the view joins it; an earlier close is never carried forward
+    vix = next((b[4] / (b[5] or 1.0) for b in vix_bars if b[0] == day), None)
     m = metrics([b[4] for b in spy], vix)
     label = classify(m)
     return {"ok": True, "label": label, "date": day, "metrics": m, "text": describe(label, m, day)}

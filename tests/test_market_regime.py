@@ -128,6 +128,9 @@ def test_r5_read():
     # the VIX is the close of the SPY session, not a later one
     later = mr.read(NOW, _opener({"SPY": (days, spy), "%5EVIX": (days + [dt.date(2026, 11, 18)], vix + [40.0])}))
     assert later["metrics"]["vix"] == 25.5
+    # a VIX series that ends before the SPY session is not carried forward (review of #1022): an old 30 is not today's
+    behind = mr.read(NOW, _opener({"SPY": (days, spy), "%5EVIX": (days[:-1], [18.0] * 118 + [30.0])}))
+    assert behind["metrics"]["vix"] is None and behind["label"] == "weak" and "VIX not read" in behind["text"]
     # no VIX read: the other rules still decide, and the text says so
     nov = mr.read(NOW, _opener({"SPY": (days, spy)}))
     assert nov["ok"] and nov["label"] == "weak" and "VIX not read" in nov["text"]
