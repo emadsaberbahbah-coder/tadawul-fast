@@ -359,7 +359,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
     ("daily_plan", "1.9.2", "daily plan"),
-    ("exit_plan", "1.4.0", "exit plan"),
+    ("exit_plan", "1.5.0", "exit plan"),
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.0", "holding read"),

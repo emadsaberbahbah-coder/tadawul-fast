@@ -901,3 +901,67 @@ def test_x16_run_gate_on_off_and_missing_log(monkeypatch, capsys):
     assert ep.run(False, False, book=nolog, now=NOW, opener=_div_opener) == 0
     assert nolog.tabs["_Exit_Plan"].values[1][4] == pytest.approx(40.0)
 
+
+
+# ----------------------------------------------------------------------------- X17 (1.5.0)
+def test_x17_the_stop_of_record_is_never_below_the_brokers(monkeypatch):
+    """1.5.0 [BROKER-FLOOR] (18 Nov: five holdings showed a plan stop under the stop working at IBKR)."""
+    flat = mk([100.0] * 35, 0.015)
+    assert round(lv(flat)["stop"], 6) == 91.0                                                # the rule's own stop
+    r = lv(flat, info={"broker_stop": 93.0})
+    assert r["stop"] == 93.0 and r["action"] == "HOLD" and round(r["stop_gap_pct"], 6) == 7.0
+    assert any("the stop of record is the stop working at IBKR (93.00), above the rule's 91.00: a stop never falls "
+               "back" in w for w in r["why"])
+    assert any("stop 7.0% under the last close" in w for w in r["why"])            # the room is the real one
+    assert not any("is under the plan's" in w for w in r["why"])
+    # the gate off = the 1.4.0 levels
+    off = ep.exit_levels("AAA.US", 100.0, flat[29][0], flat, {"broker_stop": 93.0}, {}, K(broker_floor=False), TODAY)
+    assert round(off["stop"], 6) == 91.0 and not any("working at IBKR" in w for w in off["why"])
+    monkeypatch.setenv("TFB_EXIT_BROKER_FLOOR", "off")
+    assert ep.knobs()["broker_floor"] is False
+    monkeypatch.delenv("TFB_EXIT_BROKER_FLOOR")
+    assert ep.knobs()["broker_floor"] is True
+    # a broker stop a rounding above, at the last close or above it is not taken; one below is the old note
+    assert round(lv(flat, info={"broker_stop": 91.2})["stop"], 6) == 91.0
+    assert round(lv(flat, info={"broker_stop": 100.0})["stop"], 6) == 91.0
+    assert round(lv(flat, info={"broker_stop": 104.0})["stop"], 6) == 91.0
+    low = lv(flat, info={"broker_stop": 85.0})
+    assert round(low["stop"], 6) == 91.0 and any("broker stop 85.00 is under the plan's 91.00" in w for w in low["why"])
+    # a stop the broker already carries is never a RAISE STOP to-do
+    prev = {"Stop": 91.0, "StopNorm": 91.0}
+    assert lv(flat, info={"broker_stop": 93.0}, prev=prev)["action"] == "HOLD"
+    up = mk([100.0] * 30 + [104.0, 110.0], 0.015)
+    took = {"Stop": 91.0, "StopNorm": 91.0, "TP1 Reached": "yes"}                  # the first target is behind it
+    rule = lv(up, prev=took)
+    assert rule["action"] == "RAISE STOP" and 91.0 < rule["stop"] < 105.0          # the rule alone asks for a raise
+    cov = lv(up, info={"broker_stop": 105.0}, prev=took)
+    assert cov["stop"] == 105.0 and cov["action"] == "HOLD"
+    under = lv(up, info={"broker_stop": 95.0}, prev=took)                          # the broker is behind: still a raise
+    assert under["action"] == "RAISE STOP" and under["stop"] == rule["stop"]
+    # once stored it holds, whatever happens to the order
+    kept = lv(flat, prev={"Stop": 93.0, "StopNorm": 93.0})
+    assert kept["stop"] == 93.0 and kept["action"] == "HOLD"
+    # a close at or under the floored stop is a SELL like any other stop
+    fell = mk([100.0] * 34 + [92.5], 0.015)
+    assert lv(fell, prev={"Stop": 93.0, "StopNorm": 93.0})["action"] == "SELL"
+
+
+def test_x17b_run_stores_the_brokers_stop(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setitem(SERIES, "DDI", [100.0] * 35)
+    cap = {"ok": True, "as_of": NOW, "stops": {"DDI.US": [(93.0, 200.0), (94.0, 40.0)]}}
+    b = wbook()
+    assert ep.run(False, False, book=b, now=NOW, opener=opener, capture=cap) == 0
+    row = ep.parse_ledger(b.tabs["_Exit_Plan"].values)[0]
+    assert row["Symbol"] == "DDI.US" and row["Stop"] == 93.0 and row["Action"] == "HOLD"   # the lowest working stop
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "the stop of record is the stop working at IBKR (93.00), above the rule's 91.00" in page
+    # the next day the order is gone from the capture: the stop of record stays
+    assert ep.run(False, False, book=b, now=NOW + dt.timedelta(days=1), opener=opener,
+                  capture={"ok": True, "as_of": NOW + dt.timedelta(days=1), "stops": {}}) == 0
+    assert [r["Stop"] for r in ep.parse_ledger(b.tabs["_Exit_Plan"].values)][-1] == 93.0
+    step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
+    step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
+    assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
+    assert ep.__version__ == "1.5.0"
+    assert '("exit_plan", "1.5.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
