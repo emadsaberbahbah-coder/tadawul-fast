@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.84 (2026-11-18) -- SHADOW SCORE RULE SUITE
+#
+# v1.1.84: run tests/test_trial_shadow_v2_rule.py (apply_bq_views 1.11.0: the
+# shadow_v2 challenger score and its forward trial, both fixed on 18 Nov
+# before any forward day) in the blocking lean lane.
+#
 # VERSION 1.1.83 (2026-11-18) -- MARKET REGIME SUITE
 #
 # v1.1.83: run tests/test_market_regime.py (scripts/market_regime.py 1.0.0:
@@ -1181,6 +1187,7 @@ jobs:
             tests/test_bq_views.py \
             tests/test_trial_c1_rule.py \
             tests/test_hold_vs_switch_rule.py \
+            tests/test_trial_shadow_v2_rule.py \
             tests/test_archive_market_series.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \

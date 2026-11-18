@@ -43,12 +43,32 @@
 --   spread_pp     top_ex_pp - bottom_ex_pp
 --   horizon_days  calendar days of the ladder step (7 / 14 / 30 / 91), the
 --                 overlap v_signal_edge corrects for
+-- shadow_v2 (18 Nov 2026) is a CHALLENGER score measured beside overall_score,
+-- never shown on a page and never read by a decision. WHY (owner, 18 Nov 2026,
+-- after two weeks of market shocks: do the risk and confidence parameters or
+-- the Scoring need adjusting; "forecast on a scientific basis with continuous
+-- learning"; then "let us start building"): on 18 Nov overall_score, confidence
+-- and reliability showed no edge at any horizon in any market, while the
+-- analyst target upside (US, 1M: mean IC 0.34 over 34 days, positive on every
+-- day) and the engine's 1M forecast ROI (US, 1M: 0.12) ranked the next month
+-- in the right direction - both still 'thin'. The rule was fixed on 18 Nov
+-- before any forward day:
+--   shadow_v2 = 0.6 x PERCENT_RANK(target_upside) + 0.4 x PERCENT_RANK(engine_roi_1m)
+-- ranked within the signal day and market group among the names that carry
+-- BOTH inputs (0 = the day's lowest, 1 = its highest; NULL when either input
+-- is missing - most Tadawul names have no analyst target, so Tadawul has no
+-- shadow score yet). No confidence, reliability or overall_score term. It
+-- uses only what was recorded with the forecast, never an outcome. Signal
+-- days up to 18 Nov 2026 are in-sample (the weights were chosen on them);
+-- only days from 19 Nov 2026 are evidence. Promotion is the owner's decision
+-- after at least 4 weeks, and only if v_signal_edge reads shadow_v2 ahead of
+-- overall_score on those forward days.
 -- Values are rank-tied when equal to 4 decimals (BigQuery cannot partition a
 -- window by FLOAT64, so ties are keyed on the value x 10,000 as INT64).
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_signal_edge_daily`
-OPTIONS (description = "TFB Looker v6: per signal day, market group, feature and horizon - the Spearman rank IC between each live signal (engine ROI forecasts, reliability, data quality, confidence, recommendation, investability, stance, overall/risk score, target upside) and the realized 1W/2W/1M/3M return, with top/bottom-third excess returns")
+OPTIONS (description = "TFB Looker v6: per signal day, market group, feature and horizon - the Spearman rank IC between each live signal (engine ROI forecasts, reliability, data quality, confidence, recommendation, investability, stance, overall/risk score, target upside, and the shadow_v2 challenger score = 0.6 x day rank of target upside + 0.4 x day rank of the 1M engine ROI) and the realized 1W/2W/1M/3M return, with top/bottom-third excess returns")
 AS
 WITH first_rec AS (
   SELECT symbol, recorded_date, MIN(recorded_at) AS first_at
@@ -108,11 +128,32 @@ grp AS (
   UNION ALL
   SELECT IF(j.market IN ('US', 'Tadawul'), j.market, 'Other markets') AS market_group, j.* FROM j
 ),
+both AS (
+  SELECT
+    d, market_group, symbol,
+    CAST(ROUND(target_upside * 10000) AS INT64) AS tk,
+    CAST(ROUND(engine_roi_1m * 10000) AS INT64) AS ek
+  FROM grp
+  WHERE target_upside IS NOT NULL AND engine_roi_1m IS NOT NULL
+),
+sh AS (
+  SELECT
+    d, market_group, symbol,
+    0.6 * PERCENT_RANK() OVER (PARTITION BY d, market_group ORDER BY tk)
+      + 0.4 * PERCENT_RANK() OVER (PARTITION BY d, market_group ORDER BY ek) AS shadow_v2
+  FROM both
+),
+g2 AS (
+  SELECT g.*, s.shadow_v2
+  FROM grp AS g
+  LEFT JOIN sh AS s ON s.d = g.d AND s.market_group = g.market_group AND s.symbol = g.symbol
+),
 feat AS (
   SELECT d, market_group, symbol, feature, x, r_1w, r_2w, r_1m, r_3m
-  FROM grp
+  FROM g2
   UNPIVOT (x FOR feature IN (engine_roi_1w, engine_roi_2w, engine_roi_1m, engine_roi_3m, reliability,
-    data_quality, confidence, recommendation, investability, stance, overall_score, risk_score, target_upside))
+    data_quality, confidence, recommendation, investability, stance, overall_score, risk_score, target_upside,
+    shadow_v2))
 ),
 lng AS (
   SELECT
