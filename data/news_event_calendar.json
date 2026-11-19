@@ -1,0 +1,187 @@
+{
+ "version": "1.0.0",
+ "checked": "2026-11-19",
+ "about": "Dated events that can move markets: summits, central-bank decisions, OPEC+ meetings and deadlines. Hand-kept: every event carries the page its date was read from, and 'checked' is the day the whole file was last compared with those pages. Times are Riyadh time. Information only: nothing here changes a recommendation or places an order.",
+ "kinds": [
+  "summit",
+  "central_bank",
+  "energy",
+  "deadline",
+  "budget"
+ ],
+ "statuses": [
+  "confirmed",
+  "tentative",
+  "date_not_set"
+ ],
+ "events": [
+  {
+   "id": "apec-2026",
+   "start": "2026-11-18",
+   "end": "2026-11-19",
+   "title": "APEC leaders' meeting, Shenzhen",
+   "kind": "summit",
+   "status": "confirmed",
+   "time": "",
+   "why": "Trump, Xi and Putin were set to attend; US-China trade, two months before the truce deadline",
+   "markets": "US, China, trade-exposed names",
+   "source": "https://chinaglobalsouth.com/analysis/apec-summit-2026-china-shenzhen-trump-xi-putin/"
+  },
+  {
+   "id": "saudi-budget-2027",
+   "start": "2026-11-20",
+   "end": "2026-12-31",
+   "title": "Saudi Arabia's 2027 budget: final approval, due before year-end",
+   "kind": "budget",
+   "status": "date_not_set",
+   "time": "",
+   "why": "Pre-budget statement: spending SAR 1,392 bn, revenue SAR 1,202 bn, deficit about 3.6% of GDP",
+   "markets": "Tadawul",
+   "source": "https://www.mof.gov.sa/en/w/saudi-ministry-of-finance-announces-pre-budget-statement-for-fy2027-expenditures-estimated-at-sar-1-392-bn-and-revenues-at-sar-1-202-bn"
+  },
+  {
+   "id": "opec-plus-2026-11-29",
+   "start": "2026-11-29",
+   "end": "2026-11-29",
+   "title": "OPEC+ ministers meet (42nd ministerial meeting)",
+   "kind": "energy",
+   "status": "confirmed",
+   "time": "",
+   "why": "2027 output quotas are expected to be decided; the seven-country group meets the same day",
+   "markets": "Oil, Tadawul, energy names",
+   "source": "https://opec.org/pr-detail/605-7-june-2026.html"
+  },
+  {
+   "id": "fomc-2026-12",
+   "start": "2026-12-08",
+   "end": "2026-12-09",
+   "title": "US Federal Reserve rate decision, with new projections",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Wed 9 Dec, 22:00",
+   "why": "Sets the dollar rate; the riyal is pegged to the dollar, so Saudi rates usually move with it",
+   "markets": "All markets",
+   "source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+  },
+  {
+   "id": "us-funding-2026-12-11",
+   "start": "2026-12-11",
+   "end": "2026-12-11",
+   "title": "US government funding runs out (the stopgap law ends)",
+   "kind": "deadline",
+   "status": "confirmed",
+   "time": "",
+   "why": "Without a new law a shutdown starts on 12 Dec",
+   "markets": "US",
+   "source": "https://www.nasfaa.org/news-item/39735/House_Passes_Continuing_Resolution_Funding_Government_Through_December_11"
+  },
+  {
+   "id": "g20-2026",
+   "start": "2026-12-14",
+   "end": "2026-12-15",
+   "title": "G20 leaders' summit, Miami (Doral)",
+   "kind": "summit",
+   "status": "confirmed",
+   "time": "",
+   "why": "Hosted by Trump; Xi is expected to attend, a month before the trade truce ends",
+   "markets": "All markets",
+   "source": "https://www.cityofdoral.com/Elected-officials/Christi-Fraga/Doral-at-the-Center-of-G20"
+  },
+  {
+   "id": "ecb-2026-12",
+   "start": "2026-12-16",
+   "end": "2026-12-17",
+   "title": "European Central Bank rate decision",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Thu 17 Dec",
+   "why": "Euro rates and the euro; new staff projections",
+   "markets": "Europe",
+   "source": "https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html"
+  },
+  {
+   "id": "boe-2026-12",
+   "start": "2026-12-17",
+   "end": "2026-12-17",
+   "title": "Bank of England rate decision",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Thu 17 Dec, 15:00",
+   "why": "UK rates and the pound",
+   "markets": "UK",
+   "source": "https://www.bankofengland.co.uk/news/2025/september/monetary-policy-committee-dates-for-2026"
+  },
+  {
+   "id": "boj-2026-12",
+   "start": "2026-12-17",
+   "end": "2026-12-18",
+   "title": "Bank of Japan rate decision",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Fri 18 Dec",
+   "why": "The yen and world bond yields",
+   "markets": "Japan, world bonds",
+   "source": "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
+  },
+  {
+   "id": "us-china-truce-2027-01-10",
+   "start": "2027-01-10",
+   "end": "2027-01-10",
+   "title": "US-China trade truce ends unless it is extended again",
+   "kind": "deadline",
+   "status": "confirmed",
+   "time": "",
+   "why": "Tariff relief, export-control waivers and port-fee suspensions lapse with it",
+   "markets": "US, China, trade-exposed names",
+   "source": "https://www.spglobal.com/energy/en/news-research/latest-news/agriculture/092426-us-says-trade-truce-with-china-extended-till-jan-10-2027-ahead-of-trump-xi-meet"
+  },
+  {
+   "id": "wef-2027",
+   "start": "2027-01-18",
+   "end": "2027-01-22",
+   "title": "World Economic Forum, Davos",
+   "kind": "summit",
+   "status": "confirmed",
+   "time": "",
+   "why": "Heads of state, central bankers and company chiefs in one place: headlines more than decisions",
+   "markets": "All markets",
+   "source": "https://www.davos.ch/en/experience/events/world-economic-forum-annual-meeting-2027"
+  },
+  {
+   "id": "boj-2027-01",
+   "start": "2027-01-21",
+   "end": "2027-01-22",
+   "title": "Bank of Japan rate decision, with its outlook report",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Fri 22 Jan",
+   "why": "The yen and world bond yields",
+   "markets": "Japan, world bonds",
+   "source": "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
+  },
+  {
+   "id": "fomc-2027-01",
+   "start": "2027-01-26",
+   "end": "2027-01-27",
+   "title": "US Federal Reserve rate decision",
+   "kind": "central_bank",
+   "status": "tentative",
+   "time": "Wed 27 Jan, 22:00",
+   "why": "Sets the dollar rate; the Fed confirms each 2027 date at the meeting before it",
+   "markets": "All markets",
+   "source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+  },
+  {
+   "id": "boe-2027-02",
+   "start": "2027-02-04",
+   "end": "2027-02-04",
+   "title": "Bank of England rate decision, with its policy report",
+   "kind": "central_bank",
+   "status": "confirmed",
+   "time": "Thu 4 Feb, 15:00",
+   "why": "UK rates and the pound",
+   "markets": "UK",
+   "source": "https://www.bankofengland.co.uk/news/2026/september/mpc-dates-for-2027"
+  }
+ ]
+}

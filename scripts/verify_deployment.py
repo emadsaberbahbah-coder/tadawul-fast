@@ -352,7 +352,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).
-    ("news_board", "1.0.0", "news board"),
+    ("news_board", "1.1.0", "news board"),   # 2026-11-19: v1.1.0 [EVENTS] section 6, events ahead
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.3.0", "news macro gate"),   # 2026-11-19: v1.3.0 [TRADE-RELIEF]

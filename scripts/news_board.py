@@ -4,7 +4,13 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.0.0 (2026-11-19)
+v1.1.0 (2026-11-19)
+  1.1.0: [EVENTS] section 6, EVENTS AHEAD - the dated events of the next 60 days (summits, central-bank
+         decisions, OPEC+ meetings, deadlines) from the hand-kept data/news_event_calendar.json, each with the
+         page its date was read from. Owner, 19 Nov 2026 16:09: "Next" - part 3 of the stage, the calendar of
+         summits and deadlines. Information only. The file states the day it was last checked; the page says
+         so when that is more than 21 days ago, when the file runs out, or when it cannot be read - and is
+         built all the same.
   1.0.0: the page (news learning loop, phase B: the news in the file).
 
 WHY
@@ -34,6 +40,10 @@ WHAT IT WRITES (its page News_Board; nothing else)
        new tilt began today, the list is yesterday's), the page says so
        and claims no shadow action for a holding.
     5. TRIAL: v_trial_news_overlay as it stands, and the promotion rule.
+    6. EVENTS AHEAD (v1.1.0): the dated events of the next 60 days from
+       data/news_event_calendar.json, soonest first, each with its source
+       page; and the next one in a line under the verdict. No query: the
+       file is read from the repository. For information only.
 
 SAFETY
     Read-only on BigQuery (SELECT only) and on every tab but its own; the
@@ -57,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import math
 import os
 import re
@@ -64,7 +75,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -84,6 +95,16 @@ LINE_TEXT = {"CHAMPION": "List as it is", "NEWS_OVERLAY": "List with the news ov
              "MOVED_OUT": "Names the overlay removes", "MOVED_IN": "Names the overlay adds",
              "OVERLAY_MINUS_CHAMPION": "Overlay minus list (per day)"}
 LINE_ORDER = tuple(LINE_TEXT)
+# v1.1.0 [EVENTS]: the hand-kept calendar of dated events
+CALENDAR_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "news_event_calendar.json")
+CALENDAR_DAYS = 60                                      # how far ahead section 6 looks
+CALENDAR_SOON = 14                                      # the line under the verdict names the next event this near
+CALENDAR_STALE_DAYS = 21                                # a file checked longer ago than this is said on the page
+KIND_TEXT = {"summit": "Summit", "central_bank": "Central bank", "energy": "Oil", "deadline": "Deadline",
+             "budget": "Budget"}
+STATUS_TEXT = {"confirmed": "confirmed", "tentative": "tentative", "date_not_set": "date not announced"}
+_DOW = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MON = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 # feature -> (label, kind of news, short name)
 THEMES: Dict[str, Tuple[str, str, str]] = {
     "iran_war": ("Iran: fighting", "War", "Iran war"),
@@ -105,6 +126,8 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 _SYM_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")            # what may be sent to BigQuery
 _HOLD_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")         # what may be shown as a holding (AAPL, GC=F, ^GSPC)
 _NOT_A_HOLDING = frozenset({"TOTAL", "TOTALS", "SUBTOTAL"})
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_URL_RE = re.compile(r"^https://[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?:/[^\s\"<>]*)?$")   # a calendar source: https, a host, no spaces
 
 
 def _out(msg: str) -> None:
@@ -424,6 +447,120 @@ def holding_rows(holdings: Sequence[Dict[str, str]], sectors: Dict[str, str], ti
 # ----------------------------------------------------------------------------- #
 # 5. Trial and the verdict
 # ----------------------------------------------------------------------------- #
+# ----------------------------------------------------------------------------- #
+# v1.1.0 [EVENTS]: the calendar of dated events (a repository file; no query)
+# ----------------------------------------------------------------------------- #
+def _strict_day(v: Any) -> Optional[_dt.date]:
+    if not isinstance(v, str) or not _DAY_RE.match(v):
+        return None
+    try:
+        return _dt.date.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+def clean_event(e: Any) -> Optional[Dict[str, Any]]:
+    """One calendar entry, or None when it cannot be trusted: a date that is not a date, an end before its
+    start, no title, an unknown kind or status, or a source that is not an https page."""
+    if not isinstance(e, dict):
+        return None
+    start = _strict_day(e.get("start"))
+    end = _strict_day(e.get("end")) if e.get("end") not in (None, "") else start
+    title, kind, status, source = text(e.get("title")), text(e.get("kind")), text(e.get("status")), text(e.get("source"))
+    if start is None or end is None or end < start or not title or kind not in KIND_TEXT or status not in STATUS_TEXT \
+            or not _URL_RE.match(source):
+        return None
+    return {"id": text(e.get("id")), "start": start, "end": end, "title": title, "kind": kind, "status": status,
+            "time": text(e.get("time")), "why": text(e.get("why")), "markets": text(e.get("markets")), "source": source}
+
+
+def load_calendar(path: Optional[str] = None) -> Dict[str, Any]:
+    """The hand-kept calendar. Never raises: a file that is missing or broken is said on the page, and the
+    page is built without it."""
+    blank = {"checked": None, "events": [], "dropped": 0, "error": ""}
+    try:
+        with open(path or CALENDAR_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as e:
+        return dict(blank, error="file missing" if isinstance(e, OSError) else "not valid JSON")
+    if not isinstance(raw, dict) or not isinstance(raw.get("events"), list):
+        return dict(blank, error="no list of events in it")
+    events = [clean_event(e) for e in raw["events"]]
+    kept = sorted((e for e in events if e is not None), key=lambda e: (e["start"], e["end"], e["id"], e["title"]))
+    return {"checked": _strict_day(raw.get("checked")), "events": kept, "dropped": len(events) - len(kept), "error": ""}
+
+
+def day_text(d: _dt.date, year: bool = True) -> str:
+    return "%s %d %s%s" % (_DOW[d.weekday()], d.day, _MON[d.month - 1], " %d" % d.year if year else "")
+
+
+def span_text(start: _dt.date, end: _dt.date) -> str:
+    if start == end:
+        return day_text(start)
+    return "%s - %s" % (day_text(start, year=start.year != end.year), day_text(end))
+
+
+def when_text(ev: Dict[str, Any], today: _dt.date) -> str:
+    if ev["status"] == "date_not_set":
+        return "date not announced"
+    if ev["start"] > today:
+        n = (ev["start"] - today).days
+        return "tomorrow" if n == 1 else "in %d days" % n
+    if ev["start"] == ev["end"]:
+        return "today"
+    if ev["end"] == today:
+        return "ends today"
+    return "starts today" if ev["start"] == today else "under way"
+
+
+def calendar_rows(cal: Dict[str, Any], today: _dt.date, days: int = CALENDAR_DAYS) -> List[Dict[str, Any]]:
+    """The events that have not ended and begin within the window: the dated ones soonest first, then those
+    whose date is not announced."""
+    last = today + _dt.timedelta(days=days)
+    out = []
+    for ev in cal.get("events") or []:
+        if ev["end"] < today or ev["start"] > last:
+            continue
+        window = ev["status"] == "date_not_set"
+        out.append({"date": ("by %s" % day_text(ev["end"])) if window else span_text(ev["start"], ev["end"]),
+                    "when": when_text(ev, today), "title": ev["title"], "kind": KIND_TEXT[ev["kind"]], "time": ev["time"],
+                    "why": ev["why"], "markets": ev["markets"], "status": STATUS_TEXT[ev["status"]],
+                    "source": ev["source"], "start": ev["start"], "dated": not window})
+    return sorted(out, key=lambda r: not r["dated"])                # stable: each group keeps its date order
+
+
+def calendar_notes(cal: Dict[str, Any], today: _dt.date) -> List[str]:
+    """What the reader must know about the calendar itself: unreadable, entries left out, old, or running out."""
+    if cal.get("error"):
+        return ["The events calendar could not be read (%s). No event is shown; the rest of the page is unaffected."
+                % cal["error"]]
+    notes = []
+    if cal.get("dropped"):
+        notes.append("%d calendar entr%s could not be read and %s left out." % (
+            cal["dropped"], "y" if cal["dropped"] == 1 else "ies", "is" if cal["dropped"] == 1 else "are"))
+    checked = cal.get("checked")
+    if checked is None:
+        notes.append("The calendar does not say when it was last checked; dates may have moved.")
+    elif (today - checked).days > CALENDAR_STALE_DAYS:
+        notes.append("The calendar was last checked on %s (%d days ago); dates may have moved since."
+                     % (day_text(checked), (today - checked).days))
+    events = cal.get("events") or []
+    last = max((e["start"] for e in events if e["status"] != "date_not_set"), default=None)
+    if last is None or last < today + _dt.timedelta(days=CALENDAR_SOON):
+        notes.append("The calendar holds no dated event after %s; it needs new dates."
+                     % (day_text(last) if last else "today"))
+    return notes
+
+
+def next_event_line(rows: Sequence[Dict[str, Any]], today: _dt.date) -> str:
+    """The line under the verdict: the next dated event when it starts within two weeks."""
+    for r in rows:
+        if r["dated"] and (r["start"] - today).days <= CALENDAR_SOON:
+            return "NEXT EVENT (%s): %s, %s. Section 6 lists the next %d days." % (
+                r["when"], r["title"], r["date"], CALENDAR_DAYS)
+    return ""
+
+
 def trial_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def key(r: Dict[str, Any]) -> Tuple[int, int, str, int]:
         return (0 if text(r.get("period")) == FORWARD else 1,
@@ -482,6 +619,8 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
                 "or places an order; only the Today Action Plan gives orders." % (stamp, __version__)]),
            pad([]), pad(["VERDICT"])]
     out += [pad([line]) for line in data["verdict"]]
+    if data.get("next_event"):
+        out.append(pad([data["next_event"]]))
 
     weeks = sorted({t["week_start"] for t in data["themes"] if t["week_start"]})
     ends = sorted({t["week_end"] for t in data["themes"] if t["week_end"]})
@@ -559,6 +698,19 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
         out.append(pad(["", "The trial has no row yet."]))
     out += [pad(["Promotion rule, fixed on 19 Nov 2026: the overlay is offered to the owner only after 20 changed days "
                  "(1 week) or 28 (2 weeks), 8 news weeks and a t of 2.5 or more. The owner decides."]),
+            pad([]),
+            pad(["6. EVENTS AHEAD - dated events of the next %d days%s. For information: no order comes from this section."
+                 % (CALENDAR_DAYS, (", calendar checked %s" % data["events_checked"]) if data.get("events_checked") else "")]),
+            pad(["Date", "When", "Event", "Kind", "Time (Riyadh)", "Why it matters", "Markets", "Status", "Source"])]
+    for e in data.get("events") or []:
+        out.append(pad([e["date"], e["when"], e["title"], e["kind"], e["time"], e["why"], e["markets"], e["status"],
+                        e["source"]]))
+    if not data.get("events"):
+        out.append(pad(["", "No listed event in the next %d days." % CALENDAR_DAYS]))
+    out += [pad([note]) for note in data.get("events_notes") or []]
+    out += [pad(["The news gate already raises CAUTION by itself within 30 hours of a Fed decision or a high-impact US "
+                 "data release; this list is the longer view. Dates are read from the pages in the Source column and "
+                 "can move."]),
             pad([]),
             pad(["How to read: a theme is the share of the week's news on that subject, per 1,000 (the Iran, Russia and "
                  "US-China lines count events; the rest count news documents); a tone is an index where higher is more "
@@ -638,8 +790,10 @@ def sql_trial(ds: str) -> str:
 
 # ----------------------------------------------------------------------------- #
 def collect(session: Any, project: str, dataset: str, location: str, holdings: Sequence[Dict[str, str]],
-            today: _dt.date, query: Any) -> Dict[str, Any]:
+            today: _dt.date, query: Any, calendar: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ds = "%s.%s" % (project, dataset)
+    cal = calendar if calendar is not None else load_calendar()
+    events = calendar_rows(cal, today)
     last = query(session, project, location, sql_last_news(ds, today))
     last_news = day(last[0].get("last_day")) if last else None
     themes = theme_rows(query(session, project, location, sql_themes(ds, today)))
@@ -655,10 +809,13 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
             "holdings": holding_rows(holdings, sectors, tilt, names, shadow_day), "shadow_day": shadow_day,
             "shadow_note": shadow_note(shadow_day, tilt),
             "counts": shadow_counts(names), "shadow": shadow_rows(names), "trial": trial,
-            "verdict": verdict_lines(trial, tilt, last_news, today)}
+            "verdict": verdict_lines(trial, tilt, last_news, today),
+            "events": events, "events_notes": calendar_notes(cal, today), "next_event": next_event_line(events, today),
+            "events_checked": day_text(cal["checked"]) if cal.get("checked") else ""}
 
 
-def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None, query=None) -> int:
+def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None, query=None,
+             calendar: Optional[Dict[str, Any]] = None) -> int:
     now = now or _dt.datetime.now(UTC)
     if not enabled():
         _out("TFB_NEWS_BOARD is off: nothing read, nothing written")
@@ -682,12 +839,17 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         holdings = read_holdings(_quota_call(lambda: _raw_read(book, PORTFOLIO_TAB, "A1:B200"), _SLEEP, _out,
                                              "reading %s" % PORTFOLIO_TAB))
         today = now.astimezone(RIYADH).date()
-        data = collect(session, project, dataset, _env("TFB_BQ_LOCATION", "US"), holdings, today, query)
+        data = collect(session, project, dataset, _env("TFB_BQ_LOCATION", "US"), holdings, today, query, calendar)
     except Exception as e:  # noqa: BLE001 - one page; a failed read leaves the previous page in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
     for line in data["verdict"]:
         _out("VERDICT %s" % line)
+    _out("EVENTS %d in the next %d days" % (len(data["events"]), CALENDAR_DAYS))
+    if data["next_event"]:
+        _out(data["next_event"])
+    for note in data["events_notes"]:
+        _out("EVENTS note: %s" % note)
     for a in ARMS:
         t = data["tilt"].get(a)
         if t:
@@ -701,17 +863,18 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
     rows = page_rows(data, now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M"))
     if dry_run:
         _out("dry run: %d page row(s) computed (%d theme(s), %d sector(s), %d holding(s), %d moved name(s), %d trial "
-             "row(s)), nothing written" % (len(rows), len(data["themes"]), len(data["sectors"]), len(data["holdings"]),
-                                           len(data["shadow"]), len(data["trial"])))
+             "row(s), %d event(s) ahead), nothing written" % (
+                 len(rows), len(data["themes"]), len(data["sectors"]), len(data["holdings"]), len(data["shadow"]),
+                 len(data["trial"]), len(data["events"])))
         return 0
     try:                                                # one full overwrite: safe to send again after a quota answer
         _quota_call(lambda: write_grid(book, TAB, rows, WIDTH, 120), _SLEEP, _out, "writing %s" % TAB)
     except Exception as e:  # noqa: BLE001 - reported, with the exit code that marks the run failed
         _out("ERROR: %s: %s; the page was not written" % (type(e).__name__, text(e)[:300]))
         return 2
-    _out("wrote the %s page (%d rows: %d theme(s), %d sector(s), %d holding(s), %d moved name(s), %d trial row(s))"
-         % (TAB, len(rows), len(data["themes"]), len(data["sectors"]), len(data["holdings"]), len(data["shadow"]),
-            len(data["trial"])))
+    _out("wrote the %s page (%d rows: %d theme(s), %d sector(s), %d holding(s), %d moved name(s), %d trial row(s), "
+         "%d event(s) ahead)" % (TAB, len(rows), len(data["themes"]), len(data["sectors"]), len(data["holdings"]),
+                                 len(data["shadow"]), len(data["trial"]), len(data["events"])))
     return 0
 
 
