@@ -280,6 +280,10 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.13.0 (19 Nov 2026): the standing lost-opportunity comparison
+    "v_forward_universe": "6ec169c3371f74ccb3a483c798cc0ea7954913ca0eacbc2aaf37eb09fd4b3f93",
+    "v_investable_vs_market": "075fd625480241815199aea342de68a03a38767c07bda08d3e67f6d579dbcad3",
+    "v_missed_winners": "5d696fe1c1517c8e0134fffd2fa0d6fe14f5e3d9eb7dc46bba728700cdf43faf",
     # apply_bq_views 1.12.0 (19 Nov 2026): one sector per symbol, outcomes by sector, and trial C-2
     "v_symbol_sector": "f5018131ba52c2884030e246d759214473ba3ad30c5263288e9ff27575cbde64",
     "v_outcome_sector": "2a160aee50920fd78e1a89fcdac055d14abd30eb893523fbadbdc6f06f7fd04e",
@@ -323,9 +327,10 @@ EXPECTED_ORDER = [
     "v_news_signal_eval",
     "v_trial_shadow_v2",
     "v_symbol_sector", "v_outcome_sector", "v_trial_c2",
+    "v_forward_universe", "v_investable_vs_market", "v_missed_winners",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 27)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 30)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -2271,10 +2276,86 @@ def case_v35():
     assert _c2_reading(fwd, 60, 40, 30, -0.1, 1.0)[0] == "C-2 not ahead: keep the champion"
 
 
+def _missed_cause(status, reco, block_reason):
+    """Python replica of v_missed_winners.missed_cause (the CASE order matters)."""
+    if status == "INVESTABLE":
+        return "picked (investable)"
+    if status == "BLOCKED":
+        return "blocked: " + (block_reason if block_reason is not None else "no reason given")
+    if reco in ("SELL", "STRONG_SELL", "REDUCE", "AVOID"):
+        return "rated " + reco
+    if reco in ("BUY", "STRONG_BUY", "ACCUMULATE"):
+        return "rated buy, not investable"
+    return "watchlist " + ("unrated" if reco == "" else reco)
+
+
+def case_v36():
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [x.name for x in bv.load_objects()]
+    f, m, w = objs["v_forward_universe"], objs["v_investable_vs_market"], objs["v_missed_winners"]
+    assert (f.path.name, m.path.name, w.path.name) == ("88_v_forward_universe.sql", "89_v_investable_vs_market.sql",
+                                                      "90_v_missed_winners.sql")
+    assert f.kind == m.kind == w.kind == "VIEW"
+    fc, mc, wc = bv._code(f.template), bv._code(m.template), bv._code(w.template)
+    assert set(bv._REF.findall(fc)) - {"v_forward_universe"} == {"v_universe"}
+    assert set(bv._REF.findall(mc)) - {"v_investable_vs_market"} == {"v_forward_universe"}
+    assert set(bv._REF.findall(wc)) - {"v_missed_winners"} == {"v_forward_universe"}
+    assert names.index("v_universe") < names.index("v_forward_universe") < names.index("v_investable_vs_market") \
+        < names.index("v_missed_winners")
+    # the universe: liquid market-page equities, one record per symbol and day
+    for frag in ("WHERE source_page IN ('Global_Markets', 'Market_Leaders')",
+                 "AND UPPER(CAST(asset_class AS STRING)) = 'EQUITY'",
+                 "AND avg_volume_30d * current_price >= 1000000",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, snapshot_date ORDER BY captured_at DESC, source_page) = 1",
+                 "[('1W', 7), ('2W', 14)]",
+                 "AND q.snapshot_date >= DATE_ADD(p.snapshot_date, INTERVAL h.days DAY)",
+                 "AND q.snapshot_date <= DATE_ADD(p.snapshot_date, INTERVAL h.days + 6 DAY)",
+                 "ARRAY_AGG(q.current_price ORDER BY q.snapshot_date LIMIT 1)[OFFSET(0)] / p.current_price - 1) * 100",
+                 "WHERE ret_pp IS NOT NULL AND ABS(ret_pp) < 300",
+                 "ELSE IFNULL(NULLIF(CAST(sector AS STRING), ''), '(no sector)')\n    END AS sector",
+                 "CASE vb.vol_t WHEN 1 THEN 'LOW' WHEN 2 THEN 'MID' WHEN 3 THEN 'HIGH' END AS vol_band",
+                 "PERCENTILE_CONT(o.ret_pp, 0.5) OVER (PARTITION BY o.base_date, o.horizon) AS market_median_pp"):
+        assert frag in fc, frag
+    # the groups and the scoreboard columns
+    for frag in ("('MARKET', 'ALL')",
+                 "IF(f.status = 'INVESTABLE', ('INVESTABLE', 'ALL'), NULL)",
+                 "IF(f.reco IN ('BUY', 'STRONG_BUY', 'ACCUMULATE'), ('BUY_CALL', 'ALL'), NULL)",
+                 "IF(f.ret_pct_rank >= 0.9, ('BEST_DECILE', 'ALL'), NULL)",
+                 "('SECTOR', f.sector)",
+                 "IF(f.status = 'INVESTABLE' AND f.vol_band IS NOT NULL, ('INV_VOL', f.vol_band), NULL)",
+                 "ROUND(APPROX_QUANTILES(ret_pp, 100)[OFFSET(50)] - ANY_VALUE(market_median_pp), 2) AS vs_market_pp",
+                 "ROUND(100 * COUNTIF(ret_pp > market_median_pp) / COUNT(*), 1) AS beat_market_pct"):
+        assert frag in mc, frag
+    from core.sectors import YAHOO_TO_GICS_SECTOR                                       # the same fold as v_symbol_sector
+    for yahoo, gics in YAHOO_TO_GICS_SECTOR.items():
+        assert "WHEN '%s' THEN '%s'" % (yahoo, gics) in fc, yahoo
+    assert fc.count("      WHEN '") == len(YAHOO_TO_GICS_SECTOR)
+    assert "ORDER BY ret_pp DESC, symbol) AS pos" in wc and "WHERE pos <= 20" in wc
+    for tmpl in (f.template, m.template, w.template):
+        assert "the live system never reads BigQuery" in tmpl
+    # missed_cause: the replica against the view's CASE text, then the order of the branches
+    for when, out in (("WHEN status = 'INVESTABLE' THEN 'picked (investable)'", "picked (investable)"),
+                      ("WHEN status = 'BLOCKED' THEN CONCAT('blocked: ', IFNULL(block_reason, 'no reason given'))", None),
+                      ("WHEN reco IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID') THEN CONCAT('rated ', reco)", None),
+                      ("WHEN reco IN ('BUY', 'STRONG_BUY', 'ACCUMULATE') THEN 'rated buy, not investable'", None),
+                      ("ELSE CONCAT('watchlist ', IF(reco = '', 'unrated', reco))", None)):
+        assert when in wc, when
+    order = [wc.index(x) for x in ("WHEN status = 'INVESTABLE'", "WHEN status = 'BLOCKED'",
+                                   "WHEN reco IN ('SELL'", "WHEN reco IN ('BUY'", "ELSE CONCAT('watchlist ")]
+    assert order == sorted(order)
+    assert _missed_cause("INVESTABLE", "SELL", None) == "picked (investable)"
+    assert _missed_cause("BLOCKED", "BUY", "liquidity") == "blocked: liquidity"
+    assert _missed_cause("BLOCKED", "BUY", None) == "blocked: no reason given"
+    assert _missed_cause("WATCHLIST", "STRONG_SELL", None) == "rated STRONG_SELL"
+    assert _missed_cause("WATCHLIST", "ACCUMULATE", None) == "rated buy, not investable"
+    assert _missed_cause("WATCHLIST", "HOLD", None) == "watchlist HOLD"
+    assert _missed_cause("WATCHLIST", "", None) == "watchlist unrated"
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36]
 
 
 def test_v1(): case_v1()
@@ -2312,6 +2393,7 @@ def test_v32(): case_v32()
 def test_v33(): case_v33()
 def test_v34(): case_v34()
 def test_v35(): case_v35()
+def test_v36(): case_v36()
 
 
 if __name__ == "__main__":

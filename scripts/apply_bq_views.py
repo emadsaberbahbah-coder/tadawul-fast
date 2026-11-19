@@ -2,8 +2,24 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.12.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.13.0 (program register C8, Phase 2)
 ================================================================================
+v1.13.0 (19 Nov 2026, the standing lost-opportunity comparison). WHY (owner,
+19 Nov 2026 10:04 Riyadh, verbatim: "make better compsion between the ROI as
+the investable recommdadtion and the best avalaible in the market as actual
+result and what we are missed to be consider in the future as well"). The
+review of that morning had to rebuild the comparison by hand. New
+v_forward_universe: every liquid market-page equity and archived day with its
+forward 1W / 2W price return, status, call, sector and volatility tercile. New
+v_investable_vs_market: the investable list and the buy calls beside the
+market median, the best tenth, sectors and volatility terciles, per day. New
+v_missed_winners: the day's 20 best risers with the cause each was not a pick.
+In-sample read (31 Oct - 19 Nov): the investable list 0.19 points under the
+market median at one week (48.5% above it), the low-volatility tercile 0.37
+over and the high one 1.51 under, the best tenth 11.6 over. Nothing on a page,
+in a score or in a pick changes. Research views: the live system never reads
+BigQuery.
+
 v1.12.0 (19 Nov 2026, the second trial and outcomes by sector). WHY (owner,
 19 Nov 2026 01:18 Riyadh: full review - compare the calls with what the market
 did, how many investable names gained or lost, how to improve forecasting and
@@ -270,7 +286,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
