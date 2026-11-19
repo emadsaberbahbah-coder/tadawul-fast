@@ -1045,7 +1045,37 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _loss_return_pct). Changed: normalize_holding, _apply_drawdown_guard,
 #   _add_loser_eval. Removed: 0. Tests: tests/test_pf_dd_div_basis.py.
 #   Rollback: TFB_PF_DD_DIV_BASIS=off, or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.19.0"
+# ---------------------------------------------------------------------------
+# v1.20.0 (2026-11-19) [TOTAL-RETURN] THE P&L A HOLDING SHOWS COUNTS THE
+# DIVIDENDS IT RECEIVED
+# WHY (owner, Thu 19 Nov 2026 10:04 Riyadh: "still in some pages I see that
+#   SUPN.US showing high loss but the impact of the dividends received is not
+#   effective ... check and solve that now and in the future as well").
+#   1.19.0 taught the two loss rules to count dividends received, but the
+#   row's P&L columns stayed price only by design, so Portfolio_Decision
+#   still printed -18.3% for a holding whose result, with the special
+#   dividend kept after tax, was about -2.2% (the ledger's own Return %).
+# WHAT: a holding row whose ledger "Dividends Recv" is counted (the 1.19.0
+#   rule: a positive figure no larger than the position's cost, at the cost's
+#   FX) also carries
+#       dividends_sar    the dividends received, SAR
+#       total_pnl_sar    pnl_sar + dividends_sar
+#       total_pnl_pct    total_pnl_sar / cost_sar x 100
+#   and the KPIs carry total_pnl_sar / total_pnl_pct over the same rows as
+#   pnl_sar / pnl_pct, whenever at least one of them received a dividend.
+#   The page (10_My_Portfolio 1.5.22) shows these in its P&L columns; the
+#   price-only figure stays in pnl_sar / pnl_pct for every other reader.
+#   A row whose cost or P&L is withheld (research view, a rejected basis)
+#   gets no total, because there is nothing to add the dividend to.
+# GATE: TFB_PF_TOTAL_RETURN (default on; off / 0 / false / no omits the new
+#   fields). TFB_PF_DD_DIV_BASIS=off also omits them, so that switch still
+#   restores 1.18.1 exactly. A row and a KPI block without a counted
+#   dividend are byte-identical to 1.19.0.
+# Functions added: 2 (_env_total_return, _total_return_fields). Changed:
+#   _action_row, the KPI blocks of the research view and of the main payload.
+#   Removed: 0. Tests: tests/test_pf_total_return.py. Rollback:
+#   TFB_PF_TOTAL_RETURN=off, or revert.
+PORTFOLIO_ACTIONS_VERSION = "1.20.0"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -2301,6 +2331,50 @@ def _loss_return_pct(cand):
         return (pnl + div) / cost * 100.0, price_only, div
     except Exception:  # noqa: BLE001 - pure helper, never fatal
         return None, None, 0.0
+
+
+def _env_total_return():
+    """v1.20.0 [TOTAL-RETURN]: on (default) | off. Read at call time. Needs
+    the 1.19.0 dividend basis on as well."""
+    v = str(os.environ.get("TFB_PF_TOTAL_RETURN", "")).strip().lower()
+    return v not in ("off", "0", "false", "no") and _env_dd_div_basis()
+
+
+def _total_return_fields(cand):
+    """v1.20.0 [TOTAL-RETURN] PURE: {} unless the row has a P&L, a cost and a
+    counted dividend (the _loss_return_pct bound); else dividends_sar,
+    total_pnl_sar and total_pnl_pct. Never raises."""
+    try:
+        if not _env_total_return():
+            return {}
+        total_pct, _price_pct, div = _loss_return_pct(cand)
+        pnl = _to_float((cand or {}).get("pnl_sar"))
+        if total_pct is None or pnl is None or not div:
+            return {}
+        return {"dividends_sar": _round(div, 0), "total_pnl_sar": _round(pnl + div, 0),
+                "total_pnl_pct": _round(total_pct, 1)}
+    except Exception:  # noqa: BLE001 - display helper, never fatal
+        return {}
+
+
+def _total_return_kpis(cands):
+    """v1.20.0 [TOTAL-RETURN] PURE: {} unless a row with cost and P&L received
+    a counted dividend; else total_pnl_sar / total_pnl_pct over the rows that
+    carry both cost and P&L (the pnl_sar / pnl_pct population)."""
+    try:
+        if not _env_total_return():
+            return {}
+        covered = [c for c in cands or []
+                   if _to_float(c.get("cost_sar")) is not None and _to_float(c.get("pnl_sar")) is not None]
+        divs = [_loss_return_pct(c)[2] for c in covered]
+        if not covered or not any(divs):
+            return {}
+        cost = sum(_to_float(c["cost_sar"]) for c in covered)
+        total = sum(_to_float(c["pnl_sar"]) for c in covered) + sum(divs)
+        return {"total_pnl_sar": _round(total, 0),
+                "total_pnl_pct": _round(total / cost * 100.0, 1) if _pos_float(cost) else None}
+    except Exception:  # noqa: BLE001 - display helper, never fatal
+        return {}
 
 
 def normalize_holding(row, fx_rates, controls):
@@ -4175,6 +4249,7 @@ def _action_row(entry, review_date, controls):
         },
     }
     _annotate_hold_edge(row)  # v1.2.0 hold-edge stamp (env-gated)
+    row.update(_total_return_fields(cand))  # v1.20.0 [TOTAL-RETURN]: {} without a counted dividend
     if _sk_disp:
         # v1.13.1 [P-153]: machine-readable witness on the sukuk row only.
         row["detail"]["ladder_display"] = "sukuk_na"
@@ -4468,6 +4543,7 @@ def _research_view_portfolio(rows, ctl, fx_rates, upstream_meta, certification):
                 kpis["cost_basis_sar"] = _round(cost, 0) if cost else None
                 kpis["pnl_sar"] = _round(pnl, 0)
                 kpis["pnl_pct"] = _round(pnl / cost * 100.0, 1) if _pos_float(cost) else None
+                kpis.update(_total_return_kpis(covered))  # v1.20.0 [TOTAL-RETURN]
             else:
                 withheld.append("cost_basis_incomplete")
         published = any(kpis.get(key) is not None for key in
@@ -5274,6 +5350,7 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta, post_earnings=None):
             "positions": len(cands),
             "action_counts": counts,
             "blended_reliability": _round(blended_rel, 1),
+            **_total_return_kpis(cands),                              # v1.20.0 [TOTAL-RETURN]
         },
         "actions": action_rows,
         "sector_summary": sector_summary,

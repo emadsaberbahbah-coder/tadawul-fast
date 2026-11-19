@@ -46,9 +46,10 @@ def _g(cand, action="HOLD"):
 
 
 def test_version_and_manifest_pin():
-    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.19.0"
+    # 1.20.0 [TOTAL-RETURN] moved the pin; its own test file checks it.
+    assert pa.PORTFOLIO_ACTIONS_VERSION >= "1.19.0"
     manifest = open(os.path.join(_ROOT, "scripts", "verify_deployment.py"), encoding="utf-8").read()
-    assert '"1.19.0", "portfolio actions")' in manifest
+    assert '"%s", "portfolio actions")' % pa.PORTFOLIO_ACTIONS_VERSION in manifest
 
 
 def test_the_return_the_rules_judge_counts_the_dividends():
