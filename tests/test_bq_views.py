@@ -280,6 +280,8 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.15.0 (19 Nov 2026): C-2 per call, for the observe-only labels on the pages
+    "v_c2_calls": "95ac9bcde2a5be87bfa95a2bb1ee42eaf1a26dec0abfa498339ecb3a137acd0f",
     # apply_bq_views 1.14.0 (19 Nov 2026): the news learning loop (themes, weights, tilt, shadow list, trial)
     "v_news_theme_weekly": "0a336a53e3b201f1852777dd940d751bd9b65c6f3b6c20fce57407e2168b71c3",
     "v_news_sector_weights": "83e866325a7047aeea81d824f91139aae3d219dfa632f45b74b838e120d876c8",
@@ -336,9 +338,10 @@ EXPECTED_ORDER = [
     "v_forward_universe", "v_investable_vs_market", "v_missed_winners",
     "v_news_theme_weekly", "v_news_sector_weights", "v_news_sector_tilt", "v_news_overlay_list",
     "v_trial_news_overlay",
+    "v_c2_calls",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 35)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 36)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -2589,10 +2592,52 @@ def case_v37():
     assert round(-0.03 / 0.163 * math.sqrt(6 / 7), 2) == -0.17 and max(20, 2 * 14) == 28        # t_adj (the 19 Nov read) and need
 
 
+def _c2_why_out(confidence, rel, market, tup):
+    """Python replica of v_c2_calls.why_out (None for an eligible call)."""
+    out = [w for w, c in (("HIGH confidence", str(confidence or "").upper() == "HIGH"), ("reliability 80+", (rel or 0) >= 80),
+                          ("Tadawul", (market or "") == "Tadawul"), ("no analyst target", tup is None)) if c]
+    return ", ".join(out) or None
+
+
+def case_v38():
+    """v_c2_calls (1.15.0): C-2 per call, on v_trial_c2's own WITH block."""
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [x.name for x in bv.load_objects()]
+    v, t = objs["v_c2_calls"], objs["v_trial_c2"]
+    assert v.path.name == "96_v_c2_calls.sql" and v.kind == "VIEW"
+    code, trial = bv._code(v.template), bv._code(t.template)
+    assert set(bv._REF.findall(code)) - {"v_c2_calls"} == {"v_outcome_excess", "v_signal_history"}
+    assert names.index("v_c2_calls") > names.index("v_trial_c2")
+    # the same membership, character for character: base, sig, f, r and k of the trial
+    start, end = "WITH base AS (", "\n),\ndaily AS ("
+    block = trial[trial.index(start):trial.index(end)] + "\n)"
+    assert code.index(start) == code.index("AS\nWITH base AS (") + 3
+    assert code[code.index(start):].startswith(block + "\nSELECT\n"), "v_c2_calls must carry v_trial_c2's WITH block unchanged"
+    assert "WHERE scored" not in code and "FROM k;" in code                     # every call of the day, scored or not
+    for frag in ("mg AS market_group", "IF(eligible, pos, NULL) AS upside_rank", "CAST(CEIL(n_el / 2) AS INT64) AS keeps",
+                 "n_el AS eligible_calls", "ROUND(tup, 2) AS target_upside_pp", "  c2_keep,\n", "  scored\nFROM k;",
+                 "IF(UPPER(IFNULL(confidence, '')) = 'HIGH', 'HIGH confidence', NULL)",
+                 "IF(IFNULL(rel, 0) >= 80, 'reliability 80+', NULL)",
+                 "IF(IFNULL(market, '') = 'Tadawul', 'Tadawul', NULL)",
+                 "IF(tup IS NULL, 'no analyst target', NULL)], ', ')) AS why_out"):
+        assert frag in code, frag
+    assert "the live system never reads BigQuery" in v.template and "observe-only" in v.template
+    # why_out names exactly the conditions of eligibility that fail (the trial's own (a), (b) and the known upside)
+    for conf, rel, mkt, tup in (("HIGH", 70, "US", 10.0), ("MEDIUM", 85, "US", 10.0), ("MEDIUM", 70, "Tadawul", 10.0),
+                                ("MEDIUM", 70, "US", None), ("LOW", None, "US", 5.0), ("high", 90, "Tadawul", None)):
+        elig = _c2_keep([(1, "US", conf, rel, mkt, tup)])[1]
+        assert (_c2_why_out(conf, rel, mkt, tup) is None) == elig, (conf, rel, mkt, tup)
+    assert _c2_why_out("high", 90, "Tadawul", None) == "HIGH confidence, reliability 80+, Tadawul, no analyst target"
+    # the 19 Nov read: US 5 eligible -> 3 kept (EFC 33.47, NMM 32.61, MBIN 30.22); SB 28.85 and BNY 10.76 out
+    us = [(1, "US", "MEDIUM", 60, "US", 33.47), (2, "US", "MEDIUM", 60, "US", 32.61), (3, "US", "MEDIUM", 60, "US", 30.22),
+          (4, "US", "MEDIUM", 60, "US", 28.85), (5, "US", "MEDIUM", 60, "US", 10.76)]
+    assert [i for i, k in sorted(_c2_keep(us).items()) if k] == [1, 2, 3] and math.ceil(5 / 2) == 3
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38]
 
 
 def test_v1(): case_v1()
@@ -2632,6 +2677,7 @@ def test_v34(): case_v34()
 def test_v35(): case_v35()
 def test_v36(): case_v36()
 def test_v37(): case_v37()
+def test_v38(): case_v38()
 
 
 if __name__ == "__main__":
