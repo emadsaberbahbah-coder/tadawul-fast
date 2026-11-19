@@ -90,6 +90,11 @@ def main(src, dst):
     for r in rows:
         print("| %s | %s | %s | %s | %s | %s | %s to %s |" % (r["sector"], r["symbol"], r.get("price_ret_pct"), r.get("total_ret_pct"),
               r.get("cagr_pct"), r.get("max_drawdown_pct"), r.get("start_day"), r.get("end_day")))
+    print("\n| Fund | Price % | Total % | CAGR % | Max DD % | Window |\n|---|---|---|---|---|---|")
+    for sym in [cfg["benchmark"]] + [s["etf"] for s in cfg["sectors"]]:
+        m = cache.get(sym) or {}
+        print("| FUND %s | %s | %s | %s | %s | %s to %s |" % (sym, m.get("price_ret_pct"), m.get("total_ret_pct"), m.get("cagr_pct"),
+              m.get("max_drawdown_pct"), m.get("start_day"), m.get("end_day")))
     missing = [r["symbol"] for r in rows if r.get("note")]
     print("\nMissing: %s" % (", ".join(missing) or "none"))
 
