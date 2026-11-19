@@ -12,15 +12,22 @@ WHY (owner, 19 Nov 2026: is the China summit in the news analysis; world news - 
   one headline on what was at stake ("A trade truce deadline, new export controls, and Iran") was filed as war
   de-escalation because 'truce' is a ceasefire word, and "FOMC minutes and APEC Summit in focus" as a central-bank
   story.
-WHAT: (1) taxonomy 1.1.0 (data/news_gate_taxonomy.json), four MACRO event types: trade_deal (positive; before
-  de_escalation, so a trade truce is not a ceasefire), summit_diplomacy, ai_tech and election_politics (neutral:
-  the direction comes from the headline's own positive / negative words), English and Arabic terms. None of them
-  is in a verdict rule: evaluate() is unchanged, so no new type can raise CAUTION or NO_NEW_ENTRY. (2) Three more
+WHAT: (1) taxonomy 1.1.0 (data/news_gate_taxonomy.json), four MACRO event types: trade_deal (positive),
+  summit_diplomacy, ai_tech and election_politics (neutral: the direction comes from the headline's own
+  positive / negative words), English and Arabic terms. They are LABELS ONLY ("label_only": true) and can change
+  no older reading, by construction: (a) they stand after every older MACRO type and the first match wins, so a
+  headline that had a type keeps it (a recession, a default, a tariff, a crash or a strike named beside a summit,
+  AI or an election is still read as before - Codex P2, #1031); (b) a name's own headlines never take a
+  label-only type, so no new WATCH can appear on a name; (c) no verdict rule names them: evaluate() is unchanged.
+  The verdict, its drivers, the easing line and the name flags are the same for any input. (2) Three more
   searches a language: GDELT and Google-News English 'trade china', 'ai tech', 'politics'; Google-News Arabic
   'trade china ar', 'ai tech ar' - after the existing macro searches and before the names.
-NOT IN THIS VERSION: the GDELT document API still answers HTTP 429 to the runner on most runs (its name and
-  macro searches are skipped); the daily themes now reach BigQuery by another road (scripts/
-  archive_news_themes.py reads the public GDELT tables), and moving the headlines the same way is the next step.
+NOT IN THIS VERSION: (1) two older misreadings stay as they were, because correcting them changes the easing
+  line and a CAUTION rule and needs its own evidence: a "trade truce" is read as de_escalation ('truce'), and a
+  tariff cut as trade_sanctions ('tariff'). (2) The GDELT document API still answers HTTP 429 to the runner on
+  most runs (its name and macro searches are skipped); the daily themes now reach BigQuery by another road
+  (scripts/archive_news_themes.py reads the public GDELT tables), and moving the headlines the same way is the
+  next step.
 ROLLBACK: revert this file and data/news_gate_taxonomy.json to v1.1.0 / 1.0.0. No tab or header change.
 
 v1.1.0 (2026-11-16) -- [ISSUER-LINK] A HEADLINE COUNTS FOR A NAME ONLY IF IT IS ABOUT THAT ISSUER
@@ -476,6 +483,8 @@ class Classifier:
             self.events.append({
                 "type": ev["type"], "scope": ev["scope"], "direction": int(ev["direction"]),
                 "severity": ev["severity"],
+                # v1.2.0: a label-only type names a subject and never enters a rule
+                "label_only": ev.get("label_only") is True,
                 "terms": _norm_terms(list(ev.get("en") or []) + list(ev.get("ar") or [])),
             })
         def pair(key: str) -> List[str]:
@@ -501,8 +510,9 @@ class Classifier:
     def classify(self, title: str, scope: str) -> Dict[str, Any]:
         norm = normalize_text(title)
         company_first = scope != "MACRO"
+        # v1.2.0: a name's own headline never takes a label-only type (a negative one would flag the name WATCH)
         order = ([e for e in self.events if e["scope"] == "COMPANY"]
-                 + [e for e in self.events if e["scope"] == "MACRO"]) if company_first \
+                 + [e for e in self.events if e["scope"] == "MACRO" and not e["label_only"]]) if company_first \
             else [e for e in self.events if e["scope"] == "MACRO"]
         found = None
         for ev in order:

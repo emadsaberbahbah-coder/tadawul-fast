@@ -871,11 +871,10 @@ def test_g9_ascii_module_version_pin_and_workflow():
 
 # ----------------------------------------------------------------------------- G10 (v1.2.0 [TOPICS])
 TOPIC_CASES = [
-    # the two headlines of the Shenzhen week that were filed wrongly (archive, 15 - 18 Nov 2026)
-    ("What's at stake for Trump and Xi in Shenzhen: A trade truce deadline, new export controls, and Iran",
-     "trade_deal", 1),
+    # subjects the gate had no word for (archive, 12 - 19 Nov 2026)
     ("Trump, Xi and Putin open first three-way summit in Shenzhen", "summit_diplomacy", 0),
-    ("US and China agree trade deal as tariff relief lifts stocks higher", "trade_deal", 1),
+    ("US and China agree trade deal as stocks rise", "trade_deal", 1),
+    ("Washington eases export controls on chips to China", "trade_deal", 1),
     ("APEC leaders meet as exports drop", "summit_diplomacy", -1),
     ("G20 finance chiefs gather for high-level talks", "summit_diplomacy", 0),
     ("AI bubble fears grow as Nvidia falls", "ai_tech", -1),
@@ -895,35 +894,91 @@ def test_g10_topics_are_named(title, etype, direction):
     assert (got["event_type"], got["direction"]) == (etype, direction), got
 
 
+OLDER_MACRO = ["war_escalation", "de_escalation", "emergency_policy", "market_turmoil", "oil_supply", "central_bank",
+               "inflation_data", "jobs_data", "trade_sanctions", "credit_stress"]
+LABEL_ONLY = ["trade_deal", "summit_diplomacy", "ai_tech", "election_politics"]
+
+# A headline that names an older subject beside a new one keeps the older reading (Codex P2, #1031).
+MIXED_CASES = [
+    ("China faces recession as election uncertainty grows", "credit_stress"),
+    ("Election result sparks recession fears", "credit_stress"),
+    ("Summit overshadowed as debt default looms", "credit_stress"),
+    ("Nvidia and AI stocks slide as default risk rises", "credit_stress"),
+    ("AI bubble bursts as bank run hits lenders", "emergency_policy"),
+    ("Trade deal collapses as emergency rate cut announced", "emergency_policy"),
+    ("Circuit breaker halts trading after trade deal hopes fade", "market_turmoil"),
+    ("Stocks plunge as summit ends without trade agreement", "market_turmoil"),
+    ("Trade agreement signed as ceasefire holds", "de_escalation"),
+    ("Israel and Hamas agree ceasefire deal", "de_escalation"),
+    ("Truce holds in Gaza for a third day", "de_escalation"),
+    ("Missile strike reported as leaders gather for summit", "war_escalation"),
+    ("FOMC minutes and APEC Summit in focus.", "central_bank"),
+    ("OPEC+ summit ends with output cut", "oil_supply"),
+    ("Trump threatens new tariff on China ahead of summit", "trade_sanctions"),
+    ("Sanctions on chip export widen as AI trade cools", "trade_sanctions"),
+    ("Fed holds rates steady as Powell signals patience", "central_bank"),
+    ("Recession fears return", "credit_stress"),
+    # two older misreadings, kept on purpose: correcting them changes the easing line and a CAUTION rule
+    ("What's at stake for Trump and Xi in Shenzhen: A trade truce deadline, new export controls, and Iran",
+     "de_escalation"),
+    ("US and China agree trade deal as tariff relief lifts stocks higher", "trade_sanctions"),
+]
+
+
+def _older_only(tax):
+    """The taxonomy as it was before the label-only types: the same file without them."""
+    return dict(tax, events=[e for e in tax["events"] if not e.get("label_only")])
+
+
 def test_g10_order_keeps_the_older_readings():
     tax = ng.load_taxonomy()
-    types = [e["type"] for e in tax["events"]]
-    assert types.index("war_escalation") < types.index("trade_deal") < types.index("de_escalation")
-    assert types.index("trade_sanctions") < types.index("summit_diplomacy") < types.index("ai_tech") \
-        < types.index("election_politics") < types.index("credit_stress")
-    assert types.index("oil_supply") < types.index("central_bank") < types.index("summit_diplomacy")
-    new = {e["type"]: e for e in tax["events"] if e["type"] in ("trade_deal", "summit_diplomacy", "ai_tech",
-                                                                "election_politics")}
-    assert {t: (e["scope"], e["direction"], e["severity"]) for t, e in new.items()} == {
-        "trade_deal": ("MACRO", 1, "M"), "summit_diplomacy": ("MACRO", 0, "M"), "ai_tech": ("MACRO", 0, "M"),
-        "election_politics": ("MACRO", 0, "M")}
+    macro = [e["type"] for e in tax["events"] if e["scope"] == "MACRO"]
+    assert macro == OLDER_MACRO + LABEL_ONLY                     # every older type first, in its old order
+    assert [e["type"] for e in tax["events"] if "label_only" in e] == LABEL_ONLY
+    new = {e["type"]: e for e in tax["events"] if e["type"] in LABEL_ONLY}
+    assert {t: (e["scope"], e["direction"], e["severity"], e["label_only"]) for t, e in new.items()} == {
+        "trade_deal": ("MACRO", 1, "M", True), "summit_diplomacy": ("MACRO", 0, "M", True),
+        "ai_tech": ("MACRO", 0, "M", True), "election_politics": ("MACRO", 0, "M", True)}
     assert all(e["en"] and e["ar"] for e in new.values())
     clf = ng.Classifier(tax)
-    for title, etype in (
-            ("Israel and Hamas agree ceasefire deal", "de_escalation"),               # a ceasefire is still one
-            ("Truce holds in Gaza for a third day", "de_escalation"),
-            ("Missile strike reported as leaders gather for summit", "war_escalation"),  # fighting comes first
-            ("FOMC minutes and APEC Summit in focus.", "central_bank"),              # mixed: the older type wins
-            ("OPEC+ summit ends with output cut", "oil_supply"),
-            ("Trump threatens new tariff on China ahead of summit", "trade_sanctions"),
-            ("Fed holds rates steady as Powell signals patience", "central_bank"),
-            ("Recession fears return", "credit_stress")):
+    assert [e["type"] for e in clf.events if e["label_only"]] == LABEL_ONLY
+    # only a JSON true marks a label: false or a word does not
+    loose = dict(tax, events=[dict(e, label_only={"ai_tech": "yes", "summit_diplomacy": False}.get(e["type"], True))
+                              if e["type"] in LABEL_ONLY else e for e in tax["events"]])
+    assert [e["type"] for e in ng.Classifier(loose).events if e["label_only"]] == ["trade_deal", "election_politics"]
+    for title, etype in MIXED_CASES:
         assert clf.classify(title, "MACRO")["event_type"] == etype, title
     # short words are whole words: 'apec' / 'g7' / 'g20' never match inside another word
     for title in ("Capecitabine trial data due", "Airbag7 recall widens", "Dog20 token lists"):
         assert clf.classify(title, "MACRO")["event_type"] == "", title
     # a company's own story keeps its company type
     assert clf.classify("Nvidia quarterly results beat forecasts", "NVDA.US")["event_type"] == "earnings"
+
+
+def test_g10_label_only_types_change_no_older_reading():
+    tax = ng.load_taxonomy()
+    now, was = ng.Classifier(tax), ng.Classifier(_older_only(tax))
+    assert [e["type"] for e in was.events if e["scope"] == "MACRO"] == OLDER_MACRO
+    titles = [t for t, _ in MIXED_CASES] + [t for t, _, _ in TOPIC_CASES] + [r["title"] for r in GDELT_GEO["articles"]]
+    kept = named = 0
+    for title in titles:
+        before, after = was.classify(title, "MACRO"), now.classify(title, "MACRO")
+        if before["event_type"]:
+            assert after == before, title                        # it had a reading: the same reading, whole
+            kept += 1
+        else:
+            assert after["event_type"] in LABEL_ONLY + [""], title   # it had none: a label or still none
+            named += after["event_type"] in LABEL_ONLY
+        # a name's own headline is read exactly as before, so no new flag can reach a name
+        assert now.classify(title, "NVDA.US") == was.classify(title, "NVDA.US"), title
+    assert kept >= len(MIXED_CASES) and named == len(TOPIC_CASES)
+    # every term of a label-only type is alive: alone, it is read as its own type
+    for e in tax["events"]:
+        if e.get("label_only"):
+            for term in e["en"] + e["ar"]:
+                assert now.classify(term, "MACRO")["event_type"] == e["type"], (e["type"], term)
+                own = now.classify(term, "NVDA.US")
+                assert own == was.classify(term, "NVDA.US") and own["event_type"] not in LABEL_ONLY, (e["type"], term)
 
 
 def test_g10_new_types_never_move_the_verdict():
@@ -942,7 +997,24 @@ def test_g10_new_types_never_move_the_verdict():
     cl = _clusters(items, QUIET)
     assert {c["event_type"] for c in cl} == {"summit_diplomacy", "ai_tech", "election_politics"}
     g = ng.evaluate(cl, [], {}, QUIET)
-    assert g["verdict"] == "GO" and g["drivers"] == [] and g["positives"] == []
+    assert g["verdict"] == "GO" and g["drivers"] == [] and g["positives"] == [] and g["names"] == {}
+    # an older subject named beside a new one still counts: a recession story with an election word is CAUTION
+    mixed = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/m1", "China faces recession as election uncertainty grows", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/m2", "China faces recession as election uncertainty grows", "20261030T101000Z", "apnews.com"),
+    ]), "MACRO", "politics")
+    cm = _clusters(mixed, QUIET)
+    assert [(c["event_type"], c["anchor"]) for c in cm] == [("credit_stress", "china")]
+    gm = ng.evaluate(cm, [], {}, QUIET)
+    assert gm["verdict"] == "CAUTION" and len(gm["drivers"]) == 1
+    assert gm["drivers"][0].startswith("macro: credit_stress/china grade ")
+    # a name's own headline on AI or an election takes no label-only type, so the name is not flagged
+    own = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/n1", "AI bubble fears grow as Nvidia falls", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/n2", "Nvidia shares drop on election uncertainty", "20261030T101000Z", "apnews.com"),
+    ]), "NVDA.US", "name")
+    assert _clusters(own, QUIET) == []
+    assert ng.evaluate(_clusters(own, QUIET), [], {}, QUIET)["names"] == {}
 
 
 def test_g10_topic_searches():
