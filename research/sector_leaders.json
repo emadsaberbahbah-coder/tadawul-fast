@@ -1,0 +1,622 @@
+{
+ "start": "2023-11-19",
+ "benchmark": "SPY",
+ "sectors": [
+  {
+   "sector": "Information Technology",
+   "etf": "XLK",
+   "companies": [
+    {
+     "symbol": "AAPL",
+     "name": "Apple Inc.",
+     "mcap_b": 5084
+    },
+    {
+     "symbol": "MSFT",
+     "name": "Microsoft Corporation",
+     "mcap_b": 3775
+    },
+    {
+     "symbol": "NVDA",
+     "name": "NVIDIA Corporation",
+     "mcap_b": 3625
+    },
+    {
+     "symbol": "AVGO",
+     "name": "Broadcom Inc.",
+     "mcap_b": 1690
+    },
+    {
+     "symbol": "AMD",
+     "name": "Advanced Micro Devices, Inc.",
+     "mcap_b": 877
+    },
+    {
+     "symbol": "MU",
+     "name": "Micron Technology, Inc.",
+     "mcap_b": 798
+    },
+    {
+     "symbol": "PLTR",
+     "name": "Palantir Technologies Inc.",
+     "mcap_b": 377
+    },
+    {
+     "symbol": "CSCO",
+     "name": "Cisco Systems, Inc.",
+     "mcap_b": 374
+    },
+    {
+     "symbol": "ORCL",
+     "name": "Oracle Corporation",
+     "mcap_b": 355
+    },
+    {
+     "symbol": "PANW",
+     "name": "Palo Alto Networks, Inc.",
+     "mcap_b": 293
+    }
+   ]
+  },
+  {
+   "sector": "Financials",
+   "etf": "XLF",
+   "companies": [
+    {
+     "symbol": "BRK-B",
+     "name": "Berkshire Hathaway Inc.",
+     "mcap_b": 1233
+    },
+    {
+     "symbol": "JPM",
+     "name": "JPMorgan Chase & Co.",
+     "mcap_b": 861
+    },
+    {
+     "symbol": "V",
+     "name": "Visa Inc.",
+     "mcap_b": 775
+    },
+    {
+     "symbol": "MA",
+     "name": "Mastercard Incorporated",
+     "mcap_b": 547
+    },
+    {
+     "symbol": "BAC",
+     "name": "Bank of America Corporation",
+     "mcap_b": 336
+    },
+    {
+     "symbol": "MS",
+     "name": "Morgan Stanley",
+     "mcap_b": 275
+    },
+    {
+     "symbol": "GS",
+     "name": "The Goldman Sachs Group, Inc.",
+     "mcap_b": 252
+    },
+    {
+     "symbol": "WFC",
+     "name": "Wells Fargo & Company",
+     "mcap_b": 241
+    },
+    {
+     "symbol": "AXP",
+     "name": "American Express Company",
+     "mcap_b": 211
+    },
+    {
+     "symbol": "C",
+     "name": "Citigroup Inc.",
+     "mcap_b": 193
+    }
+   ]
+  },
+  {
+   "sector": "Industrials",
+   "etf": "XLI",
+   "companies": [
+    {
+     "symbol": "GE",
+     "name": "GE Aerospace",
+     "mcap_b": 339
+    },
+    {
+     "symbol": "CAT",
+     "name": "Caterpillar Inc.",
+     "mcap_b": 261
+    },
+    {
+     "symbol": "RTX",
+     "name": "RTX Corporation",
+     "mcap_b": 261
+    },
+    {
+     "symbol": "UNP",
+     "name": "Union Pacific Corporation",
+     "mcap_b": 173
+    },
+    {
+     "symbol": "DE",
+     "name": "Deere & Company",
+     "mcap_b": 170
+    },
+    {
+     "symbol": "LMT",
+     "name": "Lockheed Martin Corporation",
+     "mcap_b": 134
+    },
+    {
+     "symbol": "ETN",
+     "name": "Eaton Corporation plc",
+     "mcap_b": 131
+    },
+    {
+     "symbol": "BA",
+     "name": "The Boeing Company",
+     "mcap_b": 129
+    },
+    {
+     "symbol": "PH",
+     "name": "Parker-Hannifin Corporation",
+     "mcap_b": 115
+    },
+    {
+     "symbol": "GD",
+     "name": "General Dynamics Corporation",
+     "mcap_b": 96
+    }
+   ]
+  },
+  {
+   "sector": "Consumer Discretionary",
+   "etf": "XLY",
+   "companies": [
+    {
+     "symbol": "AMZN",
+     "name": "Amazon.com, Inc.",
+     "mcap_b": 2895
+    },
+    {
+     "symbol": "TSLA",
+     "name": "Tesla, Inc.",
+     "mcap_b": 1517
+    },
+    {
+     "symbol": "HD",
+     "name": "The Home Depot, Inc.",
+     "mcap_b": 338
+    },
+    {
+     "symbol": "MCD",
+     "name": "McDonald's Corporation",
+     "mcap_b": 193
+    },
+    {
+     "symbol": "CVNA",
+     "name": "Carvana Co.",
+     "mcap_b": 182
+    },
+    {
+     "symbol": "TJX",
+     "name": "The TJX Companies, Inc.",
+     "mcap_b": 155
+    },
+    {
+     "symbol": "LOW",
+     "name": "Lowe's Companies, Inc.",
+     "mcap_b": 123
+    },
+    {
+     "symbol": "SBUX",
+     "name": "Starbucks Corporation",
+     "mcap_b": 123
+    },
+    {
+     "symbol": "BKNG",
+     "name": "Booking Holdings Inc.",
+     "mcap_b": 115
+    },
+    {
+     "symbol": "MAR",
+     "name": "Marriott International, Inc.",
+     "mcap_b": 109
+    }
+   ]
+  },
+  {
+   "sector": "Health Care",
+   "etf": "XLV",
+   "companies": [
+    {
+     "symbol": "LLY",
+     "name": "Eli Lilly and Company",
+     "mcap_b": 1202
+    },
+    {
+     "symbol": "JNJ",
+     "name": "Johnson & Johnson",
+     "mcap_b": 641
+    },
+    {
+     "symbol": "ABBV",
+     "name": "AbbVie Inc.",
+     "mcap_b": 499
+    },
+    {
+     "symbol": "MRK",
+     "name": "Merck & Co., Inc.",
+     "mcap_b": 324
+    },
+    {
+     "symbol": "UNH",
+     "name": "UnitedHealth Group Incorporated",
+     "mcap_b": 298
+    },
+    {
+     "symbol": "TMO",
+     "name": "Thermo Fisher Scientific Inc.",
+     "mcap_b": 255
+    },
+    {
+     "symbol": "AMGN",
+     "name": "Amgen Inc.",
+     "mcap_b": 237
+    },
+    {
+     "symbol": "GILD",
+     "name": "Gilead Sciences, Inc.",
+     "mcap_b": 211
+    },
+    {
+     "symbol": "ABT",
+     "name": "Abbott Laboratories",
+     "mcap_b": 180
+    },
+    {
+     "symbol": "PFE",
+     "name": "Pfizer Inc.",
+     "mcap_b": 160
+    }
+   ]
+  },
+  {
+   "sector": "Communication Services",
+   "etf": "XLC",
+   "companies": [
+    {
+     "symbol": "GOOGL",
+     "name": "Alphabet Inc.",
+     "mcap_b": 3384
+    },
+    {
+     "symbol": "META",
+     "name": "Meta Platforms, Inc.",
+     "mcap_b": 1582
+    },
+    {
+     "symbol": "NFLX",
+     "name": "Netflix, Inc.",
+     "mcap_b": 240
+    },
+    {
+     "symbol": "DIS",
+     "name": "The Walt Disney Company",
+     "mcap_b": 205
+    },
+    {
+     "symbol": "VZ",
+     "name": "Verizon Communications Inc.",
+     "mcap_b": 189
+    },
+    {
+     "symbol": "TMUS",
+     "name": "T-Mobile US, Inc.",
+     "mcap_b": 173
+    },
+    {
+     "symbol": "T",
+     "name": "AT&T Inc.",
+     "mcap_b": 147
+    },
+    {
+     "symbol": "APP",
+     "name": "AppLovin Corporation",
+     "mcap_b": 132
+    },
+    {
+     "symbol": "CMCSA",
+     "name": "Comcast Corporation",
+     "mcap_b": 88
+    },
+    {
+     "symbol": "LYV",
+     "name": "Live Nation Entertainment, Inc.",
+     "mcap_b": 42
+    }
+   ]
+  },
+  {
+   "sector": "Real Estate",
+   "etf": "XLRE",
+   "companies": [
+    {
+     "symbol": "WELL",
+     "name": "Welltower Inc.",
+     "mcap_b": 181
+    },
+    {
+     "symbol": "PLD",
+     "name": "Prologis, Inc.",
+     "mcap_b": 117
+    },
+    {
+     "symbol": "EQIX",
+     "name": "Equinix, Inc.",
+     "mcap_b": 103
+    },
+    {
+     "symbol": "AMT",
+     "name": "American Tower Corporation",
+     "mcap_b": 85
+    },
+    {
+     "symbol": "SPG",
+     "name": "Simon Property Group, Inc.",
+     "mcap_b": 75
+    },
+    {
+     "symbol": "DLR",
+     "name": "Digital Realty Trust, Inc.",
+     "mcap_b": 67
+    },
+    {
+     "symbol": "PSA",
+     "name": "Public Storage",
+     "mcap_b": 62
+    },
+    {
+     "symbol": "O",
+     "name": "Realty Income Corporation",
+     "mcap_b": 55
+    },
+    {
+     "symbol": "VTR",
+     "name": "Ventas, Inc.",
+     "mcap_b": 46
+    },
+    {
+     "symbol": "CBRE",
+     "name": "CBRE Group, Inc.",
+     "mcap_b": 38
+    }
+   ]
+  },
+  {
+   "sector": "Consumer Staples",
+   "etf": "XLP",
+   "companies": [
+    {
+     "symbol": "WMT",
+     "name": "Walmart Inc.",
+     "mcap_b": 1010
+    },
+    {
+     "symbol": "COST",
+     "name": "Costco Wholesale Corporation",
+     "mcap_b": 483
+    },
+    {
+     "symbol": "KO",
+     "name": "The Coca-Cola Company",
+     "mcap_b": 414
+    },
+    {
+     "symbol": "PG",
+     "name": "The Procter & Gamble Company",
+     "mcap_b": 390
+    },
+    {
+     "symbol": "PM",
+     "name": "Philip Morris International Inc.",
+     "mcap_b": 290
+    },
+    {
+     "symbol": "PEP",
+     "name": "PepsiCo, Inc.",
+     "mcap_b": 193
+    },
+    {
+     "symbol": "MO",
+     "name": "Altria Group, Inc.",
+     "mcap_b": 124
+    },
+    {
+     "symbol": "MNST",
+     "name": "Monster Beverage Corporation",
+     "mcap_b": 88
+    },
+    {
+     "symbol": "MDLZ",
+     "name": "Mondelez International, Inc.",
+     "mcap_b": 84
+    },
+    {
+     "symbol": "CL",
+     "name": "Colgate-Palmolive Company",
+     "mcap_b": 79
+    }
+   ]
+  },
+  {
+   "sector": "Utilities",
+   "etf": "XLU",
+   "companies": [
+    {
+     "symbol": "NEE",
+     "name": "NextEra Energy, Inc.",
+     "mcap_b": 178
+    },
+    {
+     "symbol": "SO",
+     "name": "The Southern Company",
+     "mcap_b": 110
+    },
+    {
+     "symbol": "DUK",
+     "name": "Duke Energy Corporation",
+     "mcap_b": 101
+    },
+    {
+     "symbol": "CEG",
+     "name": "Constellation Energy Corporation",
+     "mcap_b": 91
+    },
+    {
+     "symbol": "AEP",
+     "name": "American Electric Power Company, Inc.",
+     "mcap_b": 68
+    },
+    {
+     "symbol": "D",
+     "name": "Dominion Energy, Inc.",
+     "mcap_b": 59
+    },
+    {
+     "symbol": "XEL",
+     "name": "Xcel Energy Inc.",
+     "mcap_b": 52
+    },
+    {
+     "symbol": "ETR",
+     "name": "Entergy Corporation",
+     "mcap_b": 52
+    },
+    {
+     "symbol": "SRE",
+     "name": "Sempra",
+     "mcap_b": 50
+    },
+    {
+     "symbol": "EXC",
+     "name": "Exelon Corporation",
+     "mcap_b": 47
+    }
+   ]
+  },
+  {
+   "sector": "Energy",
+   "etf": "XLE",
+   "companies": [
+    {
+     "symbol": "XOM",
+     "name": "ExxonMobil Holdings Corporation",
+     "mcap_b": 655
+    },
+    {
+     "symbol": "CVX",
+     "name": "Chevron Corporation",
+     "mcap_b": 402
+    },
+    {
+     "symbol": "COP",
+     "name": "ConocoPhillips",
+     "mcap_b": 165
+    },
+    {
+     "symbol": "MPC",
+     "name": "Marathon Petroleum Corporation",
+     "mcap_b": 102
+    },
+    {
+     "symbol": "VLO",
+     "name": "Valero Energy Corporation",
+     "mcap_b": 96
+    },
+    {
+     "symbol": "PSX",
+     "name": "Phillips 66",
+     "mcap_b": 96
+    },
+    {
+     "symbol": "WMB",
+     "name": "The Williams Companies, Inc.",
+     "mcap_b": 84
+    },
+    {
+     "symbol": "EOG",
+     "name": "EOG Resources, Inc.",
+     "mcap_b": 80
+    },
+    {
+     "symbol": "SLB",
+     "name": "SLB N.V.",
+     "mcap_b": 71
+    },
+    {
+     "symbol": "KMI",
+     "name": "Kinder Morgan, Inc.",
+     "mcap_b": 70
+    }
+   ]
+  },
+  {
+   "sector": "Materials",
+   "etf": "XLB",
+   "companies": [
+    {
+     "symbol": "LIN",
+     "name": "Linde plc",
+     "mcap_b": 234
+    },
+    {
+     "symbol": "SCCO",
+     "name": "Southern Copper Corporation",
+     "mcap_b": 133
+    },
+    {
+     "symbol": "NEM",
+     "name": "Newmont Corporation",
+     "mcap_b": 109
+    },
+    {
+     "symbol": "SHW",
+     "name": "The Sherwin-Williams Company",
+     "mcap_b": 84
+    },
+    {
+     "symbol": "ECL",
+     "name": "Ecolab Inc.",
+     "mcap_b": 83
+    },
+    {
+     "symbol": "FCX",
+     "name": "Freeport-McMoRan Inc.",
+     "mcap_b": 71
+    },
+    {
+     "symbol": "APD",
+     "name": "Air Products and Chemicals, Inc.",
+     "mcap_b": 69
+    },
+    {
+     "symbol": "NUE",
+     "name": "Nucor Corporation",
+     "mcap_b": 57
+    },
+    {
+     "symbol": "MLM",
+     "name": "Martin Marietta Materials, Inc.",
+     "mcap_b": 37
+    },
+    {
+     "symbol": "VMC",
+     "name": "Vulcan Materials Company",
+     "mcap_b": 36
+    }
+   ]
+  }
+ ]
+}

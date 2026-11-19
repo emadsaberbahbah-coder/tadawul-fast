@@ -1,0 +1,35 @@
+# One-off research job on a research branch (never merged): the US sector leaders' 3-year return.
+# Owner, 20 Nov 2026 01:35 Riyadh. Public Yahoo data only; contents: read; no secret.
+name: 🔬 Research - sector leaders 3-year return
+
+on:
+  push:
+    branches: [research/sector-leaders-3y]
+    paths: ["research/**", ".github/workflows/research_sector_leaders.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: 🔬 Fetch and measure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: 📦 Install
+        run: python -m pip install --quiet requests
+      - name: 🔬 Measure
+        run: python research/sector_leaders_3y.py research/sector_leaders.json sector_leaders_3y.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: 📤 Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: sector-leaders-3y
+          path: |
+            sector_leaders_3y.csv
+            sector_leaders_3y.csv.bench.json
