@@ -165,7 +165,10 @@ def test_current_producer_keeps_consumer_compatible_wire_format(zone):
         after = time.time()
         assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}", stamp)
         state, instant = sync._uv_parse_value(feed_value(stamp))
-        assert state == "OK" and math.floor(before) <= instant <= after
+        # The stamp is cut to whole seconds from the C library's clock (time.strftime), which trails time.time()
+        # by up to one kernel tick: in the first milliseconds of a second it still reads the second before
+        # (CI, 19 Nov 2026: before = ...861.0003, stamp = ...860). One second of room; a zone fault is hours.
+        assert state == "OK" and math.floor(before) - 1 <= instant <= after
 
 
 class FakeSheets:
