@@ -1,0 +1,26 @@
+[
+ [
+  " * Version: 1.5.22\n *\n * v1.5.22 (2026-11-19)  (TOTAL-RETURN: A HOLDING'S P&L ON PORTFOLIO_DECISION\n *                        COUNTS THE DIVIDENDS IT RECEIVED; ALL v1.5.21 logic\n *                        carried verbatim)\n * ---------------------------------------------------------------\n * WHY (owner, 19 Nov 2026 10:04 Riyadh: 'still in some pages I see that\n * SUPN.US showing high loss but the impact of the dividends received is not\n * effective ... check and solve that now and in the future as well').\n * Since v1.5.21 the backend's loss rules count the dividends a holding has\n * received, but this page's 'P&L SAR' and 'P&L %' columns still printed the\n * price-only figure: SUPN.US read -18.3% while the ledger's own Return %,\n * with the special dividend kept after tax, was about -2.2%.\n * WHAT: portfolio_actions 1.20.0 sends, for a holding whose ledger dividend\n * it counts, dividends_sar, total_pnl_sar and total_pnl_pct, and in the\n * KPIs total_pnl_sar and total_pnl_pct. pdTotalOr_ (pure) takes the total\n * when it is a finite number and the price-only figure otherwise.\n *  (1) pdActionToRow_: 'P&L SAR' and 'P&L %' show the total; the Advisor\n *      Note of that row ends ' | P&L counts dividends received <d> SAR\n *      (price only <p>%)' (pdTotalNote_, pure), so both figures are on the\n *      page.\n *  (2) pdKpiValues_: the 'P&L (SAR)' and 'P&L %' tiles show the totals.\n * Every future dividend, and the tax recorded against it in _Dividend_Log,\n * reaches these columns the same way: through the ledger, with no change\n * here. A row and a KPI block without a counted dividend, and any reply of\n * an older backend, render exactly as in v1.5.21. The column names do not\n * change, so every reader of the page by header keeps working.\n * GATE: none in this file. The switch is the backend's TFB_PF_TOTAL_RETURN\n * (default on; off sends no totals and the page shows price only).\n * Functions added (0 removed): pdTotalOr_, pdTotalNote_ (pure). Changed:\n * pdActionToRow_ (three cells), pdKpiValues_ (two cells).\n * Harness: tests/test_pd_v1522_total_return.js (REAL file; the v1.5.21 base\n * is rebuilt by reversing these edits, SHA-256 pinned).\n * ROLLBACK: backend TFB_PF_TOTAL_RETURN = off (no re-paste); or re-paste\n * v1.5.21.\n",
+  " * Version: 1.5.21\n"
+ ],
+ [
+  "var PD_VERSION = '1.5.22';\n",
+  "var PD_VERSION = '1.5.21';\n"
+ ],
+ [
+  "/* v1.5.22 [TOTAL-RETURN] PURE: the backend's total (price change plus dividends\n * received) when it is a finite number, else the price-only figure. */\nfunction pdTotalOr_(total, price) {\n  if (total === null || total === undefined || total === '' || typeof total === 'boolean') return price;\n  var n = Number(total);\n  return isFinite(n) ? n : price;\n}\n\n/* v1.5.22 [TOTAL-RETURN] PURE: the Advisor Note, plus what the P&L columns\n * count when the row carries a total. */\nfunction pdTotalNote_(a) {\n  var note = (a && a.advisor_note !== null && a.advisor_note !== undefined) ? String(a.advisor_note) : '';\n  if (!a || pdTotalOr_(a.total_pnl_pct, null) === null) return note;\n  var div = pdTotalOr_(a.dividends_sar, null);\n  var price = pdTotalOr_(a.pnl_pct, null);\n  var tail = 'P&L counts dividends received' + (div !== null ? ' ' + Math.round(div) + ' SAR' : '') +\n      (price !== null ? ' (price only ' + price + '%)' : '');\n  return note ? note + ' | ' + tail : tail;\n}\n\n",
+  ""
+ ],
+ [
+  "          pdCell_(pdTotalOr_(a.total_pnl_sar, a.pnl_sar)),\n          pdCell_(pdTotalOr_(a.total_pnl_pct, a.pnl_pct)), pdCell_(a.weight_pct),\n",
+  "          pdCell_(a.pnl_sar), pdCell_(a.pnl_pct), pdCell_(a.weight_pct),\n"
+ ],
+ [
+  "          pdCell_(pdTotalNote_(a))];\n",
+  "          pdCell_(a.advisor_note)];\n"
+ ],
+ [
+  "          pdCell_(k.cash_sar), pdCell_(k.cash_pct),\n          pdCell_(pdTotalOr_(k.total_pnl_sar, k.pnl_sar)),\n          pdCell_(pdTotalOr_(k.total_pnl_pct, k.pnl_pct)), pdCell_(k.deployable_sar),\n",
+  "          pdCell_(k.cash_sar), pdCell_(k.cash_pct), pdCell_(k.pnl_sar),\n          pdCell_(k.pnl_pct), pdCell_(k.deployable_sar),\n"
+ ]
+]

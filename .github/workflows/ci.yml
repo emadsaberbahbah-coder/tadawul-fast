@@ -2,8 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.85 (2026-11-18) -- DIVIDEND BASIS AND HOLDING READ COLUMNS
+# VERSION 1.1.86 (2026-11-19) -- TOTAL RETURN ON HOLDINGS
 #
+# (1.1.85, 2026-11-18: DIVIDEND BASIS AND HOLDING READ COLUMNS)
+#
+# v1.1.86: run tests/test_pf_total_return.py (portfolio_actions 1.20.0: a
+# holding's P&L counts the dividends it received, beside the price-only figure)
+# and tests/test_pd_v1522_total_return.py (10_My_Portfolio 1.5.22 shows it).
 # v1.1.85: run tests/test_pf_dd_div_basis.py (portfolio_actions 1.19.0: the
 # loss rules count the dividends received), tests/test_pd_v1521_div_basis.py
 # (10_My_Portfolio 1.5.21 sends them) and
@@ -1209,7 +1214,9 @@ jobs:
             tests/test_portfolio_action_reconciliation.py \
             tests/test_pf_custody_tier.py \
             tests/test_pf_dd_div_basis.py \
+            tests/test_pf_total_return.py \
             tests/test_pd_v1521_div_basis.py \
+            tests/test_pd_v1522_total_return.py \
             tests/test_fdc_v100_final_decision_column.py \
             tests/test_pf_research_view_p06.py \
             tests/test_portfolio_exact_funding.py \
