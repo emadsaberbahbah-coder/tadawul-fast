@@ -20,8 +20,9 @@
 -- COLUMNS: symbol, base_date, horizon, ret_pp, status (investability_status),
 -- reco (recommendation, spaces as _), block_reason, sector, volatility_30d_pct,
 -- vol_band (LOW / MID / HIGH: the day's terciles of volatility_30d_pct; NULL
--- when unknown), ret_pct_rank (0..1 within the day and horizon),
--- market_median_pp (the day's median ret_pp for the horizon).
+-- when unknown), ret_pct_rank (0..1 within the day and horizon), ret_pos (1 =
+-- the day's best; ties broken by symbol), n_day (names that day and horizon),
+-- market_median_pp (the day's median ret_pp for the horizon, PERCENTILE_CONT).
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_forward_universe`
@@ -86,6 +87,8 @@ SELECT
   o.symbol, o.base_date, o.horizon, o.ret_pp, o.status, o.reco, o.block_reason, o.sector, o.volatility_30d_pct,
   CASE vb.vol_t WHEN 1 THEN 'LOW' WHEN 2 THEN 'MID' WHEN 3 THEN 'HIGH' END AS vol_band,
   PERCENT_RANK() OVER (PARTITION BY o.base_date, o.horizon ORDER BY o.ret_pp) AS ret_pct_rank,
+  ROW_NUMBER() OVER (PARTITION BY o.base_date, o.horizon ORDER BY o.ret_pp DESC, o.symbol) AS ret_pos,
+  COUNT(*) OVER (PARTITION BY o.base_date, o.horizon) AS n_day,
   PERCENTILE_CONT(o.ret_pp, 0.5) OVER (PARTITION BY o.base_date, o.horizon) AS market_median_pp
 FROM ok o
 LEFT JOIN vb USING (symbol, base_date, horizon);

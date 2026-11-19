@@ -29,10 +29,18 @@ These are views only, read by Looker and by the reviews. No table, page, score, 
 - `pytest tests/test_bq_views.py`: 43 passed together with the verifier tests.
 - Workflow audit: errors=0 warnings=0.
 - The same SQL, run read-only on 19 Nov over the archive (31 Oct - 19 Nov, in-sample):
-  - at one week, the investable list's median was 0.19 points under the market median, with 48.5% of its names above it;
+  - at one week, the investable list's median was 0.18 points under the market median, with 48.5% of its names above it;
   - the low-volatility tercile was +0.37 and the high tercile -1.51;
   - the best tenth was +11.6;
   - none of the day's 20 best risers was ever a pick; 240 of 260 were rated SELL, STRONG_SELL, REDUCE or AVOID, with an average 30-day volatility of about 110%.
 
 ## S4 - Deploy
 After merge, dispatch **BigQuery Looker Views** with `mode=write`, then `mode=verify`.
+
+## S5 - Codex review on #1029 (both P2 verified and fixed)
+1. **Group and market medians used different estimators.** The group median was APPROX_QUANTILES; the market median was PERCENTILE_CONT. Both are now PERCENTILE_CONT 0.5.
+   - Verified on the archive: MARKET now reads 0.00 against itself on every day.
+   - INVESTABLE now reads -0.18 (1W) and -0.03 (2W).
+2. **BEST_DECILE could empty on a tie at the cut.** It is now the day's best CEIL(n_day / 10) by `ret_pos` (ties broken by symbol).
+   - `v_forward_universe` gains `ret_pos` and `n_day`.
+   - Two more mutants are caught.

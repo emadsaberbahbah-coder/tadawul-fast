@@ -281,8 +281,8 @@ INSTALLED = {
 # 341bd1f3a44d (1.5.0).
 PENDING = {
     # apply_bq_views 1.13.0 (19 Nov 2026): the standing lost-opportunity comparison
-    "v_forward_universe": "6ec169c3371f74ccb3a483c798cc0ea7954913ca0eacbc2aaf37eb09fd4b3f93",
-    "v_investable_vs_market": "075fd625480241815199aea342de68a03a38767c07bda08d3e67f6d579dbcad3",
+    "v_forward_universe": "557dc2709d5bc349f98afa810730cb06fdee41a56a221612cf859deeb945f28d",
+    "v_investable_vs_market": "fafc09c95276aae31acdc302dc739fa2f0c557b9f64702ed8982b30ede506a50",
     "v_missed_winners": "5d696fe1c1517c8e0134fffd2fa0d6fe14f5e3d9eb7dc46bba728700cdf43faf",
     # apply_bq_views 1.12.0 (19 Nov 2026): one sector per symbol, outcomes by sector, and trial C-2
     "v_symbol_sector": "f5018131ba52c2884030e246d759214473ba3ad30c5263288e9ff27575cbde64",
@@ -2320,16 +2320,23 @@ def case_v36():
     for frag in ("('MARKET', 'ALL')",
                  "IF(f.status = 'INVESTABLE', ('INVESTABLE', 'ALL'), NULL)",
                  "IF(f.reco IN ('BUY', 'STRONG_BUY', 'ACCUMULATE'), ('BUY_CALL', 'ALL'), NULL)",
-                 "IF(f.ret_pct_rank >= 0.9, ('BEST_DECILE', 'ALL'), NULL)",
+                 "IF(f.ret_pos <= CAST(CEIL(f.n_day / 10) AS INT64), ('BEST_DECILE', 'ALL'), NULL)",   # Codex P2 on #1029
+                 "PERCENTILE_CONT(ret_pp, 0.5) OVER (PARTITION BY base_date, horizon, group_type, group_key) AS group_median_pp",
+                 "ROUND(ANY_VALUE(group_median_pp), 2) AS median_pp",
                  "('SECTOR', f.sector)",
                  "IF(f.status = 'INVESTABLE' AND f.vol_band IS NOT NULL, ('INV_VOL', f.vol_band), NULL)",
-                 "ROUND(APPROX_QUANTILES(ret_pp, 100)[OFFSET(50)] - ANY_VALUE(market_median_pp), 2) AS vs_market_pp",
+                 "ROUND(ANY_VALUE(group_median_pp) - ANY_VALUE(market_median_pp), 2) AS vs_market_pp",
                  "ROUND(100 * COUNTIF(ret_pp > market_median_pp) / COUNT(*), 1) AS beat_market_pct"):
         assert frag in mc, frag
     from core.sectors import YAHOO_TO_GICS_SECTOR                                       # the same fold as v_symbol_sector
     for yahoo, gics in YAHOO_TO_GICS_SECTOR.items():
         assert "WHEN '%s' THEN '%s'" % (yahoo, gics) in fc, yahoo
     assert fc.count("      WHEN '") == len(YAHOO_TO_GICS_SECTOR)
+    assert "APPROX_QUANTILES" not in mc and "ret_pct_rank >=" not in mc                # one median definition; no tie hole
+    assert "ROW_NUMBER() OVER (PARTITION BY o.base_date, o.horizon ORDER BY o.ret_pp DESC, o.symbol) AS ret_pos" in fc
+    assert "COUNT(*) OVER (PARTITION BY o.base_date, o.horizon) AS n_day" in fc
+    # the decile cut on the reviewer's example: 20 names, the three best tied -> the best 2 by position are kept
+    assert [pos for pos in range(1, 21) if pos <= math.ceil(20 / 10)] == [1, 2]
     assert "ORDER BY ret_pp DESC, symbol) AS pos" in wc and "WHERE pos <= 20" in wc
     for tmpl in (f.template, m.template, w.template):
         assert "the live system never reads BigQuery" in tmpl

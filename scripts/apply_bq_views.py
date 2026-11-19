@@ -14,7 +14,7 @@ forward 1W / 2W price return, status, call, sector and volatility tercile. New
 v_investable_vs_market: the investable list and the buy calls beside the
 market median, the best tenth, sectors and volatility terciles, per day. New
 v_missed_winners: the day's 20 best risers with the cause each was not a pick.
-In-sample read (31 Oct - 19 Nov): the investable list 0.19 points under the
+In-sample read (31 Oct - 19 Nov): the investable list 0.18 points under the
 market median at one week (48.5% above it), the low-volatility tercile 0.37
 over and the high one 1.51 under, the best tenth 11.6 over. Nothing on a page,
 in a score or in a pick changes. Research views: the live system never reads
