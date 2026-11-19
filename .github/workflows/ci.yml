@@ -2,10 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.87 (2026-11-19) -- NEWS THEMES ARCHIVE
+# VERSION 1.1.88 (2026-11-19) -- NEWS BOARD
 #
-# (1.1.86, 2026-11-19: TOTAL RETURN ON HOLDINGS)
+# (1.1.87, 2026-11-19: NEWS THEMES ARCHIVE)
 #
+# v1.1.88: run tests/test_news_board.py (scripts/news_board.py v1.0.0: the
+# News_Board page - the week's news by theme, the sector tilt, the holdings
+# beside it, the shadow list and the trial, read from the BigQuery news
+# views; workflow news_board.yml) in the blocking lean lane.
 # v1.1.87: run tests/test_archive_news_themes.py (scripts/
 # archive_news_themes.py v1.0.0: the daily world-news themes counted in the
 # public GDELT tables, for the news learning loop; workflow
@@ -1208,6 +1212,7 @@ jobs:
             tests/test_trial_shadow_v2_rule.py \
             tests/test_archive_market_series.py \
             tests/test_archive_news_themes.py \
+            tests/test_news_board.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \

@@ -1,0 +1,100 @@
+# =============================================================================
+# 📰 News Board - the world news, the sector tilt it gives, and the trial
+# -----------------------------------------------------------------------------
+# VERSION 1.0.0 (2026-11-19)
+#
+# WHY: owner, 19 Nov 2026 ("build the new news and its effect in the file";
+# 14:30: "move to the next stage"). Phase A of the news learning loop (PR
+# #1030) put the daily world-news themes, the self-correcting sector weights,
+# the shadow list and the trial into BigQuery; nothing of it was in the
+# workbook. scripts/news_board.py reads those views and publishes one page,
+# News_Board: the week's news by theme against its own normal, the sector tilt
+# for both arms, the holdings beside their sector's tilt, the names the tilt
+# would move today, and the trial with its fixed promotion rule.
+#
+# WHEN: 07:55 and 16:55 Riyadh (04:55 and 13:55 UTC): after the news themes
+# archive (04:20 Riyadh) and the morning and afternoon archives. Two runs a
+# day on purpose - a run reads about 1 GB in BigQuery. GitHub may start a
+# scheduled run late; the page states its build time, the last day of the
+# news archive and the list day.
+#
+# WRITES: only its own tab (News_Board). BigQuery: SELECT only. SHADOW: no
+# recommendation changes and no order is placed; only the Today Action Plan
+# gives orders.
+# Rollback: repository variable TFB_NEWS_BOARD=off.
+# =============================================================================
+name: 📰 News Board
+
+on:
+  schedule:
+    - cron: "55 4,13 * * *"         # 07:55 and 16:55 Riyadh
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and print only (write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tfb-news-board
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  board:
+    name: 📰 Read the news views and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 google-auth requests
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 📰 Run the news board
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
+          TFB_NEWS_BOARD: ${{ vars.TFB_NEWS_BOARD || 'on' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ARGS=()
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          python scripts/news_board.py "${ARGS[@]}"

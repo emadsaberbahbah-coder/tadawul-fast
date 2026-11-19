@@ -349,6 +349,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-19 (new script, pinned on arrival): the daily world-news themes
     # (GDELT) the news learning loop is taught from; research table only.
     ("archive_news_themes", "1.0.0", "bigquery news themes"),
+    # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
+    # week's news by theme, the sector tilt, the shadow list and the trial,
+    # read from the news views (analysis only).
+    ("news_board", "1.0.0", "news board"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.2.0", "news macro gate"),   # 2026-11-19: v1.2.0 [TOPICS]
