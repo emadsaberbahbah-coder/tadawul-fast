@@ -2,10 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.86 (2026-11-19) -- TOTAL RETURN ON HOLDINGS
+# VERSION 1.1.87 (2026-11-19) -- NEWS THEMES ARCHIVE
 #
-# (1.1.85, 2026-11-18: DIVIDEND BASIS AND HOLDING READ COLUMNS)
+# (1.1.86, 2026-11-19: TOTAL RETURN ON HOLDINGS)
 #
+# v1.1.87: run tests/test_archive_news_themes.py (scripts/
+# archive_news_themes.py v1.0.0: the daily world-news themes counted in the
+# public GDELT tables, for the news learning loop; workflow
+# bq_news_themes.yml) in the blocking lean lane.
 # v1.1.86: run tests/test_pf_total_return.py (portfolio_actions 1.20.0: a
 # holding's P&L counts the dividends it received, beside the price-only figure)
 # and tests/test_pd_v1522_total_return.py (10_My_Portfolio 1.5.22 shows it).
@@ -1203,6 +1207,7 @@ jobs:
             tests/test_hold_vs_switch_rule.py \
             tests/test_trial_shadow_v2_rule.py \
             tests/test_archive_market_series.py \
+            tests/test_archive_news_themes.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \

@@ -1,0 +1,140 @@
+# =============================================================================
+# 📰 BigQuery News Themes — the daily world-news themes the news loop learns from
+# =============================================================================
+# VERSION 1.0.0 (2026-11-19) -- news learning loop, phase A (owner, 19 Nov
+#       2026: classify world news, weight it by kind, test the weights on the
+#       past and let them correct themselves; "Let's Start build the new news").
+# scripts/archive_news_themes.py v1.0.0 asks BigQuery to count, per UTC day,
+#       the events and news documents of 14 themes in the public GDELT tables
+#       (Iran and Russia fighting, US-China coercion and tone, the Fed and
+#       rates, trade policy, uncertainty, elections, AI and technology and its
+#       tone, the tone of stock-market news, inflation, the oil price, armed
+#       conflict) and merges one row per day and theme into BigQuery table
+#       tfb_archive.news_theme_daily (project-2e3530e6-2311-4aa3-b36, US).
+#       NOTHING is written to the workbook and the live system never reads
+#       BigQuery; no decision, gate or count depends on it.
+# AUTH: the archive's service account (GOOGLE_SHEETS_CREDENTIALS) with BigQuery
+#       Data Editor + BigQuery Job User (granted by the owner on 27 Oct).
+# COST: every source is sized with a dry run first and refused above max_gb;
+#       the daily window (3 days) reads under 1 GB. The one-off history fill
+#       (start 2023-10-02, max_gb 300) reads about 240 GB once.
+# GATE: armed here (TFB_BQ_NEWS_THEMES defaults to on); kill with the
+#       repository Variable TFB_BQ_NEWS_THEMES=off.
+# SCHEDULE: 01:20 UTC daily (the UTC day before is complete). A manual
+#       dispatch is a dry run unless write=true.
+# =============================================================================
+name: 📰 BigQuery News Themes
+
+on:
+  schedule:
+    # 01:20 UTC == 04:20 Asia/Riyadh, daily.
+    - cron: "20 1 * * *"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Merge into BigQuery? (default: dry-run — sizes the queries and loads nothing)"
+        required: false
+        default: false
+        type: boolean
+      days:
+        description: "Days ending yesterday UTC (1..30); ignored when start is given"
+        required: false
+        default: "3"
+        type: string
+      start:
+        description: "History fill: first day YYYY-MM-DD (blank = use days)"
+        required: false
+        default: ""
+        type: string
+      end:
+        description: "History fill: last day YYYY-MM-DD (blank = yesterday UTC)"
+        required: false
+        default: ""
+        type: string
+      max_gb:
+        description: "Refuse a source that would read more than this many GB (1..400; the history fill needs 300)"
+        required: false
+        default: "5"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  themes:
+    name: 📰 Merge the news themes into BigQuery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 📰 Run the loader
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BQ_NEWS_THEMES: ${{ vars.TFB_BQ_NEWS_THEMES || 'on' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: "US"
+          INPUT_DAYS: ${{ github.event.inputs.days }}
+          INPUT_START: ${{ github.event.inputs.start }}
+          INPUT_END: ${{ github.event.inputs.end }}
+          INPUT_MAX_GB: ${{ github.event.inputs.max_gb }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — sizing the queries, loading nothing (tick write=true to load)."
+          fi
+          DAYS="${INPUT_DAYS:-3}"
+          MAX_GB="${INPUT_MAX_GB:-5}"
+          if [[ ! "$DAYS" =~ ^[0-9]+$ ]]; then
+            echo "::error::days must be a whole number, got '${DAYS}'"
+            exit 2
+          fi
+          if [[ ! "$MAX_GB" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_gb must be a whole number, got '${MAX_GB}'"
+            exit 2
+          fi
+          for d in "${INPUT_START:-}" "${INPUT_END:-}"; do
+            if [[ -n "$d" && ! "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::start and end must be YYYY-MM-DD, got '${d}'"
+              exit 2
+            fi
+          done
+          python scripts/archive_news_themes.py $MODE --days "$DAYS" --start "${INPUT_START:-}" --end "${INPUT_END:-}" --max-gb "$MAX_GB" 2>&1 | tee news_themes.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### 📰 BigQuery News Themes (${MODE#--})"
+            echo ""
+            echo '```'
+            tail -n 40 news_themes.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

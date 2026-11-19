@@ -280,6 +280,12 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.14.0 (19 Nov 2026): the news learning loop (themes, weights, tilt, shadow list, trial)
+    "v_news_theme_weekly": "0a336a53e3b201f1852777dd940d751bd9b65c6f3b6c20fce57407e2168b71c3",
+    "v_news_sector_weights": "83e866325a7047aeea81d824f91139aae3d219dfa632f45b74b838e120d876c8",
+    "v_news_sector_tilt": "637933f5d28aa72c12690b5d8d379e4972b222938be9e2c262e09ff26a1a67cc",
+    "v_news_overlay_list": "ce45122ead4f06ab6fcee4c3b1abf62e2a8e56a2b186337eb7f9d471f04a6aa7",
+    "v_trial_news_overlay": "edfa75b8d0da62a7afab5b9b2d44bd12146e46979914b3bacc3ad21ac3a225ec",
     # apply_bq_views 1.13.0 (19 Nov 2026): the standing lost-opportunity comparison
     "v_forward_universe": "557dc2709d5bc349f98afa810730cb06fdee41a56a221612cf859deeb945f28d",
     "v_investable_vs_market": "fafc09c95276aae31acdc302dc739fa2f0c557b9f64702ed8982b30ede506a50",
@@ -328,9 +334,11 @@ EXPECTED_ORDER = [
     "v_trial_shadow_v2",
     "v_symbol_sector", "v_outcome_sector", "v_trial_c2",
     "v_forward_universe", "v_investable_vs_market", "v_missed_winners",
+    "v_news_theme_weekly", "v_news_sector_weights", "v_news_sector_tilt", "v_news_overlay_list",
+    "v_trial_news_overlay",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 30)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 35)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -2359,10 +2367,201 @@ def case_v36():
     assert _missed_cause("WATCHLIST", "", None) == "watchlist unrated"
 
 
+def _news_usable(days, closed, prev_days, prev_weeks_back):
+    """Python replica of v_news_theme_weekly.usable: prev_days are the day counts of the four rows before,
+    prev_weeks_back how many weeks back the oldest of them is."""
+    return bool(closed and days >= 5 and len(prev_days) == 4 and all(d >= 5 for d in prev_days)
+                and prev_weeks_back == 4)
+
+
+def _news_tilt_group(pos, sectors, score):
+    """Python replica of v_news_sector_tilt.tilt_group."""
+    if pos <= 3 and score > 0:
+        return "favoured"
+    if pos > sectors - 3 and score < 0:
+        return "avoided"
+    return "neutral"
+
+
+def _news_overlay(rows, tilt):
+    """Python replica of v_news_overlay_list for one arm and day: rows are (symbol, status, reco, sector,
+    vol_band, overall_score); tilt maps sector -> group. Returns {symbol: action}."""
+    grp = lambda sec: tilt.get(sec, "neutral")
+    out = [r[0] for r in rows if r[1] == "INVESTABLE" and grp(r[3]) == "avoided"]
+    pool = sorted((r for r in rows if r[1] == "WATCHLIST" and r[2] == "HOLD" and grp(r[3]) == "favoured"
+                   and r[4] in ("LOW", "MID") and r[5] is not None), key=lambda r: (-r[5], r[0]))
+    res = {r[0]: ("out" if r[0] in out else "keep") for r in rows if r[1] == "INVESTABLE"}
+    res.update({r[0]: "in" for r in pool[:len(out)]})
+    return res
+
+
+def _news_trial_reading(line, forward, days, need, news_weeks, t_x, edge_x):
+    """Python replica of v_trial_news_overlay.reading."""
+    if line != "OVERLAY_MINUS_CHAMPION":
+        return None
+    if not forward:
+        return "in-sample: shows why this is a trial, not evidence"
+    if days < need or news_weeks < 8:
+        return "collecting: %d of %d days, %d of 8 news weeks" % (days, need, news_weeks)
+    if t_x >= 2.5 and edge_x > 0:
+        return "news overlay ahead: the owner may consider it"
+    if edge_x <= 0:
+        return "news overlay not ahead: keep the list as it is"
+    return "news overlay ahead but not yet clear (t under 2.5): keep collecting"
+
+
+def case_v37():
+    import re
+    import archive_news_themes as nt
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [x.name for x in bv.load_objects()]
+    order = ("v_news_theme_weekly", "v_news_sector_weights", "v_news_sector_tilt", "v_news_overlay_list",
+             "v_trial_news_overlay")
+    files = ("91_v_news_theme_weekly.sql", "92_v_news_sector_weights.sql", "93_v_news_sector_tilt.sql",
+             "94_v_news_overlay_list.sql", "95_v_trial_news_overlay.sql")
+    assert tuple(objs[n].path.name for n in order) == files and all(objs[n].kind == "VIEW" for n in order)
+    assert [names.index(n) for n in order] == sorted(names.index(n) for n in order)
+    code = {n: bv._code(objs[n].template) for n in order}
+    refs = {n: set(bv._REF.findall(code[n])) - {n} for n in order}
+    assert refs == {"v_news_theme_weekly": {"news_theme_daily"},
+                    "v_news_sector_weights": {"v_news_theme_weekly", "market_series_daily"},
+                    "v_news_sector_tilt": {"v_news_sector_weights"},
+                    "v_news_overlay_list": {"v_universe", "v_news_sector_tilt"},
+                    "v_trial_news_overlay": {"v_news_overlay_list", "v_forward_universe"}}, refs
+    # the source table: the loader's own, and only its declared columns are read
+    assert bv.NEWS_TABLES == {nt.TABLE} and nt.TABLE in bv.SOURCE_TABLES
+    assert {n for n in names if "news_theme_daily" in set(bv._REF.findall(bv._code(objs[n].template)))} == {
+        "v_news_theme_weekly"}
+    cols = {f["name"] for f in nt.SCHEMA}
+    wk = code["v_news_theme_weekly"].split("WITH wk AS (", 1)[1].split("GROUP BY week_start, feature", 1)[0]
+    assert set(re.findall(r"\b(date|feature|source|kind|num|den|loaded_at|run_id)\b", wk)) <= cols
+    assert {"date", "feature", "kind", "source", "num", "den"} <= set(re.findall(r"\b[a-z_]+\b", wk))
+    for tmpl in (objs[n].template for n in order):
+        assert "the live system never reads BigQuery" in tmpl
+    # 91: the week, the value by kind, the surprise against the four weeks before, the usable rule
+    w = code["v_news_theme_weekly"]
+    for frag in ("DATE_TRUNC(date, WEEK(MONDAY)) AS week_start",
+                 "MAX(MAX(date)) OVER (PARTITION BY feature) AS last_day",
+                 "IF(kind = 'share', 1000, 1) * SAFE_DIVIDE(num, den) AS value",
+                 "WINDOW p4 AS (PARTITION BY feature ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING)",
+                 "COUNTIF(days >= 5 AND value IS NOT NULL) OVER p4 AS prev_ok",
+                 "value - prev_avg AS surprise",
+                 "days = 7 OR last_day > DATE_ADD(week_start, INTERVAL 6 DAY) AS is_closed",
+                 "(days = 7 OR last_day > DATE_ADD(week_start, INTERVAL 6 DAY)) AND days >= 5 AND value IS NOT NULL\n"
+                 "    AND prev_ok = 4 AND prev_first = DATE_SUB(week_start, INTERVAL 28 DAY) AS usable"):
+        assert frag in w, frag
+    assert _news_usable(7, True, [7, 7, 6, 5], 4)
+    assert not _news_usable(4, True, [7, 7, 7, 7], 4)          # too few days
+    assert not _news_usable(6, False, [7, 7, 7, 7], 4)         # the week is still open
+    assert not _news_usable(7, True, [7, 4, 7, 7], 4)          # a thin week among the four before
+    assert not _news_usable(7, True, [7, 7, 7, 7], 5)          # a week missing among the four before
+    assert not _news_usable(7, True, [7, 7, 7], 3)             # history too short
+    # 92: the target, the link, the walk-forward weight and its own record - nothing after the news week
+    g = code["v_news_sector_weights"]
+    sec = dict(re.findall(r"\('(XL[A-Z]+)', '([^']+)'\)", g))
+    assert sec == {"XLB": "Materials", "XLC": "Communication Services", "XLE": "Energy", "XLF": "Financials",
+                   "XLI": "Industrials", "XLK": "Information Technology", "XLP": "Consumer Staples",
+                   "XLRE": "Real Estate", "XLU": "Utilities", "XLV": "Health Care", "XLY": "Consumer Discretionary"}
+    from core.sectors import YAHOO_TO_GICS_SECTOR
+    assert set(sec.values()) - set(YAHOO_TO_GICS_SECTOR.values()) == {"Communication Services", "Energy", "Industrials",
+                                                                      "Real Estate", "Utilities"}
+    import archive_market_series as ms
+    assert set(sec) | {"SPY"} <= {r["symbol"] for r in ms.series_records()}
+    for frag in ("WHERE symbol IN ('SPY', 'XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY') "
+                 "AND adj_close > 0",
+                 "ARRAY_AGG(adj_close ORDER BY date ASC LIMIT 1)[OFFSET(0)] AS c",        # the week's first close
+                 "LEAD(c) OVER (PARTITION BY symbol ORDER BY wk) / c - 1 AS r",
+                 "100 * (a.r - s.r) AS excess_pp",
+                 "WHERE a.symbol != 'SPY' AND a.r IS NOT NULL AND a.gap = 7 AND s.gap = 7",
+                 "LEFT JOIN ex ON ex.etf = e.etf AND ex.entry_week = DATE_ADD(t.week_start, INTERVAL 7 DAY)",
+                 "WHERE t.usable",
+                 "IF(n >= 52, SAFE_DIVIDE(sxy - sx * sy / n, sxx - sx * sx / n), NULL) AS beta",
+                 "beta * (x - SAFE_DIVIDE(sx, n)) AS p",
+                 "CORR(IF(y IS NULL, NULL, p), y) OVER past AS val",
+                 "p IS NOT NULL AND nv >= 26 AND IFNULL(val, 0) > 0 AS active"):
+        assert frag in g, frag
+    past = "WINDOW past AS (PARTITION BY etf, feature ORDER BY week_start ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING)"
+    assert g.count(past) == 2 and "1 PRECEDING" not in g and "FOLLOWING" not in g and "CURRENT ROW" not in g
+    # 93: two arms, the score, the groups, the window of list dates
+    t = code["v_news_sector_tilt"]
+    for frag in ("CROSS JOIN UNNEST(['events', 'all']) AS news_arm",
+                 "AND (news_arm = 'all' OR w.source = 'gdelt_events')",
+                 "SUM(IF(w.active, w.past_corr * w.prediction_pp, 0)) AS score_x",
+                 "ROW_NUMBER() OVER (PARTITION BY arm, week_start ORDER BY score_x DESC, etf) AS pos",
+                 "DATE_ADD(week_start, INTERVAL 8 DAY) AS apply_from",
+                 "DATE_ADD(week_start, INTERVAL 14 DAY) AS apply_to",
+                 "WHEN pos <= 3 AND score_x > 0 THEN 'favoured'",
+                 "WHEN pos > sectors - 3 AND score_x < 0 THEN 'avoided'",
+                 "WHERE max_active > 0"):
+        assert frag in t, frag
+    assert {s for s in (f[1] for f in nt.FEATURES)} == {"gdelt_events", "gdelt_gkg"}
+    assert [_news_tilt_group(p, 11, sc) for p, sc in ((1, 0.2), (3, 0.01), (4, 0.3), (3, 0.0), (9, -0.1), (11, -0.5),
+                                                       (8, -0.9), (9, 0.0), (10, 0.02))] == [
+        "favoured", "favoured", "neutral", "neutral", "avoided", "avoided", "neutral", "neutral", "neutral"]
+    # 94: the universe is v_forward_universe's, the rule moves names one for one
+    o = code["v_news_overlay_list"]
+    fu = bv._code(objs["v_forward_universe"].template)
+    for frag in ("WHERE source_page IN ('Global_Markets', 'Market_Leaders')",
+                 "AND UPPER(CAST(asset_class AS STRING)) = 'EQUITY'",
+                 "AND avg_volume_30d * current_price >= 1000000",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, snapshot_date ORDER BY captured_at DESC, source_page) = 1",
+                 "ELSE IFNULL(NULLIF(CAST(sector AS STRING), ''), '(no sector)')\n    END AS sector"):
+        assert frag in o and frag in fu, frag
+    for yahoo, gics in YAHOO_TO_GICS_SECTOR.items():
+        assert "WHEN '%s' THEN '%s'" % (yahoo, gics) in o, yahoo
+    for frag in ("NTILE(3) OVER (PARTITION BY base_date ORDER BY volatility_30d_pct, symbol) AS vol_t",
+                 "ON t.arm = news_arm AND t.sector = u.sector AND u.base_date BETWEEN t.apply_from AND t.apply_to",
+                 "status = 'INVESTABLE' AND tilt_group = 'avoided' AS moved_out",
+                 "status = 'WATCHLIST' AND reco = 'HOLD' AND tilt_group = 'favoured'\n"
+                 "      AND IFNULL(vol_band, '') IN ('LOW', 'MID') AND overall_score IS NOT NULL AS in_pool",
+                 "COUNTIF(moved_out) OVER (PARTITION BY arm, base_date) AS n_out",
+                 "ROW_NUMBER() OVER (PARTITION BY arm, base_date, in_pool ORDER BY overall_score DESC, symbol)",
+                 "(in_champion AND NOT moved_out) OR (in_pool AND pool_pos <= n_out) AS in_overlay",
+                 "CASE WHEN moved_out THEN 'out' WHEN in_champion THEN 'keep' ELSE 'in' END AS news_action",
+                 "WHERE in_champion OR (in_pool AND pool_pos <= n_out)"):
+        assert frag in o, frag
+    day = [("A", "INVESTABLE", "BUY", "Financials", "LOW", 70.0), ("B", "INVESTABLE", "BUY", "Energy", "LOW", 72.0),
+           ("C", "INVESTABLE", "ACCUMULATE", "Financials", "HIGH", 71.0),
+           ("D", "WATCHLIST", "HOLD", "Utilities", "LOW", 60.0), ("E", "WATCHLIST", "HOLD", "Utilities", "MID", 66.0),
+           ("F", "WATCHLIST", "HOLD", "Utilities", "HIGH", 99.0), ("G", "WATCHLIST", "SELL", "Utilities", "LOW", 98.0),
+           ("H", "BLOCKED", "HOLD", "Utilities", "LOW", 97.0), ("I", "WATCHLIST", "HOLD", "Materials", "LOW", 96.0),
+           ("J", "WATCHLIST", "HOLD", "Utilities", "LOW", None), ("K", "WATCHLIST", "HOLD", "Utilities", "LOW", 66.0)]
+    tilt = {"Financials": "avoided", "Utilities": "favoured"}
+    assert _news_overlay(day, tilt) == {"A": "out", "C": "out", "B": "keep", "E": "in", "K": "in"}
+    assert _news_overlay(day, {}) == {"A": "keep", "B": "keep", "C": "keep"}                 # no tilt, no change
+    assert _news_overlay(day, {"Utilities": "favoured"}) == {"A": "keep", "B": "keep", "C": "keep"}   # nothing left
+    # 95: the edge, forward evidence only, the changed days, the fixed promotion rule
+    r = code["v_trial_news_overlay"]
+    for frag in ("f.ret_pp - f.market_median_pp AS edge",
+                 "ON f.symbol = o.symbol AND f.base_date = o.base_date",
+                 "IF(base_date >= DATE '2026-11-20', 'forward from 2026-11-20', 'in-sample, not evidence') AS period",
+                 "CASE f.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 END AS horizon_days",
+                 "WHERE n_out > 0 AND n_ch > 0 AND n_ov > 0",
+                 "COUNT(DISTINCT news_week) AS news_weeks",
+                 "AVG(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dm",
+                 "STDDEV_SAMP(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dsd",
+                 "GREATEST(20, 2 * horizon_days) AS need",
+                 "IF(line = 'OVERLAY_MINUS_CHAMPION', SAFE_DIVIDE(dm, dsd) * SQRT(days / horizon_days), NULL) AS t_x",
+                 "UNNEST(['CHAMPION', 'NEWS_OVERLAY', 'MOVED_OUT', 'MOVED_IN', 'OVERLAY_MINUS_CHAMPION']) AS line",
+                 "WHEN days < need OR news_weeks < 8 THEN CONCAT('collecting: '",
+                 "WHEN t_x >= 2.5 AND edge_x > 0 THEN 'news overlay ahead: the owner may consider it'",
+                 "WHEN edge_x <= 0 THEN 'news overlay not ahead: keep the list as it is'"):
+        assert frag in r, frag
+    # the 19 Nov in-sample read: +0.45 a day on 13 days, t 0.69 -> in-sample whatever the figures
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", False, 13, 20, 3, 0.69, 0.45).startswith("in-sample")
+    assert _news_trial_reading("CHAMPION", True, 40, 20, 9, 3.0, 1.0) is None
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 19, 20, 9, 3.0, 1.0) == "collecting: 19 of 20 days, 9 of 8 news weeks"
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 7, 3.0, 1.0).startswith("collecting")
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 2.5, 0.3) == "news overlay ahead: the owner may consider it"
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 2.49, 0.3).startswith("news overlay ahead but not yet clear")
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 3.0, 0.0) == "news overlay not ahead: keep the list as it is"
+    assert round(0.45 / 0.89 * math.sqrt(13 / 7), 2) == 0.69 and max(20, 2 * 14) == 28          # t_adj (the 19 Nov read) and need
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37]
 
 
 def test_v1(): case_v1()
@@ -2401,6 +2600,7 @@ def test_v33(): case_v33()
 def test_v34(): case_v34()
 def test_v35(): case_v35()
 def test_v36(): case_v36()
+def test_v37(): case_v37()
 
 
 if __name__ == "__main__":
