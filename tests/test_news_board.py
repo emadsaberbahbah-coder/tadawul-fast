@@ -5,6 +5,7 @@ a fake session and a fake workbook (no network). Every figure here is invented."
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from pathlib import Path
 
@@ -183,12 +184,33 @@ class Book:
         return self.tabs[title]
 
 
+def _ev(eid, start, end, title, kind="summit", status="confirmed", time="", why="", markets=""):
+    return {"id": eid, "start": start, "end": end, "title": title, "kind": kind, "status": status, "time": time,
+            "why": why or "why " + eid, "markets": markets or "US", "source": "https://example.org/" + eid}
+
+
+# an invented calendar: every run in this suite reads it, never the real file (which changes with the world)
+CAL = {"version": "t", "checked": "2026-11-19", "events": [
+    _ev("e", "2027-01-19", "2027-01-19", "Deadline E", "deadline"),                      # 61 days ahead: outside the window
+    _ev("c", "2026-12-08", "2026-12-09", "Rate decision C", "central_bank", "tentative", "Wed 9 Dec, 22:00"),
+    _ev("w", "2026-11-20", "2026-12-31", "Budget W", "budget", "date_not_set"),
+    _ev("a", "2026-11-18", "2026-11-19", "Summit A"),
+    _ev("z", "2026-11-10", "2026-11-18", "Summit Z"),                                    # ended yesterday
+    _ev("b", "2026-11-29", "2026-11-29", "Oil meeting B", "energy"),
+    _ev("d", "2027-01-18", "2027-01-18", "Deadline D", "deadline"),                      # exactly 60 days ahead
+    _ev("y", "2026-12-30", "2027-01-02", "Summit Y"),
+]}
+
+
 @pytest.fixture(autouse=True)
-def _env(monkeypatch):
+def _env(monkeypatch, tmp_path):
     for name in list(__import__("os").environ):
         if name.startswith("TFB_NEWS_BOARD") or name.startswith("TFB_BQ_"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TFB_BQ_PROJECT", "proj-1")
+    path = tmp_path / "calendar.json"
+    path.write_text(json.dumps(CAL), encoding="utf-8")
+    monkeypatch.setattr(nb, "CALENDAR_FILE", str(path))
 
 
 def col(page, first):
@@ -437,11 +459,12 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert all(len(r) == nb.WIDTH for r in page) and len(page) >= 120
     cells = [str(c) for r in page for c in r]
     assert not any("None" in c or c.lower() in ("nan", "+nan", "-nan", "inf") for c in cells)
-    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.0.0 | SHADOW")
+    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.1.0 | SHADOW")
     assert "only the Today Action Plan gives orders" in page[1][0]
     heads = [r[0] for r in page if re.match(r"^(VERDICT|\d\. )", str(r[0]))]
     assert [h.split(" - ")[0].split(" (")[0].split(" for ")[0] for h in heads] == [
-        "VERDICT", "1. WORLD NEWS", "2. SECTOR TILT", "3. YOUR HOLDINGS AND THE TILT", "4. SHADOW LIST", "5. TRIAL"]
+        "VERDICT", "1. WORLD NEWS", "2. SECTOR TILT", "3. YOUR HOLDINGS AND THE TILT", "4. SHADOW LIST", "5. TRIAL",
+        "6. EVENTS AHEAD"]
     assert heads[1] == ("1. WORLD NEWS - last full week (2026-11-09 to 2026-11-15) against its own previous four weeks; "
                         "news archive to 2026-11-18")
     assert heads[2] == "2. SECTOR TILT - in force 2026-11-17 to 2026-11-23, from the news of the week of 2026-11-09"
@@ -566,7 +589,7 @@ def test_n7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/news_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.isascii() and nb.__version__ == "1.0.0" and "v1.0.0 (2026-11-19)" in src
+    assert src.isascii() and nb.__version__ == "1.1.0" and "v1.1.0 (2026-11-19)" in src
     assert '("news_board", "%s", "news board")' % nb.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src and nb.TAB == "News_Board"
     assert "PORTFOLIO_TAB, \"A1:B200\")" in src and src.count("_raw_read(") == 1          # one read, of two columns
@@ -628,3 +651,198 @@ def test_n8_a_quota_answer_is_waited_out_and_other_write_errors_fail_the_run(mon
     book = Book({"My_Portfolio": FlakyRead(PORTFOLIO)})
     assert nb.run_once(False, book=book, session=Session(), now=NOW, query=eb.bq_query) == 0 and waits == [65.0]
     assert col(book.tabs["News_Board"].values, "AAA.US")
+
+
+# ----------------------------------------------------------------------------- N9 (v1.1.0 [EVENTS]) the events calendar
+def test_n9_the_real_calendar_file_is_clean():
+    path = ROOT / "data" / "news_event_calendar.json"
+    raw_text = path.read_text(encoding="utf-8")
+    assert raw_text.isascii() and nb.CALENDAR_FILE != str(path)                # this suite reads the invented one
+    raw = json.loads(raw_text)
+    assert set(raw) == {"version", "checked", "about", "kinds", "statuses", "events"} and raw["version"] == "1.0.0"
+    assert nb._strict_day(raw["checked"]) is not None
+    assert raw["kinds"] == list(nb.KIND_TEXT) and raw["statuses"] == list(nb.STATUS_TEXT)
+    fields = ["id", "start", "end", "title", "kind", "status", "time", "why", "markets", "source"]
+    ids = []
+    for e in raw["events"]:
+        assert list(e) == fields, e
+        got = nb.clean_event(e)
+        assert got is not None, e                                             # every entry is one the page will show
+        assert re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", e["id"]) and 5 <= len(e["title"]) <= 70 and e["why"] and e["markets"], e
+        assert all(isinstance(e[k], str) and e[k] == e[k].strip() for k in fields), e
+        assert (got["end"] - got["start"]).days <= (45 if e["status"] == "date_not_set" else 6), e   # a meeting, not a season
+        ids.append(e["id"])
+    assert len(ids) == len(set(ids)) >= 8
+    starts = [e["start"] for e in raw["events"]]
+    assert starts == sorted(starts)
+    loaded = nb.load_calendar(str(path))
+    assert loaded["error"] == "" and loaded["dropped"] == 0 and len(loaded["events"]) == len(ids)
+    assert {e["kind"] for e in loaded["events"]} >= {"summit", "central_bank", "energy", "deadline"}
+    module = (ROOT / "scripts/news_board.py").read_text(encoding="utf-8")
+    assert '"data", "news_event_calendar.json"' in module and module.count("json.load(") == 1
+    assert "urlopen" not in module and "requests" not in module               # the calendar is a repository file: no fetch
+
+
+def test_n9_an_entry_is_kept_only_when_it_can_be_trusted(tmp_path):
+    good = _ev("a", "2026-12-08", "2026-12-09", "Rate decision", "central_bank", "tentative", "Wed 9 Dec, 22:00")
+    got = nb.clean_event(good)
+    assert got == {"id": "a", "start": dt.date(2026, 12, 8), "end": dt.date(2026, 12, 9), "title": "Rate decision",
+                   "kind": "central_bank", "status": "tentative", "time": "Wed 9 Dec, 22:00", "why": "why a", "markets": "US",
+                   "source": "https://example.org/a"}
+    one_day = dict(good)
+    del one_day["end"]
+    assert nb.clean_event(one_day)["end"] == dt.date(2026, 12, 8) and nb.clean_event(dict(good, end=""))["end"] == dt.date(2026, 12, 8)
+    for bad in (dict(good, start="2026-13-01"), dict(good, start="2026-1-1"), dict(good, start="2026-12-08T10:00"),
+                dict(good, start=20261208), dict(good, start=None), dict(good, end="2026-12-07"), dict(good, end="soon"),
+                dict(good, title=" "), dict(good, kind="party"), dict(good, kind=""), dict(good, status="maybe"),
+                dict(good, source="http://example.org/a"), dict(good, source="https://example.org/a b"),
+                dict(good, source="https://localhost/a"), dict(good, source="example.org/a"), dict(good, source=""),
+                "Rate decision", None, ["2026-12-08"]):
+        assert nb.clean_event(bad) is None, bad
+    assert nb.clean_event(dict(good, source="https://example.org"))["source"] == "https://example.org"
+    # the file: missing, broken, the wrong shape - said, never raised
+    assert nb.load_calendar(str(tmp_path / "none.json")) == {"checked": None, "events": [], "dropped": 0, "error": "file missing"}
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert nb.load_calendar(str(broken))["error"] == "not valid JSON"
+    for shape in ([good], {"events": "none"}, {"checked": "2026-11-19"}):
+        broken.write_text(json.dumps(shape), encoding="utf-8")
+        assert nb.load_calendar(str(broken)) == {"checked": None, "events": [], "dropped": 0, "error": "no list of events in it"}
+    broken.write_text(json.dumps({"checked": "19 Nov 2026", "events": [good, dict(good, kind="party"), "x",
+                                                                     dict(good, id="0", start="2026-11-29", end="2026-11-29")]}),
+                      encoding="utf-8")
+    cal = nb.load_calendar(str(broken))
+    assert cal["checked"] is None and cal["dropped"] == 2 and cal["error"] == ""
+    assert [e["id"] for e in cal["events"]] == ["0", "a"]                      # soonest first, whatever the file's order
+    broken.write_text(json.dumps({"checked": "2026-11-19T08:00:00", "events": [good]}), encoding="utf-8")
+    assert nb.load_calendar(str(broken))["checked"] is None                    # a check date is a date, nothing more
+    broken.write_text(json.dumps({"checked": "2026-11-19", "events": [good]}), encoding="utf-8")
+    assert nb.load_calendar(str(broken))["checked"] == TODAY
+    assert [e["id"] for e in nb.load_calendar()["events"]] == ["z", "a", "w", "b", "c", "y", "d", "e"]
+
+
+def test_n9_rows_the_window_and_the_wording():
+    cal = nb.load_calendar()
+    rows = nb.calendar_rows(cal, TODAY)
+    assert [r["title"] for r in rows] == ["Summit A", "Oil meeting B", "Rate decision C", "Summit Y", "Deadline D", "Budget W"]
+    assert [(r["date"], r["when"]) for r in rows] == [
+        ("Wed 18 Nov - Thu 19 Nov 2026", "ends today"), ("Sun 29 Nov 2026", "in 10 days"),
+        ("Tue 8 Dec - Wed 9 Dec 2026", "in 19 days"), ("Wed 30 Dec 2026 - Sat 2 Jan 2027", "in 41 days"),
+        ("Mon 18 Jan 2027", "in 60 days"), ("by Thu 31 Dec 2026", "date not announced")]
+    c = rows[2]
+    assert (c["kind"], c["time"], c["why"], c["markets"], c["status"], c["source"], c["dated"]) == (
+        "Central bank", "Wed 9 Dec, 22:00", "why c", "US", "tentative", "https://example.org/c", True)
+    assert (rows[1]["kind"], rows[4]["kind"], rows[5]["kind"], rows[5]["status"], rows[5]["dated"]) == (
+        "Oil", "Deadline", "Budget", "date not announced", False)
+
+    def when(day):
+        return {r["title"]: r["when"] for r in nb.calendar_rows(cal, day)}
+    assert when(dt.date(2026, 11, 18)) ["Summit A"] == "starts today" and when(dt.date(2026, 11, 18))["Summit Z"] == "ends today"
+    assert when(dt.date(2026, 11, 12))["Summit Z"] == "under way" and "Summit Z" not in when(TODAY)
+    assert when(dt.date(2026, 11, 28))["Oil meeting B"] == "tomorrow" and when(dt.date(2026, 11, 29))["Oil meeting B"] == "today"
+    assert "Oil meeting B" not in when(dt.date(2026, 11, 30)) and "Summit A" not in when(dt.date(2026, 11, 20))
+    assert "Deadline E" not in when(TODAY) and when(dt.date(2026, 11, 20))["Deadline E"] == "in 60 days"
+    assert when(dt.date(2026, 12, 31))["Budget W"] == "date not announced" and "Budget W" not in when(dt.date(2027, 1, 1))
+    assert when(dt.date(2027, 1, 1))["Summit Y"] == "under way" and when(dt.date(2027, 1, 2))["Summit Y"] == "ends today"
+    assert [r["title"] for r in nb.calendar_rows(cal, TODAY, days=10)] == ["Summit A", "Oil meeting B", "Budget W"]
+    assert nb.calendar_rows({"events": []}, TODAY) == [] and nb.calendar_rows({}, TODAY) == []
+
+
+def test_n9_notes_say_when_the_calendar_itself_needs_care():
+    cal = nb.load_calendar()
+    assert nb.calendar_notes(cal, TODAY) == []
+    assert nb.calendar_notes(cal, dt.date(2026, 12, 10)) == []                              # 21 days after the check
+    assert nb.calendar_notes(cal, dt.date(2026, 12, 11)) == [
+        "The calendar was last checked on Thu 19 Nov 2026 (22 days ago); dates may have moved since."]
+    # the last dated event starts on 19 Jan 2027: fourteen days before it the file is running out
+    assert nb.calendar_notes(dict(cal, checked=dt.date(2027, 1, 5)), dt.date(2027, 1, 5)) == []
+    assert nb.calendar_notes(dict(cal, checked=dt.date(2027, 1, 6)), dt.date(2027, 1, 6)) == [
+        "The calendar holds no dated event after Tue 19 Jan 2027; it needs new dates."]
+    # ... measured on the day the last event begins, also when it runs over several days
+    short = dict(cal, events=[e for e in cal["events"] if e["id"] in ("a", "y")])
+    assert nb.calendar_notes(dict(short, checked=dt.date(2026, 12, 16)), dt.date(2026, 12, 16)) == []
+    assert nb.calendar_notes(dict(short, checked=dt.date(2026, 12, 17)), dt.date(2026, 12, 17)) == [
+        "The calendar holds no dated event after Wed 30 Dec 2026; it needs new dates."]
+    undated = dict(cal, events=[e for e in cal["events"] if e["status"] == "date_not_set"])
+    assert nb.calendar_notes(undated, TODAY) == ["The calendar holds no dated event after today; it needs new dates."]
+    assert nb.calendar_notes(dict(cal, checked=None), TODAY) == [
+        "The calendar does not say when it was last checked; dates may have moved."]
+    assert nb.calendar_notes(dict(cal, dropped=1), TODAY) == ["1 calendar entry could not be read and is left out."]
+    assert nb.calendar_notes(dict(cal, dropped=3), TODAY) == ["3 calendar entries could not be read and are left out."]
+    both = nb.calendar_notes(dict(cal, dropped=2, checked=dt.date(2026, 10, 1)), TODAY)
+    assert len(both) == 2 and both[1].startswith("The calendar was last checked on Thu 1 Oct 2026 (49 days ago)")
+    assert nb.calendar_notes({"error": "file missing", "events": [], "checked": None, "dropped": 0}, TODAY) == [
+        "The events calendar could not be read (file missing). No event is shown; the rest of the page is unaffected."]
+
+
+def test_n9_the_line_under_the_verdict_names_the_next_dated_event():
+    cal = nb.load_calendar()
+
+    def line(day):
+        return nb.next_event_line(nb.calendar_rows(cal, day), day)
+    assert line(TODAY) == "NEXT EVENT (ends today): Summit A, Wed 18 Nov - Thu 19 Nov 2026. Section 6 lists the next 60 days."
+    assert line(dt.date(2026, 11, 20)) == "NEXT EVENT (in 9 days): Oil meeting B, Sun 29 Nov 2026. Section 6 lists the next 60 days."
+    assert line(dt.date(2026, 11, 30)).startswith("NEXT EVENT (in 8 days): Rate decision C, Tue 8 Dec - Wed 9 Dec 2026.")
+    assert line(dt.date(2026, 12, 16)).startswith("NEXT EVENT (in 14 days): Summit Y,")
+    assert line(dt.date(2026, 12, 10)) == ""                           # the next dated one is 20 days away; the budget has no date
+    assert nb.next_event_line([], TODAY) == ""
+
+
+def test_n9_the_page_shows_the_events_and_is_built_without_them(monkeypatch, tmp_path, capsys):
+    book = Book({"My_Portfolio": Sheet(PORTFOLIO)})
+    assert nb.run_once(False, book=book, session=Session(), now=NOW, query=eb.bq_query) == 0
+    out = capsys.readouterr().out
+    page = book.tabs["News_Board"].values
+    firsts = [r[0] for r in page]
+    verdict, world = firsts.index("VERDICT"), next(i for i, c in enumerate(firsts) if str(c).startswith("1. WORLD NEWS"))
+    assert firsts[world - 2] == "NEXT EVENT (ends today): Summit A, Wed 18 Nov - Thu 19 Nov 2026. Section 6 lists the next 60 days."
+    assert firsts[world - 1] == "" and world - 2 > verdict                    # the last line of the verdict block
+    head = next(i for i, c in enumerate(firsts) if str(c).startswith("6. EVENTS AHEAD"))
+    assert firsts[head] == ("6. EVENTS AHEAD - dated events of the next 60 days, calendar checked Thu 19 Nov 2026. "
+                            "For information: no order comes from this section.")
+    assert page[head + 1][:9] == ["Date", "When", "Event", "Kind", "Time (Riyadh)", "Why it matters", "Markets", "Status", "Source"]
+    assert page[head + 2][:9] == ["Wed 18 Nov - Thu 19 Nov 2026", "ends today", "Summit A", "Summit", "", "why a", "US",
+                                  "confirmed", "https://example.org/a"]
+    assert page[head + 4][:9] == ["Tue 8 Dec - Wed 9 Dec 2026", "in 19 days", "Rate decision C", "Central bank",
+                                  "Wed 9 Dec, 22:00", "why c", "US", "tentative", "https://example.org/c"]
+    assert page[head + 7][:3] == ["by Thu 31 Dec 2026", "date not announced", "Budget W"]
+    assert firsts[head + 8].startswith("The news gate already raises CAUTION by itself within 30 hours of a Fed decision")
+    assert firsts[head + 9] == "" and firsts[head + 10].startswith("How to read:")
+    assert any(str(c).startswith("Promotion rule, fixed on 19 Nov 2026") for c in firsts[:head])     # after the trial
+    assert "EVENTS 6 in the next 60 days" in out and "NEXT EVENT (ends today): Summit A" in out and "6 event(s) ahead" in out
+    assert "EVENTS note" not in out
+
+    def build(calendar_text, now=NOW):
+        (tmp_path / "calendar.json").write_text(calendar_text, encoding="utf-8")
+        b = Book({"My_Portfolio": Sheet(PORTFOLIO)})
+        assert nb.run_once(False, book=b, session=Session(), now=now, query=eb.bq_query) == 0   # the page is always built
+        cells = [r[0] for r in b.tabs["News_Board"].values]
+        start = next(i for i, c in enumerate(cells) if str(c).startswith("6. EVENTS AHEAD"))
+        return b.tabs["News_Board"].values, cells, start, capsys.readouterr().out
+    # a broken file: said in the section and in the run log; no line under the verdict; the other sections as they were
+    bad_page, cells, start, log = build("{broken")
+    assert cells[start] == "6. EVENTS AHEAD - dated events of the next 60 days. For information: no order comes from this section."
+    assert bad_page[start + 2][:2] == ["", "No listed event in the next 60 days."]
+    assert cells[start + 3] == ("The events calendar could not be read (not valid JSON). No event is shown; the rest of the "
+                                "page is unaffected.")
+    assert not any(str(c).startswith("NEXT EVENT") for c in cells)
+    assert "EVENTS 0 in the next 60 days" in log and "EVENTS note: The events calendar could not be read (not valid JSON)" in log
+    assert [r for r in bad_page if r[0] == "AAA.US"] == [r for r in page if r[0] == "AAA.US"]
+    assert bad_page[:verdict + 1] == page[:verdict + 1] and len(bad_page) == len(page)
+    # an old calendar with one entry that cannot be read: both are said under the table
+    old = dict(CAL, checked="2026-10-01", events=CAL["events"] + [{"id": "x", "start": "soon"}])
+    _, cells, start, log = build(json.dumps(old))
+    assert cells[start].startswith("6. EVENTS AHEAD - dated events of the next 60 days, calendar checked Thu 1 Oct 2026.")
+    assert cells[start + 8] == "1 calendar entry could not be read and is left out."
+    assert cells[start + 9] == "The calendar was last checked on Thu 1 Oct 2026 (49 days ago); dates may have moved since."
+    assert cells[start + 10].startswith("The news gate already raises CAUTION")
+    assert log.count("EVENTS note: ") == 2
+    # a caller's own calendar is used as given
+    b = Book({"My_Portfolio": Sheet(PORTFOLIO)})
+    own = {"checked": TODAY, "events": [nb.clean_event(_ev("q", "2026-11-21", "2026-11-21", "Deadline Q", "deadline"))],
+           "dropped": 0, "error": ""}
+    assert nb.run_once(True, book=b, session=Session(), now=NOW, query=eb.bq_query, calendar=own) == 0
+    log = capsys.readouterr().out
+    assert "NEXT EVENT (in 2 days): Deadline Q, Sat 21 Nov 2026." in log and "1 event(s) ahead" in log
+    assert "EVENTS note: The calendar holds no dated event after Sat 21 Nov 2026; it needs new dates." in log
+
