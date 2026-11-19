@@ -102,7 +102,9 @@ THEMES: Dict[str, Tuple[str, str, str]] = {
     "market_tone": ("Stock market: tone of the news", "Markets", "market tone"),
 }
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
-_SYM_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
+_SYM_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")            # what may be sent to BigQuery
+_HOLD_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")         # what may be shown as a holding (AAPL, GC=F, ^GSPC)
+_NOT_A_HOLDING = frozenset({"TOTAL", "TOTALS", "SUBTOTAL"})
 
 
 def _out(msg: str) -> None:
@@ -153,8 +155,17 @@ def fmt(v: Any, nd: int = 2, sign: bool = False) -> str:
 
 
 def market_of(symbol: str) -> str:
+    """The exchange suffix; a plain ticker with none (AAPL) is read as US, as the archive files it."""
     s = text(symbol).upper()
-    return s.rsplit(".", 1)[1] if "." in s else ""
+    if "." in s:
+        return s.rsplit(".", 1)[1]
+    return "US" if s.isalnum() else ""
+
+
+def aliases(symbol: str) -> List[str]:
+    """The names a holding may carry in the archive: itself, and TICKER.US for a plain ticker."""
+    s = text(symbol).upper()
+    return [s, s + ".US"] if s and "." not in s and s.isalnum() else [s]
 
 
 # ----------------------------------------------------------------------------- #
@@ -317,7 +328,8 @@ def clean_symbols(symbols: Sequence[Any]) -> List[str]:
 
 
 def read_holdings(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
-    """Symbol and name of each row under the 'Symbol' header of My_Portfolio (order kept)."""
+    """Symbol and name of each row under the 'Symbol' header of My_Portfolio (order kept). A symbol needs no
+    exchange suffix (AAPL, QQQ and GC=F are holdings too - Codex P2, #1032); only a totals label is passed over."""
     rows = [list(r) for r in values or []]
     for hi, r in enumerate(rows[:12]):
         cells = [text(c) for c in r]
@@ -326,7 +338,7 @@ def read_holdings(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
             out, seen = [], set()
             for row in rows[hi + 1:]:
                 sym = text(row[si]).upper() if len(row) > si else ""
-                if _SYM_RE.match(sym) and "." in sym and sym not in seen:
+                if _HOLD_RE.match(sym) and sym not in _NOT_A_HOLDING and sym not in seen:
                     seen.add(sym)
                     out.append({"symbol": sym, "name": text(row[si + 1]) if len(row) > si + 1 else ""})
             return out
@@ -391,8 +403,8 @@ def holding_rows(holdings: Sequence[Dict[str, str]], sectors: Dict[str, str], ti
     out = []
     for h in holdings:
         sym = h["symbol"]
-        sector = sectors.get(sym, "")
-        seen = names.get(sym) or {}
+        sector = next((sectors[a] for a in aliases(sym) if sectors.get(a)), "")
+        seen = next((names[a] for a in aliases(sym) if a in names), {})
         row: Dict[str, Any] = {"symbol": sym, "name": h.get("name") or seen.get("name", ""), "sector": sector,
                                "listed": ("yes" if seen.get("listed") else "no") if shadow_day else "",
                                "shadow": ACTION_TEXT.get((seen.get("actions") or {}).get("events", ""), "") if aligned else ""}
@@ -633,7 +645,7 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     themes = theme_rows(query(session, project, location, sql_themes(ds, today)))
     tilt = pick_tilt(query(session, project, location, sql_tilt(ds, today)), today)
     record = record_rows(query(session, project, location, sql_record(ds)))
-    syms = clean_symbols(h["symbol"] for h in holdings)
+    syms = clean_symbols(a for h in holdings for a in aliases(h["symbol"]))
     sectors = {text(r.get("symbol")).upper(): text(r.get("sector"))
                for r in (query(session, project, location, sql_sectors(ds, syms)) if syms else [])}
     shadow_day, names = shadow_names(query(session, project, location, sql_shadow(ds, today)))

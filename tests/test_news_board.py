@@ -294,6 +294,13 @@ def test_n3_holdings_are_read_from_the_portfolio_page():
                    {"symbol": "CCC.US", "name": "Charlie Unknown"}, {"symbol": "DDD.US", "name": ""}]
     assert nb.read_holdings([]) == [] and nb.read_holdings([["Name", "Ticker"], ["x", "AAA.US"]]) == []
     assert nb.read_holdings([["Name", "Symbol"], ["Alpha", "AAA.US"]]) == [{"symbol": "AAA.US", "name": ""}]
+    # a symbol needs no exchange suffix (Codex P2, #1032): plain tickers, a future and an index are holdings too
+    plain = nb.read_holdings([["Symbol", "Name"], ["zzq", "Plain One"], ["GC=F", "Gold"], ["^GSPC", ""], ["TOTAL", ""],
+                              ["Subtotal", ""], ["Totals", ""], ["A B", ""], ["x'--", ""], ["ZZQ", "dup"], ["QQZ", ""]])
+    assert [h["symbol"] for h in plain] == ["ZZQ", "GC=F", "^GSPC", "QQZ"] and plain[0]["name"] == "Plain One"
+    assert nb.aliases("zzq") == ["ZZQ", "ZZQ.US"] and nb.aliases("AAA.US") == ["AAA.US"] and nb.aliases("GC=F") == ["GC=F"]
+    assert nb.aliases("^GSPC") == ["^GSPC"] and nb.aliases("") == [""]
+    assert [nb.market_of(x) for x in ("ZZQ", "AAA.US", "5023.SR", "GC=F", "^GSPC", "")] == ["US", "US", "SR", "", "", ""]
     assert nb.clean_symbols(["aaa.us", "AAA.US", "x'; DROP TABLE t; --", "", None, "5023.SR", "A" * 16]) == ["AAA.US", "5023.SR"]
 
 
@@ -325,7 +332,14 @@ def test_n3_holding_rows_show_the_tilt_of_each_holding():
     stale = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, nb.pick_tilt(TILT_ROWS, dt.date(2026, 11, 24)), names,
                             "2026-11-19")
     assert (stale[0]["events"], stale[0]["all"]) == ("", "")                               # no tilt in force: none claimed
-    assert nb.holding_rows([], sectors, tilt, names) == [] and nb.market_of("5023.SR") == "SR" and nb.market_of("X") == ""
+    assert nb.holding_rows([], sectors, tilt, names) == [] and nb.market_of("5023.SR") == "SR" and nb.market_of("X") == "US"
+    # a plain ticker is found under TICKER.US, in the sector map and on the list; a future has no sector
+    bare = nb.holding_rows([{"symbol": "AAA", "name": ""}, {"symbol": "GC=F", "name": "Gold"}, {"symbol": "GGG", "name": ""}],
+                           sectors, tilt, names, "2026-11-19")
+    assert (bare[0]["sector"], bare[0]["events"], bare[0]["listed"], bare[0]["shadow"], bare[0]["note"], bare[0]["name"]) == (
+        "Financials", "avoided", "yes", "would leave", "", "Alpha Bank")
+    assert (bare[1]["sector"], bare[1]["listed"], bare[1]["note"]) == ("", "no", "sector not known to the archive")
+    assert (bare[2]["listed"], bare[2]["shadow"], bare[2]["note"]) == ("no", "would enter", "sector not known to the archive")
     # the list day decides what may be said about the list
     assert nb.shadow_note("2026-11-19", tilt) == "" and nb.shadow_note("2026-11-17", tilt) == ""
     assert nb.shadow_note("2026-11-23", tilt) == "" and nb.shadow_note("", tilt) == "" and nb.shadow_note("2026-11-19", {}) == ""
@@ -409,6 +423,16 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert list(book.tabs) == ["My_Portfolio", "News_Board"] and book.tabs["News_Board"].updates == 1
     assert book.tabs["My_Portfolio"].updates == 0 and book.tabs["My_Portfolio"].ranges == ["A1:B200"]
     assert len(sess.sql) == 7
+    assert "WHERE symbol IN ('AAA.US', 'BBB.PA', 'CCC.US', 'DDD.US')" in sess.sql[4]
+    out = capsys.readouterr().out
+    plain_book, plain_sess = Book({"My_Portfolio": Sheet([["Symbol", "Name"], ["AAA", ""], ["GC=F", "Gold"], ["TOTAL", ""]])}), Session()
+    assert nb.run_once(True, book=plain_book, session=plain_sess, now=NOW, query=eb.bq_query) == 0
+    assert "WHERE symbol IN ('AAA', 'AAA.US')" in plain_sess.sql[4]              # only clean names reach BigQuery
+    assert "2 holding(s)" in capsys.readouterr().out
+    gold_book, gold_sess = Book({"My_Portfolio": Sheet([["Symbol"], ["GC=F"]])}), Session()   # nothing BigQuery can look up
+    assert nb.run_once(True, book=gold_book, session=gold_sess, now=NOW, query=eb.bq_query) == 0
+    assert len(gold_sess.sql) == 6 and not any("v_symbol_sector" in q for q in gold_sess.sql)
+    assert "1 holding(s)" in capsys.readouterr().out
     page = book.tabs["News_Board"].values
     assert all(len(r) == nb.WIDTH for r in page) and len(page) >= 120
     cells = [str(c) for r in page for c in r]
@@ -450,7 +474,6 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert page[-1] == [""] * nb.WIDTH                                                    # the grid is blanked below the page
     last_text = [r[0] for r in page if r[0]][-1]
     assert last_text.startswith("How to read:") and last_text.endswith("Not investment advice.")
-    out = capsys.readouterr().out
     assert "wrote the News_Board page" in out and "4 holding(s)" in out and "4 moved name(s)" in out
     assert ("TILT events week 2026-11-09, in force 2026-11-17 to 2026-11-23 | favoured: Information Technology | avoided: "
             "Consumer Staples, Financials") in out

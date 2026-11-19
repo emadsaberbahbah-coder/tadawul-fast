@@ -43,9 +43,14 @@ A run reads about 1 GB in BigQuery (the sector view and the trial view are the l
 ## S5 - Tests
 - `pytest tests/test_news_board.py` run 3 times: 14 passed. The full runs go through the real BigQuery reader on a fake session that answers as the REST API does, and a fake workbook.
 - With the Evidence Board, Sheets quota, manifest pins, news themes, news gate, CI verdict, Today Action Plan and Holding_Read suites: 258 passed. Workflow suites: 154 passed. `tests/test_bq_views.py`: PASS 37/37.
-- Mutants: 50 of 50 caught (the reading thresholds and words, the week in force, the Riyadh date, stale and not-in-force warnings, the list day outside the tilt's window, forward against past, the symbol and date guards, the dry run, the off switch, the tab written, the quota wait, holdings kept out of the log); the file restored byte-identical after each.
+- Mutants: 57 of 57 caught (the reading thresholds and words, the week in force, the Riyadh date, stale and not-in-force warnings, the list day outside the tilt's window, forward against past, the symbol and date guards, the dry run, the off switch, the tab written, the quota wait, holdings kept out of the log); the file restored byte-identical after each.
 - `python3 scripts/audit_repository_workflows.py`: `errors=0 warnings=0`.
 
 ## S6 - Deploy and rollback
 - **Deploy:** merge. Then a dry run of **News Board** by hand, then a real run; the tab `News_Board` is created by the first run. Nothing to paste.
 - **Rollback:** repository variable `TFB_NEWS_BOARD=off` (the page stays as last written), or revert the commit and delete the tab.
+
+## S7 - Review finding (Codex P2 on #1032, verified and fixed)
+- **Finding:** the holdings reader kept a row only when its symbol had an exchange suffix, so a plain ticker (AAPL, QQQ) would have been dropped from section 3 without a word.
+- **Verified:** true. `core/data_engine.py` lists plain tickers and `GC=F` among the default `My_Portfolio` symbols, and the engine keeps a symbol without a suffix as it is typed. The suffix test was there only to pass over a totals row.
+- **Fix:** every row under the `Symbol` header is a holding when it reads as a symbol (plain tickers, futures such as `GC=F` and indices such as `^GSPC` included); only the labels TOTAL, TOTALS and SUBTOTAL are passed over. A plain ticker is looked up in the archive under its own name and under `TICKER.US`. Only names made of letters, digits, dots and dashes are sent to BigQuery; a future is shown with "sector not known to the archive".
