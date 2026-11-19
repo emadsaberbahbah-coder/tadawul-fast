@@ -2,8 +2,30 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.13.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.14.0 (program register C8, Phase 2)
 ================================================================================
+v1.14.0 (19 Nov 2026, the news learning loop). WHY (owner, 19 Nov 2026: world
+news - wars, politics, the economy, AI fear, elections, summits - must be
+classified, weighted by kind, tested on the past and able to correct itself;
+then 13:06 Riyadh, verbatim: "Let's Start build the new news and it's effect in
+the file by the best way that you propse and before doing that make more final
+test then apply the changes by the best possible and effective way"). The final
+test of that day (three years of GDELT against the US sector ETFs, no
+look-ahead, 75 scored weeks) found no news weight that beats chance yet: the
+favoured-minus-avoided sector spread was 0.15 - 0.17 points a week with a t of
+0.5 - 0.7, and the same method fed news 8 to 40 weeks old did as well. So the
+news is built to learn and to be measured, not to move a recommendation. New
+source table news_theme_daily (scripts/archive_news_themes.py). New
+v_news_theme_weekly (weekly themes and their surprise), v_news_sector_weights
+(walk-forward weight of every theme for every US sector, switching itself off
+when its own record turns bad), v_news_sector_tilt (favoured / avoided
+sectors per news week, two arms), v_news_overlay_list (the investable list
+beside its news version, a shadow) and v_trial_news_overlay (the trial, forward
+evidence from 20 Nov 2026, promotion rule fixed now). Nothing on a page, in a
+score or in a pick changes. Research views: the live system never reads
+BigQuery. APPLY ORDER: the news table must exist before these views are
+created - run the BigQuery News Themes workflow (write) first.
+
 v1.13.0 (19 Nov 2026, the standing lost-opportunity comparison). WHY (owner,
 19 Nov 2026 10:04 Riyadh, verbatim: "make better compsion between the ROI as
 the investable recommdadtion and the best avalaible in the market as actual
@@ -286,7 +308,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -307,7 +329,9 @@ ARCHIVE_TABLES = frozenset({
 MARKET_TABLES = frozenset({"market_series_daily"})
 # the tables scripts/archive_symbol_deep.py v1.0.0 loads (v1.3.0)
 DEEP_TABLES = frozenset({"symbol_bars_daily", "symbol_analyst_daily", "symbol_news"})
-SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES
+# the table scripts/archive_news_themes.py v1.0.0 merges (v1.14.0, the news loop)
+NEWS_TABLES = frozenset({"news_theme_daily"})
+SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
