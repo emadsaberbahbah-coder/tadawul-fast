@@ -346,7 +346,7 @@ def test_g2_taxonomy_ascii_and_complete():
     raw = Path(ng.TAXONOMY_PATH).read_bytes()
     assert all(b < 128 for b in raw)
     tax = ng.load_taxonomy()
-    assert len(tax["events"]) == 23
+    assert len(tax["events"]) == 27 and tax["version"] == "1.1.0"     # v1.2.0 [TOPICS]: +4 MACRO types
     types = [e["type"] for e in tax["events"]]
     assert types.index("law_firm_noise") < types.index("legal_regulatory")
     assert types.index("earnings") < types.index("guidance")
@@ -720,9 +720,10 @@ def test_g7_english_wires_confirm_without_gdelt(armed):
     assert any(d.startswith("macro: war_escalation/hormuz grade 1") for d in rep["gate"]["drivers"])
     scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
     gq, nq = ng.build_queries(scope)
-    assert len(gq) == 7                                       # GDELT unchanged
+    assert len(gq) == 10                                      # 8 macro (v1.2.0: +3 topics) + 2 names
     en = [q for q in nq if q[3] == "en"]
-    assert [q[1] for q in en if q[0] == "MACRO"] == ["geopolitics en", "oil en", "rates en", "markets en"]
+    assert [q[1] for q in en if q[0] == "MACRO"] == ["geopolitics en", "oil en", "rates en", "markets en",
+                                                     "trade china en", "ai tech en", "politics en"]
     assert {q[0] for q in en if q[0] != "MACRO"} == {"FRST.US", "BADCO.US"}
     assert [q[0] for q in nq if q[3] == "en-sa"] == ["5023.SR"]
 
@@ -766,10 +767,10 @@ def test_g7_time_budget_bounds_a_slow_source(armed):
     scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
     col = ng.Collector(http, _sleep, NOW, clock=lambda: t[0])
     gq, _ = ng.build_queries(scope)
-    assert len(gq) == 7
+    assert len(gq) == 10
     col.gdelt(gq, 0.0)
     assert len([u for u in http.calls if "gdeltproject" in u]) == 3   # starts at 0, 100, 200 s
-    assert "time budget 240s spent; 4 queries skipped" in col.failed["gdelt"]
+    assert "time budget 240s spent; 7 queries skipped" in col.failed["gdelt"]
 
 
 def test_g7_request_timeout_is_bounded(armed, monkeypatch):
@@ -824,7 +825,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.1.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.2.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -849,9 +850,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.1.0"   # 2026-11-16: v1.1.0 [ISSUER-LINK]
+    assert ng.__version__ == "1.2.0"   # 2026-11-19: v1.2.0 [TOPICS]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.1.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.2.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -866,6 +867,184 @@ def test_g9_ascii_module_version_pin_and_workflow():
     assert env["EODHD_API_KEY"] == "${{ secrets.EODHD_API_KEY }}"
     assert "secrets.TFB_SEC_USER_AGENT" in env["TFB_SEC_USER_AGENT"]
     assert '--dry-run' in run_step["run"] and 'python scripts/news_macro_gate.py $MODE' in run_step["run"]
+
+
+# ----------------------------------------------------------------------------- G10 (v1.2.0 [TOPICS])
+TOPIC_CASES = [
+    # subjects the gate had no word for (archive, 12 - 19 Nov 2026)
+    ("Trump, Xi and Putin open first three-way summit in Shenzhen", "summit_diplomacy", 0),
+    ("US and China agree trade deal as stocks rise", "trade_deal", 1),
+    ("Washington eases export controls on chips to China", "trade_deal", 1),
+    ("APEC leaders meet as exports drop", "summit_diplomacy", -1),
+    ("G20 finance chiefs gather for high-level talks", "summit_diplomacy", 0),
+    ("AI bubble fears grow as Nvidia falls", "ai_tech", -1),
+    ("OpenAI spending plans surge to a record", "ai_tech", 1),
+    ("Election results due as polls close", "election_politics", 0),
+    ("Government shutdown deal reached in Senate", "election_politics", 0),
+    ("\u062a\u0631\u0627\u0645\u0628 \u0648\u0634\u064a \u0648\u0628\u0648\u062a\u064a\u0646 \u0641\u064a \u0642\u0645\u0629 \u062b\u0644\u0627\u062b\u064a\u0629", "summit_diplomacy", 0),
+    ("\u0648\u0627\u0634\u0646\u0637\u0646 \u0648\u0628\u0643\u064a\u0646 \u062a\u062a\u0648\u0635\u0644\u0627\u0646 \u0625\u0644\u0649 \u0627\u062a\u0641\u0627\u0642 \u062a\u062c\u0627\u0631\u064a", "trade_deal", 1),
+    ("\u0645\u062e\u0627\u0648\u0641 \u0645\u0646 \u0641\u0642\u0627\u0639\u0629 \u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0627\u0635\u0637\u0646\u0627\u0639\u064a", "ai_tech", 0),
+    ("\u0646\u062a\u0627\u0626\u062c \u0627\u0644\u0627\u0646\u062a\u062e\u0627\u0628\u0627\u062a \u0627\u0644\u0623\u0645\u0631\u064a\u0643\u064a\u0629", "election_politics", 0),
+]
+
+
+@pytest.mark.parametrize("title,etype,direction", TOPIC_CASES)
+def test_g10_topics_are_named(title, etype, direction):
+    got = ng.Classifier(ng.load_taxonomy()).classify(title, "MACRO")
+    assert (got["event_type"], got["direction"]) == (etype, direction), got
+
+
+OLDER_MACRO = ["war_escalation", "de_escalation", "emergency_policy", "market_turmoil", "oil_supply", "central_bank",
+               "inflation_data", "jobs_data", "trade_sanctions", "credit_stress"]
+LABEL_ONLY = ["trade_deal", "summit_diplomacy", "ai_tech", "election_politics"]
+
+# A headline that names an older subject beside a new one keeps the older reading (Codex P2, #1031).
+MIXED_CASES = [
+    ("China faces recession as election uncertainty grows", "credit_stress"),
+    ("Election result sparks recession fears", "credit_stress"),
+    ("Summit overshadowed as debt default looms", "credit_stress"),
+    ("Nvidia and AI stocks slide as default risk rises", "credit_stress"),
+    ("AI bubble bursts as bank run hits lenders", "emergency_policy"),
+    ("Trade deal collapses as emergency rate cut announced", "emergency_policy"),
+    ("Circuit breaker halts trading after trade deal hopes fade", "market_turmoil"),
+    ("Stocks plunge as summit ends without trade agreement", "market_turmoil"),
+    ("Trade agreement signed as ceasefire holds", "de_escalation"),
+    ("Israel and Hamas agree ceasefire deal", "de_escalation"),
+    ("Truce holds in Gaza for a third day", "de_escalation"),
+    ("Missile strike reported as leaders gather for summit", "war_escalation"),
+    ("FOMC minutes and APEC Summit in focus.", "central_bank"),
+    ("OPEC+ summit ends with output cut", "oil_supply"),
+    ("Trump threatens new tariff on China ahead of summit", "trade_sanctions"),
+    ("Sanctions on chip export widen as AI trade cools", "trade_sanctions"),
+    ("Fed holds rates steady as Powell signals patience", "central_bank"),
+    ("Recession fears return", "credit_stress"),
+    # two older misreadings, kept on purpose: correcting them changes the easing line and a CAUTION rule
+    ("What's at stake for Trump and Xi in Shenzhen: A trade truce deadline, new export controls, and Iran",
+     "de_escalation"),
+    ("US and China agree trade deal as tariff relief lifts stocks higher", "trade_sanctions"),
+]
+
+
+def _older_only(tax):
+    """The taxonomy as it was before the label-only types: the same file without them."""
+    return dict(tax, events=[e for e in tax["events"] if not e.get("label_only")])
+
+
+def test_g10_order_keeps_the_older_readings():
+    tax = ng.load_taxonomy()
+    macro = [e["type"] for e in tax["events"] if e["scope"] == "MACRO"]
+    assert macro == OLDER_MACRO + LABEL_ONLY                     # every older type first, in its old order
+    assert [e["type"] for e in tax["events"] if "label_only" in e] == LABEL_ONLY
+    new = {e["type"]: e for e in tax["events"] if e["type"] in LABEL_ONLY}
+    assert {t: (e["scope"], e["direction"], e["severity"], e["label_only"]) for t, e in new.items()} == {
+        "trade_deal": ("MACRO", 1, "M", True), "summit_diplomacy": ("MACRO", 0, "M", True),
+        "ai_tech": ("MACRO", 0, "M", True), "election_politics": ("MACRO", 0, "M", True)}
+    assert all(e["en"] and e["ar"] for e in new.values())
+    clf = ng.Classifier(tax)
+    assert [e["type"] for e in clf.events if e["label_only"]] == LABEL_ONLY
+    # only a JSON true marks a label: false or a word does not
+    loose = dict(tax, events=[dict(e, label_only={"ai_tech": "yes", "summit_diplomacy": False}.get(e["type"], True))
+                              if e["type"] in LABEL_ONLY else e for e in tax["events"]])
+    assert [e["type"] for e in ng.Classifier(loose).events if e["label_only"]] == ["trade_deal", "election_politics"]
+    for title, etype in MIXED_CASES:
+        assert clf.classify(title, "MACRO")["event_type"] == etype, title
+    # short words are whole words: 'apec' / 'g7' / 'g20' never match inside another word
+    for title in ("Capecitabine trial data due", "Airbag7 recall widens", "Dog20 token lists"):
+        assert clf.classify(title, "MACRO")["event_type"] == "", title
+    # a company's own story keeps its company type
+    assert clf.classify("Nvidia quarterly results beat forecasts", "NVDA.US")["event_type"] == "earnings"
+
+
+def test_g10_label_only_types_change_no_older_reading():
+    tax = ng.load_taxonomy()
+    now, was = ng.Classifier(tax), ng.Classifier(_older_only(tax))
+    assert [e["type"] for e in was.events if e["scope"] == "MACRO"] == OLDER_MACRO
+    titles = [t for t, _ in MIXED_CASES] + [t for t, _, _ in TOPIC_CASES] + [r["title"] for r in GDELT_GEO["articles"]]
+    kept = named = 0
+    for title in titles:
+        before, after = was.classify(title, "MACRO"), now.classify(title, "MACRO")
+        if before["event_type"]:
+            assert after == before, title                        # it had a reading: the same reading, whole
+            kept += 1
+        else:
+            assert after["event_type"] in LABEL_ONLY + [""], title   # it had none: a label or still none
+            named += after["event_type"] in LABEL_ONLY
+        # a name's own headline is read exactly as before, so no new flag can reach a name
+        assert now.classify(title, "NVDA.US") == was.classify(title, "NVDA.US"), title
+    assert kept >= len(MIXED_CASES) and named == len(TOPIC_CASES)
+    # every term of a label-only type is alive: alone, it is read as its own type
+    for e in tax["events"]:
+        if e.get("label_only"):
+            for term in e["en"] + e["ar"]:
+                assert now.classify(term, "MACRO")["event_type"] == e["type"], (e["type"], term)
+                own = now.classify(term, "NVDA.US")
+                assert own == was.classify(term, "NVDA.US") and own["event_type"] not in LABEL_ONLY, (e["type"], term)
+
+
+def test_g10_new_types_never_move_the_verdict():
+    src = (_REPO / "scripts" / "news_macro_gate.py").read_text(encoding="utf-8")
+    body = src.split("def evaluate(", 1)[1].split("\n# ---", 1)[0]
+    for t in ("trade_deal", "summit_diplomacy", "ai_tech", "election_politics"):
+        assert t not in body, t
+    items = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/s1", "Trump, Xi and Putin open summit in Shenzhen, China", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/s2", "China hosts Trump and Putin for summit", "20261030T101000Z", "apnews.com"),
+        ("https://www.bbc.com/s3", "China summit: leaders meet in Shenzhen", "20261030T102000Z", "bbc.com"),
+        ("https://www.reuters.com/a1", "AI bubble fears grow as Nvidia falls on China chip export worries", "20261030T100500Z", "reuters.com"),
+        ("https://apnews.com/a2", "Nvidia falls as AI bubble fears hit China chip export hopes", "20261030T101500Z", "apnews.com"),
+        ("https://www.bbc.com/a3", "China election politics weigh on markets", "20261030T102500Z", "bbc.com"),
+    ]), "MACRO", "geo")
+    cl = _clusters(items, QUIET)
+    assert {c["event_type"] for c in cl} == {"summit_diplomacy", "ai_tech", "election_politics"}
+    g = ng.evaluate(cl, [], {}, QUIET)
+    assert g["verdict"] == "GO" and g["drivers"] == [] and g["positives"] == [] and g["names"] == {}
+    # an older subject named beside a new one still counts: a recession story with an election word is CAUTION
+    mixed = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/m1", "China faces recession as election uncertainty grows", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/m2", "China faces recession as election uncertainty grows", "20261030T101000Z", "apnews.com"),
+    ]), "MACRO", "politics")
+    cm = _clusters(mixed, QUIET)
+    assert [(c["event_type"], c["anchor"]) for c in cm] == [("credit_stress", "china")]
+    gm = ng.evaluate(cm, [], {}, QUIET)
+    assert gm["verdict"] == "CAUTION" and len(gm["drivers"]) == 1
+    assert gm["drivers"][0].startswith("macro: credit_stress/china grade ")
+    # a name's own headline on AI or an election takes no label-only type, so the name is not flagged
+    own = ng.parse_gdelt(gdelt_articles([
+        ("https://www.reuters.com/n1", "AI bubble fears grow as Nvidia falls", "20261030T100000Z", "reuters.com"),
+        ("https://apnews.com/n2", "Nvidia shares drop on election uncertainty", "20261030T101000Z", "apnews.com"),
+    ]), "NVDA.US", "name")
+    assert _clusters(own, QUIET) == []
+    assert ng.evaluate(_clusters(own, QUIET), [], {}, QUIET)["names"] == {}
+
+
+def test_g10_topic_searches():
+    assert [l for l, _ in ng.GDELT_MACRO_QUERIES] == ["geopolitics", "oil", "central banks", "market stress", "saudi",
+                                                    "trade china", "ai tech", "politics"]
+    assert [l for l, _ in ng.GNEWS_AR_QUERIES] == ["saudi market ar", "oil ar", "rates ar", "geopolitics ar",
+                                                  "trade china ar", "ai tech ar"]
+    assert [l for l, _ in ng.GNEWS_EN_QUERIES] == ["geopolitics en", "oil en", "rates en", "markets en",
+                                                  "trade china en", "ai tech en", "politics en"]
+    by = dict(ng.GDELT_MACRO_QUERIES)
+    for word in ("tariff", '"trade deal"', "summit", "APEC"):
+        assert word in by["trade china"]
+    assert "Nvidia" in by["ai tech"] and "election" in by["politics"]
+    en = dict(ng.GNEWS_EN_QUERIES)
+    for label, words in (("trade china en", ("tariff", '"trade deal"', "summit", "APEC")),
+                         ("ai tech en", ('"artificial intelligence"', "Nvidia", "OpenAI")),
+                         ("politics en", ("election", '"government shutdown"', '"debt ceiling"'))):
+        for word in words:
+            assert word in en[label], (label, word)
+    ar = dict(ng.GNEWS_AR_QUERIES)
+    assert "\u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0627\u0635\u0637\u0646\u0627\u0639\u064a" in ar["ai tech ar"]   # 'artificial intelligence'
+    assert ar["trade china ar"].count(" OR ") == 3 and ar["ai tech ar"].count(" OR ") == 2
+    assert all(q.endswith("sourcelang:english") for q in by.values())
+    assert all(q.endswith("when:1d") for _, q in ng.GNEWS_AR_QUERIES + ng.GNEWS_EN_QUERIES)
+    assert "\u0642\u0645\u0629" in dict(ng.GNEWS_AR_QUERIES)["trade china ar"]            # 'summit' in Arabic
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
+    gq, nq = ng.build_queries(scope)
+    assert [q[0] for q in gq[:8]] == ["MACRO"] * 8 and all(q[0] != "MACRO" for q in gq[8:])     # topics before names
+    macro_n = [i for i, q in enumerate(nq) if q[0] == "MACRO"]
+    assert macro_n == list(range(13))                                                          # 6 ar + 7 en, then names
 
 
 if __name__ == "__main__":

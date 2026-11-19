@@ -2,8 +2,34 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.1.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.2.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.2.0 (2026-11-19) -- [TOPICS] TRADE DEALS, SUMMITS, AI AND ELECTIONS ARE READ AND NAMED
+WHY (owner, 19 Nov 2026: is the China summit in the news analysis; world news - politics, wars, the economy, the
+  fear of AI, elections - is part of valuing any stock; "Let's Start build the new news"): the gate searched five
+  subjects (fighting, oil, rates, market stress, Saudi) and had no word for a summit, a trade deal, AI or an
+  election. Archive, 12 - 19 Nov: about 3,000 headlines, 23 on trade; the week of the Shenzhen APEC summit the
+  one headline on what was at stake ("A trade truce deadline, new export controls, and Iran") was filed as war
+  de-escalation because 'truce' is a ceasefire word, and "FOMC minutes and APEC Summit in focus" as a central-bank
+  story.
+WHAT: (1) taxonomy 1.1.0 (data/news_gate_taxonomy.json), four MACRO event types: trade_deal (positive),
+  summit_diplomacy, ai_tech and election_politics (neutral: the direction comes from the headline's own
+  positive / negative words), English and Arabic terms. They are LABELS ONLY ("label_only": true) and can change
+  no older reading, by construction: (a) they stand after every older MACRO type and the first match wins, so a
+  headline that had a type keeps it (a recession, a default, a tariff, a crash or a strike named beside a summit,
+  AI or an election is still read as before - Codex P2, #1031); (b) a name's own headlines never take a
+  label-only type, so no new WATCH can appear on a name; (c) no verdict rule names them: evaluate() is unchanged.
+  The verdict, its drivers, the easing line and the name flags are the same for any input. (2) Three more
+  searches a language: GDELT and Google-News English 'trade china', 'ai tech', 'politics'; Google-News Arabic
+  'trade china ar', 'ai tech ar' - after the existing macro searches and before the names.
+NOT IN THIS VERSION: (1) two older misreadings stay as they were, because correcting them changes the easing
+  line and a CAUTION rule and needs its own evidence: a "trade truce" is read as de_escalation ('truce'), and a
+  tariff cut as trade_sanctions ('tariff'). (2) The GDELT document API still answers HTTP 429 to the runner on
+  most runs (its name and macro searches are skipped); the daily themes now reach BigQuery by another road
+  (scripts/archive_news_themes.py reads the public GDELT tables), and moving the headlines the same way is the
+  next step.
+ROLLBACK: revert this file and data/news_gate_taxonomy.json to v1.1.0 / 1.0.0. No tab or header change.
+
 v1.1.0 (2026-11-16) -- [ISSUER-LINK] A HEADLINE COUNTS FOR A NAME ONLY IF IT IS ABOUT THAT ISSUER
 WHY (owner reviews of 15 and 16 Nov: "news under the wrong company (MBIN, IFS)"; news design phase 0, issuer
   linking): a name's GDELT / Google-News query is its cleaned company name, and every article the search
@@ -166,7 +192,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -457,6 +483,8 @@ class Classifier:
             self.events.append({
                 "type": ev["type"], "scope": ev["scope"], "direction": int(ev["direction"]),
                 "severity": ev["severity"],
+                # v1.2.0: a label-only type names a subject and never enters a rule
+                "label_only": ev.get("label_only") is True,
                 "terms": _norm_terms(list(ev.get("en") or []) + list(ev.get("ar") or [])),
             })
         def pair(key: str) -> List[str]:
@@ -482,8 +510,9 @@ class Classifier:
     def classify(self, title: str, scope: str) -> Dict[str, Any]:
         norm = normalize_text(title)
         company_first = scope != "MACRO"
+        # v1.2.0: a name's own headline never takes a label-only type (a negative one would flag the name WATCH)
         order = ([e for e in self.events if e["scope"] == "COMPANY"]
-                 + [e for e in self.events if e["scope"] == "MACRO"]) if company_first \
+                 + [e for e in self.events if e["scope"] == "MACRO" and not e["label_only"]]) if company_first \
             else [e for e in self.events if e["scope"] == "MACRO"]
         found = None
         for ev in order:
@@ -1116,6 +1145,10 @@ GDELT_MACRO_QUERIES: Tuple[Tuple[str, str], ...] = (
     ("central banks", '("Federal Reserve" OR FOMC OR "rate cut" OR "rate hike" OR "Treasury yields" OR "interest rates") sourcelang:english'),
     ("market stress", '("stock market" OR "Wall Street" OR stocks) (plunge OR selloff OR "sell-off" OR crash OR "circuit breaker" OR rout) sourcelang:english'),
     ("saudi", '("Saudi Arabia" OR Tadawul OR "Saudi Aramco" OR "Saudi stocks" OR Riyadh) sourcelang:english'),
+    # v1.2.0 [TOPICS]
+    ("trade china", '(tariff OR "trade deal" OR "trade truce" OR "export controls" OR summit OR APEC OR "Xi Jinping") sourcelang:english'),
+    ("ai tech", '("artificial intelligence" OR "AI bubble" OR Nvidia OR OpenAI OR "chip export" OR "chip stocks") sourcelang:english'),
+    ("politics", '(election OR "government shutdown" OR "debt ceiling" OR "executive order") sourcelang:english'),
 )
 # Arabic Google-News queries (escaped: the repository keeps added lines ASCII)
 GNEWS_AR_QUERIES: Tuple[Tuple[str, str], ...] = (
@@ -1123,6 +1156,9 @@ GNEWS_AR_QUERIES: Tuple[Tuple[str, str], ...] = (
     ("oil ar", "\u0623\u0633\u0639\u0627\u0631 \u0627\u0644\u0646\u0641\u0637 OR \u0623\u0648\u0628\u0643 when:1d"),
     ("rates ar", "\u0627\u0644\u0641\u064a\u062f\u0631\u0627\u0644\u064a OR \u0633\u0639\u0631 \u0627\u0644\u0641\u0627\u0626\u062f\u0629 when:1d"),
     ("geopolitics ar", "\u0647\u062c\u0648\u0645 OR \u062a\u0635\u0639\u064a\u062f OR \u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632 when:1d"),
+    # v1.2.0 [TOPICS]
+    ("trade china ar", "\u0642\u0645\u0629 OR \u0627\u0644\u0631\u0633\u0648\u0645 \u0627\u0644\u062c\u0645\u0631\u0643\u064a\u0629 OR \u0627\u062a\u0641\u0627\u0642 \u062a\u062c\u0627\u0631\u064a OR \u0627\u0644\u062d\u0631\u0628 \u0627\u0644\u062a\u062c\u0627\u0631\u064a\u0629 when:1d"),
+    ("ai tech ar", "\u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0627\u0635\u0637\u0646\u0627\u0639\u064a OR \u0625\u0646\u0641\u064a\u062f\u064a\u0627 OR \u0623\u0634\u0628\u0627\u0647 \u0627\u0644\u0645\u0648\u0635\u0644\u0627\u062a when:1d"),
 )
 # v1.0.2: English Google-News (US edition) reaches the licensed wires when
 # GDELT throttles the runner (27 Oct: circuit open at its second query).
@@ -1131,6 +1167,10 @@ GNEWS_EN_QUERIES: Tuple[Tuple[str, str], ...] = (
     ("oil en", '"oil prices" OR OPEC OR "Brent crude" OR "crude oil" when:1d'),
     ("rates en", '"Federal Reserve" OR FOMC OR "Treasury yields" OR "rate cut" when:1d'),
     ("markets en", '"Wall Street" OR "stock market" OR "Saudi stocks" OR Tadawul when:1d'),
+    # v1.2.0 [TOPICS]
+    ("trade china en", 'tariff OR "trade deal" OR "trade truce" OR "export controls" OR summit OR APEC when:1d'),
+    ("ai tech en", '"artificial intelligence" OR "AI bubble" OR Nvidia OR OpenAI OR "chip stocks" when:1d'),
+    ("politics en", 'election OR "government shutdown" OR "debt ceiling" OR "executive order" when:1d'),
 )
 
 
