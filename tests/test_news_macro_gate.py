@@ -1090,6 +1090,33 @@ TRADE_CASES = [
     ("China will cut tariffs if US lifts chip curbs", "trade_sanctions", "trade_sanctions", -1),  # a condition is not relief
     ("Tariff cut talks collapse", "trade_sanctions", "trade_sanctions", -1),
     ("Tariff relief deal falters in Senate", "trade_sanctions", "trade_sanctions", -1),          # a breach word alone
+    # Codex P2 x2 on #1033: a pressure word between the verb and 'tariffs' still counts; a rejection in any tense
+    ("China lifts sanctions and tariffs on Iran", "trade_sanctions", "trade_sanctions", -1),
+    ("Trump lifts embargo and tariffs on Cuba", "trade_sanctions", "trade_sanctions", -1),
+    ("China tariff cuts ruled out by officials", "trade_sanctions", "trade_sanctions", -1),
+    ("China rules out tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Officials ruling out tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Beijing rule out tariff cuts for now", "trade_sanctions", "trade_sanctions", -1),
+    # relief undone after the phrase: a past form of a relief verb
+    ("Tariff pause lifted as deadline passes", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff cuts dropped from the bill", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief scrapped by White House", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff exemptions removed for chips", "trade_sanctions", "trade_sanctions", -1),
+    # a relief that is not there, not yet, or not what it seems
+    ("No tariff relief for Canada, Trump says", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief unlikely this year, minister says", "trade_sanctions", "trade_sanctions", -1),
+    ("China would cut tariffs on US pork", "trade_sanctions", "trade_sanctions", -1),
+    ("China cuts tariffs after talks with Canada", "trade_sanctions", "trade_sanctions", -1),     # cautious: 'talks'
+    ("Senate pushed for tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("Lobby called for tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Exporters sought tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("Ministers eyed tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Farmers asked for tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("China hiked duties as Canada cuts tariffs", "trade_sanctions", "trade_sanctions", -1),
+    ("Canada cuts tariff-free quota for steel", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff pause expiring next week", "trade_sanctions", "trade_sanctions", -1),
+    ("Senators oppose tariff relief for China", "trade_sanctions", "trade_sanctions", -1),
+    ("White House walks back tariff relief", "trade_sanctions", "trade_sanctions", -1),
     # sanctions relief is not in this version; plain sanctions and tariffs read as before
     ("EU lifts sanctions on Syria", "trade_sanctions", "trade_sanctions", -1),
     ("US sanctions Hezbollah-linked charity in bid to squeeze Iran", "trade_sanctions", "trade_sanctions", -1),
@@ -1131,6 +1158,38 @@ def test_g11_a_reading_can_only_leave_a_verdict_rule():
     assert tax["trade_relief"]["verbs"] and tax["trade_relief"]["objects"] == ["tariff", "tariffs"]
     hedge = {h.strip() for h in tax["trade_hedge"]["en"]}
     assert not hedge & set(tax["trade_relief"]["verbs"])            # a relief verb is never itself a hedge
+    # a rejection or a request guards in every tense (Codex P2, #1033: 'ruled out' was missing)
+    c0 = ng.Classifier(tax)
+    guard = c0.hedge
+    for stem, forms in (("rule out", ("rule out", "rules out", "ruled out", "ruling out")),
+                        ("call for", ("call for", "calls for", "called for", "calling for")),
+                        ("push", ("push for", "pushes for", "pushed for", "pushing for")),
+                        ("seek", ("seek", "seeks", "seeking", "sought")), ("ask", ("ask", "asks", "asked", "asking")),
+                        ("eye", ("eye", "eyes", "eyed", "eyeing")), ("hike", ("hike", "hikes", "hiked", "hiking")),
+                        ("raise", ("raise", "raises", "raised", "raising")), ("expire", ("expire", "expires", "expired", "expiring", "expiry")),
+                        ("shelve", ("shelve", "shelves", "shelved", "shelving")), ("withdraw", ("withdraw", "withdraws", "withdrew", "withdrawn")),
+                        ("urge", ("urge", "urges", "urged", "urging")), ("weigh", ("weigh", "weighs", "weighed", "weighing")),
+                        ("threaten", ("threat", "threatens", "threatened", "threatening")), ("walk back", ("walk back", "walks back", "walked back")),
+                        ("fall short", ("fall short", "falls short", "fell short", "falling short of")),
+                        ("end", ("end", "ends", "ended", "ending")), ("delay", ("delay", "delays", "delayed", "delaying")),
+                        ("warn", ("warn", "warns", "warned", "warning")), ("veto", ("veto", "vetoes", "vetoed")),
+                        ("demand", ("demand", "demands", "demanded")), ("reject", ("reject", "rejects", "rejected")),
+                        ("plan", ("plan", "plans", "planned", "planning")), ("discuss", ("discuss", "discusses", "discussed")),
+                        ("block", ("block", "blocks", "blocked")), ("cancel", ("cancel", "cancels", "cancelled", "canceled")),
+                        ("pledge", ("pledge", "pledges", "pledged", "pledging")), ("promise", ("promise", "promises", "promised", "promising")),
+                        ("hope", ("hope", "hopes", "hoped", "hoping")), ("lapse", ("lapse", "lapses", "lapsed", "lapsing")),
+                        ("propose", ("propose", "proposes", "proposed", "proposing", "proposal")),
+                        ("consider", ("consider", "considers", "considered", "considering")),
+                        ("oppose", ("oppose", "opposes", "opposed", "opposing")), ("deny", ("deny", "denies", "denied", "denying")),
+                        ("refuse", ("refuse", "refuses", "refused", "refusing")), ("collapse", ("collapse", "collapses", "collapsed"))):
+        for form in forms:
+            norm = ng.normalize_text("x %s y" % form)
+            assert ng._hit(norm, guard) or ng._hit(norm, c0.breach) or ng._hit(norm, c0.denial), (stem, form)
+    # the words between the verb and 'tariffs' are kept when the match is set aside
+    c = ng.Classifier(tax)
+    assert c._without(" china lifts sanctions and tariffs on iran ", c.relief, c.relief_re) == " china sanctions and on iran "
+    assert c._without(" china cuts tariffs on pork ", c.relief, c.relief_re) == " china on pork "
+    assert c._without(" a trade truce deadline ", c.truce) == " a deadline "
     now, was = ng.Classifier(tax), ng.Classifier(_v120(tax))
     assert was.truce == [] and was.relief == [] and was.hedge == [] and was.relief_re is None and was.undo_re is None
     titles = ([t for t, *_ in TRADE_CASES] + [t for t, _ in MIXED_CASES] + [t for t, _, _ in TOPIC_CASES]
@@ -1181,6 +1240,10 @@ def test_g11_the_verdict_can_fall_and_never_rise():
     def both(items):
         return (ng.evaluate(_clusters_with(_v120(tax), items, QUIET), [], {}, QUIET),
                 ng.evaluate(_clusters_with(tax, items, QUIET), [], {}, QUIET))
+    # sanctions relief beside tariffs, and a relief ruled out, are CAUTION before and now (Codex P2 x2, #1033)
+    for title in ("China lifts sanctions and tariffs on Iran", "China tariff cuts ruled out by officials"):
+        was, now = both(_wires("MACRO", title))
+        assert was["verdict"] == now["verdict"] == "CAUTION" and was["drivers"] == now["drivers"], title
     # tariff relief from three wires on China: it raised CAUTION, now it raises nothing
     was, now = both(_wires("MACRO", "China cuts tariffs on Canadian exports as Xi meets Carney"))
     assert was["verdict"] == "CAUTION" and was["drivers"][0].startswith("macro: trade_sanctions/china grade ")

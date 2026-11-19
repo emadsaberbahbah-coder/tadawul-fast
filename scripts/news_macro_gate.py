@@ -18,8 +18,10 @@ WHAT: taxonomy 1.2.0 adds three word lists (trade_truce, trade_relief, trade_hed
       type trade_deal (shown as falling when the headline says the truce is in doubt);
   (B) a trade_sanctions reading becomes trade_deal when the headline states tariff relief (a listed phrase, or a
       relief verb up to two words before 'tariffs'), names no other trade-pressure word once that phrase is set
-      aside, and carries no hedge (threat, demand, plan, if, end, a question mark ...), no breach, denial or
-      rumour word, and no relief verb in front of the relief phrase ("scraps tariff relief").
+      aside (the words between the verb and 'tariffs' stay and still count), and carries no hedge (threat,
+      demand, plan, talks, if, no, would, end, ruled out, a question mark ...), no breach, denial or rumour
+      word, no relief verb in front of the relief phrase ("scraps tariff relief") and no past form of one
+      after it ("tariff pause lifted").
   For a name's own headline the reading is dropped instead (a name never takes a label-only type).
   SAFETY, by construction: a reading can only move from de_escalation or trade_sanctions to trade_deal (or to
   none, for a name). trade_deal is in no verdict rule, so the change can remove an easing line, a CAUTION driver
@@ -527,12 +529,17 @@ class Classifier:
         verbs = [v for v in (normalize_text(x).strip() for x in rel.get("verbs") or []) if v]
         objs = [o for o in (normalize_text(x).strip() for x in rel.get("objects") or []) if o]
         alt = "|".join(re.escape(v) for v in verbs)
-        self.relief_re = re.compile(r"(?<= )(?:%s) (?:[^ ]+ ){0,2}(?:%s)(?= )" % (
+        # group 1 holds the words between the verb and 'tariffs': they are kept when the match is set aside,
+        # so a pressure word among them still counts ("lifts sanctions and tariffs" - Codex P2, #1033)
+        self.relief_re = re.compile(r"(?<= )(?:%s) ((?:[^ ]+ ){0,2})(?:%s)(?= )" % (
             alt, "|".join(re.escape(o) for o in objs))) if verbs and objs else None
-        # a relief verb in front of a relief phrase undoes it: "scraps tariff relief", "ends the tariff pause"
-        nouns = [n.strip() for n in self.relief if n.strip() and all(ord(ch) < 128 for ch in n)]
-        self.undo_re = re.compile(r"(?<= )(?:%s) (?:[^ ]+ ){0,2}(?:%s)" % (
-            alt, "|".join(re.escape(n) for n in nouns))) if verbs and nouns else None
+        # a relief verb in front of a relief phrase undoes it ("scraps tariff relief", "ends the tariff pause"),
+        # and so does its past form after the phrase ("tariff pause lifted", "tariff cuts dropped")
+        nouns = "|".join(re.escape(n.strip()) for n in self.relief if n.strip() and all(ord(ch) < 128 for ch in n))
+        done = "|".join(re.escape(v) for v in verbs if v.split()[0].endswith("ed"))
+        self.undo_re = re.compile(r"(?<= )(?:%s) (?:[^ ]+ ){0,2}(?:%s)" % (alt, nouns)
+                                  + (r"|(?:%s)s? (?:[^ ]+ ){0,2}(?:%s)(?= )" % (nouns, done) if done else "")) \
+            if verbs and nouns else None
         self.pos = pair("positive")
         self.neg = pair("negative")
         self.rumor = pair("rumor")
@@ -551,7 +558,7 @@ class Classifier:
     @staticmethod
     def _without(norm: str, terms: Sequence[str], pattern: Optional["re.Pattern[str]"] = None) -> str:
         """The normalised headline with the given phrases set aside (v1.3.0)."""
-        out = pattern.sub(" ", norm) if pattern is not None else norm
+        out = pattern.sub(lambda m: " " + (m.group(1) or ""), norm) if pattern is not None else norm
         for t in terms:
             out = out.replace(t, " ")
         return " " + " ".join(out.split()) + " "
