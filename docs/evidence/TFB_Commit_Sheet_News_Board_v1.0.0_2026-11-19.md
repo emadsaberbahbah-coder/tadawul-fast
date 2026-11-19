@@ -21,7 +21,7 @@
 1. **World news:** each theme's last full week against its own previous four weeks, how unusual that is against a year of its own weekly changes, and the running week so far. Themes are grouped as War, Politics, Economy, Technology, Markets.
 2. **Sector tilt:** the eleven US sectors, favoured / neutral / avoided for both arms, the themes with a working weight, last week's tilt and what the sector then did; and the record of the tilt, past weeks apart from forward weeks.
 3. **Holdings:** each holding of `My_Portfolio` beside its sector's tilt, and whether the shadow list would keep it. A holding outside the US is marked "indicative only": the tilt is measured on US sector funds.
-4. **Shadow list:** the names the tilt would move out of and into the investable list today, both arms side by side. It says it is not an order.
+4. **Shadow list:** the names the tilt would move out of and into the investable list on the latest list day, both arms side by side. It says it is not an order. When that day lies outside the window of the tilt shown in section 2 (a new tilt began today and the list is yesterday's), the page says so and claims no shadow action for a holding.
 5. **Trial:** `v_trial_news_overlay` as it stands, and the promotion rule fixed on 19 Nov.
 
 ## S2 - What does not change
@@ -43,7 +43,7 @@ A run reads about 1 GB in BigQuery (the sector view and the trial view are the l
 ## S5 - Tests
 - `pytest tests/test_news_board.py` run 3 times: 14 passed. The full runs go through the real BigQuery reader on a fake session that answers as the REST API does, and a fake workbook.
 - With the Evidence Board, Sheets quota, manifest pins, news themes, news gate, CI verdict, Today Action Plan and Holding_Read suites: 258 passed. Workflow suites: 154 passed. `tests/test_bq_views.py`: PASS 37/37.
-- Mutants: 44 of 44 caught (the reading thresholds and words, the week in force, the Riyadh date, stale and not-in-force warnings, forward against past, the symbol and date guards, the dry run, the off switch, the tab written, the quota wait, holdings kept out of the log); the file restored byte-identical after each.
+- Mutants: 50 of 50 caught (the reading thresholds and words, the week in force, the Riyadh date, stale and not-in-force warnings, the list day outside the tilt's window, forward against past, the symbol and date guards, the dry run, the off switch, the tab written, the quota wait, holdings kept out of the log); the file restored byte-identical after each.
 - `python3 scripts/audit_repository_workflows.py`: `errors=0 warnings=0`.
 
 ## S6 - Deploy and rollback

@@ -195,6 +195,10 @@ def col(page, first):
     return [r for r in page if r and r[0] == first]
 
 
+def col_all(page):
+    return [r for r in page if r and r[0]]
+
+
 # ----------------------------------------------------------------------------- N1 themes
 def test_n1_theme_reading_and_change():
     r = nb.theme_reading
@@ -310,7 +314,7 @@ def test_n3_holding_rows_show_the_tilt_of_each_holding():
     tilt = nb.pick_tilt(TILT_ROWS, TODAY)
     _, names = nb.shadow_names(SHADOW_ROWS)
     sectors = {r["symbol"]: r["sector"] for r in SECTOR_ROWS}
-    rows = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, tilt, names)
+    rows = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, tilt, names, "2026-11-19")
     a, b, c, d = rows
     assert (a["symbol"], a["sector"], a["events"], a["all"], a["listed"], a["shadow"], a["note"]) == (
         "AAA.US", "Financials", "avoided", "avoided", "yes", "would leave", "")
@@ -318,9 +322,21 @@ def test_n3_holding_rows_show_the_tilt_of_each_holding():
     assert b["note"] == "the tilt is measured on US sector funds: indicative only for this market"
     assert (c["sector"], c["events"], c["all"], c["note"]) == ("", "", "", "sector not known to the archive")
     assert (d["sector"], d["events"], d["all"], d["note"]) == ("Utilities", "", "", "")      # a sector the tilt does not list
-    stale = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, nb.pick_tilt(TILT_ROWS, dt.date(2026, 11, 24)), names)
+    stale = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, nb.pick_tilt(TILT_ROWS, dt.date(2026, 11, 24)), names,
+                            "2026-11-19")
     assert (stale[0]["events"], stale[0]["all"]) == ("", "")                               # no tilt in force: none claimed
     assert nb.holding_rows([], sectors, tilt, names) == [] and nb.market_of("5023.SR") == "SR" and nb.market_of("X") == ""
+    # the list day decides what may be said about the list
+    assert nb.shadow_note("2026-11-19", tilt) == "" and nb.shadow_note("2026-11-17", tilt) == ""
+    assert nb.shadow_note("2026-11-23", tilt) == "" and nb.shadow_note("", tilt) == "" and nb.shadow_note("2026-11-19", {}) == ""
+    note = nb.shadow_note("2026-11-16", tilt)                         # yesterday's list under the tilt of the week before
+    assert note == ("NOTE: this list day is outside the window of the tilt in section 2 (2026-11-17 to 2026-11-23); its "
+                    "moves come from the tilt that applied on that day.")
+    assert nb.shadow_note("2026-11-24", tilt) == note
+    old = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, tilt, names, "2026-11-16")
+    assert (old[0]["events"], old[0]["listed"], old[0]["shadow"]) == ("avoided", "yes", "")   # the list fact stays, no action claimed
+    none = nb.holding_rows(nb.read_holdings(PORTFOLIO), sectors, tilt, {}, "")
+    assert (none[0]["listed"], none[0]["shadow"], none[1]["listed"]) == ("", "", "")       # no list day: nothing said
 
 
 # ----------------------------------------------------------------------------- N4 trial and verdict
@@ -480,6 +496,9 @@ def test_n6_empty_and_stale_inputs_still_make_an_honest_page(capsys):
                  "4. SHADOW LIST for no list day - names the news tilt would move. It is NOT an order.",
                  "No name would move on this list day.", "The trial has no row yet.", "3. YOUR HOLDINGS AND THE TILT (0 holding(s))"):
         assert want in flat, want
+    book = Book({"My_Portfolio": Sheet(PORTFOLIO)})                    # a day inside the window: no note
+    assert nb.run_once(False, book=book, session=Session(), now=NOW, query=eb.bq_query) == 0
+    book_first_page = book.tabs["News_Board"].values
     late = dt.datetime(2026, 11, 24, 5, 0, tzinfo=UTC)                 # the window closed and no newer week came
     book = Book({"My_Portfolio": Sheet(PORTFOLIO)})
     assert nb.run_once(False, book=book, session=Session(last_day="2026-11-19"), now=late, query=eb.bq_query) == 0
@@ -488,6 +507,21 @@ def test_n6_empty_and_stale_inputs_still_make_an_honest_page(capsys):
     assert "2. SECTOR TILT - NOT in force today; it applied 2026-11-17 to 2026-11-23, from the news of the week of 2026-11-09" in flat
     assert "WARNING: the news archive stops at 2026-11-19 (5 days ago); the tilt below may be out of date." in flat
     assert col(page, "AAA.US")[0][3:5] == ["", ""]                    # no tilt is claimed for a holding
+    # a new tilt begins on Tuesday while the latest list is Monday's: the page says so and claims no action
+    newer = TILT_ROWS + [tl("events", "2026-11-16", "2026-11-24", "2026-11-30", "XLF", "Financials", "0.30", 1, "iran_war", "favoured")]
+    monday = [dict(r, base_date="2026-11-23") for r in SHADOW_ROWS if r["base_date"] == "2026-11-19"]
+    book = Book({"My_Portfolio": Sheet(PORTFOLIO)})
+    assert nb.run_once(False, book=book, session=Session(last_day="2026-11-23", tilt=newer, shadow=monday), now=late,
+                       query=eb.bq_query) == 0
+    page = book.tabs["News_Board"].values
+    flat = [r[0] for r in page]
+    assert "2. SECTOR TILT - in force 2026-11-24 to 2026-11-30, from the news of the week of 2026-11-16" in flat
+    i = flat.index("4. SHADOW LIST for 2026-11-23 - names the news tilt would move. It is NOT an order.")
+    assert flat[i + 2] == ("NOTE: this list day is outside the window of the tilt in section 2 (2026-11-24 to 2026-11-30); "
+                           "its moves come from the tilt that applied on that day.") and flat[i + 3] == "Symbol"
+    hold = col(page, "AAA.US")[0]
+    assert hold[:8] == ["AAA.US", "Alpha Bank", "Financials", "FAVOURED", "", "yes", "", ""]
+    assert not any(str(r[0]).startswith("NOTE:") for r in col_all(book_first_page))
 
 
 # ----------------------------------------------------------------------------- N7 wiring

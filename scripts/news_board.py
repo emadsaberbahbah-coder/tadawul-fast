@@ -29,7 +29,10 @@ WHAT IT WRITES (its page News_Board; nothing else)
        and the record of the tilt, past weeks apart from forward weeks.
     3. HOLDINGS: each holding of My_Portfolio beside its sector's tilt.
     4. SHADOW LIST: the names the tilt would move out of and into the
-       investable list today. It is not an order.
+       investable list on the latest list day. It is not an order. When
+       that day lies outside the window of the tilt shown in section 2 (a
+       new tilt began today, the list is yesterday's), the page says so
+       and claims no shadow action for a holding.
     5. TRIAL: v_trial_news_overlay as it stands, and the promotion rule.
 
 SAFETY
@@ -367,16 +370,32 @@ def shadow_rows(names: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         + sorted(entering, key=lambda d: (-(d["score"] if d["score"] is not None else -1.0), d["symbol"]))
 
 
+def shadow_note(shadow_day: str, tilt: Dict[str, Dict[str, Any]]) -> str:
+    """Empty when the list day lies inside the window of the tilt the page shows; else what the reader must know."""
+    lead = next((a for a in ARMS if a in tilt), None)
+    d = day(shadow_day)
+    if lead is None or d is None:
+        return ""
+    a_from, a_to = tilt[lead]["apply_from"], tilt[lead]["apply_to"]
+    if a_from <= d and (a_to is None or d <= a_to):
+        return ""
+    return ("NOTE: this list day is outside the window of the tilt in section 2 (%s to %s); its moves come from the tilt "
+            "that applied on that day." % (a_from.isoformat(), a_to.isoformat() if a_to else "?"))
+
+
 def holding_rows(holdings: Sequence[Dict[str, str]], sectors: Dict[str, str], tilt: Dict[str, Dict[str, Any]],
-                 names: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+                 names: Dict[str, Dict[str, Any]], shadow_day: str = "") -> List[Dict[str, Any]]:
+    """The shadow column is filled only when the list day lies under the tilt shown beside it; with no list day
+    nothing is said about the list."""
+    aligned = bool(shadow_day) and not shadow_note(shadow_day, tilt)
     out = []
     for h in holdings:
         sym = h["symbol"]
         sector = sectors.get(sym, "")
         seen = names.get(sym) or {}
         row: Dict[str, Any] = {"symbol": sym, "name": h.get("name") or seen.get("name", ""), "sector": sector,
-                               "listed": "yes" if seen.get("listed") else "no",
-                               "shadow": ACTION_TEXT.get((seen.get("actions") or {}).get("events", ""), "")}
+                               "listed": ("yes" if seen.get("listed") else "no") if shadow_day else "",
+                               "shadow": ACTION_TEXT.get((seen.get("actions") or {}).get("events", ""), "") if aligned else ""}
         for a in ARMS:
             t = tilt.get(a) or {}
             row[a] = (t.get("sectors", {}).get(sector) or {}).get("group", "") if t.get("in_force") else ""
@@ -505,6 +524,8 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
             pad(["; ".join("%s: list of %d, %d would leave, %d would enter" % (ARM_TEXT[a], c[a]["list"], c[a]["out"], c[a]["in"])
                            for a in ARMS)]),
             pad(["Symbol", "Name", "Sector", "Engine score", "Volatility", ARM_TEXT["events"], ARM_TEXT["all"]])]
+    if data.get("shadow_note"):
+        out.insert(len(out) - 1, pad([data["shadow_note"]]))
     for d in data["shadow"]:
         out.append(pad([d["symbol"], d["name"], d["sector"], fmt(d["score"], 1), d["vol"]]
                        + [ACTION_TEXT.get(d["actions"].get(a, ""), "not on the list") for a in ARMS]))
@@ -619,7 +640,8 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     trial = trial_rows(query(session, project, location, sql_trial(ds)))
     return {"last_news": last_news.isoformat() if last_news else "", "themes": themes, "tilt": tilt,
             "sectors": sector_rows(tilt), "record": record,
-            "holdings": holding_rows(holdings, sectors, tilt, names), "shadow_day": shadow_day,
+            "holdings": holding_rows(holdings, sectors, tilt, names, shadow_day), "shadow_day": shadow_day,
+            "shadow_note": shadow_note(shadow_day, tilt),
             "counts": shadow_counts(names), "shadow": shadow_rows(names), "trial": trial,
             "verdict": verdict_lines(trial, tilt, last_news, today)}
 
