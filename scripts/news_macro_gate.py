@@ -2,8 +2,37 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.2.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.3.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.3.0 (2026-11-19) -- [TRADE-RELIEF] A TRADE TRUCE IS NOT A CEASEFIRE; A TARIFF CUT IS NOT TRADE PRESSURE
+WHY (owner, 19 Nov 2026 15:33: "Lest move to the next", part 1 of the next stage; the two misreadings v1.2.0
+  left on purpose): 'truce' is a ceasefire word, so "China extends US trade truce by two months" was put on the
+  EASING line as war de-escalation; 'tariff' is a trade-pressure word, so "China and Canada agree on tariff
+  relief" was read as trade_sanctions, a type that raises CAUTION on a market anchor. The gate's own archive
+  (27 Oct - 19 Nov, before it searched trade) holds one headline of each kind. In two weeks of world headlines
+  (GDELT, 5 - 18 Nov) 106 of 790 'tariff' headlines (13%) speak of relief and 13 of 58 'truce' headlines (22%)
+  are trade truces - none of the 13 names a ceasefire or peace talks. v1.2.0 began searching trade, so these
+  now arrive daily.
+WHAT: taxonomy 1.2.0 adds three word lists (trade_truce, trade_relief, trade_hedge). In Classifier.classify():
+  (A) a de_escalation reading whose only ceasefire word sits inside a trade-truce phrase becomes the label-only
+      type trade_deal (shown as falling when the headline says the truce is in doubt);
+  (B) a trade_sanctions reading becomes trade_deal when the headline states tariff relief (a listed phrase, or a
+      relief verb up to two words before 'tariffs'), names no other trade-pressure word once that phrase is set
+      aside (the words between the verb and 'tariffs' stay and still count), and carries no hedge (threat,
+      demand, plan, talks, if, no, would, end, ruled out, a question mark ...), no breach, denial or rumour
+      word, no relief verb in front of the relief phrase ("scraps tariff relief") and no past form of one
+      after it ("tariff pause lifted").
+  For a name's own headline the reading is dropped instead (a name never takes a label-only type).
+  SAFETY, by construction: a reading can only move from de_escalation or trade_sanctions to trade_deal (or to
+  none, for a name). trade_deal is in no verdict rule, so the change can remove an easing line, a CAUTION driver
+  or a WATCH flag and can never add one. evaluate() is unchanged. Without the three lists (taxonomy 1.1.0) the
+  classifier reads exactly as v1.2.0.
+NOT IN THIS VERSION: (1) sanctions relief ("lifts sanctions on ...") stays trade_sanctions: the archive holds no
+  such headline. (2) A fighting headline that also names a trade truce is still not read as fighting (the older
+  truce rule turns it into de-escalation, now trade_deal); closing that can RAISE a verdict, so it waits for the
+  owner's word. (3) A hedged relief headline ("seeks lower tariffs") keeps its older, cautious reading.
+ROLLBACK: revert this file and data/news_gate_taxonomy.json to v1.2.0 / 1.1.0.
+
 v1.2.0 (2026-11-19) -- [TOPICS] TRADE DEALS, SUMMITS, AI AND ELECTIONS ARE READ AND NAMED
 WHY (owner, 19 Nov 2026: is the China summit in the news analysis; world news - politics, wars, the economy, the
   fear of AI, elections - is part of valuing any stock; "Let's Start build the new news"): the gate searched five
@@ -192,7 +221,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -492,6 +521,25 @@ class Classifier:
             return _norm_terms(list(block.get("en") or []) + list(block.get("ar") or []))
         self.by_type = {e["type"]: e for e in self.events}
         self.breach = pair("breach")
+        # v1.3.0 [TRADE-RELIEF]: three optional lists; without them the two rules below are off
+        self.truce = pair("trade_truce")
+        self.relief = pair("trade_relief")
+        self.hedge = pair("trade_hedge")
+        rel = tax.get("trade_relief") or {}
+        verbs = [v for v in (normalize_text(x).strip() for x in rel.get("verbs") or []) if v]
+        objs = [o for o in (normalize_text(x).strip() for x in rel.get("objects") or []) if o]
+        alt = "|".join(re.escape(v) for v in verbs)
+        # group 1 holds the words between the verb and 'tariffs': they are kept when the match is set aside,
+        # so a pressure word among them still counts ("lifts sanctions and tariffs" - Codex P2, #1033)
+        self.relief_re = re.compile(r"(?<= )(?:%s) ((?:[^ ]+ ){0,2})(?:%s)(?= )" % (
+            alt, "|".join(re.escape(o) for o in objs))) if verbs and objs else None
+        # a relief verb in front of a relief phrase undoes it ("scraps tariff relief", "ends the tariff pause"),
+        # and so does its past form after the phrase ("tariff pause lifted", "tariff cuts dropped")
+        nouns = "|".join(re.escape(n.strip()) for n in self.relief if n.strip() and all(ord(ch) < 128 for ch in n))
+        done = "|".join(re.escape(v) for v in verbs if v.split()[0].endswith("ed"))
+        self.undo_re = re.compile(r"(?<= )(?:%s) (?:[^ ]+ ){0,2}(?:%s)" % (alt, nouns)
+                                  + (r"|(?:%s)s? (?:[^ ]+ ){0,2}(?:%s)(?= )" % (nouns, done) if done else "")) \
+            if verbs and nouns else None
         self.pos = pair("positive")
         self.neg = pair("negative")
         self.rumor = pair("rumor")
@@ -505,6 +553,33 @@ class Classifier:
         for raw, n in self.anchors:
             if n and (" " + n) in norm:
                 return self.canon.get(raw, raw)
+        return ""
+
+    @staticmethod
+    def _without(norm: str, terms: Sequence[str], pattern: Optional["re.Pattern[str]"] = None) -> str:
+        """The normalised headline with the given phrases set aside (v1.3.0)."""
+        out = pattern.sub(lambda m: " " + (m.group(1) or ""), norm) if pattern is not None else norm
+        for t in terms:
+            out = out.replace(t, " ")
+        return " " + " ".join(out.split()) + " "
+
+    def _trade_relabel(self, norm: str, title: str, found: Dict[str, Any]) -> str:
+        """v1.3.0: 'truce' when the only ceasefire word of a de_escalation reading sits inside a trade-truce
+        phrase; 'relief' when a trade_sanctions reading states tariff relief plainly; else ''. Both lead to the
+        label-only type trade_deal, so the result can only take a reading OUT of a verdict rule."""
+        trade = self.by_type.get("trade_deal")
+        if trade is None or not trade["label_only"]:
+            return ""
+        if found["type"] == "de_escalation":
+            if self.truce and _hit(norm, self.truce) and not _hit(self._without(norm, self.truce), found["terms"]):
+                return "truce"
+        elif found["type"] == "trade_sanctions":
+            stated = _hit(norm, self.relief) or (self.relief_re is not None and self.relief_re.search(norm) is not None)
+            hedged = _hit(norm, self.hedge) or _hit(norm, self.breach) or _hit(norm, self.denial) \
+                or _hit(norm, self.rumor) or "?" in title or "\u061f" in title \
+                or (self.undo_re is not None and self.undo_re.search(norm) is not None)
+            if stated and not hedged and not _hit(self._without(norm, self.relief, self.relief_re), found["terms"]):
+                return "relief"
         return ""
 
     def classify(self, title: str, scope: str) -> Dict[str, Any]:
@@ -525,13 +600,20 @@ class Classifier:
         if found is not None and found["type"] == "war_escalation" and deesc is not None \
                 and _hit(norm, deesc["terms"]) and not _hit(norm, self.breach):
             found = deesc
+        # v1.3.0 [TRADE-RELIEF]: a trade truce is not a ceasefire, a tariff cut is not trade pressure. The
+        # reading moves to the label-only trade_deal; a name's own headline, which takes no label, loses it.
+        relabel = self._trade_relabel(norm, title, found) if found is not None else ""
+        if relabel:
+            found = None if company_first else self.by_type["trade_deal"]
         pos, neg = _count(norm, self.pos), _count(norm, self.neg)
         if found is None:
             return {"event_type": "", "direction": 0, "severity": "",
                     "rumor": _hit(norm, self.rumor), "denial": _hit(norm, self.denial),
                     "anchor": self.anchor(norm)}
         direction = found["direction"]
-        if direction == 0:
+        if relabel == "truce" and (_hit(norm, self.hedge) or _hit(norm, self.breach)):
+            direction = -1                   # a trade truce in doubt: shown as falling, counted nowhere
+        elif direction == 0:
             direction = 1 if pos > neg else (-1 if neg > pos else 0)
         elif found["type"] in ("earnings", "guidance", "rating_change", "oil_supply", "central_bank"):
             direction = 1 if pos > neg else (-1 if neg > pos else direction)

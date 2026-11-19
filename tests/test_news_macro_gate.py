@@ -346,7 +346,7 @@ def test_g2_taxonomy_ascii_and_complete():
     raw = Path(ng.TAXONOMY_PATH).read_bytes()
     assert all(b < 128 for b in raw)
     tax = ng.load_taxonomy()
-    assert len(tax["events"]) == 27 and tax["version"] == "1.1.0"     # v1.2.0 [TOPICS]: +4 MACRO types
+    assert len(tax["events"]) == 27 and tax["version"] == "1.2.0"     # v1.3.0 [TRADE-RELIEF]: three word lists, no new type
     types = [e["type"] for e in tax["events"]]
     assert types.index("law_firm_noise") < types.index("legal_regulatory")
     assert types.index("earnings") < types.index("guidance")
@@ -825,7 +825,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.2.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.3.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -850,9 +850,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.2.0"   # 2026-11-19: v1.2.0 [TOPICS]
+    assert ng.__version__ == "1.3.0"   # 2026-11-19: v1.3.0 [TRADE-RELIEF]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.2.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.3.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -918,10 +918,6 @@ MIXED_CASES = [
     ("Sanctions on chip export widen as AI trade cools", "trade_sanctions"),
     ("Fed holds rates steady as Powell signals patience", "central_bank"),
     ("Recession fears return", "credit_stress"),
-    # two older misreadings, kept on purpose: correcting them changes the easing line and a CAUTION rule
-    ("What's at stake for Trump and Xi in Shenzhen: A trade truce deadline, new export controls, and Iran",
-     "de_escalation"),
-    ("US and China agree trade deal as tariff relief lifts stocks higher", "trade_sanctions"),
 ]
 
 
@@ -1015,6 +1011,273 @@ def test_g10_new_types_never_move_the_verdict():
     ]), "NVDA.US", "name")
     assert _clusters(own, QUIET) == []
     assert ng.evaluate(_clusters(own, QUIET), [], {}, QUIET)["names"] == {}
+
+
+# ----------------------------------------------------------------------------- G11 (v1.3.0 [TRADE-RELIEF])
+TRADE_LISTS = ("trade_truce", "trade_relief", "trade_hedge")
+EVALUATE_SHA = "9304bc0e24abe27b4c18f0f37b7902887f36175968af74db89c0e1ed5ec485be"      # evaluate() of v1.1.0, v1.2.0 and now
+
+# (headline, reading before v1.3.0, reading now, direction now). World headlines of 5 - 18 Nov 2026 (GDELT) and the
+# gate's own archive; the last block is written to probe the guards.
+TRADE_CASES = [
+    # (A) a trade truce is not a ceasefire
+    ("What's at stake for Trump and Xi in Shenzhen: A trade truce deadline, new export controls, and Iran",
+     "de_escalation", "trade_deal", 1),
+    ("China extends US trade truce by two months", "de_escalation", "trade_deal", 1),
+    ("China extends its trade truce with Trump for 2 more months. The rare-earth dispute is still unresolved.",
+     "de_escalation", "trade_deal", 1),
+    ("Nvidia fallout puts trade truce to test as Xi Jinping welcomes Trump", "de_escalation", "trade_deal", -1),
+    ("China extends 24% US tariff suspension, but Section 301 threat clouds trade truce", "de_escalation", "trade_deal", -1),
+    ("US presses China to honor Busan trade truce as rare earth shipments fall short.", "de_escalation", "trade_deal", -1),
+    ("How Trump and Xi went from tariff war to trade truce", "de_escalation", "trade_deal", -1),
+    ("Tariff truce extended by 90 days", "de_escalation", "trade_deal", 1),
+    ("US-China trade truce falters", "de_escalation", "trade_deal", -1),                       # a breach word alone
+    ("\u0627\u0644\u0635\u064a\u0646 \u062a\u0645\u062f\u062f \u0627\u0644\u0647\u062f\u0646\u0629 \u0627\u0644\u062a\u062c\u0627\u0631\u064a\u0629 \u0645\u0639 \u0648\u0627\u0634\u0646\u0637\u0646",
+     "de_escalation", "trade_deal", 1),                                       # China extends the trade truce with Washington
+    ("\u0647\u062f\u0646\u0629 \u062a\u062c\u0627\u0631\u064a\u0629 \u0628\u064a\u0646 \u0648\u0627\u0634\u0646\u0637\u0646 \u0648\u0628\u0643\u064a\u0646",
+     "de_escalation", "trade_deal", 1),                                       # a trade truce between Washington and Beijing
+    # ... and a real truce stays one, also beside a trade truce
+    ("Israel and Hamas agree ceasefire deal", "de_escalation", "de_escalation", 1),
+    ("Gaza truce holds as US-China trade truce nears", "de_escalation", "de_escalation", 1),
+    ("Peace talks resume as trade truce holds", "de_escalation", "de_escalation", 1),
+    ("\u062a\u0631\u0645\u0628 \u064a\u062a\u0631\u0627\u062c\u0639 \u0639\u0646 \u0647\u062f\u0646\u0629 \u0625\u064a\u0631\u0627\u0646",
+     "de_escalation", "de_escalation", 1),                                    # Trump backs away from the Iran truce
+    # (B) a tariff cut is not trade pressure
+    ("China and Canada agree on tariff relief on key exports", "trade_sanctions", "trade_deal", 1),
+    ("China cuts tariffs on Canadian exports as Xi meets Carney", "trade_sanctions", "trade_deal", 1),
+    ("China eases tariffs on Canadian pork | The Paris Star", "trade_sanctions", "trade_deal", 1),
+    ("Canada, China roll back more tariffs as Carney meets with Xi", "trade_sanctions", "trade_deal", 1),
+    ("China and Canada agree to lift more tariffs", "trade_sanctions", "trade_deal", 1),
+    ("Mark Carney and Xi Jinping strike new trade deal to remove tariffs on Canadian goods", "trade_sanctions", "trade_deal", 1),
+    ("Thailand to remove tariffs on US exports under trade deal, Trump says", "trade_sanctions", "trade_deal", 1),
+    ("China rolls back tariffs on Canadian pork, seafood in new trade deal with Ottawa", "trade_sanctions", "trade_deal", 1),
+    ("Ottawa amends, extends tariff relief program beyond U.S. steel imports", "trade_sanctions", "trade_deal", 1),
+    ("US assures India lower tariffs than peers in trade deal", "trade_sanctions", "trade_deal", 1),
+    ("US and China agree trade deal as tariff relief lifts stocks higher", "trade_sanctions", "trade_deal", 1),
+    ("China extends tariff suspension on US goods", "trade_sanctions", "trade_deal", 1),
+    ("China cuts tariff on Canadian pork", "trade_sanctions", "trade_deal", 1),
+    ("Trump lifts all steel tariffs on Canada", "trade_sanctions", "trade_deal", 1),          # two words between verb and 'tariffs'
+    # ... and a hedged, undone or mixed one keeps its older, cautious reading
+    ("China open to increasing US agricultural imports, contingent on 30 billion reciprocal tariff cuts: MOFCOM",
+     "trade_sanctions", "trade_sanctions", -1),
+    ("With 400 jobs on hold, RYAM employees hope U.S. election results spark tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("DTI seeks lower US tariffs on PH exports | The Manila Times", "trade_sanctions", "trade_sanctions", -1),
+    ("Thailand to seek US tariff cut after reaching key terms of trade deal, says minister", "trade_sanctions", "trade_sanctions", -1),
+    ("Germany urges RI to cut tariffs, expand investment in industry, energy", "trade_sanctions", "trade_sanctions", -1),
+    ("China, US discuss tariff cuts, agricultural trade ahead of leaders' meeting", "trade_sanctions", "trade_sanctions", -1),
+    ("Ajmal slams Assam government over rising prices, demands market regulation and tariff rollback",
+     "trade_sanctions", "trade_sanctions", -1),
+    ("Exclusive | Trump Administration Promised Tariff Relief in Talks to Secure U.S. Audi Factory",
+     "trade_sanctions", "trade_sanctions", -1),
+    ("Sen.-elect Josh Turek says ending Iran war, rolling back Trump tariffs should be top priorities",
+     "trade_sanctions", "trade_sanctions", -1),
+    ("Trump threatens new tariffs on China ahead of summit", "trade_sanctions", "trade_sanctions", -1),
+    ("Trump raises tariffs on China after Canada cuts tariffs", "trade_sanctions", "trade_sanctions", -1),
+    ("China suspends tariffs on US farm goods as sanctions on Iran tighten", "trade_sanctions", "trade_sanctions", -1),
+    ("Trump drops plan to cut tariffs on steel", "trade_sanctions", "trade_sanctions", -1),
+    ("Will China cut tariffs on US soybeans?", "trade_sanctions", "trade_sanctions", -1),
+    ("China cuts tariffs on US pork\u061f", "trade_sanctions", "trade_sanctions", -1),            # an Arabic question mark
+    ("China will not cut tariffs, ministry says", "trade_sanctions", "trade_sanctions", -1),
+    ("China won't cut tariffs, ministry says", "trade_sanctions", "trade_sanctions", -1),
+    ("China denies it will cut tariffs", "trade_sanctions", "trade_sanctions", -1),
+    ("China is considering tariff cuts, sources said", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief ends as exemptions lapse", "trade_sanctions", "trade_sanctions", -1),
+    ("White House scraps tariff relief for steel", "trade_sanctions", "trade_sanctions", -1),
+    ("China ends the tariff pause on US goods", "trade_sanctions", "trade_sanctions", -1),
+    ("Beijing cuts tariff exemptions for US chips", "trade_sanctions", "trade_sanctions", -1),
+    ("Trump lifts all the steel tariffs on Canada", "trade_sanctions", "trade_sanctions", -1),   # three words: out of reach
+    ("China reportedly cuts tariffs on US pork", "trade_sanctions", "trade_sanctions", -1),       # a rumour is not relief
+    ("China will cut tariffs if US lifts chip curbs", "trade_sanctions", "trade_sanctions", -1),  # a condition is not relief
+    ("Tariff cut talks collapse", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief deal falters in Senate", "trade_sanctions", "trade_sanctions", -1),          # a breach word alone
+    # Codex P2 x2 on #1033: a pressure word between the verb and 'tariffs' still counts; a rejection in any tense
+    ("China lifts sanctions and tariffs on Iran", "trade_sanctions", "trade_sanctions", -1),
+    ("Trump lifts embargo and tariffs on Cuba", "trade_sanctions", "trade_sanctions", -1),
+    ("China tariff cuts ruled out by officials", "trade_sanctions", "trade_sanctions", -1),
+    ("China rules out tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Officials ruling out tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Beijing rule out tariff cuts for now", "trade_sanctions", "trade_sanctions", -1),
+    # relief undone after the phrase: a past form of a relief verb
+    ("Tariff pause lifted as deadline passes", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff cuts dropped from the bill", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief scrapped by White House", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff exemptions removed for chips", "trade_sanctions", "trade_sanctions", -1),
+    # a relief that is not there, not yet, or not what it seems
+    ("No tariff relief for Canada, Trump says", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff relief unlikely this year, minister says", "trade_sanctions", "trade_sanctions", -1),
+    ("China would cut tariffs on US pork", "trade_sanctions", "trade_sanctions", -1),
+    ("China cuts tariffs after talks with Canada", "trade_sanctions", "trade_sanctions", -1),     # cautious: 'talks'
+    ("Senate pushed for tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("Lobby called for tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Exporters sought tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("Ministers eyed tariff cuts", "trade_sanctions", "trade_sanctions", -1),
+    ("Farmers asked for tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    ("China hiked duties as Canada cuts tariffs", "trade_sanctions", "trade_sanctions", -1),
+    ("Canada cuts tariff-free quota for steel", "trade_sanctions", "trade_sanctions", -1),
+    ("Tariff pause expiring next week", "trade_sanctions", "trade_sanctions", -1),
+    ("Senators oppose tariff relief for China", "trade_sanctions", "trade_sanctions", -1),
+    ("White House walks back tariff relief", "trade_sanctions", "trade_sanctions", -1),
+    # sanctions relief is not in this version; plain sanctions and tariffs read as before
+    ("EU lifts sanctions on Syria", "trade_sanctions", "trade_sanctions", -1),
+    ("US sanctions Hezbollah-linked charity in bid to squeeze Iran", "trade_sanctions", "trade_sanctions", -1),
+    ("Stocks surge as tariff concerns ease, oil prices fall", "oil_supply", "oil_supply", 1),
+    # known limit, as before: a fighting headline that names a trade truce is not read as fighting
+    ("Missile strike reported as US-China trade truce holds", "de_escalation", "trade_deal", 1),
+    ("Missile strike breaks calm as trade truce collapses", "war_escalation", "war_escalation", -1),
+]
+
+
+def _v120(tax):
+    """The taxonomy as v1.2.0 read it: the same file without the three trade lists."""
+    return {k: v for k, v in tax.items() if k not in TRADE_LISTS}
+
+
+@pytest.mark.parametrize("title,before,after,direction", TRADE_CASES)
+def test_g11_trade_truce_and_tariff_relief(title, before, after, direction):
+    tax = ng.load_taxonomy()
+    was, now = ng.Classifier(_v120(tax)).classify(title, "MACRO"), ng.Classifier(tax).classify(title, "MACRO")
+    assert was["event_type"] == before, was
+    assert (now["event_type"], now["direction"]) == (after, direction), now
+    if before == after:
+        assert now == was                                         # untouched: the same reading, whole
+    else:
+        assert (before in ("de_escalation", "trade_sanctions")) and after == "trade_deal"
+        assert (now["severity"], now["anchor"], now["rumor"], now["denial"]) == ("M", was["anchor"], was["rumor"], was["denial"])
+    # a name's own headline: the moved reading is dropped, every other one is the same
+    own_was, own_now = ng.Classifier(_v120(tax)).classify(title, "ZZZ.US"), ng.Classifier(tax).classify(title, "ZZZ.US")
+    if before != after:
+        assert own_was["event_type"] == before and own_now["event_type"] == "" and own_now["direction"] == 0
+    else:
+        assert own_now == own_was
+
+
+def test_g11_a_reading_can_only_leave_a_verdict_rule():
+    tax = ng.load_taxonomy()
+    for key in TRADE_LISTS:
+        assert tax[key]["en"] and tax[key]["ar"], key
+    assert tax["trade_relief"]["verbs"] and tax["trade_relief"]["objects"] == ["tariff", "tariffs"]
+    hedge = {h.strip() for h in tax["trade_hedge"]["en"]}
+    assert not hedge & set(tax["trade_relief"]["verbs"])            # a relief verb is never itself a hedge
+    # a rejection or a request guards in every tense (Codex P2, #1033: 'ruled out' was missing)
+    c0 = ng.Classifier(tax)
+    guard = c0.hedge
+    for stem, forms in (("rule out", ("rule out", "rules out", "ruled out", "ruling out")),
+                        ("call for", ("call for", "calls for", "called for", "calling for")),
+                        ("push", ("push for", "pushes for", "pushed for", "pushing for")),
+                        ("seek", ("seek", "seeks", "seeking", "sought")), ("ask", ("ask", "asks", "asked", "asking")),
+                        ("eye", ("eye", "eyes", "eyed", "eyeing")), ("hike", ("hike", "hikes", "hiked", "hiking")),
+                        ("raise", ("raise", "raises", "raised", "raising")), ("expire", ("expire", "expires", "expired", "expiring", "expiry")),
+                        ("shelve", ("shelve", "shelves", "shelved", "shelving")), ("withdraw", ("withdraw", "withdraws", "withdrew", "withdrawn")),
+                        ("urge", ("urge", "urges", "urged", "urging")), ("weigh", ("weigh", "weighs", "weighed", "weighing")),
+                        ("threaten", ("threat", "threatens", "threatened", "threatening")), ("walk back", ("walk back", "walks back", "walked back")),
+                        ("fall short", ("fall short", "falls short", "fell short", "falling short of")),
+                        ("end", ("end", "ends", "ended", "ending")), ("delay", ("delay", "delays", "delayed", "delaying")),
+                        ("warn", ("warn", "warns", "warned", "warning")), ("veto", ("veto", "vetoes", "vetoed")),
+                        ("demand", ("demand", "demands", "demanded")), ("reject", ("reject", "rejects", "rejected")),
+                        ("plan", ("plan", "plans", "planned", "planning")), ("discuss", ("discuss", "discusses", "discussed")),
+                        ("block", ("block", "blocks", "blocked")), ("cancel", ("cancel", "cancels", "cancelled", "canceled")),
+                        ("pledge", ("pledge", "pledges", "pledged", "pledging")), ("promise", ("promise", "promises", "promised", "promising")),
+                        ("hope", ("hope", "hopes", "hoped", "hoping")), ("lapse", ("lapse", "lapses", "lapsed", "lapsing")),
+                        ("propose", ("propose", "proposes", "proposed", "proposing", "proposal")),
+                        ("consider", ("consider", "considers", "considered", "considering")),
+                        ("oppose", ("oppose", "opposes", "opposed", "opposing")), ("deny", ("deny", "denies", "denied", "denying")),
+                        ("refuse", ("refuse", "refuses", "refused", "refusing")), ("collapse", ("collapse", "collapses", "collapsed"))):
+        for form in forms:
+            norm = ng.normalize_text("x %s y" % form)
+            assert ng._hit(norm, guard) or ng._hit(norm, c0.breach) or ng._hit(norm, c0.denial), (stem, form)
+    # the words between the verb and 'tariffs' are kept when the match is set aside
+    c = ng.Classifier(tax)
+    assert c._without(" china lifts sanctions and tariffs on iran ", c.relief, c.relief_re) == " china sanctions and on iran "
+    assert c._without(" china cuts tariffs on pork ", c.relief, c.relief_re) == " china on pork "
+    assert c._without(" a trade truce deadline ", c.truce) == " a deadline "
+    now, was = ng.Classifier(tax), ng.Classifier(_v120(tax))
+    assert was.truce == [] and was.relief == [] and was.hedge == [] and was.relief_re is None and was.undo_re is None
+    titles = ([t for t, *_ in TRADE_CASES] + [t for t, _ in MIXED_CASES] + [t for t, _, _ in TOPIC_CASES]
+              + [r["title"] for r in GDELT_GEO["articles"]] + [c[0] for c in ISSUER_CASES])
+    moved = 0
+    for title in titles:
+        for scope in ("MACRO", "ZZZ.US"):
+            a, b = was.classify(title, scope), now.classify(title, scope)
+            if a != b:                                           # the only move there is
+                assert a["event_type"] in ("de_escalation", "trade_sanctions"), (title, scope)
+                assert b["event_type"] == ("trade_deal" if scope == "MACRO" else ""), (title, scope)
+                moved += 1
+    assert moved == 2 * sum(1 for _, b, a, _ in TRADE_CASES if b != a)
+    assert now.by_type["trade_deal"]["label_only"] is True
+    # the rules stand on trade_deal being a label: without the type, or with it un-marked, nothing moves
+    no_type = dict(tax, events=[e for e in tax["events"] if e["type"] != "trade_deal"])
+    unmarked = dict(tax, events=[dict(e, label_only=False) if e["type"] == "trade_deal" else e for e in tax["events"]])
+    for odd in (no_type, unmarked):
+        clf = ng.Classifier(odd)
+        assert clf.classify("China extends US trade truce by two months", "MACRO")["event_type"] == "de_escalation"
+        assert clf.classify("China and Canada agree on tariff relief on key exports", "MACRO")["event_type"] == "trade_sanctions"
+    # no verdict rule was touched: evaluate() is byte-identical to v1.1.0 and v1.2.0
+    src = (_REPO / "scripts" / "news_macro_gate.py").read_text(encoding="utf-8")
+    body = "def evaluate(" + src.split("def evaluate(", 1)[1].split("\n# ---", 1)[0]
+    import hashlib
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == EVALUATE_SHA
+    assert "trade_deal" not in body
+
+
+def _clusters_with(tax, items, now):
+    clf = ng.Classifier(tax)
+    return ng.cluster_items([i for i in ng.classify_all([dict(i) for i in items], clf, now)
+                             if i.get("event_type") and i["event_type"] != "law_firm_noise"])
+
+
+def _wires(scope, *titles):
+    doms = [("https://www.reuters.com/", "reuters.com"), ("https://apnews.com/", "apnews.com"), ("https://www.bbc.com/", "bbc.com")]
+    rows = []
+    for n, title in enumerate(titles):
+        for k, (base, dom) in enumerate(doms):
+            rows.append((base + "t%d%d" % (n, k), title, "20261030T10%02d00Z" % (n * 3 + k), dom))
+    return ng.parse_gdelt(gdelt_articles(rows), scope, "trade china")
+
+
+def test_g11_the_verdict_can_fall_and_never_rise():
+    tax = ng.load_taxonomy()
+
+    def both(items):
+        return (ng.evaluate(_clusters_with(_v120(tax), items, QUIET), [], {}, QUIET),
+                ng.evaluate(_clusters_with(tax, items, QUIET), [], {}, QUIET))
+    # sanctions relief beside tariffs, and a relief ruled out, are CAUTION before and now (Codex P2 x2, #1033)
+    for title in ("China lifts sanctions and tariffs on Iran", "China tariff cuts ruled out by officials"):
+        was, now = both(_wires("MACRO", title))
+        assert was["verdict"] == now["verdict"] == "CAUTION" and was["drivers"] == now["drivers"], title
+    # tariff relief from three wires on China: it raised CAUTION, now it raises nothing
+    was, now = both(_wires("MACRO", "China cuts tariffs on Canadian exports as Xi meets Carney"))
+    assert was["verdict"] == "CAUTION" and was["drivers"][0].startswith("macro: trade_sanctions/china grade ")
+    assert now["verdict"] == "GO" and now["drivers"] == [] and now["positives"] == []
+    # a trade truce from three wires: it stood on the EASING line as war de-escalation, now it does not
+    was, now = both(_wires("MACRO", "China extends US trade truce by two months"))
+    assert was["verdict"] == "GO" and len(was["positives"]) == 1 and was["positives"][0].startswith("de_escalation/china grade ")
+    assert now["verdict"] == "GO" and now["positives"] == [] and now["drivers"] == []
+    # a tariff threat, a hedged relief and a relief beside new tariffs are CAUTION before and now
+    for title in ("Trump threatens new tariffs on China ahead of summit", "China, US discuss tariff cuts ahead of leaders' meeting",
+                  "Trump raises tariffs on China after Canada cuts tariffs"):
+        was, now = both(_wires("MACRO", title))
+        assert was["verdict"] == now["verdict"] == "CAUTION" and was["drivers"] == now["drivers"], title
+    # a real ceasefire still stands on the EASING line
+    was, now = both(_wires("MACRO", "Israel and Hamas agree ceasefire deal in Gaza"))
+    assert was["positives"] == now["positives"] and len(now["positives"]) == 1
+    # one run with every headline of the corpus: no driver, easing line or name flag that was not there before
+    rank = {"GO": 0, "CAUTION": 1, "NO_NEW_ENTRY": 2}
+    corpus = [t for t, *_ in TRADE_CASES]
+    was, now = both(_wires("MACRO", *corpus) + _wires("ZZZ.US", *corpus))
+    assert rank[now["verdict"]] <= rank[was["verdict"]]
+    key = lambda line: line.split(" grade ")[0]                    # noqa: E731 - the cluster a line speaks of
+    assert {key(d) for d in now["drivers"]} <= {key(d) for d in was["drivers"]}
+    assert {key(p) for p in now["positives"]} <= {key(p) for p in was["positives"]}
+    assert set(now["names"]) <= set(was["names"])
+    for sym, flags in now["names"].items():
+        assert {f["level"] for f in flags} <= {f["level"] for f in was["names"][sym]}
+    # a name's own tariff-relief headline flagged the name WATCH; now it does not
+    was, now = both(_wires("ZZZ.US", "Zeta rises as US lifts tariffs on steel"))
+    assert was["names"]["ZZZ.US"][0]["level"] == "WATCH" and "trade_sanctions negative" in was["names"]["ZZZ.US"][0]["why"]
+    assert now["names"] == {}
+    # ... and a name's own tariff-threat headline flags it before and now
+    was, now = both(_wires("ZZZ.US", "Zeta falls as US threatens new tariffs on steel"))
+    assert was["names"] == now["names"] and now["names"]["ZZZ.US"][0]["level"] == "WATCH"
 
 
 def test_g10_topic_searches():
