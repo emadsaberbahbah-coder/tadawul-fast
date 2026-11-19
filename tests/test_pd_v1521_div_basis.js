@@ -22,7 +22,9 @@ const vm = require('node:vm');
 
 const ROOT = path.join(__dirname, '..');
 const hist = require(path.join(__dirname, 'js', 'pd_history.js'));
-const NEW = fs.readFileSync(process.argv[2] || path.join(ROOT, 'apps_script', '10_My_Portfolio.gs'), 'utf8');
+// 2026-11-19: v1.5.22 [TOTAL-RETURN] is delivered; this harness proves the v1.5.21 diff, so it reads the v1.5.21 file
+// rebuilt from the delivered one (tests/js/pd_history.js: the v1.5.22 hunks reversed, SHA-256 pinned).
+const NEW = hist.v1521Source(fs.readFileSync(process.argv[2] || path.join(ROOT, 'apps_script', '10_My_Portfolio.gs'), 'utf8'));
 const BASE = hist.v1520Source(NEW);
 const copy = (v) => JSON.parse(JSON.stringify(v));
 
