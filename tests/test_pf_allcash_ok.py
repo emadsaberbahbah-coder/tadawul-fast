@@ -197,8 +197,9 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-11-03: v1.5.19 (plain block reasons, PD_PLAIN_REASONS default off) stacks on top; pin moved
     # 2026-11-16: v1.5.20 (Exit Plan stop on the rendered rows, PD_EXIT_PLAN_STOP default on) stacks on top; pin moved
     # 2026-11-18: v1.5.21 (dividends received sent with the row, no Script Property) stacks on top; pin moved
-    assert " * Version: 1.5.21\n" in text and "var PD_VERSION = '1.5.21';" in text
-    assert "var PD_VERSION = '1.5.20';" not in text
+    # 2026-11-19: v1.5.22 (P&L cells and tiles count dividends received) stacks on top; pin moved
+    assert " * Version: 1.5.22\n" in text and "var PD_VERSION = '1.5.22';" in text
+    assert "var PD_VERSION = '1.5.20';" not in text and "var PD_VERSION = '1.5.21';" not in text
     assert "var PD_VERSION = '1.5.14';" not in text and "var PD_VERSION = '1.5.15';" not in text
     assert "var PD_VERSION = '1.5.16';" not in text and "var PD_VERSION = '1.5.17';" not in text
     assert "var PD_VERSION = '1.5.18';" not in text and "var PD_VERSION = '1.5.19';" not in text
@@ -221,7 +222,10 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-11-18: v1.5.21 adds one pure function
     v1521 = {"pdDivRecvApply_"}
     assert v1521 <= now, sorted(v1521 - now)
-    assert sorted(now - base - v1519 - v1520 - v1521) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
+    # 2026-11-19: v1.5.22 adds two pure functions
+    v1522 = {"pdTotalOr_", "pdTotalNote_"}
+    assert v1522 <= now, sorted(v1522 - now)
+    assert sorted(now - base - v1519 - v1520 - v1521 - v1522) == ["pdAllCashMode_", "pdAllCashProof_", "pdCashSnapApply_", "pdCashSnapCents_",
                                   "pdCashSnapCoreOk_", "pdCashSnapHeaderMap_", "pdCashSnapLastKnownNote_",
                                   "pdCashSnapMode_", "pdCashSnapRead_", "pdCashSnapRiyadh_", "pdCashSnapRow_",
                                   "pdCashSnapSheetState_", "pdCashSnapStampMs_", "pdCashSnapTailScan_",
@@ -238,7 +242,8 @@ def test_version_bumped_in_lockstep_and_nothing_removed(golden):
     # 2026-11-03: + 275 lines for v1.5.19 (plain block reasons, ticker-change hint)
     # 2026-11-16: + 184 lines for v1.5.20 (Exit Plan stop on the rendered rows)
     # 2026-11-18: + 84 lines for v1.5.21 (dividends received on the posted row)
-    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275 + 184 + 84
+    # 2026-11-19: + 56 lines for v1.5.22 (P&L cells and tiles count dividends received)
+    assert len(text.split("\n")) - golden["source_lines"] == 92 + 224 + 259 + 708 + 275 + 184 + 84 + 56
 
 
 def test_added_lines_are_es5_and_ascii(base_source):

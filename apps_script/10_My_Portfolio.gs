@@ -1,7 +1,41 @@
 /**
  * 10_My_Portfolio.gs
  * Tadawul Tracker — My Portfolio Page Module
- * Version: 1.5.21
+ * Version: 1.5.22
+ *
+ * v1.5.22 (2026-11-19)  (TOTAL-RETURN: A HOLDING'S P&L ON PORTFOLIO_DECISION
+ *                        COUNTS THE DIVIDENDS IT RECEIVED; ALL v1.5.21 logic
+ *                        carried verbatim)
+ * ---------------------------------------------------------------
+ * WHY (owner, 19 Nov 2026 10:04 Riyadh: 'still in some pages I see that
+ * SUPN.US showing high loss but the impact of the dividends received is not
+ * effective ... check and solve that now and in the future as well').
+ * Since v1.5.21 the backend's loss rules count the dividends a holding has
+ * received, but this page's 'P&L SAR' and 'P&L %' columns still printed the
+ * price-only figure: SUPN.US read -18.3% while the ledger's own Return %,
+ * with the special dividend kept after tax, was about -2.2%.
+ * WHAT: portfolio_actions 1.20.0 sends, for a holding whose ledger dividend
+ * it counts, dividends_sar, total_pnl_sar and total_pnl_pct, and in the
+ * KPIs total_pnl_sar and total_pnl_pct. pdTotalOr_ (pure) takes the total
+ * when it is a finite number and the price-only figure otherwise.
+ *  (1) pdActionToRow_: 'P&L SAR' and 'P&L %' show the total; the Advisor
+ *      Note of that row ends ' | P&L counts dividends received <d> SAR
+ *      (price only <p>%)' (pdTotalNote_, pure), so both figures are on the
+ *      page.
+ *  (2) pdKpiValues_: the 'P&L (SAR)' and 'P&L %' tiles show the totals.
+ * Every future dividend, and the tax recorded against it in _Dividend_Log,
+ * reaches these columns the same way: through the ledger, with no change
+ * here. A row and a KPI block without a counted dividend, and any reply of
+ * an older backend, render exactly as in v1.5.21. The column names do not
+ * change, so every reader of the page by header keeps working.
+ * GATE: none in this file. The switch is the backend's TFB_PF_TOTAL_RETURN
+ * (default on; off sends no totals and the page shows price only).
+ * Functions added (0 removed): pdTotalOr_, pdTotalNote_ (pure). Changed:
+ * pdActionToRow_ (three cells), pdKpiValues_ (two cells).
+ * Harness: tests/test_pd_v1522_total_return.js (REAL file; the v1.5.21 base
+ * is rebuilt by reversing these edits, SHA-256 pinned).
+ * ROLLBACK: backend TFB_PF_TOTAL_RETURN = off (no re-paste); or re-paste
+ * v1.5.21.
  *
  * v1.5.21 (2026-11-18)  (DIV-BASIS: THE DIVIDENDS A HOLDING HAS RECEIVED GO
  *                        TO THE BACKEND WITH ITS ROW, SO A LOSS RULE DOES
@@ -2986,7 +3020,7 @@ function getMyPortfolioStrictThreshold_(propertyName, fallback) {
  * 'Portfolio_Decision' sheet. Render-only: no action logic in GAS (§8).
  * ========================================================================= */
 
-var PD_VERSION = '1.5.21';
+var PD_VERSION = '1.5.22';
 var PD_SHEET = 'Portfolio_Decision';
 var PD_ENDPOINT = '/sheet-rows/portfolio-actions';
 var PD_DEFAULT_BACKEND = 'https://tadawul-fast-bridge.onrender.com';
@@ -3101,6 +3135,26 @@ var PD_ACTION_HEADERS = ['Action', 'Symbol', 'Name', 'Sector', 'Ccy', 'Qty',
   'TP1 SAR', 'TP2 SAR', 'ROI %', 'Engine ROI %', 'Rel', 'DQ', 'Conf',
   'Advisor Note'];
 
+/* v1.5.22 [TOTAL-RETURN] PURE: the backend's total (price change plus dividends
+ * received) when it is a finite number, else the price-only figure. */
+function pdTotalOr_(total, price) {
+  if (total === null || total === undefined || total === '' || typeof total === 'boolean') return price;
+  var n = Number(total);
+  return isFinite(n) ? n : price;
+}
+
+/* v1.5.22 [TOTAL-RETURN] PURE: the Advisor Note, plus what the P&L columns
+ * count when the row carries a total. */
+function pdTotalNote_(a) {
+  var note = (a && a.advisor_note !== null && a.advisor_note !== undefined) ? String(a.advisor_note) : '';
+  if (!a || pdTotalOr_(a.total_pnl_pct, null) === null) return note;
+  var div = pdTotalOr_(a.dividends_sar, null);
+  var price = pdTotalOr_(a.pnl_pct, null);
+  var tail = 'P&L counts dividends received' + (div !== null ? ' ' + Math.round(div) + ' SAR' : '') +
+      (price !== null ? ' (price only ' + price + '%)' : '');
+  return note ? note + ' | ' + tail : tail;
+}
+
 function pdActionToRow_(a) {
   var delta = '';
   if (a.action === 'ADD') {
@@ -3113,14 +3167,15 @@ function pdActionToRow_(a) {
           pdCell_(a.sector), pdCell_(a.currency), pdCell_(a.quantity),
           pdCell_(a.avg_cost), pdCell_(a.price), pdCell_(a.price_sar),
           pdCell_(a.market_value_sar), pdCell_(a.cost_sar),
-          pdCell_(a.pnl_sar), pdCell_(a.pnl_pct), pdCell_(a.weight_pct),
+          pdCell_(pdTotalOr_(a.total_pnl_sar, a.pnl_sar)),
+          pdCell_(pdTotalOr_(a.total_pnl_pct, a.pnl_pct)), pdCell_(a.weight_pct),
           delta,
           pdCell_(a.suggested_delta_shares),
           pdCell_(a.funds_from), pdCell_(a.stop_sar), pdCell_(a.tp1_sar),
           pdCell_(a.tp2_sar), pdCell_(a.roi_pct), pdCell_(a.engine_roi_pct),
           pdCell_(a.reliability),
           pdCell_(a.dq), pdCell_(a.confidence_band),
-          pdCell_(a.advisor_note)];
+          pdCell_(pdTotalNote_(a))];
 }
 
 var PD_SECTOR_HEADERS = ['Sector', 'Value SAR', 'Weight %', 'Cap %',
@@ -3148,8 +3203,9 @@ function pdKpiValues_(k) {
   var actions = [pdCell_(c.ADD), pdCell_(c.HOLD), pdCell_(c.TRIM),
                  pdCell_(c.EXIT), pdCell_(c.BLOCK)].join(' / ');
   return [pdCell_(k.portfolio_value_sar), pdCell_(k.holdings_value_sar),
-          pdCell_(k.cash_sar), pdCell_(k.cash_pct), pdCell_(k.pnl_sar),
-          pdCell_(k.pnl_pct), pdCell_(k.deployable_sar),
+          pdCell_(k.cash_sar), pdCell_(k.cash_pct),
+          pdCell_(pdTotalOr_(k.total_pnl_sar, k.pnl_sar)),
+          pdCell_(pdTotalOr_(k.total_pnl_pct, k.pnl_pct)), pdCell_(k.deployable_sar),
           pdCell_(k.adds_funded_sar), pdCell_(k.capital_unallocated_sar),
           actions];
 }
