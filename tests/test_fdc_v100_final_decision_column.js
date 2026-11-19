@@ -23,6 +23,8 @@
  *       OLD past 3 days, "not read" without the tab or the table, and no formula then
  *   S16 (1.4.0) colours of their own; a second tick reuses the columns; a header left elsewhere is cleared; rebuild;
  *       rollback
+ *   S17 (1.4.0, Codex P2 on #1036) news labels past the end of their window: EXPIRED in the header and the cells,
+ *       the C-2 cells untouched; the last day of the window still shows the tilt
  * The last line is 'PASS k/k' (exit 1 on any failure).
  */
 'use strict';
@@ -465,17 +467,17 @@ test('S13 (1.3.0) a second tick reuses the columns; colours; a header left elsew
   ok(/Portfolio_Decision: header only \(no rows\) · read: headers only \(no rows\)/.test(e3.ctx.fdcTick()), 'no rows');
 });
 
-const TL_HEAD = ['Symbol', 'Final decision', 'C-2 trial', 'News trial', 'Call day', 'News week', 'Sector'];
-function tlabels(callDay, head) {
+const TL_HEAD = ['Symbol', 'Final decision', 'C-2 trial', 'News trial', 'Call day', 'News week', 'News until', 'Sector'];
+function tlabels(callDay, head, until) {
   head = head || TL_HEAD;
   const row = o => head.map(h => (h in o ? o[h] : ''));
-  const day = callDay === undefined ? '2026-11-16' : callDay;
+  const day = callDay === undefined ? '2026-11-16' : callDay, upto = until === undefined ? '2026-11-22' : until;
   return [['TRIAL LABELS - what the two open trials would do with each stock. OBSERVE ONLY: not a decision, not an order.'], ['Built 2026-11-16 08:05 Riyadh'],
     ['C-2 ...'], ['NEWS ...'], [], head.slice(),
     row({ Symbol: 'AX.US', 'Final decision': 'BUY', 'C-2 trial': 'KEEPS (all horizons) - analyst upside +20.0%, 1st of 4 eligible US calls, top 2 kept',
-          'News trial': 'AVOIDED - Financials: political events AVOIDED, events + news themes AVOIDED', 'Call day': day, 'News week': '2026-11-09', Sector: 'Financials' }),
+          'News trial': 'AVOIDED - Financials: political events AVOIDED, events + news themes AVOIDED', 'Call day': day, 'News week': '2026-11-09', 'News until': upto, Sector: 'Financials' }),
     row({ Symbol: 'DDI.US', 'Final decision': 'HOLD', 'C-2 trial': 'NO BUY CALL - none on 16 Nov; C-2 judges buy calls only',
-          'News trial': 'FAVOURED - Communication Services: political events FAVOURED', 'Call day': day, 'News week': '2026-11-09', Sector: 'Communication Services' })];
+          'News trial': 'FAVOURED - Communication Services: political events FAVOURED', 'Call day': day, 'News week': '2026-11-09', 'News until': upto, Sector: 'Communication Services' })];
 }
 const worldT = o => worldR(Object.assign({ Trial_Labels: tlabels() }, o || {}));
 const atT = (L, S) => 'INDEX(Trial_Labels!$' + L + ':$' + L + ',MATCH(TRIM(INDIRECT("R"&ROW()&"C2",FALSE)),Trial_Labels!$' + (S || 'A') + ':$' + (S || 'A') + ',0))';
@@ -565,16 +567,16 @@ test('S16 (1.4.0) colours of their own; a second tick reuses the columns; a head
   const heads = []; for (const [k, x] of sh._cells) if (typeof x.v === 'string' && /^(FINAL DECISION|C-2 TRIAL|NEWS TRIAL)/.test(x.v)) heads.push(k);
   eq(heads.sort().join(','), '19:32,19:33,19:34', 'one header each after two ticks');
   const rules = sh._rules();
-  eq(rules.length, 1 + 6 + 5 + 6, 'the page\'s rule, six for FINAL DECISION, five for C-2, six for the news');
+  eq(rules.length, 1 + 6 + 5 + 7, 'the page\'s rule, six for FINAL DECISION, five for C-2, seven for the news');
   ok(rules[0] === other, 'the page\'s rule kept first');
   eq(rules.slice(7, 12).map(r => r.spec.text).join('|'), 'KEEPS|PARTLY|DROPS|NO |n/a');
-  eq(rules.slice(12).map(r => r.spec.text).join('|'), 'FAVOURED|AVOIDED|MIXED|NEUTRAL|NO |n/a');
+  eq(rules.slice(12).map(r => r.spec.text).join('|'), 'FAVOURED|AVOIDED|MIXED|NEUTRAL|NO |EXPIRED|n/a');
   ok(rules.slice(7, 12).every(r => r.spec.ranges[0].getColumn() === 33 && r.spec.ranges[0].getRow() === 20 && r.spec.ranges[0].getNumRows() === 3), 'C-2 rules on the C-2 cells');
   ok(rules.slice(12).every(r => r.spec.ranges[0].getColumn() === 34), 'news rules on the news cells');
   ok(!rules.slice(7).some(r => /^#(e6f4ea|fdecea)$/.test(r.spec.bg)), 'never the BUY green or the SELL red');
   // Portfolio_Decision: FINAL DECISION, the read and the trials, each with their own rules
   const pdS = env.book.getSheetByName('Portfolio_Decision');
-  eq(pdS._rules().length, 6 + 11 + 5 + 6);
+  eq(pdS._rules().length, 6 + 11 + 5 + 7);
   // a trial header left further right by another layout is cleared, with its cells
   sh.insertColumnsAfter(sh.getMaxColumns(), 6);
   sh.getRange(19, 37).setValue('NEWS TRIAL · old place'); sh.getRange(20, 37).setValue('stale text');
@@ -598,6 +600,37 @@ test('S16 (1.4.0) colours of their own; a second tick reuses the columns; a head
   s2.getRange(19, 32, 4, 1).clear();
   eq(e2.ctx.fdcRemoveColumn()[0], 'Top_10_Investments: no column (2 trial column(s) removed)');
   ok(!colOf(s2, /^(C-2 TRIAL|NEWS TRIAL)/), 'gone');
+});
+
+test('S17 (1.4.0, Codex P2 on #1036) news labels past the end of their window say EXPIRED; C-2 untouched', () => {
+  // NOW is 16 Nov 09:00 Riyadh. A window that ended on the 15th has expired; one ending today has not
+  let env = makeEnv(worldT({ Trial_Labels: tlabels('2026-11-16', undefined, '2026-11-15') }));
+  const line = env.ctx.fdcTick();
+  ok(/trials: calls of 2026-11-16, news EXPIRED in columns AG-AH/.test(line), line);
+  const t10 = env.book.getSheetByName('Top_10_Investments');
+  eq(t10._cells.get('19:34').v, 'NEWS TRIAL · news week of 2026-11-09 · EXPIRED (its window ended 2026-11-15; Trial_Labels not rebuilt since) · observe only, not a decision or an order');
+  eq(t10._cells.get('19:34').setBackground, '#b45309', 'the news header is amber');
+  eq(t10._cells.get('19:33').setBackground, '#4527a0', 'the C-2 header is not');
+  eq(t10._cells.get('20:34').f, '="EXPIRED — the news window ended 2026-11-15; Trial_Labels has not been rebuilt since"', 'no old tilt is shown');
+  eq(formulaRows(t10, 34).join(','), '20,21,22', 'on every seat row');
+  eq(t10._cells.get('20:33').f, '=IFERROR(' + atT('C') + '&"","n/a — not on Trial_Labels")', 'the C-2 cells read the tab as before');
+  const pdS = env.book.getSheetByName('Portfolio_Decision');
+  ok(/^="EXPIRED/.test(pdS._cells.get('6:32').f), 'Portfolio_Decision too');
+  ok(pdS._rules().some(r => r.spec.text === 'EXPIRED' && r.spec.ranges[0].getColumn() === 32), 'grey, by its own rule');
+  // the tab rebuilt with the next window: the labels come back on the next tick
+  env.book._s.set('Trial_Labels', makeSheet('Trial_Labels', tlabels('2026-11-16', undefined, '2026-11-22')));
+  env.ctx.fdcTick();
+  eq(t10._cells.get('20:34').f, '=IFERROR(' + atT('D') + '&"","n/a — not on Trial_Labels")');
+  ok(!/EXPIRED/.test(t10._cells.get('19:34').v), 'header current again');
+  // the last day of the window is still inside it; no window at all is never 'expired'
+  env = makeEnv(worldT({ Trial_Labels: tlabels('2026-11-16', undefined, '2026-11-16') })); env.ctx.fdcTick();
+  ok(!/EXPIRED/.test(env.book.getSheetByName('Top_10_Investments')._cells.get('19:34').v), 'today is the last day');
+  env = makeEnv(worldT({ Trial_Labels: tlabels('2026-11-16', undefined, '') })); env.ctx.fdcTick();
+  ok(!/EXPIRED/.test(env.book.getSheetByName('Top_10_Investments')._cells.get('19:34').v), 'no window, nothing to expire');
+  const c = env.ctx;
+  ok(!c.fdcNewsExpired_({ ok: false, newsUntil: '2026-11-01' }, Date.UTC(2026, 10, 16, 6, 0)), 'an unread tab is not called expired');
+  ok(c.fdcNewsExpired_({ ok: true, newsUntil: '2026-11-15' }, Date.UTC(2026, 10, 15, 21, 0)), '00:00 Riyadh on the 16th');
+  ok(!c.fdcNewsExpired_({ ok: true, newsUntil: '2026-11-15' }, Date.UTC(2026, 10, 15, 20, 59)), '23:59 Riyadh on the 15th');
 });
 
 console.log((failed ? 'FAIL ' : 'PASS ') + passed + '/' + (passed + failed));

@@ -17,7 +17,10 @@
  *          colours are their own (violet, blue, amber, grey) so a label is never read as a BUY or a SELL. Each cell is a
  *          formula that looks up the symbol of ITS OWN ROW on Trial_Labels (INDIRECT on ROW(), as the other columns), the
  *          Trial_Labels columns are found by header name, and the C-2 header says OLD when the call day is more than
- *          FDC.TRIALS.OLD_DAYS (3) days back. A stock not on the tab reads "n/a - not on Trial_Labels". Without the tab
+ *          FDC.TRIALS.OLD_DAYS (3) days back. The news labels hold only inside the window of their news week (the tab's
+ *          'News until' day): once that day has passed and the tab was not rebuilt (its job failed or was switched off),
+ *          the NEWS TRIAL header says EXPIRED and its cells say so instead of the old tilt (Codex P2 on #1036). A stock
+ *          not on the tab reads "n/a - not on Trial_Labels". Without the tab
  *          the headers say so and no formula is written. The same 10-minute tick writes them: NO new trigger, no setup -
  *          paste the file and save. fdcRemoveColumn takes them off with the other columns.
  *   1.3.0: THE HOLDING READ ON THE PORTFOLIO PAGE (owner, Wed 18 Nov 2026 09:36 Riyadh: "add two new [fields] to the
@@ -140,7 +143,7 @@ var FDC = {
   },
   TRIALS: {   // 1.4.0: the two Trial_Labels columns on a page with trials: true
     SOURCE: 'Trial_Labels',
-    NEED: ['Symbol', 'C-2 trial', 'News trial', 'Call day', 'News week'],
+    NEED: ['Symbol', 'C-2 trial', 'News trial', 'Call day', 'News week', 'News until'],
     C2_PREFIX: 'C-2 TRIAL',
     NEWS_PREFIX: 'NEWS TRIAL',
     WIDTH_C2: 340,
@@ -151,7 +154,8 @@ var FDC = {
     COLORS_C2: [['KEEPS', '#ede7f6', '#4527a0'], ['PARTLY', '#f3eefa', '#5e35b1'], ['DROPS', '#f7f7f7', '#6b7785'],
                 ['NO ', '#f7f7f7', '#6b7785'], ['n/a', '#f7f7f7', '#6b7785']],
     COLORS_NEWS: [['FAVOURED', '#e8f0fe', '#1a4fa0'], ['AVOIDED', '#fff3e0', '#b45309'], ['MIXED', '#fff8e1', '#7a5d00'],
-                  ['NEUTRAL', '#f7f7f7', '#6b7785'], ['NO ', '#f7f7f7', '#6b7785'], ['n/a', '#f7f7f7', '#6b7785']]
+                  ['NEUTRAL', '#f7f7f7', '#6b7785'], ['NO ', '#f7f7f7', '#6b7785'], ['EXPIRED', '#f7f7f7', '#6b7785'],
+                  ['n/a', '#f7f7f7', '#6b7785']]
   },
   COLORS: [['SELL', '#fdecea', '#b3261e'], ['BUY', '#e6f4ea', '#2e7d32'], ['HOLD', '#eef1f5', '#1b2a41'],
            ['WATCH', '#fff3e0', '#b45309'], ['DO NOT INVEST', '#f3dede', '#7b1f1f'], ['n/a', '#f7f7f7', '#6b7785']]
@@ -257,8 +261,8 @@ function fdcDayText_(v) {
   var m = /^(\d{4}-\d{2}-\d{2})/.exec(fdcTrim_(v));
   return m ? m[1] : '';
 }
-/* PURE (1.4.0): Trial_Labels values -> { ok, why, callDay, newsWeek ('yyyy-MM-dd', the newest of any row; '' when
- * none), cols: { sym, c2, news } (1-based) }. The header row is the first row holding every name in FDC.TRIALS.NEED,
+/* PURE (1.4.0): Trial_Labels values -> { ok, why, callDay, newsWeek, newsUntil ('yyyy-MM-dd', the newest of any row;
+ * '' when none), cols: { sym, c2, news } (1-based) }. The header row is the first row holding every name in FDC.TRIALS.NEED,
  * wherever the tab puts it. */
 function fdcTrialsFromValues_(vals) {
   vals = vals || [];
@@ -270,19 +274,26 @@ function fdcTrialsFromValues_(vals) {
     for (var k = 0; k < need.length; k++) if (!names.hasOwnProperty(need[k])) all = false;
     if (all) { hdr = r; seen = names; }
   }
-  if (hdr < 0) return { ok: false, why: 'no label table on the tab', callDay: '', newsWeek: '', cols: null };
-  var callDay = '', newsWeek = '', n = 0;
+  if (hdr < 0) return { ok: false, why: 'no label table on the tab', callDay: '', newsWeek: '', newsUntil: '', cols: null };
+  var callDay = '', newsWeek = '', newsUntil = '', n = 0;
   for (r = hdr + 1; r < vals.length; r++) {
     var sym = fdcTrim_((vals[r] || [])[seen.Symbol - 1]);
     if (!sym || /\s/.test(sym)) continue;
     n++;
-    var cd = fdcDayText_(vals[r][seen['Call day'] - 1]), nw = fdcDayText_(vals[r][seen['News week'] - 1]);
+    var cd = fdcDayText_(vals[r][seen['Call day'] - 1]), nw = fdcDayText_(vals[r][seen['News week'] - 1]), nu = fdcDayText_(vals[r][seen['News until'] - 1]);
     if (cd > callDay) callDay = cd;
     if (nw > newsWeek) newsWeek = nw;
+    if (nu > newsUntil) newsUntil = nu;
   }
-  if (!n) return { ok: false, why: 'no stock rows', callDay: '', newsWeek: '', cols: null };
-  return { ok: true, why: '', callDay: callDay, newsWeek: newsWeek,
+  if (!n) return { ok: false, why: 'no stock rows', callDay: '', newsWeek: '', newsUntil: '', cols: null };
+  return { ok: true, why: '', callDay: callDay, newsWeek: newsWeek, newsUntil: newsUntil,
            cols: { sym: seen.Symbol, c2: seen['C-2 trial'], news: seen['News trial'] } };
+}
+/* PURE (1.4.0, Codex P2 on #1036): true once the news window of the labels has ended (its last day is before today,
+ * Riyadh) - the tab was not rebuilt since, so its tilt no longer applies. */
+function fdcNewsExpired_(ts, nowMs) {
+  var age = ts && ts.ok ? fdcSessionAgeD_(ts.newsUntil, nowMs) : null;
+  return age !== null && age > 0;
 }
 /* PURE (1.4.0): the two header texts [C-2, news]. */
 function fdcTrialHeaders_(ts, nowMs) {
@@ -293,7 +304,8 @@ function fdcTrialHeaders_(ts, nowMs) {
   }
   var age = fdcSessionAgeD_(ts.callDay, nowMs), old = age !== null && age > T.OLD_DAYS ? ' \u00b7 OLD (' + age + ' days)' : '';
   return [T.C2_PREFIX + ' \u00b7 ' + (ts.callDay ? 'buy calls of ' + ts.callDay : 'no call day') + old + tail,
-          T.NEWS_PREFIX + ' \u00b7 ' + (ts.newsWeek ? 'news week of ' + ts.newsWeek : 'no news tilt in force') + tail];
+          T.NEWS_PREFIX + ' \u00b7 ' + (ts.newsWeek ? 'news week of ' + ts.newsWeek : 'no news tilt in force') +
+            (fdcNewsExpired_(ts, nowMs) ? ' \u00b7 EXPIRED (its window ended ' + ts.newsUntil + '; Trial_Labels not rebuilt since)' : '') + tail];
 }
 /* PURE (1.4.0): the two cell formulas for the row they sit in (its own symbol, looked up on Trial_Labels). */
 function fdcTrialFormulas_(symCol, cols) {
@@ -401,7 +413,7 @@ function fdcReadRead_(ss) {
 /* 1.4.0: Trial_Labels as the tick sees it. */
 function fdcTrialsRead_(ss) {
   var sh = ss.getSheetByName(FDC.TRIALS.SOURCE);
-  if (!sh || sh.getLastRow() < 2) return { ok: false, why: 'tab missing or empty', callDay: '', newsWeek: '', cols: null };
+  if (!sh || sh.getLastRow() < 2) return { ok: false, why: 'tab missing or empty', callDay: '', newsWeek: '', newsUntil: '', cols: null };
   return fdcTrialsFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), FDC.TRIALS.MAX_ROWS), Math.min(Math.max(sh.getLastColumn(), 1), FDC.TRIALS.MAX_COLS)).getValues());
 }
 /* 1.4.0: the two Trial_Labels columns, right of the file's other columns of a page with trials: true ('offset' = the
@@ -413,20 +425,22 @@ function fdcStampTrials_(sh, t, ts, lastRow, offset) {
     if (t.trials[e] !== c1 && t.trials[e] !== c2) sh.getRange(t.hdr, t.trials[e], Math.max(1, lastRow - t.hdr + 1), 1).clear();
   }
   if (lastRow > t.hdr) sh.getRange(t.hdr + 1, c1, lastRow - t.hdr, 2).clearContent();
-  var bg = ts.ok && heads[0].indexOf('OLD (') < 0 ? '#4527a0' : '#b45309';
+  var nowMs = new Date().getTime(), expired = fdcNewsExpired_(ts, nowMs);
+  var bg = ts.ok && heads[0].indexOf('OLD (') < 0 ? '#4527a0' : '#b45309', bg2 = ts.ok && !expired ? '#4527a0' : '#b45309';
   sh.getRange(t.hdr, c1).setValue(heads[0]).setFontWeight('bold').setFontColor('#ffffff').setBackground(bg).setWrap(true).setVerticalAlignment('middle');
-  sh.getRange(t.hdr, c2).setValue(heads[1]).setFontWeight('bold').setFontColor('#ffffff').setBackground(bg).setWrap(true).setVerticalAlignment('middle');
+  sh.getRange(t.hdr, c2).setValue(heads[1]).setFontWeight('bold').setFontColor('#ffffff').setBackground(bg2).setWrap(true).setVerticalAlignment('middle');
   sh.setColumnWidth(c1, T.WIDTH_C2); sh.setColumnWidth(c2, T.WIDTH_NEWS);
   var where = ' in columns ' + fdcColLetter_(c1) + '-' + fdcColLetter_(c2);
   if (!ts.ok) return { text: 'trials: headers only (' + ts.why + ')', blocks: null, cols: [c1, c2] };
   if (!t.rows.length) return { text: 'trials: headers only (no rows)', blocks: null, cols: [c1, c2] };
   var first = t.rows[0], last = t.rows[t.rows.length - 1], f = fdcTrialFormulas_(t.symCol, ts.cols), grid = [], want = {};
+  if (expired) f[1] = '="EXPIRED \u2014 the news window ended ' + ts.newsUntil + '; Trial_Labels has not been rebuilt since"';   // Codex P2, #1036
   for (var i = 0; i < t.rows.length; i++) want[t.rows[i]] = true;
   for (var r = first; r <= last; r++) grid.push(want[r] ? [f[0], f[1]] : ['', '']);
   var both = sh.getRange(first, c1, grid.length, 2);
   both.setFormulas(grid);
   both.setFontSize(9).setWrap(true).setVerticalAlignment('middle');
-  return { text: 'trials: calls of ' + (ts.callDay || '(none)') + where,
+  return { text: 'trials: calls of ' + (ts.callDay || '(none)') + (expired ? ', news EXPIRED' : '') + where,
            blocks: [sh.getRange(first, c1, grid.length, 1), sh.getRange(first, c2, grid.length, 1)], cols: [c1, c2] };
 }
 /* 1.3.0: the two Holding_Read columns, directly right of the FINAL DECISION column of a page with read: true. Returns
@@ -524,7 +538,7 @@ function fdcTick() {
     var ss = SpreadsheetApp.getActive(), src = fdcReadSource_(ss), staleH = fdcStaleH_(), out = [], rs = null;
     try { rs = fdcReadRead_(ss); } catch (eH) { rs = { ok: false, why: String(eH && eH.message || eH).slice(0, 80), session: '', cols: null }; }   // 1.3.0
     var ts = null;
-    try { ts = fdcTrialsRead_(ss); } catch (eL) { ts = { ok: false, why: String(eL && eL.message || eL).slice(0, 80), callDay: '', newsWeek: '', cols: null }; }   // 1.4.0
+    try { ts = fdcTrialsRead_(ss); } catch (eL) { ts = { ok: false, why: String(eL && eL.message || eL).slice(0, 80), callDay: '', newsWeek: '', newsUntil: '', cols: null }; }   // 1.4.0
     for (var i = 0; i < FDC.PAGES.length; i++) {
       try { out.push(fdcStampPage_(ss, FDC.PAGES[i], src, staleH, rs, ts)); }
       catch (e) { out.push(FDC.PAGES[i].name + ': ' + String(e && e.message || e).slice(0, 120)); }
@@ -654,8 +668,8 @@ function fdcCoreOk_() {
     var hr = fdcReadFromValues_([['HOLDING READ'], ['status'], [], ['Symbol', 'Name', 'Last session', 'Stock %', 'Market %', 'Sector %', 'Driver', 'Main news (last session)', 'Next session read', 'Up after similar days'],
       ['AX.US', 'Axos', '2026-11-17', '-1.20%', '-1.00%', '-1.90%', 'SECTOR', 'news', 'NO EDGE', '']]);
     var tx = fdcFindTable_([['Action', 'Symbol', 'Name', '', 'FINAL DECISION x', 'LAST SESSION \u00b7 what moved it y', 'NEXT SESSION READ z', 'C-2 TRIAL q', 'NEWS TRIAL r'], ['HOLD', 'A.US', 'a']], ['Action', 'Symbol'], 'blank');
-    var tl = fdcTrialsFromValues_([['TRIAL LABELS'], ['Built'], [], ['Symbol', 'Final decision', 'C-2 trial', 'News trial', 'Call day', 'News week', 'Sector'],
-      ['AX.US', 'BUY', 'KEEPS (all horizons) - x', 'AVOIDED - y', '2026-11-19', '2026-11-09', 'Financials'], ['DDI.US', 'HOLD', 'NO BUY CALL - z', 'NO SECTOR - w', '2026-11-18', '', '']]);
+    var tl = fdcTrialsFromValues_([['TRIAL LABELS'], ['Built'], [], ['Symbol', 'Final decision', 'C-2 trial', 'News trial', 'Call day', 'News week', 'News until', 'Sector'],
+      ['AX.US', 'BUY', 'KEEPS (all horizons) - x', 'AVOIDED - y', '2026-11-19', '2026-11-09', '2026-11-23', 'Financials'], ['DDI.US', 'HOLD', 'NO BUY CALL - z', 'NO SECTOR - w', '2026-11-18', '', '', '']]);
     var hu = fdcReadFromValues_([['Symbol', 'Last session', 'Stock %', 'Driver', 'Main news (last session)', 'Next session read', 'Up after similar days'],
       ['5023.SR', '', '', 'n/a', 'fixed income', 'NO EDGE', ''], ['AX.US', '2026-11-16', '', '', '', '', ''], ['GLPI.US', '2026-11-17', '', '', '', '', '']]);
     return hr.ok && hr.session === '2026-11-17' && hr.cols.sym === 1 && hr.cols.news === 8 && hr.cols.up === 10 && hr.cols.session === 3 &&
@@ -664,7 +678,8 @@ function fdcCoreOk_() {
       fdcReadHeaders_(hr, Date.UTC(2026, 10, 25, 6, 0))[0].indexOf('OLD (8 days)') > 0 && fdcReadHeaders_(hr, Date.UTC(2026, 10, 18, 6, 0))[1].indexOf('OLD') < 0 &&
       fdcReadFormulas_(2, hr.cols)[0].indexOf('MATCH(TRIM(INDIRECT("R"&ROW()&"C2",FALSE)),Holding_Read!$A:$A,0)') > 0 &&
       tx.col === 5 && tx.existing && tx.extras.join(',') === '6,7' && tx.trials.join(',') === '8,9' &&
-      tl.ok && tl.callDay === '2026-11-19' && tl.newsWeek === '2026-11-09' && tl.cols.sym === 1 && tl.cols.c2 === 3 && tl.cols.news === 4 &&
+      tl.ok && tl.callDay === '2026-11-19' && tl.newsWeek === '2026-11-09' && tl.newsUntil === '2026-11-23' && tl.cols.sym === 1 && tl.cols.c2 === 3 && tl.cols.news === 4 &&
+      !fdcNewsExpired_(tl, Date.UTC(2026, 10, 23, 20, 0)) && fdcNewsExpired_(tl, Date.UTC(2026, 10, 23, 21, 30)) &&
       fdcTrialHeaders_(tl, Date.UTC(2026, 10, 23, 6, 0))[0].indexOf('OLD (4 days)') > 0 && fdcTrialHeaders_(tl, Date.UTC(2026, 10, 19, 6, 0))[0].indexOf('OLD') < 0 &&
       fdcTrialFormulas_(2, tl.cols)[0] === '=IFERROR(INDEX(Trial_Labels!$C:$C,MATCH(TRIM(INDIRECT("R"&ROW()&"C2",FALSE)),Trial_Labels!$A:$A,0))&"","n/a \u2014 not on Trial_Labels")' &&
       !!t && t.hdr === 4 && t.symCol === 2 && t.col === 7 && t.rows.join(',') === '5,6' && !t.existing &&

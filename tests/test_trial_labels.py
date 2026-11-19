@@ -191,7 +191,7 @@ def test_l2_c2_label_says_what_the_trial_does_and_why():
 def test_l3_news_label_reads_the_tilt_in_force_and_the_news_list():
     t = nb.pick_tilt(TILT, TODAY)
     d, names = nb.shadow_names(SHADOW)
-    assert tl.tilt_week(t) == "2026-11-09"
+    assert tl.tilt_week(t) == "2026-11-09" and tl.tilt_until(t) == "2026-11-23"
     assert tl.news_label("AAA.US", "Financials", t, names, d) == (
         "AVOIDED - Financials: political events AVOIDED, events + news themes AVOIDED; news list of 19 Nov: would leave (both arms)")
     assert tl.news_label("HHH.US", "Financials", t, names, d) == (
@@ -213,7 +213,7 @@ def test_l3_news_label_reads_the_tilt_in_force_and_the_news_list():
     assert "news list" not in tl.news_label("AAA.US", "Financials", t, names2, d2)
     # no tilt in force (the window has closed): nothing is claimed for the sector
     late = nb.pick_tilt(TILT, dt.date(2026, 11, 25))
-    assert tl.tilt_week(late) == "" and tl.news_label("AAA.US", "Financials", late, names, d) == \
+    assert tl.tilt_week(late) == "" and tl.tilt_until(late) == "" and tl.tilt_until({}) == "" and tl.news_label("AAA.US", "Financials", late, names, d) == \
         "NO TILT IN FORCE - no news week applies today (Financials)"
     assert tl.news_label("AAA.US", "Financials", {}, {}, "") == "NO TILT IN FORCE - no news week applies today (Financials)"
 
@@ -256,11 +256,11 @@ def test_l5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert head == 5 and [r[0] for r in page[head + 1:head + 7]] == ["AAA.US", "HHH.US", "2222.SR", "ZZZ", "BBB.US", "CCC.US"]
     aaa = row_of(page, "AAA.US")[0]
     assert aaa[1] == "BUY" and aaa[2].startswith("KEEPS (all horizons)") and aaa[3].startswith("AVOIDED - Financials")
-    assert aaa[4:] == ["2026-11-19", "2026-11-09", "Financials"]
+    assert aaa[4:] == ["2026-11-19", "2026-11-09", "2026-11-23", "Financials"]
     hhh = row_of(page, "HHH.US")[0]
     assert hhh[1:3] == ["HOLD", "NO BUY CALL - none on 19 Nov; C-2 judges buy calls only"]
     zzz = row_of(page, "ZZZ")[0]
-    assert zzz[1] == "" and zzz[3] == "NO SECTOR - not known to the archive" and zzz[6] == ""
+    assert zzz[1] == "" and zzz[3] == "NO SECTOR - not known to the archive" and zzz[6:] == ["2026-11-23", ""]
     assert page[-1] == [""] * tl.WIDTH
     last_text = [r[0] for r in page if r[0]][-1]
     assert last_text.startswith("How to read:") and last_text.endswith("Not investment advice.")

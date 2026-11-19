@@ -28,7 +28,8 @@ WHAT IT WRITES (its tab Trial_Labels; nothing else)
                    and its rank among the day's eligible calls of its market
                    group (the top half is kept). From v_c2_calls, the trial's
                    own membership, so the label cannot disagree with the trial.
-      News trial   FAVOURED / AVOIDED / MIXED / NEUTRAL / NO TILT / NO SECTOR:
+      News trial   FAVOURED / AVOIDED / MIXED / NEUTRAL / NO TILT / NO SECTOR (with the last day of
+                   its window, 'News until', after which the pages call it EXPIRED):
                    the news tilt in force for the stock's sector in both arms
                    (political events; events + news themes), and whether the
                    news version of the investable list would take the stock
@@ -77,7 +78,7 @@ RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 TAB = "Trial_Labels"
 FINAL_TAB = "Final_Decisions"
 PORTFOLIO_TAB = "My_Portfolio"
-HEAD = ["Symbol", "Final decision", "C-2 trial", "News trial", "Call day", "News week", "Sector"]
+HEAD = ["Symbol", "Final decision", "C-2 trial", "News trial", "Call day", "News week", "News until", "Sector"]
 WIDTH = len(HEAD)
 CALL_DAYS_BACK = 7                                      # the latest call day is looked for this far back
 HORIZONS = ("1W", "2W", "1M", "3M")
@@ -209,6 +210,14 @@ def tilt_week(tilt: Dict[str, Dict[str, Any]]) -> str:
     return tilt[lead]["week"] if lead else ""
 
 
+def tilt_until(tilt: Dict[str, Dict[str, Any]]) -> str:
+    """The last day the tilt in force applies ('' when none is in force): the page's news labels expire after it, even
+    when this job stops writing the tab (31_Final_Decision_Column 1.4.0 reads it; Codex P2 on #1036)."""
+    lead = next((a for a in nb.ARMS if (tilt.get(a) or {}).get("in_force")), None)
+    a_to = tilt[lead]["apply_to"] if lead else None
+    return a_to.isoformat() if a_to else ""
+
+
 def news_label(symbol: str, sector: str, tilt: Dict[str, Dict[str, Any]], names: Dict[str, Dict[str, Any]],
                shadow_day: str) -> str:
     if not sector:
@@ -243,13 +252,14 @@ def news_label(symbol: str, sector: str, tilt: Dict[str, Dict[str, Any]], names:
 def label_rows(stocks: Sequence[Tuple[str, str]], call_day: Optional[_dt.date], calls: Dict[str, List[Dict[str, Any]]],
                sectors: Dict[str, str], tilt: Dict[str, Dict[str, Any]], names: Dict[str, Dict[str, Any]],
                shadow_day: str) -> List[Dict[str, str]]:
-    week = tilt_week(tilt)
+    week, until = tilt_week(tilt), tilt_until(tilt)
     out = []
     for sym, dec in stocks:
         sector = _find(sectors, sym) or ""
         out.append({"symbol": sym, "decision": dec, "c2": c2_label(_find(calls, sym), call_day),
                     "news": news_label(sym, sector, tilt, names, shadow_day),
-                    "call_day": call_day.isoformat() if call_day else "", "week": week, "sector": sector})
+                    "call_day": call_day.isoformat() if call_day else "", "week": week, "until": until,
+                    "sector": sector})
     return out
 
 
@@ -274,7 +284,7 @@ def page_rows(rows: Sequence[Dict[str, str]], call_day: Optional[_dt.date], tilt
         list(HEAD),
     ]
     for r in rows:
-        page.append([r["symbol"], r["decision"], r["c2"], r["news"], r["call_day"], r["week"], r["sector"]])
+        page.append([r["symbol"], r["decision"], r["c2"], r["news"], r["call_day"], r["week"], r["until"], r["sector"]])
     if not rows:
         page.append(["", "", "No stock could be read from Final_Decisions, My_Portfolio or the latest buy calls."])
     page.append([""])
