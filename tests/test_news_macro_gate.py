@@ -825,7 +825,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.3.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.4.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -850,9 +850,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.3.0"   # 2026-11-19: v1.3.0 [TRADE-RELIEF]
+    assert ng.__version__ == "1.4.0"   # 2026-11-19: v1.4.0 [TRUCE-READ]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.3.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.4.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1015,7 +1015,9 @@ def test_g10_new_types_never_move_the_verdict():
 
 # ----------------------------------------------------------------------------- G11 (v1.3.0 [TRADE-RELIEF])
 TRADE_LISTS = ("trade_truce", "trade_relief", "trade_hedge")
-EVALUATE_SHA = "9304bc0e24abe27b4c18f0f37b7902887f36175968af74db89c0e1ed5ec485be"      # evaluate() of v1.1.0, v1.2.0 and now
+# evaluate() without its easing block: the rules that RAISE a verdict, byte-identical from v1.1.0 to now
+RAISE_RULES_SHA = "68bed4f220d1dcae14d5f17eb98ce609400e5d43ec580ae0ca151c2f82dc53ce"
+EVALUATE_SHA = "99430618bbb085518c3c81665d000dca0462eadef17255abc05e12b5ecdb8a4c"      # evaluate() of v1.4.0 [TRUCE-READ]
 
 # (headline, reading before v1.3.0, reading now, direction now). World headlines of 5 - 18 Nov 2026 (GDELT) and the
 # gate's own archive; the last block is written to probe the guards.
@@ -1121,9 +1123,6 @@ TRADE_CASES = [
     ("EU lifts sanctions on Syria", "trade_sanctions", "trade_sanctions", -1),
     ("US sanctions Hezbollah-linked charity in bid to squeeze Iran", "trade_sanctions", "trade_sanctions", -1),
     ("Stocks surge as tariff concerns ease, oil prices fall", "oil_supply", "oil_supply", 1),
-    # known limit, as before: a fighting headline that names a trade truce is not read as fighting
-    ("Missile strike reported as US-China trade truce holds", "de_escalation", "trade_deal", 1),
-    ("Missile strike breaks calm as trade truce collapses", "war_escalation", "war_escalation", -1),
 ]
 
 
@@ -1211,12 +1210,21 @@ def test_g11_a_reading_can_only_leave_a_verdict_rule():
         clf = ng.Classifier(odd)
         assert clf.classify("China extends US trade truce by two months", "MACRO")["event_type"] == "de_escalation"
         assert clf.classify("China and Canada agree on tariff relief on key exports", "MACRO")["event_type"] == "trade_sanctions"
-    # no verdict rule was touched: evaluate() is byte-identical to v1.1.0 and v1.2.0
+    # no rule that raises a verdict was touched: evaluate() without its easing block is byte-identical to v1.1.0
     src = (_REPO / "scripts" / "news_macro_gate.py").read_text(encoding="utf-8")
     body = "def evaluate(" + src.split("def evaluate(", 1)[1].split("\n# ---", 1)[0]
     import hashlib
+    import re
+    block = re.compile(r'        if c\["event_type"\] == "de_escalation".*?(?=        if c\["severity"\] == "H")', re.S)
+    easing = block.findall(body)
+    assert len(easing) == 1                                       # one easing block, and it is the only part that differs
+    assert hashlib.sha256(block.sub("", body).encode("utf-8")).hexdigest() == RAISE_RULES_SHA
     assert hashlib.sha256(body.encode("utf-8")).hexdigest() == EVALUATE_SHA
     assert "trade_deal" not in body
+    # the easing block can write the EASING line and nothing else: no verdict step, no driver, no name flag
+    for word in ("bump(", "drivers", "names[", "level"):
+        assert word not in easing[0], word
+    assert "positives.append(" in easing[0] and easing[0].rstrip().endswith("continue")
 
 
 def _clusters_with(tax, items, now):
@@ -1278,6 +1286,130 @@ def test_g11_the_verdict_can_fall_and_never_rise():
     # ... and a name's own tariff-threat headline flags it before and now
     was, now = both(_wires("ZZZ.US", "Zeta falls as US threatens new tariffs on steel"))
     assert was["names"] == now["names"] and now["names"]["ZZZ.US"][0]["level"] == "WATCH"
+
+
+# ----------------------------------------------------------------------------- G12 (v1.4.0 [TRUCE-READ])
+# (headline, reading with a taxonomy that has no trade-truce list, reading now, direction now)
+FIGHT_CASES = [
+    ("Missile strike reported as US-China trade truce holds", "de_escalation", "war_escalation", -1),
+    ("Drone attack hits tanker near Hormuz as tariff truce is extended", "de_escalation", "war_escalation", -1),
+    ("Airstrike kills 12 as trade truce talks continue", "de_escalation", "war_escalation", -1),
+    # a real truce beside the fighting still turns it into a truce story (the older rule, unchanged) ...
+    ("Missile fire stops as Gaza truce takes hold", "de_escalation", "de_escalation", 1),
+    ("Missile fire stops as Gaza truce takes hold amid US-China trade truce", "de_escalation", "de_escalation", 1),
+    # ... unless the truce is reported broken (unchanged)
+    ("Missile strike breaks calm as trade truce collapses", "war_escalation", "war_escalation", -1),
+    ("Airstrike hits Gaza, violating ceasefire", "war_escalation", "war_escalation", -1),
+]
+# (headline, direction for the market, direction as a name's own headline)
+BREAKING_CASES = [
+    ("Trump's Board of Peace Warns Gaza Ceasefire Could Collapse", -1, 1),
+    ("Board of Peace delivers bleak report on Gaza, warning of ceasefire collapse without immediate action", -1, 1),
+    ("Israeli army launches military offensive in central Gaza despite ceasefire", -1, 1),
+    ("Iran attacks US bases in Gulf countries despite diplomatic efforts", -1, 1),
+    ("Trump says US could devastate Iran in three days as diplomatic efforts stall", -1, 1),
+    ("Oil Prices Rise 5% on Fears of US-Iran Ceasefire Collapse", -1, 1),
+    ("Iran defends two-day proposal for peace talks after US rejects conditions", -1, 1),
+    ("\u0627\u0633\u062a\u0645\u0631\u0627\u0631 \u062d\u0631\u0627\u0626\u0642 \u0627\u0644\u0646\u0627\u0642\u0644\u0627\u062a \u0641\u064a \u0647\u0631\u0645\u0632 \u0631\u063a\u0645 \u0622\u0645\u0627\u0644 \u0627\u0644\u062a\u0647\u062f\u0626\u0629", -1, 1),   # tanker fires go on in Hormuz despite hopes of calm
+    ("Israel and Hamas agree ceasefire deal", 1, 1),
+    ("Truce holds in Gaza for a third day", 1, 1),
+    ("Peace talks resume in Doha", 1, 1),
+    ("Gaza truce holds as US-China trade truce nears", 1, 1),
+    # the gate's own archive, 27 Oct - 19 Nov: each of these was recorded as easing
+    ("Arab parties endorse Eisenkot for Israeli PM, IDF reports 52 ceasefire violations Oct. 16-Nov. 5", -1, 1),
+    ("Crude Oil Prices Finish Higher as Progress Stalls in US-Iran Peace Talks", -1, 1),
+    ("Israeli army blows up Palestinian homes in central Gaza amid continued ceasefire violations", -1, 1),
+    ("Israel launches assault targeting residential areas in Gaza despite ceasefire", -1, 1),
+    # a denied breach is not a breach (archive: the first one); one word may stand between, not two
+    ("Russia and Ukraine confirm no ceasefire violations in Ukrainian town of Oleshky", 1, 1),
+    ("No ceasefire violations reported in Gaza, monitors say", 1, 1),
+    ("Ceasefire holds, no violations reported", 1, 1),
+    ("Truce holds without any breach, UN says", 1, 1),
+    ("Gaza truce holds with zero reported breaches", 1, 1),
+    ("Monitors report no major ceasefire violations", -1, 1),
+    ("Ceasefire talks end with no deal after violations", -1, 1),
+    # the denial covers that word only: another breach word beside it still counts
+    ("Hamas says no breach of truce as Israel resumes attacks", -1, 1),
+    ("Ceasefire talks: no deal, no progress", -1, 1),
+    ("Peace talks end without progress in Doha", -1, 1),
+    ("Gaza ceasefire holds despite sporadic clashes", -1, 1),
+]
+
+
+@pytest.mark.parametrize("title,before,after,direction", FIGHT_CASES)
+def test_g12_fighting_beside_a_trade_truce_is_fighting(title, before, after, direction):
+    tax = ng.load_taxonomy()
+    for scope in ("MACRO", "ZZZ.US"):
+        was, now = ng.Classifier(_v120(tax)).classify(title, scope), ng.Classifier(tax).classify(title, scope)
+        assert was["event_type"] == before, (scope, was)
+        assert (now["event_type"], now["direction"]) == (after, direction), (scope, now)
+        if before != after:
+            assert (before, after) == ("de_escalation", "war_escalation") and now["severity"] == "H"
+
+
+@pytest.mark.parametrize("title,market,own", BREAKING_CASES)
+def test_g12_a_ceasefire_that_is_breaking_is_read_as_falling(title, market, own):
+    clf = ng.Classifier(ng.load_taxonomy())
+    got = clf.classify(title, "MACRO")
+    assert (got["event_type"], got["direction"]) == ("de_escalation", market), got
+    name = clf.classify(title, "ZZZ.US")                      # a name's own headline is left as it was
+    assert (name["event_type"], name["direction"]) == ("de_escalation", own), name
+
+
+@pytest.mark.parametrize("title,event,direction", [
+    ("OPEC+ raises output despite price collapse", "oil_supply", 1),
+    ("Nvidia beats estimates despite chip curbs", "ai_tech", 1),
+    ("Trump and Xi sign trade deal despite tensions", "trade_deal", 1),
+    ("G20 summit opens despite boycott", "summit_diplomacy", 0),
+])
+def test_g12_only_a_ceasefire_reading_is_turned(title, event, direction):
+    # 'despite', 'collapse' and the other breach words turn a ceasefire headline and no other reading
+    got = ng.Classifier(ng.load_taxonomy()).classify(title, "MACRO")
+    assert (got["event_type"], got["direction"]) == (event, direction), got
+
+
+def test_g12_the_easing_line_and_the_one_reading_that_can_rise():
+    tax = ng.load_taxonomy()
+
+    def run(items, t=None):
+        return ng.evaluate(_clusters_with(t or tax, items, QUIET), [], {}, QUIET)
+    # a ceasefire that is holding stands on the EASING line, exactly as before
+    calm = run(_wires("MACRO", "Israel and Hamas agree ceasefire deal in Gaza"))
+    assert calm["verdict"] == "GO" and calm["drivers"] == []
+    assert calm["positives"] == ["de_escalation/israel grade 1, 3 sources: Israel and Hamas agree ceasefire deal in Gaza"]
+    # one reported as breaking does not - and raises nothing
+    for title in ("Board of Peace warns Gaza ceasefire could collapse", "Israeli army launches military offensive in central Gaza despite ceasefire"):
+        got = run(_wires("MACRO", title))
+        assert (got["verdict"], got["drivers"], got["positives"], got["names"]) == ("GO", [], [], {}), title
+    # mixed cluster: the holding reports outnumber the breaking one - listed, with a holding headline and their own count
+    wires = _wires("MACRO", "Gaza ceasefire holds for a third day", "Board of Peace warns Gaza ceasefire could collapse")
+    holding, breaking = wires[:3], wires[3:]
+    assert len(holding) == len(breaking) == 3 and len({w["url"] for w in wires}) == 6
+    for calm_n, breaking_n, grade in ((3, 1, 1), (3, 2, 1), (2, 1, 2)):   # the grade and the count are the holding reports' own
+        mixed = run(holding[:calm_n] + breaking[:breaking_n])
+        assert mixed["positives"] == ["de_escalation/gaza grade %d, %d sources: Gaza ceasefire holds for a third day" % (grade, calm_n)], (calm_n, breaking_n)
+        assert mixed["verdict"] == "GO" and mixed["drivers"] == []
+    # ... the breaking reports outnumber the holding ones, or match them: not listed
+    for calm_n, breaking_n in ((1, 2), (3, 3), (2, 2), (1, 1), (0, 3)):
+        assert run(holding[:calm_n] + breaking[:breaking_n])["positives"] == [], (calm_n, breaking_n)
+    # ... and the holding ones must be confirmed on their own: one unranked site beside a wire's warning is not
+    weak = ng.parse_gdelt(gdelt_articles([
+        ("https://a.example.org/1", "Gaza ceasefire holds for a third day", "20261030T100000Z", "a.example.org"),
+        ("https://b.example.org/2", "Gaza ceasefire holds, residents say", "20261030T100500Z", "b.example.org"),
+        ("https://www.reuters.com/3", "Board of Peace warns Gaza ceasefire could collapse", "20261030T101000Z", "reuters.com"),
+    ]), "MACRO", "geopolitics")
+    assert run(weak)["positives"] == []
+    # fighting beside a trade truce from three wires on a Gulf anchor: it raised nothing, now it is the top verdict
+    strike = _wires("MACRO", "Missile strike on tanker in Hormuz as US-China trade truce holds")
+    was, now = run(strike, _v120(tax)), run(strike)
+    assert was["verdict"] == "GO" and was["drivers"] == [] and len(was["positives"]) == 1
+    assert now["verdict"] == "NO_NEW_ENTRY" and now["positives"] == []
+    assert now["drivers"] == ["macro: war_escalation/hormuz grade 1, 3 sources: Missile strike on tanker in Hormuz as US-China trade truce holds"]
+    # the same strike without the truce words reads the same now, with either taxonomy
+    plain = _wires("MACRO", "Missile strike on tanker in Hormuz")
+    assert run(plain)["verdict"] == run(plain, _v120(tax))["verdict"] == "NO_NEW_ENTRY"
+    # a name's own headline about a breaking ceasefire gains no flag
+    assert run(_wires("ZZZ.US", "Zeta slides as Gaza ceasefire collapses"))["names"] == {}
 
 
 def test_g10_topic_searches():

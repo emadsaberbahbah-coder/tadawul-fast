@@ -2,8 +2,34 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.3.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.4.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.4.0 (2026-11-19) -- [TRUCE-READ] FIGHTING BESIDE A TRADE TRUCE IS FIGHTING; A CEASEFIRE THAT IS BREAKING IS NOT EASING
+WHY (owner, 19 Nov 2026 16:09: "for what you are waiting for my decision go and select the best option"; the two
+  readings v1.3.0 left open):
+  (1) the older truce rule turns a fighting headline into de-escalation when it also names a truce - and
+      'truce' inside "trade truce" counted, so "Missile strike reported as US-China trade truce holds" was not
+      read as fighting;
+  (2) every de_escalation reading stood on the EASING line, also when the headline says the ceasefire is
+      breaking. The gate's archive (27 Oct - 19 Nov, 352 market-wide de-escalation headlines): 29 carry an
+      English breach word and every one was recorded as easing (direction +1), 6 of them in a grade-1 cluster
+      - "Trump's Board of Peace Warns Gaza Ceasefire Could Collapse" (Bloomberg), "Iran attacks US bases in
+      Gulf countries despite diplomatic efforts" (Reuters), "Israeli army launches military offensive in
+      central Gaza despite ceasefire".
+WHAT: (1) Classifier.classify(): the older truce rule looks for a ceasefire word with the trade-truce phrases set
+  aside, so fighting beside a trade truce stays war_escalation. THIS CAN RAISE A VERDICT - it is the reading the
+  rule was written for. (2) A market-wide de_escalation headline that carries a breach word is read as falling
+  (direction -1; a name's own headline is left as it was, so no name gains a flag; a denied breach - "no
+  ceasefire violations" - does not count). evaluate(): the EASING line
+  lists a de-escalation cluster only for its members that are not falling - they must outnumber the falling
+  ones and be confirmed (grade 1-2) on their own - and quotes one of their headlines. With no falling member the
+  line is exactly as before. This part can only remove an easing line; a de_escalation cluster still raises
+  nothing.
+NOT IN THIS VERSION: the fighting words themselves are unchanged. "Iran attacks US bases" carries none of them
+  ('attack' alone is not listed: it is also "attacks the Fed chair"), so it is no longer easing but is not yet
+  read as fighting.
+ROLLBACK: revert this file to v1.3.0.
+
 v1.3.0 (2026-11-19) -- [TRADE-RELIEF] A TRADE TRUCE IS NOT A CEASEFIRE; A TARIFF CUT IS NOT TRADE PRESSURE
 WHY (owner, 19 Nov 2026 15:33: "Lest move to the next", part 1 of the next stage; the two misreadings v1.2.0
   left on purpose): 'truce' is a ceasefire word, so "China extends US trade truce by two months" was put on the
@@ -221,7 +247,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -495,6 +521,11 @@ def _norm_terms(terms: Iterable[str]) -> List[str]:
     return out
 
 
+# v1.4.0 [TRUCE-READ]: "no ceasefire violations", "without a breach" - the breach word is denied, so the
+# headline does not report a ceasefire as breaking. English only; one word may stand between.
+_NO_BREACH_RE = re.compile(r"(?<= )(?:no|without|zero) (?:[^ ]+ )?(?:violat|breach)[^ ]*")
+
+
 def _hit(norm: str, terms: Sequence[str]) -> bool:
     return any(t in norm for t in terms)
 
@@ -597,8 +628,11 @@ class Classifier:
         # A truce or de-escalation story that also names an attack word is
         # de-escalation unless it says the truce was broken (Codex P2, #859).
         deesc = self.by_type.get("de_escalation")
+        # v1.4.0 [TRUCE-READ]: 'truce' inside a trade-truce phrase is not a ceasefire word here either, so
+        # fighting beside a trade truce stays fighting.
         if found is not None and found["type"] == "war_escalation" and deesc is not None \
-                and _hit(norm, deesc["terms"]) and not _hit(norm, self.breach):
+                and _hit(self._without(norm, self.truce) if self.truce else norm, deesc["terms"]) \
+                and not _hit(norm, self.breach):
             found = deesc
         # v1.3.0 [TRADE-RELIEF]: a trade truce is not a ceasefire, a tariff cut is not trade pressure. The
         # reading moves to the label-only trade_deal; a name's own headline, which takes no label, loses it.
@@ -613,6 +647,9 @@ class Classifier:
         direction = found["direction"]
         if relabel == "truce" and (_hit(norm, self.hedge) or _hit(norm, self.breach)):
             direction = -1                   # a trade truce in doubt: shown as falling, counted nowhere
+        elif found["type"] == "de_escalation" and not company_first \
+                and _hit(_NO_BREACH_RE.sub(" ", norm), self.breach):
+            direction = -1                   # v1.4.0: a ceasefire reported as breaking is not easing
         elif direction == 0:
             direction = 1 if pos > neg else (-1 if neg > pos else 0)
         elif found["type"] in ("earnings", "guidance", "rating_change", "oil_supply", "central_bank"):
@@ -937,8 +974,21 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
         grade = information_grade(recent)
         anchor = c["anchor"]
         tag = f"{c['event_type']}/{anchor} grade {grade}, {len(doms)} sources: {c['headline'][:90]}"
-        if c["event_type"] == "de_escalation" and grade <= 2:
-            positives.append(tag)
+        if c["event_type"] == "de_escalation":
+            # v1.4.0 [TRUCE-READ]: a ceasefire reported as breaking (a member read as falling) is not easing.
+            # The line lists the cluster for its other members only: they must outnumber the falling ones and
+            # be confirmed on their own, and one of their headlines is quoted. A de-escalation cluster raises
+            # nothing, as before.
+            falling = [m for m in recent if m.get("direction", 0) < 0]
+            if not falling:
+                if grade <= 2:
+                    positives.append(tag)
+            else:
+                calm = [m for m in recent if m.get("direction", 0) >= 0]
+                if len(calm) > len(falling) and information_grade(calm) <= 2:
+                    lead = sorted(calm, key=lambda m: _TIER_RANK.get(m.get("tier", "F"), 9))[0]["title"]
+                    positives.append(f"{c['event_type']}/{anchor} grade {information_grade(calm)}, "
+                                     f"{len({m.get('domain') for m in calm if m.get('domain')})} sources: {lead[:90]}")
             continue
         if c["severity"] == "H" and c["event_type"] in ("war_escalation", "emergency_policy", "market_turmoil"):
             if anchor in GULF_ANCHORS and grade == 1 and len(doms) >= 3:
