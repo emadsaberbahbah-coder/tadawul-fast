@@ -1,7 +1,23 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.5 (2026-11-17)
+ * Version: 1.4.6 (2026-11-19)
+ *   1.4.6: [RETURN-COL] A HOLDING'S RETURN CELL COUNTS THE DIVIDENDS IT RECEIVED (owner, Thu 19 Nov 2026 10:04 Riyadh:
+ *          "still in some pages I see that SUPN.US showing high loss but the impact of the dividends received is not
+ *          effective ... check and solve that now and in the future as well"). The holdings table's 'Unreal.' cell
+ *          printed the price-only loss of a lot that had been paid a large special dividend (-18.3%), and only the name
+ *          cell, in small text, said the ledger's total return (-2.2%). The cell now carries the total for such a lot
+ *          and the name cell names the price-only figure instead:
+ *          - dp2LotReturn_ (pure): Total Return SAR over the lot's cost in SAR when the ledger lot carries dividends
+ *            received; otherwise the 1.4.5 price-only figure, the same expression as before.
+ *          - dp2ReturnNameTxt_ (pure): ' . with dividends <amount> <ccy> (ledger) . price only <p>%' for such a lot;
+ *            otherwise the 1.4.4 text (dp2TotalReturnTxt_, unchanged).
+ *          - the column is headed 'Return' (a fixed-income row already showed its return with coupons there).
+ *          The figure is the ledger's own: _Portfolio_CostBasis 'Total Return SAR', which counts 'Dividends Recv' from
+ *          _Dividend_Log, a tax row as its negative amount. Every future dividend reaches the cell the same way.
+ *          Script Property DP2_RETURN_WITH_DIV: 0 / off / false / no = the 1.4.5 table; anything else, absent or
+ *          unreadable = on. A lot without dividends shows the same figure as in 1.4.5. Analysis only: no gate,
+ *          ticket, sizing, order or broker call reads it.
  *   1.4.5: [DIV-NET] A DIVIDEND COUNTS NET OF THE TAX RECORDED FOR IT (owner, Tue 17 Nov 2026 10:33 Riyadh, asked whether
  *          the entry should count a dividend net of the tax withheld: "go with the best option"). The exit engine cell
  *          lowered the entry by the whole dividend. A Saudi resident does not receive the whole dividend of a US
@@ -511,7 +527,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.5';   // lockstep with the header
+var DP2_VERSION = '1.4.6';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1847,6 +1863,41 @@ function dp2FinalHoldsStop_(r) {
 function dp2TotalReturnTxt_(l, fx) {
   if (!l || !(l.dividends > 0) || typeof l.totalReturnSar !== 'number' || !(l.costBasis > 0) || !(fx > 0)) return '';
   return ' \u00b7 total return ' + dp2Pct_(l.totalReturnSar / (l.costBasis * fx) * 100, 1) + ' with dividends ' + dp2Fmt_(l.dividends, 2) + ' ' + dp2Str_(l.ccy) + ' (ledger)';
+}
+/* v1.4.6 [RETURN-COL]: Script Property DP2_RETURN_WITH_DIV (default on), read once per execution. */
+var DP2_RETURN_COL_PROP = 'DP2_RETURN_WITH_DIV';
+var DP2_RC_ = null;
+function dp2ReturnColOn_() {
+  if (DP2_RC_ === null) DP2_RC_ = !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_RETURN_COL_PROP)).trim());
+  return DP2_RC_;
+}
+/* PURE (v1.4.6 [RETURN-COL]): does the lot's ledger row carry dividends received and a total return to show? */
+function dp2LotHasTotal_(l, fx) {
+  return !!l && l.dividends > 0 && typeof l.totalReturnSar === 'number' && isFinite(l.totalReturnSar) && l.costBasis > 0 && fx > 0;
+}
+/* PURE (v1.4.6 [RETURN-COL]): the table's return cell, a fraction: the total with dividends for such a lot when on,
+ * else the price-only figure of 1.4.5 (unrealized SAR over the cost in SAR; blank without both). */
+function dp2LotReturn_(l, fx, on) {
+  if (on && dp2LotHasTotal_(l, fx)) return l.totalReturnSar / (l.costBasis * fx);
+  return l && l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * fx)) : null;
+}
+/* PURE (v1.4.6 [RETURN-COL]): the name cell's tail. On, for a lot with dividends: what the return cell counts and the
+ * price-only figure; otherwise the 1.4.4 text. */
+function dp2ReturnNameTxt_(l, fx, on) {
+  if (!(on && dp2LotHasTotal_(l, fx))) return dp2TotalReturnTxt_(l, fx);
+  var price = l.unrealSar !== null && l.unrealSar !== undefined && isFinite(l.unrealSar) ? ' \u00b7 price only ' + dp2Pct_(l.unrealSar / (l.costBasis * fx) * 100, 1) : '';
+  return ' \u00b7 with dividends ' + dp2Fmt_(l.dividends, 2) + ' ' + dp2Str_(l.ccy) + ' (ledger)' + price;
+}
+function dp2V146CoreOk_() {
+  try {
+    var l = { dividends: 12.5, totalReturnSar: -9.375, unrealSar: -56.25, costBasis: 100, ccy: 'USD' };
+    var a = Math.abs(dp2LotReturn_(l, 3.75, true) + 0.025) < 1e-12 && Math.abs(dp2LotReturn_(l, 3.75, false) + 0.15) < 1e-12 &&
+            Math.abs(dp2LotReturn_({ dividends: 0, totalReturnSar: 5, unrealSar: 5, costBasis: 100 }, 3.75, true) - 5 / 375) < 1e-12 &&
+            dp2LotReturn_({ unrealSar: 0, costBasis: 100 }, 3.75, true) === null && dp2LotReturn_(null, 3.75, true) === null;
+    var b = dp2ReturnNameTxt_(l, 3.75, true) === ' \u00b7 with dividends 12.50 USD (ledger) \u00b7 price only \u221215.0%' &&
+            dp2ReturnNameTxt_(l, 3.75, false) === dp2TotalReturnTxt_(l, 3.75) && dp2ReturnNameTxt_({ dividends: 0 }, 3.75, true) === '';
+    return a && b;
+  } catch (x) { return false; }
 }
 function dp2V144CoreOk_() {
   try {
@@ -4056,7 +4107,7 @@ function buildPortfolioDecisionV2() {
 
   // holdings table — dynamic exits
   row = dp2Section_(sh, row, 1, 16, 'HOLDINGS — ledger lots, dynamic exits and IBKR order status', 'Dyn. stop = trailing rule: entry − 2 × ATR14 at entry; breakeven lock after +1R; 2 × ATR under the highest close (1.5 × ATR after +2R); never loosens. SELL NOW = last at/below the dynamic stop, or a profitable name closing below its 10-day average after giving back ≥ 1 ATR. Broker levels from _IBKR_Orders; the fixed broker stop is only a floor — RAISE STOP tells you when to move it.' + (dp2StopRule_() ? ' DP2_STOP_RULE: lots entered from ' + dp2StopRule_().from + ' use a fixed stop ' + DP2X.FIXED_STOP_PCT + '% under the entry and a time stop after ' + DP2X.TIME_STOP_SESSIONS + ' sessions.' : ''));
-  var hdrs = ['Symbol', 'Name · sector', '3-month close', 'Qty', 'Avg cost', 'Last', 'Value SAR', '% NAV', 'Unreal.', 'Broker TP / stop', 'Dyn. stop (trail)', 'Exit engine', 'Order status (IBKR)', 'Exit signal'];
+  var hdrs = ['Symbol', 'Name · sector', '3-month close', 'Qty', 'Avg cost', 'Last', 'Value SAR', '% NAV', dp2ReturnColOn_() ? 'Return' : 'Unreal.', 'Broker TP / stop', 'Dyn. stop (trail)', 'Exit engine', 'Order status (IBKR)', 'Exit signal'];
   var spans = [1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1];
   var trows = [], sigKinds = [], exitItems = [];
   var brackets = {};
@@ -4189,7 +4240,7 @@ function buildPortfolioDecisionV2() {
           { covered: ib.ordersKnown ? br.stopQty : null, shares: posShares, verifyOnly: dp2FinalVerifyOnly_(fc.row), planHolds: dp2FinalHoldsStop_(fc.row) });   // 1.4.3 [STOP-OF-RECORD]; 1.4.4 planHolds
     }
     sigKinds.push(fin.on && fc.kind ? fc.kind : sig.kind);
-    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : '') + dp2TotalReturnTxt_(l, lfx), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, l.unrealSar && l.costBasis ? (l.unrealSar / (l.costBasis * lfx)) : null, (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
+    trows.push([l.symbol, dp2Str_(l.name) + ' · ' + dp2Str_(m2.sector || '') + ' · ' + (l.holdingDays !== null ? l.holdingDays + ' d' : '') + (m2.rsi !== null && m2.rsi !== undefined ? ' · RSI ' + Math.round(m2.rsi) : '') + dp2ReturnNameTxt_(l, lfx, dp2ReturnColOn_()), spark, l.shares, cost, last, l.mvSar, navSar ? l.mvSar / navSar : null, dp2LotReturn_(l, lfx, dp2ReturnColOn_()), (!ib.ordersKnown && br.n > 0 ? (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + '\n(UNVERIFIED — stale/undated snapshot)' : (br.tp ? dp2Fmt_(br.tp, 2) : '—') + ' / ' + (br.stop ? dp2Fmt_(br.stop, 2) : '—') + (br.active === 0 && (br.lastTp || br.lastStop) ? '\n(last ' + (br.lastTp ? dp2Fmt_(br.lastTp, 2) : '—') + ' / ' + (br.lastStop ? dp2Fmt_(br.lastStop, 2) : '—') + ' not working)' : (br.state === 'partial' ? (br.stop ? '\nno active TP' : '\nNO ACTIVE STOP' + (br.lastStop ? ' (last ' + dp2Fmt_(br.lastStop, 2) + ')' : '')) : (tpPct !== null ? '\nTP ' + dp2Pct_(tpPct, 1) : '')))), dynTxt, engTxt, ostat, decision]);
   }
   // v1.2.21 (review finding on 736ccd6): the unfunded-plans / capital-call action is computed once per page (dp2UnfundedAction_)
   var unfundedAct = dp2UnfundedAction_(alloc);
@@ -4726,6 +4777,7 @@ function dp2SelfTest() {
   if (dp2EvidenceSince_()) { var esOk = dp2EvidenceSinceCoreOk_(); checks.push({ name: 'evidence since (DP2_EVIDENCE_SINCE): ' + dp2EvidenceSince_().label + ' \u00b7 ' + (hit.since && hit.since.col ? dp2Fmt_(hit.since.n) + ' matured INVESTABLE records since' + (hit.since.n ? ', hit rate ' + dp2PctPlain_(hit.since.rate * 100, 1) : '') : 'no Date Recorded column in Performance_Log') + ' \u00b7 core ' + (esOk ? 'ok' : 'FAIL'), ok: esOk && !!(hit.since && hit.since.col) }); }   // v1.2.36
   checks.push({ name: 'v1.4.4 cores: plan accept, total return, evidence recent (DP2_EVIDENCE_RECENT_DAYS: ' + (dp2EvidenceRecentDays_() ? dp2EvidenceRecentDays_() + ' d' : 'off') + ')', ok: dp2V144CoreOk_() });
   checks.push({ name: 'v1.4.5 core: a dividend net of the tax recorded for it (DP2_DIV_NET: ' + (dp2DivNetOn_() ? 'on' : 'off') + ')', ok: dp2V145CoreOk_() });
+  checks.push({ name: 'v1.4.6 core: the return cell counts dividends received (DP2_RETURN_WITH_DIV: ' + (dp2ReturnColOn_() ? 'on' : 'off') + ')', ok: dp2V146CoreOk_() });
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var slotN = 0; try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) slotN++; }); } catch (eSl) { slotN = 0; }
   if (slotN) { var slOk = dp2SlotCoreOk_(); checks.push({ name: 'refresh slots (' + DP2_SLOT_HANDLER_ + ' every ' + DP2_SLOT_EVERY_MIN_ + ' min): ' + dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_)).join(',') + ' \u00b7 core ' + (slOk ? 'ok' : 'FAIL') + ' (one page per execution, after the main-page render of the hour)', ok: slOk }); }   // v1.3.0
