@@ -285,7 +285,7 @@ PENDING = {
     "v_news_sector_weights": "83e866325a7047aeea81d824f91139aae3d219dfa632f45b74b838e120d876c8",
     "v_news_sector_tilt": "637933f5d28aa72c12690b5d8d379e4972b222938be9e2c262e09ff26a1a67cc",
     "v_news_overlay_list": "ce45122ead4f06ab6fcee4c3b1abf62e2a8e56a2b186337eb7f9d471f04a6aa7",
-    "v_trial_news_overlay": "edfa75b8d0da62a7afab5b9b2d44bd12146e46979914b3bacc3ad21ac3a225ec",
+    "v_trial_news_overlay": "b2b0fdf88c772fb0239479387bcb9719f6638dfb35b64c6721ffdad5fa510b83",
     # apply_bq_views 1.13.0 (19 Nov 2026): the standing lost-opportunity comparison
     "v_forward_universe": "557dc2709d5bc349f98afa810730cb06fdee41a56a221612cf859deeb945f28d",
     "v_investable_vs_market": "fafc09c95276aae31acdc302dc739fa2f0c557b9f64702ed8982b30ede506a50",
@@ -2395,6 +2395,17 @@ def _news_overlay(rows, tilt):
     return res
 
 
+def _news_trial_day(base, horizon_days, last_list_day, moved_out, n_out, moved_in, n_in, n_ch, n_ov):
+    """Python replica of v_trial_news_overlay's day rule (final_day, scored, complete)."""
+    import datetime as _d
+    if moved_out <= 0:
+        return "unchanged"
+    final = _d.date.fromisoformat(base) + _d.timedelta(days=horizon_days + 6) <= _d.date.fromisoformat(last_list_day)
+    if not final:
+        return "pending"
+    return "counted" if (n_out == moved_out and n_in == moved_in and n_ch > 0 and n_ov > 0) else "incomplete"
+
+
 def _news_trial_reading(line, forward, days, need, news_weeks, t_x, edge_x):
     """Python replica of v_trial_news_overlay.reading."""
     if line != "OVERLAY_MINUS_CHAMPION":
@@ -2533,13 +2544,22 @@ def case_v37():
     # 95: the edge, forward evidence only, the changed days, the fixed promotion rule
     r = code["v_trial_news_overlay"]
     for frag in ("f.ret_pp - f.market_median_pp AS edge",
-                 "ON f.symbol = o.symbol AND f.base_date = o.base_date",
+                 "CROSS JOIN hz AS h\n  LEFT JOIN `{{DS}}.v_forward_universe` AS f\n"
+                 "    ON f.symbol = o.symbol AND f.base_date = o.base_date AND f.horizon = h.horizon",
+                 "[('1W', 7), ('2W', 14)]",
+                 "MAX(o.base_date) OVER () AS last_list_day",
+                 "DATE_ADD(base_date, INTERVAL MIN(horizon_days) + 6 DAY) <= MAX(last_list_day) AS final_day",
+                 "COUNTIF(in_champion AND edge IS NOT NULL) AS n_ch, SUM(IF(in_champion, edge, NULL)) AS s_ch",
+                 "COUNTIF(news_action = 'out') AS moved_out",
+                 "COUNTIF(news_action = 'in') AS moved_in",
+                 "n_out = moved_out AND n_in = moved_in AND n_ch > 0 AND n_ov > 0 AS complete",
+                 "WHERE moved_out > 0 AND final_day",
+                 "COUNTIF(complete) AS days",
+                 "COUNTIF(NOT complete) AS incomplete_days",
+                 "COUNT(DISTINCT IF(complete, news_week, NULL)) AS news_weeks",
                  "IF(base_date >= DATE '2026-11-20', 'forward from 2026-11-20', 'in-sample, not evidence') AS period",
-                 "CASE f.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 END AS horizon_days",
-                 "WHERE n_out > 0 AND n_ch > 0 AND n_ov > 0",
-                 "COUNT(DISTINCT news_week) AS news_weeks",
-                 "AVG(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dm",
-                 "STDDEV_SAMP(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dsd",
+                 "AVG(IF(complete, SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch), NULL)) AS dm",
+                 "STDDEV_SAMP(IF(complete, SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch), NULL)) AS dsd",
                  "GREATEST(20, 2 * horizon_days) AS need",
                  "IF(line = 'OVERLAY_MINUS_CHAMPION', SAFE_DIVIDE(dm, dsd) * SQRT(days / horizon_days), NULL) AS t_x",
                  "UNNEST(['CHAMPION', 'NEWS_OVERLAY', 'MOVED_OUT', 'MOVED_IN', 'OVERLAY_MINUS_CHAMPION']) AS line",
@@ -2547,15 +2567,26 @@ def case_v37():
                  "WHEN t_x >= 2.5 AND edge_x > 0 THEN 'news overlay ahead: the owner may consider it'",
                  "WHEN edge_x <= 0 THEN 'news overlay not ahead: keep the list as it is'"):
         assert frag in r, frag
-    # the 19 Nov in-sample read: +0.45 a day on 13 days, t 0.69 -> in-sample whatever the figures
-    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", False, 13, 20, 3, 0.69, 0.45).startswith("in-sample")
+    assert "\n  JOIN `{{DS}}.v_forward_universe`" not in r                 # never an inner join: a missing outcome is seen
+    # a day: (base, horizon days, newest list day, moved out, out scored, moved in, in scored, champion scored, overlay scored)
+    cases = [("2026-11-20", 7, "2026-12-03", 3, 3, 3, 3, 40, 40, "counted"),
+             ("2026-11-20", 7, "2026-12-02", 3, 3, 3, 3, 40, 40, "pending"),        # one day short of final
+             ("2026-11-20", 14, "2026-12-03", 3, 3, 3, 3, 40, 40, "pending"),
+             ("2026-11-20", 7, "2026-12-03", 3, 2, 3, 3, 40, 39, "incomplete"),     # a name moved out has no outcome
+             ("2026-11-20", 7, "2026-12-03", 3, 3, 3, 2, 39, 40, "incomplete"),     # a name brought in has none
+             ("2026-11-20", 7, "2026-12-03", 3, 3, 2, 2, 40, 39, "counted"),        # a short pool is still the day's list
+             ("2026-11-20", 7, "2026-12-03", 0, 0, 0, 0, 40, 40, "unchanged")]
+    for base, hd, last, mo, no, mi, ni, nch, nov, want in cases:
+        assert _news_trial_day(base, hd, last, mo, no, mi, ni, nch, nov) == want, (base, hd, last, mo, no, mi, ni)
+    # the 19 Nov in-sample read: -0.03 a day on 6 final days, t -0.17 -> in-sample whatever the figures
+    assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", False, 6, 20, 2, -0.17, -0.03).startswith("in-sample")
     assert _news_trial_reading("CHAMPION", True, 40, 20, 9, 3.0, 1.0) is None
     assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 19, 20, 9, 3.0, 1.0) == "collecting: 19 of 20 days, 9 of 8 news weeks"
     assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 7, 3.0, 1.0).startswith("collecting")
     assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 2.5, 0.3) == "news overlay ahead: the owner may consider it"
     assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 2.49, 0.3).startswith("news overlay ahead but not yet clear")
     assert _news_trial_reading("OVERLAY_MINUS_CHAMPION", True, 30, 28, 8, 3.0, 0.0) == "news overlay not ahead: keep the list as it is"
-    assert round(0.45 / 0.89 * math.sqrt(13 / 7), 2) == 0.69 and max(20, 2 * 14) == 28          # t_adj (the 19 Nov read) and need
+    assert round(-0.03 / 0.163 * math.sqrt(6 / 7), 2) == -0.17 and max(20, 2 * 14) == 28        # t_adj (the 19 Nov read) and need
 
 
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,

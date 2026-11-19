@@ -13,14 +13,24 @@
 -- 8 to 40 weeks old did better than fresh news in 5 of 9 cases ('events')
 -- and 3 of 9 ('all'). On the 13 archived list days (31 Oct - 12 Nov), one
 -- week ahead, the 'events' overlay was ahead of the list on 12 days and the
--- 'all' overlay behind it on 8; this view's own 'events' arm reads +0.45
--- points a day with an overlap-adjusted t of 0.69: three weekly decisions,
--- two arms, opposite answers. Nothing is proven.
+-- 'all' overlay behind it on 8 in the test's first cut; this view's own
+-- 'events' arm, on the 6 of those days that are final (31 Oct - 6 Nov),
+-- reads -0.03 points a day (overlap-adjusted t -0.17): a few weekly
+-- decisions, two arms, opposite answers. Nothing is proven.
 -- MEASURE: edge = a name's forward price return minus the day's market
 -- median (v_forward_universe, 1W and 2W). Per arm, horizon and day, on days
 -- when the news moved at least one name: the mean edge of the list
 -- (CHAMPION), of the news version (NEWS_OVERLAY), of the names moved out and
 -- of the names brought in.
+-- MISSING OUTCOMES (Codex P2 on #1030): the lists are the ones chosen that
+-- day, whatever happened next. A day is read only once it is final - the
+-- newest archived list day is at least the horizon plus the 6 days
+-- v_forward_universe waits for a price after it - so no later price can
+-- change it. A name kept on both lists with no outcome is left out of both
+-- alike; a final day counts only when EVERY name moved out and EVERY name
+-- brought in has its outcome, so the two lists are never compared on
+-- different names. Final changed days that fail this are counted in
+-- incomplete_days and enter no figure.
 -- EVIDENCE: only list days from 20 Nov 2026 (period 'forward from
 -- 2026-11-20'); earlier days are in-sample.
 -- PROMOTION RULE (fixed now), per arm and horizon: forward, at least the
@@ -31,23 +41,27 @@
 -- and two horizons are read). Even then the owner decides; nothing here
 -- changes a page, a pick or an order.
 -- COLUMNS: period, arm, horizon, line (CHAMPION / NEWS_OVERLAY / MOVED_OUT /
--- MOVED_IN / OVERLAY_MINUS_CHAMPION), names, days, news_weeks, edge_pp,
--- right_pct (share of names above the market median), t_adj
--- (OVERLAY_MINUS_CHAMPION only), first_day, last_day, reading.
+-- MOVED_IN / OVERLAY_MINUS_CHAMPION), names, days, incomplete_days,
+-- news_weeks, edge_pp, right_pct (share of names above the market median),
+-- t_adj (OVERLAY_MINUS_CHAMPION only), first_day, last_day, reading.
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_trial_news_overlay`
 OPTIONS (description = "TFB news trial (fixed 19 Nov 2026): the news version of the investable list against the list itself, per arm and horizon - forward evidence from 20 Nov 2026 with an overlap-adjusted t and a fixed promotion rule")
 AS
-WITH l AS (
+WITH hz AS (
+  SELECT * FROM UNNEST(ARRAY<STRUCT<horizon STRING, horizon_days INT64>>[('1W', 7), ('2W', 14)])
+),
+l AS (
   SELECT
     o.arm, o.base_date, o.symbol, o.in_champion, o.in_overlay, o.news_action, o.news_week,
-    f.horizon,
-    CASE f.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 END AS horizon_days,
+    h.horizon, h.horizon_days,
+    MAX(o.base_date) OVER () AS last_list_day,
     f.ret_pp - f.market_median_pp AS edge
   FROM `{{DS}}.v_news_overlay_list` AS o
-  JOIN `{{DS}}.v_forward_universe` AS f
-    ON f.symbol = o.symbol AND f.base_date = o.base_date
+  CROSS JOIN hz AS h
+  LEFT JOIN `{{DS}}.v_forward_universe` AS f
+    ON f.symbol = o.symbol AND f.base_date = o.base_date AND f.horizon = h.horizon
 ),
 daily AS (
   SELECT
@@ -55,36 +69,48 @@ daily AS (
     arm, horizon, base_date,
     MIN(horizon_days) AS horizon_days,
     MAX(news_week) AS news_week,
-    COUNTIF(in_champion) AS n_ch, SUM(IF(in_champion, edge, 0)) AS s_ch, COUNTIF(in_champion AND edge > 0) AS w_ch,
-    COUNTIF(in_overlay) AS n_ov, SUM(IF(in_overlay, edge, 0)) AS s_ov, COUNTIF(in_overlay AND edge > 0) AS w_ov,
-    COUNTIF(news_action = 'out') AS n_out, SUM(IF(news_action = 'out', edge, 0)) AS s_out,
+    DATE_ADD(base_date, INTERVAL MIN(horizon_days) + 6 DAY) <= MAX(last_list_day) AS final_day,
+    COUNTIF(in_champion AND edge IS NOT NULL) AS n_ch, SUM(IF(in_champion, edge, NULL)) AS s_ch,
+    COUNTIF(in_champion AND edge > 0) AS w_ch,
+    COUNTIF(in_overlay AND edge IS NOT NULL) AS n_ov, SUM(IF(in_overlay, edge, NULL)) AS s_ov,
+    COUNTIF(in_overlay AND edge > 0) AS w_ov,
+    COUNTIF(news_action = 'out') AS moved_out,
+    COUNTIF(news_action = 'out' AND edge IS NOT NULL) AS n_out, SUM(IF(news_action = 'out', edge, NULL)) AS s_out,
     COUNTIF(news_action = 'out' AND edge > 0) AS w_out,
-    COUNTIF(news_action = 'in') AS n_in, SUM(IF(news_action = 'in', edge, 0)) AS s_in,
+    COUNTIF(news_action = 'in') AS moved_in,
+    COUNTIF(news_action = 'in' AND edge IS NOT NULL) AS n_in, SUM(IF(news_action = 'in', edge, NULL)) AS s_in,
     COUNTIF(news_action = 'in' AND edge > 0) AS w_in
   FROM l
   GROUP BY period, arm, horizon, base_date
+),
+scored AS (
+  SELECT
+    daily.*,
+    n_out = moved_out AND n_in = moved_in AND n_ch > 0 AND n_ov > 0 AS complete
+  FROM daily
+  WHERE moved_out > 0 AND final_day
 ),
 agg AS (
   SELECT
     period, arm, horizon,
     MIN(horizon_days) AS horizon_days,
-    COUNT(*) AS days,
-    COUNT(DISTINCT news_week) AS news_weeks,
-    SUM(n_ch) AS n_ch, SUM(s_ch) AS s_ch, SUM(w_ch) AS w_ch,
-    SUM(n_ov) AS n_ov, SUM(s_ov) AS s_ov, SUM(w_ov) AS w_ov,
-    SUM(n_out) AS n_out, SUM(s_out) AS s_out, SUM(w_out) AS w_out,
-    SUM(n_in) AS n_in, SUM(s_in) AS s_in, SUM(w_in) AS w_in,
-    AVG(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dm,
-    STDDEV_SAMP(SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch)) AS dsd,
-    MIN(base_date) AS first_day,
-    MAX(base_date) AS last_day
-  FROM daily
-  WHERE n_out > 0 AND n_ch > 0 AND n_ov > 0
+    COUNTIF(complete) AS days,
+    COUNTIF(NOT complete) AS incomplete_days,
+    COUNT(DISTINCT IF(complete, news_week, NULL)) AS news_weeks,
+    SUM(IF(complete, n_ch, 0)) AS n_ch, SUM(IF(complete, s_ch, 0)) AS s_ch, SUM(IF(complete, w_ch, 0)) AS w_ch,
+    SUM(IF(complete, n_ov, 0)) AS n_ov, SUM(IF(complete, s_ov, 0)) AS s_ov, SUM(IF(complete, w_ov, 0)) AS w_ov,
+    SUM(IF(complete, n_out, 0)) AS n_out, SUM(IF(complete, s_out, 0)) AS s_out, SUM(IF(complete, w_out, 0)) AS w_out,
+    SUM(IF(complete, n_in, 0)) AS n_in, SUM(IF(complete, s_in, 0)) AS s_in, SUM(IF(complete, w_in, 0)) AS w_in,
+    AVG(IF(complete, SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch), NULL)) AS dm,
+    STDDEV_SAMP(IF(complete, SAFE_DIVIDE(s_ov, n_ov) - SAFE_DIVIDE(s_ch, n_ch), NULL)) AS dsd,
+    MIN(IF(complete, base_date, NULL)) AS first_day,
+    MAX(IF(complete, base_date, NULL)) AS last_day
+  FROM scored
   GROUP BY period, arm, horizon
 ),
 rows_ AS (
   SELECT
-    period, arm, horizon, line, days, news_weeks, first_day, last_day,
+    period, arm, horizon, line, days, incomplete_days, news_weeks, first_day, last_day,
     GREATEST(20, 2 * horizon_days) AS need,
     CASE line WHEN 'CHAMPION' THEN n_ch WHEN 'NEWS_OVERLAY' THEN n_ov WHEN 'MOVED_OUT' THEN n_out
               WHEN 'MOVED_IN' THEN n_in ELSE n_ov END AS names,
@@ -99,7 +125,7 @@ rows_ AS (
   CROSS JOIN UNNEST(['CHAMPION', 'NEWS_OVERLAY', 'MOVED_OUT', 'MOVED_IN', 'OVERLAY_MINUS_CHAMPION']) AS line
 )
 SELECT
-  period, arm, horizon, line, names, days, news_weeks,
+  period, arm, horizon, line, names, days, incomplete_days, news_weeks,
   ROUND(edge_x, 2) AS edge_pp,
   right_pct,
   ROUND(t_x, 2) AS t_adj,

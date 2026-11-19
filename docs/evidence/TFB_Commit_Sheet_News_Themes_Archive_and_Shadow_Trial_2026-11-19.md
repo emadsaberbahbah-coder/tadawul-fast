@@ -19,7 +19,7 @@ Three years of GDELT (Oct 2023 - Nov 2026) against the 11 US sector ETFs minus S
 
 - "Stale news" is the same method fed news 8 to 40 weeks old. It should not work; it scored as well as fresh news.
 - The first cut of the test had read events by event date and prices Friday to Friday. That let weekend news and next-day reports into the week. The clean version above is the one that counts.
-- On the 13 archived list days (31 Oct - 12 Nov), one week ahead: the events overlay was ahead of the list on 12 days; the all-themes overlay was behind it on 8. Three weekly decisions, two arms, opposite answers.
+- On the 13 archived list days (31 Oct - 12 Nov), one week ahead, in the test's first cut: the events overlay was ahead of the list on 12 days; the all-themes overlay was behind it on 8. On the 6 of those days that are final, the trial view reads the events overlay 0.03 points behind. A few weekly decisions, two arms, opposite answers.
 
 **Reading:** no news weight beats chance yet. So the news is built to learn and to be measured in the open, and it moves nothing.
 
@@ -42,11 +42,19 @@ Three years of GDELT (Oct 2023 - Nov 2026) against the 11 US sector ETFs minus S
 - The daily window (3 days) reads under 1 GB. The one-off history fill (`--start 2023-10-02 --max-gb 300`) reads about 240 GB once.
 
 ## S4 - Tests
-- `pytest tests/test_archive_news_themes.py` run 3 times: 11 passed. 15 of 15 mutants caught; the file restored byte-identical.
-- `python3 tests/test_bq_views.py` run 3 times: **PASS 37/37**. 18 of 18 SQL mutants caught by `case_v37` (the hash pins catch them too).
+- `pytest tests/test_archive_news_themes.py` run 3 times: 11 passed. 16 of 16 mutants caught; the file restored byte-identical.
+- `python3 tests/test_bq_views.py` run 3 times: **PASS 37/37**. 23 of 23 SQL mutants caught by `case_v37` (the hash pins catch them too).
 - Related files together (views, both archive scripts, manifest pins, CI verdict, runner pins, trial rules): 174 passed, 13 skipped.
 - `python3 scripts/audit_repository_workflows.py`: `errors=0 warnings=0`.
-- **Live check, read-only, 19 Nov:** the five view bodies were run in BigQuery as one query, with the table replaced by the loader's own events SELECT over three years. They returned 162 weeks (153 usable), the tilt of each week, today's shadow list, and the trial rows. In-sample, events arm, 1W: list -0.42, news version -0.14, mean daily difference +0.45, overlap-adjusted t 0.69.
+- **Live check, read-only, 19 Nov:** the five view bodies were run in BigQuery as one query, with the table replaced by the loader's own events SELECT over three years. They returned 162 weeks (153 usable), the tilt of each week, today's shadow list, and the trial rows. In-sample, events arm, 1W, on the 6 final list days (31 Oct - 6 Nov): list -0.87, news version -0.90, mean daily difference -0.03, overlap-adjusted t -0.17; one final day left out as incomplete.
+
+## S6 - Codex review on #1030 (P2, verified and fixed)
+**Trial days were scored on whatever outcomes existed.** The inner join dropped a name without a forward outcome from one list only, so a day could compare the full list with a news version missing its replacement. Verified on the first live check: 169 names in against 168 out. Now:
+- the join is a LEFT JOIN per horizon, so a missing outcome is seen;
+- a day is read only once it is final (the newest list day is at least the horizon plus 6 days later), so no later price changes it;
+- a final day counts only when every name moved out and every name brought in has its outcome; otherwise it is counted in `incomplete_days` and enters no figure;
+- a name kept on both lists with no outcome is left out of both alike.
+The live re-check returned balanced lists (673 names each, 21 in, 21 out).
 
 ## S5 - Deploy (order matters: the views need the table)
 1. Merge.
