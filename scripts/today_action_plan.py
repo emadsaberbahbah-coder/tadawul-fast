@@ -4,7 +4,17 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.7.0 (2026-11-17)
+v1.7.1 (2026-11-20)
+  1.7.1: [ALIGN-TEXT] THE HOLDINGS ALIGNMENT LINE NAMES THE OTHER PAGES' OWN READINGS (owner, 20 Nov 2026 01:21 Riyadh:
+         "Please check if there is any room for improvement let's do that"). The workbook of 20 Nov 00:42 read, under
+         HOLDINGS ON THE OTHER PAGES, "No holding has another exit reading on a portfolio page that was read", while
+         the ONE DECISION PER STOCK table of the same page, and Final_Decisions, listed "Analysis differs on
+         Portfolio_Decision_v2" for DDI.US, GLPI.US, IBOC.US and SUPN.US (its own trailing rule read SELL NOW). Both
+         were right about the decision - HOLD by the Exit Plan, the v2 rule is analysis since 1.6.0 - but the line
+         said the readings did not exist. When a holding's final row carries another page's own reading, the line now
+         says no page shows another decision and names each such holding with that page's reading, as analysis; the
+         stop of record and the broker stop stand. Without such a row the line is the 1.7.0 one, word for word.
+         Display only: no decision, step, tile, tab or archive row changes.
   1.7.0: THE DECISION, ITS CONTROL STATUS AND ITS ORDER STATUS ARE THREE THINGS (review of 16 Nov; owner, 17 Nov
          00:10: "if you need to make any update or revised please do that"). Read on the 16 Nov 23:42 Riyadh run:
            - a holding's final row read HOLD with "Verify ... plan quantity 14 differs from broker quantity 15" and
@@ -233,7 +243,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -943,6 +953,19 @@ def _differs(dec: str, held: bool, h: Optional[Dict[str, Any]], views: Sequence[
             stop = h.get("stop")
             if y.get("verb") == "RAISE STOP" and y.get("level") and stop and abs(y["level"] - stop) / stop * 100.0 > tol_pct:
                 out.append(page + " (stop %s)" % fmt(y["level"]))
+    return out
+
+
+def analysis_readings(final: Sequence[Dict[str, Any]]) -> List[str]:
+    """1.7.1 [ALIGN-TEXT] PURE: '<symbol> (<page>: <its own reading>)' for each held stock whose final row carries
+    another page's own reading (its "Analysis differs on"), in the order of the final rows; [] when none."""
+    out: List[str] = []
+    for r in final or []:
+        if not r.get("held") or not r.get("differs"):
+            continue
+        pages = [text(p).split(" (")[0] for p in r["differs"]]
+        said = ["%s: %s" % (p, text(w)) for p, w, _ in r.get("views") or [] if p in pages and text(w)]
+        out.append("%s (%s)" % (r["symbol"], "; ".join(said) or ", ".join(r["differs"])))
     return out
 
 
@@ -1690,8 +1713,15 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
                            ["cell_b", "cell", "", "cell", "", "cell", "", "", {"hard": "bad", "soft": "warn"}[a["level"]]],
                            [(1, 3), (3, 5), (5, 8), (8, WIDTH)])
             else:
-                pg.add(["", "No holding has another exit reading on a portfolio page that was read. A trim to the "
-                            "position cap is a control exception, listed under the checks."], ["", "msg"], [(1, WIDTH)])
+                own = analysis_readings(d.get("final") or [])             # 1.7.1 [ALIGN-TEXT]
+                if own:
+                    pg.add(["", "No portfolio page shows another decision. Their own exit rules read differently on %d "
+                                "holding(s), as analysis only: %s. The Exit Plan's stop of record and the broker stop "
+                                "stand. A trim to the position cap is a control exception, listed under the checks."
+                            % (len(own), "; ".join(own))], ["", "msg"], [(1, WIDTH)])
+                else:
+                    pg.add(["", "No holding has another exit reading on a portfolio page that was read. A trim to the "
+                                "position cap is a control exception, listed under the checks."], ["", "msg"], [(1, WIDTH)])
 
     # ---- B. holdings
     pg.add(height=10)
