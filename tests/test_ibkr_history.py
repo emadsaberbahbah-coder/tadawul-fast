@@ -454,3 +454,16 @@ def test_a_drive_read_that_fails_is_a_failed_run_and_no_file_is_not(monkeypatch,
     assert ih.run_once(False, book=book, now=NOW, found=denied) == 2 and book.tabs == {}
     assert "ERROR: Drive list answered HTTP 403; nothing written" in capsys.readouterr().out
     assert ih.run_once(False, book=book, now=NOW, found=empty) == 0
+
+
+def test_the_archive_keeps_subsecond_times_so_the_order_survives_a_round_trip():
+    """Codex P2 on #1041: fills within one second must keep their order after _IBKR_Fills is written and read back."""
+    seq = [trade("b", "SSS", "BUY", 10, "2026-09-01T14:00:00.100Z"),
+           trade("d", "SSS", "SELL", 10, "2026-09-01T14:00:00.200Z", realized=5.0),
+           trade("c", "SSS", "BUY", 10, "2026-09-01T14:00:00.300Z"),
+           trade("a", "SSS", "SELL", 10, "2026-09-01T14:00:00.400Z", realized=7.0)]
+    fresh = ih.round_trips(_fills(seq))
+    back = ih.read_fills([ih.FILL_HEAD] + [ih.fill_row(f) for f in _fills(seq)])
+    assert [t["realized"] for t in ih.round_trips(back)] == [t["realized"] for t in fresh] == [5.0, 7.0]
+    assert ih.fill_row(_fills(seq)[0])[1] == "2026-09-01T14:00:00.100000Z"
+    assert ih.stamp_utc(dt.datetime(2026, 9, 1, 17, 0, tzinfo=dt.timezone(dt.timedelta(hours=3)))) == "2026-09-01T14:00:00Z"

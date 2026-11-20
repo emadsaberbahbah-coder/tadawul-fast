@@ -330,8 +330,14 @@ def chain_nav(existing: Sequence[Tuple[_dt.date, float]], series: Sequence[Tuple
     return sorted(old.items()), "kept (IBKR's series shares no day with the tab)"
 
 
+def stamp_utc(t: _dt.datetime) -> str:
+    """A fill's time in UTC with its full precision (microseconds kept when there are any), as fill() reads it back."""
+    t = t.astimezone(UTC)
+    return t.strftime("%Y-%m-%dT%H:%M:%S") + (".%06d" % t.microsecond if t.microsecond else "") + "Z"
+
+
 def fill_row(f: Dict[str, Any]) -> List[Any]:
-    return [f["trade_id"], f["time"].strftime("%Y-%m-%dT%H:%M:%SZ"), f["symbol"], f["name"], f["ccy"], f["sec_type"],
+    return [f["trade_id"], stamp_utc(f["time"]), f["symbol"], f["name"], f["ccy"], f["sec_type"],
             f["side"], f["size"], f["price"], f["order_type"], round(f["commission"], 6), round(f["realized"], 6),
             f["order_id"]]
 
