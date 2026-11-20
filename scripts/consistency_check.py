@@ -2,7 +2,17 @@
 """
 scripts/consistency_check.py - TFB cross-page consistency check
 ===============================================================
-VERSION 1.4.0 (2026-11-20) - first written 2026-11-11 (1.0.0)
+VERSION 1.5.0 (2026-11-21) - first written 2026-11-11 (1.0.0)
+
+1.5.0: C15 READS THE TABS THE PAGE ACTUALLY USES (owner, 20 Nov 23:34 Riyadh:
+"Keep review the file for coming 3 hours and give me next update and
+improvements"). scripts/ibkr_history.py 1.0.0 now writes _IBKR_NAV_History and
+_IBKR_Trades from IBKR's own figures and stamps _IBKR_Trades with an as_of in
+H:I. C15 reads that as_of (a record with rows and no as_of is a hand-filled
+snapshot of unknown age: STALE). _IBKR_Account is read only while no IBKR
+capture is read: with a capture, Portfolio_Decision_v2 takes the account and
+the orders from the capture, so the account tab's age no longer says anything
+about the page. Every other check is the 1.4.0 one.
 
 1.4.0: THE BROKER, THE LEARNING GATE AND THE BROKER TABS (owner, 20 Nov 2026
 22:40 Riyadh, in Arabic: "a full review of the file against the market ... the
@@ -61,7 +71,7 @@ and the pages they come from. It changes no other page and decides nothing.
   C8 cash          Portfolio_Decision cash vs the main page's cash panel
   C13 broker       the ledger's shares vs the newest IBKR capture (1.4.0)
   C14 S-1 gate     the Evidence Board's copy of the S-1 gate vs S1_Gate (1.4.0)
-  C15 broker tabs  the age of _IBKR_NAV_History and _IBKR_Account (1.4.0)
+  C15 broker tabs  the age of _IBKR_NAV_History and _IBKR_Trades (1.4.0, 1.5.0)
   C9 stops         Portfolio_Decision stop vs the Exit Plan's stop per holding
   C10 actions      Portfolio_Decision action vs the Exit Plan's action
 
@@ -129,7 +139,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -359,28 +369,41 @@ def gate_check(g: Dict[str, List[List[Any]]]) -> Optional[List[str]]:
     return row("C14 S-1 gate", "MATCH", "the Evidence Board shows the gate's own reading: %s" % a, a, b, pages)
 
 
-def broker_tabs_check(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float]) -> Optional[List[str]]:
+def broker_tabs_check(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float],
+                      cap: Optional[Dict[str, Any]] = None) -> Optional[List[str]]:
     """1.4.0 C15: the age of the broker tabs Portfolio_Decision_v2 reads the account's return and trade record from
-    (None: no date on either tab)."""
-    pages = "_IBKR_NAV_History / _IBKR_Account / Portfolio_Decision_v2"
-    found: List[Tuple[str, _dt.date]] = []
+    (None: no date on any of them). 1.5.0: _IBKR_Trades by the as_of ibkr_history writes in H:I (a record with rows
+    and no as_of is a hand-filled snapshot of unknown age); _IBKR_Account only while no IBKR capture is read - with
+    one, the page takes the account and the orders from the capture."""
+    pages = "_IBKR_NAV_History / _IBKR_Trades / _IBKR_Account / Portfolio_Decision_v2"
+    found: List[Tuple[str, Optional[_dt.date]]] = []
     nav = [_DATE.search(text(cell(r, 0))) for r in g.get("_IBKR_NAV_History") or []]
     days = sorted(_dt.date.fromisoformat(m.group(1)) for m in nav if m)
     if days:
         found.append(("_IBKR_NAV_History ends %s" % days[-1].isoformat(), days[-1]))
-    for r in g.get("_IBKR_Account") or []:
-        if text(cell(r, 0)).lower() == "as_of":
-            m = _DATE.search(text(cell(r, 1)))
-            if m:
-                d = _dt.date.fromisoformat(m.group(1))
-                found.append(("_IBKR_Account as of %s" % d.isoformat(), d))
+    rec = g.get("_IBKR_Trades") or []
+    stamp = [_DATE.search(text(cell(r, 8))) for r in rec if text(cell(r, 7)).lower() == "as_of"]
+    if stamp and stamp[0]:
+        d = _dt.date.fromisoformat(stamp[0].group(1))
+        found.append(("_IBKR_Trades as of %s" % d.isoformat(), d))
+    elif any(text(cell(r, 0)) for r in rec[1:]):
+        found.append(("_IBKR_Trades has no as_of (a hand-filled snapshot)", None))
+    if not (cap or {}).get("ok"):
+        for r in g.get("_IBKR_Account") or []:
+            if text(cell(r, 0)).lower() == "as_of":
+                m = _DATE.search(text(cell(r, 1)))
+                if m:
+                    d = _dt.date.fromisoformat(m.group(1))
+                    found.append(("_IBKR_Account as of %s" % d.isoformat(), d))
     if not found:
         return None
-    old = [(t, (today - d).days) for t, d in found if (today - d).days > k["ibkr_tab_days"]]
+    old = [(t, None if d is None else (today - d).days) for t, d in found
+           if d is None or (today - d).days > k["ibkr_tab_days"]]
     if old:
         return row("C15 broker tabs", "STALE", "%s - Portfolio_Decision_v2 reads the account's return and trade record "
                    "from these tabs, so those figures are not the broker's today (limit %d days)" % (
-                       "; ".join("%s (%d days)" % (t, n) for t, n in old), k["ibkr_tab_days"]), pages=pages)
+                       "; ".join(t if n is None else "%s (%d days)" % (t, n) for t, n in old), k["ibkr_tab_days"]),
+                   pages=pages)
     return row("C15 broker tabs", "MATCH", "; ".join(t for t, _ in found) + " - within %d days" % k["ibkr_tab_days"],
                pages=pages)
 
@@ -388,6 +411,7 @@ def broker_tabs_check(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[st
 def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float],
                now: Optional[_dt.datetime] = None, cap: Optional[Dict[str, Any]] = None) -> List[List[str]]:
     out: List[List[str]] = []
+    capture = cap                                                   # 1.5.0: C12 reuses the name `cap` for its own cap
     t10, pd = g.get("Top_10_Investments") or [], g.get("Portfolio_Decision") or []
     seats = table_rows(t10, ("Rank", "Symbol", "Ticket SAR", "Shares"), "Symbol")
     tickets = {text(s["Symbol"]).upper(): s for s in seats if (num(s.get("Ticket SAR")) or 0) > 0
@@ -571,7 +595,7 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
     gate = gate_check(g)                                            # 1.4.0 (None: neither page read)
     if gate:
         out.append(gate)
-    tabs = broker_tabs_check(g, today, k)                           # 1.4.0 (None: no date on either tab)
+    tabs = broker_tabs_check(g, today, k, capture)                  # 1.4.0 (None: no date on any tab)
     if tabs:
         out.append(tabs)
     if now is not None:
@@ -597,8 +621,9 @@ CONTROLS = {
     "C13": "The share count is the broker's. A holding the broker no longer holds is recorded as sold in the ledger; "
            "a position the ledger lacks is added.",
     "C14": "S1_Gate rules. A page that copies the gate shows its newest reading; an older copy is rebuilt.",
-    "C15": "The account's return and trade record are the broker's. A broker tab older than the limit is refreshed, or "
-           "the figures read from it are not used.",
+    "C15": "The account's return and trade record are the broker's. A broker tab older than the limit is refreshed "
+           "(the IBKR History workflow writes them from the daily IBKR history file), or the figures read from it are "
+           "not used.",
 }
 
 LOG_DETAIL = ("C1", "C2", "C3", "C11", "C14", "C15")                             # names and times only; nothing of the account
@@ -631,7 +656,8 @@ RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:Z60", "Top_
           "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Daily_Plan": "A1:B4", "Exit_Plan": "A1:B4", "Calendar_Events": "A1:J4000",
           "Dividend_Events": "A1:J4000",
           # 1.4.0: the S-1 gate and its copy, and the broker tabs
-          "S1_Gate": "A1:D3", "Evidence_Board": "A1:E120", "_IBKR_NAV_History": "A1:B800", "_IBKR_Account": "A1:B12"}
+          "S1_Gate": "A1:D3", "Evidence_Board": "A1:E120", "_IBKR_NAV_History": "A1:B800", "_IBKR_Account": "A1:B12",
+          "_IBKR_Trades": "A1:I6"}
 
 
 def broker_capture(now: _dt.datetime) -> Dict[str, Any]:

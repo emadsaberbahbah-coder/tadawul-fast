@@ -1,0 +1,103 @@
+# =============================================================================
+# 🏦 IBKR History - the broker's own return and trade record on the v2 page
+# -----------------------------------------------------------------------------
+# VERSION 1.0.0 (2026-11-21)
+#
+# WHY: owner, 20 Nov 2026 22:40 Riyadh (in Arabic: a full review of the file
+# against the market, the differences between the pages and the market) and
+# 23:34 ("Keep review the file for coming 3 hours and give me next update and
+# improvements"). Portfolio_Decision_v2 read the account's return and its
+# closed-trade record from _IBKR_NAV_History and _IBKR_Trades, filled by hand
+# on 17 Oct and never since (consistency_check C15: STALE). On 20 Nov the page
+# showed -0.1% since 11 Aug and 3 wins in 15; IBKR: -4.7% and 5 wins in 22.
+#
+# WHAT: scripts/ibkr_history.py reads the newest TFB_IBKR_History_*.json files
+# (a daily read-only scheduled task copies IBKR's performance series and trades
+# into the capture folder at 00:20 Riyadh) and writes _IBKR_NAV_History,
+# _IBKR_Fills and _IBKR_Trades. Without a history file it writes nothing and
+# says so (exit 0).
+#
+# WHEN: 00:45 Riyadh Tuesday to Saturday (21:45 UTC Monday to Friday), before
+# the 00:50 Consistency Check, and 09:45 Riyadh Tuesday to Saturday (06:45 UTC)
+# to catch a file that came late.
+#
+# WRITES: only its three tabs. Drive: read-only. Never calls the broker. The
+# log carries counts and dates only. Reporting only: no decision, score, list
+# or order changes.
+# Rollback: repository variable TFB_IBKR_HISTORY=off.
+# =============================================================================
+name: 🏦 IBKR History
+
+on:
+  schedule:
+    - cron: "45 21 * * 1-5"         # 00:45 Riyadh, Tuesday to Saturday
+    - cron: "45 6 * * 2-6"          # 09:45 Riyadh, Tuesday to Saturday
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and print counts only (write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tfb-ibkr-history
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  history:
+    name: 🏦 Write the broker's return and trade record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 google-auth requests
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 🏦 Write the IBKR history tabs
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_IBKR_HISTORY: ${{ vars.TFB_IBKR_HISTORY || 'on' }}
+          TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
+          TFB_IBKR_NAV_FROM: ${{ vars.TFB_IBKR_NAV_FROM || '2026-08-11' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ARGS=()
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          python scripts/ibkr_history.py "${ARGS[@]}"

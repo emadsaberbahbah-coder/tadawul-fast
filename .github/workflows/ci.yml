@@ -2,10 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.89 (2026-11-19) -- TRIAL LABELS
+# VERSION 1.1.90 (2026-11-21) -- IBKR HISTORY
 #
-# (1.1.88, 2026-11-19: NEWS BOARD; 1.1.87, 2026-11-19: NEWS THEMES ARCHIVE)
+# (1.1.89, 2026-11-19: TRIAL LABELS; 1.1.88, 2026-11-19: NEWS BOARD)
 #
+# v1.1.90: run tests/test_ibkr_history.py (scripts/ibkr_history.py v1.0.0:
+# _IBKR_NAV_History, _IBKR_Fills and _IBKR_Trades from the daily read-only IBKR
+# history file, for Portfolio_Decision_v2's return and trade record; workflow
+# ibkr_history.yml) in the blocking lean lane.
 # v1.1.89: run tests/test_trial_labels.py (scripts/trial_labels.py v1.0.0: the
 # Trial_Labels tab - what trial C-2 and the news overlay would do with each
 # stock, observe-only; workflow trial_labels.yml) in the blocking lean lane.
@@ -1253,6 +1257,7 @@ jobs:
             tests/test_today_action_plan.py \
             tests/test_plan_archive.py \
             tests/test_ibkr_capture.py \
+            tests/test_ibkr_history.py \
             tests/test_exit_plan.py \
             tests/test_holding_read.py \
             tests/test_consistency_check.py \
