@@ -1700,6 +1700,34 @@ def test_t16_a_page_that_shows_the_final_decision_is_never_a_step_or_a_disagreem
     assert "SUPN.US" not in tiles_of(page)["PAGES"][1]
     _, rows = _final(book)
     assert rows["SUPN.US"]["Decision"] == "HOLD" and rows["SUPN.US"]["Analysis differs on"] == "Portfolio_Decision_v2"
+    # 1.7.1 [ALIGN-TEXT]: the alignment line names the v2 readings as analysis instead of saying there are none
+    flat = [" | ".join(str(c) for c in r if c != "") for r in page]
+    i = flat.index("HOLDINGS ON THE OTHER PAGES - the Exit Plan is the exit rule of record")
+    line = flat[i + 3]
+    assert line.startswith("No portfolio page shows another decision. Their own exit rules read differently on ")
+    assert "SUPN.US (Portfolio_Decision_v2: " in line and line.endswith("listed under the checks.")
+    assert "No holding has another exit reading" not in " ".join(flat)
+    assert rows["SUPN.US"]["Other pages' own rules"].count("Portfolio_Decision_v2: ") == 1
+
+
+def test_t18_analysis_readings_names_each_held_stock_with_its_page_reading():
+    """1.7.1 [ALIGN-TEXT], from the 20 Nov 00:42 rows: four holdings HOLD by the Exit Plan, v2's own rule SELL NOW."""
+    v2 = "Portfolio_Decision_v2"
+    final = [
+        {"symbol": "AX.US", "held": True, "differs": [], "views": [("Portfolio_Decision", "HOLD", "HOLD")]},
+        {"symbol": "GLPI.US", "held": True, "differs": [v2],
+         "views": [("Portfolio_Decision", "HOLD", "HOLD"), (v2, "SELL NOW \u2014 stop 38.31 hit", "SELL")]},
+        {"symbol": "DDI.US", "held": True, "differs": [v2 + " (stop 15.29)"],
+         "views": [(v2, "RAISE STOP 15.22 \u2192 15.29", "HOLD")]},
+        {"symbol": "EFC.US", "held": False, "differs": ["Top_10_Investments"],
+         "views": [("Top_10_Investments", "Research", "WATCH")]},
+        {"symbol": "XYZ.US", "held": True, "differs": ["Exit_Plan_v9"], "views": []},
+    ]
+    assert tap.analysis_readings(final) == [
+        "GLPI.US (Portfolio_Decision_v2: SELL NOW \u2014 stop 38.31 hit)",
+        "DDI.US (Portfolio_Decision_v2: RAISE STOP 15.22 \u2192 15.29)",
+        "XYZ.US (Exit_Plan_v9)"]                                         # no reading to quote: the page is named
+    assert tap.analysis_readings([]) == [] and tap.analysis_readings(None) == []
 
 
 # ----------------------------------------------------------------------------- T17 (1.7.0) control, order, day orders
@@ -1859,7 +1887,7 @@ def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeyp
         assert tap.day_order_on() is want, value
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
-    assert tap.__version__ == "1.7.0"
+    assert tap.__version__ == "1.7.1"
 
 
 def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):

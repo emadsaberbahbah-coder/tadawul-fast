@@ -479,6 +479,19 @@ def test_h10_workflow_manifest_ci():
     wf = yaml.safe_load((ROOT / ".github/workflows/holding_read.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
     assert "workflow_dispatch" in on and len(on["schedule"]) >= 1
+    # workflow 1.1.0: it also follows each successful main-branch Exit Plan run, and reads only after a close
+    assert on["workflow_run"] == {"workflows": ["\U0001F3AF Exit Plan"], "types": ["completed"]}
+    ep = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
+    assert ep["name"] == "\U0001F3AF Exit Plan"                               # the name the trigger follows
+    job = wf["jobs"]["holding_read"]
+    for frag in ("github.event_name != 'workflow_run'", "github.event.workflow_run.conclusion == 'success'",
+                 "github.event.workflow_run.head_branch == 'main'",
+                 "github.event.workflow_run.head_repository.full_name == github.repository",
+                 'contains(fromJSON(\'["schedule", "workflow_dispatch"]\'), github.event.workflow_run.event)'):
+        assert frag in job["if"], frag
+    win = job["steps"][0]
+    assert win["id"] == "window" and 'TZ=Asia/Riyadh date +%H' in win["run"] and '" 23 00 01 02 03 15 16 "' in win["run"]
+    assert all(s.get("if") == "steps.window.outputs.go == 'true'" for s in job["steps"][1:])
     step = [s for s in wf["jobs"]["holding_read"]["steps"] if "holding_read.py" in str(s.get("run", ""))][0]
     env = step["env"]
     assert env["TFB_HOLDING_READ"] == "${{ vars.TFB_HOLDING_READ || 'on' }}"

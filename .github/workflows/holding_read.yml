@@ -1,5 +1,20 @@
 name: 📰 Holding Read
 
+# VERSION 1.1.0 (2026-11-20) -- IT ALSO RUNS RIGHT AFTER THE EXIT PLAN, IN THE HOURS AFTER A CLOSE
+# WHY (owner, 20 Nov 01:21 Riyadh: "Please check if there is any room for
+# improvement let's do that"): on 19 Nov the S&P 500 fell 2.0% and the workbook
+# of 20 Nov 00:42 still read "newest session 2026-11-18" on Portfolio_Decision.
+# GitHub had started the 15:40 slot at 23:58 Riyadh (eight hours late, before
+# the US close) and had not started the 00:40 slot by 01:23. The Exit Plan, which
+# the Apps Script dispatcher starts every hour, had already read the 19 Nov bars
+# at 00:41. WHAT: a run of this workflow also follows each successful Exit Plan
+# run of the main branch, and reads only in the Riyadh hours after a close:
+# 23:00-03:59 (the US close is 00:00 in winter, 23:00 in summer) and 15:00-16:59
+# (the Tadawul close); otherwise it ends at once. The four schedules stay as the
+# fallback. Each run reads the last completed session, so a second run writes
+# the same rows. Rollback: remove the workflow_run block (or
+# TFB_HOLDING_READ=off, which stops every run).
+#
 # VERSION 1.0.0 (2026-11-18) -- WHAT MOVED EACH HOLDING, AND THE NEXT-SESSION READ
 # WHY (owner, 18 Nov 09:36 Riyadh): after two losing sessions no page said what
 # each holding's fall followed (its own news, its group or the market), and no
@@ -20,6 +35,9 @@ on:
     - cron: "10 2 * * *"            # 05:10 Riyadh
     - cron: "10 5 * * *"            # 08:10 Riyadh: the morning read, with news since the close
     - cron: "40 12 * * 0-4"         # 15:40 Riyadh Sun-Thu: after the Tadawul close
+  workflow_run:                     # 1.1.0: right after the hourly Exit Plan, in the hours after a close
+    workflows: ["🎯 Exit Plan"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -47,21 +65,48 @@ env:
 jobs:
   holding_read:
     name: 📰 Read each holding's last session
+    if: >-
+      ${{ github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event.workflow_run.event)
+      ) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: 🕒 After a close?
+        id: window
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          H="$(TZ=Asia/Riyadh date +%H)"
+          if [[ "$EVENT_NAME" != "workflow_run" ]]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          elif [[ " 23 00 01 02 03 15 16 " == *" $H "* ]]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "Riyadh hour $H: after a close - reading the last session"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "Riyadh hour $H: not after a close - nothing to read (the scheduled runs cover the rest)"
+          fi
+
       - name: ⬇️ Checkout
+        if: steps.window.outputs.go == 'true'
         uses: actions/checkout@v6
 
       - name: 🐍 Set up Python
+        if: steps.window.outputs.go == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Install dependencies
+        if: steps.window.outputs.go == 'true'
         run: python -m pip install --quiet gspread==6.2.1 google-auth requests
 
       - name: 🔎 Resolve spreadsheet id
+        if: steps.window.outputs.go == 'true'
         id: sheet
         env:
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -74,6 +119,7 @@ jobs:
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
 
       - name: 📰 Run the holding read
+        if: steps.window.outputs.go == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
