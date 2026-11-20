@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Release one audited decision-feed cell from the final veto to EXECUTABLE.
 
+VERSION 1.4.2 (2026-11-20) -- A QUOTA ANSWER IS RETRIED IN THE NEXT QUOTA MINUTE.
+Run 44812868616 (20 Nov 20:37 UTC) ended exit 3 "layout_fault" on HTTP 429
+"Read requests per minute per user": the one 1.4.1 retry came 5 s later, inside
+the same per-minute window, and met the same answer. The retry wait is now
+read_retry_wait(exc): max(read_retry_seconds(), 65) for the quota answer
+(scripts/sheets_quota.WAITS[0]), read_retry_seconds() for every other transient
+fault as before, in both the release read and the writer-start supersede read.
+Still exactly one retry; still never a layout or auth fault.
+No gate, rule, value or slot changes. The job's 30-minute limit holds.
+
 VERSION 1.4.1 (2026-11-18) -- ONE TRANSIENT READ FAULT IS RETRIED ONCE. The
 release run of 18 Nov 00:18 Riyadh ended layout_fault / layout_or_read_failed
 on a single Sheets read timeout of the key block; the next scheduled run read
@@ -316,7 +326,7 @@ from core.secret_redaction import safe_error_text  # noqa: E402
 from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 
-SCRIPT_VERSION = "1.4.1"
+SCRIPT_VERSION = "1.4.2"
 # v1.4.1: one retry of the first key-block read on a transient fault.
 READ_RETRY_ENV = "TFB_RELEASE_READ_RETRY_S"
 READ_RETRY_DEFAULT_S = 5.0
@@ -936,6 +946,23 @@ def read_retry_seconds() -> float:
     return min(30.0, max(0.0, v))
 
 
+QUOTA_RETRY_MIN_S = 65.0   # v1.4.2: the Sheets read quota is counted per minute
+
+
+def _is_quota_fault(exc: BaseException) -> bool:
+    """PURE (v1.4.2). The Sheets per-minute quota answer (HTTP 429)."""
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    text = "%s %s" % (type(exc).__name__, exc)
+    return (str(status) == "429" or "HttpError 429" in text or "[429]" in text
+            or "Quota exceeded" in text or "RESOURCE_EXHAUSTED" in text)
+
+
+def read_retry_wait(exc: BaseException) -> float:
+    """PURE (v1.4.2). Seconds before the one retry: a quota answer waits into the next minute."""
+    base = read_retry_seconds()
+    return max(base, QUOTA_RETRY_MIN_S) if _is_quota_fault(exc) else base
+
+
 def is_transient_read_fault(exc: BaseException) -> bool:
     """PURE (v1.4.1). A timeout, a dropped connection, HTTP 408/429/5xx. Never a
     layout fault (ValueError, KeyError, ...) and never an auth/permission error."""
@@ -1022,7 +1049,7 @@ async def run(sheet_id: str, source_run_id: Any, *, mode: str = "release", reade
             if not is_transient_read_fault(first):
                 raise
             out["read_retried"] = safe_error_text(first)
-            await (settle_sleep or asyncio.sleep)(read_retry_seconds())
+            await (settle_sleep or asyncio.sleep)(read_retry_wait(first))
             grid = service.spreadsheets().values().get(
                 spreadsheetId=sheet_id, range=fin.KEY_RANGE,
                 valueRenderOption="UNFORMATTED_VALUE").execute().get("values")
@@ -1303,7 +1330,7 @@ def supersede(sheet_id: str, current_run_id: Any, *, attempt: Any = None, servic
             if not is_transient_read_fault(first):
                 raise
             out["read_retried"] = safe_error_text(first)
-            (read_sleep or time.sleep)(read_retry_seconds())
+            (read_sleep or time.sleep)(read_retry_wait(first))
             slot, prior = _read_feed(service, sheet_id, fin)
     except Exception as exc:  # noqa: BLE001 - layout or transport fault: fail closed
         out["fatal"] = safe_error_text(exc)

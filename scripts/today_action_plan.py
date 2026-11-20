@@ -4,7 +4,13 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.8.0 (2026-11-20)
+v1.8.1 (2026-11-20)
+  1.8.1: A PASSING GOOGLE SERVER FAULT IS WAITED OUT LIKE THE QUOTA. The 20 Nov 20:22 UTC run (44810684039) stopped
+         with "APIError [503]: The service is currently unavailable.; nothing written" and the page kept its older
+         content; the next scheduled run was green. HTTP 500/502/503/504 from the Sheets API now take the same
+         20 / 40 / 65 s waits and TFB_TAP_RETRIES budget as the quota answer (scripts/sheets_quota.py 1.1.0
+         is_server_transient). Every other error (a 4xx, a layout or a value fault) still stops the run at once.
+         Nothing on the page, no rule and no number changes.
   1.8.0: A HOLDING THE BROKER SOLD TODAY, AND A HOLDING UNDER A TENDER OFFER (owner, 20 Nov 2026 22:40 Riyadh, in
          Arabic: "a full review of the file against the market ... and if something is missing we can develop it").
          Read on the 22:22 run of 20 Nov:
@@ -269,7 +275,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -308,6 +314,15 @@ def quota_error(e: BaseException) -> bool:
     return code == 429 or "[429]" in s or "Quota exceeded" in s or "RESOURCE_EXHAUSTED" in s
 
 
+def server_transient(e: BaseException) -> bool:
+    """1.8.1: True for a passing Sheets server fault (HTTP 500/502/503/504); never a 4xx."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if str(code) in ("500", "502", "503", "504"):
+        return True
+    s = "%s %s" % (type(e).__name__, e)
+    return any(("[%s]:" % c) in s for c in ("500", "502", "503", "504"))
+
+
 def with_retry(fn: Callable[[], Any], retries: int, sleep: Callable[[float], None], what: str) -> Any:
     """Run fn; after a quota answer wait and run it again, at most `retries` more times."""
     n = 0
@@ -315,11 +330,13 @@ def with_retry(fn: Callable[[], Any], retries: int, sleep: Callable[[float], Non
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 - re-raised unless it is the quota answer and tries remain
-            if n >= retries or not quota_error(e):
+            quota = quota_error(e)
+            if n >= retries or not (quota or server_transient(e)):
                 raise
             wait = QUOTA_WAITS[min(n, len(QUOTA_WAITS) - 1)]
             n += 1
-            _out("Sheets quota reached while %s: waiting %d s, then try %d of %d" % (what, wait, n, retries))
+            _out("Sheets %s while %s: waiting %d s, then try %d of %d"
+                 % ("quota reached" if quota else "server fault (%s)" % type(e).__name__, what, wait, n, retries))
             sleep(wait)
 
 

@@ -2,6 +2,18 @@
 """
 scripts/sheets_quota.py - wait out the Google Sheets per-minute read quota
 ==========================================================================
+VERSION 1.1.0 (2026-11-20) - A PASSING SERVER FAULT IS NOT A LAYOUT FAULT
+On 20 Nov 2026 three scheduled runs ended red within 15 minutes of each other
+on Sheets answers that were gone a minute later: Today Action Plan (20:29 UTC,
+"APIError [503]: The service is currently unavailable"), Release Decision Feed
+(20:37 UTC, HTTP 429 "Read requests per minute per user", retried after 5 s -
+inside the same quota minute) and Full Refresh Coverage (20:36 UTC, same
+minute). New pure helper is_server_transient(e): HTTP 500/502/503/504 from
+the Sheets client ("APIError: [503]: ...") or the Google API client (HttpError 503).
+wait_for_transient(e, attempt) returns the quota wait for a 429 (unchanged:
+65, 65) and SERVER_WAITS (15, 30) for a passing server fault; anything else
+None. call() is unchanged (quota only), so no existing caller changes.
+
 VERSION 1.0.1 (2026-11-14) - THE GOOGLE API CLIENT'S 429 IS THE QUOTA TOO
 The Provider Target Coverage Alert reads through the Google API client, whose
 quota answer is "<HttpError 429 when requesting ...>" with the status on
@@ -32,10 +44,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 WAITS = (65.0, 65.0)                       # seconds; the quota is counted per minute
 RETRIES = 2
+SERVER_WAITS = (15.0, 30.0)                # seconds; 1.1.0, a passing 5xx from the Sheets API
+_SERVER_CODES = ("500", "502", "503", "504")
 
 
 def is_quota(e: BaseException) -> bool:
@@ -45,6 +59,27 @@ def is_quota(e: BaseException) -> bool:
     s = "%s %s" % (type(e).__name__, e)
     return (code == 429 or str(status) == "429" or "[429]" in s or "HttpError 429" in s or "Quota exceeded" in s
             or "RESOURCE_EXHAUSTED" in s)
+
+
+def is_server_transient(e: BaseException) -> bool:
+    """1.1.0: True for a passing Sheets server fault (HTTP 500/502/503/504); never a 4xx."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    status = getattr(getattr(e, "resp", None), "status", None)
+    if str(code) in _SERVER_CODES or str(status) in _SERVER_CODES:
+        return True
+    s = "%s %s" % (type(e).__name__, e)
+    return any(("[%s]:" % c) in s or ("HttpError %s" % c) in s for c in _SERVER_CODES)
+
+
+def wait_for_transient(e: BaseException, attempt: int) -> Optional[float]:
+    """1.1.0: seconds to wait after the `attempt`-th failed try for a quota answer or a passing
+    server fault, else None (every other error is not retried)."""
+    q = wait_for(e, attempt)
+    if q is not None:
+        return q
+    if is_server_transient(e):
+        return SERVER_WAITS[min(max(attempt, 1), len(SERVER_WAITS)) - 1]
+    return None
 
 
 def wait_for(e: BaseException, attempt: int) -> Optional[float]:

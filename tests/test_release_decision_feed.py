@@ -1399,7 +1399,39 @@ def case_n30_one_transient_read_fault_is_retried(mp, tmp_path):
     for raw, want in (("", 5.0), ("abc", 5.0), ("-3", 0.0), ("99", 30.0), ("nan", 5.0), ("2", 2.0)):
         mp.setenv(R.READ_RETRY_ENV, raw)
         assert R.read_retry_seconds() == want, raw
-    assert R.SCRIPT_VERSION == "1.4.1"
+    assert R.SCRIPT_VERSION == "1.4.2"
+
+
+def case_n31_quota_answer_is_retried_in_the_next_quota_minute(mp, tmp_path):
+    """v1.4.2 (run 44812868616, 20 Nov 2026 20:37 UTC: HTTP 429 retried 5 s later, same minute)."""
+    quota = Exception("<HttpError 429 when requesting x returned \"Quota exceeded for quota metric 'Read requests'\">")
+    quota.resp = SimpleNamespace(status=429)
+    mp.delenv(R.READ_RETRY_ENV, raising=False)
+    assert R.read_retry_wait(quota) == 65.0
+    assert R.read_retry_wait(TimeoutError("The read operation timed out")) == 5.0
+    mp.setenv(R.READ_RETRY_ENV, "0")
+    assert R.read_retry_wait(quota) == 65.0 and R.read_retry_wait(ConnectionError("x")) == 0.0
+    five = Exception("HttpError 503")
+    five.resp = SimpleNamespace(status=503)
+    assert R.read_retry_wait(five) == 0.0
+
+    class Flaky(GoogleValues):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.left = 1
+
+        def get(self, **kwargs):
+            if kwargs["range"] == final.KEY_RANGE and self.left > 0:
+                self.left -= 1
+                raise quota
+            return super().get(**kwargs)
+    ctx, _ = released(mp, tmp_path)
+    service = Flaky()
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    slept = []
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
+                         now_utc=ctx.clock["now"], read_sleep=slept.append)
+    assert result["exit_code"] == 0 and "429" in result["read_retried"] and slept == [65.0]
 
 
 def case_n29_supersede_faults_fail_closed(mp, tmp_path):
