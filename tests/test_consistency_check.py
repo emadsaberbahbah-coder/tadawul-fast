@@ -345,7 +345,7 @@ def test_k7_the_13_nov_differences():
     assert [r for r in got if r[0] == "C10 actions"][0][1] == "MATCH"
     # the page: its own count and place
     page = cc.page_rows(cc.run_checks(wb13(), today, cc.knobs(), now), "2026-11-13 11:50")
-    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.4.0" in page[1][0]
+    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.5.0" in page[1][0]
     order = [r[1] for r in page[4:]]
     assert order.index("OVER CAP") > max(i for i, s in enumerate(order) if s in ("MISMATCH", "STALE"))
     assert order.index("OVER CAP") < min(i for i, s in enumerate(order) if s in ("INFO", "MATCH"))
@@ -395,7 +395,7 @@ def test_k9_a_plan_with_no_pick_is_a_plan():
     # no row of any Kind for today: still 'not cut yet'
     c1 = by(wb(_Daily_Plan=zero[:2]), "C1 decision")[0]
     assert c1[1] == "INFO" and "no Daily Plan for 2026-11-11 yet" in c1[2]
-    assert cc.__version__ == "1.4.0"
+    assert cc.__version__ == "1.5.0"
 
 
 # ----------------------------------------------------------------------------- K10 (1.4.0)
@@ -494,3 +494,26 @@ def test_k10_the_run_reads_the_capture_and_the_four_tabs(monkeypatch, capsys):
     assert cc.broker_capture(NOW) == {"ok": False, "reason": "boom"} and calls == [NOW]
     monkeypatch.setattr(ic, "latest", lambda now, out=None: 1 / 0)
     assert cc.broker_capture(NOW) == {"ok": False, "reason": "capture not read (ZeroDivisionError)"}
+
+
+def test_k11_c15_reads_the_trade_record_stamp_and_lets_the_capture_rule_the_account():
+    """1.5.0: ibkr_history writes _IBKR_Trades with an as_of in H:I; with a capture, the page takes the account from it."""
+    today = dt.date(2026, 11, 21)
+    nav = [["date", "twr_cum_since_inception"], ["2026-08-11", 0.0109], ["2026-11-20", -0.037]]
+    stamped = [["symbol", "name", "ccy", "exit_type", "span", "realized_usd", "", "as_of", "2026-11-21 00:20 Riyadh"],
+               ["AAA", "Aaa", "USD", "stop", "12→20 Nov", -1.0, "", "source", "TFB_IBKR_History_x.json"]]
+    acct = [["key", "value"], ["as_of", "2026-10-17 18:15 Riyadh"]]
+    cap = {"ok": True, "age_h": 0.5, "positions": {}, "reason": ""}
+    got = [x for x in cc.run_checks(wb(_IBKR_NAV_History=nav, _IBKR_Trades=stamped, _IBKR_Account=acct), today,
+                                    cc.knobs(), None, cap) if x[0] == "C15 broker tabs"][0]
+    assert got[1] == "MATCH" and got[2] == ("_IBKR_NAV_History ends 2026-11-20; _IBKR_Trades as of 2026-11-21 - "
+                                            "within 7 days")
+    no_cap = [x for x in cc.run_checks(wb(_IBKR_NAV_History=nav, _IBKR_Trades=stamped, _IBKR_Account=acct), today,
+                                       cc.knobs()) if x[0] == "C15 broker tabs"][0]
+    assert no_cap[1] == "STALE" and "_IBKR_Account as of 2026-10-17 (35 days)" in no_cap[2]
+    seed = [["symbol", "name", "ccy", "exit_type", "span", "realized_usd"], ["SHG", "Shinhan", "USD", "limit TP", "x", 1.0]]
+    hand = [x for x in cc.run_checks(wb(_IBKR_NAV_History=nav, _IBKR_Trades=seed), today, cc.knobs(), None, cap)
+            if x[0] == "C15 broker tabs"][0]
+    assert hand[1] == "STALE" and "_IBKR_NAV_History" not in hand[2]
+    assert hand[2].startswith("_IBKR_Trades has no as_of (a hand-filled snapshot) - Portfolio_Decision_v2 reads")
+    assert cc.RANGES["_IBKR_Trades"] == "A1:I6" and cc.log_detail(hand) == hand[2]
