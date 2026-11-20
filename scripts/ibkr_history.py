@@ -73,7 +73,9 @@ SAFETY
     three tabs. A file that is unreadable, of another schema, dated in the
     future or whose captured_at differs from Drive's creation time by more
     than 10 minutes is not used; with no usable file nothing is written (exit
-    0 with the reason; the tabs keep what they hold). The run log carries
+    0 with the reason; the tabs keep what they hold). A Drive read that fails
+    (an error answer, a raised call, or no file downloadable) is exit 2, so a
+    lost permission shows as a failed run. The run log carries
     counts and dates only: no amount, quantity, symbol or account number.
     Reporting only: no decision, score, list or order changes.
 
@@ -238,15 +240,18 @@ def parse(body: Any, created: Optional[_dt.datetime], now: _dt.datetime, name: s
 
 
 def latest_files(now: _dt.datetime, session: Any = None, folder: Optional[str] = None) -> Dict[str, Any]:
-    """The newest usable history files of the folder, newest first. Never raises."""
-    res: Dict[str, Any] = {"ok": False, "reason": "", "files": [], "skipped": 0}
+    """The newest usable history files of the folder, newest first. Never raises. "failed" marks a read that could
+    not be made (Drive answered an error, the call raised, the folder id is malformed, or every file to read failed
+    to download): the run then exits 2. No file, or only unusable files, is not a failure (Codex P2)."""
+    res: Dict[str, Any] = {"ok": False, "failed": False, "reason": "", "files": [], "skipped": 0}
     folder = ic._env("TFB_IBKR_CAPTURE_FOLDER_ID") if folder is None else folder
     if not folder:
         res["reason"] = "capture folder not set (TFB_IBKR_CAPTURE_FOLDER_ID)"
         return res
     if not ic._FOLDER_RE.match(folder):
-        res["reason"] = "capture folder id invalid"
+        res["reason"], res["failed"] = "capture folder id invalid", True
         return res
+    errors = 0
     try:
         sess = session or ic._session()
         r = sess.get("https://www.googleapis.com/drive/v3/files", timeout=30, params={
@@ -254,7 +259,7 @@ def latest_files(now: _dt.datetime, session: Any = None, folder: Optional[str] =
             "orderBy": "createdTime desc", "pageSize": MAX_FILES * 2, "fields": "files(id,name,createdTime,size)",
             "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"})
         if r.status_code != 200:
-            res["reason"] = "Drive list answered HTTP %d" % r.status_code
+            res["reason"], res["failed"] = "Drive list answered HTTP %d" % r.status_code, True
             return res
         listed = [f for f in (r.json().get("files") or [])
                   if str(f.get("name", "")).startswith(PREFIX) and str(f.get("name", "")).lower().endswith(".json")]
@@ -266,6 +271,7 @@ def latest_files(now: _dt.datetime, session: Any = None, folder: Optional[str] =
                          params={"alt": "media", "supportsAllDrives": "true"})
             if g.status_code != 200:
                 res["skipped"] += 1
+                errors += 1
                 continue
             try:
                 body = json.loads(g.content.decode("utf-8"))
@@ -277,12 +283,15 @@ def latest_files(now: _dt.datetime, session: Any = None, folder: Optional[str] =
                 res["files"].append(p)
             else:
                 res["skipped"] += 1
-    except Exception as e:  # noqa: BLE001 - nothing is written without a file
-        res["reason"] = "history read failed (%s)" % type(e).__name__
+    except Exception as e:  # noqa: BLE001 - nothing is written without a file; the run reports the failure
+        res["reason"], res["failed"] = "history read failed (%s)" % type(e).__name__, True
         return res
     if not res["files"]:
-        res["reason"] = ("no history file in the folder (the daily IBKR history task writes %s*.json)" % PREFIX
-                         if not res["skipped"] else "no usable history file (%d unusable)" % res["skipped"])
+        if errors:
+            res["reason"], res["failed"] = "no history file could be downloaded (%d Drive error(s))" % errors, True
+        else:
+            res["reason"] = ("no history file in the folder (the daily IBKR history task writes %s*.json)" % PREFIX
+                             if not res["skipped"] else "no usable history file (%d unusable)" % res["skipped"])
         return res
     res["ok"] = True
     return res
@@ -567,6 +576,9 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         return 0
     found = found if found is not None else latest_files(now, session)
     if not found.get("ok"):
+        if found.get("failed"):                         # a read that could not be made is a failed run (exit 2)
+            _out("ERROR: %s; nothing written" % (found.get("reason") or "history read failed"))
+            return 2
         _out("%s: nothing written; the tabs keep what they hold" % (found.get("reason") or "no history file"))
         return 0
     try:

@@ -422,3 +422,32 @@ def test_a_carried_row_keeps_its_closing_year_a_year_later():
     assert kept == [["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28,
                      "carried: closed 2026-08-06 (hand-filled, before the first fill)"]]
     assert ih.carried_rows(rec, D(2026, 8, 1), D(2027, 8, 6)) == []                  # the fills now reach it
+
+
+def test_a_drive_read_that_fails_is_a_failed_run_and_no_file_is_not(monkeypatch, capsys):
+    """Codex P2 on #1041: a Drive error must not look like an empty folder; an empty folder stays a quiet no-op."""
+    monkeypatch.delenv("TFB_IBKR_HISTORY", raising=False)
+    folder = "1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH"
+
+    class Denied(Drive):
+        def get(self, url, timeout=None, params=None):
+            return Resp(403)
+
+    class Broken(Drive):
+        def get(self, url, timeout=None, params=None):
+            raise ConnectionError("reset")
+
+    denied = ih.latest_files(NOW, Denied([], {}), folder=folder)
+    assert denied["failed"] and denied["reason"] == "Drive list answered HTTP 403"
+    assert ih.latest_files(NOW, Broken([], {}), folder=folder)["reason"] == "history read failed (ConnectionError)"
+    lost = ih.latest_files(NOW, Drive([_meta("n1", "TFB_IBKR_History_20261121-002031.json")], {}), folder=folder)
+    assert lost["failed"] and lost["reason"] == "no history file could be downloaded (1 Drive error(s))"
+    assert ih.latest_files(NOW, Drive([], {}), folder="bad id!")["failed"]
+    empty = ih.latest_files(NOW, Drive([], {}), folder=folder)
+    assert not empty["ok"] and not empty["failed"]
+    bad = ih.latest_files(NOW, Drive([_meta("b", "TFB_IBKR_History_x.json")], {"b": b"{oops"}), folder=folder)
+    assert not bad["failed"] and bad["reason"] == "no usable history file (1 unusable)"
+    book = Book({})
+    assert ih.run_once(False, book=book, now=NOW, found=denied) == 2 and book.tabs == {}
+    assert "ERROR: Drive list answered HTTP 403; nothing written" in capsys.readouterr().out
+    assert ih.run_once(False, book=book, now=NOW, found=empty) == 0
