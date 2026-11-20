@@ -4,7 +4,13 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.2.0 (2026-11-20)
+v1.3.0 (2026-11-21)
+  1.3.0: [PEERS] the record of the new classes in section 7 is read against the same-day average of the US
+         names (v_company_news_eval, apply_bq_views 1.17.0) - the S&P 500 beside it - because against the
+         index every class looked ahead, neutral as much as positive: the names beat the index, not their
+         news. Owner, 21 Nov 2026 02:20 Riyadh, in Arabic: "let us also review the news analysis". Until the
+         view is updated in BigQuery the line keeps the 1.2.0 reading against the S&P 500 and says so, so the
+         page never fails on the order in which the two are deployed.
   1.2.0: [COMPANY] section 7, COMPANY NEWS RE-READ - each holding's headlines of the last 7 days as
          v_symbol_news_class reads them from their own text: how many are about the company and how many,
          filed under it, are about someone else; the week's class (POSITIVE / NEGATIVE / neutral / no company
@@ -54,7 +60,8 @@ WHAT IT WRITES (its page News_Board; nothing else)
     7. COMPANY NEWS, RE-READ (v1.2.0): each holding's headlines of the last
        7 days, re-classified from their own text (v_symbol_news_class), with
        the provider's old reading beside them and the record of the new
-       classes (v_company_news_eval). For information only.
+       classes (v_company_news_eval; v1.3.0: against the same-day US names,
+       the S&P 500 beside it). For information only.
 
 SAFETY
     Read-only on BigQuery (SELECT only) and on every tab but its own; the
@@ -86,7 +93,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -510,18 +517,36 @@ def company_rows(holdings: Sequence[Dict[str, str]], found: Sequence[Dict[str, A
     return out
 
 
+def _class_figure(c: str, mean: Any, days: Any, beat: Any = None) -> str:
+    if num(mean) is None:
+        return "%s: no matured day yet" % c
+    return "%s %s pts on %s day(s)%s" % (c, fmt(mean, 2, True), fmt(days, 0) or "0",
+                                         (", ahead on %s %%" % fmt(beat, 1)) if num(beat) is not None else "")
+
+
 def company_record_line(rows: Sequence[Dict[str, Any]]) -> str:
-    """The record of the new classes, in one line; the provider's own reading after it."""
+    """The record of the new classes, in one line; the provider's own reading after it. v1.3.0: against the same-day
+    average of the US names (the view's reading, apply_bq_views 1.17.0), the S&P 500 beside it; rows from the view
+    before 1.17.0 (no peer column) keep the 1.2.0 line against the S&P 500 and say the peers are still to come."""
     mine = {text(r.get("class")): r for r in rows if text(r.get("signal")) == "company_news"}
     if not mine:
         return "Record of the new classes: no scored day yet."
-    parts = ["%s %s pts on %s day(s)" % (c, fmt(mine[c].get("mean_5d_excess_pp"), 2, True), fmt(mine[c].get("matured_5d"), 0))
-             for c in ("positive", "neutral", "negative") if c in mine]
-    reading = text(next(iter(mine.values())).get("reading"))
+    order = [c for c in ("positive", "neutral", "negative") if c in mine]
+    reading = text(next(iter(mine.values())).get("reading")) or "not read"
     prov = next((text(r.get("reading")) for r in rows if text(r.get("signal")) == "provider_sentiment"), "")
-    return ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500): %s - reading: %s."
-            % ("; ".join(parts), reading or "not read")) + (" The provider's own reading, scored the same way: %s." % prov
-                                                              if prov else "")
+    tail = (" The provider's own reading, scored the same way: %s." % prov) if prov else ""
+    if not any("mean_5d_peer_pp" in mine[c] for c in order):
+        parts = [_class_figure(c, mine[c].get("mean_5d_excess_pp"), mine[c].get("matured_5d")) for c in order]
+        return ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500; the "
+                "comparison with the same-day US names comes with the next BigQuery views update): %s - reading: %s.%s"
+                % ("; ".join(parts), reading, tail))
+    peers = next((fmt(mine[c].get("peers"), 0) for c in order if num(mine[c].get("peers"))), "")
+    parts = [_class_figure(c, mine[c].get("mean_5d_peer_pp"), mine[c].get("matured_5d_peer", mine[c].get("matured_5d")),
+                           mine[c].get("beat_5d_peer_pct")) for c in order]
+    spy = "; ".join("%s %s" % (c, fmt(mine[c].get("mean_5d_excess_pp"), 2, True) or "n/a") for c in order)
+    return ("Record of the new classes (US names, the 5 sessions after the news day, against the same-day average of "
+            "the US names%s): %s - reading: %s. Against the S&P 500 instead: %s pts.%s"
+            % ((", about %s of them" % peers) if peers else "", "; ".join(parts), reading, spy, tail))
 
 
 # ----------------------------------------------------------------------------- #
@@ -900,9 +925,25 @@ def sql_company_news(ds: str, symbols: Sequence[Any], today: _dt.date) -> str:
             % (pick, pick, pick, ds, ", ".join("'%s'" % s for s in syms), _d(today), COMPANY_DAYS - 1, _d(today)))
 
 
-def sql_company_eval(ds: str) -> str:
-    return ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading "
-            "FROM `%s.v_company_news_eval` ORDER BY signal, class" % ds)
+def sql_company_eval(ds: str, peers: bool = True) -> str:
+    """v1.3.0: with the peer columns of apply_bq_views 1.17.0; peers=False is the 1.2.0 read, for a view not yet
+    updated in BigQuery."""
+    extra = ", mean_5d_peer_pp, matured_5d_peer, beat_5d_peer_pct, corr_5d_peer, peers" if peers else ""
+    return ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading%s "
+            "FROM `%s.v_company_news_eval` ORDER BY signal, class" % (extra, ds))
+
+
+def read_company_eval(session: Any, project: str, location: str, ds: str, query: Any) -> List[Dict[str, Any]]:
+    """v1.3.0: the record with the peers; if BigQuery does not know the peer columns yet (the view before
+    apply_bq_views 1.17.0), the 1.2.0 read instead - any other refusal still fails the run."""
+    try:
+        return query(session, project, location, sql_company_eval(ds))
+    except RuntimeError as e:
+        if "Unrecognized name" not in text(e):
+            raise
+        _out("COMPANY NEWS record: the view has no peer columns yet (apply_bq_views 1.17.0 not applied); "
+             "read against the S&P 500 only")
+        return query(session, project, location, sql_company_eval(ds, peers=False))
 
 
 # ----------------------------------------------------------------------------- #
@@ -922,7 +963,7 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     shadow_day, names = shadow_names(query(session, project, location, sql_shadow(ds, today)))
     trial = trial_rows(query(session, project, location, sql_trial(ds)))
     found = query(session, project, location, sql_company_news(ds, syms, today)) if syms else []
-    company_eval = query(session, project, location, sql_company_eval(ds))
+    company_eval = read_company_eval(session, project, location, ds, query)
     return {"last_news": last_news.isoformat() if last_news else "", "themes": themes, "tilt": tilt,
             "sectors": sector_rows(tilt), "record": record,
             "holdings": holding_rows(holdings, sectors, tilt, names, shadow_day), "shadow_day": shadow_day,
