@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Read-only, full-row audit for the GitHub automatic refresh pipeline.
 
+VERSION 1.3.3 (2026-11-20) — a passing Sheets fault is waited out, not scored.
+Run 44812767456 (20 Nov 20:36 UTC) went red in the same quota minute in which
+Release Decision Feed met HTTP 429 "Read requests per minute per user"; a page
+whose read raised was recorded "audit failed: <error>" and the run exited 2.
+Each page read (bounded grid and complete A:A column) now waits out a quota
+answer (65 s, 65 s) or a passing 5xx (15 s, 30 s) and tries again, at most
+twice (scripts/sheets_quota.py 1.1.0 wait_for_transient). Every other error is
+raised at once, unchanged. Rules, floors, coverage math, exit codes: UNTOUCHED.
+
 VERSION 1.3.2 — Insights audits accept exactly the same current/legacy report
 contracts and physical column order supported by the writer. Its non-symbol
 row-count policy remains unchanged; no new report freshness rule is added.
@@ -52,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 END_COL, DEFAULT_MAX_ROWS = "EZ", 20000
 SYMBOL = ("Symbol", "Ticker")
 NAME = ("Name", "Company Name", "Instrument Name")
@@ -195,17 +204,39 @@ def resolve_registry():
         except Exception: pass
     return None
 
+READ_RETRIES = 2
+
+def _transient_wait(exc, attempt):
+    """1.3.3: seconds to wait before another try after a quota answer or a passing 5xx, else None."""
+    try:
+        from scripts.sheets_quota import wait_for_transient
+    except Exception:  # noqa: BLE001 - without the helper nothing is retried (1.3.2 behaviour)
+        return None
+    return wait_for_transient(exc, attempt)
+
+async def _read_with_retry(reader, sid, rng, sleep=None):
+    """1.3.3: one range read; a transient Sheets fault is waited out at most READ_RETRIES times."""
+    loop=asyncio.get_running_loop(); n=0
+    while True:
+        try:
+            val=await loop.run_in_executor(None,lambda:reader(sid,rng))
+            if inspect.isawaitable(val): val=await val
+            return val
+        except Exception as exc:
+            wait=_transient_wait(exc,n+1)
+            if wait is None or n>=READ_RETRIES: raise
+            n+=1
+            print(f"Sheets transient fault reading {rng}: {type(exc).__name__}; waiting {wait:.0f} s, then try {n} of {READ_RETRIES}",file=sys.stderr)
+            await (sleep or asyncio.sleep)(wait)
+
 async def read(reader, sid, page, limit):
-    loop=asyncio.get_running_loop(); val=await loop.run_in_executor(None,lambda:reader(sid,f"{page}!A1:{END_COL}{limit+50}"))
-    if inspect.isawaitable(val): val=await val
+    val=await _read_with_retry(reader,sid,f"{page}!A1:{END_COL}{limit+50}")
     if not isinstance(val,list): raise TypeError("read_range did not return a list")
     return [list(r) if isinstance(r,(list,tuple)) else [r] for r in val]
 
 async def read_symbol_column(reader, sid, page):
     """A complete A:A read proves that no sparse tail symbol escaped the window."""
-    loop=asyncio.get_running_loop()
-    val=await loop.run_in_executor(None,lambda:reader(sid,f"{page}!A:A"))
-    if inspect.isawaitable(val): val=await val
+    val=await _read_with_retry(reader,sid,f"{page}!A:A")
     if not isinstance(val,list): raise TypeError("complete Symbol column did not return a list")
     return val
 

@@ -1887,7 +1887,7 @@ def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeyp
         assert tap.day_order_on() is want, value
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
-    assert tap.__version__ == "1.8.0"
+    assert tap.__version__ == "1.8.1"
 
 
 def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
@@ -2034,3 +2034,25 @@ def test_t19_a_holding_under_a_tender_offer_gets_no_blind_stop_instruction():
     assert not any("tender" in x[2] for x in cards(b3.tabs["Today_Action_Plan"].values))
     h = {"symbol": "X.US", "qty": 10.0, "stop": 9.0, "action": "SELL", "why": "", "offer": True}
     assert tap.holding_steps(h, 1.0)[0]["do"].endswith("(selling tendered shares can open a short position).")
+
+
+def test_v181_passing_server_fault_is_waited_out(capsys):
+    """1.8.1 (run 44810684039, 20 Nov 2026: APIError [503]; nothing written)."""
+    class APIError(Exception):
+        pass
+    assert tap.server_transient(APIError("APIError: [503]: The service is currently unavailable."))
+    assert not tap.server_transient(APIError("APIError: [403]: The caller does not have permission"))
+    assert not tap.server_transient(ValueError("row 503 is short"))
+    slept, n = [], {"i": 0}
+
+    def fn():
+        n["i"] += 1
+        if n["i"] == 1:
+            raise APIError("APIError: [503]: The service is currently unavailable.")
+        return "pages"
+    assert tap.with_retry(fn, 3, slept.append, "reading the source pages") == "pages" and slept == [20.0]
+    assert "server fault (APIError) while reading the source pages: waiting 20 s, then try 1 of 3" in capsys.readouterr().out
+    with pytest.raises(APIError):
+        tap.with_retry(lambda: (_ for _ in ()).throw(APIError("[503]: x")), 0, slept.append, "x")
+    with pytest.raises(ValueError):
+        tap.with_retry(lambda: (_ for _ in ()).throw(ValueError("[500] in a cell")), 3, slept.append, "x")

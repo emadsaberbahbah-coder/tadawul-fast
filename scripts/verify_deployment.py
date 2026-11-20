@@ -253,7 +253,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("workflow_activation_receipt", "1.0.1", "non-secret DQ/tracker execution receipts"),
     ("run_inline_page_recovery", "1.2.1", "recovery with child write-receipt retention"),
     ("approved_universe_scope", "1.0.1", "approved exact physical roster membership"),
-    ("audit_full_refresh_coverage", "1.3.2", "read-only full row coverage audit"),
+    ("audit_full_refresh_coverage", "1.3.3", "read-only full row coverage audit"),
     # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
     # (the FEED banner detail keeps up to 1,000 characters).
     ("validate_dashboard", "1.3.4", "scoped literal contract and native cockpit validation"),
@@ -277,7 +277,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
     # vars.TFB_RELEASE_RENDER_HOLD default off; workflow-scoped, never on Render;
     # 1.3.1 is claimed by open PR #831).
-    ("release_decision_feed", "1.4.1", "gated audited decision-feed release (P0-1)"),
+    ("release_decision_feed", "1.4.2", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.5", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
@@ -377,14 +377,14 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("holding_read", "1.0.0", "holding read"),
     ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.8.0", "today action plan"),
+    ("today_action_plan", "1.8.1", "today action plan"),
     ("plan_archive", "1.1.1", "plan archive"),
     ("ibkr_capture", "1.2.0", "ibkr capture"),
     # 2026-11-21 (new script, pinned on arrival): _IBKR_NAV_History, _IBKR_Fills and _IBKR_Trades from the daily
     # read-only IBKR history file, for Portfolio_Decision_v2's return and trade record.
     ("ibkr_history", "1.0.0", "ibkr history"),
     ("cash_cells", "1.0.0", "cash cells"),
-    ("sheets_quota", "1.0.1", "sheets quota"),
+    ("sheets_quota", "1.1.0", "sheets quota"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]
