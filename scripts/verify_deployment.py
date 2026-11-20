@@ -330,7 +330,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-08 (manifest pin only): 1.5.0 -> 1.6.0 (v_signal_edge_daily and
     # v_signal_edge) -> 1.7.0 (total-return engine, v_outcome_excess, the
     # regime views); research views, nothing live reads them.
-    ("apply_bq_views", "1.14.0", "bigquery looker views"),
+    ("apply_bq_views", "1.15.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -353,6 +353,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).
     ("news_board", "1.1.0", "news board"),   # 2026-11-19: v1.1.0 [EVENTS] section 6, events ahead
+    # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
+    # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
+    ("trial_labels", "1.0.0", "trial labels"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.4.0", "news macro gate"),   # 2026-11-19: v1.4.0 [TRUCE-READ]

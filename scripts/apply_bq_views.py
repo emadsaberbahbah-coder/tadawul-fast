@@ -2,8 +2,20 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.14.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.15.0 (program register C8, Phase 2)
 ================================================================================
+v1.15.0 (19 Nov 2026, the trial labels on the pages). WHY (owner, 19 Nov 2026
+18:46 Riyadh, verbatim: "This new updat for news is linked with the
+recommdadtions pages like protofilo or investment pages"; 18:50, in Arabic:
+"do the best and most suitable for the project"). The two open trials - C-2 and
+the news overlay - lived only in BigQuery and on News_Board, away from the
+pages where the owner decides. New v_c2_calls: every buy call with what C-2
+does with it (kept or not, its upside rank in the day, the conditions it
+fails), built on v_trial_c2's own WITH block, character for character, so a
+label cannot disagree with the trial. scripts/trial_labels.py reads it for the
+observe-only Trial_Labels tab. Research view: the live system never reads
+BigQuery; no decision depends on it.
+
 v1.14.0 (19 Nov 2026, the news learning loop). WHY (owner, 19 Nov 2026: world
 news - wars, politics, the economy, AI fear, elections, summits - must be
 classified, weighted by kind, tested on the past and able to correct itself;
@@ -308,7 +320,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.14.0"
+__version__ = "1.15.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
