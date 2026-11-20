@@ -16,10 +16,11 @@ CREATED = dt.datetime(2026, 11, 20, 21, 20, 30, tzinfo=UTC)
 D = dt.date
 
 
-def trade(tid, sym, side, size, when, otype="LIMIT", realized=0.0, ccy="USD", sec="STK", price=10.0, name=None):
+def trade(tid, sym, side, size, when, otype="LIMIT", realized=0.0, ccy="USD", sec="STK", price=10.0, name=None,
+          order=None):
     return {"trade_id": tid, "symbol": sym, "company_name": name or (sym + " HOLDINGS INC"), "sec_type": sec,
             "currency": ccy, "side": side, "size": size, "price": price, "order_type": otype, "trade_time": when,
-            "commission": 1.0, "net_amount": size * price, "realized_pnl": realized, "order_id": 7}
+            "commission": 1.0, "net_amount": size * price, "realized_pnl": realized, "order_id": order or "o-" + tid}
 
 
 TRADES = [
@@ -76,8 +77,12 @@ def test_parse_refuses_a_wrong_or_misdated_file():
     assert ih.parse(body(captured_at="2026-11-21T02:00:00+03:00"), None, NOW)["reason"] == "captured_at is in the future"
     late = ih.parse(body(), CREATED + dt.timedelta(minutes=11), NOW)
     assert late["reason"] == "captured_at differs from the file's creation time" and not late["ok"]
-    empty = ih.parse(body(performance={}, trades_90d={"trades": []}, trades_last_quarter=None), CREATED, NOW)
+    empty = ih.parse(body(performance={}, trades_90d=None, trades_last_quarter=None), CREATED, NOW)
     assert empty["reason"] == "no performance series and no trades in the file"
+    quiet = ih.parse(body(performance={}, trades_90d={"trades": []}, trades_last_quarter=None), CREATED, NOW)
+    assert quiet["ok"] and quiet["has_trades"] and quiet["fills"] == []          # no trade in 90 days is still a read
+    perf_only = ih.parse(body(trades_90d=None, trades_last_quarter=None), CREATED, NOW)
+    assert perf_only["ok"] and not perf_only["has_trades"] and perf_only["series"]
     bad = body(trades_90d={"trades": [{"trade_id": "z", "side": "HOLD", "size": 1, "price": 1,
                                        "trade_time": "2026-11-20T14:30:01Z"}, "junk"]}, trades_last_quarter=None)
     assert ih.parse(bad, CREATED, NOW)["fills"] == []                                       # no usable fill, series kept
@@ -129,19 +134,20 @@ def test_round_trips_cover_partial_sales_same_day_trips_unknown_starts_and_open_
     assert sorted(trips) == ["AAA", "BBB", "CCC", "DDD", "EEE", "GGG"]                  # FFF is still held; no FX trip
     assert trips["BBB"]["realized"] == -42.0 and trips["BBB"]["fills"] == 3
     assert trips["EEE"]["start"] is None                                               # sold more than the fills show
-    rows = ih.trade_rows(list(trips.values()), ih.fx_rates(_fills(TRADES)))
-    assert rows == [
-        ["AAA", "AAA Holdings", "USD", "limit TP", "24 Aug→3 Sep", 250.5],
-        ["DDD", "DDD Holdings (SGD)", "SGD", "limit TP", "12→21 Aug", round(127.0 / 1.27, 2)],   # nearest rate
-        ["GGG", "GGG Holdings", "USD", "limit exit", "1→9 Oct", -2.0],
-        ["CCC", "CCC Holdings", "USD", "market exit", "5 Nov", -5.25],
-        ["EEE", "EEE Holdings", "USD", "limit exit", "?→7 Aug", -8.0],
-        ["BBB", "BBB Holdings", "USD", "stop", "8 Sep→22 Oct", -42.0]]
+    rows, left = ih.trade_rows(list(trips.values()), ih.fx_rates(_fills(TRADES)))
+    assert left == [] and rows == [
+        ["AAA", "AAA Holdings", "USD", "limit TP", "24 Aug→3 Sep", 250.5, ""],
+        ["DDD", "DDD Holdings (SGD)", "SGD", "limit TP", "12→21 Aug", round(127.0 / 1.27, 2), ""],   # nearest rate
+        ["GGG", "GGG Holdings", "USD", "limit exit", "1→9 Oct", -2.0, ""],
+        ["CCC", "CCC Holdings", "USD", "market exit", "5 Nov", -5.25, ""],
+        ["EEE", "EEE Holdings", "USD", "limit exit", "?→7 Aug", -8.0, ""],
+        ["BBB", "BBB Holdings", "USD", "stop", "8 Sep→22 Oct", -42.0, ""]]
 
 
-def test_a_trip_in_another_currency_stays_in_it_without_a_conversion():
-    rows = ih.trade_rows(ih.round_trips(_fills(TRADES[8:10])), {})
-    assert rows == [["DDD", "DDD Holdings (SGD)", "SGD", "limit TP", "12→21 Aug", 127.0]]
+def test_a_trip_without_a_usd_rate_is_left_out_and_named_never_summed_as_usd():
+    """Codex P2 on #1041: the page sums realized_usd as USD, so a native-currency amount there would corrupt it."""
+    rows, left = ih.trade_rows(ih.round_trips(_fills(TRADES[8:10])), {})
+    assert rows == [] and left == ["DDD (SGD)"]
 
 
 def test_merge_keeps_one_fill_per_id_the_later_read_winning():
@@ -267,7 +273,9 @@ def test_the_run_writes_the_three_tabs_and_logs_no_amount(monkeypatch, capsys):
     assert [r[7:9] for r in rec[:4]] == [["as_of", "2026-11-21 00:20 Riyadh"], ["source", "TFB_IBKR_History_0.json"],
                                          ["fills", 2 + len(TRADES)], ["written", "2026-11-21 00:50 Riyadh"]]
     log = capsys.readouterr().out
-    assert "closed trades 7 (2 won)" in log and "fills %d (%d new)" % (2 + len(TRADES), len(TRADES)) in log
+    assert "closed trades 7 (2 won; 0 carried from the hand-filled record; 0 not converted)" in log
+    assert "fills %d (%d new)" % (2 + len(TRADES), len(TRADES)) in log
+    assert [r[7:9] for r in rec[4:6]] == [["carried", 0], ["not converted", "none"]]
     assert "NAV 6 day(s) to 2026-11-20 (chained at 2026-11-16)" in log
     for word in ("AAA", "BBB", "OLD", "250.5", "-42", "0.0109", "3000"):
         assert word not in log
@@ -332,3 +340,62 @@ def test_a_tab_that_cannot_be_joined_is_left_as_it_is(monkeypatch, capsys):
     log = capsys.readouterr().out
     assert "(kept (IBKR's series shares no day with the tab))" in log
     assert "wrote _IBKR_Fills (%d row(s)), _IBKR_Trades (6 row(s))" % len(TRADES) in log
+
+
+def test_a_file_without_a_trades_read_updates_the_return_only(monkeypatch, capsys):
+    """Codex P2 on #1041: the record and its as_of come only from a file that carries a trades read."""
+    monkeypatch.delenv("TFB_IBKR_HISTORY", raising=False)
+    monkeypatch.delenv("TFB_IBKR_NAV_FROM", raising=False)
+    newest = body(captured_at="2026-11-21T00:20:31+03:00", trades_90d=None, trades_last_quarter=None)
+    older = body(captured_at="2026-11-20T00:20:31+03:00", performance={})
+    book = Book({})
+    assert ih.run_once(False, book=book, now=NOW, found=_found(newest, older)) == 0
+    rec = book.tabs["_IBKR_Trades"].values
+    assert rec[0][7:9] == ["as_of", "2026-11-20 00:20 Riyadh"] and rec[1][7:9] == ["source", "TFB_IBKR_History_1.json"]
+    assert book.tabs["_IBKR_NAV_History"].values[-1] == ["2026-11-20", -0.01]
+    hand = Sheet([ih.TRADE_HEAD, ["SHG", "Shinhan", "USD", "limit TP", "24 Aug→3 Sep", 693.32]])
+    book = Book({"_IBKR_Trades": hand})
+    assert ih.run_once(False, book=book, now=NOW, found=_found(newest)) == 0
+    assert hand.writes == 0 and "_IBKR_Fills" not in book.tabs                 # no trades read: both tabs kept
+    assert "no trades read in the files: _IBKR_Fills and _IBKR_Trades keep what they hold" in capsys.readouterr().out
+
+
+def test_hand_filled_rows_that_close_before_the_first_fill_are_carried_forward(monkeypatch):
+    monkeypatch.delenv("TFB_IBKR_HISTORY", raising=False)
+    hand = Sheet([ih.TRADE_HEAD, ["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28],
+                  ["AAA", "Aaa", "USD", "limit TP", "24 Aug→3 Sep", 250.5],          # the fills rebuild it
+                  ["BAD", "Bad", "USD", "stop", "soon", -1.0]])
+    book = Book({"_IBKR_Trades": hand})
+    assert ih.run_once(False, book=book, now=NOW, found=_found(body())) == 0
+    rec = hand.values
+    assert [r[0] for r in rec[1:9] if r[0]] == ["AAA", "DDD", "GGG", "CCC", "OLD", "EEE", "BBB"]
+    old = [r for r in rec if r[0] == "OLD"][0]
+    assert old[:7] == ["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28, ih.CARRY_MARK]
+    assert [r[0] for r in rec].count("AAA") == 1 and "BAD" not in [r[0] for r in rec]
+    assert [r for r in rec if r[7] == "carried"][0][8] == 1
+    assert ih.run_once(False, book=book, now=NOW, found=_found(body())) == 0      # stamped now: only marked rows carry
+    assert [r[0] for r in hand.values].count("OLD") == 1
+
+
+def test_span_end_reads_the_last_day_in_the_right_year():
+    today = D(2026, 1, 10)
+    assert ih.span_end("28 Dec→5 Jan", today) == D(2026, 1, 5)
+    assert ih.span_end("12→21 Dec", today) == D(2025, 12, 21) and ih.span_end("5 Nov", D(2026, 11, 21)) == D(2026, 11, 5)
+    assert ih.span_end("?→7 Aug", D(2026, 11, 21)) == D(2026, 8, 7) and ih.span_end("soon", today) is None
+    assert ih.span_end("31 Feb", today) is None
+
+
+def test_an_order_filled_in_pieces_is_one_sale_even_with_an_unknown_start():
+    """21 Nov, real account: one market order sold 4 + 1 shares of a holding bought before the 90-day read; read fill by
+    fill it gave two trips with an unknown start."""
+    pieces = [trade("p1", "PPP", "SELL", 1, "2026-09-08T13:30:01Z", "MARKET", -0.87, order="5600293471"),
+              trade("p2", "PPP", "SELL", 4, "2026-09-08T13:30:01Z", "MARKET", -5.78, order="5600293471")]
+    trips = ih.round_trips(_fills(pieces))
+    assert len(trips) == 1 and trips[0]["start"] is None and round(trips[0]["realized"], 2) == -6.65
+    same_time = [dict(p, order_id="") for p in pieces]                          # no order id: the same time groups them
+    assert len(ih.round_trips(_fills(same_time))) == 1
+    two_orders = [trade("q1", "QQQ", "BUY", 10, "2026-09-01T13:30:00Z"),
+                  trade("q2", "QQQ", "SELL", 4, "2026-09-02T13:30:00Z", realized=1.0),
+                  trade("q3", "QQQ", "SELL", 6, "2026-09-03T13:30:00Z", realized=2.0)]
+    one = ih.round_trips(_fills(two_orders))
+    assert len(one) == 1 and one[0]["fills"] == 3 and one[0]["realized"] == 3.0     # a scale-out is still one trip

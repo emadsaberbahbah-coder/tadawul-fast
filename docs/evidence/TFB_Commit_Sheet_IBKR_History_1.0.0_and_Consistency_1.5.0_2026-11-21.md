@@ -54,10 +54,16 @@
 
 ## What the owner does
 - **Approve one scheduled task.** It reads IBKR performance and 90 days of trades, read-only, at 00:20 Riyadh Tue–Sat, and writes `TFB_IBKR_History_<date>-<time>.json` to the capture folder.
-- **One seed file.** On approval, Claude writes one seed file with IBKR's LAST_QUARTER trades (Jul–Sep), read-only, so the fills since 28 Jul are in `_IBKR_Fills`. After that the tab keeps them.
+- **Optional seed file.** On approval, Claude can write one seed file with IBKR's LAST_QUARTER trades (Jul–Sep), read-only, so the 4 trips bought before the 90-day read show their real start instead of "?". The record is complete without it: realized figures and the 22 trips are the same.
 - **Until then** the workflow writes nothing and says why.
 
-## Tests (`tests/test_ibkr_history.py`, 17; `tests/test_consistency_check.py` K11)
+## Review fixes (Codex, PR 1041)
+- **P2: a non-USD amount in the USD column.** A trip in another currency with no USD conversion in the fills is now left out of the record. It is named in the stamp ("not converted"). Before, it was written in its own currency into `realized_usd`, which the page sums as USD.
+- **P2: a stamp without a trades read.** The record and its `as_of` now come only from files that carry a trades read. A file with only the performance series updates the return; `_IBKR_Fills` and `_IBKR_Trades` keep what they hold.
+  - A first run can no longer replace the hand-filled record with a shorter one. Its rows that close before the first fill are carried forward and marked in column G.
+- **Also found on the real data.** One market order filled in two pieces (4 + 1 shares) read as two trips. Fills of one order now count as one execution.
+
+## Tests (`tests/test_ibkr_history.py`, 21; `tests/test_consistency_check.py` K11)
 - **Files.**
   - Parsing: schema, captured_at against creation time, a future time, the longest series, fills.
   - Every date shape.
@@ -65,7 +71,8 @@
   - Rebuilt from an empty tab.
   - Rebased at the first shared day, with the tab's later non-IBKR row dropped.
   - Kept when it cannot be joined.
-- **Round trips.** Partial sales, a same-day trip, an unknown start, an open position not listed, the SGD conversion and its absence.
+- **Round trips.** Partial sales, a same-day trip, an unknown start, an open position not listed, an order filled in pieces, a scale-out, the SGD conversion, and a trip with no USD rate (left out and named).
+- **Trades read.** A file with only the series updates the return and keeps both trade tabs. Hand-filled rows before the first fill are carried; a second run carries only the marked rows. Span end dates are read across a year end.
 - **Merge, names, spans, exit types.**
   - Fills: one per trade id, the later read wins, and they read back the same from the tab.
   - Names are tidied, spans across a year end are right, and each closing order type maps to its exit type.

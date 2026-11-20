@@ -4,6 +4,15 @@ scripts/ibkr_history.py - the broker's own return and trade record, for Portfoli
 ================================================================================
 VERSION 1.0.0 (2026-11-21)
 
+Review (Codex, PR 1041): (P2) a trip in another currency with no USD
+conversion in the fills is left out of the record and named in the stamp,
+never written in its own currency into realized_usd, which the page sums as
+USD. (P2) the record and its as_of come only from files that carry a trades
+read: a file with only the performance series updates the return, and the
+record keeps what it holds. Rows of a hand-filled record (no as_of) that close
+before the first fill are carried forward, marked in column G, so a first run
+without the older fills cannot drop them.
+
 WHY (owner, 20 Nov 2026 22:40 Riyadh, in Arabic: a full review of the file
 against the market - the main differences between the pages, and between the
 file and the market; 23:34: "Keep review the file for coming 3 hours and give
@@ -45,10 +54,14 @@ WHAT
                          the sale shows an unknown start ("?"). H1:I4 carry
                          as_of, source, fills and written, which
                          consistency_check C15 reads.
+    The fills of one order (same symbol, side and order id) count as one
+    execution, so an order filled in pieces is one sale.
     Checked on 21 Nov against IBKR's own trades since 28 Jul: the 15 trips the
     hand-filled tab held come out with the same realized figure, span and exit
     type (the one SGD trip within 0.8 USD: the tab had used another rate), and
-    the 7 trips closed since 8 Oct are added.
+    the 7 trips closed since 8 Oct are added. With the 90-day read alone, the
+    record still holds the 22 trips: the 5 hand-filled rows that close before
+    the first fill are carried, and 4 trips show an unknown start.
     The page reads the three tabs as before. _IBKR_Account and _IBKR_Orders
     are left alone: the hourly capture supersedes them on the page.
 
@@ -194,9 +207,10 @@ def fills_of(body: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def parse(body: Any, created: Optional[_dt.datetime], now: _dt.datetime, name: str = "") -> Dict[str, Any]:
     """One history file as this script uses it. PURE.
-    {"ok", "reason", "name", "as_of", "age_h", "series": [(day, cps)], "fills": [fill]}"""
+    {"ok", "reason", "name", "as_of", "age_h", "series": [(day, cps)], "fills": [fill], "has_trades": a trades
+    read is in the file (an empty list of trades is still a read)}"""
     out: Dict[str, Any] = {"ok": False, "reason": "", "name": name, "as_of": None, "age_h": None, "series": [],
-                           "fills": []}
+                           "fills": [], "has_trades": False}
     if not isinstance(body, dict) or str(body.get("schema")) != SCHEMA:
         out["reason"] = "history schema not recognised"
         return out
@@ -212,7 +226,9 @@ def parse(body: Any, created: Optional[_dt.datetime], now: _dt.datetime, name: s
         return out
     out["as_of"], out["age_h"] = at, max(0.0, (now - at).total_seconds() / 3600.0)
     out["series"], out["fills"] = nav_series(body.get("performance")), fills_of(body)
-    if not out["series"] and not out["fills"]:
+    out["has_trades"] = any(str(k).startswith("trades") and isinstance(v, dict) and isinstance(v.get("trades"), list)
+                            for k, v in body.items())
+    if not out["series"] and not out["has_trades"]:
         out["reason"] = "no performance series and no trades in the file"
         return out
     out["ok"] = True
@@ -330,10 +346,28 @@ def merge_fills(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) ->
     return sorted(by.values(), key=lambda f: (f["time"], f["trade_id"]))
 
 
+def executions(fills: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The stock fills of one order (same symbol, currency, side and order id; without an order id, the same time)
+    as one execution at its last fill: an order filled in pieces is one sale, not several. PURE."""
+    by: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for f in sorted((f for f in fills if f["sec_type"] in ("STK", "")), key=lambda f: (f["time"], f["trade_id"])):
+        key = (f["symbol"], f["ccy"], f["side"], f["order_id"] or f["time"].isoformat())
+        e = by.get(key)
+        if e is None:
+            by[key] = dict(f)
+            continue
+        e["size"] += f["size"]
+        e["realized"] += f["realized"]
+        e["commission"] += f["commission"]
+        e["time"], e["trade_id"], e["order_type"] = f["time"], f["trade_id"], f["order_type"] or e["order_type"]
+    return sorted(by.values(), key=lambda f: (f["time"], f["trade_id"]))
+
+
 def round_trips(fills: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Closed round trips per symbol and currency: from flat to flat again. A sale of more shares than the fills
-    show held closes a trip whose start is unknown. Open positions are not returned. PURE."""
-    stocks = sorted((f for f in fills if f["sec_type"] in ("STK", "")), key=lambda f: (f["time"], f["trade_id"]))
+    """Closed round trips per symbol and currency, from flat to flat again, over executions (an order's fills
+    together). A sale of more shares than the fills show held closes a trip whose start is unknown. Open positions
+    are not returned. PURE."""
+    stocks = executions(fills)
     pos: Dict[Tuple[str, str], float] = {}
     open_: Dict[Tuple[str, str], Dict[str, Any]] = {}
     trips: List[Dict[str, Any]] = []
@@ -397,27 +431,71 @@ def tidy_name(s: str) -> str:
     return " ".join(w if (len(w) <= 3 and w.isalpha()) else w.capitalize() for w in t.split())
 
 
-def trade_rows(trips: Sequence[Dict[str, Any]], fx: Dict[str, List[Tuple[_dt.datetime, float]]]) -> List[List[Any]]:
-    """symbol | name | ccy | exit_type | span | realized_usd per closed trip, best first. PURE."""
-    rows: List[Tuple[float, List[Any]]] = []
+def trade_rows(trips: Sequence[Dict[str, Any]], fx: Dict[str, List[Tuple[_dt.datetime, float]]]
+               ) -> Tuple[List[List[Any]], List[str]]:
+    """symbol | name | ccy | exit_type | span | realized_usd | (G: blank) per closed trip, best first, and the trips
+    left out because no USD conversion was found for their currency ("SYM (CCY)"). PURE."""
+    rows: List[List[Any]] = []
+    out: List[str] = []
     for t in trips:
         val, ccy = t["realized"], t["ccy"] or "USD"
         if ccy != "USD":
             near = sorted(fx.get(ccy) or [], key=lambda x: abs((x[0] - t["end"]).total_seconds()))
-            if near:
-                val = val / near[0][1]
+            if not near:                                # the page sums this column as USD: never a native amount
+                out.append("%s (%s)" % (t["symbol"], ccy))
+                continue
+            val = val / near[0][1]
         name = tidy_name(t["name"]) + (" (%s)" % ccy if ccy != "USD" else "")
-        rows.append((val, [t["symbol"], name, ccy, exit_type(t), span(t["start"], t["end"]), round(val, 2)]))
-    return [r for _, r in sorted(rows, key=lambda x: -x[0])]
+        rows.append([t["symbol"], name, ccy, exit_type(t), span(t["start"], t["end"]), round(val, 2), ""])
+    return sorted(rows, key=lambda r: -r[5]), out
 
 
-def stamp_rows(rows: List[List[Any]], as_of: _dt.datetime, source: str, n_fills: int, now: _dt.datetime) -> List[List[Any]]:
-    """The record (A:F) with the stamp C15 reads in H1:I4."""
-    grid = [list(TRADE_HEAD) + ["", "", ""]] + [list(r) + ["", "", ""] for r in rows]
-    while len(grid) < 4:
+_SPAN_END = re.compile(r"(\d{1,2}) ([A-Z][a-z]{2})\s*$")
+_MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                                       "Dec"), 1)}
+CARRY_MARK = "carried: hand-filled, before the first fill"
+
+
+def span_end(text: Any, today: _dt.date) -> Optional[_dt.date]:
+    """The last day of a span ('24 Aug\u21923 Sep' -> 3 Sep) in the latest year that does not put it after today. PURE."""
+    m = _SPAN_END.search(str(text or "").strip())
+    if not m or m.group(2) not in _MONTHS:
+        return None
+    for year in (today.year, today.year - 1):
+        try:
+            d = _dt.date(year, _MONTHS[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+        if d <= today:
+            return d
+    return None
+
+
+def carried_rows(values: Sequence[Sequence[Any]], first_fill: Optional[_dt.date], today: _dt.date) -> List[List[Any]]:
+    """The rows of a hand-filled record (no as_of in H:I), or rows already carried (column G), that close before the
+    first fill: the fills cannot rebuild them, so they stay, marked in column G. PURE."""
+    rows = [(list(r) + [""] * TRADE_WIDTH)[:TRADE_WIDTH] for r in list(values)]
+    stamped = any(str(r[7]).strip().lower() == "as_of" for r in rows)
+    out: List[List[Any]] = []
+    for r in rows[1:]:
+        if not str(r[0]).strip() or (stamped and str(r[6]).strip() != CARRY_MARK):
+            continue
+        end, val = span_end(r[4], today), ic._num(r[5])
+        if end is None or val is None or (first_fill is not None and end >= first_fill):
+            continue
+        out.append([str(r[0]).strip(), r[1], r[2], r[3], r[4], val, CARRY_MARK])
+    return out
+
+
+def stamp_rows(rows: List[List[Any]], as_of: _dt.datetime, source: str, n_fills: int, now: _dt.datetime,
+               carried: int = 0, unconverted: Sequence[str] = ()) -> List[List[Any]]:
+    """The record (A:F, G the carry mark) with the stamp in H1:I6; C15 reads as_of."""
+    grid = [list(TRADE_HEAD) + ["", "", ""]] + [(list(r) + [""] * 7)[:7] + ["", ""] for r in rows]
+    while len(grid) < 6:
         grid.append([""] * TRADE_WIDTH)
     stamp = [("as_of", as_of.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M") + " Riyadh"), ("source", source),
-             ("fills", n_fills), ("written", now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M") + " Riyadh")]
+             ("fills", n_fills), ("written", now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M") + " Riyadh"),
+             ("carried", carried), ("not converted", ", ".join(unconverted) or "none")]
     for i, (k, v) in enumerate(stamp):
         grid[i][7], grid[i][8] = k, v
     return grid
@@ -436,20 +514,33 @@ def read_tab(book, tab: str, rng: str) -> List[List[Any]]:
 
 
 def compute(files: Sequence[Dict[str, Any]], nav_values: Sequence[Sequence[Any]],
-            fill_values: Sequence[Sequence[Any]], start: _dt.date) -> Dict[str, Any]:
-    """Everything the run writes, from the files (newest first) and the two tabs as read. PURE."""
-    newest = files[0]
+            fill_values: Sequence[Sequence[Any]], trade_values: Sequence[Sequence[Any]],
+            start: _dt.date) -> Dict[str, Any]:
+    """Everything the run writes, from the files (newest first) and the three tabs as read. PURE.
+    The return comes from the newest file with a series; the fills and the record only from files with a trades read
+    (none: "trade_file" is None and the two tabs are left as they are)."""
+    nav_file = next((f for f in files if f["series"]), None)
+    trade_files = [f for f in files if f.get("has_trades")]
+    nav, how = chain_nav(read_nav(nav_values), nav_file["series"] if nav_file else [], start)
+    x: Dict[str, Any] = {"nav_file": nav_file, "nav": nav, "how": how, "trade_file": None, "fills": [], "added": 0,
+                         "trades": [], "won": 0, "carried": 0, "unconverted": []}
+    if not trade_files:
+        return x
     old_fills = read_fills(fill_values)
     new_fills: List[Dict[str, Any]] = []
-    for f in reversed(list(files)):                    # oldest file first: a later read of a trade id wins
+    for f in reversed(trade_files):                    # oldest file first: a later read of a trade id wins
         new_fills += f["fills"]
     fills = merge_fills(old_fills, new_fills)
-    nav, how = chain_nav(read_nav(nav_values), newest["series"], start)
-    trips = round_trips(fills)
-    rows = trade_rows(trips, fx_rates(fills))
+    rows, unconverted = trade_rows(round_trips(fills), fx_rates(fills))
+    times = [f["time"] for f in fills if f["sec_type"] in ("STK", "")]
+    today = trade_files[0]["as_of"].astimezone(RIYADH).date()
+    carried = carried_rows(trade_values, min(times).date() if times else None, today)
+    rows = sorted(rows + carried, key=lambda r: -r[5])
     known = {f["trade_id"] for f in old_fills}
-    return {"newest": newest, "fills": fills, "added": sum(1 for f in fills if f["trade_id"] not in known),
-            "nav": nav, "how": how, "trades": rows, "won": sum(1 for r in rows if r[5] > 0)}
+    x.update({"trade_file": trade_files[0], "fills": fills, "added": sum(1 for f in fills if f["trade_id"] not in known),
+              "trades": rows, "won": sum(1 for r in rows if r[5] > 0), "carried": len(carried),
+              "unconverted": unconverted})
+    return x
 
 
 def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None,
@@ -470,38 +561,45 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         nav_values = _quota_call(lambda: read_tab(book, NAV_TAB, "A1:B3000"), _SLEEP, _out, "reading %s" % NAV_TAB)
         fill_values = _quota_call(lambda: read_tab(book, FILLS_TAB, "A1:M20000"), _SLEEP, _out,
                                   "reading %s" % FILLS_TAB)
+        trade_values = _quota_call(lambda: read_tab(book, TRADES_TAB, "A1:I400"), _SLEEP, _out,
+                                   "reading %s" % TRADES_TAB)
     except Exception as e:  # noqa: BLE001 - a failed read leaves the tabs in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, str(e)[:300]))
         return 2
-    x = compute(found["files"], nav_values or [], fill_values or [], nav_from())
-    newest = x["newest"]
+    x = compute(found["files"], nav_values or [], fill_values or [], trade_values or [], nav_from())
+    newest, tf = found["files"][0], x["trade_file"]
     last = x["nav"][-1][0].isoformat() if x["nav"] else "none"
     _out("history %s read: %.1f h old, %d file(s) merged%s" % (
         newest["name"], newest["age_h"], len(found["files"]),
         (", %d unusable" % found["skipped"]) if found.get("skipped") else ""))
-    _out("NAV %d day(s) to %s (%s) | fills %d (%d new) | closed trades %d (%d won)" % (
-        len(x["nav"]), last, x["how"], len(x["fills"]), x["added"], len(x["trades"]), x["won"]))
+    _out("NAV %d day(s) to %s (%s) | %s" % (len(x["nav"]), last, x["how"], (
+        "fills %d (%d new) | closed trades %d (%d won; %d carried from the hand-filled record; %d not converted)" % (
+            len(x["fills"]), x["added"], len(x["trades"]), x["won"], x["carried"], len(x["unconverted"]))
+        if tf else "no trades read in the files: %s and %s keep what they hold" % (FILLS_TAB, TRADES_TAB))))
     if dry_run:
         _out("dry run: nothing written")
         return 0
     from scripts.daily_plan import write_grid  # noqa: PLC0415
     from scripts.sheets_quota import call as _quota_call  # noqa: PLC0415
-    grids = [(FILLS_TAB, [list(FILL_HEAD)] + [fill_row(f) for f in x["fills"]], len(FILL_HEAD), 200, len(x["fills"])),
-             (NAV_TAB, [list(NAV_HEAD)] + [[d.isoformat(), round(v, 8)] for d, v in x["nav"]], len(NAV_HEAD), 200,
-              len(x["nav"])),
-             (TRADES_TAB, stamp_rows(x["trades"], newest["as_of"], newest["name"], len(x["fills"]), now), TRADE_WIDTH,
-              60, len(x["trades"]))]
+    grids = []
+    if tf:                                              # the fills first: they are the store the record is built from
+        grids.append((FILLS_TAB, [list(FILL_HEAD)] + [fill_row(f) for f in x["fills"]], len(FILL_HEAD), 200,
+                      len(x["fills"])))
+    if len(x["nav"]) and not x["how"].startswith("kept"):
+        grids.append((NAV_TAB, [list(NAV_HEAD)] + [[d.isoformat(), round(v, 8)] for d, v in x["nav"]], len(NAV_HEAD),
+                      200, len(x["nav"])))
+    if tf:
+        grids.append((TRADES_TAB, stamp_rows(x["trades"], tf["as_of"], tf["name"], len(x["fills"]), now, x["carried"],
+                                             x["unconverted"]), TRADE_WIDTH, 60, len(x["trades"])))
     wrote = []
-    for tab, grid, width, min_rows, n in grids:        # the fills first: they are the store the record is built from
-        if tab == NAV_TAB and (len(grid) < 2 or x["how"].startswith("kept")):
-            continue                                    # nothing new to say about the return: the tab is left as it is
+    for tab, grid, width, min_rows, n in grids:
         try:                                            # one full overwrite: safe to send again after a quota answer
             _quota_call(lambda: write_grid(book, tab, grid, width, min_rows), _SLEEP, _out, "writing %s" % tab)
         except Exception as e:  # noqa: BLE001 - reported, with the exit code that marks the run failed
             _out("ERROR: %s: %s; %s was not written" % (type(e).__name__, str(e)[:300], tab))
             return 2
         wrote.append("%s (%d row(s))" % (tab, n))
-    _out("wrote %s" % ", ".join(wrote))
+    _out("wrote %s" % (", ".join(wrote) or "nothing (nothing new to write)"))
     return 0
 
 
