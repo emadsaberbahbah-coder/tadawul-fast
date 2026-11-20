@@ -1,4 +1,4 @@
-"""scripts/news_board.py v1.0.0 - the News Board (news learning loop, phase B): the week's world news by theme, the
+"""scripts/news_board.py v1.0.0 - v1.2.0 - the News Board (news learning loop, phase B): the week's world news by theme, the
 sector tilt of both arms, the holdings beside their sector's tilt, the shadow list and the trial, read from the
 BigQuery news views on every run. Pure functions, the SQL builders, and full runs through the real BigQuery reader on
 a fake session and a fake workbook (no network). Every figure here is invented."""
@@ -103,6 +103,27 @@ FORWARD_ROWS = [
     tr(nb.FORWARD, "events", "CHAMPION", 400, 9, 0, 3, "0.10", "51.0"),
     tr(nb.FORWARD, "events", "OVERLAY_MINUS_CHAMPION", 400, 9, 0, 3, "0.42", None, "1.31", "collecting: 9 of 20 days, 3 of 8 news weeks"),
 ]
+def cn(symbol, company, other, score, prov, title=None, event=None, day_=None):
+    return {"symbol": symbol, "company_items": str(company), "other_items": str(other), "score": score,
+            "provider_mean": prov, "top_title": title, "top_event": event, "top_day": day_}
+
+
+# v1.2.0 [COMPANY]: what v_symbol_news_class gives for the holdings (CCC.US has no headline at all)
+COMPANY_ROWS = [
+    cn("AAA.US", 3, 1, "2.5", "0.95", "Alpha Bank (AAA) Tops Q3 Earnings and Revenue Estimates", "EARNINGS_BEAT", "2026-11-17"),
+    cn("BBB.PA", 0, 2, "0.0", "0.99"),
+    cn("DDD.US", 1, 0, "-2.0", "0.97", "Delta Power (DDD) Lags Q3 Earnings Estimates", "EARNINGS_MISS", "2026-11-18"),
+]
+
+
+def ce(signal, cls, matured, mean5, reading):
+    return {"signal": signal, "class": cls, "matured_5d": str(matured), "mean_5d_excess_pp": mean5, "beat_5d_pct": "60.0",
+            "corr_5d": "0.02", "reading": reading}
+
+
+EVAL_ROWS = [ce("company_news", "negative", 5, "3.19", "NO EDGE"), ce("company_news", "neutral", 187, "1.15", "NO EDGE"),
+             ce("company_news", "positive", 51, "1.17", "NO EDGE"),
+             ce("provider_sentiment", "positive", 391, "0.96", "BIASED (class > 90 %)")]
 PORTFOLIO = [["MY PORTFOLIO"], [], ["Symbol", "Name"], ["aaa.us", "Alpha Bank"], ["BBB.PA", "Bravo Tech"], ["", ""],
              ["CCC.US", "Charlie Unknown"], ["AAA.US", "dup"], ["not a symbol", "x"], ["TOTAL", ""], ["DDD.US", ""]]
 
@@ -147,6 +168,10 @@ class Session:
             return Resp(payload(self.shadow))
         if ".v_trial_news_overlay`" in sql:
             return Resp(payload(self.trial))
+        if ".v_symbol_news_class`" in sql:
+            return Resp(payload(COMPANY_ROWS))
+        if ".v_company_news_eval`" in sql:
+            return Resp(payload(EVAL_ROWS))
         raise AssertionError("unexpected query: %s" % sql[:80])
 
 
@@ -413,7 +438,8 @@ def test_n4_trial_order_and_verdict():
 # ----------------------------------------------------------------------------- N5 SQL
 def test_n5_sql_is_select_only_dated_and_clean():
     sqls = [nb.sql_last_news(DS, TODAY), nb.sql_themes(DS, TODAY), nb.sql_tilt(DS, TODAY), nb.sql_record(DS),
-            nb.sql_sectors(DS, ["aaa.us", "x' OR '1'='1", "5023.SR"]), nb.sql_shadow(DS, TODAY), nb.sql_trial(DS)]
+            nb.sql_sectors(DS, ["aaa.us", "x' OR '1'='1", "5023.SR"]), nb.sql_shadow(DS, TODAY), nb.sql_trial(DS),
+            nb.sql_company_news(DS, ["aaa.us", "x' OR '1'='1", "BBB.PA"], TODAY), nb.sql_company_eval(DS)]
     for sql in sqls:
         assert re.match(r"^(WITH|SELECT)\b", sql) and "`proj-1.tfb_archive." in sql and ";" not in sql
         assert not re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|CALL)\b", sql, re.I), sql
@@ -428,6 +454,17 @@ def test_n5_sql_is_select_only_dated_and_clean():
             nb.sql_themes(DS, bad)
     with pytest.raises(ValueError):
         nb.sql_sectors(DS, ["", "not a symbol"])
+    with pytest.raises(ValueError):
+        nb.sql_company_news(DS, ["", "not a symbol"], TODAY)
+    with pytest.raises(ValueError):
+        nb.sql_company_news(DS, ["AAA.US"], "2026-11-19")
+    company = sqls[7]
+    assert "FROM `proj-1.tfb_archive.v_symbol_news_class` WHERE symbol IN ('AAA.US', 'BBB.PA')" in company
+    assert "news_date >= DATE_SUB(DATE '2026-11-19', INTERVAL 6 DAY) AND news_date <= DATE '2026-11-19'" in company
+    assert company.count("ORDER BY ABS(score) DESC, published_at DESC, title LIMIT 1)[SAFE_OFFSET(0)]") == 3
+    assert "COUNTIF(relevance = 'company') AS company_items" in company and company.endswith("GROUP BY symbol")
+    assert sqls[8] == ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading "
+                       "FROM `proj-1.tfb_archive.v_company_news_eval` ORDER BY signal, class")
     assert nb.FORWARD == "forward from 2026-11-20" and nb.FORWARD_WEEK == dt.date(2026, 11, 16)
     view = (ROOT / "sql/bigquery/95_v_trial_news_overlay.sql").read_text(encoding="utf-8")
     assert "'%s'" % nb.FORWARD in view                                       # the label is the trial view's own
@@ -444,8 +481,9 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
     assert list(book.tabs) == ["My_Portfolio", "News_Board"] and book.tabs["News_Board"].updates == 1
     assert book.tabs["My_Portfolio"].updates == 0 and book.tabs["My_Portfolio"].ranges == ["A1:B200"]
-    assert len(sess.sql) == 7
+    assert len(sess.sql) == 9
     assert "WHERE symbol IN ('AAA.US', 'BBB.PA', 'CCC.US', 'DDD.US')" in sess.sql[4]
+    assert "v_symbol_news_class" in sess.sql[7] and "WHERE symbol IN ('AAA.US', 'BBB.PA', 'CCC.US', 'DDD.US')" in sess.sql[7]
     out = capsys.readouterr().out
     plain_book, plain_sess = Book({"My_Portfolio": Sheet([["Symbol", "Name"], ["AAA", ""], ["GC=F", "Gold"], ["TOTAL", ""]])}), Session()
     assert nb.run_once(True, book=plain_book, session=plain_sess, now=NOW, query=eb.bq_query) == 0
@@ -453,18 +491,18 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert "2 holding(s)" in capsys.readouterr().out
     gold_book, gold_sess = Book({"My_Portfolio": Sheet([["Symbol"], ["GC=F"]])}), Session()   # nothing BigQuery can look up
     assert nb.run_once(True, book=gold_book, session=gold_sess, now=NOW, query=eb.bq_query) == 0
-    assert len(gold_sess.sql) == 6 and not any("v_symbol_sector" in q for q in gold_sess.sql)
+    assert len(gold_sess.sql) == 7 and not any("v_symbol_sector" in q or "v_symbol_news_class" in q for q in gold_sess.sql)
     assert "1 holding(s)" in capsys.readouterr().out
     page = book.tabs["News_Board"].values
     assert all(len(r) == nb.WIDTH for r in page) and len(page) >= 120
     cells = [str(c) for r in page for c in r]
     assert not any("None" in c or c.lower() in ("nan", "+nan", "-nan", "inf") for c in cells)
-    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.1.0 | SHADOW")
+    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.2.0 | SHADOW")
     assert "only the Today Action Plan gives orders" in page[1][0]
     heads = [r[0] for r in page if re.match(r"^(VERDICT|\d\. )", str(r[0]))]
     assert [h.split(" - ")[0].split(" (")[0].split(" for ")[0] for h in heads] == [
         "VERDICT", "1. WORLD NEWS", "2. SECTOR TILT", "3. YOUR HOLDINGS AND THE TILT", "4. SHADOW LIST", "5. TRIAL",
-        "6. EVENTS AHEAD"]
+        "6. EVENTS AHEAD", "7. COMPANY NEWS, RE-READ"]
     assert heads[1] == ("1. WORLD NEWS - last full week (2026-11-09 to 2026-11-15) against its own previous four weeks; "
                         "news archive to 2026-11-18")
     assert heads[2] == "2. SECTOR TILT - in force 2026-11-17 to 2026-11-23, from the news of the week of 2026-11-09"
@@ -508,11 +546,11 @@ def test_n6_a_full_run_writes_one_page(capsys):
 def test_n6_dry_run_off_switch_and_failures_write_nothing(monkeypatch, capsys):
     book, sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session()
     assert nb.run_once(True, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert "News_Board" not in book.tabs and len(sess.sql) == 7
+    assert "News_Board" not in book.tabs and len(sess.sql) == 9
     assert "dry run:" in capsys.readouterr().out
     assert nb.main(["--dry-run"], book=book, session=Session(), now=NOW, query=eb.bq_query) == 0 and "News_Board" not in book.tabs
     for view in ("v_news_theme_weekly", "v_news_sector_tilt", "v_symbol_sector", "v_news_overlay_list", "v_trial_news_overlay",
-                 "news_theme_daily"):
+                 "news_theme_daily", "v_symbol_news_class", "v_company_news_eval"):
         old = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Sheet([["old page"]])})
         assert nb.run_once(False, book=old, session=Session(fail=view), now=NOW, query=eb.bq_query) == 2, view
         assert old.tabs["News_Board"].values == [["old page"]] and old.tabs["News_Board"].updates == 0
@@ -533,7 +571,7 @@ def test_n6_empty_and_stale_inputs_still_make_an_honest_page(capsys):
     book = Book({})                                                   # no portfolio page, no tilt, no list day, no trial
     sess = Session(trial=[], last_day=None, tilt=[], shadow=[])
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert len(sess.sql) == 6 and not any("v_symbol_sector" in s for s in sess.sql)        # nothing to look up
+    assert len(sess.sql) == 7 and not any("v_symbol_sector" in s or "v_symbol_news_class" in s for s in sess.sql)  # nothing to look up
     page = book.tabs["News_Board"].values
     flat = [r[0] for r in page] + [r[1] for r in page]
     for want in ("WARNING: the news archive could not be dated; treat the tilt below as unconfirmed.",
@@ -589,7 +627,7 @@ def test_n7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/news_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.isascii() and nb.__version__ == "1.1.0" and "v1.1.0 (2026-11-19)" in src
+    assert src.isascii() and nb.__version__ == "1.2.0" and "v1.2.0 (2026-11-20)" in src
     assert '("news_board", "%s", "news board")' % nb.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src and nb.TAB == "News_Board"
     assert "PORTFOLIO_TAB, \"A1:B200\")" in src and src.count("_raw_read(") == 1          # one read, of two columns
@@ -621,7 +659,7 @@ def test_n8_a_quota_answer_is_waited_out_and_other_write_errors_fail_the_run(mon
     book = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Flaky(1, Quota())})
     sess = Session()
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert waits == [65.0] and book.tabs["News_Board"].updates == 1 and len(sess.sql) == 7     # the queries are not repeated
+    assert waits == [65.0] and book.tabs["News_Board"].updates == 1 and len(sess.sql) == 9     # the queries are not repeated
     assert book.tabs["News_Board"].values[0][0].startswith("NEWS BOARD - ")
     assert "Sheets quota reached while writing News_Board" in capsys.readouterr().out
     waits.clear()
@@ -807,7 +845,7 @@ def test_n9_the_page_shows_the_events_and_is_built_without_them(monkeypatch, tmp
                                   "Wed 9 Dec, 22:00", "why c", "US", "tentative", "https://example.org/c"]
     assert page[head + 7][:3] == ["by Thu 31 Dec 2026", "date not announced", "Budget W"]
     assert firsts[head + 8].startswith("The news gate already raises CAUTION by itself within 30 hours of a Fed decision")
-    assert firsts[head + 9] == "" and firsts[head + 10].startswith("How to read:")
+    assert firsts[head + 9] == "" and firsts[head + 10].startswith("7. COMPANY NEWS, RE-READ")
     assert any(str(c).startswith("Promotion rule, fixed on 19 Nov 2026") for c in firsts[:head])     # after the trial
     assert "EVENTS 6 in the next 60 days" in out and "NEXT EVENT (ends today): Summit A" in out and "6 event(s) ahead" in out
     assert "EVENTS note" not in out
@@ -846,3 +884,58 @@ def test_n9_the_page_shows_the_events_and_is_built_without_them(monkeypatch, tmp
     assert "NEXT EVENT (in 2 days): Deadline Q, Sat 21 Nov 2026." in log and "1 event(s) ahead" in log
     assert "EVENTS note: The calendar holds no dated event after Sat 21 Nov 2026; it needs new dates." in log
 
+
+
+# ----------------------------------------------------------------------------- N10 (v1.2.0 [COMPANY]) the holdings' own news
+def test_n10_classes_and_readings_follow_the_view_thresholds():
+    assert [nb.news_class(s, n) for s, n in ((2.5, 3), (1.0, 1), (0.5, 2), (-0.5, 1), (-1.0, 1), (None, 0), (3.0, 0))] == [
+        "positive", "positive", "neutral", "neutral", "negative", "none", "none"]
+    assert [nb.provider_reading(v) for v in (0.99, 0.15, 0.1, -0.15, None)] == ["positive", "positive", "neutral", "negative", ""]
+    view = (ROOT / "sql/bigquery/98_v_company_news_eval.sql").read_text(encoding="utf-8")
+    assert "n.x >= 1 THEN 'positive'" in view and "n.x <= -1 THEN 'negative'" in view          # the same thresholds
+    assert "n.x >= 0.15 THEN 'positive'" in view and "n.x <= -0.15 THEN 'negative'" in view
+    classes = (ROOT / "sql/bigquery/97_v_symbol_news_class.sql").read_text(encoding="utf-8")
+    for ev in re.findall(r"'([A-Z_]+)' AS event_type|\(\d+, '([A-Z_]+)',", classes):
+        name = ev[0] or ev[1]
+        assert name in nb.EVENT_TEXT, name                                                    # every event has words
+    rows = nb.company_rows([{"symbol": "AAA", "name": "Alpha"}, {"symbol": "BBB.PA", "name": ""},
+                            {"symbol": "CCC.US", "name": "Charlie"}], COMPANY_ROWS)
+    assert [r["class"] for r in rows] == ["positive", "none", "none"]
+    assert rows[0]["event"] == "results above estimates" and rows[0]["day"] == "2026-11-17" and rows[0]["provider"] == "positive"
+    assert rows[1]["company"] == 0 and rows[1]["other"] == 2 and rows[1]["title"] == "" and rows[1]["note"] == ""
+    assert rows[2]["note"] == "no headline in the archive for these 7 days" and rows[2]["provider"] == ""
+    long = [dict(COMPANY_ROWS[0], top_title="x" * 200)]
+    assert nb.company_rows([{"symbol": "AAA.US", "name": ""}], long)[0]["title"] == "x" * 160 + "..."
+    line = nb.company_record_line(EVAL_ROWS)
+    assert line == ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500): "
+                    "positive +1.17 pts on 51 day(s); neutral +1.15 pts on 187 day(s); negative +3.19 pts on 5 day(s) - "
+                    "reading: NO EDGE. The provider's own reading, scored the same way: BIASED (class > 90 %).")
+    assert nb.company_record_line([]) == "Record of the new classes: no scored day yet."
+
+
+def test_n10_the_page_shows_each_holding_and_the_log_shows_counts_only(capsys):
+    book = Book({"My_Portfolio": Sheet(PORTFOLIO)})
+    assert nb.run_once(False, book=book, session=Session(), now=NOW, query=eb.bq_query) == 0
+    out = capsys.readouterr().out
+    page = book.tabs["News_Board"].values
+    firsts = [r[0] for r in page]
+    head = next(i for i, c in enumerate(firsts) if str(c).startswith("7. COMPANY NEWS, RE-READ"))
+    assert firsts[head] == ("7. COMPANY NEWS, RE-READ - your holdings' headlines of the last 7 days, classified from their own "
+                           "text. For information: no order comes from this section.")
+    assert page[head + 1][:11] == ["Symbol", "Name", "News (7 days)", "Score", "Headlines about the company",
+                                   "Filed under it, about others", "Main headline", "Its event", "Day", "Provider's reading (old)",
+                                   "Note"]
+    assert page[head + 2][:11] == ["AAA.US", "Alpha Bank", "POSITIVE", "+2.5", "3", "1",
+                                   "Alpha Bank (AAA) Tops Q3 Earnings and Revenue Estimates", "results above estimates",
+                                   "2026-11-17", "positive", ""]
+    assert page[head + 3][:11] == ["BBB.PA", "Bravo Tech", "no company news", "", "0", "2", "", "", "", "positive", ""]
+    assert page[head + 4][:11] == ["CCC.US", "Charlie Unknown", "no company news", "", "0", "0", "", "", "", "",
+                                   "no headline in the archive for these 7 days"]
+    assert page[head + 5][:10] == ["DDD.US", "", "NEGATIVE", "-2.0", "1", "0", "Delta Power (DDD) Lags Q3 Earnings Estimates",
+                                   "results below estimates", "2026-11-18", "positive"]
+    assert firsts[head + 6].startswith("Record of the new classes (US names, the 5 sessions after the news day")
+    assert firsts[head + 7].startswith("A headline counts for a holding only when it names the company")
+    assert firsts[head + 8] == "" and firsts[head + 9].startswith("How to read:")
+    assert "COMPANY NEWS 4 holding(s): 1 positive, 1 negative, 0 neutral, 2 without company news; Record of the new classes" in out
+    for sym in ("AAA", "BBB", "CCC", "DDD", "Alpha", "Delta"):
+        assert sym not in out, sym                                                         # holdings stay out of the run log

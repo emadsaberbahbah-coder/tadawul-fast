@@ -4,7 +4,14 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.1.0 (2026-11-19)
+v1.2.0 (2026-11-20)
+  1.2.0: [COMPANY] section 7, COMPANY NEWS RE-READ - each holding's headlines of the last 7 days as
+         v_symbol_news_class reads them from their own text: how many are about the company and how many,
+         filed under it, are about someone else; the week's class (POSITIVE / NEGATIVE / neutral / no company
+         news) from the summed score; the main headline and its event; the provider's old reading beside it;
+         and the record of the new classes from v_company_news_eval (5 sessions after the news day, against
+         the S&P 500). Owner, 20 Nov 2026 12:54 Riyadh, in Arabic: "let us do the expected improvement to the
+         news classification, improve it and re-classify it". Analysis only, like the rest of the page.
   1.1.0: [EVENTS] section 6, EVENTS AHEAD - the dated events of the next 60 days (summits, central-bank
          decisions, OPEC+ meetings, deadlines) from the hand-kept data/news_event_calendar.json, each with the
          page its date was read from. Owner, 19 Nov 2026 16:09: "Next" - part 3 of the stage, the calendar of
@@ -44,6 +51,10 @@ WHAT IT WRITES (its page News_Board; nothing else)
        data/news_event_calendar.json, soonest first, each with its source
        page; and the next one in a line under the verdict. No query: the
        file is read from the repository. For information only.
+    7. COMPANY NEWS, RE-READ (v1.2.0): each holding's headlines of the last
+       7 days, re-classified from their own text (v_symbol_news_class), with
+       the provider's old reading beside them and the record of the new
+       classes (v_company_news_eval). For information only.
 
 SAFETY
     Read-only on BigQuery (SELECT only) and on every tab but its own; the
@@ -75,7 +86,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -103,6 +114,21 @@ CALENDAR_STALE_DAYS = 21                                # a file checked longer 
 KIND_TEXT = {"summit": "Summit", "central_bank": "Central bank", "energy": "Oil", "deadline": "Deadline",
              "budget": "Budget"}
 STATUS_TEXT = {"confirmed": "confirmed", "tentative": "tentative", "date_not_set": "date not announced"}
+# v1.2.0 [COMPANY]: the holdings' own news, re-read (v_symbol_news_class, v_company_news_eval)
+COMPANY_DAYS = 7                                        # the window of section 7, today included
+NEWS_CLASS_TEXT = {"positive": "POSITIVE", "negative": "NEGATIVE", "neutral": "neutral", "none": "no company news"}
+EVENT_TEXT = {
+    "PREVIEW": "results ahead", "TAKEOVER_TARGET": "takeover of the company", "OFFERING": "share offering",
+    "LEGAL": "legal matter", "DIVIDEND_CUT": "dividend cut", "DIVIDEND_UP": "dividend raised",
+    "GUIDANCE_DOWN": "guidance lowered", "GUIDANCE_UP": "guidance raised", "DOWNGRADE": "rating downgrade",
+    "UPGRADE": "rating upgrade", "TARGET_DOWN": "price target lowered", "TARGET_UP": "price target raised",
+    "EARNINGS_INLINE": "results in line", "EARNINGS_MISS": "results below estimates",
+    "EARNINGS_BEAT": "results above estimates", "MGMT_EXIT": "management exit", "INDEX_ADD": "added to an index",
+    "APPROVAL_DEAL": "approval or deal", "ESTIMATES_UP": "estimates rising", "ESTIMATES_DOWN": "estimates falling",
+    "BUYBACK": "buyback", "PRICE_DOWN": "price fell (already happened)", "PRICE_UP": "price rose (already happened)",
+    "OPINION_NEG": "opinion: negative", "OPINION_POS": "opinion: positive", "RESULTS": "results",
+    "DIVIDEND_REGULAR": "regular dividend", "ACQUIRER": "acquisition by the company", "OTHER": "other news",
+}
 _DOW = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MON = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 # feature -> (label, kind of news, short name)
@@ -445,6 +471,60 @@ def holding_rows(holdings: Sequence[Dict[str, str]], sectors: Dict[str, str], ti
 
 
 # ----------------------------------------------------------------------------- #
+# v1.2.0 [COMPANY]: section 7, each holding's own news re-read
+# ----------------------------------------------------------------------------- #
+def news_class(score: Optional[float], company_items: int) -> str:
+    """The week's class of a name from the summed score of its company headlines (the view's own thresholds)."""
+    if not company_items:
+        return "none"
+    if score is not None and score >= 1:
+        return "positive"
+    if score is not None and score <= -1:
+        return "negative"
+    return "neutral"
+
+
+def provider_reading(mean: Optional[float]) -> str:
+    """The provider's old reading of the same headlines (the thresholds v_news_signal_eval uses)."""
+    if mean is None:
+        return ""
+    return "positive" if mean >= 0.15 else ("negative" if mean <= -0.15 else "neutral")
+
+
+def company_rows(holdings: Sequence[Dict[str, str]], found: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One row per holding, in the order of My_Portfolio; a holding with no headline at all says so."""
+    by = {text(r.get("symbol")).upper(): r for r in found or []}
+    out = []
+    for h in holdings:
+        r = next((by[a] for a in aliases(h["symbol"]) if a in by), {})
+        comp, other = int(num(r.get("company_items")) or 0), int(num(r.get("other_items")) or 0)
+        score = num(r.get("score")) if comp else None
+        cls = news_class(score, comp)
+        title = text(r.get("top_title")) if comp else ""
+        out.append({"symbol": h["symbol"], "name": h.get("name", ""), "class": cls, "score": score,
+                    "company": comp, "other": other, "title": title[:160] + ("..." if len(title) > 160 else ""),
+                    "event": EVENT_TEXT.get(text(r.get("top_event")), text(r.get("top_event"))) if comp else "",
+                    "day": text(r.get("top_day"))[:10] if comp else "",
+                    "provider": provider_reading(num(r.get("provider_mean"))) if r else "",
+                    "note": ("no headline in the archive for these %d days" % COMPANY_DAYS) if not r else ""})
+    return out
+
+
+def company_record_line(rows: Sequence[Dict[str, Any]]) -> str:
+    """The record of the new classes, in one line; the provider's own reading after it."""
+    mine = {text(r.get("class")): r for r in rows if text(r.get("signal")) == "company_news"}
+    if not mine:
+        return "Record of the new classes: no scored day yet."
+    parts = ["%s %s pts on %s day(s)" % (c, fmt(mine[c].get("mean_5d_excess_pp"), 2, True), fmt(mine[c].get("matured_5d"), 0))
+             for c in ("positive", "neutral", "negative") if c in mine]
+    reading = text(next(iter(mine.values())).get("reading"))
+    prov = next((text(r.get("reading")) for r in rows if text(r.get("signal")) == "provider_sentiment"), "")
+    return ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500): %s - reading: %s."
+            % ("; ".join(parts), reading or "not read")) + (" The provider's own reading, scored the same way: %s." % prov
+                                                              if prov else "")
+
+
+# ----------------------------------------------------------------------------- #
 # 5. Trial and the verdict
 # ----------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------- #
@@ -712,6 +792,21 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
                  "data release; this list is the longer view. Dates are read from the pages in the Source column and "
                  "can move."]),
             pad([]),
+            pad(["7. COMPANY NEWS, RE-READ - your holdings' headlines of the last %d days, classified from their own text. "
+                 "For information: no order comes from this section." % COMPANY_DAYS]),
+            pad(["Symbol", "Name", "News (%d days)" % COMPANY_DAYS, "Score", "Headlines about the company",
+                 "Filed under it, about others", "Main headline", "Its event", "Day", "Provider's reading (old)", "Note"])]
+    for c in data.get("company") or []:
+        out.append(pad([c["symbol"], c["name"], NEWS_CLASS_TEXT[c["class"]], fmt(c["score"], 1, True), str(c["company"]),
+                        str(c["other"]), c["title"], c["event"], c["day"], c["provider"], c["note"]]))
+    if not data.get("company"):
+        out.append(pad(["", "No holding could be read from %s." % PORTFOLIO_TAB]))
+    out += [pad([data.get("company_record") or "Record of the new classes: no scored day yet."]),
+            pad(["A headline counts for a holding only when it names the company (its name, an alias or its ticker in the "
+                 "market's own form); the score adds 2 for a hard event (results against estimates, guidance, a rating "
+                 "change, a dividend cut or raise, an offering, a legal matter), 1 for a softer one, 0.5 for an opinion "
+                 "and 0 for a price move that has already happened. POSITIVE at +1 or more, NEGATIVE at -1 or less."]),
+            pad([]),
             pad(["How to read: a theme is the share of the week's news on that subject, per 1,000 (the Iran, Russia and "
                  "US-China lines count events; the rest count news documents); a tone is an index where higher is more "
                  "positive. 'Normal' is the theme's own previous four weeks. A sector's weight for a theme is re-fitted "
@@ -788,6 +883,28 @@ def sql_trial(ds: str) -> str:
             "reading FROM `%s.v_trial_news_overlay`" % ds)
 
 
+def sql_company_news(ds: str, symbols: Sequence[Any], today: _dt.date) -> str:
+    """v1.2.0: per holding, the last COMPANY_DAYS days of re-read headlines; the main headline is the one with the
+    largest absolute score, the newest first, then by title (one order for the four picks, so they agree)."""
+    syms = clean_symbols(symbols)
+    if not syms:
+        raise ValueError("no symbol to look up")
+    pick = "ORDER BY ABS(score) DESC, published_at DESC, title LIMIT 1)[SAFE_OFFSET(0)]"
+    return ("SELECT symbol, COUNTIF(relevance = 'company') AS company_items, COUNTIF(relevance != 'company') AS other_items, "
+            "ROUND(SUM(score), 1) AS score, ROUND(AVG(provider_polarity), 3) AS provider_mean, "
+            "ARRAY_AGG(IF(relevance = 'company', title, NULL) IGNORE NULLS %s AS top_title, "
+            "ARRAY_AGG(IF(relevance = 'company', event_type, NULL) IGNORE NULLS %s AS top_event, "
+            "ARRAY_AGG(IF(relevance = 'company', CAST(news_date AS STRING), NULL) IGNORE NULLS %s AS top_day "
+            "FROM `%s.v_symbol_news_class` WHERE symbol IN (%s) AND news_date >= DATE_SUB(%s, INTERVAL %d DAY) "
+            "AND news_date <= %s GROUP BY symbol"
+            % (pick, pick, pick, ds, ", ".join("'%s'" % s for s in syms), _d(today), COMPANY_DAYS - 1, _d(today)))
+
+
+def sql_company_eval(ds: str) -> str:
+    return ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading "
+            "FROM `%s.v_company_news_eval` ORDER BY signal, class" % ds)
+
+
 # ----------------------------------------------------------------------------- #
 def collect(session: Any, project: str, dataset: str, location: str, holdings: Sequence[Dict[str, str]],
             today: _dt.date, query: Any, calendar: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -804,6 +921,8 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
                for r in (query(session, project, location, sql_sectors(ds, syms)) if syms else [])}
     shadow_day, names = shadow_names(query(session, project, location, sql_shadow(ds, today)))
     trial = trial_rows(query(session, project, location, sql_trial(ds)))
+    found = query(session, project, location, sql_company_news(ds, syms, today)) if syms else []
+    company_eval = query(session, project, location, sql_company_eval(ds))
     return {"last_news": last_news.isoformat() if last_news else "", "themes": themes, "tilt": tilt,
             "sectors": sector_rows(tilt), "record": record,
             "holdings": holding_rows(holdings, sectors, tilt, names, shadow_day), "shadow_day": shadow_day,
@@ -811,7 +930,8 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
             "counts": shadow_counts(names), "shadow": shadow_rows(names), "trial": trial,
             "verdict": verdict_lines(trial, tilt, last_news, today),
             "events": events, "events_notes": calendar_notes(cal, today), "next_event": next_event_line(events, today),
-            "events_checked": day_text(cal["checked"]) if cal.get("checked") else ""}
+            "events_checked": day_text(cal["checked"]) if cal.get("checked") else "",
+            "company": company_rows(holdings, found), "company_record": company_record_line(company_eval)}
 
 
 def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None, query=None,
@@ -850,6 +970,9 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         _out(data["next_event"])
     for note in data["events_notes"]:
         _out("EVENTS note: %s" % note)
+    tally = {k: sum(1 for c in data["company"] if c["class"] == k) for k in NEWS_CLASS_TEXT}
+    _out("COMPANY NEWS %d holding(s): %d positive, %d negative, %d neutral, %d without company news; %s" % (
+        len(data["company"]), tally["positive"], tally["negative"], tally["neutral"], tally["none"], data["company_record"]))
     for a in ARMS:
         t = data["tilt"].get(a)
         if t:

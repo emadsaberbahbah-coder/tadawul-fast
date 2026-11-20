@@ -280,6 +280,9 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.16.0 (20 Nov 2026): the company news re-read from the headline text, and its scoreboard
+    "v_symbol_news_class": "d8386af8a947caa69ff169401a1cce69a0ca258da4bee74039b99f80900cf9f0",
+    "v_company_news_eval": "130256c0270d10d9d99a85e8881e6560d3d15aae67c3780374ef65ef52171483",
     # apply_bq_views 1.15.0 (19 Nov 2026): C-2 per call, for the observe-only labels on the pages
     "v_c2_calls": "95ac9bcde2a5be87bfa95a2bb1ee42eaf1a26dec0abfa498339ecb3a137acd0f",
     # apply_bq_views 1.14.0 (19 Nov 2026): the news learning loop (themes, weights, tilt, shadow list, trial)
@@ -339,9 +342,10 @@ EXPECTED_ORDER = [
     "v_news_theme_weekly", "v_news_sector_weights", "v_news_sector_tilt", "v_news_overlay_list",
     "v_trial_news_overlay",
     "v_c2_calls",
+    "v_symbol_news_class", "v_company_news_eval",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 36)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 38)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -896,13 +900,16 @@ def case_v18():
     assert {c.strip() for c in bars_cte.split(",")} <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bt\.([a-z_]+)", code["v_symbol_analyst"])) <= cols["symbol_analyst_daily"]
     assert set(re.findall(r"\be\.([a-z_]+)", code["v_symbol_news"])) <= cols["symbol_news"]
+    assert set(re.findall(r"\be\.([a-z_]+)", code["v_symbol_news_class"])) <= cols["symbol_news"]
     used = {n: set(bv._REF.findall(c)) & bv.DEEP_TABLES for n, c in code.items()}
     assert {n: t for n, t in used.items() if t} == {
         "v_symbol_candles": {"symbol_bars_daily"}, "v_symbol_analyst": {"symbol_analyst_daily"},
         "v_symbol_news": {"symbol_news"},
         "v_outcome_engine": {"symbol_bars_daily"},           # v1.5.0: the engine reads the bars too
         "v_trial_c1": {"symbol_bars_daily"},                  # v1.8.0: the trial reads each call's 1-month price
-        "v_news_signal_eval": {"symbol_bars_daily"}}, used    # v1.10.0: each name's next 5 sessions
+        "v_news_signal_eval": {"symbol_bars_daily"},         # v1.10.0: each name's next 5 sessions
+        "v_symbol_news_class": {"symbol_news"},              # v1.16.0: each headline re-read
+        "v_company_news_eval": {"symbol_bars_daily"}}, used   # v1.16.0: the next sessions after the news day
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
@@ -2634,10 +2641,225 @@ def case_v38():
     assert [i for i, k in sorted(_c2_keep(us).items()) if k] == [1, 2, 3] and math.ceil(5 / 2) == 3
 
 
+# ----------------------------------------------------------------------------- v1.16.0: the company news re-read
+def _news_cfg():
+    """The literals of v_symbol_news_class, read from the file itself, so the Python reading below cannot drift from
+    the SQL. On 20 Nov 2026 this reading and the view gave the same relevance, event and direction on all 1,306
+    archived headlines."""
+    import re
+    code = bv._code({o.name: o for o in bv.load_objects()}["v_symbol_news_class"].template)
+    lst = lambda name: re.findall(r"'([^']*)'", re.search(r"\[([^\]]*)\] AS %s" % name, code).group(1))
+    aliases = re.search(r"\[(STRUCT\('[^\]]*)\] AS aliases", code).group(1)
+    rules_src = code[code.index("[STRUCT(5 AS priority"):code.index("] AS rules")]
+    rules = [(int(p), e, int(d), float(w), pat) for p, e, d, w, pat in re.findall(
+        r"(\d+)(?: AS priority)?, '([A-Z_]+)'(?: AS event_type)?, (-?\d)(?: AS direction)?, ([0-9.]+)(?: AS weight)?, "
+        r"r'([^']*)'", rules_src)]
+    return {"suffix": set(lst("suffix")), "generic": set(lst("generic")), "acronym": set(lst("acronym")),
+            "alias": re.findall(r"\('([^']+)'(?: AS symbol)?, '([^']+)'(?: AS alias)?\)", aliases),
+            "rules": sorted(rules),
+            "exch": dict(re.findall(r"WHEN '([A-Z]+)' THEN '([^']+)'", code)),
+            "noise": re.search(r"REGEXP_CONTAINS\(h\.t, r'([^']+)'\) THEN 'noise'", code).group(1),
+            "roundup": re.search(r"REGEXP_CONTAINS\(h\.t, r'([^']+)'\) THEN 'roundup'", code).group(1),
+            "actor": re.findall(r"CONCAT\('\(\^\|\[\^a-z0-9\]\)', k, r'([^']+)'\)",
+                                code[code.index("AS name_hit,"):code.index("AS actor_hit,")]),
+            "clause": re.search(r"REGEXP_REPLACE\(y\.t, r'([^']+)', ''\) AS main", code).group(1), "code": code}
+
+
+def _news_read(cfg, symbol, name, title):
+    """The view's reading of one headline, in Python: (relevance, event_type, direction, score)."""
+    import re
+    import unicodedata
+
+    def norm(x):
+        x = unicodedata.normalize("NFD", (x or "").replace("&amp;", "&"))
+        x = "".join(ch for ch in x if unicodedata.category(ch) != "Mn").lower()
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9&]+", " ", x)).strip()
+    t, n = norm(title), norm(name)
+    x = unicodedata.normalize("NFD", (title or "").replace("&amp;", "&"))
+    x = "".join(ch for ch in x if unicodedata.category(ch) != "Mn").lower()
+    ta = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9&:]+", " ", x)).strip()       # the colon kept: "...: BNP Paribas"
+    tick, mk = (symbol.rsplit(".", 1) if "." in symbol else (symbol, "US"))
+    tick = tick.replace("-UN", ".UN")
+    words = [w for w in n.split(" ") if w and w not in cfg["suffix"]]
+    keys = [a for s_, a in cfg["alias"] if s_ == symbol]
+    if words:
+        keys.append(" ".join(words))
+    if len(words) >= 2:
+        keys.append(words[0] + " " + words[1])
+    if words and len(words[0]) >= 4 and words[0] not in cfg["generic"]:
+        keys.append(words[0])
+    keys = {k for k in keys if len(k) >= 3}
+    tre = re.sub(r"([.\-])", r"\\\1", tick)
+    exch = cfg["exch"].get(mk, "NONE")
+    ticker = not re.fullmatch(r"[0-9]+", tick) and bool(
+        re.search("(" + exch + "):" + tre + r"\)", title)
+        or (mk == "US" and re.search(r"\(" + tre + r"\)", title))
+        or (mk == "US" and len(tick) >= 3 and tick not in cfg["acronym"]
+            and re.search("(^|[^A-Za-z0-9:])" + tre + "($|[^A-Za-z0-9])", title)))
+    named = any(re.search("(^|[^a-z0-9])" + k + "($|[^a-z0-9])", t) for k in keys)
+    rating, move, view, own = ["(^|[^a-z0-9])" + "%s" + a for a in cfg["actor"]]
+    actor = any(re.search(rating % k, t) or re.search(move % k, t)
+                or (re.search(view % k, t) and not re.search(own % k, t)) or ta.endswith(": " + k) for k in keys)
+    if re.search(cfg["noise"], t):
+        rel = "noise"
+    elif not (ticker or named):
+        rel = "other"
+    elif re.search(cfg["roundup"], t):
+        rel = "roundup"
+    elif actor:
+        rel = "actor"
+    else:
+        rel = "company"
+    main = re.sub(cfg["clause"], "", t)
+    ev = next(((e, d, w) for _, e, d, w, pat in cfg["rules"] if re.search(pat, main)), ("OTHER", 0, 0.0))
+    if rel == "noise":
+        ev = ("OTHER", 0, 0.0)
+    return rel, ev[0], ev[1], (ev[1] * ev[2] if rel == "company" else 0.0)
+
+
+def case_v39():
+    """v_symbol_news_class (1.16.0): relevance first, then the event of the main clause, then the score."""
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_symbol_news_class"]
+    assert v.path.name == "97_v_symbol_news_class.sql" and v.kind == "VIEW"
+    cfg = _news_cfg()
+    code = cfg["code"]
+    assert set(bv._REF.findall(code)) - {"v_symbol_news_class"} == {"symbol_news", "v_universe_latest"}
+    assert names.index("v_symbol_news_class") > names.index("v_universe_latest")
+    assert "the live system never reads BigQuery" in v.template and "Research view" in v.template
+    # the literals were read: 28 rules in strict priority order, every weight in {0, 0.5, 1, 2}
+    pri = [r[0] for r in cfg["rules"]]
+    assert len(cfg["rules"]) == 28 and pri == sorted(set(pri)), pri
+    assert {r[3] for r in cfg["rules"]} == {0.0, 0.5, 1.0, 2.0}
+    assert {r[1] for r in cfg["rules"] if r[3] == 0.0} == {"PREVIEW", "EARNINGS_INLINE", "PRICE_DOWN", "PRICE_UP", "RESULTS",
+                                                         "DIVIDEND_REGULAR", "ACQUIRER"}     # a price move scores 0
+    assert all(r[2] == 0 for r in cfg["rules"] if r[1] in ("PREVIEW", "EARNINGS_INLINE", "RESULTS", "DIVIDEND_REGULAR",
+                                                           "ACQUIRER"))
+    assert cfg["rules"][0][1] == "PREVIEW"                       # a forecast of results is never read as the results
+    assert "cal{2}" in code and "'company', COALESCE(c.ev.direction, 0) * COALESCE(c.ev.weight, 0.0), 0.0) AS score" in code
+    assert "IF(c.relevance = 'noise', 'OTHER'" in code and "c.polarity AS provider_polarity" in code
+    assert "CONCAT('&amp', CHR(59))" in code and code.count(";") == 1
+    # the steps the Python reading below takes in code are the view's own steps, in the view's order
+    for frag in ("CONCAT('(^|[^A-Za-z0-9:])', y.tick_re, '($|[^A-Za-z0-9])')",    # never right after a colon
+                 "CONCAT('(', y.exch, '):', y.tick_re, r'\\)')", "CONCAT(r'\\(', y.tick_re, r'\\)')",
+                 "LENGTH(y.tick) >= 3 AND y.tick NOT IN UNNEST(y.acronym)", "NOT REGEXP_CONTAINS(y.tick, r'^[0-9]+$')",
+                 "WHERE REGEXP_CONTAINS(h.main, r.pattern) ORDER BY r.priority LIMIT 1) AS ev",
+                 "WHERE LENGTH(x) >= 3) AS name_keys", "LENGTH(k.words[OFFSET(0)]) >= 4"):
+        assert frag in code, frag
+    assert len(cfg["actor"]) == 4 and "raises" not in cfg["actor"][0] and "says" not in cfg["actor"][0]
+    assert "REGEXP_CONTAINS(y.ta, CONCAT(': ', k, '$'))) AS actor_hit" in code and "ENDS_WITH(y.t" not in code
+    assert "r'[^a-z0-9&:]+', ' '), r'\\s+', ' ')) AS ta" in code                      # the colon kept in ta
+    assert "AND NOT REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (says|said|sees|expects|predicts) [a-z0-9 ]*" in code
+    steps = ["THEN 'noise'", "WHEN NOT (h.ticker_hit OR h.name_hit) THEN 'other'", "THEN 'roundup'",
+             "WHEN h.actor_hit THEN 'actor'", "ELSE 'company'"]
+    assert [code.index(x) for x in steps] == sorted(code.index(x) for x in steps)
+    cases = [
+        ("AX.US", "Axos Financial, Inc.", "Axos Financial (AX) Q1 Earnings and Revenues Top Estimates",
+         ("company", "EARNINGS_BEAT", 1, 2.0)),
+        ("SBLK.US", "Star Bulk Carriers Corp.", "Star Bulk Carriers (SBLK) Lags Q3 Earnings and Revenue Estimates",
+         ("company", "EARNINGS_MISS", -1, -2.0)),
+        ("HBAN.US", "Huntington Bancshares Incorporated", "Huntington Q3 Earnings Match Estimates as NII &amp; Fee Income Rise Y/Y",
+         ("company", "EARNINGS_INLINE", 0, 0.0)),
+        ("ZTO.US", "ZTO Express (Cayman) Inc.", "ZTO Express beats revenue estimates despite earnings miss",
+         ("company", "EARNINGS_BEAT", 1, 2.0)),                                           # the clause before "despite"
+        ("PINE.US", "Alpine Income Property Trust, Inc.",
+         "Alpine Income Property Trust (PINE) Stock Price Sinks Despite Raised Q3 Earnings Outlook",
+         ("company", "PRICE_DOWN", -1, 0.0)),                                             # a move: context, no score
+        ("SPNT.US", "SiriusPoint Ltd.", "SiriusPoint (SPNT) Expected to Beat Earnings Estimates: Can the Stock Move Higher?",
+         ("company", "PREVIEW", 0, 0.0)),
+        ("ASB.US", "Associated Banc-Corp", "Associated Banc-Corp raises quarterly dividend by 4.2% to $0.25/share",
+         ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("BARC.L", "Barclays PLC", "Barclays (LSE:BARC) Faces Class Action Probe Over Alleged Misleading Disclosures",
+         ("company", "LEGAL", -1, -2.0)),
+        ("UMBF.US", "UMB Financial Corporation", "UMB Financial (NASDAQ:UMBF) surprises with Q3 2026 sales",
+         ("company", "EARNINGS_BEAT", 1, 2.0)),
+        ("ACA.PA", "Crédit Agricole S.A.", "Credit Agricole Q3 profit rises on investment banking strength",
+         ("company", "EARNINGS_BEAT", 1, 2.0)),                                           # an alias, accents removed
+        ("AX.US", "Axos Financial, Inc.", "Axos Financial (AX) Stock May Be Undervalued On Earnings Power Today",
+         ("company", "OPINION_POS", 1, 0.5)),
+        ("DDI.US", "DoubleDown Interactive Co., Ltd.", "DoubleDown Interactive Reports Third Quarter 2026 Revenue of $94.3 "
+         "Million and Earnings per Fully Diluted Common Share of $7.41", ("company", "RESULTS", 0, 0.0)),
+        ("BMRN.US", "BioMarin Pharmaceutical Inc.", "BioMarin Enters Into Exclusive Worldwide License Agreement for "
+         "Investigational Medicines", ("company", "OTHER", 0, 0.0)),                     # not a legal matter
+        ("C.US", "Citigroup Inc.", "Citi downgrades BJ's Wholesale, says optimism already priced in",
+         ("actor", "OTHER", 0, 0.0)),                                                     # Citi is the one speaking
+        ("BNP.PA", "BNP Paribas SA", "GE Vernova meets high bar, but slot conversions now in focus: BNP Paribas",
+         ("actor", "OTHER", 0, 0.0)),                                                     # the source after a colon
+        ("C.US", "Citigroup Inc.", "AI fatigue: Citi cuts U.S. and tech to neutral, turns bullish on Europe",
+         ("actor", "OPINION_POS", 1, 0.0)),                                               # a rating move on others
+        ("C.US", "Citigroup Inc.", "Citi raises BJ's Wholesale price target to $120", ("actor", "OTHER", 0, 0.0)),
+        ("C.US", "Citigroup Inc.", "Emerging market central banks turn hawkish as inflation pressures mount, Citi says",
+         ("actor", "OTHER", 0, 0.0)),
+        ("KB.US", "KB Financial Group Inc.", "KB Financial Says Korea Stock Selloff Favors Buyers",
+         ("actor", "PRICE_DOWN", -1, 0.0)),
+        # review P2 (PR 1038): the company's own dividend, guidance or results are never "the company speaking"
+        ("C.US", "Citigroup Inc.", "Citi raises quarterly dividend", ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("AX.US", "Axos Financial, Inc.", "Axos Financial cuts full-year guidance", ("company", "GUIDANCE_DOWN", -1, -2.0)),
+        ("GSL.US", "Global Ship Lease, Inc.", "Global Ship Lease raises dividend by 10% to $0.6875",
+         ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("SBLK.US", "Star Bulk Carriers Corp.", "Star Bulk Carriers raises dividend by 11.1% to $1.00",
+         ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("C.US", "Citigroup Inc.", "Citi says fourth-quarter revenue will top estimates", ("company", "EARNINGS_BEAT", 1, 2.0)),
+        ("ICG.L", "ICG plc", "Workhuman Legal Settlement Change The Bull Case For ICG (LSE:ICG)?",
+         ("company", "OPINION_POS", 1, 0.5)),                                             # its own ticker ends it
+        ("PNFP.US", "Pinnacle Financial Partners, Inc.",
+         "Higher Rates Still Matter for U.S. Bank Stocks Like Pinnacle Financial Partners", ("company", "OTHER", 0, 0.0)),
+        ("CTO.US", "CTO Realty Growth, Inc.", "Memory supply constraints will be even 'tighter' in 2027: Micron CTO",
+         ("other", "OTHER", 0, 0.0)),                                                     # CTO here is a job title
+        ("CBK.US", "Commercial Bancgroup, Inc.", "Commerzbank (XTRA:CBK) Faces A Valuation Test, Is It Still A Bargain?",
+         ("other", "OPINION_POS", 1, 0.0)),                                               # Frankfurt's CBK, not CBK.US
+        ("TEN.US", "Tsakos Energy Navigation Limited", "Tenaris (BIT:TEN), What Is Behind The Fresh Attention?",
+         ("other", "OTHER", 0, 0.0)),
+        ("BNP.PA", "BNP Paribas SA", "Colgate Palmolive (CL) Stock Fair Value Edges Higher After Q3 Earnings Beat",
+         ("other", "TARGET_UP", 1, 0.0)),
+        ("CRC.US", "California Resources Corporation", "Bloom Energy Stock In Focus After California Power Deal",
+         ("other", "OTHER", 0, 0.0)),                                                     # a state is not the company
+        ("INVP.L", "Investec Group", "Form 8.5 (EPT/RI)-Gamma Communications Plc", ("noise", "OTHER", 0, 0.0)),
+        ("MBIN.US", "Merchants Bancorp", "1 Bank Stock on Our Buy List and 2 We Find Risky (MBIN)",
+         ("roundup", "OPINION_NEG", -1, 0.0)),
+        ("ICG.L", "ICG plc", "ICG (LSE:ICG) Closes Europe IX Fund At A Record €12 Billion", ("company", "OTHER", 0, 0.0)),
+        ("GRT-UN.TO", "Granite Real Estate Investment Trust", "Granite REIT (TSX:GRT.UN) Announces Three-for-One Unit Split",
+         ("company", "OTHER", 0, 0.0)),
+    ]
+    for sym, name, title, want in cases:
+        assert _news_read(cfg, sym, name, title) == want, (sym, title, _news_read(cfg, sym, name, title), want)
+
+
+def case_v40():
+    """v_company_news_eval (1.16.0): no look-ahead, against the S&P 500, the two signals scored alike."""
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_company_news_eval"]
+    assert v.path.name == "98_v_company_news_eval.sql" and v.kind == "VIEW"
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_company_news_eval"} == {"v_symbol_news_class", "symbol_bars_daily",
+                                                                    "market_series_daily"}
+    assert names.index("v_company_news_eval") > names.index("v_symbol_news_class")
+    for frag in ("b.date > y.d AND b.date <= DATE_ADD(y.d, INTERVAL 6 DAY)",          # entry strictly after the news day
+                 "ORDER BY b.date ASC LIMIT 1)[OFFSET(0)] AS e",
+                 "WHERE symbol = 'SPY'", "JOIN spy AS s ON s.date = n.e.date",
+                 "n.e.r5 - (s.c5 / s.close - 1) * 100 AS ex5", "n.e.r1 - (s.c1 / s.close - 1) * 100 AS ex1",
+                 "WHERE relevance = 'company' AND ENDS_WITH(symbol, '.US')",
+                 "WHERE provider_polarity IS NOT NULL AND ENDS_WITH(symbol, '.US')",
+                 "SELECT 'company_news' AS signal, symbol, d, x FROM nd",
+                 "SELECT 'provider_sentiment', symbol, d, x FROM od",
+                 "WHEN top_share > 0.9 THEN 'BIASED (class > 90 %)'", "WHEN min_matured < 60 THEN 'THIN'",
+                 "WHEN corr_5d IS NULL OR corr_5d <= 0.05 THEN 'NO EDGE'", "ELSE 'CANDIDATE (forward test)'"):
+        assert frag in code, frag
+    assert "b.date >= y.d" not in code and "CURRENT_DATE" not in code
+    assert re.search(r"no look-ahead", v.template) and "the live system never reads BigQuery" in v.template
+    # the scoreboard of 16 Nov stays as it was read
+    old = bv._code(objs["v_news_signal_eval"].template)
+    assert "v_symbol_news_class" not in old and "v_company_news_eval" not in old
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
-         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38]
+         case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
+         case_v39, case_v40]
 
 
 def test_v1(): case_v1()
@@ -2678,6 +2900,8 @@ def test_v35(): case_v35()
 def test_v36(): case_v36()
 def test_v37(): case_v37()
 def test_v38(): case_v38()
+def test_v39(): case_v39()
+def test_v40(): case_v40()
 
 
 if __name__ == "__main__":
