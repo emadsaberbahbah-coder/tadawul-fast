@@ -370,7 +370,8 @@ def test_hand_filled_rows_that_close_before_the_first_fill_are_carried_forward(m
     rec = hand.values
     assert [r[0] for r in rec[1:9] if r[0]] == ["AAA", "DDD", "GGG", "CCC", "OLD", "EEE", "BBB"]
     old = [r for r in rec if r[0] == "OLD"][0]
-    assert old[:7] == ["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28, ih.CARRY_MARK]
+    assert old[:7] == ["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28,
+                       "carried: closed 2026-08-06 (hand-filled, before the first fill)"]
     assert [r[0] for r in rec].count("AAA") == 1 and "BAD" not in [r[0] for r in rec]
     assert [r for r in rec if r[7] == "carried"][0][8] == 1
     assert ih.run_once(False, book=book, now=NOW, found=_found(body())) == 0      # stamped now: only marked rows carry
@@ -399,3 +400,25 @@ def test_an_order_filled_in_pieces_is_one_sale_even_with_an_unknown_start():
                   trade("q3", "QQQ", "SELL", 6, "2026-09-03T13:30:00Z", realized=2.0)]
     one = ih.round_trips(_fills(two_orders))
     assert len(one) == 1 and one[0]["fills"] == 3 and one[0]["realized"] == 3.0     # a scale-out is still one trip
+
+
+def test_an_order_filled_around_a_sale_keeps_the_positions_history():
+    """Codex P2 on #1041: BUY 10, SELL 10, BUY 10 (the same buy order), SELL 10 is two trips, not one open position."""
+    seq = [trade("r1", "RRR", "BUY", 10, "2026-09-01T14:00:00Z", order="A"),
+           trade("r2", "RRR", "SELL", 10, "2026-09-02T14:00:00Z", realized=5.0, order="B"),
+           trade("r3", "RRR", "BUY", 10, "2026-09-03T14:00:00Z", order="A"),
+           trade("r4", "RRR", "SELL", 10, "2026-09-04T14:00:00Z", realized=-2.0, order="C")]
+    trips = ih.round_trips(_fills(seq))
+    assert [(t["realized"], t["fills"]) for t in trips] == [(5.0, 2), (-2.0, 2)]
+    assert len(ih.executions(_fills(seq))) == 4
+
+
+def test_a_carried_row_keeps_its_closing_year_a_year_later():
+    """Codex P2 on #1041: the closing day is written when a row is first carried and read back, never guessed again."""
+    rec = [ih.TRADE_HEAD + ["", "as_of", "2026-11-21 00:20 Riyadh"],
+           ["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28, ih.carry_mark(D(2026, 8, 6))],
+           ["NEW", "New Co", "USD", "stop", "1→3 Sep", -1.0, ""]]                    # rebuilt from fills: not carried
+    kept = ih.carried_rows(rec, D(2026, 8, 21), D(2027, 8, 6))
+    assert kept == [["OLD", "Old Co", "USD", "market exit", "5→6 Aug", -6.28,
+                     "carried: closed 2026-08-06 (hand-filled, before the first fill)"]]
+    assert ih.carried_rows(rec, D(2026, 8, 1), D(2027, 8, 6)) == []                  # the fills now reach it

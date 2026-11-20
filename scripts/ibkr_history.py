@@ -10,8 +10,10 @@ never written in its own currency into realized_usd, which the page sums as
 USD. (P2) the record and its as_of come only from files that carry a trades
 read: a file with only the performance series updates the return, and the
 record keeps what it holds. Rows of a hand-filled record (no as_of) that close
-before the first fill are carried forward, marked in column G, so a first run
-without the older fills cannot drop them.
+before the first fill are carried forward, marked in column G with the closing
+day they were given, so a first run without the older fills cannot drop them
+and a later year cannot misread them. Only consecutive fills of one order are
+joined: a fill on the other side in between starts a new execution.
 
 WHY (owner, 20 Nov 2026 22:40 Riyadh, in Arabic: a full review of the file
 against the market - the main differences between the pages, and between the
@@ -347,20 +349,25 @@ def merge_fills(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) ->
 
 
 def executions(fills: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The stock fills of one order (same symbol, currency, side and order id; without an order id, the same time)
-    as one execution at its last fill: an order filled in pieces is one sale, not several. PURE."""
-    by: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    """Consecutive stock fills of one order (same symbol, currency, side and order id; without an order id, the same
+    time) as one execution at its last fill: an order filled in pieces is one sale, not several. A fill of the symbol
+    on the other side in between starts a new execution, so the position's history keeps its order (Codex P2). PURE."""
+    out: List[Dict[str, Any]] = []
+    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for f in sorted((f for f in fills if f["sec_type"] in ("STK", "")), key=lambda f: (f["time"], f["trade_id"])):
-        key = (f["symbol"], f["ccy"], f["side"], f["order_id"] or f["time"].isoformat())
-        e = by.get(key)
-        if e is None:
-            by[key] = dict(f)
+        sym = (f["symbol"], f["ccy"])
+        key = (f["side"], f["order_id"] or f["time"].isoformat())
+        e = last.get(sym)
+        if e is not None and e["_key"] == key:
+            e["size"] += f["size"]
+            e["realized"] += f["realized"]
+            e["commission"] += f["commission"]
+            e["time"], e["trade_id"], e["order_type"] = f["time"], f["trade_id"], f["order_type"] or e["order_type"]
             continue
-        e["size"] += f["size"]
-        e["realized"] += f["realized"]
-        e["commission"] += f["commission"]
-        e["time"], e["trade_id"], e["order_type"] = f["time"], f["trade_id"], f["order_type"] or e["order_type"]
-    return sorted(by.values(), key=lambda f: (f["time"], f["trade_id"]))
+        e = dict(f, _key=key)
+        out.append(e)
+        last[sym] = e
+    return sorted(out, key=lambda f: (f["time"], f["trade_id"]))
 
 
 def round_trips(fills: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -453,7 +460,14 @@ def trade_rows(trips: Sequence[Dict[str, Any]], fx: Dict[str, List[Tuple[_dt.dat
 _SPAN_END = re.compile(r"(\d{1,2}) ([A-Z][a-z]{2})\s*$")
 _MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
                                        "Dec"), 1)}
-CARRY_MARK = "carried: hand-filled, before the first fill"
+CARRY_PREFIX = "carried: closed "
+_CARRIED = re.compile(r"^carried: closed (\d{4}-\d{2}-\d{2})")
+
+
+def carry_mark(end: _dt.date) -> str:
+    """Column G of a carried row: the closing day it was given when first carried, so the year is never guessed again
+    (Codex P2: a yearless span re-read a year later would land in the new year)."""
+    return "%s%s (hand-filled, before the first fill)" % (CARRY_PREFIX, end.isoformat())
 
 
 def span_end(text: Any, today: _dt.date) -> Optional[_dt.date]:
@@ -478,12 +492,14 @@ def carried_rows(values: Sequence[Sequence[Any]], first_fill: Optional[_dt.date]
     stamped = any(str(r[7]).strip().lower() == "as_of" for r in rows)
     out: List[List[Any]] = []
     for r in rows[1:]:
-        if not str(r[0]).strip() or (stamped and str(r[6]).strip() != CARRY_MARK):
+        m = _CARRIED.match(str(r[6]).strip())
+        if not str(r[0]).strip() or (stamped and not m):
             continue
-        end, val = span_end(r[4], today), ic._num(r[5])
+        end = _dt.date.fromisoformat(m.group(1)) if m else span_end(r[4], today)
+        val = ic._num(r[5])
         if end is None or val is None or (first_fill is not None and end >= first_fill):
             continue
-        out.append([str(r[0]).strip(), r[1], r[2], r[3], r[4], val, CARRY_MARK])
+        out.append([str(r[0]).strip(), r[1], r[2], r[3], r[4], val, carry_mark(end)])
     return out
 
 

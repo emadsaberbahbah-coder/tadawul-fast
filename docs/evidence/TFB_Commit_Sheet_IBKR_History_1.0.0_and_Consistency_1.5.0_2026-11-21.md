@@ -62,8 +62,10 @@
 - **P2: a stamp without a trades read.** The record and its `as_of` now come only from files that carry a trades read. A file with only the performance series updates the return; `_IBKR_Fills` and `_IBKR_Trades` keep what they hold.
   - A first run can no longer replace the hand-filled record with a shorter one. Its rows that close before the first fill are carried forward and marked in column G.
 - **Also found on the real data.** One market order filled in two pieces (4 + 1 shares) read as two trips. Fills of one order now count as one execution.
+- **P2 (second pass): an order filled around a sale.** Only consecutive fills of one order are joined. A fill on the other side in between starts a new execution, so BUY 10, SELL 10, BUY 10 (same buy order), SELL 10 stays two trips.
+- **P2 (second pass): the closing year of a carried row.** Column G now records the closing day when a row is first carried ("carried: closed 2026-08-06 ..."). It is read back on every later run, never guessed again from the yearless span.
 
-## Tests (`tests/test_ibkr_history.py`, 21; `tests/test_consistency_check.py` K11)
+## Tests (`tests/test_ibkr_history.py`, 23; `tests/test_consistency_check.py` K11)
 - **Files.**
   - Parsing: schema, captured_at against creation time, a future time, the longest series, fills.
   - Every date shape.
