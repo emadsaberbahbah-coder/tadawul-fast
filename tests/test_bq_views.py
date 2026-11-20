@@ -281,7 +281,7 @@ INSTALLED = {
 # 341bd1f3a44d (1.5.0).
 PENDING = {
     # apply_bq_views 1.16.0 (20 Nov 2026): the company news re-read from the headline text, and its scoreboard
-    "v_symbol_news_class": "c998f04180ff2dc25e685e5b8d1f36af47684def23afa5a564fe754b719334f4",
+    "v_symbol_news_class": "d8386af8a947caa69ff169401a1cce69a0ca258da4bee74039b99f80900cf9f0",
     "v_company_news_eval": "130256c0270d10d9d99a85e8881e6560d3d15aae67c3780374ef65ef52171483",
     # apply_bq_views 1.15.0 (19 Nov 2026): C-2 per call, for the observe-only labels on the pages
     "v_c2_calls": "95ac9bcde2a5be87bfa95a2bb1ee42eaf1a26dec0abfa498339ecb3a137acd0f",
@@ -2660,7 +2660,8 @@ def _news_cfg():
             "exch": dict(re.findall(r"WHEN '([A-Z]+)' THEN '([^']+)'", code)),
             "noise": re.search(r"REGEXP_CONTAINS\(h\.t, r'([^']+)'\) THEN 'noise'", code).group(1),
             "roundup": re.search(r"REGEXP_CONTAINS\(h\.t, r'([^']+)'\) THEN 'roundup'", code).group(1),
-            "actor": re.search(r"CONCAT\('\(\^\|\[\^a-z0-9\]\)', k, r'([^']+)'\)\) OR ENDS_WITH", code).group(1),
+            "actor": re.findall(r"CONCAT\('\(\^\|\[\^a-z0-9\]\)', k, r'([^']+)'\)",
+                                code[code.index("AS name_hit,"):code.index("AS actor_hit,")]),
             "clause": re.search(r"REGEXP_REPLACE\(y\.t, r'([^']+)', ''\) AS main", code).group(1), "code": code}
 
 
@@ -2674,6 +2675,9 @@ def _news_read(cfg, symbol, name, title):
         x = "".join(ch for ch in x if unicodedata.category(ch) != "Mn").lower()
         return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9&]+", " ", x)).strip()
     t, n = norm(title), norm(name)
+    x = unicodedata.normalize("NFD", (title or "").replace("&amp;", "&"))
+    x = "".join(ch for ch in x if unicodedata.category(ch) != "Mn").lower()
+    ta = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9&:]+", " ", x)).strip()       # the colon kept: "...: BNP Paribas"
     tick, mk = (symbol.rsplit(".", 1) if "." in symbol else (symbol, "US"))
     tick = tick.replace("-UN", ".UN")
     words = [w for w in n.split(" ") if w and w not in cfg["suffix"]]
@@ -2693,7 +2697,9 @@ def _news_read(cfg, symbol, name, title):
         or (mk == "US" and len(tick) >= 3 and tick not in cfg["acronym"]
             and re.search("(^|[^A-Za-z0-9:])" + tre + "($|[^A-Za-z0-9])", title)))
     named = any(re.search("(^|[^a-z0-9])" + k + "($|[^a-z0-9])", t) for k in keys)
-    actor = any(re.search("(^|[^a-z0-9])" + k + cfg["actor"], t) or t.endswith(" " + k) for k in keys)
+    rating, move, view, own = ["(^|[^a-z0-9])" + "%s" + a for a in cfg["actor"]]
+    actor = any(re.search(rating % k, t) or re.search(move % k, t)
+                or (re.search(view % k, t) and not re.search(own % k, t)) or ta.endswith(": " + k) for k in keys)
     if re.search(cfg["noise"], t):
         rel = "noise"
     elif not (ticker or named):
@@ -2741,6 +2747,10 @@ def case_v39():
                  "WHERE REGEXP_CONTAINS(h.main, r.pattern) ORDER BY r.priority LIMIT 1) AS ev",
                  "WHERE LENGTH(x) >= 3) AS name_keys", "LENGTH(k.words[OFFSET(0)]) >= 4"):
         assert frag in code, frag
+    assert len(cfg["actor"]) == 4 and "raises" not in cfg["actor"][0] and "says" not in cfg["actor"][0]
+    assert "REGEXP_CONTAINS(y.ta, CONCAT(': ', k, '$'))) AS actor_hit" in code and "ENDS_WITH(y.t" not in code
+    assert "r'[^a-z0-9&:]+', ' '), r'\\s+', ' ')) AS ta" in code                      # the colon kept in ta
+    assert "AND NOT REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (says|said|sees|expects|predicts) [a-z0-9 ]*" in code
     steps = ["THEN 'noise'", "WHEN NOT (h.ticker_hit OR h.name_hit) THEN 'other'", "THEN 'roundup'",
              "WHEN h.actor_hit THEN 'actor'", "ELSE 'company'"]
     assert [code.index(x) for x in steps] == sorted(code.index(x) for x in steps)
@@ -2775,7 +2785,26 @@ def case_v39():
         ("C.US", "Citigroup Inc.", "Citi downgrades BJ's Wholesale, says optimism already priced in",
          ("actor", "OTHER", 0, 0.0)),                                                     # Citi is the one speaking
         ("BNP.PA", "BNP Paribas SA", "GE Vernova meets high bar, but slot conversions now in focus: BNP Paribas",
+         ("actor", "OTHER", 0, 0.0)),                                                     # the source after a colon
+        ("C.US", "Citigroup Inc.", "AI fatigue: Citi cuts U.S. and tech to neutral, turns bullish on Europe",
+         ("actor", "OPINION_POS", 1, 0.0)),                                               # a rating move on others
+        ("C.US", "Citigroup Inc.", "Citi raises BJ's Wholesale price target to $120", ("actor", "OTHER", 0, 0.0)),
+        ("C.US", "Citigroup Inc.", "Emerging market central banks turn hawkish as inflation pressures mount, Citi says",
          ("actor", "OTHER", 0, 0.0)),
+        ("KB.US", "KB Financial Group Inc.", "KB Financial Says Korea Stock Selloff Favors Buyers",
+         ("actor", "PRICE_DOWN", -1, 0.0)),
+        # review P2 (PR 1038): the company's own dividend, guidance or results are never "the company speaking"
+        ("C.US", "Citigroup Inc.", "Citi raises quarterly dividend", ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("AX.US", "Axos Financial, Inc.", "Axos Financial cuts full-year guidance", ("company", "GUIDANCE_DOWN", -1, -2.0)),
+        ("GSL.US", "Global Ship Lease, Inc.", "Global Ship Lease raises dividend by 10% to $0.6875",
+         ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("SBLK.US", "Star Bulk Carriers Corp.", "Star Bulk Carriers raises dividend by 11.1% to $1.00",
+         ("company", "DIVIDEND_UP", 1, 2.0)),
+        ("C.US", "Citigroup Inc.", "Citi says fourth-quarter revenue will top estimates", ("company", "EARNINGS_BEAT", 1, 2.0)),
+        ("ICG.L", "ICG plc", "Workhuman Legal Settlement Change The Bull Case For ICG (LSE:ICG)?",
+         ("company", "OPINION_POS", 1, 0.5)),                                             # its own ticker ends it
+        ("PNFP.US", "Pinnacle Financial Partners, Inc.",
+         "Higher Rates Still Matter for U.S. Bank Stocks Like Pinnacle Financial Partners", ("company", "OTHER", 0, 0.0)),
         ("CTO.US", "CTO Realty Growth, Inc.", "Memory supply constraints will be even 'tighter' in 2027: Micron CTO",
          ("other", "OTHER", 0, 0.0)),                                                     # CTO here is a job title
         ("CBK.US", "Commercial Bancgroup, Inc.", "Commerzbank (XTRA:CBK) Faces A Valuation Test, Is It Still A Bargain?",

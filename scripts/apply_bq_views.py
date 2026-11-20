@@ -15,7 +15,10 @@ noise / other), event type, direction, weight and score - with the provider
 polarity beside it; the same rules written in Python gave the same reading on
 all 1,306 headlines (a plain US ticker never counts right after a colon:
 "XTRA:CBK" is Commerzbank, not CBK.US - found by the worked examples in the
-tests). New v_company_news_eval: the scoreboard of the new classes
+tests; and the company counts as the one speaking about others only for a
+rating, target or view - never for its own dividend, guidance or results:
+"Star Bulk Carriers raises dividend" is company news - review P2 on PR 1038).
+New v_company_news_eval: the scoreboard of the new classes
 (entry the first close after the news day, 1 and 5 sessions against the S&P
 500, US names), the provider's sentiment scored the same way beside it. First
 read: the classes are balanced at last (positive 21 %, neutral 77 %, negative

@@ -21,7 +21,7 @@
 --   first_day, last_day, reading:
 --     'NOT MEASURABLE (one class)', 'BIASED (class > 90 %)', 'NO EDGE' (corr_5d <= 0.05, or positive not above
 --     negative), 'THIN' (a class with fewer than 60 matured days), else 'CANDIDATE (forward test)'. Never "proven".
--- First read (20 Nov 2026, 2 Oct - 20 Nov): company_news positive 57 days +1.17 pp, neutral 213 days +1.14 pp, negative
+-- First read (20 Nov 2026, 2 Oct - 20 Nov): company_news positive 58 days +1.14 pp, neutral 213 days +1.16 pp, negative
 -- 6 days +3.19 pp, corr 0.02 - balanced at last (the provider read 455 of 464 days positive) but no edge yet.
 -- Research view: the live system never reads BigQuery; no decision, gate or order depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_company_news_eval`

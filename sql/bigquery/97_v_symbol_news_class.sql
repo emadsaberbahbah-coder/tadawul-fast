@@ -11,7 +11,10 @@
 --   relevance  company: the title names the company - its name, an alias, or its ticker in the market's own form
 --                       ("(AX)", "NASDAQ:PNFP", "LSE:BARC"; a plain ticker only for a US name of 3+ letters that is
 --                       not a common acronym, and never right after a colon: "XTRA:CBK" is Commerzbank, not CBK.US);
---              actor:   the company is the one speaking ("Citi downgrades X", "...: BNP Paribas");
+--              actor:   the company is the one speaking about others - a rating action ("Citi downgrades X"), a
+--                       target or rating move ("Citi cuts U.S. and tech to neutral"; never its own dividend or
+--                       guidance: "Star Bulk Carriers raises dividend" is company news), a view that is not about its
+--                       own results ("Citi says ..."), or the source after a colon ("...: BNP Paribas");
 --              roundup: a list of several stocks; noise: filings and notices; other: about someone else.
 --   event      the first rule that matches the clause before "despite" / "even as" / "while", by priority (the
 --              rules array below; "cal{2}" is written so because the loader refuses the bare word).
@@ -94,6 +97,8 @@ base AS (
     u.name, u.sector, COALESCE(u.symbol_label, e.symbol) AS symbol_label,
     TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(REGEXP_REPLACE(NORMALIZE(REPLACE(e.title, CONCAT('&amp', CHR(59)), '&'), NFD), r'\p{M}', '')),
          r'[^a-z0-9&]+', ' '), r'\s+', ' ')) AS t,
+    TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(REGEXP_REPLACE(NORMALIZE(REPLACE(e.title, CONCAT('&amp', CHR(59)), '&'), NFD), r'\p{M}', '')),
+         r'[^a-z0-9&:]+', ' '), r'\s+', ' ')) AS ta,
     TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(REGEXP_REPLACE(NORMALIZE(REPLACE(COALESCE(u.name, ''), CONCAT('&amp', CHR(59)), '&'), NFD), r'\p{M}', '')),
          r'[^a-z0-9&]+', ' '), r'\s+', ' ')) AS n,
     REPLACE(IF(STRPOS(e.symbol, '.') > 0, REGEXP_EXTRACT(e.symbol, r'^(.*)\.[^.]+$'), e.symbol), '-UN', '.UN') AS tick,
@@ -146,7 +151,11 @@ hits AS (
            AND REGEXP_CONTAINS(y.title, CONCAT('(^|[^A-Za-z0-9:])', y.tick_re, '($|[^A-Za-z0-9])'))))) AS ticker_hit,
     EXISTS (SELECT 1 FROM UNNEST(y.name_keys) AS k WHERE REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, '($|[^a-z0-9])'))) AS name_hit,
     EXISTS (SELECT 1 FROM UNNEST(y.name_keys) AS k
-            WHERE REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (downgrades|upgrades|raises|cuts|lowers|initiates|reiterates|maintains|names|says|said|sees|expects|predicts|backs|upgrade|downgrade|analysts?|strategists?|economists?|s (stock |top )?picks)\b')) OR ENDS_WITH(y.t, CONCAT(' ', k))) AS actor_hit,
+            WHERE REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (downgrades|upgrades|initiates|reiterates|maintains|names|backs|upgrade|downgrade|analysts?|strategists?|economists?|s (stock |top )?picks)\b'))
+               OR REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (raises|cuts|lowers|lifts|trims) [a-z0-9 ]*\b(price target|target|pt|rating|estimates?|to (buy|sell|hold|neutral|outperform|underperform|overweight|underweight|equal weight|market perform|sector perform|peer perform))\b'))
+               OR (REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (says|said|sees|expects|predicts)\b'))
+                   AND NOT REGEXP_CONTAINS(y.t, CONCAT('(^|[^a-z0-9])', k, r' (says|said|sees|expects|predicts) [a-z0-9 ]*\b(revenue|sales|earnings|profit|eps|ebitda|guidance|outlook|results|dividend|q[1-4]|quarter|full year|fy|production|deliveries|orders|bookings)\b')))
+               OR REGEXP_CONTAINS(y.ta, CONCAT(': ', k, '$'))) AS actor_hit,
     REGEXP_REPLACE(y.t, r'\b(despite|even as|while)\b.*$', '') AS main
   FROM keys AS y
 ),
