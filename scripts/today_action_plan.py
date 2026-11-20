@@ -19,8 +19,11 @@ v1.8.0 (2026-11-20)
                SOLD AT IBKR: one step "IBKR shows <SYM> sold today: the position is 0 and no stop is working on it.
                Record the sale in the ledger (_Portfolio_CostBasis) from the broker's confirmation; nothing to
                place.", its final decision is SELL with those words, its control status reads VERIFY (the ledger
-               still holds it) and its order status "SOLD at IBKR today (position 0)". A holding absent with no day's
-               P&L reads as before. TFB_TAP_SOLD_AT_BROKER = on (default) | off (= 1.7.1).
+               still holds it) and its order status "SOLD at IBKR today (position 0)". When the capture still shows a
+               sell order working on it (Codex P1, #1039), the step says so and comes first: "... but a sell order is
+               still working on it (stop 80.98 for 24 shares). Cancel it at IBKR - with no shares it can open a short
+               position - then record the sale in the ledger ...". A holding absent with no day's P&L reads as before.
+               TFB_TAP_SOLD_AT_BROKER = on (default) | off (= 1.7.1).
            (b) the page reads Holding_Read (optional). A holding whose next-session read is PINNED BY AN OFFER and has
                no stop at IBKR gets: "No stop order is working at IBKR for <SYM>, which is under a cash tender
                offer: if its shares were tendered, place no sell order on them (selling tendered shares can open a
@@ -866,6 +869,9 @@ def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
     act, qty, stop = h["action"], h.get("qty") or 0, h.get("stop")
     shares = "%s shares" % fmt(qty, 0) if qty else "the position"
     if h.get("sold_at_broker"):                                     # 1.8.0
+        if open_sells_text(h):                                      # Codex P1, #1039
+            return "SELL", ("Sold at IBKR today, but a sell order is still working on it: cancel it at IBKR (with no "
+                            "shares it can open a short position), then record the sale in the ledger.")
         return "SELL", ("Sold at IBKR today: the position is 0 and no stop is working on it - nothing to place. Record "
                         "the sale in the ledger from the broker's confirmation.")
     if h.get("review_reason") and act != "NO RULE":
@@ -916,7 +922,8 @@ def _holding_control(h: Dict[str, Any]) -> str:
     if h.get("action") == "NO RULE":
         return "n/a"                                                # no exit rule: nothing here is checked at IBKR
     if h.get("sold_at_broker"):                                     # 1.8.0
-        return "VERIFY: sold at IBKR today - the ledger still holds it"
+        return "VERIFY: sold at IBKR today - %sthe ledger still holds it" % (
+            "a sell order is still working and " if open_sells_text(h) else "")
     return "VERIFY: %s" % h["review_reason"] if h.get("review_reason") else "OK"
 
 
@@ -925,7 +932,8 @@ def _holding_order(h: Dict[str, Any], tol_pct: float) -> str:
     if h.get("action") == "NO RULE":
         return ""
     if h.get("sold_at_broker"):                                     # 1.8.0
-        return "SOLD at IBKR today (position 0)"
+        left = open_sells_text(h)
+        return "SOLD at IBKR today (position 0)" + ("; sell order still working: %s" % left if left else "")
     if h.get("at_broker") is False:
         return "not in the IBKR capture"
     state = stop_state(h, tol_pct)
@@ -1172,7 +1180,17 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
             h["broker_qty"] = cap["positions"][h["symbol"]]
         elif h["symbol"] in closed:
             h["closed_at_broker"] = True                            # 0 shares, with a P&L for the day
+            # a sell order still working on a closed position can open a short (Codex P1, #1039)
+            h["open_sells"] = ([("stop", px, q) for px, q in (cap.get("stops") or {}).get(h["symbol"], [])] +
+                               [("limit", px, q) for px, q in (cap.get("limits") or {}).get(h["symbol"], [])])
     return out
+
+
+def open_sells_text(h: Dict[str, Any]) -> str:
+    """1.8.0 (Codex P1, #1039): the sell orders the capture still shows working on a position IBKR closed today,
+    e.g. "stop 80.98 for 24 shares; limit 99.50 for 24 shares" ("" when none)."""
+    return "; ".join("%s %s for %s shares" % (kind, fmt(px) if px is not None else "(price not read)", fmt(q, 0))
+                     for kind, px, q in h.get("open_sells") or [])
 
 
 def stop_state(h: Dict[str, Any], tol_pct: float) -> str:
@@ -1199,6 +1217,14 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
     steps: List[Dict[str, Any]] = []
     shares = "%s shares" % fmt(qty, 0) if qty else "the position"
     if h.get("sold_at_broker"):                                     # 1.8.0
+        left = open_sells_text(h)
+        if left:                                                    # Codex P1, #1039: an order still working
+            return [{"urgency": 0.5, "symbol": sym, "kind": "sold", "source": "Exit_Plan",
+                     "do": "IBKR shows %s sold today: the position is 0, but a sell order is still working on it (%s). "
+                           "Cancel it at IBKR - with no shares it can open a short position - then record the sale in "
+                           "the ledger (_Portfolio_CostBasis) from the broker's confirmation." % (sym, left),
+                     "levels": "plan stop %s · last %s · sell order still working" % (fmt(stop), fmt(h.get("last"))),
+                     "why": h.get("why", "")}]
         return [{"urgency": 2.6, "symbol": sym, "kind": "sold", "source": "Exit_Plan",
                  "do": "IBKR shows %s sold today: the position is 0 and no stop is working on it. Record the sale in "
                        "the ledger (_Portfolio_CostBasis) from the broker's confirmation; nothing to place." % sym,

@@ -37,6 +37,12 @@
   - `consistency_check.yml` 1.4.0 passes the capture settings and the two new knobs.
 - **`scripts/verify_deployment.py`.** Pins today_action_plan 1.8.0, consistency_check 1.4.0, ibkr_capture 1.2.0.
 
+## Review fixes (Codex, PR 1039)
+- **P1: a sell order still working on a closed position.** The capture can show a zero-share row and a working stop or limit on the same symbol. With no shares, that order can open a short.
+  - The SOLD step now names every such order and comes first: "... but a sell order is still working on it (stop 63.20 for 10 shares). Cancel it at IBKR ... then record the sale ...".
+  - The decision, control status and order status say the same.
+- **P2: the gate's third verdict.** C14 reads NOT_DECIDABLE as well as PASS and FAIL. So a NOT_DECIDABLE gate against an older PASS copy is STALE, and two NOT_DECIDABLE pages MATCH.
+
 ## Tests
 - **`test_ibkr_capture` C5.**
   - A zero row with a day's P&L reads as `closed_today`.

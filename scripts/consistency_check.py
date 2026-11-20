@@ -294,20 +294,21 @@ def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float, id
 
 
 _NOT_SET = re.compile(r"^(TFB_IBKR_CAPTURE is off|capture folder not set)")   # 1.4.0: no capture configured
-_VERDICT = re.compile(r"verdict:\s*(PASS|FAIL)", re.I)
+_VERDICT = re.compile(r"verdict:\s*(PASS|FAIL|NOT[_ ]DECIDABLE)", re.I)          # every verdict the gate writes
 _AS_OF = re.compile(r"as of\s*(\d{4}-\d{2}-\d{2})", re.I)
 _DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def gate_reading(values: Sequence[Sequence[Any]]) -> Tuple[Optional[str], Optional[str]]:
-    """1.4.0: (verdict, as-of date) of the first row that names the S-1 gate and carries 'verdict: PASS|FAIL'."""
+    """1.4.0: (verdict, as-of date) of the first row that names the S-1 gate and carries 'verdict: PASS | FAIL |
+    NOT_DECIDABLE' (run_shadow_scorer's three verdicts; Codex P2, #1039)."""
     for r in values or []:
         if not text(cell(r, 0)).upper().startswith("S-1 GATE"):
             continue
         line = " ".join(text(c) for c in r)
         v, d = _VERDICT.search(line), _AS_OF.search(line)
         if v:
-            return v.group(1).upper(), d.group(1) if d else None
+            return v.group(1).upper().replace(" ", "_"), d.group(1) if d else None
     return None, None
 
 

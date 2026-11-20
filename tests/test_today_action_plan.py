@@ -1976,6 +1976,26 @@ def test_t19_a_holding_the_broker_sold_today_reads_sold_at_ibkr(monkeypatch, cap
     for value, want in (("on", True), ("", True), ("0", False), ("no", False)):
         monkeypatch.setenv("TFB_TAP_SOLD_AT_BROKER", value)
         assert tap.sold_on() is want, value
+    # Codex P1, #1039: a sell order still working on the closed position is named first, never "no stop is working"
+    monkeypatch.setenv("TFB_TAP_SOLD_AT_BROKER", "on")
+    left = _closed_capture()
+    left["stops"]["IBOC.US"] = [(63.2, 10.0)]
+    left["limits"]["IBOC.US"] = [(74.2, 52.0)]
+    book4 = _final_book()
+    assert tap.run_once(False, book=book4, now=NOW, capture=left) == 0
+    c4 = cards(book4.tabs["Today_Action_Plan"].values)
+    assert c4[0][1] == "IBOC.US" and c4[0][2] == (
+        "IBKR shows IBOC.US sold today: the position is 0, but a sell order is still working on it (stop 63.20 for 10 "
+        "shares; limit 74.20 for 52 shares). Cancel it at IBKR - with no shares it can open a short position - then "
+        "record the sale in the ledger (_Portfolio_CostBasis) from the broker's confirmation.")
+    f4 = _final(book4)[1]["IBOC.US"]
+    assert f4["Decision"] == "SELL" and f4["Do today"] == c4[0][2]
+    assert f4["Control status"] == "VERIFY: sold at IBKR today - a sell order is still working and the ledger still holds it"
+    assert f4["Order status"] == ("SOLD at IBKR today (position 0); sell order still working: stop 63.20 for 10 shares; "
+                                  "limit 74.20 for 52 shares")
+    h = {"symbol": "X.US", "sold_at_broker": True, "open_sells": [("stop", None, 5.0)], "action": "HOLD"}
+    assert tap.open_sells_text(h) == "stop (price not read) for 5 shares" and tap.open_sells_text({}) == ""
+    assert tap._holding_decision(h)[1].startswith("Sold at IBKR today, but a sell order is still working on it")
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_SOLD_AT_BROKER: ${{ vars.TFB_TAP_SOLD_AT_BROKER || 'on' }}" in raw
 

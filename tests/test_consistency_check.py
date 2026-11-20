@@ -442,6 +442,14 @@ def test_k10_the_s1_gate_and_its_copy():
              ["S-1 GATE v1.9.7", "as of 2026-11-19 Riyadh", "verdict: FAIL"]]
     assert cc.gate_reading(gate) == ("PASS", "2026-11-20") and cc.gate_reading(board) == ("FAIL", "2026-11-19")
     assert cc.gate_reading([["S-1 GATE", "FAIL", "day 28/28"]]) == (None, None)    # no 'verdict:' word: not read
+    # Codex P2, #1039: the gate's third verdict takes part like the other two
+    nd = [["S-1 GATE v1.9.7", "as of 2026-11-21 Riyadh", "verdict: NOT_DECIDABLE"]]
+    assert cc.gate_reading(nd) == ("NOT_DECIDABLE", "2026-11-21")
+    assert cc.gate_reading([["S-1 GATE", "as of 2026-11-21", "verdict: not decidable"]]) == ("NOT_DECIDABLE", "2026-11-21")
+    st = [x for x in cc.run_checks(wb(S1_Gate=nd, Evidence_Board=gate), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0]
+    assert st[1] == "STALE" and "S1_Gate reads NOT_DECIDABLE as of 2026-11-21" in st[2]
+    both = [x for x in cc.run_checks(wb(S1_Gate=nd, Evidence_Board=nd), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"]
+    assert both and both[0][1] == "MATCH"
     r = [x for x in cc.run_checks(wb(S1_Gate=gate, Evidence_Board=board), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0]
     assert r[1] == "STALE" and r[2] == ("the Evidence Board (and the Today Action Plan, which copies it) shows S-1 FAIL as of "
                                         "2026-11-19; S1_Gate reads PASS as of 2026-11-20 - read S1_Gate until the board is rebuilt")
