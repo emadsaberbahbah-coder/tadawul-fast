@@ -217,9 +217,11 @@ def test_latest_files_reads_the_newest_usable_files_and_skips_the_rest():
 class Sheet:
     def __init__(self, rows=None):
         self.values, self.row_count, self.col_count, self.writes, self.kw = list(rows or []), 200, 30, 0, []
+        self.ranges = []
 
     def get(self, rng, **kw):
         self.kw.append(kw)
+        self.ranges.append(rng)
         return [list(r) for r in self.values]
 
     def resize(self, rows=None, cols=None):
@@ -262,6 +264,7 @@ def test_the_run_writes_the_three_tabs_and_logs_no_amount(monkeypatch, capsys):
     book = Book({"_IBKR_NAV_History": nav, "_IBKR_Fills": kept})
     assert ih.run_once(False, book=book, now=NOW, found=_found(body())) == 0
     assert nav.kw[0] == {"value_render_option": "UNFORMATTED_VALUE", "date_time_render_option": "FORMATTED_STRING"}
+    assert nav.ranges == ["A:B"] and kept.ranges == ["A:M"]          # whole columns: a rewrite never drops a row
     assert nav.values[0] == ["date", "twr_cum_since_inception"] and nav.values[1] == ["2026-08-11", 0.0109]
     assert [r[0] for r in nav.values[1:]] == ["2026-08-11", "2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19",
                                               "2026-11-20"]

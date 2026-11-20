@@ -63,6 +63,7 @@
   - A first run can no longer replace the hand-filled record with a shorter one. Its rows that close before the first fill are carried forward and marked in column G.
 - **Also found on the real data.** One market order filled in two pieces (4 + 1 shares) read as two trips. Fills of one order now count as one execution.
 - **P2 (second pass): an order filled around a sale.** Only consecutive fills of one order are joined. A fill on the other side in between starts a new execution, so BUY 10, SELL 10, BUY 10 (same buy order), SELL 10 stays two trips.
+- **P2 (fourth pass): a bounded read before a full rewrite.** The three tabs are read by whole columns (`A:B`, `A:M`, `A:I`), so a rewrite can never drop rows past a read limit.
 - **P2 (third pass): a failed Drive read looked like an empty folder.** A Drive error answer, a raised call, a malformed folder id, or files that all fail to download now exit 2. A folder with no history file, or only unusable files, stays a quiet no-op (exit 0).
 - **P2 (second pass): the closing year of a carried row.** Column G now records the closing day when a row is first carried ("carried: closed 2026-08-06 ..."). It is read back on every later run, never guessed again from the yearless span.
 

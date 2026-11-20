@@ -586,11 +586,10 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
             from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
             book = _open_book()
         from scripts.sheets_quota import call as _quota_call  # noqa: PLC0415
-        nav_values = _quota_call(lambda: read_tab(book, NAV_TAB, "A1:B3000"), _SLEEP, _out, "reading %s" % NAV_TAB)
-        fill_values = _quota_call(lambda: read_tab(book, FILLS_TAB, "A1:M20000"), _SLEEP, _out,
-                                  "reading %s" % FILLS_TAB)
-        trade_values = _quota_call(lambda: read_tab(book, TRADES_TAB, "A1:I400"), _SLEEP, _out,
-                                   "reading %s" % TRADES_TAB)
+        # whole columns: the three tabs are rewritten in full, so a bounded read could drop rows past its end (Codex P2)
+        nav_values = _quota_call(lambda: read_tab(book, NAV_TAB, "A:B"), _SLEEP, _out, "reading %s" % NAV_TAB)
+        fill_values = _quota_call(lambda: read_tab(book, FILLS_TAB, "A:M"), _SLEEP, _out, "reading %s" % FILLS_TAB)
+        trade_values = _quota_call(lambda: read_tab(book, TRADES_TAB, "A:I"), _SLEEP, _out, "reading %s" % TRADES_TAB)
     except Exception as e:  # noqa: BLE001 - a failed read leaves the tabs in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, str(e)[:300]))
         return 2
