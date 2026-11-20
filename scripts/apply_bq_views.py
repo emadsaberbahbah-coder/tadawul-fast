@@ -2,8 +2,28 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.15.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.16.0 (program register C8, Phase 2)
 ================================================================================
+v1.16.0 (20 Nov 2026, the company news re-read). WHY (owner, 20 Nov 2026 12:54
+Riyadh, in Arabic: "let us do the expected improvement to the news
+classification, improve it and re-classify it"). The news scoreboard showed the
+provider's sentiment says "positive" on 97 % of name-days and carries nothing;
+reading the 1,306 archived headlines found that four in ten of those filed
+under a symbol are about another company. New v_symbol_news_class: every
+headline re-read from its own text - relevance (company / actor / roundup /
+noise / other), event type, direction, weight and score - with the provider
+polarity beside it; the same rules written in Python gave the same reading on
+all 1,306 headlines (a plain US ticker never counts right after a colon:
+"XTRA:CBK" is Commerzbank, not CBK.US - found by the worked examples in the
+tests). New v_company_news_eval: the scoreboard of the new classes
+(entry the first close after the news day, 1 and 5 sessions against the S&P
+500, US names), the provider's sentiment scored the same way beside it. First
+read: the classes are balanced at last (positive 21 %, neutral 77 %, negative
+2 %, against the provider's 98 % positive) but carry no edge yet (correlation
+0.02; reading NO EDGE). scripts/news_board.py 1.2.0 shows each holding's
+re-read news in a new section 7. Nothing in a score, a pick or an order
+changes. Research views: the live system never reads BigQuery.
+
 v1.15.0 (19 Nov 2026, the trial labels on the pages). WHY (owner, 19 Nov 2026
 18:46 Riyadh, verbatim: "This new updat for news is linked with the
 recommdadtions pages like protofilo or investment pages"; 18:50, in Arabic:
@@ -320,7 +340,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.15.0"
+__version__ = "1.16.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
