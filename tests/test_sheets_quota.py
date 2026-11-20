@@ -41,7 +41,7 @@ def test_q1_what_counts_as_the_quota_answer():
     assert not sq.is_quota(APIError("[503]: The service is currently unavailable"))
     assert not sq.is_quota(KeyError("Symbol")) and not sq.is_quota(RuntimeError("quota"))   # the word alone is not it
     assert sq.wait_for(APIError(QUOTA), 1) == 65.0 and sq.wait_for(APIError(QUOTA), 2) == 65.0
-    assert sq.wait_for(APIError(QUOTA), 9) == 65.0 and sq.wait_for(APIError("[503]"), 1) is None
+    assert sq.wait_for(APIError(QUOTA), 9) == 65.0 and sq.wait_for(APIError("[503]: x"), 1) is None
     assert min(sq.WAITS) > 60                                         # each wait crosses into a new quota minute
 
 
@@ -193,3 +193,22 @@ def test_q7_provider_coverage_waits_out_the_quota_on_a_page_read(capsys):
     rep = asyncio.run(ptc.run_live("1234567890abc", ["GM"], base, ptc.Config(), False, False, reader=rd,
                                    sleep=slept.append))
     assert rep.exit_code == 2 and calls["n"] == 1 and slept == []
+
+
+def test_q9_server_transient_v110():
+    """1.1.0 (20 Nov 2026, Today Action Plan run 44810684039: APIError [503])."""
+    assert sq.__version__ == "1.1.0"
+    assert sq.is_server_transient(APIError("APIError: [503]: The service is currently unavailable."))
+    assert sq.is_server_transient(RuntimeError("<HttpError 502 when requesting x>"))
+    e = RuntimeError("busy")
+    e.resp = type("R", (), {"status": 500})()
+    assert sq.is_server_transient(e)
+    assert not sq.is_server_transient(APIError("APIError: [403]: The caller does not have permission"))
+    assert not sq.is_server_transient(APIError(QUOTA)) and not sq.is_server_transient(ValueError("row 503 is short"))
+    assert sq.wait_for_transient(APIError(QUOTA), 1) == 65.0                     # the quota keeps its waits
+    assert sq.wait_for_transient(APIError("[503]: x"), 1) == 15.0 and sq.wait_for_transient(APIError("[503]: x"), 2) == 30.0
+    assert sq.wait_for_transient(APIError("[503]: x"), 9) == 30.0
+    assert sq.wait_for_transient(KeyError("Symbol"), 1) is None
+    # call() is unchanged: a 503 is still raised at once there
+    with pytest.raises(APIError):
+        sq.call(lambda: (_ for _ in ()).throw(APIError("[503]: x")), lambda s: None, lambda m: None, "x")

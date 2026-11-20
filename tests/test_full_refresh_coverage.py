@@ -277,3 +277,34 @@ class FullRefreshCoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_v133_transient_sheets_fault_is_waited_out_then_read(monkeypatch):
+    """1.3.3 (run 44812767456, 20 Nov 2026): a quota answer or a passing 5xx is retried, at most twice."""
+    assert coverage.VERSION == "1.3.3"
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+    monkeypatch.setattr(coverage.asyncio, "sleep", fake_sleep)
+    calls = {"n": 0}
+
+    def reader(_sid, a1):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("<HttpError 429 when requesting x returned \"Quota exceeded for quota metric\">")
+        if calls["n"] == 2:
+            raise RuntimeError("APIError: [503]: The service is currently unavailable.")
+        return [["Symbol"], ["A.SR"]]
+    assert asyncio.run(coverage.read(reader, "sid", "Market_Leaders", 100)) == [["Symbol"], ["A.SR"]]
+    assert slept == [65.0, 30.0] and calls["n"] == 3
+    # a third transient fault in a row is raised
+    calls["n"], slept[:] = -5, []
+    with pytest.raises(RuntimeError):
+        asyncio.run(coverage.read(lambda *_: (_ for _ in ()).throw(RuntimeError("APIError: [503]: x")), "sid", "X", 100))
+    assert slept == [15.0, 30.0]
+    # any other error is raised at once, without a wait
+    slept[:] = []
+    with pytest.raises(RuntimeError):
+        asyncio.run(coverage.read_symbol_column(lambda *_: (_ for _ in ()).throw(RuntimeError("synthetic")), "sid", "X"))
+    assert slept == []
