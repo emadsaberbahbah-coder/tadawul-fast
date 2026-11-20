@@ -4,7 +4,33 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.7.1 (2026-11-20)
+v1.8.0 (2026-11-20)
+  1.8.0: A HOLDING THE BROKER SOLD TODAY, AND A HOLDING UNDER A TENDER OFFER (owner, 20 Nov 2026 22:40 Riyadh, in
+         Arabic: "a full review of the file against the market ... and if something is missing we can develop it").
+         Read on the 22:22 run of 20 Nov:
+           - the GTC stop on NMM.US had filled at the US open (17:30 Riyadh, 24 shares). The IBKR capture listed
+             NMM at 0 shares with the day's P&L, the page said "Verify NMM.US at IBKR before acting: the holding is
+             absent from the broker capture", and Final_Decisions read HOLD - for shares the account no longer had;
+           - DDI.US is under a cash tender offer (Holding_Read: PINNED BY AN OFFER). Its stop at IBKR was cancelled
+             37 minutes after the broker's tender notice, and the page said "place one at 15.22 for all 240 shares".
+             If the shares were tendered, a sell order on them can open a short position.
+         Now:
+           (a) a holding at 0 shares in a capture that carries its day's P&L (ibkr_capture 1.2.0, "closed_today") is
+               SOLD AT IBKR: one step "IBKR shows <SYM> sold today: the position is 0 and no stop is working on it.
+               Record the sale in the ledger (_Portfolio_CostBasis) from the broker's confirmation; nothing to
+               place.", its final decision is SELL with those words, its control status reads VERIFY (the ledger
+               still holds it) and its order status "SOLD at IBKR today (position 0)". When the capture still shows a
+               sell order working on it (Codex P1, #1039), the step says so and comes first: "... but a sell order is
+               still working on it (stop 80.98 for 24 shares). Cancel it at IBKR - with no shares it can open a short
+               position - then record the sale in the ledger ...". A holding absent with no day's P&L reads as before.
+               TFB_TAP_SOLD_AT_BROKER = on (default) | off (= 1.7.1).
+           (b) the page reads Holding_Read (optional). A holding whose next-session read is PINNED BY AN OFFER and has
+               no stop at IBKR gets: "No stop order is working at IBKR for <SYM>, which is under a cash tender
+               offer: if its shares were tendered, place no sell order on them (selling tendered shares can open a
+               short position); if not, place a stop at <stop> for all <n> shares." Every other step on such a
+               holding (raise, add or repair a stop, sell) ends with the same caution. Any other holding reads as
+               before.
+         Every other step, tile, decision and archive row is the 1.7.1 one.
   1.7.1: [ALIGN-TEXT] THE HOLDINGS ALIGNMENT LINE NAMES THE OTHER PAGES' OWN READINGS (owner, 20 Nov 2026 01:21 Riyadh:
          "Please check if there is any room for improvement let's do that"). The workbook of 20 Nov 00:42 read, under
          HOLDINGS ON THE OTHER PAGES, "No holding has another exit reading on a portfolio page that was read", while
@@ -228,7 +254,7 @@ ENV
     TFB_TAP_STALE_EVIDENCE_H (18), TFB_TAP_ALIGN (on | off), TFB_TAP_HOLD_ALIGN (on | off; 1.5.0), TFB_TAP_NEWS_MAX_H (24),
     TFB_TAP_IBKR_MAX_AGE_H (30), TFB_IBKR_CAPTURE (on | off), TFB_IBKR_CAPTURE_FOLDER_ID,
     TFB_TAP_BUY_CAPTURE_MARKET_H (2; 1.3.2), TFB_TAP_BQ (off | on; 1.4.0), TFB_TAP_BQ_TABLE (today_action_plan),
-    TFB_TAP_FINAL (on | off; 1.6.0), TFB_TAP_DAY_ORDER (on | off; 1.7.0),
+    TFB_TAP_FINAL (on | off; 1.6.0), TFB_TAP_DAY_ORDER (on | off; 1.7.0), TFB_TAP_SOLD_AT_BROKER (on | off; 1.8.0),
     TFB_BQ_PROJECT, TFB_BQ_DATASET.
 ================================================================================
 """
@@ -243,7 +269,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -477,6 +503,26 @@ def read_consistency(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
 PEG = 3.75
 NEWS_TAB, CASH_TAB = "_News_Gate", "_Cash_Snapshot"
 T10_TAB, V2_TAB = "Top_10_Investments", "Top_10_Investments_v2"
+HR_TAB, HR_RANGE = "Holding_Read", "A1:L60"                                        # 1.8.0
+OFFER_READ = "PINNED BY AN OFFER"
+
+
+def sold_on() -> bool:
+    """1.8.0: a holding the broker sold today reads SOLD AT IBKR (off = the 1.7.1 'absent from the capture' check)."""
+    return _env("TFB_TAP_SOLD_AT_BROKER", "on").lower() not in ("off", "0", "false", "no")
+
+
+def read_offers(values: Sequence[Sequence[Any]]) -> List[str]:
+    """1.8.0: the holdings whose Holding_Read next-session read is PINNED BY AN OFFER (a cash tender or merger stands)."""
+    hi, col = find_table(values, ("Symbol", "Next session read"))
+    if hi is None:
+        return []
+    out = []
+    for r in values[hi + 1:]:
+        sym = text(cell(r, col["Symbol"])).upper()
+        if sym and text(cell(r, col["Next session read"])).upper().startswith(OFFER_READ):
+            out.append(sym)
+    return out
 
 
 def _stamp(s: str, after: str = "") -> str:
@@ -822,6 +868,12 @@ def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
     """(decision, what it means today) for one holding, from the Exit Plan's action - the exit rule of record."""
     act, qty, stop = h["action"], h.get("qty") or 0, h.get("stop")
     shares = "%s shares" % fmt(qty, 0) if qty else "the position"
+    if h.get("sold_at_broker"):                                     # 1.8.0
+        if open_sells_text(h):                                      # Codex P1, #1039
+            return "SELL", ("Sold at IBKR today, but a sell order is still working on it: cancel it at IBKR (with no "
+                            "shares it can open a short position), then record the sale in the ledger.")
+        return "SELL", ("Sold at IBKR today: the position is 0 and no stop is working on it - nothing to place. Record "
+                        "the sale in the ledger from the broker's confirmation.")
     if h.get("review_reason") and act != "NO RULE":
         return "HOLD", "Hold. Verify at IBKR before any change: %s." % h["review_reason"]
     if act == "SELL":
@@ -869,6 +921,9 @@ def _holding_control(h: Dict[str, Any]) -> str:
     """1.7.0: OK | VERIFY: <reason> | n/a - whether the holding's figures were checked against the broker capture."""
     if h.get("action") == "NO RULE":
         return "n/a"                                                # no exit rule: nothing here is checked at IBKR
+    if h.get("sold_at_broker"):                                     # 1.8.0
+        return "VERIFY: sold at IBKR today - %sthe ledger still holds it" % (
+            "a sell order is still working and " if open_sells_text(h) else "")
     return "VERIFY: %s" % h["review_reason"] if h.get("review_reason") else "OK"
 
 
@@ -876,6 +931,9 @@ def _holding_order(h: Dict[str, Any], tol_pct: float) -> str:
     """1.7.0: what the capture shows working at IBKR for a holding - its stop, and the shares it covers."""
     if h.get("action") == "NO RULE":
         return ""
+    if h.get("sold_at_broker"):                                     # 1.8.0
+        left = open_sells_text(h)
+        return "SOLD at IBKR today (position 0)" + ("; sell order still working: %s" % left if left else "")
     if h.get("at_broker") is False:
         return "not in the IBKR capture"
     state = stop_state(h, tol_pct)
@@ -1113,12 +1171,26 @@ def apply_capture(holdings: List[Dict[str, Any]], plan: Dict[str, Any], cap: Opt
         # 1.7.0: the working buys that are day orders, and whether their session has closed since the capture
         out["day_buys"] = dict((sym, q) for sym, q in (cap.get("day_buys") or {}).items() if sym in picks)
         out["us_closed"] = us_close_between(cap["as_of"], now)
+    closed = cap.get("closed_today") or {}                          # 1.8.0
     for h in holdings:
         h["at_broker"] = h["symbol"] in cap["positions"]
+        h.pop("closed_at_broker", None)
         if h["at_broker"]:
             h["broker_stop"], h["broker_cover"] = stop_cover(cap, h["symbol"])
             h["broker_qty"] = cap["positions"][h["symbol"]]
+        elif h["symbol"] in closed:
+            h["closed_at_broker"] = True                            # 0 shares, with a P&L for the day
+            # a sell order still working on a closed position can open a short (Codex P1, #1039)
+            h["open_sells"] = ([("stop", px, q) for px, q in (cap.get("stops") or {}).get(h["symbol"], [])] +
+                               [("limit", px, q) for px, q in (cap.get("limits") or {}).get(h["symbol"], [])])
     return out
+
+
+def open_sells_text(h: Dict[str, Any]) -> str:
+    """1.8.0 (Codex P1, #1039): the sell orders the capture still shows working on a position IBKR closed today,
+    e.g. "stop 80.98 for 24 shares; limit 99.50 for 24 shares" ("" when none)."""
+    return "; ".join("%s %s for %s shares" % (kind, fmt(px) if px is not None else "(price not read)", fmt(q, 0))
+                     for kind, px, q in h.get("open_sells") or [])
 
 
 def stop_state(h: Dict[str, Any], tol_pct: float) -> str:
@@ -1144,6 +1216,19 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
     sym, qty, stop, bs, act = h["symbol"], h.get("qty") or 0, h.get("stop"), h.get("broker_stop"), h["action"]
     steps: List[Dict[str, Any]] = []
     shares = "%s shares" % fmt(qty, 0) if qty else "the position"
+    if h.get("sold_at_broker"):                                     # 1.8.0
+        left = open_sells_text(h)
+        if left:                                                    # Codex P1, #1039: an order still working
+            return [{"urgency": 0.5, "symbol": sym, "kind": "sold", "source": "Exit_Plan",
+                     "do": "IBKR shows %s sold today: the position is 0, but a sell order is still working on it (%s). "
+                           "Cancel it at IBKR - with no shares it can open a short position - then record the sale in "
+                           "the ledger (_Portfolio_CostBasis) from the broker's confirmation." % (sym, left),
+                     "levels": "plan stop %s · last %s · sell order still working" % (fmt(stop), fmt(h.get("last"))),
+                     "why": h.get("why", "")}]
+        return [{"urgency": 2.6, "symbol": sym, "kind": "sold", "source": "Exit_Plan",
+                 "do": "IBKR shows %s sold today: the position is 0 and no stop is working on it. Record the sale in "
+                       "the ledger (_Portfolio_CostBasis) from the broker's confirmation; nothing to place." % sym,
+                 "levels": "plan stop %s · last %s" % (fmt(stop), fmt(h.get("last"))), "why": h.get("why", "")}]
     if h.get("review_reason") and act != "NO RULE":
         return [{"urgency": 2.6, "symbol": sym, "kind": "verify", "source": "Exit_Plan",
                  "do": "Verify %s at IBKR before acting: %s." % (sym, h["review_reason"]),
@@ -1179,7 +1264,12 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
              "last %s · stop %s" % (fmt(h.get("last")), fmt(stop)))
     state = stop_state(h, tol_pct)                  # 1.3.0: "" unless the IBKR capture gave the orders
     if act in ("HOLD", "REVIEW", "CHECK") and stop and state:
-        if state == "none":
+        if state == "none" and h.get("offer"):                     # 1.8.0: a tendered share is not sold twice
+            step(2.4, "No stop order is working at IBKR for %s, which is under a cash tender offer: if its shares were "
+                      "tendered, place no sell order on them (selling tendered shares can open a short position); if "
+                      "not, place a stop at %s for all %s." % (sym, fmt(stop), shares),
+                 "plan stop %s · no stop at the broker · tender offer" % fmt(stop))
+        elif state == "none":
             step(2.4, "No stop order is working at IBKR for %s: place one at %s for all %s." % (sym, fmt(stop), shares),
                  "plan stop %s · no stop at the broker" % fmt(stop))
         elif state == "partial":
@@ -1204,6 +1294,12 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
         elif bs < stop * (1 - tol_pct / 100.0):
             step(2.5, "The broker stop on %s (%s) is below the plan's stop (%s): raise it for all %s." % (
                 sym, fmt(bs), fmt(stop), shares), "plan stop %s · broker stop %s" % (fmt(stop), fmt(bs)))
+    if h.get("offer"):                                              # 1.8.0: every sell-side step of a tendered name
+        for st in steps:
+            if "tender offer" not in st["do"]:
+                st["do"] += (" %s is under a cash tender offer: if its shares were tendered, place no sell order on them "
+                             "(selling tendered shares can open a short position)." % sym)
+                st["levels"] += " · tender offer"
     return steps
 
 
@@ -1320,10 +1416,15 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     custody_reason = "" if broker.get("used") else "broker cash and orders are unverified (%s)" % (broker.get("why") or "no capture")
     exit_reason = action_source_reason("Exit_Plan", ages, k) or custody_reason
     steps: List[Dict[str, Any]] = []
+    offers = set(x.get("offers") or ())                             # 1.8.0
     for h in holdings:
         h.pop("review_reason", None)
+        h.pop("sold_at_broker", None)
+        h["offer"] = h["symbol"] in offers
         if exit_reason:
             h["review_reason"] = exit_reason
+        elif h.get("at_broker") is False and h.get("closed_at_broker") and sold_on():
+            h["sold_at_broker"] = True                              # 1.8.0: the broker sold it today
         elif h.get("at_broker") is False:
             h["review_reason"] = "the holding is absent from the broker capture"
         elif h.get("qty") is None or h.get("broker_qty") is None or abs(h["qty"] - h["broker_qty"]) > 1e-6:
@@ -1468,7 +1569,8 @@ STYLES: Dict[str, Dict[str, Any]] = {
 CHIP = {"sell": ("C62828", "SELL"), "profit": ("2E7D32", "TAKE PROFIT"), "stop": ("EF6C00", "RAISE STOP"),
         "broker": ("B26A00", "CONFIRM"), "review": ("6A1B9A", "REVIEW"), "buy": ("1565C0", "BUY"),
         "skip": ("7B1F1F", "DO NOT BUY"), "news": ("8E5A00", "READ FIRST"), "nofund": ("5F6B7A", "NOT FUNDED"),
-        "placed": ("00695C", "PLACED"), "verify": ("B26A00", "VERIFY"), "other": ("7B1F1F", "OTHER PAGE")}
+        "placed": ("00695C", "PLACED"), "verify": ("B26A00", "VERIFY"), "other": ("7B1F1F", "OTHER PAGE"),
+        "sold": ("455A64", "SOLD")}                                 # 1.8.0
 for _k, (_bg, _label) in CHIP.items():                         # the step number, and the kind's name under it
     STYLES["chip_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 15, "align": "CENTER", "valign": "BOTTOM"}
     STYLES["chiplabel_" + _k] = {"bg": _bg, "fg": "FFFFFF", "bold": True, "size": 8, "align": "CENTER", "valign": "TOP"}
@@ -1733,7 +1835,8 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
     for h in d["holdings"]:
         bs = h.get("broker_stop")
         state = stop_state(h, k["stop_tol"])
-        note = "" if h["action"] == "NO RULE" else (h.get("review_reason") or (
+        note = "" if h["action"] == "NO RULE" else ("sold at IBKR today - record it in the ledger" if h.get("sold_at_broker")
+                                                    else None) or (h.get("review_reason") or (
             {"none": "no stop at IBKR", "partial": "stop covers %s of %s shares" % (fmt(h.get("broker_cover"), 0), fmt(h.get("qty"), 0)),
              "unpriced": "stop price not read", "low": "broker stop below the plan", "ok": "stop in place"}[state] if state else (
                 "not at IBKR" if h.get("at_broker") is False and h.get("stop") else (
@@ -1742,10 +1845,13 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
                         else "stop in place")))))
         pl = text(h.get("pl_pct", ""))
         shown_action = "VERIFY" if h.get("review_reason") and h["action"] != "NO RULE" else h["action"]
+        if h.get("sold_at_broker"):                                 # 1.8.0
+            shown_action = "SOLD"
         pg.add([h["symbol"], h["name"], fmt(h.get("qty"), 0), fmt(h.get("last")), h.get("pl_pct", ""), shown_action,
                 fmt(h.get("stop")), fmt(bs), fmt(h.get("target")), note],
                ["cell_b", "cell", "num", "num", "neg" if pl.startswith("-") else ("pos" if pl else "num"),
-                "act_review" if shown_action == "VERIFY" else ACTION_STYLE.get(h["action"], "act_hold"), "num", "num", "num",
+                "act_review" if shown_action == "VERIFY" else ("act_sell" if shown_action == "SOLD" else
+                                                               ACTION_STYLE.get(h["action"], "act_hold")), "num", "num", "num",
                 "ok" if note == "stop in place" else ("bad" if state in ("none", "partial") else ("warn" if note else "cell"))])
     if not d["holdings"]:
         pg.add(["", "The Exit_Plan page lists no holding (or could not be read)."], ["", "msg"], [(1, WIDTH)])
@@ -2047,7 +2153,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                "Evidence_Board": _read(b, "Evidence_Board", "A1:L120"),
                "Consistency_Check": _read(b, "Consistency_Check", "A1:G60")}
         more: Dict[str, List[List[Any]]] = {}
-        tabs = ((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000")) if aligned else ()
+        tabs = ((T10_TAB, "A1:AE60"), (V2_TAB, "A1:P70"), (NEWS_TAB, "A1:L3000"), (CASH_TAB, "A1:G2000"),
+                (HR_TAB, HR_RANGE)) if aligned else ()               # 1.8.0: Holding_Read (optional)
         if aligned and hold_align:                                  # 1.5.0
             tabs = tabs + ((PFD_TAB, PFD_RANGE), (PF2_TAB, PF2_RANGE))
         for tab, rng in tabs:
@@ -2084,7 +2191,7 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
         cash, cash_at = snapshot_cash(more.get(CASH_TAB) or [])
         extra = {"t10": read_top10(more.get(T10_TAB) or []), "v2": read_top10_v2(more.get(V2_TAB) or []),
                  "news": read_news_gate(more.get(NEWS_TAB) or [], now), "cash": cash, "cash_at": cash_at,
-                 "cash_src": "ledger" if cash is not None else ""}
+                 "cash_src": "ledger" if cash is not None else "", "offers": read_offers(more.get(HR_TAB) or [])}
         if hold_align:                                              # 1.5.0
             extra.update(hold_align=True, pf=read_pf_main(more.get(PFD_TAB) or []),
                          pf2=read_pf_v2(more.get(PF2_TAB) or []))

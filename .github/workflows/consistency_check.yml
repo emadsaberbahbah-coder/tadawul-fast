@@ -1,7 +1,16 @@
 # =============================================================================
 # 🧮 Consistency Check - the same figure on every page
 # -----------------------------------------------------------------------------
-# VERSION 1.3.0 (2026-11-13)
+# VERSION 1.4.0 (2026-11-20)
+#
+# 1.4.0: THE BROKER IN THE COMPARISON (owner, 20 Nov 22:40: full review of the
+# file against the market). On 20 Nov IBKR sold all NMM shares by the stop
+# while every page still held them and this page read "0 mismatch(es)".
+# consistency_check.py 1.4.0 reads the newest read-only IBKR capture
+# (TFB_IBKR_CAPTURE, TFB_IBKR_CAPTURE_FOLDER_ID) for C13 (the ledger's shares
+# vs the broker's; TFB_CONS_IBKR_MAX_AGE_H 30), and adds C14 (the Evidence
+# Board's copy of the S-1 gate vs S1_Gate) and C15 (the age of the broker
+# tabs, TFB_CONS_IBKR_TAB_DAYS 7). Detail with figures stays off the log.
 #
 # 1.3.0: THE FIVE DIFFERENCES OF 13 NOV (owner, 12:34: "need to solve it").
 # A first step, scripts/cash_cells.py, writes the broker's free cash (the
@@ -121,6 +130,10 @@ jobs:
           TFB_CONS_SAR_TOL: ${{ vars.TFB_CONS_SAR_TOL || '50' }}
           TFB_CONS_PAGE_MAX_AGE_H: ${{ vars.TFB_CONS_PAGE_MAX_AGE_H || '2' }}
           TFB_CONS_PAGE_IDLE_MAX_H: ${{ vars.TFB_CONS_PAGE_IDLE_MAX_H || '26' }}
+          TFB_CONS_IBKR_MAX_AGE_H: ${{ vars.TFB_CONS_IBKR_MAX_AGE_H || '30' }}
+          TFB_CONS_IBKR_TAB_DAYS: ${{ vars.TFB_CONS_IBKR_TAB_DAYS || '7' }}
+          TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
+          TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}

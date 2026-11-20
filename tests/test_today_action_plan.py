@@ -1887,7 +1887,7 @@ def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeyp
         assert tap.day_order_on() is want, value
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
-    assert tap.__version__ == "1.7.1"
+    assert tap.__version__ == "1.8.0"
 
 
 def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
@@ -1911,3 +1911,126 @@ def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
     assert [k for k, r in rows.items() if r["Decision"] == "BUY"] == []              # no page is told the order works
     assert "FINAL NMM.US    WATCH" in capsys.readouterr().out
 
+
+
+# ----------------------------------------------------------------------------- T19 (1.8.0)
+HREAD = [["HOLDING READ - what moved each holding last session, and the read for the next one"],
+         ["As of 2026-11-12 08:30 Riyadh · last session 2026-11-11"], [],
+         ["Symbol", "Name", "Last session", "Stock %", "Market %", "Sector %", "Driver", "Main news (last session)",
+          "Next session read", "Up after similar days"],
+         ["DDI.US", "DoubleDown", "2026-11-11", "-0.9%", "-2.0%", "", "NORMAL RANGE", "", "PINNED BY AN OFFER", "58% of 71"],
+         ["GLPI.US", "Gaming & Leisure", "2026-11-11", "-1.4%", "-2.0%", "-1.8%", "SECTOR", "", "NO EDGE", "47% of 85"]]
+
+
+def _closed_capture(day_pnl=-28.57, ddi_stop=False):
+    """20 Nov: IBOC's stop filled during the session - IBKR lists it at 0 shares with the day's P&L."""
+    orders = [ib_order("Sell 79 GLPI", "STOP", "SELL", "STP 35.74, GTC", 79),
+              ib_order("Sell 95 SUPN", "STOP", "SELL", "STP 24.25, GTC", 95)]
+    if ddi_stop:
+        orders.append(ib_order("Sell 240 DDI", "STOP", "SELL", "STP 14.80, GTC", 240))
+    pos = [{"contract_description": "DDI", "position": 240.0}, {"contract_description": "GLPI", "position": 79.0},
+           {"contract_description": "SUPN", "position": 95.0},
+           {"contract_description": "IBOC", "position": 0.0, "market_price": 64.12, "daily_pnl": day_pnl}]
+    raw = {"schema": "tfb.ibkr-capture/v1", "captured_at": NOW.astimezone(tap.RIYADH).isoformat(),
+           "positions": {"positions": pos},
+           "balances": {"balances": [{"currency": "USD", "cash_balance": 4679.15, "settled_cash": 4679.15,
+                                      "realized_pnl": -164.78}]},
+           "orders": {"orders": orders}}
+    return ic.parse(raw, None, NOW, "TFB_IBKR_Capture_20261112-090000.json")
+
+
+def test_t19_a_holding_the_broker_sold_today_reads_sold_at_ibkr(monkeypatch, capsys):
+    """20 Nov 22:22: NMM's stop had filled at the open; the page asked to verify it and Final_Decisions read HOLD."""
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=_closed_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    c = [x for x in cards(page) if x[1] == "IBOC.US"]
+    assert len(c) == 1 and c[0][2] == ("IBKR shows IBOC.US sold today: the position is 0 and no stop is working on it. "
+                                       "Record the sale in the ledger (_Portfolio_CostBasis) from the broker's "
+                                       "confirmation; nothing to place.")
+    assert c[0][4] == "plan stop 63.20 · last 68.02"
+    a = [i for i, r in enumerate(page) if r[0] == "A. DO TODAY - in this order"][0]
+    chips = [page[a + 3 + 2 * i][0] for i in range(len(cards(page)))]
+    assert "SOLD" in chips and not any("absent from the broker capture" in str(r) for r in page)
+    row = [r for r in page if r[0] == "IBOC.US" and r[5] == "SOLD"]
+    assert len(row) == 1 and row[0][9] == "sold at IBKR today - record it in the ledger"           # section B
+    head, rows = _final(book)
+    f = rows["IBOC.US"]
+    assert f["Decision"] == "SELL" and f["Do today"] == c[0][2]                     # the step's words, as section A
+    assert f["Control status"] == "VERIFY: sold at IBKR today - the ledger still holds it"
+    assert f["Order status"] == "SOLD at IBKR today (position 0)"
+    assert rows["GLPI.US"]["Decision"] == "HOLD" and rows["GLPI.US"]["Control status"] == "OK"     # the others as before
+    out = capsys.readouterr().out
+    assert "164.78" not in out and "28.57" not in out                              # no amount in the run log
+    # a holding absent with no P&L for the day is still a check, as in 1.7.1
+    book2 = _final_book()
+    assert tap.run_once(False, book=book2, now=NOW, capture=_closed_capture(day_pnl=0.0)) == 0
+    assert any(x[2] == "Verify IBOC.US at IBKR before acting: the holding is absent from the broker capture."
+               for x in cards(book2.tabs["Today_Action_Plan"].values))
+    # off = 1.7.1
+    monkeypatch.setenv("TFB_TAP_SOLD_AT_BROKER", "off")
+    assert tap.sold_on() is False
+    book3 = _final_book()
+    assert tap.run_once(False, book=book3, now=NOW, capture=_closed_capture()) == 0
+    assert _final(book3)[1]["IBOC.US"]["Decision"] == "HOLD"
+    for value, want in (("on", True), ("", True), ("0", False), ("no", False)):
+        monkeypatch.setenv("TFB_TAP_SOLD_AT_BROKER", value)
+        assert tap.sold_on() is want, value
+    # Codex P1, #1039: a sell order still working on the closed position is named first, never "no stop is working"
+    monkeypatch.setenv("TFB_TAP_SOLD_AT_BROKER", "on")
+    left = _closed_capture()
+    left["stops"]["IBOC.US"] = [(63.2, 10.0)]
+    left["limits"]["IBOC.US"] = [(74.2, 52.0)]
+    book4 = _final_book()
+    assert tap.run_once(False, book=book4, now=NOW, capture=left) == 0
+    c4 = cards(book4.tabs["Today_Action_Plan"].values)
+    assert c4[0][1] == "IBOC.US" and c4[0][2] == (
+        "IBKR shows IBOC.US sold today: the position is 0, but a sell order is still working on it (stop 63.20 for 10 "
+        "shares; limit 74.20 for 52 shares). Cancel it at IBKR - with no shares it can open a short position - then "
+        "record the sale in the ledger (_Portfolio_CostBasis) from the broker's confirmation.")
+    f4 = _final(book4)[1]["IBOC.US"]
+    assert f4["Decision"] == "SELL" and f4["Do today"] == c4[0][2]
+    assert f4["Control status"] == "VERIFY: sold at IBKR today - a sell order is still working and the ledger still holds it"
+    assert f4["Order status"] == ("SOLD at IBKR today (position 0); sell order still working: stop 63.20 for 10 shares; "
+                                  "limit 74.20 for 52 shares")
+    h = {"symbol": "X.US", "sold_at_broker": True, "open_sells": [("stop", None, 5.0)], "action": "HOLD"}
+    assert tap.open_sells_text(h) == "stop (price not read) for 5 shares" and tap.open_sells_text({}) == ""
+    assert tap._holding_decision(h)[1].startswith("Sold at IBKR today, but a sell order is still working on it")
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_SOLD_AT_BROKER: ${{ vars.TFB_TAP_SOLD_AT_BROKER || 'on' }}" in raw
+
+
+def test_t19_a_holding_under_a_tender_offer_gets_no_blind_stop_instruction():
+    """20 Nov: DDI's stop was cancelled after the broker's tender notice and the page said 'place one at 15.22'.
+    Selling tendered shares can open a short position, so the step names the condition."""
+    assert tap.read_offers(HREAD) == ["DDI.US"] and tap.read_offers([]) == [] and tap.read_offers([["x"]]) == []
+    held = _hold_exit()
+    i = [n for n, r in enumerate(held) if r and r[0] == "DDI.US"][0]
+    held[i][13], held[i][15] = "HOLD", ""                                           # the 20 Nov case: HOLD, no stop
+    book = _final_book(Holding_Read=Sheet(HREAD), Exit_Plan=Sheet(held))
+    assert tap.run_once(False, book=book, now=NOW, capture=_closed_capture()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    c = [x for x in cards(page) if x[1] == "DDI.US"]
+    assert len(c) == 1 and c[0][2] == ("No stop order is working at IBKR for DDI.US, which is under a cash tender offer: "
+                                       "if its shares were tendered, place no sell order on them (selling tendered "
+                                       "shares can open a short position); if not, place a stop at 14.80 for all 240 "
+                                       "shares.")
+    assert c[0][4] == "plan stop 14.80 · no stop at the broker · tender offer"
+    assert _final(book)[1]["DDI.US"]["Do today"].startswith("No stop order is working at IBKR for DDI.US, which is under")
+    # a raise on a tendered name carries the same caution (the fixture's own DDI row reads RAISE STOP)
+    br = _final_book(Holding_Read=Sheet(HREAD))
+    assert tap.run_once(False, book=br, now=NOW, capture=_closed_capture()) == 0
+    r = [x for x in cards(br.tabs["Today_Action_Plan"].values) if x[1] == "DDI.US"]
+    assert r[0][2] == ("Raise the stop on DDI.US to 14.80 for all 240 shares. DDI.US is under a cash tender offer: if its "
+                       "shares were tendered, place no sell order on them (selling tendered shares can open a short "
+                       "position).") and r[0][4].endswith(" · tender offer")
+    # without the Holding_Read page, or with a stop working, the words are the 1.7.1 ones
+    b2 = _final_book(Exit_Plan=Sheet(held))
+    assert tap.run_once(False, book=b2, now=NOW, capture=_closed_capture()) == 0
+    assert any(x[2] == "No stop order is working at IBKR for DDI.US: place one at 14.80 for all 240 shares."
+               for x in cards(b2.tabs["Today_Action_Plan"].values))
+    b3 = _final_book(Holding_Read=Sheet(HREAD), Exit_Plan=Sheet(held))
+    assert tap.run_once(False, book=b3, now=NOW, capture=_closed_capture(ddi_stop=True)) == 0
+    assert not any("tender" in x[2] for x in cards(b3.tabs["Today_Action_Plan"].values))
+    h = {"symbol": "X.US", "qty": 10.0, "stop": 9.0, "action": "SELL", "why": "", "offer": True}
+    assert tap.holding_steps(h, 1.0)[0]["do"].endswith("(selling tendered shares can open a short position).")

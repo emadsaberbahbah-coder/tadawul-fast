@@ -1,4 +1,4 @@
-"""scripts/ibkr_capture.py v1.0.0 - the read-only IBKR capture for the plan pages (owner, 13 Nov 2026: the action plan
+"""scripts/ibkr_capture.py v1.2.0 - the read-only IBKR capture for the plan pages (owner, 13 Nov 2026: the action plan
 should follow the cash available at IBKR). Zero network: a fake Drive session."""
 import datetime as dt
 import json
@@ -193,5 +193,27 @@ def test_c4_the_working_buys_that_are_day_orders():
                                      order("Sell 5 GTY", "LIMIT", "SELL", "Limit 31.25, Day", total="5", limit="31.25")]})
     q = ic.parse(two, CREATED, NOW)
     assert q["day_buys"] == {"GTY.US": 10.0} and q["buys"]["GTY.US"] == [(28.2, 10.0), (28.0, 14.0)]   # a sell is never one
-    assert ic.parse({"schema": "x"}, CREATED, NOW)["day_buys"] == {} and ic.__version__ == "1.1.0"
+    assert ic.parse({"schema": "x"}, CREATED, NOW)["day_buys"] == {} and ic.__version__ == "1.2.0"
+
+
+def test_c5_a_position_the_broker_closed_today():
+    """20 Nov: the GTC stop on NMM filled at the US open. The captures that followed listed NMM at 0 shares with the
+    day's P&L; 1.1.0 dropped the row, so the pages only knew that NMM was absent (1.2.0)."""
+    pos = {"positions": [{"contract_description": "AX", "position": 10.0, "market_price": 85.5, "daily_pnl": -8.5},
+                         {"contract_description": "NMM", "position": 0.0, "market_price": 81.25, "daily_pnl": -28.5685},
+                         {"contract_description": "FLAT", "position": 0.0},                       # no day's P&L: not today
+                         {"contract_description": "ZERO", "position": 0.0, "daily_pnl": 0.0},      # nothing happened today
+                         {"contract_description": "TINY", "position": 0.0, "daily_pnl": 0.004}]}
+    bal = {"balances": [{"currency": "USD", "cash_balance": 4927.12, "settled_cash": 4927.12, "realized_pnl": -164.78}]}
+    p = ic.parse(capture(positions=pos, balances=bal), CREATED, NOW)
+    assert p["ok"] and p["positions"] == {"AX.US": 10.0}                                 # held shares as before
+    assert p["closed_today"] == {"NMM.US": {"day_pnl_usd": -28.5685, "price": 81.25}}
+    assert p["realized_usd"] == -164.78
+    both = {"positions": [{"contract_description": "NMM", "position": 0.0, "daily_pnl": -28.5},
+                          {"contract_description": "NMM", "position": 5.0}]}                # a second row still holds shares
+    q = ic.parse(capture(positions=both), CREATED, NOW)
+    assert q["positions"] == {"NMM.US": 5.0} and q["closed_today"] == {}
+    old = ic.parse(capture(), CREATED, NOW)                                              # a 1.1.0 capture reads as before
+    assert old["closed_today"] == {} and old["realized_usd"] is None
+    assert ic.parse({"schema": "x"}, CREATED, NOW)["closed_today"] == {}
 
