@@ -21,11 +21,28 @@
 # status line reads 'output: EXECUTABLE' and is at most 3 h old; otherwise
 # every ticket row reads CHECK (never GO). Mapped to enforce below; rollback:
 # set the repository variable TFB_PREOPEN_BOARD_GUARD=off.
+# 2026-11-21 (v1.2.0 CHAIN): GitHub's schedule never started this check inside
+# its window. Since 9 Nov every scheduled run began between 20:03 and 22:54
+# UTC (23:03 - 01:54 Riyadh), after the US close, and printed "outside the
+# pre-open window ... nothing to do": the schedule never wrote the
+# Pre_Open_Check tab. WHY now: owner, 21 Nov 2026 02:20 Riyadh (in Arabic:
+# review the updates and see the updates they need). The check also runs after
+# the Exit Plan workflow, which the workbook dispatches every hour at :35
+# (apps_script/29_Page_Refresh_Dispatch.gs), on weekdays (Mon-Fri UTC) when the
+# UTC hour is one of TFB_PREOPEN_CHAIN_HOURS (repository Variable; default
+# "12 13" = about 15:40 and 16:40 Riyadh; "off" = cron only). The script's own
+# window still decides: in winter the 13:4x UTC run lands inside it (about 45
+# minutes before the 14:30 UTC open), in summer the 12:4x run (before the
+# 13:30 UTC open); the other one prints "nothing to do". A chained run writes,
+# like a scheduled one. The cron entries stay.
 name: ⏰ Pre-Open Check
 
 on:
   schedule:
     - cron: "0 13,14 * * 1-5"
+  workflow_run:
+    workflows: ["🎯 Exit Plan"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       write:
@@ -60,15 +77,39 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: 🕒 Is a chained run due this hour?
+        id: due
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHAIN_HOURS: ${{ vars.TFB_PREOPEN_CHAIN_HOURS || '12 13' }}
+        run: |
+          # CHAIN (2026-11-21): a run chained to the hourly Exit Plan works only in the listed UTC hours,
+          # on weekdays (Mon-Fri UTC); schedule and dispatch always. "off" (or no number) = no chained run.
+          RUN=true
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            HOUR=$((10#$(date -u +%H)))
+            RUN=false
+            for h in $CHAIN_HOURS; do
+              if [[ "$h" =~ ^[0-9]+$ ]] && (( 10#$h == HOUR )); then RUN=true; fi
+            done
+            DOW=$((10#$(date -u +%u)))
+            if (( DOW > 5 )); then RUN=false; fi
+            echo "Chained run at UTC hour $HOUR (hours: $CHAIN_HOURS): run=$RUN"
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
       - name: ⬇️ Checkout
+        if: steps.due.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: 🐍 Set up Python
+        if: steps.due.outputs.run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Install dependencies
+        if: steps.due.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip setuptools wheel
           if [[ -f requirements.render.txt ]]; then
@@ -78,6 +119,7 @@ jobs:
           fi
 
       - name: 🔎 Resolve spreadsheet id
+        if: steps.due.outputs.run == 'true'
         id: sheet
         env:
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -90,6 +132,7 @@ jobs:
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
 
       - name: ⏰ Run pre-open check
+        if: steps.due.outputs.run == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
@@ -99,8 +142,8 @@ jobs:
           TFB_PREOPEN_BOARD_GUARD: ${{ vars.TFB_PREOPEN_BOARD_GUARD || 'enforce' }}
           TFB_PREOPEN_BOARD_MAX_AGE_H: ${{ vars.TFB_PREOPEN_BOARD_MAX_AGE_H || '3' }}
         run: |
-          # Schedule always writes; a manual dispatch writes ONLY when
-          # write=true was explicitly ticked (dry-run otherwise).
+          # Schedule and a chained run (v1.2.0) always write; a manual dispatch
+          # writes ONLY when write=true was explicitly ticked (dry-run otherwise).
           MODE="--write"
           EXTRA=""
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then

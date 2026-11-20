@@ -613,7 +613,8 @@ def test_n7_workflow_manifest_and_read_only_scope():
     raw = (ROOT / ".github/workflows/news_board.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["schedule"] == [{"cron": "55 4,13 * * *"}] and set(on) == {"schedule", "workflow_dispatch"}
+    assert on["schedule"] == [{"cron": "55 4,13 * * *"}] and set(on) == {"schedule", "workflow_dispatch", "workflow_run"}
+    assert on["workflow_run"] == {"workflows": ["\U0001F3AF Exit Plan"], "types": ["completed"]}   # 1.1.0 CHAIN (test_page_chains)
     assert on["workflow_dispatch"]["inputs"]["dry_run"]["default"] is False
     assert wf["name"] == "\U0001F4F0 News Board" and wf["permissions"] == {"contents": "read"}
     assert wf["concurrency"] == {"group": "tfb-news-board", "cancel-in-progress": False}

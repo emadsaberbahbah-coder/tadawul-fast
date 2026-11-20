@@ -344,7 +344,8 @@ def test_l7_workflow_manifest_and_read_only_scope():
     raw = (ROOT / ".github/workflows/trial_labels.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert set(on) == {"schedule", "workflow_dispatch"} and on["schedule"] == [{"cron": "5 5,9,14 * * *"}]
+    assert set(on) == {"schedule", "workflow_dispatch", "workflow_run"} and on["schedule"] == [{"cron": "5 5,9,14 * * *"}]
+    assert on["workflow_run"] == {"workflows": ["\U0001F3AF Exit Plan"], "types": ["completed"]}   # 1.1.0 CHAIN (test_page_chains)
     assert on["workflow_dispatch"]["inputs"]["dry_run"]["default"] is False
     assert wf["permissions"] == {"contents": "read"} and wf["concurrency"] == {"group": "tfb-trial-labels", "cancel-in-progress": False}
     job = wf["jobs"]["labels"]
