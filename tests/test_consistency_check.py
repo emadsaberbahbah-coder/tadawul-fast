@@ -204,7 +204,7 @@ def test_k4_gate_page_and_read_failure(monkeypatch, capsys):
     assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared", "Control rule"]
     assert all(len(r) == 7 for r in page) and all(r[6] for r in page[3:])          # every check carries its rule
     assert [r[6] for r in page[3:] if r[0] == "C9 stops"] == ["The stop to place is the Exit Plan's. Another page's stop is analysis."]
-    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 13))
+    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 16))
     assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 3 + ["INFO"] * 4 + ["MATCH"] * 6
     assert set(b.tabs) - set(wb()) == {"Consistency_Check"}                       # no other page is touched
     log = capsys.readouterr().out                                                 # 1.2.0: the run log is public
@@ -345,7 +345,7 @@ def test_k7_the_13_nov_differences():
     assert [r for r in got if r[0] == "C10 actions"][0][1] == "MATCH"
     # the page: its own count and place
     page = cc.page_rows(cc.run_checks(wb13(), today, cc.knobs(), now), "2026-11-13 11:50")
-    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.3.0" in page[1][0]
+    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.4.0" in page[1][0]
     order = [r[1] for r in page[4:]]
     assert order.index("OVER CAP") > max(i for i, s in enumerate(order) if s in ("MISMATCH", "STALE"))
     assert order.index("OVER CAP") < min(i for i, s in enumerate(order) if s in ("INFO", "MATCH"))
@@ -395,4 +395,94 @@ def test_k9_a_plan_with_no_pick_is_a_plan():
     # no row of any Kind for today: still 'not cut yet'
     c1 = by(wb(_Daily_Plan=zero[:2]), "C1 decision")[0]
     assert c1[1] == "INFO" and "no Daily Plan for 2026-11-11 yet" in c1[2]
-    assert cc.__version__ == "1.3.0"
+    assert cc.__version__ == "1.4.0"
+
+
+# ----------------------------------------------------------------------------- K10 (1.4.0)
+NOW20 = dt.datetime(2026, 11, 20, 19, 30, tzinfo=dt.timezone.utc)                 # 22:30 Riyadh
+
+
+def _cap(positions, closed=None, age_h=0.4, ok=True, reason=""):
+    return {"ok": ok, "reason": reason, "positions": positions, "closed_today": closed or {}, "age_h": age_h,
+            "as_of": NOW20 - dt.timedelta(hours=age_h)}
+
+
+def test_k10_the_ledger_against_the_broker():
+    """20 Nov 22:41: IBKR had sold all NMM shares at the open; every page still held them and the page read 0 mismatches."""
+    g = wb()
+    g["_Portfolio_CostBasis"] = g["_Portfolio_CostBasis"] + [["NMM.US", "USD", "Active", 24, 82.08, 3.75, "7,387"]]
+    kk = cc.knobs()
+    rows = [r for r in cc.run_checks(g, TODAY, kk, None, _cap({"DDI.US": 240.0, "GLPI.US": 79.0},
+                                                                 {"NMM.US": {"day_pnl_usd": -28.57, "price": 81.25}}))
+            if r[0] == "C13 broker"]
+    assert len(rows) == 1 and rows[0][1] == "MISMATCH"
+    assert rows[0][2].startswith("NMM.US ledger 24 vs IBKR 0 (sold at IBKR today) - the share count is the broker's")
+    assert "5023.SR" not in rows[0][2]                                             # kept elsewhere: not compared
+    ok = [r for r in cc.run_checks(wb(), TODAY, kk, None, _cap({"DDI.US": 240.0, "GLPI.US": 79.0})) if r[0] == "C13 broker"]
+    assert ok[0][1] == "MATCH" and ok[0][2].startswith("the ledger's shares equal IBKR's for 2 holding(s) (capture of 2026-11-20 22:")
+    extra = [r for r in cc.run_checks(wb(), TODAY, kk, None, _cap({"DDI.US": 230.0, "GLPI.US": 79.0, "AX.US": 10.0}))
+             if r[0] == "C13 broker"][0]
+    assert extra[1] == "MISMATCH" and "DDI.US ledger 240 vs IBKR 230" in extra[2] and "AX.US ledger 0 vs IBKR 10 (not in the ledger)" in extra[2]
+    old = [r for r in cc.run_checks(wb(), TODAY, kk, None, _cap({}, age_h=31.0)) if r[0] == "C13 broker"][0]
+    assert old[1] == "INFO" and "31 h old (limit 30 h)" in old[2]
+    bad = [r for r in cc.run_checks(wb(), TODAY, kk, None, _cap({}, ok=False, reason="no capture file visible"))
+           if r[0] == "C13 broker"][0]
+    assert bad[1] == "INFO" and bad[2] == "IBKR capture not read: no capture file visible - not compared"
+    for why in ("TFB_IBKR_CAPTURE is off", "capture folder not set (TFB_IBKR_CAPTURE_FOLDER_ID)"):
+        assert not [r for r in cc.run_checks(wb(), TODAY, kk, None, _cap({}, ok=False, reason=why)) if r[0] == "C13 broker"]
+    assert not [r for r in cc.run_checks(wb(), TODAY, kk) if r[0] == "C13 broker"]             # no capture given: 1.3.0
+    assert cc.log_detail(rows[0]) == "(figures on the Consistency_Check page)"     # quantities stay off the log
+    assert kk["ibkr_h"] == 30.0 and kk["ibkr_tab_days"] == 7.0
+
+
+def test_k10_the_s1_gate_and_its_copy():
+    """20 Nov: S1_Gate read PASS as of 20 Nov; the Evidence Board and the Today Action Plan still showed FAIL of 19 Nov."""
+    gate = [["S-1 GATE v1.9.7", "as of 2026-11-20 Riyadh", "verdict: PASS"]]
+    board = [["EVIDENCE BOARD"], ["6. LEARNING GATE - copied from the S1_Gate page"],
+             ["S-1 GATE v1.9.7", "as of 2026-11-19 Riyadh", "verdict: FAIL"]]
+    assert cc.gate_reading(gate) == ("PASS", "2026-11-20") and cc.gate_reading(board) == ("FAIL", "2026-11-19")
+    assert cc.gate_reading([["S-1 GATE", "FAIL", "day 28/28"]]) == (None, None)    # no 'verdict:' word: not read
+    r = [x for x in cc.run_checks(wb(S1_Gate=gate, Evidence_Board=board), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0]
+    assert r[1] == "STALE" and r[2] == ("the Evidence Board (and the Today Action Plan, which copies it) shows S-1 FAIL as of "
+                                        "2026-11-19; S1_Gate reads PASS as of 2026-11-20 - read S1_Gate until the board is rebuilt")
+    same = [["S-1 GATE v1.9.7", "as of 2026-11-20 Riyadh", "verdict: FAIL"]]
+    assert [x for x in cc.run_checks(wb(S1_Gate=gate, Evidence_Board=same), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0][1] == "MISMATCH"
+    assert [x for x in cc.run_checks(wb(S1_Gate=gate, Evidence_Board=gate), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0][1] == "MATCH"
+    one = [x for x in cc.run_checks(wb(S1_Gate=gate), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"][0]
+    assert one[1] == "INFO" and one[2] == "not compared: the verdict is not readable on Evidence_Board"
+    assert not [x for x in cc.run_checks(wb(), TODAY, cc.knobs()) if x[0] == "C14 S-1 gate"]      # neither page: no row
+    assert cc.log_detail(r) == r[2]                                                # names and dates only
+
+
+def test_k10_the_broker_tabs_age():
+    """20 Nov: _IBKR_NAV_History ended 17 Oct, so Portfolio_Decision_v2 read the account's return as -0.1% (broker: -4.1%)."""
+    nav = [["date", "twr_cum_since_inception"], ["2026-08-11 00:00:00", 0.0109], ["2026-10-17 00:00:00", 0.0099]]
+    acct = [["key", "value"], ["as_of", "2026-10-17 18:15 Riyadh"], ["nav_usd", 22187.54]]
+    today = dt.date(2026, 11, 20)
+    r = [x for x in cc.run_checks(wb(_IBKR_NAV_History=nav, _IBKR_Account=acct), today, cc.knobs()) if x[0] == "C15 broker tabs"][0]
+    assert r[1] == "STALE" and r[2].startswith("_IBKR_NAV_History ends 2026-10-17 (34 days); _IBKR_Account as of 2026-10-17 "
+                                                "(34 days) - Portfolio_Decision_v2 reads the account's return")
+    fresh = [["date", "x"], ["2026-11-19", 0.0]]
+    m = [x for x in cc.run_checks(wb(_IBKR_NAV_History=fresh), today, cc.knobs()) if x[0] == "C15 broker tabs"][0]
+    assert m[1] == "MATCH" and m[2] == "_IBKR_NAV_History ends 2026-11-19 - within 7 days"
+    assert not [x for x in cc.run_checks(wb(), today, cc.knobs()) if x[0] == "C15 broker tabs"]    # no tab: no row
+    assert "22187" not in cc.log_detail(r) and "0.0099" not in r[2]
+
+
+def test_k10_the_run_reads_the_capture_and_the_four_tabs(monkeypatch, capsys):
+    monkeypatch.setattr(cc, "_SLEEP", lambda s: None)
+    g = wb(S1_Gate=[["S-1 GATE v1.9.7", "as of 2026-11-11 Riyadh", "verdict: PASS"]])
+    b = Book(g)
+    assert cc.run(False, book=b, now=NOW, capture=_cap({"DDI.US": 240.0}, age_h=0.2)) == 0
+    page = b.tabs["Consistency_Check"].values
+    got = dict((r[0], r[1]) for r in page[3:])
+    assert got["C13 broker"] == "MISMATCH" and got["C14 S-1 gate"] == "INFO"
+    assert {"S1_Gate", "Evidence_Board", "_IBKR_NAV_History", "_IBKR_Account"} <= set(cc.RANGES)
+    out = capsys.readouterr().out
+    assert "GLPI.US ledger" not in out and "C13 broker       MISMATCH (figures on the Consistency_Check page)" in out
+    calls = []
+    import scripts.ibkr_capture as ic
+    monkeypatch.setattr(ic, "latest", lambda now, out=None: calls.append(now) or {"ok": False, "reason": "boom"})
+    assert cc.broker_capture(NOW) == {"ok": False, "reason": "boom"} and calls == [NOW]
+    monkeypatch.setattr(ic, "latest", lambda now, out=None: 1 / 0)
+    assert cc.broker_capture(NOW) == {"ok": False, "reason": "capture not read (ZeroDivisionError)"}

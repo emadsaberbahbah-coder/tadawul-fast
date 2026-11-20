@@ -375,11 +375,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.0", "holding read"),
-    ("consistency_check", "1.3.0", "consistency check"),
+    ("consistency_check", "1.4.0", "consistency check"),
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.7.1", "today action plan"),
+    ("today_action_plan", "1.8.0", "today action plan"),
     ("plan_archive", "1.1.1", "plan archive"),
-    ("ibkr_capture", "1.1.0", "ibkr capture"),
+    ("ibkr_capture", "1.2.0", "ibkr capture"),
     ("cash_cells", "1.0.0", "cash cells"),
     ("sheets_quota", "1.0.1", "sheets quota"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.

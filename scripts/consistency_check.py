@@ -2,7 +2,37 @@
 """
 scripts/consistency_check.py - TFB cross-page consistency check
 ===============================================================
-VERSION 1.3.0 (2026-11-18) - first written 2026-11-11 (1.0.0)
+VERSION 1.4.0 (2026-11-20) - first written 2026-11-11 (1.0.0)
+
+1.4.0: THE BROKER, THE LEARNING GATE AND THE BROKER TABS (owner, 20 Nov 2026
+22:40 Riyadh, in Arabic: "a full review of the file against the market ... the
+most important differences between the pages ... and if something is missing
+we can develop it"). Read on the workbook of 20 Nov 22:41, while this page
+said "0 mismatch(es)":
+  - IBKR had sold all 24 NMM shares at 17:30 Riyadh (the stop filled at the
+    open). The ledger, My_Portfolio, both portfolio pages and the Exit Plan
+    still held them; C5 compares the ledger with Portfolio_Decision, both of
+    which read the ledger, so the broker was never in the comparison.
+  - S1_Gate read PASS (as of 20 Nov) while the Evidence Board - and the Today
+    Action Plan, which copies it - still showed FAIL (as of 19 Nov).
+  - _IBKR_NAV_History ended on 17 Oct and _IBKR_Account was "as of 2026-10-17":
+    Portfolio_Decision_v2 showed the account's return since 11 Aug as -0.1%
+    (the broker: -4.1%) and a closed-trade record a month old.
+Three checks are added; every other check is the 1.3.0 one:
+  C13 broker   the ledger's shares against the newest IBKR capture
+               (ibkr_capture.latest): a US holding the broker no longer holds
+               ("sold at IBKR today" when the capture lists it at 0 shares
+               with the day's P&L), a different count, or a broker position
+               the ledger lacks is a MISMATCH. A holding kept elsewhere (not a
+               US listing, not at IBKR) is not compared. A capture that cannot
+               be read, or one older than TFB_CONS_IBKR_MAX_AGE_H (30), gives
+               INFO. Detail stays off the run log.
+  C14 S-1 gate the Evidence Board's copy of the gate against S1_Gate: an older
+               copy is STALE, the same day with another verdict a MISMATCH.
+  C15 broker tabs  the last date of _IBKR_NAV_History and the as_of of
+               _IBKR_Account against TFB_CONS_IBKR_TAB_DAYS (7): older is
+               STALE - the figures Portfolio_Decision_v2 reads from them are
+               not the broker's today.
 
 WHY (owner, Wed 11 Nov 2026 11:24 Riyadh): "improve and accurate output data
 matching in all pages". Read on the live workbook at 11:30 the same day:
@@ -29,6 +59,9 @@ and the pages they come from. It changes no other page and decides nothing.
   C6 FX            the ledger's USD rate vs the 3.75 peg
   C7 NAV           Portfolio_Decision total vs ledger total (named difference)
   C8 cash          Portfolio_Decision cash vs the main page's cash panel
+  C13 broker       the ledger's shares vs the newest IBKR capture (1.4.0)
+  C14 S-1 gate     the Evidence Board's copy of the S-1 gate vs S1_Gate (1.4.0)
+  C15 broker tabs  the age of _IBKR_NAV_History and _IBKR_Account (1.4.0)
   C9 stops         Portfolio_Decision stop vs the Exit Plan's stop per holding
   C10 actions      Portfolio_Decision action vs the Exit Plan's action
 
@@ -96,7 +129,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -146,7 +179,9 @@ def knobs() -> Dict[str, float]:
             "earn_days": _env_num("TFB_PLAN_EARN_DAYS", 7, 0, 30),
             "sar_tol": _env_num("TFB_CONS_SAR_TOL", 50.0, 0.0, 1e6),
             "page_h": _env_num("TFB_CONS_PAGE_MAX_AGE_H", 2.0, 0.25, 240.0),
-            "idle_h": _env_num("TFB_CONS_PAGE_IDLE_MAX_H", 26.0, 1.0, 720.0)}
+            "idle_h": _env_num("TFB_CONS_PAGE_IDLE_MAX_H", 26.0, 1.0, 720.0),
+            "ibkr_h": _env_num("TFB_CONS_IBKR_MAX_AGE_H", 30.0, 0.5, 240.0),                 # 1.4.0
+            "ibkr_tab_days": _env_num("TFB_CONS_IBKR_TAB_DAYS", 7.0, 1.0, 365.0)}
 
 
 # ----------------------------------------------------------------------------- #
@@ -258,8 +293,99 @@ def freshness(g: Dict[str, List[List[Any]]], now: _dt.datetime, max_h: float, id
     return out
 
 
+_NOT_SET = re.compile(r"^(TFB_IBKR_CAPTURE is off|capture folder not set)")   # 1.4.0: no capture configured
+_VERDICT = re.compile(r"verdict:\s*(PASS|FAIL)", re.I)
+_AS_OF = re.compile(r"as of\s*(\d{4}-\d{2}-\d{2})", re.I)
+_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def gate_reading(values: Sequence[Sequence[Any]]) -> Tuple[Optional[str], Optional[str]]:
+    """1.4.0: (verdict, as-of date) of the first row that names the S-1 gate and carries 'verdict: PASS|FAIL'."""
+    for r in values or []:
+        if not text(cell(r, 0)).upper().startswith("S-1 GATE"):
+            continue
+        line = " ".join(text(c) for c in r)
+        v, d = _VERDICT.search(line), _AS_OF.search(line)
+        if v:
+            return v.group(1).upper(), d.group(1) if d else None
+    return None, None
+
+
+def broker_check(lots: Dict[str, Dict[str, Any]], cap: Dict[str, Any], k: Dict[str, float]) -> List[str]:
+    """1.4.0 C13: the ledger's shares against the newest IBKR capture (the broker's count)."""
+    pages = "_Portfolio_CostBasis / IBKR capture"
+    if not cap.get("ok"):
+        return row("C13 broker", "INFO", "IBKR capture not read: %s - not compared" % (cap.get("reason") or "unknown"),
+                   pages=pages)
+    if cap.get("age_h") is not None and cap["age_h"] > k["ibkr_h"]:
+        return row("C13 broker", "INFO", "the newest IBKR capture is %.0f h old (limit %.0f h) - not compared" % (
+            cap["age_h"], k["ibkr_h"]), pages=pages)
+    held, closed = cap.get("positions") or {}, cap.get("closed_today") or {}
+    bad, n = [], 0
+    for s, lot in sorted(lots.items()):
+        b = held.get(s)
+        if b is None and s not in closed and not s.endswith(".US"):
+            continue                                                # kept elsewhere (the sukuk): not at IBKR
+        n += 1
+        if abs((b or 0.0) - lot["shares"]) > 1e-6:
+            bad.append("%s ledger %s vs IBKR %s%s" % (s, fmt(lot["shares"], 0), fmt(b or 0.0, 0),
+                                                      " (sold at IBKR today)" if s in closed else ""))
+    for s in sorted(set(held) - set(lots)):
+        bad.append("%s ledger 0 vs IBKR %s (not in the ledger)" % (s, fmt(held[s], 0)))
+    at = cap["as_of"].astimezone(RIYADH).strftime("%Y-%m-%d %H:%M") if cap.get("as_of") else "?"
+    return row("C13 broker", "MISMATCH" if bad else "MATCH",
+               ("%s - the share count is the broker's: record each difference in the ledger (capture of %s Riyadh)" % (
+                   "; ".join(bad), at)) if bad else
+               "the ledger's shares equal IBKR's for %d holding(s) (capture of %s Riyadh)" % (n, at), pages=pages)
+
+
+def gate_check(g: Dict[str, List[List[Any]]]) -> Optional[List[str]]:
+    """1.4.0 C14: the Evidence Board's copy of the S-1 gate against the gate's own page (None: neither page read)."""
+    pages = "S1_Gate / Evidence_Board"
+    gv, gd = gate_reading(g.get("S1_Gate") or [])
+    ev, ed = gate_reading(g.get("Evidence_Board") or [])
+    if not gv and not ev:
+        return None
+    if not gv or not ev:
+        return row("C14 S-1 gate", "INFO", "not compared: the verdict is not readable on %s" % (
+            "S1_Gate" if not gv else "Evidence_Board"), pages=pages)
+    a, b = "%s as of %s" % (gv, gd or "?"), "%s as of %s" % (ev, ed or "?")
+    if gd and ed and ed < gd:
+        return row("C14 S-1 gate", "STALE", "the Evidence Board (and the Today Action Plan, which copies it) shows S-1 "
+                   "%s; S1_Gate reads %s - read S1_Gate until the board is rebuilt" % (b, a), a, b, pages)
+    if gv != ev:
+        return row("C14 S-1 gate", "MISMATCH", "the Evidence Board shows S-1 %s; S1_Gate reads %s" % (b, a), a, b, pages)
+    return row("C14 S-1 gate", "MATCH", "the Evidence Board shows the gate's own reading: %s" % a, a, b, pages)
+
+
+def broker_tabs_check(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float]) -> Optional[List[str]]:
+    """1.4.0 C15: the age of the broker tabs Portfolio_Decision_v2 reads the account's return and trade record from
+    (None: no date on either tab)."""
+    pages = "_IBKR_NAV_History / _IBKR_Account / Portfolio_Decision_v2"
+    found: List[Tuple[str, _dt.date]] = []
+    nav = [_DATE.search(text(cell(r, 0))) for r in g.get("_IBKR_NAV_History") or []]
+    days = sorted(_dt.date.fromisoformat(m.group(1)) for m in nav if m)
+    if days:
+        found.append(("_IBKR_NAV_History ends %s" % days[-1].isoformat(), days[-1]))
+    for r in g.get("_IBKR_Account") or []:
+        if text(cell(r, 0)).lower() == "as_of":
+            m = _DATE.search(text(cell(r, 1)))
+            if m:
+                d = _dt.date.fromisoformat(m.group(1))
+                found.append(("_IBKR_Account as of %s" % d.isoformat(), d))
+    if not found:
+        return None
+    old = [(t, (today - d).days) for t, d in found if (today - d).days > k["ibkr_tab_days"]]
+    if old:
+        return row("C15 broker tabs", "STALE", "%s - Portfolio_Decision_v2 reads the account's return and trade record "
+                   "from these tabs, so those figures are not the broker's today (limit %d days)" % (
+                       "; ".join("%s (%d days)" % (t, n) for t, n in old), k["ibkr_tab_days"]), pages=pages)
+    return row("C15 broker tabs", "MATCH", "; ".join(t for t, _ in found) + " - within %d days" % k["ibkr_tab_days"],
+               pages=pages)
+
+
 def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float],
-               now: Optional[_dt.datetime] = None) -> List[List[str]]:
+               now: Optional[_dt.datetime] = None, cap: Optional[Dict[str, Any]] = None) -> List[List[str]]:
     out: List[List[str]] = []
     t10, pd = g.get("Top_10_Investments") or [], g.get("Portfolio_Decision") or []
     seats = table_rows(t10, ("Rank", "Symbol", "Ticket SAR", "Shares"), "Symbol")
@@ -361,6 +487,8 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
     out.append(row("C5 quantities", "MISMATCH" if bad_qty else "MATCH", "; ".join(bad_qty) or
                    "quantities agree for %d holding(s)" % len([s for s in lots if s in pdr]),
                    pages="_Portfolio_CostBasis / Portfolio_Decision"))
+    if cap is not None and not _NOT_SET.match(cap.get("reason") or ""):   # 1.4.0: the broker itself
+        out.append(broker_check(lots, cap, k))
     # C6
     fx = sorted({round(lot["fx"], 4) for lot in lots.values() if lot["ccy"] == "USD" and lot["fx"]})
     off = [f for f in fx if _pct(f, PEG) > k["fx_tol"]]
@@ -439,6 +567,12 @@ def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, floa
                            "the cap; a trim is a sizing decision, not a price exit" % (
                                " of %s%%" % fmt(cap, 0) if cap is not None else "", "; ".join(over)),
                            pages="Portfolio_Decision / Exit_Plan"))
+    gate = gate_check(g)                                            # 1.4.0 (None: neither page read)
+    if gate:
+        out.append(gate)
+    tabs = broker_tabs_check(g, today, k)                           # 1.4.0 (None: no date on either tab)
+    if tabs:
+        out.append(tabs)
     if now is not None:
         out += freshness(g, now, k["page_h"], k.get("idle_h", 26.0))
     return out
@@ -459,9 +593,14 @@ CONTROLS = {
     "C10": "A price exit is the Exit Plan's call. Another page's sell-side action is analysis.",
     "C11": "A page not rebuilt within the limit is analysis only until it is rebuilt.",
     "C12": "The position cap is the owner's rule. A holding above it is reported; trimming is the owner's decision.",
+    "C13": "The share count is the broker's. A holding the broker no longer holds is recorded as sold in the ledger; "
+           "a position the ledger lacks is added.",
+    "C14": "S1_Gate rules. A page that copies the gate shows its newest reading; an older copy is rebuilt.",
+    "C15": "The account's return and trade record are the broker's. A broker tab older than the limit is refreshed, or "
+           "the figures read from it are not used.",
 }
 
-LOG_DETAIL = ("C1", "C2", "C3", "C11")                             # names and times only; nothing of the account
+LOG_DETAIL = ("C1", "C2", "C3", "C11", "C14", "C15")                             # names and times only; nothing of the account
 
 
 def log_detail(r: Sequence[str]) -> str:
@@ -489,10 +628,21 @@ def page_rows(results: List[List[str]], stamp: str) -> List[List[str]]:
 RANGES = {"Top_10_Investments": "A1:AE60", "Portfolio_Decision": "A1:Z60", "Top_10_Investments_v2": "A1:Z4",
           "Portfolio_Decision_v2": "A1:Z4", "_Portfolio_CostBasis": "A1:Z600", "My_Portfolio": "A1:K60",
           "_Daily_Plan": "A1:AB2001", "_Exit_Plan": "A1:Q3001", "Daily_Plan": "A1:B4", "Exit_Plan": "A1:B4", "Calendar_Events": "A1:J4000",
-          "Dividend_Events": "A1:J4000"}
+          "Dividend_Events": "A1:J4000",
+          # 1.4.0: the S-1 gate and its copy, and the broker tabs
+          "S1_Gate": "A1:D3", "Evidence_Board": "A1:E120", "_IBKR_NAV_History": "A1:B800", "_IBKR_Account": "A1:B12"}
 
 
-def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> int:
+def broker_capture(now: _dt.datetime) -> Dict[str, Any]:
+    """1.4.0: the newest IBKR capture, read-only; never raises."""
+    try:
+        from scripts import ibkr_capture  # noqa: PLC0415
+        return ibkr_capture.latest(now, out=_out)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "capture not read (%s)" % type(e).__name__}
+
+
+def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None, capture: Optional[Dict[str, Any]] = None) -> int:
     write = mode() == "on" and not dry_run
     now = now or _dt.datetime.now(UTC)
     today = now.astimezone(RIYADH).date()
@@ -514,7 +664,8 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None) -> int:
                 return 2
             _out("read failed (%s) - attempt %d of %d" % (type(e).__name__, attempt, READ_ATTEMPTS))
             _SLEEP(READ_RETRY_S)
-    results = run_checks(grids, today, knobs(), now)
+    cap = capture if capture is not None else broker_capture(now)
+    results = run_checks(grids, today, knobs(), now, cap)
     for r in results:
         _out("%-16s %-8s %s" % (r[0], r[1], log_detail(r)))
     if not write:

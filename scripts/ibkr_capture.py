@@ -2,7 +2,18 @@
 """
 scripts/ibkr_capture.py - the latest read-only IBKR capture, for the plan pages
 ================================================================================
-VERSION 1.1.0 (2026-11-17) - first written 2026-11-13 (1.0.0)
+VERSION 1.2.0 (2026-11-20) - first written 2026-11-13 (1.0.0)
+
+1.2.0: A POSITION THE BROKER CLOSED TODAY. On 20 Nov the GTC stop on NMM filled
+at the US open (17:30 Riyadh). The next captures still listed NMM - with
+"position": 0.0 and the day's P&L - and parse() dropped every zero row, so the
+plan pages only knew that NMM was "absent from the broker capture" and asked
+for a check while every page still counted the shares. parse() now also
+returns "closed_today": {SYM: {"day_pnl_usd", "price"}} - the zero rows that
+carry a day's P&L (IBKR keeps a position closed during the session on the
+list, at 0 shares, until the next day) - and "realized_usd", the balance's
+realized P&L of the day. Every other key is unchanged: "positions" still
+holds only the shares the account holds.
 
 1.1.0: WHICH WORKING BUYS ARE DAY ORDERS. On 16 Nov a day order to buy (limit,
 "Day") expired unfilled at the US close; the last capture of the session
@@ -54,7 +65,7 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -117,10 +128,12 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
     {"ok", "reason", "name", "as_of", "age_h", "cash_usd", "settled_usd", "nav_usd", "stock_usd",
      "positions": {SYM: qty}, "stops": {SYM: [(price, qty)]}, "limits": {SYM: [(price, qty)]},
      "buys": {SYM: [(limit or None, qty)]}, "day_buys": {SYM: qty} (1.1.0: the working buys that are day orders),
-     "n_orders"}"""
+     "closed_today": {SYM: {"day_pnl_usd", "price"}} (1.2.0: a position at 0 shares that carries a day's P&L - the
+     broker closed it during the session), "realized_usd" (1.2.0: the balance's realized P&L), "n_orders"}"""
     out: Dict[str, Any] = {"ok": False, "reason": "", "name": name, "as_of": None, "age_h": None, "cash_usd": None,
                            "settled_usd": None, "nav_usd": None, "stock_usd": None, "positions": {}, "stops": {},
-                           "limits": {}, "buys": {}, "day_buys": {}, "n_orders": 0}
+                           "limits": {}, "buys": {}, "day_buys": {}, "closed_today": {}, "realized_usd": None,
+                           "n_orders": 0}
     if not isinstance(capture, dict) or str(capture.get("schema")) != SCHEMA:
         out["reason"] = "capture schema not recognised"
         return out
@@ -158,14 +171,21 @@ def parse(capture: Any, created: Optional[_dt.datetime], now: _dt.datetime, name
     out["cash_usd"] = cash if cash is not None else settled
     out["settled_usd"] = settled
     out["nav_usd"], out["stock_usd"] = _num(b.get("net_liquidation_value")), _num(b.get("stock_market_value"))
+    out["realized_usd"] = _num(b.get("realized_pnl"))                                   # 1.2.0
     pos = (capture.get("positions") or {}).get("positions") if isinstance(capture.get("positions"), dict) else None
     if not isinstance(pos, list):
         out["reason"] = "capture has no positions list"
         return out
+    closed: Dict[str, Dict[str, Optional[float]]] = {}
     for p in pos:
         sym, q = symbol_of((p or {}).get("contract_description")), _num((p or {}).get("position"))
         if sym and q:
             out["positions"][sym] = out["positions"].get(sym, 0.0) + q
+        elif sym and q is not None:                                 # 1.2.0: 0 shares and a P&L for the day
+            day = _num((p or {}).get("daily_pnl"))
+            if day is not None and abs(day) > 0.005:
+                closed[sym] = {"day_pnl_usd": day, "price": _num((p or {}).get("market_price"))}
+    out["closed_today"] = dict((sym, v) for sym, v in closed.items() if sym not in out["positions"])
     orders = (capture.get("orders") or {}).get("orders") if isinstance(capture.get("orders"), dict) else None
     if not isinstance(orders, list):
         out["reason"] = "capture has no orders list"
