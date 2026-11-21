@@ -280,6 +280,12 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.18.0 (21 Nov 2026): the condition of every market, their order, the forward test and its
+    # scorecard (observe only)
+    "v_market_condition": "73a161bea603ebe303c160438f3e74039da889df2ded39b0e76e3db623c74995",
+    "v_market_rank": "e393fbb23ccc0f5a8308e6c3f73bcbc3c14f4d3c9d1101652e9837cc4cc90ec1",
+    "v_market_trial": "183d8109018a0d71007379bcb229ef319ee9543eb03bab2821707731474d6464",
+    "v_market_trial_summary": "5395fa8b4f9410b33aa062dc796320c959994c8cdf13b212d4a9508411c9c5ac",
     # apply_bq_views 1.17.0 (21 Nov 2026): the company news scoreboard against the same-day US names, not only SPY
     # (replaces the 1.16.0 body 130256c0270d)
     "v_company_news_eval": "07807483369ded1bb735dc33bfe14d31ffe3a044ce3605037c7e1ffdcb313ae7",
@@ -345,9 +351,10 @@ EXPECTED_ORDER = [
     "v_trial_news_overlay",
     "v_c2_calls",
     "v_symbol_news_class", "v_company_news_eval",
+    "v_market_condition", "v_market_rank", "v_market_trial", "v_market_trial_summary",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 38)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 42)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -911,7 +918,8 @@ def case_v18():
         "v_trial_c1": {"symbol_bars_daily"},                  # v1.8.0: the trial reads each call's 1-month price
         "v_news_signal_eval": {"symbol_bars_daily"},         # v1.10.0: each name's next 5 sessions
         "v_symbol_news_class": {"symbol_news"},              # v1.16.0: each headline re-read
-        "v_company_news_eval": {"symbol_bars_daily"}}, used   # v1.16.0: the next sessions after the news day
+        "v_company_news_eval": {"symbol_bars_daily"},        # v1.16.0: the next sessions after the news day
+        "v_market_condition": {"symbol_bars_daily"}}, used    # v1.18.0: the Saudi REITs (4330-4350) as one index
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
@@ -2894,11 +2902,201 @@ def case_v41():
     assert "same-day average of the US names (the reading)" in v.template      # the description says it too
 
 
+def _in_list(code, cte):
+    """The quoted symbols of the `s.symbol IN (...)` filter inside the CTE `cte`."""
+    import re
+    part = code.split(cte + " AS (", 1)[1].split("\n),", 1)[0]
+    return re.findall(r"'([^']+)'", part.split("s.symbol IN (", 1)[1].split(")", 1)[0])
+
+
+def _mk_funds(code):
+    """The fund of each market of v_market_condition's list, in its order ('' = none: a reading only)."""
+    import re
+    block = code.split("FROM UNNEST([", 1)[1].split("])", 1)[0]
+    out = []
+    for chunk in block.split("STRUCT(")[1:]:
+        tok = re.findall(r"'[^']*'|CAST\(NULL AS STRING\)|\bTRUE\b|\bFALSE\b|\b\d+\b", chunk)
+        assert len(tok) == 7, tok                       # order, id, market, reading, reading name, fund, buyable
+        out.append("" if tok[5].startswith("CAST") else tok[5].strip("'"))
+    return out
+
+
+def case_v42():
+    """v_market_condition (1.18.0): the five labels of v_market_regime for eleven markets; the US read exactly as the
+    view (and the live rule) reads it, every other market's limits scaled by k = its normal volatility / 16."""
+    import re
+    import market_regime as mr
+    objs = {o.name: o for o in bv.load_objects()}
+    v = objs["v_market_condition"]
+    assert v.path.name == "99_v_market_condition.sql" and v.kind == "VIEW"
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_market_condition"} == {"market_series_daily", "symbol_bars_daily"}
+    # the markets, the readings and the funds a buy would use
+    rows = re.findall(r"STRUCT\((\d+)(?: AS market_order)?, '([a-z_]+)'(?: AS market_id)?, '([^']+)'(?: AS market)?, "
+                      r"'([^']+)'", code)
+    assert [(int(n), m, r) for n, m, _, r in rows] == [
+        (1, "us", "SPY"), (2, "sa", "^TASI.SR"), (3, "eu", "^STOXX"), (4, "jp", "^N225"), (5, "cn", "^HSI"),
+        (6, "gold", "GC=F"), (7, "oil", "BZ=F"), (8, "bonds", "IEF"), (9, "sukuk", "SPSK"), (10, "reits_us", "VNQ"),
+        (11, "reits_sa", "SA_REITS")]
+    assert _mk_funds(code) == ["SPY", "KSA", "VGK", "EWJ", "MCHI", "GLD", "", "IEF", "SPSK", "VNQ", "SA_REITS"]
+    assert "CAST(NULL AS STRING), FALSE)" in code                                   # oil: a reading only
+    import archive_market_series as ms
+    archived = {s[1] for s in ms.SERIES}
+    assert {r for _, _, _, r in rows} - {"SA_REITS"} <= archived                    # every reading is archived
+    assert set(_mk_funds(code)) - {"", "SA_REITS"} <= archived                      # and every fund
+    # the US exactly as v_market_regime: price closes, k = 1, the VIX, the same windows and the same tests
+    for frag in ("IF(mk.market_id = 'us', s.close, COALESCE(s.adj_close, s.close)) AS close",
+                 "IF(m.market_id = 'us', 1.0, ROUND(m.normal_vol_pct / 16, 4)) AS k",
+                 "LEFT JOIN vix AS v ON w.market_id = 'us' AND v.date = w.date",
+                 "WHERE symbol = '^VIX' AND close IS NOT NULL",
+                 "IF(w.n50 = 50, ROUND((SAFE_DIVIDE(w.close, w.ma50) - 1) * 100, 4), NULL) AS vs_50d_pct",
+                 "IF(w.n20 = 20, ROUND(w.sd20 * SQRT(252) * 100, 4), NULL) AS vol20_pct",
+                 "ROUND((SAFE_DIVIDE(w.close, w.high250) - 1) * 100, 4) AS dd_from_high_pct",
+                 "IF(w.n250 >= 120, ROUND(w.sd250 * SQRT(252) * 100, 4), NULL) AS normal_vol_pct",
+                 "ROUND(-2 * lim.k, 4) AS limit_r1_pct", "ROUND(-3 * lim.k, 4) AS limit_r5_pct",
+                 "ROUND(-8 * lim.k, 4) AS limit_dd_pct", "ROUND(25 * lim.k, 4) AS limit_vol20_pct",
+                 "WHEN x.k IS NULL THEN NULL",
+                 "WHEN x.r1_pct <= x.limit_r1_pct THEN 'crash_day'",
+                 "WHEN x.r5_pct <= x.limit_r5_pct OR x.dd_from_high_pct <= x.limit_dd_pct THEN 'drawdown'",
+                 "WHEN (x.market_id = 'us' AND x.vix_close >= 25) OR x.vol20_pct >= x.limit_vol20_pct THEN 'stress'",
+                 "WHEN x.vs_50d_pct < 0 THEN 'weak'", "ELSE 'calm'"):
+        assert frag in code, frag
+    regime = bv._code(objs["v_market_regime"].template)
+    for frame in ("ROWS BETWEEN 49 PRECEDING AND CURRENT ROW", "ROWS BETWEEN 249 PRECEDING AND CURRENT ROW",
+                  "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW"):
+        assert frame in code and frame in regime, frame
+    for lim in ("<= -2 THEN 'crash_day'", "<= -3 OR", "<= -8 THEN 'drawdown'", "vix_close >= 25", "_vol20_pct >= 25",
+                "_vs_50d_pct < 0 THEN 'weak'"):
+        assert lim in regime, lim                                                   # the US limits k scales
+    labels = re.findall(r"THEN '([a-z_]+)'", code.split("END AS label", 1)[0].split("CASE", 1)[1]) + ["calm"]
+    assert tuple(labels) == mr.LABELS                                               # the live rule's labels, its order
+    # the Saudi REITs: the funds of Tadawul's REIT codes, an equal-weight index of daily total returns
+    for frag in (r"REGEXP_CONTAINS(symbol, r'^43(3[0-9]|4[0-9]|50)\.SR$') AND close > 0",
+                 "COALESCE(adj_close, close) AS px", "WHERE chg IS NOT NULL AND ABS(chg) <= 0.105",
+                 "HAVING COUNT(*) >= 10",
+                 "100 * EXP(SUM(LN(1 + chg)) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))"):
+        assert frag in code, frag
+    # what it waits for: every failed test, joined; the trend score in units of the normal move
+    assert "IF(x.k IS NULL, NULL, ARRAY_TO_STRING([" in code and "], ' | ')) AS waiting_for" in code
+    assert ("ROUND((SAFE_DIVIDE(x.r20_pct, x.normal_vol_pct * SQRT(20 / 252))\n"
+            "         + SAFE_DIVIDE(x.r60_pct, x.normal_vol_pct * SQRT(60 / 252))) / 2, 3) AS trend_score") in code
+    # no look-ahead
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "no look-ahead" in v.template and "the live system never reads BigQuery" in v.template
+    assert "Observe only" in v.template
+
+
+def case_v43():
+    """v_market_rank (1.18.0): each calendar day, each market's latest labelled close (6 days at most), open only
+    when calm - the Daily Plan's US test, market by market - ranked by trend, and the verdict."""
+    import re
+    import daily_plan as dp
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_market_rank"]
+    assert v.path.name == "100_v_market_rank.sql" and v.kind == "VIEW"
+    assert names.index("v_market_rank") == names.index("v_market_condition") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_market_rank"} == {"v_market_condition", "market_series_daily"}
+    for frag in ("FROM `{{DS}}.v_market_condition`\n  WHERE label IS NOT NULL",
+                 "FROM bounds, UNNEST(GENERATE_DATE_ARRAY(bounds.d0, bounds.d1)) AS as_of",
+                 "LAST_VALUE(c.date IGNORE NULLS)",
+                 "OVER (PARTITION BY g.market_id ORDER BY g.as_of ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
+                 "LEFT JOIN c ON c.market_id = g.market_id AND c.date = g.as_of",
+                 "WHERE DATE_DIFF(fl.as_of, fl.session, DAY) <= 6",
+                 "ON ff.symbol = c.fund_symbol AND ff.as_of = fl.as_of AND DATE_DIFF(fl.as_of, ff.fdate, DAY) <= 6",
+                 "IF(c.label = 'calm', 'open', 'hold') AS state",
+                 "ORDER BY IF(r.state = 'open', 0, 1), r.trend_score DESC NULLS LAST, r.market_order) AS rank",
+                 "COUNTIF(r.state = 'open' AND r.buyable) OVER (PARTITION BY r.as_of) AS open_markets",
+                 "COUNTIF(r.buyable) OVER (PARTITION BY r.as_of) AS buyable_markets",
+                 "IF(ranked.open_markets = 0, 'ALL ON HOLD - cash stays cash',",
+                 "FORMAT('%d of %d open', ranked.open_markets, ranked.buyable_markets)) AS verdict"):
+        assert frag in code, frag
+    # open = calm is the Daily Plan's own test: it holds a US buy on every label but calm
+    wf = (ROOT / ".github" / "workflows" / "daily_plan.yml").read_text(encoding="utf-8")
+    assert "vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day'" in wf
+    assert set(dp.REGIME_LABELS) - {"weak", "stress", "drawdown", "crash_day"} == {"calm"}
+    # the funds read here are the funds of v_market_condition
+    cond = bv._code(objs["v_market_condition"].template)
+    assert _in_list(code, "fund") == [f for f in _mk_funds(cond) if f not in ("", "SA_REITS")]
+    assert "SELECT 'SA_REITS', date, r5_pct, r20_pct" in code
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert re.search(r"ROW_NUMBER\(\) OVER \(PARTITION BY r\.as_of, r\.buyable", code)
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v44():
+    """v_market_trial and v_market_trial_summary (1.18.0): each US session, what each market's fund did from the
+    first close AFTER the day (never the day's own close), 'forward' from 23 Nov 2026; the scorecard the review reads."""
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    t, s = objs["v_market_trial"], objs["v_market_trial_summary"]
+    assert t.path.name == "101_v_market_trial.sql" and s.path.name == "102_v_market_trial_summary.sql"
+    assert names.index("v_market_trial") == names.index("v_market_rank") + 1
+    assert names.index("v_market_trial_summary") == names.index("v_market_trial") + 1
+    code = bv._code(t.template)
+    assert set(bv._REF.findall(code)) - {"v_market_trial"} == {"v_market_rank", "market_series_daily",
+                                                              "v_market_condition"}
+    for frag in ("WHERE symbol = 'SPY' AND close > 0",                              # the decision days: US sessions
+                 "JOIN us ON us.d = r.as_of",
+                 "COALESCE(r.fund_symbol, r.reading_symbol) AS outcome_symbol",
+                 "ON e.symbol = b.outcome_symbol AND e.date > b.as_of AND e.date <= DATE_ADD(b.as_of, INTERVAL 7 DAY)",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY b.as_of, b.market_id ORDER BY e.date) = 1",
+                 "LEFT JOIN seq AS x5 ON x5.symbol = en.symbol AND x5.n = en.entry_n + 5",
+                 "LEFT JOIN seq AS x10 ON x10.symbol = en.symbol AND x10.n = en.entry_n + 10",
+                 "LEFT JOIN seq AS x20 ON x20.symbol = en.symbol AND x20.n = en.entry_n + 20",
+                 "IF(b.as_of >= DATE '2026-11-23', 'forward', 'backtest') AS period",
+                 "LEFT JOIN fwd AS s ON s.as_of = b.as_of AND s.market_id = 'us'",
+                 "ROUND(f.f5_pct - s.f5_pct, 4) AS vs_spy_f5_pp"):
+        assert frag in code, frag
+    assert "e.date >= b.as_of" not in code and "CURRENT_DATE" not in code and "LEAD(" not in code
+    cond = bv._code(objs["v_market_condition"].template)
+    assert _in_list(code, "out_px") == [f for f in _mk_funds(cond) if f not in ("", "SA_REITS")] + ["BZ=F"]
+    sc = bv._code(s.template)
+    assert set(bv._REF.findall(sc)) - {"v_market_trial_summary"} == {"v_market_trial"}
+    for frag in ("FROM `{{DS}}.v_market_trial`\n  WHERE buyable",
+                 "f5_pct AS f, spy_f5_pct AS spy", "f10_pct, spy_f10_pct", "f20_pct, spy_f20_pct",
+                 "ROUND(APPROX_QUANTILES(IF(state = 'open', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS open_p5_pct",
+                 "ROUND(APPROX_QUANTILES(IF(state = 'hold', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS hold_p5_pct",
+                 "WHERE state = 'open' AND buyable_rank = 1",
+                 "COUNTIF(market_id = 'us' AND f IS NOT NULL) AS top_us_n",
+                 "ROUND(AVG(IF(market_id != 'us', f - spy, NULL)), 2) AS top_vs_spy_pp",
+                 "WHERE open_markets = 0 AND spy IS NOT NULL",
+                 "CORR(rs, rf) AS ic", "HAVING COUNT(*) >= 5",
+                 "ROUND(b.open_mean_pct - b.hold_mean_pct, 2) AS open_minus_hold_pp"):
+        assert frag in sc, frag
+    for tpl in (t.template, s.template):
+        assert "overlap" in tpl and "the live system never reads BigQuery" in tpl and "Observe only" in tpl
+
+
+def case_v45():
+    """apply_bq_views 1.18.0: a file number may have three digits, and the files are applied in number order (99 before
+    100); every two-digit file keeps its place."""
+    assert bv.__version__ == "1.18.0"
+    objs = bv.load_objects()
+    files = [o.path.name for o in objs]
+    assert files[-4:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+                          "102_v_market_trial_summary.sql"]
+    assert files[:-3] == sorted(files[:-3])                                         # the two-digit order is unchanged
+    assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
+                                                                                   (10 ** 9, "x.sql")]
+    later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
+    with tempfile.TemporaryDirectory() as d:
+        got = bv.load_objects(_write(Path(d), {"00_f_a.sql": GOOD_FN, "99_v_a.sql": GOOD_VIEW, "100_v_b.sql": later}))
+        assert [o.name for o in got] == ["f_a", "v_a", "v_b"] and bv.check_objects(got) == []
+    for files, needle in (({"00_f_a.sql": GOOD_FN, "1000_v_a.sql": GOOD_VIEW}, "file name must be NN_<object>.sql or NNN_"),
+                          ({"00_f_a.sql": GOOD_FN, "9_v_a.sql": GOOD_VIEW}, "file name must be NN_<object>.sql or NNN_"),
+                          ({"00_f_a.sql": GOOD_FN, "100_v_x.sql": GOOD_VIEW}, "defines v_a, file name says v_x")):
+        with tempfile.TemporaryDirectory() as d:
+            problems = bv.check_objects(bv.load_objects(_write(Path(d), files)))
+            assert any(needle in p for p in problems), (needle, problems)
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
-         case_v39, case_v40, case_v41]
+         case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45]
 
 
 def test_v1(): case_v1()
@@ -2942,6 +3140,10 @@ def test_v38(): case_v38()
 def test_v39(): case_v39()
 def test_v40(): case_v40()
 def test_v41(): case_v41()
+def test_v42(): case_v42()
+def test_v43(): case_v43()
+def test_v44(): case_v44()
+def test_v45(): case_v45()
 
 
 if __name__ == "__main__":
