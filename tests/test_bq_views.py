@@ -280,6 +280,16 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.20.0 (21 Nov 2026): the news by market and by person (news_entity_daily), every news signal
+    # read against what the markets did next, and its scorecard (observe only)
+    "v_market_news": "5ed47514ad0dad5468e0c3589043028982c898b98e2c3b2297010367309d91d6",
+    "v_people_news": "1b7666e0778adc97d81d2b4acf45c109618c321a2063e5813d327c4e9989242e",
+    "v_news_trial": "54527e02f322335733a88a32fb32fd7710309df9dc1b333998fa900cfd0fd746",
+    "v_news_trial_summary": "832a7677fd5408d617fc36578d708cff344d76d24095db62544cdc432ee2039c",
+    # apply_bq_views 1.19.0 (21 Nov 2026): the ready list - every qualified name with the market it tracks, that
+    # market's state, the day's ready order - and its scorecard on the names (observe only)
+    "v_ready_list": "64f7822e70358028b8a09392636d4775be69dba0678d93f7f18685a7a9e8a15e",
+    "v_ready_trial": "c1a6d83a31feae9a302dc814016ea6347e650566f398ee843aa355245b9dd468",
     # apply_bq_views 1.18.0 (21 Nov 2026): the condition of every market, their order, the forward test and its
     # scorecard (observe only)
     "v_market_condition": "73a161bea603ebe303c160438f3e74039da889df2ded39b0e76e3db623c74995",
@@ -352,9 +362,11 @@ EXPECTED_ORDER = [
     "v_c2_calls",
     "v_symbol_news_class", "v_company_news_eval",
     "v_market_condition", "v_market_rank", "v_market_trial", "v_market_trial_summary",
+    "v_ready_list", "v_ready_trial",
+    "v_market_news", "v_people_news", "v_news_trial", "v_news_trial_summary",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 42)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 48)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -2460,9 +2472,12 @@ def case_v37():
                     "v_news_overlay_list": {"v_universe", "v_news_sector_tilt"},
                     "v_trial_news_overlay": {"v_news_overlay_list", "v_forward_universe"}}, refs
     # the source table: the loader's own, and only its declared columns are read
-    assert bv.NEWS_TABLES == {nt.TABLE} and nt.TABLE in bv.SOURCE_TABLES
+    assert bv.NEWS_TABLES == {nt.TABLE, nt.ENTITY_TABLE} and bv.NEWS_TABLES <= bv.SOURCE_TABLES
     assert {n for n in names if "news_theme_daily" in set(bv._REF.findall(bv._code(objs[n].template)))} == {
         "v_news_theme_weekly"}
+    # 1.20.0: the places and the people live in their own table, so the loop's every-feature rule is unchanged
+    assert {n for n in names if "news_entity_daily" in set(bv._REF.findall(bv._code(objs[n].template)))} == {
+        "v_market_news", "v_people_news", "v_news_trial"}
     cols = {f["name"] for f in nt.SCHEMA}
     wk = code["v_news_theme_weekly"].split("WITH wk AS (", 1)[1].split("GROUP BY week_start, feature", 1)[0]
     assert set(re.findall(r"\b(date|feature|source|kind|num|den|loaded_at|run_id)\b", wk)) <= cols
@@ -2525,7 +2540,9 @@ def case_v37():
                  "WHEN pos > sectors - 3 AND score_x < 0 THEN 'avoided'",
                  "WHERE max_active > 0"):
         assert frag in t, frag
-    assert {s for s in (f[1] for f in nt.FEATURES)} == {"gdelt_events", "gdelt_gkg"}
+    # the loop's table holds the two v1.0.0 sources only (archive_news_themes 1.1.0 sends its new ones elsewhere)
+    assert {f[1] for f in nt.FEATURES if nt.TABLE_OF[f[1]] == nt.TABLE} == {"gdelt_events", "gdelt_gkg"}
+    assert {s for s in nt.SOURCES if nt.TABLE_OF[s] == nt.TABLE} == {"gdelt_events", "gdelt_gkg"}
     assert [_news_tilt_group(p, 11, sc) for p, sc in ((1, 0.2), (3, 0.01), (4, 0.3), (3, 0.0), (9, -0.1), (11, -0.5),
                                                        (8, -0.9), (9, 0.0), (10, 0.02))] == [
         "favoured", "favoured", "neutral", "neutral", "avoided", "avoided", "neutral", "neutral", "neutral"]
@@ -3073,14 +3090,16 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0: a file number may have three digits, and the files are applied in number order (99 before
-    100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.18.0"
+    """apply_bq_views 1.18.0 (kept in 1.20.0): a file number may have three digits, and the files are applied in number
+    order (99 before 100); every two-digit file keeps its place."""
+    assert bv.__version__ == "1.20.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-4:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
-                          "102_v_market_trial_summary.sql"]
-    assert files[:-3] == sorted(files[:-3])                                         # the two-digit order is unchanged
+    assert files[-10:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+                           "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
+                           "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
+                           "108_v_news_trial_summary.sql"]
+    assert files[:-9] == sorted(files[:-9])                                         # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3095,11 +3114,305 @@ def case_v45():
             assert any(needle in p for p in problems), (needle, problems)
 
 
+def case_v46():
+    """v_ready_list (1.19.0): each archived day, every qualified name (the panel floors) with the market it tracks -
+    not its currency - that market's state, the day's ready order (top 3 = the ready list), what it waits for, and
+    the live US rule beside it. Observe only."""
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_ready_list"]
+    assert v.path.name == "103_v_ready_list.sql" and v.kind == "VIEW"
+    assert names.index("v_ready_list") == names.index("v_market_trial_summary") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_ready_list"} == {"v_universe", "v_market_rank", "v_my_portfolio"}
+    # not a holding: a name held that day is out (the ready list is for new money, like v_hold_vs_switch's candidates)
+    for frag in ("FROM `{{DS}}.v_my_portfolio` AS p\n  WHERE p.position_qty > 0",
+                 "LEFT JOIN held AS h ON h.snapshot_date = v.snapshot_date AND h.symbol = UPPER(v.symbol)",
+                 "AND h.symbol IS NULL\n),"):
+        assert frag in code, frag
+    assert "p.position_qty > 0" in bv._code(objs["v_hold_vs_switch"].template)          # the same holdings test
+    # qualified = INVESTABLE + INVEST + the floors of v_universe_latest, one row per name and day (the last capture)
+    floors = "COALESCE({0}.reliability >= 70 AND {0}.data_quality >= 80, FALSE)"
+    assert floors.format("v") in code and floors.format("r") in bv._code(objs["v_universe_latest"].template)
+    for frag in ("WHERE UPPER(v.investability_status) = 'INVESTABLE'", "AND UPPER(v.final_action) = 'INVEST'",
+                 "AND v.block_reason IS NULL"):
+        assert frag in code, frag
+    # the day's last copy first, then the floors (Codex P2, #1046): a name whose last copy is blocked stays out
+    assert ("WITH last_copy AS (\n  SELECT v.*\n  FROM `{{DS}}.v_universe` AS v\n"
+            "  QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, "
+            "v.source_page) = 1\n),") in code
+    assert ("FROM last_copy AS v\n  LEFT JOIN held AS h ON h.snapshot_date = v.snapshot_date AND h.symbol = "
+            "UPPER(v.symbol)\n  WHERE UPPER(v.investability_status) = 'INVESTABLE'") in code
+    assert code.count("QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol") == 1 and code.count("v_universe`") == 1
+    # the market a name tracks: every market fund of v_market_condition by name, the futures, the listings
+    cond = bv._code(objs["v_market_condition"].template)
+    ids = [m for _, m, _, _ in re.findall(r"STRUCT\((\d+)(?: AS market_order)?, '([a-z_]+)'(?: AS market_id)?, "
+                                          r"'([^']+)'(?: AS market)?, '([^']+)'", cond)]
+    for mid, fund in zip(ids, _mk_funds(cond)):
+        if fund not in ("", "SPY", "SA_REITS"):
+            assert "WHEN IFNULL(u.market_code, 'US') = 'US' AND u.base = '%s' THEN '%s'" % (fund, mid) in code, fund
+    mapped = set(re.findall(r"THEN '([a-z_]+)'", code.split("END AS market_id", 1)[0].split("CASE", 1)[1]))
+    assert mapped | {"reits_us", "us"} <= set(ids) and "oil" in mapped                # only markets that are read
+    reits = r"REGEXP_CONTAINS(symbol, r'^43(3[0-9]|4[0-9]|50)\.SR$')"
+    assert reits in cond and reits.replace("(symbol", "(u.symbol") in code           # the same Tadawul REITs
+    for frag in ("WHEN UPPER(IFNULL(u.asset_class, '')) != 'EQUITY' THEN NULL",
+                 "THEN IF(STARTS_WITH(UPPER(IFNULL(u.industry, '')), 'REIT'), 'reits_us', 'us')",
+                 "AND u.base NOT IN ('EFA', 'EEM', 'ACWI', 'VEA', 'VWO', 'IEFA', 'IEMG', 'SLV')",
+                 "WHEN u.market_code IN ('HK', 'SS', 'SZ') THEN 'cn'", "WHEN u.market_code = 'T' THEN 'jp'",
+                 "WHEN IFNULL(u.region, '') = 'Europe' AND IFNULL(u.market_code, '') != 'IS' THEN 'eu'",
+                 "ELSE NULL\n    END AS market_id"):
+        assert frag in code, frag
+    # the market's state that day - or on its last day, 6 days at most - by equality joins only
+    for frag in ("LEAST(m.snapshot_date, l.last_as_of) AS look_day",
+                 "LEFT JOIN day_us AS d ON d.as_of = t.look_day AND DATE_DIFF(t.snapshot_date, t.look_day, DAY) <= 6",
+                 "LEFT JOIN mk_day AS k ON k.as_of = d.as_of AND k.market_id = t.market_id",
+                 "IF(t.market_id IS NULL OR k.state IS NULL, 'not read', k.state) AS market_state",
+                 "MAX(IF(k.market_id = 'us', k.label, NULL)) OVER (PARTITION BY k.as_of) AS us_label"):
+        assert frag in code, frag
+    # Codex P2 (#1048): the 6 days run from the market's own close, which v_market_rank carries up to 6 days, to the
+    # day - for the market and for the US label beside it - so a close 12 days old cannot pass
+    for frag in ("k.date AS market_close,",
+                 "MAX(IF(k.market_id = 'us', k.date, NULL)) OVER (PARTITION BY k.as_of) AS us_close",
+                 "SELECT DISTINCT as_of, us_label, us_close",
+                 "LEFT JOIN mk_day AS k ON k.as_of = d.as_of AND k.market_id = t.market_id\n"
+                 "    AND DATE_DIFF(t.snapshot_date, k.market_close, DAY) <= 6\n),",
+                 "IF(DATE_DIFF(t.snapshot_date, d.us_close, DAY) <= 6, d.us_label, NULL) AS us_label"):
+        assert frag in code, frag
+    rank = bv._code(objs["v_market_rank"].template)
+    assert "    c.*,\n" in rank and "JOIN c ON c.market_id = fl.market_id AND c.date = fl.session" in rank  # carries date
+    # the ready order: open, then held, then not read; two names a market first; the market's rank; the name
+    for frag in ("ROW_NUMBER() OVER (PARTITION BY j.snapshot_date, j.market_id\n"
+                 "                       ORDER BY j.expected_roi_1m_pct DESC NULLS LAST, j.overall_score DESC NULLS "
+                 "LAST, j.symbol)\n      AS pos_in_market",
+                 "ORDER BY CASE p.market_state WHEN 'open' THEN 0 WHEN 'hold' THEN 1 ELSE 2 END,",
+                 "IF(p.pos_in_market <= 2, 0, 1), p.market_rank NULLS LAST,",
+                 "o.ready_rank <= 3 AS in_ready",
+                 "CASE o.market_state WHEN 'hold' THEN 'calmer market' WHEN 'open' THEN 'cash or a switch'",
+                 "ELSE 'market not read' END AS waiting_for",
+                 "o.market_state = 'hold' AS market_rule_holds"):
+        assert frag in code, frag
+    # the live US rule beside it, with the Daily Plan's workflow defaults: every USD name unless the US is calm
+    assert "UPPER(IFNULL(o.currency, '')) = 'USD' AND IFNULL(o.us_label, 'calm') != 'calm' AS live_us_rule_holds" in code
+    wf = (ROOT / ".github" / "workflows" / "daily_plan.yml").read_text(encoding="utf-8")
+    for default in ("vars.TFB_PLAN_REGIME || 'enforce'", "vars.TFB_PLAN_REGIME_CCY || 'USD'",
+                    "vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day'"):
+        assert default in wf, default
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v47():
+    """v_ready_trial (1.19.0): what the qualified names did over the next week and two weeks, by the state of their
+    market, on or off the ready list, held or not by each rule - one pass over the names, an exact worst 5 %."""
+    import markets_board as mb
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_ready_trial"]
+    assert v.path.name == "104_v_ready_trial.sql" and v.kind == "VIEW"
+    assert names.index("v_ready_trial") == names.index("v_ready_list") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_ready_trial"} == {"v_ready_list", "v_forward_universe"}
+    fwd = bv._code(objs["v_forward_universe"].template)
+    for col in ("AS base_date", "AS ret_pp", "AS market_median_pp"):
+        assert col in fwd, col                                                      # the outcome it reads
+    for frag in ("JOIN f ON f.symbol = r.symbol AND f.base_date = r.snapshot_date",
+                 "IF(r.snapshot_date >= DATE '2026-11-23', 'forward', 'backtest') AS period",
+                 "f.ret_pp - f.market_median_pp AS excess_pp",
+                 "FROM j, UNNEST([\n    'all qualified',\n    CONCAT('market ', j.market_state),",
+                 "IF(j.in_ready, 'ready list (top 3)', 'other qualified'),",
+                 "IF(j.market_rule_holds, 'market rule holds it', 'market rule does not'),",
+                 "IF(j.live_us_rule_holds, 'live US rule holds it', 'live US rule does not')",
+                 "PERCENTILE_CONT(g.ret_pp, 0.05) OVER (PARTITION BY g.period, g.horizon, g.grp) AS p5",
+                 "ROUND(MAX(p5), 2) AS p5_ret_pp", "GROUP BY period, horizon, grp"):
+        assert frag in code, frag
+    assert "UNION ALL" not in code and "APPROX_QUANTILES" not in code               # one pass; the same every read
+    # the forward test starts with the market trial's, on the day the board names
+    assert "DATE '2026-11-23'" in bv._code(objs["v_market_trial"].template)
+    assert mb.FORWARD_FROM.isoformat() == "2026-11-23"
+    # every group the board's reading names is a group of this view
+    import inspect
+    for grp in ("ready list (top 3)", "other qualified", "market rule holds it", "market rule does not",
+                "live US rule holds it", "live US rule does not"):
+        assert "'%s'" % grp in code and '"%s"' % grp in inspect.getsource(mb.trial_reading), grp
+    assert "FOLLOWING" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def _structs(code, after):
+    """The rows of the first UNNEST([STRUCT(...), ...]) list after `after`, each as its quoted strings and numbers."""
+    import re
+    block = code.split(after, 1)[1].split("FROM UNNEST([", 1)[1].split("])", 1)[0]
+    return [re.findall(r"'[^']*'|-?\b\d+\b", chunk) for chunk in block.split("STRUCT(")[1:]]
+
+
+def _labels(code, column):
+    """The quoted labels a CASE ... END AS <column> can return."""
+    import re
+    body = code.split("END AS %s" % column, 1)[0].rsplit("CASE", 1)[1]
+    return set(re.findall(r"'([a-z_]+)'", body))                     # the conditions quote nothing
+
+
+def case_v48():
+    """v_market_news (1.20.0): each news day, each market's place against its own previous 250 news days - the share
+    and tone of the news naming it and the fighting there - a 5-day score signed for the market, its momentum and a
+    surprise flag. Reads the new table only; nothing after the news day enters a row. Observe only."""
+    import archive_news_themes as nt
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_market_news"]
+    assert v.path.name == "105_v_market_news.sql" and v.kind == "VIEW"
+    assert names.index("v_market_news") == names.index("v_ready_trial") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_market_news"} == {"news_entity_daily"}
+    # the markets are v_market_condition's, in its order and with its names; each reads a place the loader archives
+    rows = _structs(code, "mk AS (")
+    cond = _structs(bv._code(objs["v_market_condition"].template), "WITH mk AS (")
+    assert [(r[0], r[1].strip("'"), r[2].strip("'")) for r in rows] == [
+        (c[0], c[1].strip("'"), c[2].strip("'")) for c in cond]
+    places = {p for p, _ in nt.PLACES}
+    assert {r[3].strip("'") for r in rows} == places
+    sign = {r[1].strip("'"): int(r[5]) for r in rows}
+    place = {r[1].strip("'"): r[3].strip("'") for r in rows}
+    assert {m for m, x in sign.items() if x == -1} == {"gold", "oil", "bonds"} and set(sign.values()) == {1, -1}
+    assert place["gold"] == place["oil"] == "mideast" and place["bonds"] == place["reits_us"] == place["us"] == "us"
+    assert place["sukuk"] == place["reits_sa"] == place["sa"] == "sa"
+    # the features it reads are the loader's own names
+    feats = {f[0] for f in nt.FEATURES if nt.TABLE_OF[f[1]] == nt.ENTITY_TABLE}
+    import re
+    pat = re.compile(r"^(place_[a-z]+_(share|tone)|fight_[a-z]+)$")
+    assert {f for f in feats if pat.match(f)} == {f for f in feats if not f.startswith("person_")}
+    for frag in ("WHERE REGEXP_CONTAINS(feature, r'^(place_[a-z]+_(share|tone)|fight_[a-z]+)$')",
+                 "WINDOW w AS (PARTITION BY pl.place ORDER BY pl.date ROWS BETWEEN 250 PRECEDING AND 1 PRECEDING)",
+                 "IF(st.hist_days >= 120, ROUND(SAFE_DIVIDE(st.att_pct - st.att_mean, NULLIF(st.att_sd, 0)), 3), NULL)",
+                 "ROUND((z.tone_z - z.fight_z) / 2, 3) AS news_score",
+                 "IF(COUNT(s.news_score) OVER w5 = 5, ROUND(AVG(s.news_score) OVER w5, 3), NULL) AS score_5",
+                 "WINDOW w5 AS (PARTITION BY s.place ORDER BY s.date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW)",
+                 "ROUND(s5.score_5 - LAG(s5.score_5, 5) OVER (PARTITION BY s5.place ORDER BY s5.date), 3) AS momentum_5",
+                 "ROUND(k.sign * m.score_5, 3) AS market_score",
+                 "WHEN j.market_score >= 0.5 THEN 'favourable'", "WHEN j.market_score <= -0.5 THEN 'unfavourable'",
+                 "WHEN j.market_momentum >= 0.5 THEN 'improving'", "WHEN j.market_momentum <= -0.5 THEN 'worsening'",
+                 "WHEN j.att_z >= 2 THEN IF(j.sign * COALESCE(j.tone_z, 0) >= 0, 'surge_favourable', 'surge_unfavourable')"):
+        assert frag in code, frag
+    assert _labels(code, "reading") == {"favourable", "unfavourable", "neutral"}
+    assert _labels(code, "momentum_label") == {"improving", "worsening", "steady"}
+    assert _labels(code, "surprise") == {"surge_favourable", "surge_unfavourable", "none"}
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v49():
+    """v_people_news (1.20.0): each news day, 17 people against their own previous 250 news days, a spike flag and the
+    markets each is expected to move - the loader's people, in its order. Observe only."""
+    import archive_news_themes as nt
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_people_news"]
+    assert v.path.name == "106_v_people_news.sql" and v.kind == "VIEW"
+    assert names.index("v_people_news") == names.index("v_market_news") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_people_news"} == {"news_entity_daily"}
+    who = _structs(code, "who AS (")
+    assert [r[1].strip("'") for r in who] == [p for p, _ in nt.PEOPLE]
+    assert [int(r[0]) for r in who] == list(range(1, len(nt.PEOPLE) + 1))
+    markets = {r[1].strip("'") for r in _structs(bv._code(objs["v_market_condition"].template), "WITH mk AS (")}
+    for r in who:
+        tied = r[-1].strip("'").split(",")
+        assert tied and len(tied) == len(set(tied)) and set(tied) <= markets, r
+    for frag in ("WHERE REGEXP_CONTAINS(feature, r'^person_[a-z]+_(share|tone)$')",
+                 "WINDOW w AS (PARTITION BY pp.person_id ORDER BY pp.date ROWS BETWEEN 250 PRECEDING AND 1 PRECEDING)",
+                 "IF(st.hist_days >= 120, ROUND(SAFE_DIVIDE(st.share_pct - st.share_mean, NULLIF(st.share_sd, 0)), 3), NULL)",
+                 "WHEN z.att_z >= 2 AND z.docs >= 20 THEN IF(COALESCE(z.tone_z, 0) >= 0, 'spike_positive', 'spike_negative')",
+                 "JOIN who AS w ON w.person_id = z.person_id"):
+        assert frag in code, frag
+    assert _labels(code, "reading") == {"spike_positive", "spike_negative", "quiet"}
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v50():
+    """v_news_trial (1.20.0): each US session, each market's news reading of an earlier, complete news day and what its
+    fund did next (v_market_trial, read once) - every signal of 105 and 106 with the way it is expected to move the
+    market. Observe only."""
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_news_trial"]
+    assert v.path.name == "107_v_news_trial.sql" and v.kind == "VIEW"
+    assert names.index("v_news_trial") == names.index("v_people_news") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_news_trial"} == {"v_market_trial", "market_series_daily",
+                                                            "news_entity_daily", "v_market_news", "v_people_news"}
+    for ref in ("v_market_trial", "v_market_news", "v_people_news"):
+        assert code.count("`{{DS}}.%s`" % ref) == 1, ref                          # each read once
+    for frag in ("WHERE symbol = 'SPY' AND close > 0",
+                 "ON n.date >= DATE_SUB(us.d, INTERVAL 3 DAY) AND n.date <= DATE_SUB(us.d, INTERVAL 1 DAY)",
+                 "STRUCT('market_news' AS signal, mn.reading AS reading, mn.market_score AS value)",
+                 "STRUCT('momentum', mn.momentum_label, mn.market_momentum)",
+                 "STRUCT('surprise', mn.surprise, CAST(NULL AS FLOAT64))",
+                 "SELECT pn.date, mk, CONCAT('person_', pn.person_id), pn.reading, pn.att_z",
+                 "FROM `{{DS}}.v_people_news` AS pn, UNNEST(SPLIT(pn.markets, ',')) AS mk",
+                 "JOIN nd ON nd.decision_day = t.decision_day",
+                 "JOIN sig ON sig.market_id = t.market_id AND sig.date = nd.news_day"):
+        assert frag in code, frag
+    assert "DATE_SUB(us.d, INTERVAL 0 DAY)" not in code and "n.date <= us.d" not in code   # never the day's own news
+    # every reading 105 and 106 can give has its expected way: +1 / -1, and 0 for the middle ones
+    import re
+    plus = set(re.findall(r"'([a-z_]+)'", code.split("WHEN sig.reading IN (", 1)[1].split(") THEN 1", 1)[0]))
+    minus = set(re.findall(r"'([a-z_]+)'", code.split("WHEN sig.reading IN (", 2)[2].split(") THEN -1", 1)[0]))
+    mn, pn = bv._code(objs["v_market_news"].template), bv._code(objs["v_people_news"].template)
+    readings = (_labels(mn, "reading") | _labels(mn, "momentum_label") | _labels(mn, "surprise")
+                | _labels(pn, "reading"))
+    assert plus == {"favourable", "improving", "surge_favourable", "spike_positive"}
+    assert minus == {"unfavourable", "worsening", "surge_unfavourable", "spike_negative"}
+    assert readings - plus - minus == {"neutral", "steady", "none", "quiet"}
+    # the forward test starts with the market trial's
+    assert "IF(b.as_of >= DATE '2026-11-23', 'forward', 'backtest') AS period" in bv._code(objs["v_market_trial"].template)
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v51():
+    """v_news_trial_summary (1.20.0): one pass over v_news_trial - each reading against its signal's own mean, an
+    overlap-adjusted t, an exact worst 5 % and the signal's rank correlation across markets; forward lines collect
+    until 10 sessions. Observe only."""
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_news_trial_summary"]
+    assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
+    assert code.count("`{{DS}}.v_news_trial`") == 1
+    for frag in ("FROM t, UNNEST([\n    STRUCT(5 AS horizon, t.f5_pct AS f, t.vs_spy_f5_pp AS vs),",
+                 "STRUCT(10, t.f10_pct, t.vs_spy_f10_pp),", "STRUCT(20, t.f20_pct, t.vs_spy_f20_pp)",
+                 "PERCENTILE_CONT(h.f, 0.05) OVER (PARTITION BY h.period, h.horizon, h.signal, h.reading) AS p5",
+                 "AVG(h.f) OVER (PARTITION BY h.period, h.horizon, h.signal) AS base_f",
+                 "COUNT(h.value) OVER (PARTITION BY h.period, h.horizon, h.signal, h.decision_day) AS day_n",
+                 "IF(q1.day_n >= 5 AND q1.day_varies AND q1.day_moves,",
+                 "CORR(q1.rank_value, q1.rank_f) OVER (PARTITION BY q1.period, q1.horizon, q1.signal, q1.decision_day)",
+                 "AVG(IF(q2.day_row = 1, q2.day_ic, NULL)) OVER s AS ic_mean",
+                 "GROUP BY period, horizon, signal, reading",
+                 "SAFE_DIVIDE(g.mean_f - g.base_f, g.sd_f / SQRT(GREATEST(g.n / g.horizon, 1))) AS t_adj",
+                 "WHEN r.period = 'forward' AND r.days < 10 THEN CONCAT('collecting: ', CAST(r.days AS STRING), ' of 10 sessions')",
+                 "WHEN r.expected = 0 THEN 'the middle reading (the base)'",
+                 "WHEN SIGN(r.edge) = r.expected AND ABS(r.t_adj) >= 2 THEN 'holds: the expected way, t 2 or more'"):
+        assert frag in code, frag
+    assert "UNION ALL" not in code and "APPROX_QUANTILES" not in code               # one pass; the same every read
+    assert "h.decision_day, h.value)" not in code and "h.decision_day, h.f)" not in code   # no window keyed on a float
+    # tied values share their average rank: (rank up + count - rank down + 1) / 2
+    assert ("+ COUNT(h.value) OVER (PARTITION BY h.period, h.horizon, h.signal, h.decision_day)\n"
+            "        - RANK() OVER (PARTITION BY h.period, h.horizon, h.signal, h.decision_day ORDER BY h.value DESC) + 1) / 2"
+            in code)
+    assert "FOLLOWING" not in code and "CURRENT_DATE" not in code
+    assert "overlap" in v.template and "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
-         case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45]
+         case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
+         case_v48, case_v49, case_v50, case_v51]
 
 
 def test_v1(): case_v1()
@@ -3147,6 +3460,12 @@ def test_v42(): case_v42()
 def test_v43(): case_v43()
 def test_v44(): case_v44()
 def test_v45(): case_v45()
+def test_v46(): case_v46()
+def test_v47(): case_v47()
+def test_v48(): case_v48()
+def test_v49(): case_v49()
+def test_v50(): case_v50()
+def test_v51(): case_v51()
 
 
 if __name__ == "__main__":

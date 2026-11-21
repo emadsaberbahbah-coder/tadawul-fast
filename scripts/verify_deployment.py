@@ -332,7 +332,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # regime views); research views, nothing live reads them.
     # 2026-11-21 (manifest pin only): 1.17.0 -> 1.18.0 (v_market_condition, v_market_rank, v_market_trial,
     # v_market_trial_summary - the condition of every market, observe only; three-digit file numbers).
-    ("apply_bq_views", "1.18.0", "bigquery looker views"),
+    # 2026-11-21 (manifest pin only): 1.18.0 -> 1.19.0 (v_ready_list, v_ready_trial - the ready list and its
+    # scorecard on the names, observe only).
+    # 2026-11-21 (manifest pin only): 1.19.0 -> 1.20.0 (v_market_news, v_people_news, v_news_trial,
+    # v_news_trial_summary - the news by market and by person and its scorecard, observe only).
+    ("apply_bq_views", "1.20.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -352,17 +356,21 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("archive_symbol_deep", "1.2.0", "bigquery symbol deep data"),
     # 2026-11-19 (new script, pinned on arrival): the daily world-news themes
     # (GDELT) the news learning loop is taught from; research table only.
-    ("archive_news_themes", "1.0.0", "bigquery news themes"),
+    # 2026-11-21: 1.0.0 -> 1.1.0 (three more sources: the fights, the share
+    # and the tone of the news by place, and the news of 17 people).
+    ("archive_news_themes", "1.1.0", "bigquery news themes"),
     # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).
-    ("news_board", "1.3.0", "news board"),   # 2026-11-21: v1.3.0 [PEERS] the company news record against the same-day US names
+    # 2026-11-21: v1.3.0 [PEERS] the company news record against the same-day US names; v1.4.0 [MARKETS / PEOPLE]
+    # sections 8-10: the news by market and by person and every news signal on trial (apply_bq_views 1.20.0).
+    ("news_board", "1.4.0", "news board"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
     # 2026-11-21 (new script, pinned on arrival): the Markets_Board tab - the condition of every market, their
     # order by trend and risk and the scorecard of the forward test, read from the market views (observe only).
-    ("markets_board", "1.0.0", "markets board"),
+    ("markets_board", "1.1.0", "markets board"),   # 2026-11-21: v1.1.0 the ready list, the switch check
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.4.0", "news macro gate"),   # 2026-11-19: v1.4.0 [TRUCE-READ]

@@ -2,8 +2,40 @@
 # scripts/archive_news_themes.py
 """
 ================================================================================
-TFB News Themes - v1.0.0 (news learning loop, phase A: the daily theme archive)
+TFB News Themes - v1.1.0 (news learning loop, phase A: the daily theme archive)
 ================================================================================
+v1.1.0 (21 Nov 2026) - [PLACES / PEOPLE] three more sources, so the news can be
+read market by market and person by person. WHY (owner, 21 Nov 2026 11:03
+Riyadh, item 5 of the build list: "News: a news reading per market; forward
+event scenarios; momentum/surprise; influential figures of 19 Nov; score every
+news signal"; the people were part 4 of the 19 Nov stage, left out of News
+Board 1.0.0):
+  gdelt_events_places  the share of the day's events that are fights (CAMEO
+                       18-20) located (ActionGeo_CountryCode, FIPS 10-4) in
+                       each place of PLACES: fight_<place>.
+  gdelt_gkg_places     the share of the day's documents that name a place of
+                       PLACES (the country field of the V1 Locations list) and
+                       their mean tone: place_<place>_share, place_<place>_tone.
+  gdelt_gkg_people     the share of the day's documents that name a person of
+                       PEOPLE (the V1 Persons list, lower case) and their mean
+                       tone: person_<id>_share, person_<id>_tone. Every name
+                       was read in GDELT before it was listed (Macron is not:
+                       GDELT's Persons list almost never holds him); the
+                       holders of each office were checked on 21 Nov 2026
+                       (Fed chair Kevin Warsh since 22 May 2026; Iran's leader
+                       Mojtaba Khamenei since 8 Mar 2026; Netanyahu caretaker
+                       and Eisenkot asked to form a government, 7 Nov 2026;
+                       Lagarde leaves the ECB on 7 Feb 2027).
+  The three read only Locations, Persons, V2Tone and the events' place and
+  root code - about 0.11 GB a day; the three-year fill about 125 GB. They
+  merge into their own table, <dataset>.news_entity_daily (same columns),
+  NOT into news_theme_daily: the news loop of 19 Nov 2026 (v_news_theme_weekly
+  and the trial fixed that day) reads every feature of news_theme_daily, so
+  a new feature there would change its rule. The existing sources and their
+  table are unchanged, row for row. Views v_market_news, v_people_news,
+  v_news_trial and v_news_trial_summary (apply_bq_views 1.20.0) read the new
+  table; nothing live does.
+v1.0.0 (19 Nov 2026)
 WHY (owner, 19 Nov 2026: world news - wars, politics, the economy, the fear of
 AI, elections, summits - is part of valuing any stock, so classify it, weight
 it by kind, test the weights on the past and let them correct themselves; then
@@ -43,6 +75,10 @@ COST GUARD: every source is first sent as a BigQuery dry run; a window that
 would read more than --max-gb is refused, and the MERGE itself carries
 maximumBytesBilled. The daily window (3 days) reads under 1 GB; the one-off
 history fill (--start 2023-10-02) reads about 240 GB and needs --max-gb 300.
+v1.1.0's three sources add about 0.35 GB to the daily window; their own fill
+from 2023-10-02 reads about 125 GB (dry runs of 21 Nov 2026: gdelt_gkg_places
+79, gdelt_gkg_people 43, gdelt_events_places 3) and needs --max-gb 100 with
+--sources gdelt_events_places,gdelt_gkg_places,gdelt_gkg_people.
 
 GATE: TFB_BQ_NEWS_THEMES = on|1|true|yes arms the job (default off here - the
 workflow arms it; kill with the repository Variable TFB_BQ_NEWS_THEMES=off).
@@ -53,7 +89,8 @@ BigQuery Data Editor + Job User), GITHUB_RUN_ID.
 CLI: --write | --dry-run (default) ; --days N (default 3, 1..30: the window
 ends yesterday UTC) ; --start YYYY-MM-DD [--end YYYY-MM-DD] (a history fill;
 replaces --days) ; --max-gb G (default 5, 1..400) ; --sources a,b (a subset
-of gdelt_events, gdelt_gkg).
+of gdelt_events, gdelt_gkg, gdelt_events_places, gdelt_gkg_places,
+gdelt_gkg_people).
 Exit: 0 every source loaded (or sized, in a dry run), 1 one or more sources
 failed (the others are loaded), 2 configuration missing, a window refused or
 the table differs from SCHEMA.
@@ -74,12 +111,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 TABLE = "news_theme_daily"
+ENTITY_TABLE = "news_entity_daily"                      # v1.1.0: the places and the people, apart from the loop's themes
 GDELT_EVENTS = "gdelt-bq.gdeltv2.events_partitioned"
 GDELT_GKG = "gdelt-bq.gdeltv2.gkg_partitioned"
-SOURCES = ("gdelt_events", "gdelt_gkg")
+SOURCES = ("gdelt_events", "gdelt_gkg", "gdelt_events_places", "gdelt_gkg_places", "gdelt_gkg_people")
+TABLE_OF = {"gdelt_events": TABLE, "gdelt_gkg": TABLE, "gdelt_events_places": ENTITY_TABLE,
+            "gdelt_gkg_places": ENTITY_TABLE, "gdelt_gkg_people": ENTITY_TABLE}
 KINDS = ("share", "mean")
 DEFAULT_DAYS = 3
 MIN_DAYS, MAX_DAYS = 1, 30
@@ -144,6 +184,79 @@ FEATURES: Tuple[Tuple[str, str, str, str, str], ...] = (
 )
 
 
+# ------------------------------------------------- v1.1.0: places and people
+# (id, FIPS 10-4 country codes): GDELT writes a country as its FIPS code, in
+# the events (ActionGeo_CountryCode) and in the GKG Locations list alike.
+PLACES: Tuple[Tuple[str, str], ...] = (
+    ("us", "US"),
+    ("sa", "SA"),
+    ("mideast", "IR|IZ|YM|IS|LE|SY|JO|KU|QA|AE|BA|MU"),     # the war zone around Saudi Arabia and the Gulf
+    ("eu", "UK|FR|GM|IT|SP|NL|SZ|SW|BE|DA|NO|FI|AU|EI|PO|PL"),
+    ("jp", "JA"),
+    ("cn", "CH|HK"),
+)
+# (id, regular expression on the lower-case V1 Persons list): first and last
+# name, so a namesake (Glen Powell, Eric Trump) does not count; 'jinping'
+# alone because GDELT often splits Xi off ("b jinping"); 'putin', 'khamenei',
+# 'netanyahu' and 'eisenkot' alone because each is one family in the news
+# (Ali and, since March 2026, Mojtaba Khamenei). The Saudi energy minister is
+# written several ways ("abdulaziz bin salman", "abdulaziz al-salman").
+# Emmanuel Macron is left out: GDELT's Persons list almost never holds him (3
+# garbled entries in 17-19 Nov 2026, while 522 documents of 19 Nov alone name
+# him in AllNames), and reading AllNames would triple this source's bytes.
+PEOPLE: Tuple[Tuple[str, str], ...] = (
+    ("trump", r"\bdonald (j\.? )?trump\b"),
+    ("warsh", r"\bkevin warsh\b"),
+    ("bessent", r"\bscott bessent\b"),
+    ("musk", r"\belon musk\b"),
+    ("huang", r"\bjensen huang\b"),
+    ("altman", r"\bsam altman\b"),
+    ("xi", r"\bjinping\b"),
+    ("mbs", r"\b(mohammed|mohammad|muhammad|mohamed) (bin|ben) salman\b"),
+    ("abdulaziz", r"\babdul ?aziz (bin|ben|al-?) ?salman\b"),
+    ("putin", r"\bputin\b"),
+    ("khamenei", r"\bkhamenei\b"),
+    ("netanyahu", r"\bnetanyahu\b"),
+    ("eisenkot", r"\beisenkot\b"),
+    ("lagarde", r"\bchristine lagarde\b"),
+    ("merz", r"\b(friedrich|frederick) merz\b"),
+    ("takaichi", r"\b(sanae takaichi|takaichi sanae)\b"),
+    ("ueda", r"\b(kazuo ueda|ueda kazuo)\b"),
+)
+
+
+def _place_doc(codes: str) -> str:
+    """A GKG document names the place: one of the codes is the country field
+    of a V1 location (TYPE#NAME#COUNTRY#ADM1#...)."""
+    return "REGEXP_CONTAINS(Locations, r'#(%s)#')" % codes
+
+
+def _person_doc(pattern: str) -> str:
+    return "REGEXP_CONTAINS(Persons, r'%s')" % pattern
+
+
+def _place_features() -> Tuple[Tuple[str, str, str, str, str], ...]:
+    out: List[Tuple[str, str, str, str, str]] = []
+    for pid, codes in PLACES:
+        listed = ", ".join("'%s'" % c for c in codes.split("|"))
+        out.append(("fight_%s" % pid, "gdelt_events_places", "share",
+                    f"COUNTIF({_FIGHT} AND ActionGeo_CountryCode IN ({listed}))", "COUNT(*)"))
+    for pid, codes in PLACES:
+        doc = _place_doc(codes)
+        out.append(("place_%s_share" % pid, "gdelt_gkg_places", "share", f"COUNTIF({doc})", "COUNT(*)"))
+        out.append(("place_%s_tone" % pid, "gdelt_gkg_places", "mean",
+                    f"SUM(IF({doc}, {_TONE}, NULL))", f"COUNTIF({doc} AND {_TONE} IS NOT NULL)"))
+    for pid, pattern in PEOPLE:
+        doc = _person_doc(pattern)
+        out.append(("person_%s_share" % pid, "gdelt_gkg_people", "share", f"COUNTIF({doc})", "COUNT(*)"))
+        out.append(("person_%s_tone" % pid, "gdelt_gkg_people", "mean",
+                    f"SUM(IF({doc}, {_TONE}, NULL))", f"COUNTIF({doc} AND {_TONE} IS NOT NULL)"))
+    return tuple(out)
+
+
+FEATURES = FEATURES + _place_features()
+
+
 def _out(msg: str) -> None:
     sys.stderr.write(f"[news_themes v{__version__}] {msg}\n")
 
@@ -182,7 +295,7 @@ def source_select(source: str, start: _dt.date, end: _dt.date) -> str:
         ("STRUCT('%s' AS feature, '%s' AS kind, CAST(IFNULL(n%d, 0) AS FLOAT64) AS num, CAST(d%d AS FLOAT64) AS den)"
          if i == 0 else "('%s', '%s', CAST(IFNULL(n%d, 0) AS FLOAT64), CAST(d%d AS FLOAT64))") % (name, kind, i, i)
         for i, (name, _, kind, _, _) in enumerate(feats))
-    if source == "gdelt_events":
+    if source.startswith("gdelt_events"):                   # v1.1.0: gdelt_events_places reads the same table
         added = "PARSE_DATE('%Y%m%d', CAST(DIV(DATEADDED, 1000000) AS STRING))"
         lo = _day(start - _dt.timedelta(days=1))
         inner = (
@@ -206,14 +319,18 @@ def source_select(source: str, start: _dt.date, end: _dt.date) -> str:
 
 def merge_sql(project: str, dataset: str, source: str, start: _dt.date, end: _dt.date, run_id: str) -> str:
     """One atomic statement: the window's rows of one source replace the rows
-    of the same day and theme, and new days are added."""
+    of the same day and theme in the source's own table (TABLE_OF), and new
+    days are added."""
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project or ""):
         raise ValueError(f"bad project id {project!r}")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,1023}", dataset or ""):
         raise ValueError(f"bad dataset id {dataset!r}")
     rid = re.sub(r"[^0-9A-Za-z_-]", "", run_id or "")[:64]
+    table = TABLE_OF.get(source)
+    if table is None:
+        raise ValueError(f"unknown source {source!r}")
     return (
-        f"MERGE `{project}.{dataset}.{TABLE}` AS t\nUSING (\n{source_select(source, start, end)}\n) AS s\n"
+        f"MERGE `{project}.{dataset}.{table}` AS t\nUSING (\n{source_select(source, start, end)}\n) AS s\n"
         f"ON t.date = s.date AND t.feature = s.feature\n"
         f"WHEN MATCHED THEN UPDATE SET source = s.source, kind = s.kind, num = s.num, den = s.den,\n"
         f"  loaded_at = CURRENT_TIMESTAMP(), run_id = '{rid}'\n"
@@ -290,28 +407,38 @@ def schema_problems(table: Dict[str, Any]) -> List[str]:
     return ["columns differ: " + ("; ".join(diff[:5]) or f"{len(got)} columns, want {len(want)}")]
 
 
-def ensure_table(session: Any, project: str, dataset: str) -> bool:
+TABLE_TEXT = {
+    TABLE: ("TFB daily world-news themes counted in the public GDELT tables (events and documents): one row per "
+            "UTC day and theme with a numerator and a denominator, merged by scripts/archive_news_themes.py."),
+    ENTITY_TABLE: ("TFB daily world news by place and by person, counted in the public GDELT tables (the fighting "
+                   "located in a place, the share and tone of the documents naming a place or a person): one row "
+                   "per UTC day and feature with a numerator and a denominator, merged by "
+                   "scripts/archive_news_themes.py 1.1.0."),
+}
+
+
+def ensure_table(session: Any, project: str, dataset: str, table: str = TABLE) -> bool:
     """True when the table was created now, False when it existed with the
     right schema; RuntimeError when it exists with another layout."""
+    if table not in TABLE_TEXT:
+        raise ValueError(f"unknown table {table!r}")
     base = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables"
-    resp = session.get(f"{base}/{TABLE}", timeout=60)
+    resp = session.get(f"{base}/{table}", timeout=60)
     if resp.status_code == 200:
         problems = schema_problems(resp.json() or {})
         if problems:
-            raise RuntimeError(f"table {TABLE} differs from SCHEMA: {' | '.join(problems)}")
+            raise RuntimeError(f"table {table} differs from SCHEMA: {' | '.join(problems)}")
         return False
     if resp.status_code != 404:
-        raise RuntimeError(f"table {TABLE}: {_err(resp)}")
+        raise RuntimeError(f"table {table}: {_err(resp)}")
     body = {
-        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": TABLE},
+        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": table},
         "schema": {"fields": SCHEMA},
-        "description": ("TFB daily world-news themes counted in the public GDELT tables (events and "
-                        "documents): one row per UTC day and theme with a numerator and a denominator, "
-                        "merged by scripts/archive_news_themes.py."),
+        "description": TABLE_TEXT[table],
     }
     resp = session.post(base, json=body, timeout=60)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"create {TABLE}: {_err(resp)}")
+        raise RuntimeError(f"create {table}: {_err(resp)}")
     return True
 
 
@@ -387,8 +514,11 @@ def run(session: Any, *, project: str, dataset: str, location: str, sources: Seq
         print(f"[news_themes v{__version__}] {len(sized)} source(s), {start}..{end}, would read "
               f"{total_gb:.2f} GB (dry run, nothing loaded)")
         return 0
+    created: List[str] = []
     try:
-        created = ensure_table(session, project, dataset)
+        for table in [t for t in (TABLE, ENTITY_TABLE) if t in {TABLE_OF[s] for s, _ in sized}]:
+            if ensure_table(session, project, dataset, table):
+                created.append(table)
     except Exception as exc:  # noqa: BLE001
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
@@ -406,7 +536,7 @@ def run(session: Any, *, project: str, dataset: str, location: str, sources: Seq
             failed.append(source)
             _out(f"ERROR {str(exc)[:400]}")
     print(f"[news_themes v{__version__}] {len(sized) - len(failed)}/{len(sized)} source(s), {rows} row(s), "
-          f"{start}..{end}" + (" | table created" if created else "")
+          f"{start}..{end}" + (f" | table created: {', '.join(created)}" if created else "")
           + (f"; FAILED: {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0
 

@@ -1,6 +1,15 @@
 # =============================================================================
 # 🧭 Markets Board - the condition of every market and their order, observe-only
 # -----------------------------------------------------------------------------
+# VERSION 1.1.0 (2026-11-21) -- THE READY LIST AND THE SWITCH CHECK
+# WHY: owner, 21 Nov 2026 11:03 Riyadh, items 3 and 4 of the build list (a ready
+#       list of the 2-3 best qualified names from the top-ranked markets, each
+#       with what it is waiting for; a switch check after the costs of both
+#       trades). scripts/markets_board.py 1.1.0 adds both, reads Final_Decisions
+#       (the Today Action Plan's own decision per stock) and needs the live US
+#       rule's settings to say what that rule does with each name: the step
+#       passes TFB_PLAN_REGIME, TFB_PLAN_REGIME_BLOCK and TFB_PLAN_REGIME_CCY
+#       with the Daily Plan workflow's own defaults.
 # VERSION 1.0.0 (2026-11-21)
 #
 # WHY: owner, 21 Nov 2026 11:03 Riyadh, the build list after the voice call:
@@ -20,9 +29,9 @@
 # Exit Plan). The cron at 08:45 Riyadh is the backstop: GitHub starts this
 # repository's scheduled runs hours late (the rule of News Board 1.1.0).
 #
-# WRITES: only its own tab (Markets_Board). BigQuery: SELECT only. It reads no
-# tab. No decision, score, list or order changes; the Daily Plan keeps its US
-# rule; only the Today Action Plan gives orders.
+# WRITES: only its own tab (Markets_Board). BigQuery: SELECT only. It reads
+# Final_Decisions!A1:C400 (1.1.0). No decision, score, list or order changes;
+# the Daily Plan keeps its US rule; only the Today Action Plan gives orders.
 # Rollback: repository variable TFB_MARKETS_BOARD=off.
 # =============================================================================
 name: 🧭 Markets Board
@@ -133,6 +142,10 @@ jobs:
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           TFB_MARKETS_BOARD: ${{ vars.TFB_MARKETS_BOARD || 'on' }}
+          # 1.1.0: the live US rule's settings, with the Daily Plan workflow's own defaults (read, never changed)
+          TFB_PLAN_REGIME: ${{ vars.TFB_PLAN_REGIME || 'enforce' }}
+          TFB_PLAN_REGIME_BLOCK: ${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
+          TFB_PLAN_REGIME_CCY: ${{ vars.TFB_PLAN_REGIME_CCY || 'USD' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
         run: |

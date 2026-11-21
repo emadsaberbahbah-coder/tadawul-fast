@@ -2,8 +2,60 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.18.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.20.0 (program register C8, Phase 2)
 ================================================================================
+v1.20.0 (21 Nov 2026, the news by market and by person). WHY (owner, 21 Nov
+2026 11:03 Riyadh, item 5 of the build list): "News: a news reading per
+market; forward event scenarios; momentum/surprise; influential figures of
+19 Nov; score every news signal." Four new views, observe only, over the
+three sources archive_news_themes 1.1.0 merges into its new table
+news_entity_daily (kept apart from news_theme_daily, whose every feature the
+news loop of 19 Nov 2026 reads): v_market_news (105) - each
+news day, each market's place (the US, Saudi Arabia, the war zone around the
+Gulf for gold and oil, Europe, Japan, China / Hong Kong) against its own
+previous 250 news days: the share and tone of the news naming it and the
+fighting located there, a 5-day score signed for the market (favourable /
+neutral / unfavourable), its momentum and a surprise flag; v_people_news
+(106) - the same for 17 people who move markets, with a spike flag and the
+markets each is expected to move; v_news_trial (107) - each US session, each
+market's reading of the day before and what its fund did over the next 5,
+10 and 20 closes (v_market_trial; 'forward' from 23 Nov 2026); and
+v_news_trial_summary (108) - the scorecard: each reading against its
+signal's own mean, an overlap-adjusted t, and the signal's rank correlation
+with the markets' next changes. First read (backtest, about 690 sessions
+from Feb 2024; the windows overlap): no news reading is proven - favourable
+news was followed by -0.15 / -0.40 / -0.87 pp against the signal's mean over
+5 / 10 / 20 closes (t -0.77 / -1.04 / -1.51), unfavourable news by +0.01 /
++0.33 / +0.74, the rank correlation -0.02 / -0.06 / -0.11 (t -0.79 / -1.50 /
+-1.86); improving news +0.18 pp over 5 closes (t 1.09); an unfavourable
+surge +0.47 / +0.68 / +1.17 pp; no person's spike reached a t of 1.1 over 10
+closes. If anything, bad news has been followed by rebounds; the forward
+sessions decide. Research views: the live system never reads BigQuery.
+
+v1.19.0 (21 Nov 2026, the ready list). WHY (owner, 21 Nov 2026 11:03 Riyadh,
+items 3 and 4 of the build list): "A ready list: each day the 2-3 best
+qualified names from the top-ranked markets, each labelled with what it is
+waiting for (cash / calmer market / switch)" and "The Daily Plan's hold then
+works market by market. It follows the market an asset tracks, not the
+currency it trades in." Two new views, observe only: v_ready_list (103) - on
+each archived day every qualified name (INVESTABLE, INVEST, the panel floors,
+not held that day; the day's last copy first, then the floors) with the
+market it tracks (the market funds by name, US REITs, Tadawul REITs,
+Hong Kong / China, Tokyo, Europe; anything else not read yet), that market's
+state that day, the ready order (open markets first, two names per market,
+then the market's rank and the name's 1-month expected return; the top 3 are
+the ready list), what it waits for, and the live US rule beside it;
+v_ready_trial (104) - what those names did over the next week and two weeks
+(v_forward_universe), by the state of their market, on and off the ready list,
+and held or not by each rule. First read (names of 31 Oct - 14 Nov, 1 week,
+a falling stretch; windows overlap): the names the live US rule held moved
+-1.11 % against +0.69 % for the others (720 and 428 name-days); the market
+rule's held names -0.84 % against +0.38 % (768 and 380); the ready list's 43
+name-days -1.73 % against -0.39 % for the other qualified names - the list
+is not proven. The worst 5 % is exact (PERCENTILE_CONT). The switch check of
+item 4 is v_hold_vs_switch (1.9.0), shown beside them by markets_board 1.1.0.
+Research views: the live system never reads BigQuery.
+
 v1.18.0 (21 Nov 2026, a condition reading for every market). WHY (owner, 21
 Nov 2026 11:03 Riyadh, the build list after the voice call): "A condition
 reading for every market, with the same tests as v_market_regime ... A daily
@@ -384,7 +436,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.18.0"
+__version__ = "1.20.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -405,8 +457,8 @@ ARCHIVE_TABLES = frozenset({
 MARKET_TABLES = frozenset({"market_series_daily"})
 # the tables scripts/archive_symbol_deep.py v1.0.0 loads (v1.3.0)
 DEEP_TABLES = frozenset({"symbol_bars_daily", "symbol_analyst_daily", "symbol_news"})
-# the table scripts/archive_news_themes.py v1.0.0 merges (v1.14.0, the news loop)
-NEWS_TABLES = frozenset({"news_theme_daily"})
+# the table scripts/archive_news_themes.py merges (v1.14.0, the news loop; its 1.1.0 sources since v1.20.0)
+NEWS_TABLES = frozenset({"news_theme_daily", "news_entity_daily"})   # v1.20.0: the places and the people apart
 SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
