@@ -17,8 +17,11 @@ E3  fetch_window: each request asks one day wider on each side, 1,000 a page,
     the offset; a full first page brings a second; a full second page cuts the
     window in two; one retry on a failure; the token never in an error;
     --max-calls stops the reading
-E4  the budget guard: /api/user is read first; refused or unreadable -> the
-    run is SKIPPED (exit 0) and no economic-events call is made
+E4  the budget guard: /api/user is read first; a room smaller than the plan,
+    or an unreadable limit -> the run is SKIPPED (exit 0) and no
+    economic-events call is made; the room says yes exactly when
+    archive_symbol_deep.budget_check does; every call, retries and the halves
+    of a cut window included, stays inside the room (Codex P2 on #1049)
 E5  dry run: EODHD read and counted, BigQuery only for the dataset check; a
     failed window and the windows past the cap fail the run (exit 1)
 E6  write: econ_calendar is created (month partitions on event_at, clustered
@@ -320,6 +323,42 @@ def test_e4_budget_guard_skips(monkeypatch, capsys, kw):
     assert not s.loads and not s.queries and TOKEN not in out.out + out.err
 
 
+@pytest.mark.parametrize("used,limit,dated", [(0, 100000, "2026-11-21"), (59990, 100000, "2026-11-21"),
+                                              (59990, 100000, "2026-11-20"), (590, 1000, "2026-11-21"),
+                                              (599, 1000, None), (0, 0, "2026-11-21")])
+def test_e4_room_follows_the_shared_rule(used, limit, dated):
+    """The room says yes to a plan exactly when archive_symbol_deep.budget_check does."""
+    def opener(req, timeout):
+        user = {"apiRequests": used, "dailyRateLimit": limit}
+        if dated is not None:
+            user["apiRequestsDate"] = dated
+        return _Body(json.dumps(user).encode())
+    import archive_symbol_deep as asd
+    room, _ = ec.budget_room(TOKEN, 0.60, opener, today="2026-11-21")
+    for planned in (1, 2, 10, 600):
+        ok, _ = asd.budget_check(TOKEN, planned, 0.60, opener, today="2026-11-21")
+        assert ok == (room is not None and room >= planned), (used, limit, dated, planned)
+
+
+def test_e4_retries_and_splits_stay_inside_the_room(monkeypatch, capsys):
+    """Codex P2 on #1049: 598 of 600 allowed calls used, two planned - a retry must not take the run past 600."""
+    calls = []
+    s = FakeBQ()
+    rc, slept = _main(monkeypatch, ["--write", "--countries", "US"], s,
+                      make_opener(one_window, used=598, limit=1000, calls=calls, fail={("US", "2026-11-17")}))
+    out = capsys.readouterr()
+    eco = [c for c in calls if c[0].endswith("economic-events")]
+    assert len(eco) == 2 and rc == 1                       # the room of 2: the first try and its retry, no more
+    assert "at most 2 this run" in out.err and "FAILED: US 2026-11-18..2026-12-12" in out.out
+    calls = []
+    rc, _ = _main(monkeypatch, ["--countries", "US"], FakeBQ(),
+                  make_opener(lambda c, f, t, o: [ev("2026-11-20", typ=f"T{o}{i}") for i in range(1000)],
+                              used=597, limit=1000, calls=calls))
+    out = capsys.readouterr()
+    assert len([c for c in calls if c[0].endswith("economic-events")]) == 3 and rc == 1
+    assert "NOT READ (the cap of 3 call(s) spent)" in out.out
+
+
 # ------------------------------------------------------------------ E5
 def test_e5_dry_run(monkeypatch, capsys):
     calls = []
@@ -343,7 +382,7 @@ def test_e5_failed_window_and_cap_fail_the_run(monkeypatch, capsys):
     assert rc == 1 and "1 window(s) FAILED: SA 2026-11-18..2026-12-12" in out.out and TOKEN not in out.out + out.err
     rc, _ = _main(monkeypatch, ["--countries", "US,SA,JP", "--max-calls", "2"], FakeBQ(), make_opener(one_window))
     out = capsys.readouterr()
-    assert rc == 1 and "1 window(s) NOT READ (--max-calls 2 spent)" in out.out
+    assert rc == 1 and "1 window(s) NOT READ (the cap of 2 call(s) spent)" in out.out
 
 
 # ------------------------------------------------------------------ E6

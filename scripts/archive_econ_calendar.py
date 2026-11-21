@@ -40,12 +40,15 @@ known when: the forecast before the figure, then the figure. A window that
 could not be read, or that came back empty, marks nothing gone.
 
 BUDGET GUARD: the EODHD daily limit is shared with the live sync. Before
-reading, the job reads /api/user (free) and skips the run (exit 0, nothing
-read) when the calls used today plus the planned calls would pass
-TFB_ECON_EODHD_MAX_SHARE (default 0.60) of the daily limit, or when the limit
-cannot be read (fail closed): archive_symbol_deep.budget_check, the same
-function. --max-calls caps a run (default 400): a window past the cap is not
-read and the run fails (exit 1), so the gap is seen.
+reading, the job reads /api/user (free): the room is TFB_ECON_EODHD_MAX_SHARE
+(default 0.60) of the daily limit less the calls used today, by the rule of
+archive_symbol_deep.budget_check (a counter dated before today counts 0; a
+limit that cannot be read skips the run - fail closed). The run is skipped
+(exit 0, nothing read) when the room is smaller than its planned calls (two
+a window), and every call it makes - retries and the halves of a cut window
+included - counts against min(room, --max-calls) (default 400): a window
+past that cap is not read and the run fails (exit 1), so the gap is seen
+(Codex P2 on #1049: the planned calls alone did not bound the retries).
 
 DEFAULT WINDOW: from 3 days before today to 21 days after (UTC dates): the
 releases of the last days get their figures, the next three weeks their
@@ -213,6 +216,30 @@ def windows(start: _dt.date, end: _dt.date, days: int = WINDOW_DAYS) -> List[Tup
 
 
 # -------------------------------------------------------------------- EODHD
+def budget_room(token: str, share: float, opener: Callable[..., Any], *, today: str) -> Tuple[Optional[int], str]:
+    """(room, why): the calls this run may still make today - share x the
+    daily limit less the calls used - by the rule of
+    archive_symbol_deep.budget_check: a counter dated before `today` (UTC,
+    YYYY-MM-DD) is yesterday's and counts as 0 used; a missing, malformed or
+    later date counts as today's. None when the usage or the limit cannot be
+    read (fail closed)."""
+    try:
+        user = asd.eodhd_get("user", {}, token, opener)
+        used = int(float(user.get("apiRequests") or 0))
+        limit = int(float(user.get("dailyRateLimit") or 0))
+        dated = str(user.get("apiRequestsDate") or "").strip()[:10]
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return None, f"EODHD usage unreadable ({asd._scrub(exc, token)[:120]})"
+    if limit <= 0:
+        return None, "EODHD daily limit unknown"
+    note = ""
+    if _DAY.fullmatch(dated) and _DAY.fullmatch(today or "") and dated < today:
+        note = f"; counter dated {dated} not reset yet, its {used} not counted"
+        used = 0
+    ceiling = int(share * limit)
+    return max(0, ceiling - used), f"EODHD {used} used of {ceiling} allowed ({share:.0%} of {limit}){note}"
+
+
 class Calls:
     """The calls of one run, capped at --max-calls."""
 
@@ -498,12 +525,14 @@ def run(session: Any, *, token: str, project: str, dataset: str, location: str, 
         return 2
     wins = windows(start, end)
     planned = min(int(max_calls), 2 * len(wins) * len(countries))
-    ok, why = asd.budget_check(token, planned, share, opener, today=now.astimezone(UTC).date().isoformat())
-    _out(why)
-    if not ok:
+    room, why = budget_room(token, share, opener, today=now.astimezone(UTC).date().isoformat())
+    if room is None or room < planned:
+        why += "" if room is None else f": room {room} < {planned} planned"
         print(f"[econ_calendar v{__version__}] SKIPPED: {why} - nothing read, nothing written")
         return 0
-    calls = Calls(max_calls)
+    cap = min(int(max_calls), room)
+    _out(f"{why}: {planned} call(s) planned, at most {cap} this run (retries and split windows included)")
+    calls = Calls(cap)
     found: Dict[str, Dict[str, Any]] = {}
     covered: List[Tuple[str, _dt.date, _dt.date]] = []
     failed: List[str] = []
@@ -534,7 +563,7 @@ def run(session: Any, *, token: str, project: str, dataset: str, location: str, 
         _out(ln)
     rows = [found[k] for k in sorted(found)]
     tail = (f"; {len(failed)} window(s) FAILED: {', '.join(failed[:8])}" if failed else "") + (
-        f"; {unread} window(s) NOT READ (--max-calls {max_calls} spent)" if unread else "")
+        f"; {unread} window(s) NOT READ (the cap of {cap} call(s) spent)" if unread else "")
     head = (f"[econ_calendar v{__version__}] {len(countries)} countr(ies), {start}..{end}, {len(rows)} release(s), "
             f"{calls.used} EODHD call(s)")
     if not write:

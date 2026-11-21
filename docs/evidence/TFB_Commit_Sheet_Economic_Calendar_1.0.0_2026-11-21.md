@@ -6,7 +6,7 @@ Branch `feat/event-scenarios`, against main. It is stacked on #1047 (which carri
 |---|---|
 | `scripts/archive_econ_calendar.py` | new, **1.0.0** |
 | `.github/workflows/bq_econ_calendar.yml` | new, **1.0.0** |
-| `tests/test_archive_econ_calendar.py` | new, E1-E10 (18 tests) |
+| `tests/test_archive_econ_calendar.py` | new, E1-E10 (25 tests) |
 | `.github/workflows/ci.yml` | 1.1.93 -> **1.1.94** (the new test in the blocking lean lane) |
 | `scripts/verify_deployment.py` | pin: archive_econ_calendar 1.0.0 |
 
@@ -55,22 +55,24 @@ The INSERT was run in BigQuery on stand-in tables (a read-only query: no table w
 
 Seven deliberate faults were each caught by the tests: no one-day margin, an empty window counted as read, the older copy of a release kept, no retry, no window split, the budget guard ignored, NaN accepted as a figure.
 
+**After the first review.** Codex P2: the guard reserved two calls a window, but a retry or a cut window could take more, so a run close to the share could pass it. Now every call, retries and halves included, counts against the room left under the share (test E4: with 2 calls left, a failed window makes its first try and one retry, and no third).
+
 ## Safety
 
 - Observe only. The live system never reads BigQuery. No score, pick, gate, order or variable changes.
-- The EODHD daily limit is shared with the live sync. The run reads `/api/user` first (free) and is skipped when today's calls plus its own would pass 60 % of the limit (`TFB_ECON_EODHD_MAX_SHARE`), or when the limit cannot be read. This is `archive_symbol_deep.budget_check`, the same function.
-- `--max-calls` (default 400) caps a run. A window past the cap is not read and the run fails, so the gap shows.
+- The EODHD daily limit is shared with the live sync. The run reads `/api/user` first (free). Its room is 60 % of the limit (`TFB_ECON_EODHD_MAX_SHARE`) less today's calls, by the rule of `archive_symbol_deep.budget_check`; test E4 checks that both say yes to the same plans. The run is skipped when the room is smaller than its planned calls, or when the limit cannot be read.
+- Every call counts against the room and against `--max-calls` (default 400), retries and the halves of a cut window included. A window past the cap is not read and the run fails, so the gap shows.
 - The token never reaches a log line (test E10). The log prints counts and event names only: economic releases are public figures.
 - The only DML is the INSERT into `econ_calendar`. Nothing is deleted or rewritten.
 - Rollback: the repository Variable `TFB_BQ_ECON=off` stops the job. The table can be dropped without touching anything else.
 
 ## Tests
 
-`tests/test_archive_econ_calendar.py`, 18 tests:
+`tests/test_archive_econ_calendar.py`, 25 tests:
 - E1: the parsing, and the gate's key;
 - E2: the windows;
 - E3: the request shape, the second page, the split, the retry, the cap;
-- E4: the budget guard;
+- E4: the budget guard, the room against the shared rule, and the retries and split windows held inside the room (Codex P2);
 - E5: the dry run, a failed window, the cap;
 - E6: the write path (table, stage, INSERT, coverage);
 - E7: the INSERT text and the table layout;
