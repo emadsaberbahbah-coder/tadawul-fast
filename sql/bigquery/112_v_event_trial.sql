@@ -7,7 +7,14 @@
 -- they are scored on: period = 'forward' from Monday 23 Nov 2026 (00:00
 -- Riyadh), 'backtest' before it (the same rules read back on the archive).
 -- A scenario reads only events before its own (v_event_scenarios), so each
--- forecast is one that could have been made in time.
+-- forecast is one that could have been made in time. And a FORWARD event is
+-- scored on the scenario logged last before it (event_scenario_log, appended
+-- by archive_econ_calendar 1.1.0 after each calendar run): scenario =
+-- 'logged', with logged_at; a later read of the calendar (a revised figure or
+-- forecast, a release EODHD drops) cannot change it (Codex P2 on #1050). With
+-- none logged in time: 'not logged', and nothing is scored. Its figure is
+-- read against the forecast logged, in the usual miss logged. The backtest
+-- rebuilds each scenario from today's calendar ('rebuilt'): a read-back.
 -- THE TESTS (each needs earlier events of its family: NULL until then):
 --   1. the band     band_hit: the event-day move (r1_pct) fell within the
 --                   middle 80 % of the earlier moves (8 or more of them); a
@@ -33,12 +40,64 @@
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it. Observe only.
 CREATE OR REPLACE VIEW `{{DS}}.v_event_trial`
-OPTIONS (description = "TFB events v1: one row per event that is out and market - the scenario before it (the band of earlier moves, the chance of a big move, the median move after the same figure) against what happened: band hit, big-move Brier against any day's, direction and drift hits, and the Brier score of the family's figure chances - period 'forward' from 23 Nov 2026, 'backtest' before it. Observe only.")
+OPTIONS (description = "TFB events v1: one row per event that is out and market - the scenario before it (the band of earlier moves, the chance of a big move, the median move after the same figure) against what happened: band hit, big-move Brier against any day's, direction and drift hits, and the Brier score of the family's figure chances - period 'forward' from 23 Nov 2026 (scored on the scenario logged before the event), 'backtest' before it (rebuilt). Observe only.")
 AS
-WITH s AS (
-  SELECT *
+WITH s0 AS (
+  SELECT *, IF(event_at >= TIMESTAMP '2026-11-22 21:00:00+00', 'forward', 'backtest') AS trial
   FROM `{{DS}}.v_event_scenarios`
   WHERE is_out
+),
+lg AS (
+  -- a forward event: the scenario logged last before it (archive_econ_calendar 1.1.0)
+  SELECT l.*
+  FROM `{{DS}}.event_scenario_log` AS l
+  JOIN s0 ON s0.event_id = l.event_id AND s0.market_id = l.market_id AND l.logged_at < s0.event_at
+  WHERE s0.trial = 'forward'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY l.event_id, l.market_id ORDER BY l.logged_at DESC, l.run_id DESC) = 1
+),
+s AS (
+  -- the scenario scored: logged before the event (forward), or rebuilt from today's calendar (backtest)
+  SELECT
+    s0.trial AS period, s0.event_id, s0.family, s0.family_name, s0.kind, s0.country, s0.event_at, s0.event_day,
+    s0.period AS release_period, s0.actual, s0.market_order, s0.market_id, s0.market,
+    CASE WHEN s0.trial = 'backtest' THEN 'rebuilt' WHEN lg.event_id IS NOT NULL THEN 'logged' ELSE 'not logged' END
+      AS scenario,
+    lg.logged_at,
+    IF(s0.trial = 'forward', lg.estimate, s0.estimate) AS estimate,
+    IF(s0.trial = 'forward', ROUND(SAFE_DIVIDE(s0.actual - lg.estimate, lg.surprise_sd), 3), s0.surprise_z)
+      AS surprise_z,
+    -- the figure against the forecast logged, in the usual miss logged (v_event_calendar's rule)
+    IF(s0.trial = 'forward',
+       CASE
+         WHEN s0.actual IS NULL OR lg.estimate IS NULL THEN NULL
+         WHEN lg.surprise_sd > 0 THEN
+           CASE WHEN (s0.actual - lg.estimate) / lg.surprise_sd >= 0.5 THEN 'above'
+                WHEN (s0.actual - lg.estimate) / lg.surprise_sd <= -0.5 THEN 'below' ELSE 'in_line' END
+         WHEN s0.actual > lg.estimate THEN 'above'
+         WHEN s0.actual < lg.estimate THEN 'below'
+         ELSE 'in_line'
+       END,
+       s0.figure) AS figure,
+    IF(s0.trial = 'forward', lg.n_prior, s0.n_prior) AS n_prior,
+    IF(s0.trial = 'forward', lg.r1_p10, s0.r1_p10) AS r1_p10,
+    IF(s0.trial = 'forward', lg.r1_p50, s0.r1_p50) AS r1_p50,
+    IF(s0.trial = 'forward', lg.r1_p90, s0.r1_p90) AS r1_p90,
+    IF(s0.trial = 'forward', lg.n_move, s0.n_move) AS n_move,
+    IF(s0.trial = 'forward', lg.p_big, s0.p_big) AS p_big,
+    IF(s0.trial = 'forward', lg.n_above, s0.n_above) AS n_above,
+    IF(s0.trial = 'forward', lg.n_below, s0.n_below) AS n_below,
+    IF(s0.trial = 'forward', lg.r1_p50_above, s0.r1_p50_above) AS r1_p50_above,
+    IF(s0.trial = 'forward', lg.r1_p50_below, s0.r1_p50_below) AS r1_p50_below,
+    IF(s0.trial = 'forward', lg.n_f5_above, s0.n_f5_above) AS n_f5_above,
+    IF(s0.trial = 'forward', lg.n_f5_below, s0.n_f5_below) AS n_f5_below,
+    IF(s0.trial = 'forward', lg.f5_p50_above, s0.f5_p50_above) AS f5_p50_above,
+    IF(s0.trial = 'forward', lg.f5_p50_below, s0.f5_p50_below) AS f5_p50_below,
+    IF(s0.trial = 'forward', lg.n_fig, s0.n_fig) AS n_fig,
+    IF(s0.trial = 'forward', lg.p_above, s0.p_above) AS p_above,
+    IF(s0.trial = 'forward', lg.p_in_line, s0.p_in_line) AS p_in_line,
+    IF(s0.trial = 'forward', lg.p_below, s0.p_below) AS p_below
+  FROM s0
+  LEFT JOIN lg USING (event_id, market_id)
 ),
 r AS (
   SELECT event_id, market_id, pre_day, event_close_day, r1_pct, r5_pct, f5_pct, z1, move, any_up_share, any_down_share
@@ -62,8 +121,7 @@ j AS (
   JOIN r USING (event_id, market_id)
 )
 SELECT
-  IF(event_at >= TIMESTAMP '2026-11-22 21:00:00+00', 'forward', 'backtest') AS period,
-  event_id, family, family_name, kind, country, event_at, event_day, period AS release_period,
+  period, event_id, family, family_name, kind, country, event_at, event_day, release_period, scenario, logged_at,
   actual, estimate, surprise_z, figure,
   market_order, market_id, market, n_prior, pre_day, event_close_day, r1_pct, r5_pct, f5_pct, z1, move,
   r1_p10, r1_p50, r1_p90,

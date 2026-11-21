@@ -54,6 +54,8 @@
 --   family:YYYY-MM-DD), family, family_name, kind (meeting | release),
 --   country, event_at (UTC), event_day (Riyadh), source (official | eodhd),
 --   event_type, period, actual, estimate, previous, surprise, surprise_z,
+--   surprise_sd (the family's usual miss the z is read in, from earlier
+--   events: known before the figure, so it is logged with the scenario),
 --   figure, is_out (the figure is out, or the meeting's time has passed: a
 --   past release that EODHD lists without its figure stays out of the
 --   reactions, the scenarios and the trial - 7 of the 481 past releases on
@@ -229,6 +231,7 @@ SELECT
   event_type, period, actual, estimate, previous,
   ROUND(surprise, 6) AS surprise,
   IF(n_sd >= 6 AND sd > 0, ROUND(surprise / sd, 3), NULL) AS surprise_z,
+  IF(n_sd >= 6 AND sd > 0, ROUND(sd, 6), NULL) AS surprise_sd,
   CASE
     WHEN surprise IS NULL THEN NULL
     WHEN n_sd >= 6 AND sd > 0 THEN

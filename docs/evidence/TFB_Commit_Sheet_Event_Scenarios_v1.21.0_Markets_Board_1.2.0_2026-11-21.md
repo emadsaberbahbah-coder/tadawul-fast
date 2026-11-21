@@ -4,7 +4,8 @@ Branch `feat/event-scenarios-views`, against main, after #1049 (the economic cal
 
 | File | Version |
 |---|---|
-| `scripts/apply_bq_views.py` | 1.20.0 -> **1.21.0** (5 views; `econ_calendar` is a source table) |
+| `scripts/apply_bq_views.py` | 1.20.0 -> **1.21.0** (5 views; `econ_calendar` and `event_scenario_log` are source tables) |
+| `scripts/archive_econ_calendar.py` | 1.0.0 -> **1.1.0** (after each written run, the scenarios of the events ahead are logged) |
 | `sql/bigquery/109_v_event_calendar.sql` | new |
 | `sql/bigquery/110_v_event_reactions.sql` | new |
 | `sql/bigquery/111_v_event_scenarios.sql` | new |
@@ -13,9 +14,10 @@ Branch `feat/event-scenarios-views`, against main, after #1049 (the economic cal
 | `scripts/markets_board.py` | 1.1.0 -> **1.2.0** (the next event, sections 7 and 8) |
 | `.github/workflows/markets_board.yml` | 1.1.0 -> **1.2.0** (also runs after the economic calendar archive) |
 | `scripts/news_macro_gate.py` | 1.4.0 -> **1.4.1** (the Fed's revised 2027 days) |
-| `scripts/verify_deployment.py` | pins: apply_bq_views 1.21.0, markets_board 1.2.0, news_macro_gate 1.4.1 |
+| `scripts/verify_deployment.py` | pins: apply_bq_views 1.21.0, archive_econ_calendar 1.1.0, markets_board 1.2.0, news_macro_gate 1.4.1 |
 | `tests/test_bq_views.py` | V52-V56, V45 (file order to 113), five PENDING pins; the 37 pins read back on 21 Nov (run 44910876350, 76 of 76) move to INSTALLED |
 | `tests/test_markets_board.py` | the event sections, the page before the views exist, M9 |
+| `tests/test_archive_econ_calendar.py` | E11 (the scenario log); E6 and E10 for the second table and INSERT |
 | `tests/test_news_macro_gate.py` | G13 (the 2027 schedule) |
 
 No new test file, so `ci.yml` is unchanged.
@@ -41,6 +43,14 @@ The design of 16 Nov 2026 asked for the same thing in more detail: for each big 
 - **The scenarios (111).** For each event, held or ahead, from the earlier events of its family only: the 10th, 50th and 90th percentile of the event-day move, the chance of a move of a normal day or more, the median move after a figure above or below its forecast, and the chances of the figure itself.
 - **The trial and its scorecard (112, 113).** Each scenario against what came: did the move fall inside the band, did the big-move chance beat any day's (Brier), did the direction and the drift after the figure hold (a z against a coin), did the figure chances beat equal thirds. Forward from Monday 23 Nov 2026 00:00 Riyadh; the same rules read back on the archive are the backtest.
 - **The Markets Board 1.2.0.** A NEXT EVENT line under the US line; section 7, the events of the next 14 days with their band per market, the move after a figure above or below, the big-move chance and the market that moved most, and the last 7 days against their band; section 8, the scorecard. Before the views exist the page is built all the same and says so.
+
+## The scenario log (Codex P2 on the first push)
+
+Codex found that the views rebuild every scenario from today's calendar: if a later read changes an earlier release (a revised figure or forecast, a release EODHD drops), the scenario of an event already scored changes with it, even on the rows marked forward. So the forward test would not score what was said before each event.
+
+- `archive_econ_calendar` 1.1.0 appends, after each written run, the scenarios of the events of the next 21 days, as `v_event_scenarios` reads them on the calendar just loaded, to **`event_scenario_log`** (DAY partitions on `logged_at`): the forecast, the family's usual miss (`surprise_sd`, new in 109), and per market the band, the big-move chance, the medians after a figure and the figure chances. Three runs a day: a US release (13:30 UTC) is scored on the 04:50 log, China's PMI (01:30 UTC) on the evening before.
+- `v_event_trial` scores a **forward** event on the last row logged before it (`scenario = 'logged'`, with `logged_at`); its figure is read against the forecast logged, in the usual miss logged. With none logged in time: `'not logged'`, nothing scored, and the scorecard counts it apart (`not_logged`; the board says so). The backtest stays rebuilt (`'rebuilt'`): a read-back, not a record.
+- Checked in BigQuery with a stand-in log (each event since 1 Sep 2026 logged an hour before it, US payrolls left out): 43 events logged, their figures, forecasts and z identical to the calendar's; the 3 payroll events read 'not logged' with nothing scored. And on a hand-made trial: the scored and not-logged counts and the event-clustered z as computed by hand.
 
 ## Changes after the first read on the real history
 
@@ -81,13 +91,16 @@ By family the band ranges from 54.9 % (US GDP, 12 events) to 78.4 % (China PMI);
 
 - Observe only. The live system never reads BigQuery. No score, pick, gate, order or variable changes.
 - The board reads only the views and writes only `Markets_Board`. Its run log prints counts, never a symbol.
+- The calendar loader's only DML: the INSERTs into `econ_calendar` and `event_scenario_log` (research tables). A dry run writes neither.
 - The news gate's change touches only its 2027 FOMC days: nothing before 2027 moves.
 - The broker stays read-only.
 - Rollback: `TFB_MARKETS_BOARD=off` for the page; the views can be dropped without touching anything else.
 
 ## After the merge
 
-1. `bq_views.yml` in `write` mode: the five views (the source table `econ_calendar` exists since the history fill).
-2. The Markets Board shows sections 7 and 8 on its next run.
+1. `bq_econ_calendar.yml` with `write=true`: creates `event_scenario_log` (it logs nothing yet: the views are not there).
+2. `bq_views.yml` in `write` mode: the five views (`v_event_trial` reads the log table, so step 1 comes first).
+3. `bq_econ_calendar.yml` with `write=true` again: the first scenarios logged (the schedule does it three times a day after that). This must happen before the first forward event, US core PCE on 25 Nov 13:30 UTC.
+4. The Markets Board shows sections 7 and 8 on its next run.
 
 Not investment advice; the owner decides and executes every trade.

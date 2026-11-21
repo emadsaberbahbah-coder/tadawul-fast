@@ -243,8 +243,9 @@ def sql_events_last(ds: str, now: _dt.datetime) -> str:
 
 def sql_events_summary(ds: str) -> str:
     """1.2.0: the events scorecard, the all-markets lines of each family and of all families."""
-    return ("SELECT period, family, family_name, events, band_n, band_pct, big_n, big_pct, any_pct, big_skill, dir_n, "
-            "dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, fig_n, fig_skill, verdict "
+    return ("SELECT period, family, family_name, events, not_logged, band_n, band_pct, big_n, big_pct, any_pct, "
+            "big_skill, dir_n, dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, fig_n, "
+            "fig_skill, verdict "
             "FROM `%s.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family" % ds)
 
 
@@ -721,9 +722,11 @@ def event_reading(summary: Sequence[Dict[str, Any]], period: str) -> str:
     """One sentence for `period` from its all-families line."""
     line = next((r for r in summary if text(r.get("period")) == period and text(r.get("family")) == "all"), None)
     n = int(num((line or {}).get("events")) or 0)
+    unlogged = int(num((line or {}).get("not_logged")) or 0)
+    late = ("; %d more came with no scenario logged before them and are not scored" % unlogged) if unlogged else ""
     if period == "forward" and n < REVIEW_SESSIONS:
-        return ("EVENTS, FORWARD (from %s): %d event(s) scored so far - collecting; the owner reviews them with the "
-                "rest after %d sessions." % (short_day(EVENT_FORWARD_FROM), n, REVIEW_SESSIONS))
+        return ("EVENTS, FORWARD (from %s): %d event(s) scored so far%s - collecting; the owner reviews them with "
+                "the rest after %d sessions." % (short_day(EVENT_FORWARD_FROM), n, late, REVIEW_SESSIONS))
     if not line:
         return "EVENTS, %s: no event scored yet." % period.upper()
     parts = []
@@ -746,7 +749,8 @@ def event_reading(summary: Sequence[Dict[str, Any]], period: str) -> str:
     if fn and fs is not None:
         parts.append("the figure chances scored %+.2f against equal thirds over %d figures" % (fs, fn))
     head = ("EVENTS, BACKTEST (the same rules read back on the archive, %d events)" % n if period == "backtest" else
-            "EVENTS, FORWARD (from %s, %d events)" % (short_day(EVENT_FORWARD_FROM), n))
+            "EVENTS, FORWARD (from %s, %d events, each scored on the scenario logged before it%s)"
+            % (short_day(EVENT_FORWARD_FROM), n, late))
     return "%s: %s." % (head, "; ".join(parts))
 
 

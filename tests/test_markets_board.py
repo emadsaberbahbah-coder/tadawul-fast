@@ -153,7 +153,8 @@ LAST = [lrow("us", "-0.42", "-1.1", "0.9", "true"), lrow("sa", "0.1", None, None
 
 
 def esum(period, family, name, events, **kw):
-    r = {"period": period, "family": family, "family_name": name, "events": str(events), "band_n": "0",
+    r = {"period": period, "family": family, "family_name": name, "events": str(events), "not_logged": "0",
+         "band_n": "0",
          "band_pct": None, "big_n": "0", "big_pct": None, "any_pct": None, "big_skill": None, "dir_n": "0",
          "dir_events": "0", "dir_pct": None, "dir_z": None, "drift_n": "0", "drift_events": "0", "drift_pct": None,
          "drift_z": None, "fig_n": "0",
@@ -802,6 +803,7 @@ def test_m9_event_sql_is_select_only_timed_and_reads_the_three_views():
     assert "AND market_id IN ('us', 'sa', 'oil', 'gold', 'bonds')" in b
     assert c.endswith("FROM `proj-1.tfb_archive.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family")
     assert ", dir_n, dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, " in c   # events, each once
+    assert "SELECT period, family, family_name, events, not_logged, " in c
     for sql in (a, b, c):
         assert sql.startswith("SELECT ") and "CURRENT_" not in sql
         assert not re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE)\b", sql, re.I)
@@ -835,8 +837,13 @@ def test_m9_event_cells_and_readings():
     assert mb.event_reading([], "forward").startswith("EVENTS, FORWARD (from Mon 23 Nov 2026): 0 event(s) scored so far")
     ten = [esum("forward", "all", "All families", 10, band_n=40, band_pct=95.0, big_n=0, dir_n=0)]
     got = mb.event_reading(ten, "forward")
-    assert got.startswith("EVENTS, FORWARD (from Mon 23 Nov 2026, 10 events): the band of the earlier moves held 95 % "
-                          "of 40 event-market rows (a true band holds 80 %: too wide)")
+    assert got.startswith("EVENTS, FORWARD (from Mon 23 Nov 2026, 10 events, each scored on the scenario logged before "
+                          "it): the band of the earlier moves held 95 % of 40 event-market rows (a true band holds 80 "
+                          "%: too wide)")
+    late = [esum("forward", "all", "All families", 3, not_logged=2)]          # 1.2.0: no scenario logged in time
+    assert mb.event_reading(late, "forward") == (
+        "EVENTS, FORWARD (from Mon 23 Nov 2026): 3 event(s) scored so far; 2 more came with no scenario logged before "
+        "them and are not scored - collecting; the owner reviews them with the rest after 10 sessions.")
     assert got.endswith("; no direction after a figure is scored yet.")
     narrow = [esum("backtest", "all", "All families", 30, band_n=200, band_pct=61.0, big_n=150, big_pct=40.0,
                    any_pct=25.0, big_skill=0.12)]

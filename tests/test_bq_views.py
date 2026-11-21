@@ -338,11 +338,11 @@ INSTALLED = {
 PENDING = {
     # apply_bq_views 1.21.0 (21 Nov 2026): the forward event scenarios - the meetings and releases, each market's move
     # around them, the scenarios from the earlier events of each family, the trial and its scorecard (observe only)
-    "v_event_calendar": "66a43c94b1dac73bba43c24d420f12bd401185b168c00531ce39c4e453418014",
+    "v_event_calendar": "8149d12c6e35334edef0de87eb375ad278965a22eded8094a564cc63d0dd6ce2",
     "v_event_reactions": "10d89bdd0e31593951118006848f3048b91ab4e21a7dcb3a6aa215d15048cfd6",
-    "v_event_scenarios": "634581da8d58f4c68edb51504cb3864235487b1e4a341f66db43f0c39dae6a26",
-    "v_event_trial": "9ee18698cdb5a6fc624df438daf1ca65aa8bcd92ef6b784338046ff6d2c5d28e",
-    "v_event_trial_summary": "6d85c329c66aeac624715bafd5ed557c8936911da235fb840738b14cdaa2b6fa",
+    "v_event_scenarios": "73f28feb2afbd02f9a5d8845891872444bec24c5001b61d87beadcdb9f569fc6",
+    "v_event_trial": "518ab72be1b266a6a226ef038f1dd942b02d90c048257f947a30ac947e7fdd6d",
+    "v_event_trial_summary": "9ca3cbc11e11e53dda4f3a005a20218426bd5e75f8bb0c1539c7056c13e12dfb",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3539,10 +3539,33 @@ def case_v54():
 
 def case_v55():
     """v_event_trial (1.21.0): each scenario against what came - the band, the big move against any day's, the
-    direction and the drift after a figure, the figure chances; 'forward' from 23 Nov 2026 00:00 Riyadh."""
-    objs, code = _event_view("v_event_trial", 112, {"v_event_scenarios", "v_event_reactions"})
+    direction and the drift after a figure, the figure chances; 'forward' from 23 Nov 2026 00:00 Riyadh, scored on
+    the scenario logged last before the event (event_scenario_log, archive_econ_calendar 1.1.0; Codex P2 on #1050),
+    the backtest on scenarios rebuilt from today's calendar."""
+    objs, code = _event_view("v_event_trial", 112, {"v_event_scenarios", "v_event_reactions", "event_scenario_log"})
     start = dt.datetime(2026, 11, 23, tzinfo=dt.timezone(dt.timedelta(hours=3))).astimezone(dt.timezone.utc)
-    assert "IF(event_at >= TIMESTAMP '%s+00', 'forward', 'backtest') AS period" % start.strftime("%Y-%m-%d %H:%M:%S") in code
+    assert "IF(event_at >= TIMESTAMP '%s+00', 'forward', 'backtest') AS trial" % start.strftime("%Y-%m-%d %H:%M:%S") in code
+    assert "event_scenario_log" in bv.SOURCE_TABLES
+    # the log: the last row before the event, per event and market; a forward row takes every scenario field from it
+    for frag in ("JOIN s0 ON s0.event_id = l.event_id AND s0.market_id = l.market_id AND l.logged_at < s0.event_at",
+                 "WHERE s0.trial = 'forward'",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY l.event_id, l.market_id ORDER BY l.logged_at DESC, "
+                 "l.run_id DESC) = 1",
+                 "CASE WHEN s0.trial = 'backtest' THEN 'rebuilt' WHEN lg.event_id IS NOT NULL THEN 'logged' "
+                 "ELSE 'not logged' END",
+                 "IF(s0.trial = 'forward', lg.estimate, s0.estimate) AS estimate",
+                 "IF(s0.trial = 'forward', ROUND(SAFE_DIVIDE(s0.actual - lg.estimate, lg.surprise_sd), 3), "
+                 "s0.surprise_z)",
+                 "CASE WHEN (s0.actual - lg.estimate) / lg.surprise_sd >= 0.5 THEN 'above'",
+                 "WHEN (s0.actual - lg.estimate) / lg.surprise_sd <= -0.5 THEN 'below' ELSE 'in_line' END",
+                 "LEFT JOIN lg USING (event_id, market_id)"):
+        assert frag in code, frag
+    import archive_econ_calendar as ec                                           # the log's own columns
+    for col in ("n_prior", "r1_p10", "r1_p50", "r1_p90", "n_move", "p_big", "n_above", "n_below", "r1_p50_above",
+                "r1_p50_below", "n_f5_above", "n_f5_below", "f5_p50_above", "f5_p50_below", "n_fig", "p_above",
+                "p_in_line", "p_below"):
+        assert f"IF(s0.trial = 'forward', lg.{col}, s0.{col}) AS {col}" in code, col
+        assert col in ec.LOG_COLUMNS, col
     for frag in ("IF(n_prior >= 8, r1_pct BETWEEN r1_p10 AND r1_p90, NULL) AS band_hit",
                  "IF(n_move >= 8 AND big IS NOT NULL, ROUND(POW(p_big - big, 2), 6), NULL) AS brier_big",
                  "ROUND(POW(any_big - big, 2), 6), NULL) AS brier_any",

@@ -25,7 +25,10 @@ what came ('forward' from 23 Nov 2026); v_event_trial_summary (113) - the
 scorecard: the band against 80 %, the big-move chance against any day's, the
 direction and the drift after a figure against a coin (each event counted
 once over its markets), the figure chances of the releases against equal
-thirds. One event per release: EODHD lists some releases twice ("Oct" and
+thirds. A forward event is scored on the scenario logged last before it
+(event_scenario_log, appended by archive_econ_calendar 1.1.0 after each
+calendar run), never on one rebuilt later (Codex P2 on #1050); the backtest
+is rebuilt from today's calendar. One event per release: EODHD lists some releases twice ("Oct" and
 "Oct. 2026") and a first estimate with its revisions (US GDP, a flash and its
 final) under the same period, so a family's same period within 120 days is
 one release. First read (backtest, the history loaded on 21 Nov 2026, run
@@ -495,8 +498,9 @@ MARKET_TABLES = frozenset({"market_series_daily"})
 DEEP_TABLES = frozenset({"symbol_bars_daily", "symbol_analyst_daily", "symbol_news"})
 # the table scripts/archive_news_themes.py merges (v1.14.0, the news loop; its 1.1.0 sources since v1.20.0)
 NEWS_TABLES = frozenset({"news_theme_daily", "news_entity_daily"})   # v1.20.0: the places and the people apart
-# the change log scripts/archive_econ_calendar.py v1.0.0 appends (v1.21.0, the event scenarios)
-ECON_TABLES = frozenset({"econ_calendar"})
+# the change log scripts/archive_econ_calendar.py v1.0.0 appends, and the scenarios it logs before their events
+# from v1.1.0 (v1.21.0, the event scenarios)
+ECON_TABLES = frozenset({"econ_calendar", "event_scenario_log"})
 SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")

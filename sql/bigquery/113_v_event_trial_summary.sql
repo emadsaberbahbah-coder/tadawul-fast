@@ -8,7 +8,10 @@
 -- review with the owner, and switch on only what proved itself."
 -- READ FROM v_event_trial (one pass, GROUPING SETS; a market row of an event
 -- counts once; the figure lines count each event once):
---   events, rows          the events and the event-market rows behind the line
+--   events, rows          the events scored and the event-market rows behind
+--                         the line
+--   not_logged            forward events that came with no scenario logged
+--                         before them (v_event_trial): not scored
 --   band_n, band_pct      the rows with a band and the share inside it (a
 --                         true band: 80 %)
 --   big_n, big_pct        the rows with a big-move chance, and the share that
@@ -61,7 +64,8 @@ grp AS (
     GROUPING(family) AS g_family, GROUPING(market_id) AS g_market,
     ANY_VALUE(family_name) AS any_family_name, ANY_VALUE(market) AS any_market,
     ANY_VALUE(market_order) AS any_market_order,
-    COUNT(DISTINCT event_id) AS events,
+    COUNT(DISTINCT IF(scenario = 'not logged', NULL, event_id)) AS events,
+    COUNT(DISTINCT IF(scenario = 'not logged', event_id, NULL)) AS not_logged,
     COUNT(*) AS n_rows,
     COUNTIF(band_hit IS NOT NULL) AS band_n,
     ROUND(100 * AVG(IF(band_hit, 1, IF(band_hit IS NULL, NULL, 0))), 1) AS band_pct,
@@ -115,7 +119,7 @@ figl AS (
   FROM figs
 )
 SELECT
-  r.period, r.family, r.family_name, r.market_order, r.market_id, r.market, r.events, r.n_rows,
+  r.period, r.family, r.family_name, r.market_order, r.market_id, r.market, r.events, r.not_logged, r.n_rows,
   r.band_n, r.band_pct, r.big_n, r.big_pct, r.any_pct, r.big_skill,
   r.dir_n, r.dir_events, r.dir_pct, r.dir_z, r.drift_n, r.drift_events, r.drift_pct, r.drift_z,
   IF(r.market_id = 'all', f.fig_n, NULL) AS fig_n,

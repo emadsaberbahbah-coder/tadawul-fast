@@ -22,6 +22,11 @@
 --                                 the event close (f5_pct) after each
 --   n_fig, p_above / p_in_line / p_below  the family's figures (every market
 --                                 alike): (count + 1) / (n_fig + 3)
+-- The event's own columns are v_event_calendar's (surprise_sd included).
+-- An event ahead is read again on each calendar run; archive_econ_calendar
+-- 1.1.0 logs these rows for the events of the next 21 days into
+-- event_scenario_log, and v_event_trial scores a forward event on the last
+-- row logged before it.
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it. Observe only.
 CREATE OR REPLACE VIEW `{{DS}}.v_event_scenarios`
@@ -29,7 +34,7 @@ OPTIONS (description = "TFB events v1: one row per event (held or ahead) and mar
 AS
 WITH ev AS (
   SELECT event_id, family, family_name, kind, country, event_at, event_day, period, actual, estimate, previous,
-         surprise, surprise_z, figure, is_out
+         surprise, surprise_z, surprise_sd, figure, is_out
   FROM `{{DS}}.v_event_calendar`
 ),
 re AS (
@@ -87,7 +92,7 @@ fig AS (
 )
 SELECT
   e.event_id, e.family, e.family_name, e.kind, e.country, e.event_at, e.event_day, e.period,
-  e.actual, e.estimate, e.previous, e.surprise, e.surprise_z, e.figure, e.is_out,
+  e.actual, e.estimate, e.previous, e.surprise, e.surprise_z, e.surprise_sd, e.figure, e.is_out,
   a.market_order, a.market_id, a.market, a.n_prior,
   ROUND(a.r1_p10, 4) AS r1_p10, ROUND(a.r1_p50, 4) AS r1_p50, ROUND(a.r1_p90, 4) AS r1_p90,
   a.n_big, a.n_move,
