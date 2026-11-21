@@ -359,6 +359,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-21: 1.0.0 -> 1.1.0 (three more sources: the fights, the share
     # and the tone of the news by place, and the news of 17 people).
     ("archive_news_themes", "1.1.0", "bigquery news themes"),
+    # 2026-11-21 (new script, pinned on arrival): the EODHD economic calendar of six economies, history
+    # included, appended to BigQuery as a change log for the forward event scenarios; research table only.
+    ("archive_econ_calendar", "1.0.0", "bigquery economic calendar"),
     # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).

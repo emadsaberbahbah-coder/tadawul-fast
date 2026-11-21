@@ -1,0 +1,148 @@
+# =============================================================================
+# 🗓️ BigQuery Economic Calendar — the releases of six economies, with history
+# =============================================================================
+# VERSION 1.0.0 (2026-11-21) -- owner, 21 Nov 2026 11:03 Riyadh, item 5 of the
+#       build list: "News: a news reading per market; forward event scenarios;
+#       momentum/surprise; influential figures of 19 Nov; score every news
+#       signal." The news gate keeps five days of the US and Saudi calendars;
+#       the scenarios need the history of every release and its forecast.
+# scripts/archive_econ_calendar.py v1.0.0 reads EODHD economic-events (1 call a
+#       request) for the US, the euro area (EU), Germany, Japan, China and
+#       Saudi Arabia and appends what changed to BigQuery table
+#       tfb_archive.econ_calendar (project-2e3530e6-2311-4aa3-b36, US): one row
+#       per release per change - new, changed (a forecast or a figure) or gone.
+#       NOTHING is written to the workbook and the live system never reads
+#       BigQuery; no decision, gate or count depends on it.
+# AUTH: the archive's service account (GOOGLE_SHEETS_CREDENTIALS, BigQuery Data
+#       Editor + Job User) and the existing EODHD_API_KEY secret.
+# BUDGET: /api/user (free) is read first; the run is SKIPPED when the calls used
+#       today plus this run's would pass TFB_ECON_EODHD_MAX_SHARE (default
+#       0.60) of the daily limit shared with the live sync. A scheduled run
+#       reads one window: 3 days back to 21 ahead, 6 calls.
+# GATE: armed here (TFB_BQ_ECON defaults to on); kill with the repository
+#       Variable TFB_BQ_ECON=off.
+# SCHEDULE: 04:50 UTC (07:50 Riyadh: Asia and Saudi Arabia have released),
+#       14:10 UTC on weekdays (the US 8:30 releases and the ECB are out) and
+#       21:30 UTC on weekdays (after the Fed's 2 pm and the US close). GitHub
+#       may start a scheduled run late; the next run catches up.
+# DISPATCH: a dry run unless write=true. A history fill: write=true and start
+#       2023-11-01 (the market archive's first months), about 230 calls.
+# =============================================================================
+name: 🗓️ BigQuery Economic Calendar
+
+on:
+  schedule:
+    - cron: "50 4 * * *"            # 07:50 Riyadh, daily
+    - cron: "10 14 * * 1-5"         # 17:10 Riyadh, weekdays
+    - cron: "30 21 * * 1-5"         # 00:30 Riyadh, weekdays
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Append the changes to BigQuery? (default: dry run - reads EODHD and prints the counts)"
+        required: false
+        default: false
+        type: boolean
+      start:
+        description: "First day, YYYY-MM-DD (blank = 3 days ago; a history fill: 2023-11-01)"
+        required: false
+        default: ""
+        type: string
+      end:
+        description: "Last day, YYYY-MM-DD (blank = 21 days ahead)"
+        required: false
+        default: ""
+        type: string
+      countries:
+        description: "Comma-separated two-letter codes (blank = US,EU,DE,JP,CN,SA)"
+        required: false
+        default: ""
+        type: string
+      max_calls:
+        description: "EODHD calls this run may use (1..5000)"
+        required: false
+        default: "400"
+        type: string
+      list_types:
+        description: "Print every event name read, with its count"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  econ:
+    name: 🗓️ Load the economic calendar into BigQuery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 🗓️ Run the loader
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          TFB_BQ_ECON: ${{ vars.TFB_BQ_ECON || 'on' }}
+          TFB_ECON_EODHD_MAX_SHARE: ${{ vars.TFB_ECON_EODHD_MAX_SHARE || '0.60' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: "US"
+          INPUT_START: ${{ github.event.inputs.start }}
+          INPUT_END: ${{ github.event.inputs.end }}
+          INPUT_COUNTRIES: ${{ github.event.inputs.countries }}
+          INPUT_MAX_CALLS: ${{ github.event.inputs.max_calls }}
+          INPUT_LIST_TYPES: ${{ github.event.inputs.list_types }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — reading EODHD, writing nothing (tick write=true to append)."
+          fi
+          MAX_CALLS="${INPUT_MAX_CALLS:-400}"
+          if [[ ! "$MAX_CALLS" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_calls must be a whole number, got '${MAX_CALLS}'"
+            exit 2
+          fi
+          EXTRA=()
+          if [[ "${INPUT_LIST_TYPES}" == "true" ]]; then
+            EXTRA+=(--list-types)
+          fi
+          python scripts/archive_econ_calendar.py $MODE --start "${INPUT_START:-}" --end "${INPUT_END:-}" \
+            --countries "${INPUT_COUNTRIES:-}" --max-calls "$MAX_CALLS" "${EXTRA[@]}" 2>&1 | tee econ_calendar.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### 🗓️ BigQuery Economic Calendar (${MODE#--})"
+            echo ""
+            echo '```'
+            tail -n 60 econ_calendar.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
