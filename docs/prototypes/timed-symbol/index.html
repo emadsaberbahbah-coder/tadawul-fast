@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>TFB — بحث الرمز</title>
+  <style>
+    :root { color-scheme: light; --navy:#0b2545; --teal:#007d87; --ink:#17334e; --muted:#536779; --line:#d6e0e9; --paper:#fff; --wash:#f4f7fa; --amber:#805000; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--wash); font:16px/1.7 Tahoma,Arial,sans-serif; }
+    button,input { font:inherit; }
+    button,a,input { outline-offset:4px; }
+    button:focus-visible,a:focus-visible,input:focus-visible { outline:3px solid #d98718; }
+    button { cursor:pointer; border:1px solid transparent; border-radius:10px; padding:.62rem 1rem; background:var(--navy); color:white; font-weight:700; }
+    button:hover { filter:brightness(1.1); }
+    button.secondary { color:var(--navy); background:white; border-color:var(--line); }
+    button.link { background:none; color:var(--teal); padding:.1rem .25rem; font-size:.88rem; }
+    a { color:var(--teal); text-underline-offset:3px; }
+    [hidden] { display:none !important; }
+    .top { background:var(--navy); color:white; padding:1rem max(1rem,calc((100vw - 1440px)/2)); display:flex; align-items:center; gap:1rem; justify-content:space-between; }
+    .brand { font-weight:800; font-size:1.25rem; letter-spacing:.02em; }
+    .top small { opacity:.85; display:block; font-size:.78rem; }
+    .master-badge { display:flex; align-items:center; gap:.5rem; padding:.35rem .8rem; border:1px solid #42607b; border-radius:10px; font-size:.9rem; }
+    .wrap { max-width:1440px; margin:auto; padding:1.25rem; }
+    .prototype { padding:.75rem 1rem; background:#fff7e5; border:1px solid #ead3a2; border-radius:10px; color:var(--amber); font-size:.9rem; }
+    .layout { display:grid; grid-template-columns:238px minmax(0,1fr); gap:1.25rem; margin-top:1.25rem; }
+    nav { align-self:start; position:sticky; top:1rem; background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:.6rem; }
+    nav button { display:block; width:100%; background:none; color:var(--muted); text-align:right; border-radius:9px; margin:.1rem 0; padding:.7rem .8rem; }
+    nav button[aria-current=page] { color:var(--navy); background:#e7f3f3; box-shadow:inset -4px 0 var(--teal); }
+    nav button small { display:block; font-weight:400; font-size:.7rem; direction:ltr; text-align:right; }
+    main { min-width:0; }
+    .heading { display:flex; align-items:flex-start; gap:1rem; justify-content:space-between; margin:.15rem 0 1rem; }
+    h1 { font-size:1.65rem; line-height:1.4; margin:0; color:var(--navy); }
+    h1 small { display:block; font:400 .85rem/1.7 Arial,sans-serif; color:var(--muted); margin-top:.25rem; direction:ltr; text-align:right; }
+    .section-purpose { color:var(--muted); margin:.5rem 0 0; max-width:800px; }
+    .card { background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:1.2rem; margin-bottom:1rem; }
+    .symbol-state { display:flex; justify-content:space-between; align-items:center; gap:1rem; background:#edf5f8; border-color:#c6dce5; }
+    .symbol-label { font-size:.8rem; color:var(--muted); }
+    .symbol { font:bold 1.6rem/1.3 Arial,sans-serif; margin-top:.25rem; color:var(--navy); }
+    .status { font-size:.86rem; font-weight:700; color:var(--teal); }
+    .status.temporary { color:var(--amber); }
+    .countdown { font:700 1.2rem/1.5 Arial,sans-serif; color:var(--amber); }
+    form { margin-top:.75rem; display:flex; align-items:end; gap:.65rem; flex-wrap:wrap; }
+    label { display:block; font-size:.9rem; font-weight:700; }
+    .input-wrap { flex:1 1 220px; }
+    input { width:100%; min-height:48px; border:1px solid #b2c2cf; border-radius:9px; padding:.5rem .8rem; color:var(--navy); direction:ltr; text-align:left; background:white; }
+    input:invalid:not(:placeholder-shown) { border-color:#a5332e; }
+    .hint { color:var(--muted); font-size:.85rem; margin:.5rem 0 0; }
+    .error { color:#a22a27; min-height:1.6em; margin:.5rem 0 0; font-size:.88rem; }
+    .data-placeholder { border:1px dashed #a3b9c9; background:linear-gradient(140deg,#fff,#f0f6fa); text-align:center; padding:2.5rem 1.5rem; }
+    .data-placeholder h2 { font-size:1.2rem; margin:.3rem 0; color:var(--navy); }
+    .data-placeholder p { max-width:640px; margin:.6rem auto; color:var(--muted); }
+    .section-tag { display:inline-block; border-radius:30px; background:#e8eef4; color:var(--ink); padding:.2rem .65rem; font-size:.8rem; }
+    .current-report { display:inline-block; margin-top:.7rem; font-weight:700; }
+    .embed-note { color:var(--muted); font-size:.85rem; margin-bottom:.5rem; }
+    iframe { width:100%; height:1000px; border:1px solid var(--line); border-radius:12px; background:white; }
+    .help-inline { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.8rem; }
+    .help-inline div { border-top:3px solid #b7d7db; padding:.5rem .1rem; }
+    .help-inline strong { font-size:.85rem; color:var(--navy); }
+    .help-inline p { color:var(--muted); font-size:.87rem; margin:.35rem 0; }
+    footer { font-size:.82rem; color:var(--muted); padding:0 .3rem 1.5rem; }
+    dialog { width:min(760px,calc(100% - 2rem)); max-height:85vh; border:1px solid var(--line); border-radius:18px; padding:1.5rem; color:var(--ink); box-shadow:0 24px 80px #0b254533; }
+    dialog::backdrop { background:#0b254588; }
+    dialog header { display:flex; align-items:start; gap:1rem; justify-content:space-between; }
+    dialog h2 { margin:0; color:var(--navy); font-size:1.3rem; }
+    dialog h3 { font-size:1rem; margin:1rem 0 .35rem; color:var(--teal); }
+    dialog p { margin:.3rem 0; }
+    dialog ul { padding-right:1.3rem; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
+    @media(max-width:920px) { .layout { grid-template-columns:1fr; } nav { position:static; display:flex; overflow-x:auto; gap:.3rem; } nav button { min-width:145px; white-space:nowrap; } .help-inline { grid-template-columns:1fr; } }
+    @media(max-width:560px) { .wrap { padding:.8rem; } .top { align-items:start; flex-wrap:wrap; } .heading { flex-direction:column; } .symbol-state { align-items:start; } h1 { font-size:1.35rem; } button { padding:.6rem .8rem; } iframe { height:760px; } }
+    @media(prefers-reduced-motion:no-preference) { button { transition:filter .12s ease; } }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div><div class="brand"><span dir="ltr">TFB</span> · بحث الرمز</div><small>نظرة عامة واحدة، ومقارنة مؤقتة عند الحاجة</small></div>
+    <div class="master-badge">الرمز الأساسي <b id="masterBadge" dir="ltr">2222.SR</b><button class="link" id="goOverview" style="color:#b9eef0">تغييره من نظرة عامة</button></div>
+  </header>
+  <div class="wrap">
+    <div class="prototype" role="note">نموذج خاص لتجربة التنقل والعودة بعد خمس دقائق. عرض بيانات التقرير غير متصل بعد؛ لا تظهر هنا بيانات مالية أو أخبار تجريبية.</div>
+    <div class="layout">
+      <nav id="navigation" aria-label="أقسام بحث الرمز"></nav>
+      <main>
+        <div class="heading">
+          <div><h1 id="pageTitle"></h1><p id="pagePurpose" class="section-purpose"></p></div>
+          <button class="secondary" id="openHelp" aria-haspopup="dialog">ⓘ شرح هذه الصفحة</button>
+        </div>
+        <section class="card symbol-state" aria-label="الرمز المستخدم لهذه الصفحة">
+          <div><div class="symbol-label">الرمز المختار في هذه الواجهة</div><div class="symbol" id="effectiveSymbol" dir="ltr"></div></div>
+          <div><div class="status" id="selectionStatus"></div><div id="countdown" class="countdown" dir="ltr" aria-label="الوقت المتبقي للمقارنة المؤقتة"></div></div>
+        </section>
+        <section class="card" id="masterSection">
+          <label for="masterInput">الرمز الأساسي لجميع أقسام البحث</label>
+          <form id="masterForm" novalidate>
+            <div class="input-wrap"><input id="masterInput" aria-describedby="masterHint formError" autocomplete="off" spellcheck="false" maxlength="48" placeholder="2222.SR"></div>
+            <button type="submit">تطبيق على كل الأقسام</button>
+          </form>
+          <p class="hint" id="masterHint">تثبيت الرمز هنا يلغي كل المقارنات المؤقتة. أدخل رمز المصدر مع لاحقة السوق، مثل <span dir="ltr">2222.SR</span> أو <span dir="ltr">ITRN.US</span>.</p>
+        </section>
+        <section class="card" id="overrideSection" hidden>
+          <label for="overrideInput">رمز آخر لهذه الصفحة فقط</label>
+          <form id="overrideForm" novalidate>
+            <div class="input-wrap"><input id="overrideInput" aria-describedby="overrideHint formError" autocomplete="off" spellcheck="false" maxlength="48" placeholder="ITRN.US"></div>
+            <button type="submit">استخدمه لخمس دقائق</button>
+            <button type="button" class="secondary" id="clearOverride">العودة للرمز الأساسي</button>
+          </form>
+          <p class="hint" id="overrideHint">يبقى الرمز الأساسي كما هو. يعود هذا القسم إليه تلقائيًا عند انتهاء خمس دقائق؛ الانتقال لصفحة أخرى لا يمدد المدة.</p>
+        </section>
+        <p id="formError" class="error" role="alert"></p>
+        <section class="card data-placeholder" id="dataPlaceholder">
+          <span class="section-tag" id="dataSectionTag"></span>
+          <h2>عرض البيانات غير متصل بعد</h2>
+          <p>اختيار الرمز والعدّ التنازلي يعملان داخل هذه الواجهة. لن نعرض تقريرًا قد يُظهر رمزًا مختلفًا عن اختيارك.</p>
+          <p class="hint">يمكنك فتح التقرير الحالي بشكل مستقل، وتغيير الرمز داخله عند الحاجة.</p>
+          <a class="current-report" id="currentReport" target="_blank" rel="noopener noreferrer">فتح التقرير الحالي ↗</a>
+        </section>
+        <section id="embedSection" hidden>
+          <p class="embed-note">الرمز المُرسل إلى التقرير: <b id="sentSymbol" dir="ltr"></b>. لا يعني تحميل التقرير أن البيانات حديثة؛ راجع أوقات المصدر وقيوده داخل التقرير.</p>
+          <div id="embedHost"></div>
+        </section>
+        <section class="card help-inline" aria-label="دليل سريع">
+          <div><strong>الغرض</strong><p id="helpPurpose"></p></div>
+          <div><strong>طريقة القراءة</strong><p id="helpRead"></p></div>
+          <div><strong>حدود البيانات</strong><p id="helpLimits"></p></div>
+        </section>
+        <footer>واجهة بحثية فقط. تغيير الرمز لا يغيّر قرار المحرك ولا ينفّذ صفقة. لا تمثل درجات النموذج أو نبرة الأخبار ضمانًا للعائد.</footer>
+      </main>
+    </div>
+  </div>
+  <div id="announcements" class="sr-only" role="status" aria-live="polite"></div>
+  <dialog id="helpDialog" aria-labelledby="helpTitle">
+    <header><h2 id="helpTitle"></h2><button class="secondary" id="closeHelp" aria-label="إغلاق الشرح">إغلاق ✕</button></header>
+    <div id="helpBody"></div>
+  </dialog>
+  <noscript>تحتاج هذه الواجهة إلى JavaScript لتطبيق اختيار الرمز والمدة المؤقتة. يمكنك استخدام التقرير الحالي مباشرة؛ لا يعمل العد التنازلي هنا دون JavaScript.</noscript>
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>
