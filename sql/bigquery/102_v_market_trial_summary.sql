@@ -8,8 +8,9 @@
 --   days                   US sessions with a reading
 --   open_n / open_mean_pct / open_up_pct / open_p5_pct    the open markets'
 --                          funds: how many outcomes, their mean change, the
---                          share that rose, and the worst 5 % (the 5th
---                          percentile: the loss the hold is meant to avoid)
+--                          share that rose, and the worst 5 % (the exact 5th
+--                          percentile, PERCENTILE_CONT: the loss the hold is
+--                          meant to avoid; the same on every read)
 --   hold_n / hold_mean_pct / hold_up_pct / hold_p5_pct    the same for the
 --                          markets on hold
 --   open_minus_hold_pp     open_mean_pct - hold_mean_pct: the hold earns its
@@ -26,7 +27,8 @@
 --                          outcome) of the rank correlation between the trend
 --                          score and the fund's change: above 0 = the order helps
 -- The windows of consecutive days overlap: the means are fair, the counts are
--- not independent trials.
+-- not independent trials. The three horizons come from one read of the trial
+-- (UNNEST), not three.
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_market_trial_summary`
@@ -38,17 +40,15 @@ WITH t AS (
   WHERE buyable
 ),
 h AS (
-  SELECT period, 5 AS horizon, decision_day, market_id, state, buyable_rank, trend_score, open_markets,
-         f5_pct AS f, spy_f5_pct AS spy
-  FROM t
-  UNION ALL
-  SELECT period, 10, decision_day, market_id, state, buyable_rank, trend_score, open_markets,
-         f10_pct, spy_f10_pct
-  FROM t
-  UNION ALL
-  SELECT period, 20, decision_day, market_id, state, buyable_rank, trend_score, open_markets,
-         f20_pct, spy_f20_pct
-  FROM t
+  SELECT t.period, z.horizon, t.decision_day, t.market_id, t.state, t.buyable_rank, t.trend_score, t.open_markets,
+         z.f, z.spy
+  FROM t, UNNEST([STRUCT(5 AS horizon, t.f5_pct AS f, t.spy_f5_pct AS spy),
+                  STRUCT(10, t.f10_pct, t.spy_f10_pct),
+                  STRUCT(20, t.f20_pct, t.spy_f20_pct)]) AS z
+),
+q AS (
+  SELECT h.*, PERCENTILE_CONT(h.f, 0.05) OVER (PARTITION BY h.period, h.horizon, h.state) AS p5
+  FROM h
 ),
 base AS (
   SELECT
@@ -59,13 +59,13 @@ base AS (
     ROUND(AVG(IF(state = 'open', f, NULL)), 2) AS open_mean_pct,
     ROUND(SAFE_DIVIDE(COUNTIF(state = 'open' AND f > 0), COUNTIF(state = 'open' AND f IS NOT NULL)) * 100, 1)
       AS open_up_pct,
-    ROUND(APPROX_QUANTILES(IF(state = 'open', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS open_p5_pct,
+    ROUND(MAX(IF(state = 'open', p5, NULL)), 2) AS open_p5_pct,
     COUNTIF(state = 'hold' AND f IS NOT NULL) AS hold_n,
     ROUND(AVG(IF(state = 'hold', f, NULL)), 2) AS hold_mean_pct,
     ROUND(SAFE_DIVIDE(COUNTIF(state = 'hold' AND f > 0), COUNTIF(state = 'hold' AND f IS NOT NULL)) * 100, 1)
       AS hold_up_pct,
-    ROUND(APPROX_QUANTILES(IF(state = 'hold', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS hold_p5_pct
-  FROM h
+    ROUND(MAX(IF(state = 'hold', p5, NULL)), 2) AS hold_p5_pct
+  FROM q
   GROUP BY period, horizon
 ),
 top AS (

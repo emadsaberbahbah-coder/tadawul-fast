@@ -96,6 +96,8 @@ This sheet is items 1 and 2, and the scoring of item 6. The ready list and the s
 - SPY after the days with every market on hold;
 - the rank correlation of the trend score with the outcome.
 
+The worst 5% is the exact 5th percentile (`PERCENTILE_CONT`), so it reads the same on every run. An approximate quantile moved the held figure by 0.07 pp between two reads of the same rows. The three spans come from one read of the trial (`UNNEST`), not three: the scorecard reads in under a minute (18.6 MB, about 2,200 slot-seconds).
+
 **No fitted limits.** No limit was fitted to the archive. The US limits are `v_market_regime`'s. Every other limit is the US limit scaled by k. The lookbacks (20 and 60 closes) were set before the first read.
 
 ## Evidence (read 21 Nov 2026)
@@ -134,7 +136,7 @@ This sheet is items 1 and 2, and the scoring of item 6. The ready list and the s
 | Open markets: outcomes / mean | 3,400 / +0.11% | 3,390 / +0.28% | 3,374 / +0.70% |
 | Held markets: outcomes / mean | 2,736 / +0.25% | 2,696 / +0.49% | 2,612 / +0.88% |
 | Open minus held | -0.14 pp | -0.21 pp | -0.18 pp |
-| Worst 5%: open / held | -3.10% / -3.67% | -3.89% / -4.55% | -5.65% / -6.08% |
+| Worst 5%: open / held | -3.09% / -3.60% | -3.89% / -4.55% | -5.65% / -6.07% |
 | First open market other than the US against SPY | -0.37 pp (beat 46%) | -0.83 pp (40.9%) | -1.21 pp (36.6%) |
 | Days with every market on hold / SPY after them | 26 / +0.92% | 26 / +1.71% | 24 / +3.73% |
 | Rank correlation, trend score against the outcome | -0.004 | +0.011 | +0.041 |

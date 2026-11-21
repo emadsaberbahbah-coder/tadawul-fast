@@ -285,7 +285,7 @@ PENDING = {
     "v_market_condition": "73a161bea603ebe303c160438f3e74039da889df2ded39b0e76e3db623c74995",
     "v_market_rank": "e393fbb23ccc0f5a8308e6c3f73bcbc3c14f4d3c9d1101652e9837cc4cc90ec1",
     "v_market_trial": "183d8109018a0d71007379bcb229ef319ee9543eb03bab2821707731474d6464",
-    "v_market_trial_summary": "5395fa8b4f9410b33aa062dc796320c959994c8cdf13b212d4a9508411c9c5ac",
+    "v_market_trial_summary": "94a456bfff6f321693ddbe6369a5635285b20f170caf6dc5fd86f0115fb8293a",
     # apply_bq_views 1.17.0 (21 Nov 2026): the company news scoreboard against the same-day US names, not only SPY
     # (replaces the 1.16.0 body 130256c0270d)
     "v_company_news_eval": "07807483369ded1bb735dc33bfe14d31ffe3a044ce3605037c7e1ffdcb313ae7",
@@ -3055,9 +3055,11 @@ def case_v44():
     sc = bv._code(s.template)
     assert set(bv._REF.findall(sc)) - {"v_market_trial_summary"} == {"v_market_trial"}
     for frag in ("FROM `{{DS}}.v_market_trial`\n  WHERE buyable",
-                 "f5_pct AS f, spy_f5_pct AS spy", "f10_pct, spy_f10_pct", "f20_pct, spy_f20_pct",
-                 "ROUND(APPROX_QUANTILES(IF(state = 'open', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS open_p5_pct",
-                 "ROUND(APPROX_QUANTILES(IF(state = 'hold', f, NULL), 20)[SAFE_OFFSET(1)], 2) AS hold_p5_pct",
+                 "FROM t, UNNEST([STRUCT(5 AS horizon, t.f5_pct AS f, t.spy_f5_pct AS spy),",   # one read, 3 spans
+                 "STRUCT(10, t.f10_pct, t.spy_f10_pct),", "STRUCT(20, t.f20_pct, t.spy_f20_pct)]) AS z",
+                 "PERCENTILE_CONT(h.f, 0.05) OVER (PARTITION BY h.period, h.horizon, h.state) AS p5",  # exact
+                 "ROUND(MAX(IF(state = 'open', p5, NULL)), 2) AS open_p5_pct",
+                 "ROUND(MAX(IF(state = 'hold', p5, NULL)), 2) AS hold_p5_pct",
                  "WHERE state = 'open' AND buyable_rank = 1",
                  "COUNTIF(market_id = 'us' AND f IS NOT NULL) AS top_us_n",
                  "ROUND(AVG(IF(market_id != 'us', f - spy, NULL)), 2) AS top_vs_spy_pp",
@@ -3065,6 +3067,7 @@ def case_v44():
                  "CORR(rs, rf) AS ic", "HAVING COUNT(*) >= 5",
                  "ROUND(b.open_mean_pct - b.hold_mean_pct, 2) AS open_minus_hold_pp"):
         assert frag in sc, frag
+    assert "UNION ALL" not in sc and "APPROX_QUANTILES" not in sc               # one read; the same on every read
     for tpl in (t.template, s.template):
         assert "overlap" in tpl and "the live system never reads BigQuery" in tpl and "Observe only" in tpl
 
