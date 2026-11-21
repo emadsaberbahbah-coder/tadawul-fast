@@ -280,9 +280,11 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.17.0 (21 Nov 2026): the company news scoreboard against the same-day US names, not only SPY
+    # (replaces the 1.16.0 body 130256c0270d)
+    "v_company_news_eval": "07807483369ded1bb735dc33bfe14d31ffe3a044ce3605037c7e1ffdcb313ae7",
     # apply_bq_views 1.16.0 (20 Nov 2026): the company news re-read from the headline text, and its scoreboard
     "v_symbol_news_class": "d8386af8a947caa69ff169401a1cce69a0ca258da4bee74039b99f80900cf9f0",
-    "v_company_news_eval": "130256c0270d10d9d99a85e8881e6560d3d15aae67c3780374ef65ef52171483",
     # apply_bq_views 1.15.0 (19 Nov 2026): C-2 per call, for the observe-only labels on the pages
     "v_c2_calls": "95ac9bcde2a5be87bfa95a2bb1ee42eaf1a26dec0abfa498339ecb3a137acd0f",
     # apply_bq_views 1.14.0 (19 Nov 2026): the news learning loop (themes, weights, tilt, shadow list, trial)
@@ -2827,7 +2829,8 @@ def case_v39():
 
 
 def case_v40():
-    """v_company_news_eval (1.16.0): no look-ahead, against the S&P 500, the two signals scored alike."""
+    """v_company_news_eval (1.16.0): no look-ahead, against the S&P 500, the two signals scored alike (the reading
+    moved to the same-day peers in 1.17.0: case_v41)."""
     import re
     objs = {o.name: o for o in bv.load_objects()}
     names = [o.name for o in bv.load_objects()]
@@ -2846,7 +2849,7 @@ def case_v40():
                  "SELECT 'company_news' AS signal, symbol, d, x FROM nd",
                  "SELECT 'provider_sentiment', symbol, d, x FROM od",
                  "WHEN top_share > 0.9 THEN 'BIASED (class > 90 %)'", "WHEN min_matured < 60 THEN 'THIN'",
-                 "WHEN corr_5d IS NULL OR corr_5d <= 0.05 THEN 'NO EDGE'", "ELSE 'CANDIDATE (forward test)'"):
+                 "ELSE 'CANDIDATE (forward test)'"):
         assert frag in code, frag
     assert "b.date >= y.d" not in code and "CURRENT_DATE" not in code
     assert re.search(r"no look-ahead", v.template) and "the live system never reads BigQuery" in v.template
@@ -2855,11 +2858,47 @@ def case_v40():
     assert "v_symbol_news_class" not in old and "v_company_news_eval" not in old
 
 
+def case_v41():
+    """v_company_news_eval (1.17.0): each name-day also against the same-day average of the US names, over the same
+    sessions from the same close, and the reading taken from it; the SPY columns kept, first and in their order."""
+    objs = {o.name: o for o in bv.load_objects()}
+    v = objs["v_company_news_eval"]
+    code = bv._code(v.template)
+    # the peers: every US name's own next 1 and 5 sessions from each close, averaged per day
+    peer = code.split("peer AS (", 1)[1].split("),", 1)[0]
+    for frag in ("AVG((c1 / close - 1) * 100) AS p1", "AVG((c5 / close - 1) * 100) AS p5", "COUNT(*) AS n_peers",
+                 "FROM bars", "WHERE ENDS_WITH(symbol, '.US') AND close > 0", "GROUP BY date"):
+        assert frag in peer, frag
+    # set against the name on its entry close - never the news day's own close (no look-ahead)
+    for frag in ("JOIN peer AS p ON p.date = n.e.date", "n.e.r1 - p.p1 AS px1", "n.e.r5 - p.p5 AS px5",
+                 "LEFT JOIN spy AS s ON s.date = n.e.date",              # a day with no SPY bar keeps its peers
+                 "COUNTIF(o.px5 IS NOT NULL) AS matured_5d_peer",
+                 "MIN(r.matured_5d_peer) OVER (PARTITION BY r.signal) AS min_matured",
+                 "CORR(x, ex5) AS c, CORR(x, px5) AS cp",
+                 "ROUND(AVG(o.px1), 2) AS mean_1d_peer_pp, ROUND(AVG(o.px5), 2) AS mean_5d_peer_pp",
+                 "COUNTIF(o.px5 > 0), COUNTIF(o.px5 IS NOT NULL)) * 100, 1) AS beat_5d_peer_pct",
+                 "ROUND(c.cp, 3) AS corr_5d_peer",
+                 "MAX(IF(r.class = 'positive', r.mean_5d_peer_pp, NULL)) OVER (PARTITION BY r.signal) AS hi_mean",
+                 "MAX(IF(r.class = 'negative', r.mean_5d_peer_pp, NULL)) OVER (PARTITION BY r.signal) AS lo_mean",
+                 "WHEN corr_5d_peer IS NULL OR corr_5d_peer <= 0.05 THEN 'NO EDGE'"):
+        assert frag in code, frag
+    assert "p.date = n.d" not in code and "p.date = y.d" not in code and "WHEN corr_5d IS NULL" not in code
+    # the old columns first and in their order, the new ones after them
+    final = code.rsplit("\nSELECT ", 1)[1]
+    assert final.startswith("signal, class, days, matured_1d, matured_5d, mean_1d_excess_pp, mean_5d_excess_pp, "
+                            "beat_5d_pct, corr_5d,\n       share_pct, first_day, last_day,"), final[:200]
+    assert final.rstrip().rstrip(";").endswith("END AS reading,\n       mean_1d_peer_pp, mean_5d_peer_pp, "
+                                               "matured_5d_peer, beat_5d_peer_pct, corr_5d_peer, peers\nFROM shaped"), \
+        final[-200:]
+    assert "the reading comes from the peer columns" in v.template and "WHY THE PEERS" in v.template
+    assert "same-day average of the US names (the reading)" in v.template      # the description says it too
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
-         case_v39, case_v40]
+         case_v39, case_v40, case_v41]
 
 
 def test_v1(): case_v1()
@@ -2902,6 +2941,7 @@ def test_v37(): case_v37()
 def test_v38(): case_v38()
 def test_v39(): case_v39()
 def test_v40(): case_v40()
+def test_v41(): case_v41()
 
 
 if __name__ == "__main__":

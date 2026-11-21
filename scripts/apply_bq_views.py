@@ -2,8 +2,27 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.16.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.17.0 (program register C8, Phase 2)
 ================================================================================
+v1.17.0 (21 Nov 2026, the company news against its peers). WHY (owner, 21 Nov
+2026 02:20 Riyadh, in Arabic: "let us also review the news analysis and review
+the updates for 6 hours"). The review found every class of v_company_news_eval
+beating the S&P 500 - neutral as much as positive - because the US names of the
+archive beat the index in a falling market, not because of their news: the
+comparison with SPY was measuring the names, not the news. v_company_news_eval
+now also sets each name-day against the same-day average of every US name in
+symbol_bars_daily over the same 1 and 5 sessions from the same close (about 490
+names; new columns mean_1d_peer_pp, mean_5d_peer_pp, matured_5d_peer,
+beat_5d_peer_pct, corr_5d_peer and peers, added after the old ones), and the
+reading is taken from the peer columns (THIN from the peer matured count); a day
+with no SPY bar now keeps its peer figures instead of being dropped (none was,
+since 15 Sep). First peer read (news days 2 Oct - 18 Nov): positive +0.69 pp
+on 52 matured days, neutral +0.67 pp on 186, negative +2.55 pp on 5, correlation
+0.019 - still NO EDGE, and the index had added about half a point to every
+class. The SPY columns stay for continuity. scripts/news_board.py 1.3.0 shows
+the peer figures, with SPY beside them. Nothing in a score, a pick or an order
+changes. Research view: the live system never reads BigQuery.
+
 v1.16.0 (20 Nov 2026, the company news re-read). WHY (owner, 20 Nov 2026 12:54
 Riyadh, in Arabic: "let us do the expected improvement to the news
 classification, improve it and re-classify it"). The news scoreboard showed the
@@ -343,7 +362,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.16.0"
+__version__ = "1.17.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
