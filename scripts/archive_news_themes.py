@@ -27,10 +27,14 @@ Board 1.0.0):
                        and Eisenkot asked to form a government, 7 Nov 2026;
                        Lagarde leaves the ECB on 7 Feb 2027).
   The three read only Locations, Persons, V2Tone and the events' place and
-  root code - about 0.11 GB a day; the three-year fill about 125 GB. The
-  existing sources are unchanged, row for row. Views v_market_news,
-  v_people_news, v_news_trial and v_news_trial_summary (apply_bq_views
-  1.20.0) read them; nothing live does.
+  root code - about 0.11 GB a day; the three-year fill about 125 GB. They
+  merge into their own table, <dataset>.news_entity_daily (same columns),
+  NOT into news_theme_daily: the news loop of 19 Nov 2026 (v_news_theme_weekly
+  and the trial fixed that day) reads every feature of news_theme_daily, so
+  a new feature there would change its rule. The existing sources and their
+  table are unchanged, row for row. Views v_market_news, v_people_news,
+  v_news_trial and v_news_trial_summary (apply_bq_views 1.20.0) read the new
+  table; nothing live does.
 v1.0.0 (19 Nov 2026)
 WHY (owner, 19 Nov 2026: world news - wars, politics, the economy, the fear of
 AI, elections, summits - is part of valuing any stock, so classify it, weight
@@ -110,9 +114,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 __version__ = "1.1.0"
 
 TABLE = "news_theme_daily"
+ENTITY_TABLE = "news_entity_daily"                      # v1.1.0: the places and the people, apart from the loop's themes
 GDELT_EVENTS = "gdelt-bq.gdeltv2.events_partitioned"
 GDELT_GKG = "gdelt-bq.gdeltv2.gkg_partitioned"
 SOURCES = ("gdelt_events", "gdelt_gkg", "gdelt_events_places", "gdelt_gkg_places", "gdelt_gkg_people")
+TABLE_OF = {"gdelt_events": TABLE, "gdelt_gkg": TABLE, "gdelt_events_places": ENTITY_TABLE,
+            "gdelt_gkg_places": ENTITY_TABLE, "gdelt_gkg_people": ENTITY_TABLE}
 KINDS = ("share", "mean")
 DEFAULT_DAYS = 3
 MIN_DAYS, MAX_DAYS = 1, 30
@@ -312,14 +319,18 @@ def source_select(source: str, start: _dt.date, end: _dt.date) -> str:
 
 def merge_sql(project: str, dataset: str, source: str, start: _dt.date, end: _dt.date, run_id: str) -> str:
     """One atomic statement: the window's rows of one source replace the rows
-    of the same day and theme, and new days are added."""
+    of the same day and theme in the source's own table (TABLE_OF), and new
+    days are added."""
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project or ""):
         raise ValueError(f"bad project id {project!r}")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,1023}", dataset or ""):
         raise ValueError(f"bad dataset id {dataset!r}")
     rid = re.sub(r"[^0-9A-Za-z_-]", "", run_id or "")[:64]
+    table = TABLE_OF.get(source)
+    if table is None:
+        raise ValueError(f"unknown source {source!r}")
     return (
-        f"MERGE `{project}.{dataset}.{TABLE}` AS t\nUSING (\n{source_select(source, start, end)}\n) AS s\n"
+        f"MERGE `{project}.{dataset}.{table}` AS t\nUSING (\n{source_select(source, start, end)}\n) AS s\n"
         f"ON t.date = s.date AND t.feature = s.feature\n"
         f"WHEN MATCHED THEN UPDATE SET source = s.source, kind = s.kind, num = s.num, den = s.den,\n"
         f"  loaded_at = CURRENT_TIMESTAMP(), run_id = '{rid}'\n"
@@ -396,28 +407,38 @@ def schema_problems(table: Dict[str, Any]) -> List[str]:
     return ["columns differ: " + ("; ".join(diff[:5]) or f"{len(got)} columns, want {len(want)}")]
 
 
-def ensure_table(session: Any, project: str, dataset: str) -> bool:
+TABLE_TEXT = {
+    TABLE: ("TFB daily world-news themes counted in the public GDELT tables (events and documents): one row per "
+            "UTC day and theme with a numerator and a denominator, merged by scripts/archive_news_themes.py."),
+    ENTITY_TABLE: ("TFB daily world news by place and by person, counted in the public GDELT tables (the fighting "
+                   "located in a place, the share and tone of the documents naming a place or a person): one row "
+                   "per UTC day and feature with a numerator and a denominator, merged by "
+                   "scripts/archive_news_themes.py 1.1.0."),
+}
+
+
+def ensure_table(session: Any, project: str, dataset: str, table: str = TABLE) -> bool:
     """True when the table was created now, False when it existed with the
     right schema; RuntimeError when it exists with another layout."""
+    if table not in TABLE_TEXT:
+        raise ValueError(f"unknown table {table!r}")
     base = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables"
-    resp = session.get(f"{base}/{TABLE}", timeout=60)
+    resp = session.get(f"{base}/{table}", timeout=60)
     if resp.status_code == 200:
         problems = schema_problems(resp.json() or {})
         if problems:
-            raise RuntimeError(f"table {TABLE} differs from SCHEMA: {' | '.join(problems)}")
+            raise RuntimeError(f"table {table} differs from SCHEMA: {' | '.join(problems)}")
         return False
     if resp.status_code != 404:
-        raise RuntimeError(f"table {TABLE}: {_err(resp)}")
+        raise RuntimeError(f"table {table}: {_err(resp)}")
     body = {
-        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": TABLE},
+        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": table},
         "schema": {"fields": SCHEMA},
-        "description": ("TFB daily world-news themes counted in the public GDELT tables (events and "
-                        "documents): one row per UTC day and theme with a numerator and a denominator, "
-                        "merged by scripts/archive_news_themes.py."),
+        "description": TABLE_TEXT[table],
     }
     resp = session.post(base, json=body, timeout=60)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"create {TABLE}: {_err(resp)}")
+        raise RuntimeError(f"create {table}: {_err(resp)}")
     return True
 
 
@@ -493,8 +514,11 @@ def run(session: Any, *, project: str, dataset: str, location: str, sources: Seq
         print(f"[news_themes v{__version__}] {len(sized)} source(s), {start}..{end}, would read "
               f"{total_gb:.2f} GB (dry run, nothing loaded)")
         return 0
+    created: List[str] = []
     try:
-        created = ensure_table(session, project, dataset)
+        for table in [t for t in (TABLE, ENTITY_TABLE) if t in {TABLE_OF[s] for s, _ in sized}]:
+            if ensure_table(session, project, dataset, table):
+                created.append(table)
     except Exception as exc:  # noqa: BLE001
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
@@ -512,7 +536,7 @@ def run(session: Any, *, project: str, dataset: str, location: str, sources: Seq
             failed.append(source)
             _out(f"ERROR {str(exc)[:400]}")
     print(f"[news_themes v{__version__}] {len(sized) - len(failed)}/{len(sized)} source(s), {rows} row(s), "
-          f"{start}..{end}" + (" | table created" if created else "")
+          f"{start}..{end}" + (f" | table created: {', '.join(created)}" if created else "")
           + (f"; FAILED: {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0
 

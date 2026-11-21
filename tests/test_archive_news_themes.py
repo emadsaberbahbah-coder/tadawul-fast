@@ -34,6 +34,9 @@ N11 nothing here writes to the workbook; the only DML is the MERGE into the
 N12 v1.1.0: the places are FIPS country codes read from the country field of
     a location (events: ActionGeo_CountryCode); each person's pattern counts
     the forms GDELT writes (read from GDELT, 17-19 Nov 2026) and no namesake
+N13 v1.1.0: the three new sources merge into their own table,
+    news_entity_daily, never into news_theme_daily - the news loop of 19 Nov
+    2026 reads every feature of that table
 """
 from __future__ import annotations
 
@@ -86,8 +89,9 @@ class FakeBQ:
     """Offline BigQuery: datasets.get, tables.get / insert, dry-run queries
     (bytes per source) and query jobs (DONE after `polls` GETs)."""
 
-    def __init__(self, table=None, dataset=True, bytes_by_source=None, job_error=None, start_error=None, polls=2):
-        self.table = table
+    def __init__(self, table=None, dataset=True, bytes_by_source=None, job_error=None, start_error=None, polls=2,
+                 entity_table=None):
+        self.tables = {nt.TABLE: table, nt.ENTITY_TABLE: entity_table if entity_table is not None else table}
         self.dataset = dataset
         self.bytes_by_source = dict(DEFAULT_BYTES, **(bytes_by_source or {}))
         self.job_error = job_error or {}
@@ -112,15 +116,16 @@ class FakeBQ:
                 "numDmlAffectedRows": str(job["rows"]), "totalBytesBilled": str(job["bytes"])}}})
         if url.endswith(f"/datasets/{DATASET}"):
             return Resp(200 if self.dataset else 404, {})
-        if url.endswith(f"/tables/{nt.TABLE}"):
-            return Resp(200, self.table) if self.table is not None else Resp(404, {})
+        for name, table in self.tables.items():
+            if url.endswith(f"/tables/{name}"):
+                return Resp(200, table) if table is not None else Resp(404, {})
         raise AssertionError("unexpected GET " + url)
 
     def post(self, url, json=None, timeout=None, **_):
         self.calls.append(("POST", url))
         if url.endswith(f"/datasets/{DATASET}/tables"):
             self.created.append(json)
-            self.table = {"schema": json["schema"]}
+            self.tables[json["tableReference"]["tableId"]] = {"schema": json["schema"]}
             return Resp(200, json)
         if url.endswith(f"/projects/{PROJECT}/queries"):
             assert json["dryRun"] is True and json["useLegacySql"] is False
@@ -295,10 +300,11 @@ def test_n6_write(monkeypatch, capsys):
     rc, slept = _run(monkeypatch, ["--write", "--max-gb", "5"], bq)
     out = capsys.readouterr()
     assert rc == 0, out.err
-    assert len(bq.created) == 1
-    body = bq.created[0]
-    assert body["tableReference"] == {"projectId": PROJECT, "datasetId": DATASET, "tableId": "news_theme_daily"}
-    assert body["schema"]["fields"] == nt.SCHEMA and "rangePartitioning" not in body and "timePartitioning" not in body
+    assert [b["tableReference"]["tableId"] for b in bq.created] == ["news_theme_daily", "news_entity_daily"]
+    for body in bq.created:
+        assert body["tableReference"]["projectId"] == PROJECT and body["tableReference"]["datasetId"] == DATASET
+        assert body["schema"]["fields"] == nt.SCHEMA and "rangePartitioning" not in body and "timePartitioning" not in body
+    assert "by place and by person" in bq.created[1]["description"] and "themes" in bq.created[0]["description"]
     jobs = list(bq.jobs.values())
     assert [j["source"] for j in jobs] == list(nt.SOURCES)
     for j in jobs:
@@ -309,12 +315,18 @@ def test_n6_write(monkeypatch, capsys):
         assert q["query"] == nt.merge_sql(PROJECT, DATASET, j["source"], dt.date(2026, 11, 16), dt.date(2026, 11, 18), "777")
         assert j["polls"] == 2
     assert slept == [3.0] * 10
-    assert "5/5 source(s), 198 row(s), 2026-11-16..2026-11-18 | table created" in out.out     # 3 days x 66 features
+    assert ("5/5 source(s), 198 row(s), 2026-11-16..2026-11-18 | table created: news_theme_daily, news_entity_daily"
+            in out.out)                                                                       # 3 days x 66 features
     # the table already there with the right columns: no create, same load
     bq2 = FakeBQ(table={"schema": {"fields": [dict(f, type={"FLOAT": "FLOAT64"}.get(f["type"], f["type"]))
                                               for f in nt.SCHEMA]}})
     rc2, _ = _run(monkeypatch, ["--write"], bq2)
     assert rc2 == 0 and not bq2.created and len(bq2.jobs) == 5
+    # only the tables of the sources loaded are read or created
+    bq5 = FakeBQ()
+    assert _run(monkeypatch, ["--write", "--sources", "gdelt_gkg"], bq5)[0] == 0
+    assert [b["tableReference"]["tableId"] for b in bq5.created] == ["news_theme_daily"]
+    assert all(not u.endswith("/tables/news_entity_daily") for _, u in bq5.calls)
     # a history fill carries its own cap and window
     bq3 = FakeBQ(bytes_by_source={"gdelt_events": 6 * (1 << 30), "gdelt_gkg": 230 * (1 << 30)})
     rc3, _ = _run(monkeypatch, ["--write", "--start", "2023-10-02", "--max-gb", "300", "--sources",
@@ -442,9 +454,9 @@ def test_n11_no_workbook_write_and_one_dml():
     code = src.split('"""', 2)[2]
     for word in ("DELETE FROM", "DROP TABLE", "TRUNCATE TABLE", "CREATE TABLE", "CREATE OR REPLACE", "WRITE_TRUNCATE"):
         assert word not in code, word
-    assert code.count("MERGE `") == 1 and 'f"MERGE `{project}.{dataset}.{TABLE}` AS t' in code
+    assert code.count("MERGE `") == 1 and 'f"MERGE `{project}.{dataset}.{table}` AS t' in code
     assert set(re.findall(r"gdelt-bq\.[a-z0-9_]+\.[a-z_]+", code)) == {nt.GDELT_EVENTS, nt.GDELT_GKG}
-    assert nt.TABLE == "news_theme_daily" and nt.__version__ == "1.1.0"
+    assert nt.TABLE == "news_theme_daily" and nt.ENTITY_TABLE == "news_entity_daily" and nt.__version__ == "1.1.0"
 
 
 # --------------------------------------------------------------------------- N12
@@ -501,3 +513,33 @@ def test_n12_places_and_people():
         for name in names:
             assert not people[pid].search(name), (pid, name)
     assert "macron" not in dict(nt.PEOPLE)                         # GDELT's Persons list almost never holds him
+
+
+# --------------------------------------------------------------------------- N13
+def test_n13_new_sources_have_their_own_table(monkeypatch, capsys):
+    assert nt.TABLE_OF == {"gdelt_events": "news_theme_daily", "gdelt_gkg": "news_theme_daily",
+                           "gdelt_events_places": "news_entity_daily", "gdelt_gkg_places": "news_entity_daily",
+                           "gdelt_gkg_people": "news_entity_daily"}
+    assert set(nt.TABLE_OF) == set(nt.SOURCES)
+    a, b = dt.date(2026, 11, 16), dt.date(2026, 11, 18)
+    for source in nt.SOURCES:
+        sql = nt.merge_sql(PROJECT, DATASET, source, a, b, "1")
+        assert sql.startswith("MERGE `%s.%s.%s` AS t\n" % (PROJECT, DATASET, nt.TABLE_OF[source])), source
+    # the 14 themes of 19 Nov 2026 are all the loop's table holds: every v1.0.0 feature, nothing else
+    loop = {f[0] for f in nt.FEATURES if nt.TABLE_OF[f[1]] == nt.TABLE}
+    assert loop == set(PINNED)
+    with pytest.raises(ValueError):
+        nt.merge_sql(PROJECT, DATASET, "reuters", a, b, "1")
+    with pytest.raises(ValueError):
+        nt.ensure_table(FakeBQ(), PROJECT, DATASET, "news_other")
+    # a table with another layout stops the run before any job, whichever table it is
+    other = FakeBQ(table={"schema": {"fields": nt.SCHEMA}}, entity_table={"schema": {"fields": nt.SCHEMA[:-1]}})
+    assert _run(monkeypatch, ["--write"], other)[0] == 2 and not other.jobs
+    assert "table news_entity_daily differs from SCHEMA" in capsys.readouterr().err
+    # the loop's sources alone never touch the new table, and the new ones never touch the loop's
+    old = FakeBQ(table={"schema": {"fields": nt.SCHEMA}}, entity_table={"schema": {"fields": nt.SCHEMA[:-1]}})
+    assert _run(monkeypatch, ["--write", "--sources", "gdelt_events,gdelt_gkg"], old)[0] == 0
+    assert {j["source"] for j in old.jobs.values()} == {"gdelt_events", "gdelt_gkg"}
+    new = FakeBQ(table={"schema": {"fields": nt.SCHEMA[:-1]}}, entity_table={"schema": {"fields": nt.SCHEMA}})
+    assert _run(monkeypatch, ["--write", "--sources", "gdelt_gkg_people"], new)[0] == 0
+    assert all(nt.TABLE_OF[j["source"]] == nt.ENTITY_TABLE for j in new.jobs.values()) and len(new.jobs) == 1
