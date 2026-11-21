@@ -2,12 +2,31 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.4)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.3.5)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.3.5 (2026-11-21) — A PASSING SHEETS FAULT IS WAITED OUT, NOT A FAILED AUDIT
+--------------------------------------------------------------------------------
+WHY (owner, 21 Nov 2026 02:20 Riyadh, in Arabic: review the updates for 6 hours
+and the updates they need): sync run 44801530434 (20 Nov, 22:22 Riyadh) wrote
+all 6,602 Global_Markets rows, then this validator's literal read got Google's
+"HttpError 500 ... Internal error encountered" once. The read fell back to the
+logical engine rows, scope.coverage read "UNKNOWN literal-sheet extent" (FAIL,
+exit 2), and the leg and the final-publication check went red. The same passing
+fault ended three other runs that hour; sheets_quota 1.1.0 (PR 1040) taught
+those scripts to wait it out, and this read was the one left.
+WHAT: both literal reads - every page, and the decision surface - go through
+_read_literal. A Sheets quota answer (429: 65 s, 65 s) or a passing server
+fault (500/502/503/504: 15 s, then 30 s), as scripts/sheets_quota.py reads
+them, is waited out and the read tried again, at most READ_RETRIES (2) times.
+Any other error, or the last try, goes on exactly as in v1.3.4: the fallback
+reader for a page, decision.read FAIL for the surface. Without
+scripts/sheets_quota.py nothing is retried. Checks, statuses, thresholds and
+exit codes are unchanged; a fault that lasts still fails.
+
 v1.3.4 (2026-10-28) — FULL FEED BANNER IN THE EVIDENCE
 --------------------------------------------------------------------------------
 WHY (audit 2026-10-28): decision.feed_banner_present kept only the first 120
@@ -312,7 +331,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.3.4"
+SCRIPT_VERSION = "1.3.5"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -618,6 +637,39 @@ class _PageData:
     sampled: bool = False   # v1.3.0: more rows existed beyond max_rows
 
 
+# v1.3.5 [TRANSIENT-READ]: a passing Sheets fault is waited out, not scored as a failed audit
+READ_RETRIES = 2
+_SLEEP: Optional[Callable] = None         # the wait between tries; None = asyncio.sleep (a test replaces it)
+
+
+def _transient_wait(exc: BaseException, attempt: int) -> Optional[float]:
+    """v1.3.5: seconds to wait before another literal read after a Sheets quota answer (429) or a passing
+    server fault (500/502/503/504), else None. Without scripts/sheets_quota.py nothing is retried (v1.3.4)."""
+    try:
+        from scripts.sheets_quota import wait_for_transient  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - the helper missing is the v1.3.4 behaviour, never a new failure
+        return None
+    return wait_for_transient(exc, attempt)
+
+
+async def _read_literal(read_range: Callable, sid: str, rng: str, page: str) -> Any:
+    """v1.3.5: one literal read; a transient Sheets fault is waited out at most READ_RETRIES times, then raised."""
+    loop = asyncio.get_running_loop()
+    n = 0
+    while True:
+        try:
+            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
+            return await _maybe_await(grid)
+        except Exception as e:
+            wait = _transient_wait(e, n + 1)
+            if wait is None or n >= READ_RETRIES:
+                raise
+            n += 1
+            logger.warning("v1.3.5 Sheets transient fault reading %s (%s); waiting %.0f s, then read %d of %d",
+                           page, str(e)[:160], wait, n, READ_RETRIES)
+            await (_SLEEP or asyncio.sleep)(wait)
+
+
 async def _read_page(
     page: str,
     sid: str,
@@ -634,9 +686,7 @@ async def _read_page(
         rng = f"{page}!A1:{_READ_END_COL}{max(2, max_rows + 25)}"
         grid: Any = None
         try:
-            loop = asyncio.get_running_loop()
-            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
-            grid = await _maybe_await(grid)
+            grid = await _read_literal(read_range, sid, rng, page)        # v1.3.5: transient faults waited out
         except Exception as e:
             logger.warning("read_range failed for %s: %s", page, e)
             grid = None
@@ -1202,9 +1252,7 @@ async def _run_decision_surface(page: str, sid: str,
     stuck_note = ""
     while True:
         try:
-            loop = asyncio.get_running_loop()
-            grid = await loop.run_in_executor(None, lambda: read_range(sid, rng))
-            grid = await _maybe_await(grid)
+            grid = await _read_literal(read_range, sid, rng, page)        # v1.3.5: transient faults waited out
         except Exception as e:
             return [CheckResult(page, "decision.read", "FAIL", detail=str(e))]
         if not isinstance(grid, list) or not grid:

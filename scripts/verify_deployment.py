@@ -256,7 +256,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("audit_full_refresh_coverage", "1.3.3", "read-only full row coverage audit"),
     # 2026-10-28 (audit; pin only, SCRIPT_VERSION unchanged): 1.3.3 -> 1.3.4
     # (the FEED banner detail keeps up to 1,000 characters).
-    ("validate_dashboard", "1.3.4", "scoped literal contract and native cockpit validation"),
+    ("validate_dashboard", "1.3.5", "scoped literal contract and native cockpit validation"),   # 2026-11-21: v1.3.5 transient Sheets reads waited out
     ("name_identity_evidence", "1.0.0", "read-only current listing evidence"),
     ("audit_decision_surface_freshness", "1.3.2", "read-only decision surface audit"),
     ("tfb_workbook_dq_audit", "1.0.4", "nightly offline workbook DQ audit"),
