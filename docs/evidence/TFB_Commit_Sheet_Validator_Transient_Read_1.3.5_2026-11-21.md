@@ -27,7 +27,7 @@ What the new tests cover:
 - The waits are the shared helper's, and nothing is retried without it.
 
 ## Pre-merge checks
-- **Tests.** test_validator_transient_read 15/15. The validator, scope, publication, embargo, CI-verdict and manifest suites together: 366 passed, 39 subtests passed.
+- **Tests.** test_validator_transient_read 14/14. The validator, scope, publication, embargo, CI-verdict and manifest suites together: 366 passed, 39 subtests passed.
 - **Mutants: 8 / 8 killed.**
   1. no retry;
   2. more retries;
