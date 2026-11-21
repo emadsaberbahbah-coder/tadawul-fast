@@ -25,7 +25,11 @@
 --   5. the figure   brier_figure = the squared error of the family's chances
 --                   of above / in line / below (8 or more earlier figures)
 --                   against the figure that came; equal thirds score 2/3.
---                   The same on every market row of the event.
+--                   The same on every market row of the event. Releases
+--                   only: a rate decision is nearly always the forecast (the
+--                   Fed's and the Bank of Japan's at 24 of 25 decisions since
+--                   November 2023, the ECB's at all), so scoring it would
+--                   flatter the figure score.
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it. Observe only.
 CREATE OR REPLACE VIEW `{{DS}}.v_event_trial`
@@ -74,7 +78,7 @@ SELECT
   IF(drift_sign = 0, NULL, CAST(drift_sign AS INT64)) AS drift_expected,
   IF(drift_sign IS NULL OR drift_sign = 0 OR f5_pct IS NULL OR f5_pct = 0, NULL, SIGN(f5_pct) = drift_sign) AS drift_hit,
   n_fig, p_above, p_in_line, p_below,
-  IF(n_fig >= 8 AND figure IS NOT NULL,
+  IF(kind = 'release' AND n_fig >= 8 AND figure IS NOT NULL,
      ROUND(POW(p_above - IF(figure = 'above', 1, 0), 2) + POW(p_in_line - IF(figure = 'in_line', 1, 0), 2)
            + POW(p_below - IF(figure = 'below', 1, 0), 2), 6),
      NULL) AS brier_figure

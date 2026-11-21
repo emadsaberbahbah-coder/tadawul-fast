@@ -155,14 +155,16 @@ LAST = [lrow("us", "-0.42", "-1.1", "0.9", "true"), lrow("sa", "0.1", None, None
 def esum(period, family, name, events, **kw):
     r = {"period": period, "family": family, "family_name": name, "events": str(events), "band_n": "0",
          "band_pct": None, "big_n": "0", "big_pct": None, "any_pct": None, "big_skill": None, "dir_n": "0",
-         "dir_pct": None, "dir_z": None, "drift_n": "0", "drift_pct": None, "drift_z": None, "fig_n": "0",
+         "dir_events": "0", "dir_pct": None, "dir_z": None, "drift_n": "0", "drift_events": "0", "drift_pct": None,
+         "drift_z": None, "fig_n": "0",
          "fig_skill": None, "verdict": "collecting" if period == "forward" else "band too few, direction too few"}
     r.update({k: str(v) for k, v in kw.items()})
     return r
 
 
 EV_SUMMARY = [esum("backtest", "all", "All families", 96, band_n=719, band_pct=71.2, big_n=564, big_pct=25.7,
-                   any_pct=24.9, big_skill=-0.078, dir_n=40, dir_pct=55.0, dir_z=0.63, drift_n=38, drift_pct=47.4,
+                   any_pct=24.9, big_skill=-0.078, dir_n=40, dir_events=6, dir_pct=55.0, dir_z=0.63, drift_n=38,
+                   drift_events=5, drift_pct=47.4,
                    fig_n=60, fig_skill=0.041, verdict="band calibrated, direction not proven"),
               esum("backtest", "opec", "OPEC+ meeting", 27, band_n=216, band_pct=74.5, big_n=192, big_pct=24.0,
                    any_pct=24.8, big_skill=-0.06, verdict="band calibrated, direction too few"),
@@ -461,15 +463,16 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert page[la_head + 1][:10] == ["Tue 17 Nov 16:30", "US retail sales (m/m)", "above", 0.4, 0.6, "",
                                       "-0.42 (inside the band)", "", "+0.10 (no band yet)", "-3.10 (OUTSIDE the band)"]
     et_head = page.index(mb.EVENT_TRIAL_HEAD + [""] * (mb.WIDTH - len(mb.EVENT_TRIAL_HEAD)))
-    assert page[et_head + 1][:16] == ["backtest", "All families", 96, 71.2, 719, 25.7, 24.9, -0.08, 55.0, 40, 0.63,
-                                      47.4, 38, 0.04, 60, "band calibrated, direction not proven"]
+    assert page[et_head + 1][:16] == ["backtest", "All families", 96, 71.2, 719, 25.7, 24.9, -0.08, 55.0, 6, 0.63,
+                                      47.4, 5, 0.04, 60, "band calibrated, direction not proven"]   # events, not rows
     assert page[et_head + 3][:3] == ["forward", "All families", 2] and page[et_head + 3][15] == "collecting"
     ev_text = [x for x in texts if x.startswith("EVENTS, BACKTEST")][0]
     assert ev_text == ("EVENTS, BACKTEST (the same rules read back on the archive, 96 events): the band of the earlier "
                        "moves held 71 % of 719 event-market rows (a true band holds 80 %: close); a big move came on "
                        "26 % of the event days against 25 % of any days, and the family's chance of one scored -0.08 "
                        "against any day's (it told nothing more); the direction after a figure held 55 % of 40 rows "
-                       "(z +0.63); the figure chances scored +0.04 against equal thirds over 60 figures.")
+                       "over 6 events (z +0.63, each event once); the figure chances scored +0.04 against equal thirds "
+                       "over 60 figures.")
     assert ("EVENTS, FORWARD (from Mon 23 Nov 2026): 2 event(s) scored so far - collecting; the owner reviews them "
             "with the rest after 10 sessions.") in texts
     out = capsys.readouterr().out
@@ -798,6 +801,7 @@ def test_m9_event_sql_is_select_only_timed_and_reads_the_three_views():
            "INTERVAL 7 DAY) AND event_at < TIMESTAMP '2026-11-21 08:40:00+00'" in b
     assert "AND market_id IN ('us', 'sa', 'oil', 'gold', 'bonds')" in b
     assert c.endswith("FROM `proj-1.tfb_archive.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family")
+    assert ", dir_n, dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, " in c   # events, each once
     for sql in (a, b, c):
         assert sql.startswith("SELECT ") and "CURRENT_" not in sql
         assert not re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE)\b", sql, re.I)

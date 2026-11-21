@@ -154,8 +154,8 @@ EVENT_HEAD = ["When (Riyadh)", "Event", "Forecast", "Previous", "Figure: above /
 EVENT_LAST_HEAD = ["When (Riyadh)", "Event", "Figure", "Forecast", "Actual", "", "United States", "", "Saudi Arabia",
                    "Oil", "Gold", "Bonds"]
 EVENT_TRIAL_HEAD = ["Period", "Family", "Events", "Band held %", "Band rows", "Big moves %", "Any day %",
-                    "Big-move skill", "Direction held %", "Direction rows", "Direction z", "Drift held %",
-                    "Drift rows", "Figure skill", "Figures", "Verdict"]
+                    "Big-move skill", "Direction held %", "Direction events", "Direction z", "Drift held %",
+                    "Drift events", "Figure skill", "Figures", "Verdict"]
 EVENT_VIEWS = "v_event_scenarios, v_event_trial and v_event_trial_summary (apply_bq_views 1.21.0)"
 
 text, num, day, flag = nb.text, nb.num, nb.day, nb.flag
@@ -244,7 +244,7 @@ def sql_events_last(ds: str, now: _dt.datetime) -> str:
 def sql_events_summary(ds: str) -> str:
     """1.2.0: the events scorecard, the all-markets lines of each family and of all families."""
     return ("SELECT period, family, family_name, events, band_n, band_pct, big_n, big_pct, any_pct, big_skill, dir_n, "
-            "dir_pct, dir_z, drift_n, drift_pct, drift_z, fig_n, fig_skill, verdict "
+            "dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, fig_n, fig_skill, verdict "
             "FROM `%s.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family" % ds)
 
 
@@ -710,8 +710,9 @@ def event_trial_rows(summary: Sequence[Dict[str, Any]]) -> List[List[Any]]:
     for r in summary:
         out.append([text(r.get("period")), text(r.get("family_name")), int(num(r.get("events")) or 0),
                     r2(r.get("band_pct")), int(num(r.get("band_n")) or 0), r2(r.get("big_pct")), r2(r.get("any_pct")),
-                    r2(r.get("big_skill")), r2(r.get("dir_pct")), int(num(r.get("dir_n")) or 0), r2(r.get("dir_z")),
-                    r2(r.get("drift_pct")), int(num(r.get("drift_n")) or 0), r2(r.get("fig_skill")),
+                    r2(r.get("big_skill")), r2(r.get("dir_pct")), int(num(r.get("dir_events")) or 0),
+                    r2(r.get("dir_z")), r2(r.get("drift_pct")), int(num(r.get("drift_events")) or 0),
+                    r2(r.get("fig_skill")),
                     int(num(r.get("fig_n")) or 0), text(r.get("verdict"))])
     return out
 
@@ -735,10 +736,10 @@ def event_reading(summary: Sequence[Dict[str, Any]], period: str) -> str:
         parts.append("a big move came on %.0f %% of the event days against %.0f %% of any days, and the family's "
                      "chance of one scored %+.2f against any day's (%s)" % (
                          big, anyp, skill, "it told more" if skill > 0 else "it told nothing more"))
-    dn = int(num(line.get("dir_n")) or 0)
+    dn, de = int(num(line.get("dir_n")) or 0), int(num(line.get("dir_events")) or 0)
     if dn and num(line.get("dir_pct")) is not None:
-        parts.append("the direction after a figure held %.0f %% of %d rows (z %+.2f)" % (
-            num(line.get("dir_pct")), dn, num(line.get("dir_z")) or 0.0))
+        parts.append("the direction after a figure held %.0f %% of %d rows over %d events (z %+.2f, each event once)"
+                     % (num(line.get("dir_pct")), dn, de, num(line.get("dir_z")) or 0.0))
     else:
         parts.append("no direction after a figure is scored yet")
     fn, fs = int(num(line.get("fig_n")) or 0), num(line.get("fig_skill"))
@@ -914,7 +915,8 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
         rows += [line(*r) for r in last_rows(last)] or [line("", "no event in the last %d days" % EVENT_BACK_DAYS)]
     rows += [line(), line("8. THE EVENTS SCORECARD - each scenario against what came (v_event_trial_summary; a true "
                           "band holds 80 %%; skill above 0 = better than any day's chance, or than equal thirds for "
-                          "the figure; z against a coin; forward from %s)" % short_day(EVENT_FORWARD_FROM))]
+                          "the figure; z against a coin, each event once; forward from %s)"
+                          % short_day(EVENT_FORWARD_FROM))]
     if ev_summary is None:
         rows.append(line("", "the event views are not in BigQuery yet: %s" % EVENT_VIEWS))
     else:

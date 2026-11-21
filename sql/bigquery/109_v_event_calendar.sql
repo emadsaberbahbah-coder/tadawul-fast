@@ -54,7 +54,11 @@
 --   family:YYYY-MM-DD), family, family_name, kind (meeting | release),
 --   country, event_at (UTC), event_day (Riyadh), source (official | eodhd),
 --   event_type, period, actual, estimate, previous, surprise, surprise_z,
---   figure, is_out (the figure is out, or the meeting's time has passed)
+--   figure, is_out (the figure is out, or the meeting's time has passed: a
+--   past release that EODHD lists without its figure stays out of the
+--   reactions, the scenarios and the trial - 7 of the 481 past releases on
+--   21 Nov 2026, among them US retail sales of April 2024 and the US core
+--   CPI of November 2025: EODHD has their yearly figure, not the monthly one)
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it. Observe only.
 CREATE OR REPLACE VIEW `{{DS}}.v_event_calendar`

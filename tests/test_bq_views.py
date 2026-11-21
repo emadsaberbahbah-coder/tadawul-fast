@@ -341,8 +341,8 @@ PENDING = {
     "v_event_calendar": "66a43c94b1dac73bba43c24d420f12bd401185b168c00531ce39c4e453418014",
     "v_event_reactions": "10d89bdd0e31593951118006848f3048b91ab4e21a7dcb3a6aa215d15048cfd6",
     "v_event_scenarios": "634581da8d58f4c68edb51504cb3864235487b1e4a341f66db43f0c39dae6a26",
-    "v_event_trial": "89b608a1322920a9122215b151b08e2ae9454d829082eb545d19573505cc7fc1",
-    "v_event_trial_summary": "55f11536d861945c79b3b8506441b2d3c5074790548a402683e8f46bac954146",
+    "v_event_trial": "9ee18698cdb5a6fc624df438daf1ca65aa8bcd92ef6b784338046ff6d2c5d28e",
+    "v_event_trial_summary": "6d85c329c66aeac624715bafd5ed557c8936911da235fb840738b14cdaa2b6fa",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3549,7 +3549,7 @@ def case_v55():
                  "WHEN 'above' THEN IF(s.n_above >= 4, SIGN(s.r1_p50_above), NULL)",
                  "WHEN 'below' THEN IF(s.n_f5_below >= 4, SIGN(s.f5_p50_below), NULL)",
                  "IF(dir_sign IS NULL OR dir_sign = 0 OR r1_pct = 0, NULL, SIGN(r1_pct) = dir_sign) AS dir_hit",
-                 "IF(n_fig >= 8 AND figure IS NOT NULL,", "WHERE is_out"):
+                 "IF(kind = 'release' AND n_fig >= 8 AND figure IS NOT NULL,", "WHERE is_out"):
         assert frag in code, frag
     assert "CURRENT_" not in code
 
@@ -3564,9 +3564,20 @@ def case_v56():
     for frag in ("GROUP BY GROUPING SETS ((period, family, market_id), (period, family), (period, market_id), (period))",
                  "GROUP BY period, family, event_id", "ROUND(1 - AVG(brier_figure) / (2 / 3), 3) AS fig_skill",
                  "ROUND(1 - SAFE_DIVIDE(AVG(IF(brier_any IS NULL, NULL, brier_big)), AVG(brier_any)), 3) AS big_skill",
-                 "SQRT(COUNTIF(dir_hit IS NOT NULL) / 4)", "WHEN r.period = 'forward' AND r.events < 10 THEN 'collecting'",
+                 # the z against a coin: (hits - n/2) / sqrt(n/4) on a one-market line; on an all-markets line each
+                 # event's markets are summed first, so that an event counts once (its markets move together)
+                 "IF(dir_hit IS NULL, NULL, IF(dir_hit, 0.5, -0.5)) AS d_dir",
+                 "SAFE_DIVIDE(POW(SUM(d_dir) OVER (PARTITION BY period, event_id), 2), "
+                 "COUNT(*) OVER (PARTITION BY period, event_id))",
+                 "SAFE_DIVIDE(SUM(d_dir), SQRT(SUM(d_dir * d_dir))) AS dir_z_row",
+                 "SAFE_DIVIDE(SUM(d_dir), SQRT(SUM(w_dir))) AS dir_z_event",
+                 "ROUND(IF(g.g_market = 1, g.dir_z_event, g.dir_z_row), 2) AS dir_z",
+                 "ROUND(IF(g.g_market = 1, g.drift_z_event, g.drift_z_row), 2) AS drift_z",
+                 "COUNT(DISTINCT IF(dir_hit IS NULL, NULL, event_id)) AS dir_events",
+                 "WHEN r.period = 'forward' AND r.events < 10 THEN 'collecting'",
                  "WHEN r.band_pct < 70 THEN 'too narrow' WHEN r.band_pct > 90 THEN 'too wide'",
-                 "WHEN r.dir_z >= 2 THEN 'holds' ELSE 'not proven'", "IF(r.market_id = 'all', f.fig_skill, NULL)"):
+                 "CASE WHEN r.dir_events < 20 THEN 'too few' WHEN r.dir_z >= 2 THEN 'holds' ELSE 'not proven' END",
+                 "IF(r.market_id = 'all', f.fig_skill, NULL)"):
         assert frag in code, frag
     assert "CURRENT_" not in code
 

@@ -23,8 +23,22 @@ big move, the median move after a figure above / below its forecast, and the
 chances of the figure itself; v_event_trial (112) - each scenario against
 what came ('forward' from 23 Nov 2026); v_event_trial_summary (113) - the
 scorecard: the band against 80 %, the big-move chance against any day's, the
-direction and the drift after a figure against a coin, the figure chances
-against equal thirds. Research views: the live system never reads BigQuery.
+direction and the drift after a figure against a coin (each event counted
+once over its markets), the figure chances of the releases against equal
+thirds. One event per release: EODHD lists some releases twice ("Oct" and
+"Oct. 2026") and a first estimate with its revisions (US GDP, a flash and its
+final) under the same period, so a family's same period within 120 days is
+one release. First read (backtest, the history loaded on 21 Nov 2026, run
+44914578389: 27,886 releases of six economies since November 2023; 544
+events with 5,805 event-market rows): the band of the earlier moves held
+72.9 % of 4,342 rows (a true band 80 %: a band read off 8 to 35 earlier
+events is narrower than the truth); event days moved a normal day or more
+25.7 % of the time against 25.2 % for any day, and the families' chance of
+it did not beat any day's (skill -0.08); the direction after a figure held
+52.1 % of 1,502 rows over 148 events (z 1.38, not proven), the drift after
+the close 52.4 % (z 1.59); the figure chances scored -0.01 against equal
+thirds over 342 figures. No family reaches 20 events scored for direction
+yet. Research views: the live system never reads BigQuery.
 
 v1.20.0 (21 Nov 2026, the news by market and by person). WHY (owner, 21 Nov
 2026 11:03 Riyadh, item 5 of the build list): "News: a news reading per
