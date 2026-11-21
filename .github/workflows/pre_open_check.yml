@@ -54,10 +54,6 @@ on:
         type: boolean
         default: false
 
-concurrency:
-  group: tfb-pre-open-check
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
@@ -72,10 +68,12 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  pre_open_check:
-    name: ⏰ Read futures & pre-market, publish the verdicts
+  due:
+    name: 🕒 Is a chained run due this hour?
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.due.outputs.run }}
     steps:
       - name: 🕒 Is a chained run due this hour?
         id: due
@@ -98,18 +96,27 @@ jobs:
           fi
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
 
+  pre_open_check:
+    # CHAIN fix (Codex P2, PR 1043): the gate is its own job, so a chained run that is not
+    # due never enters this job's concurrency group and cannot cancel or replace a run that publishes.
+    needs: due
+    if: needs.due.outputs.run == 'true'
+    concurrency:
+      group: tfb-pre-open-check
+      cancel-in-progress: true
+    name: ⏰ Read futures & pre-market, publish the verdicts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
       - name: ⬇️ Checkout
-        if: steps.due.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: 🐍 Set up Python
-        if: steps.due.outputs.run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Install dependencies
-        if: steps.due.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip setuptools wheel
           if [[ -f requirements.render.txt ]]; then
@@ -119,7 +126,6 @@ jobs:
           fi
 
       - name: 🔎 Resolve spreadsheet id
-        if: steps.due.outputs.run == 'true'
         id: sheet
         env:
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -132,7 +138,6 @@ jobs:
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
 
       - name: ⏰ Run pre-open check
-        if: steps.due.outputs.run == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}

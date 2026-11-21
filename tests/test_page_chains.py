@@ -2,13 +2,16 @@
 
 The workflows are news_board.yml 1.1.0, trial_labels.yml 1.1.0 and pre_open_check.yml v1.2.0. Each also runs after
 the Exit Plan workflow, which the workbook dispatches every hour (apps_script/29_Page_Refresh_Dispatch.gs), but only
-in the UTC hours of its repository Variable. This is the rule of News & Macro Gate 1.1.0.
+in the UTC hours of its repository Variable. This is the rule of News & Macro Gate 1.1.0, which 1.1.1 aligns.
 
 Why: since 19 Nov every scheduled News Board run started about 8 hours late. Since 9 Nov every scheduled Pre-Open
 Check started after the US close and wrote nothing.
 
+The hour gate is its own job ('due'), and the page job holds the concurrency group (Codex P2 on PR 1043). So a
+chained run that is not due never enters the group, and cannot cancel or replace a run that publishes.
+
 What is tested:
-  C1  the wiring
+  C1  the wiring: the trigger, the crons kept, the two jobs, the concurrency on the page job only
   C2  the gate step, run in bash with a fixed clock
   C3  the pre-open window in both DST regimes, read by the script's own window function
 """
@@ -29,12 +32,18 @@ from scripts import pre_open_check as pc
 ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / ".github" / "workflows"
 EXIT_PLAN = "\U0001F3AF Exit Plan"
-GATE_IF = "steps.due.outputs.run == 'true'"
-# workflow: (job, repository Variable, default UTC hours, weekdays only, the crons that stay)
+JOB_IF = "needs.due.outputs.run == 'true'"
+# workflow: (page job, repository Variable, default UTC hours, weekdays only, the crons that stay, its concurrency)
 CHAINS = {
-    "news_board.yml": ("board", "TFB_NEWS_BOARD_CHAIN_HOURS", "4 13", False, ["55 4,13 * * *"]),
-    "trial_labels.yml": ("labels", "TFB_TRIAL_LABELS_CHAIN_HOURS", "5 9 14", False, ["5 5,9,14 * * *"]),
-    "pre_open_check.yml": ("pre_open_check", "TFB_PREOPEN_CHAIN_HOURS", "12 13", True, ["0 13,14 * * 1-5"]),
+    "news_board.yml": ("board", "TFB_NEWS_BOARD_CHAIN_HOURS", "4 13", False, ["55 4,13 * * *"],
+                       {"group": "tfb-news-board", "cancel-in-progress": False}),
+    "trial_labels.yml": ("labels", "TFB_TRIAL_LABELS_CHAIN_HOURS", "5 9 14", False, ["5 5,9,14 * * *"],
+                         {"group": "tfb-trial-labels", "cancel-in-progress": False}),
+    "pre_open_check.yml": ("pre_open_check", "TFB_PREOPEN_CHAIN_HOURS", "12 13", True, ["0 13,14 * * 1-5"],
+                           {"group": "tfb-pre-open-check", "cancel-in-progress": True}),
+    "news_macro_gate.yml": ("gate", "TFB_NEWS_GATE_CHAIN_HOURS", "6 9 12 13 16 19", False,
+                            ["41 6 * * 0-4", "47 12 * * 1-5", "23 19 * * 1-5"],
+                            {"group": "${{ github.workflow }}-${{ github.ref }}", "cancel-in-progress": False}),
 }
 
 
@@ -47,23 +56,28 @@ def _on(wf):
 
 
 # ----------------------------------------------------------------------------- C1 wiring
-def test_c1_the_three_pages_follow_the_exit_plan_and_keep_their_crons():
+def test_c1_the_pages_follow_the_exit_plan_keep_their_crons_and_gate_in_their_own_job():
     assert _wf("exit_plan.yml")["name"] == EXIT_PLAN                            # the name the chains wait for
-    assert _on(_wf("news_macro_gate.yml"))["workflow_run"] == {"workflows": [EXIT_PLAN], "types": ["completed"]}
-    for name, (job, var, hours, weekdays, crons) in CHAINS.items():
+    for name, (job, var, hours, weekdays, crons, conc) in CHAINS.items():
         wf = _wf(name)
         on = _on(wf)
         assert set(on) == {"schedule", "workflow_run", "workflow_dispatch"}, name
         assert on["workflow_run"] == {"workflows": [EXIT_PLAN], "types": ["completed"]}, name
         assert [c["cron"] for c in on["schedule"]] == crons, name                 # the cron stays as the backstop
-        assert "if" not in wf["jobs"][job], name
-        steps = wf["jobs"][job]["steps"]
-        gate = steps[0]
+        assert set(wf["jobs"]) == {"due", job}, name
+        due = wf["jobs"]["due"]
+        assert due["runs-on"] == "ubuntu-24.04" and due["timeout-minutes"] == 5 and "concurrency" not in due, name
+        assert due["outputs"] == {"run": "${{ steps.due.outputs.run }}"} and len(due["steps"]) == 1, name
+        gate = due["steps"][0]
         assert gate["id"] == "due" and "if" not in gate and gate["name"].endswith("Is a chained run due this hour?"), name
         assert gate["env"] == {"EVENT_NAME": "${{ github.event_name }}",
                                "CHAIN_HOURS": "${{ vars.%s || '%s' }}" % (var, hours)}, name
-        assert len(steps) >= 5 and all(s.get("if") == GATE_IF for s in steps[1:]), name   # nothing else runs when not due
         assert ("DOW=$((10#$(date -u +%u)))" in gate["run"]) is weekdays, name
+        page = wf["jobs"][job]
+        assert page["needs"] == "due" and page["if"] == JOB_IF, name
+        # Codex P2 (PR 1043): the group is the page job's, never the workflow's, so a run that is not due stays out of it
+        assert "concurrency" not in wf and page["concurrency"] == conc, name
+        assert len(page["steps"]) >= 4 and not any("steps.due" in str(s.get("if", "")) for s in page["steps"]), name
         head = (WF / name).read_text(encoding="utf-8").split("\nname:", 1)[0]
         assert var in head and "29_Page_Refresh_Dispatch" in head and "The cron" in head, name
     # a chained run writes like a scheduled one: only a dispatch can ask for a dry run
@@ -81,7 +95,7 @@ def _gate(name, event, utc, hours=None):
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is not installed")
-    step = _wf(name)["jobs"][CHAINS[name][0]]["steps"][0]
+    step = _wf(name)["jobs"]["due"]["steps"][0]
     with tempfile.TemporaryDirectory() as d:
         out = Path(d) / "out"
         stub = ('date() { case "$2" in "+%%H") echo %s ;; "+%%u") echo %d ;; *) command date "$@" ;; esac; }\n'
@@ -102,7 +116,8 @@ def _at(day, hour, minute=40):
     ("trial_labels.yml", 5, True), ("trial_labels.yml", 9, True), ("trial_labels.yml", 14, True),
     ("trial_labels.yml", 4, False), ("trial_labels.yml", 13, False),
     ("pre_open_check.yml", 12, True), ("pre_open_check.yml", 13, True), ("pre_open_check.yml", 14, False),
-    ("pre_open_check.yml", 11, False)])
+    ("pre_open_check.yml", 11, False),
+    ("news_macro_gate.yml", 6, True), ("news_macro_gate.yml", 19, True), ("news_macro_gate.yml", 7, False)])
 def test_c2_a_chained_run_works_only_in_its_hours(name, hour, want):
     run, log = _gate(name, "workflow_run", _at(23, hour))
     assert run == "run=%s" % ("true" if want else "false"), (name, hour, run)

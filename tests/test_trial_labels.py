@@ -347,9 +347,10 @@ def test_l7_workflow_manifest_and_read_only_scope():
     assert set(on) == {"schedule", "workflow_dispatch", "workflow_run"} and on["schedule"] == [{"cron": "5 5,9,14 * * *"}]
     assert on["workflow_run"] == {"workflows": ["\U0001F3AF Exit Plan"], "types": ["completed"]}   # 1.1.0 CHAIN (test_page_chains)
     assert on["workflow_dispatch"]["inputs"]["dry_run"]["default"] is False
-    assert wf["permissions"] == {"contents": "read"} and wf["concurrency"] == {"group": "tfb-trial-labels", "cancel-in-progress": False}
+    assert wf["permissions"] == {"contents": "read"} and "concurrency" not in wf
     job = wf["jobs"]["labels"]
-    assert "if" not in job and job["timeout-minutes"] == 15
+    assert job["concurrency"] == {"group": "tfb-trial-labels", "cancel-in-progress": False}
+    assert job["if"] == "needs.due.outputs.run == 'true'" and job["timeout-minutes"] == 15     # 1.1.0: the gate job decides
     step = [s for s in job["steps"] if "trial_labels.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_TRIAL_LABELS"] == "${{ vars.TFB_TRIAL_LABELS || 'on' }}"
     assert step["env"]["TFB_BQ_PROJECT"] == "${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}"

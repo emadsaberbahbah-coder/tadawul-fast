@@ -1,4 +1,4 @@
-# Commit Sheet: three pages follow the hourly Exit Plan (news_board.yml 1.1.0, trial_labels.yml 1.1.0, pre_open_check.yml v1.2.0, ci.yml 1.1.91), 2026-11-21
+# Commit Sheet: three pages follow the hourly Exit Plan (news_board.yml 1.1.0, trial_labels.yml 1.1.0, pre_open_check.yml v1.2.0, news_macro_gate.yml 1.1.1, ci.yml 1.1.91), 2026-11-21
 
 **Scope.** Owner, 21 Nov 2026 02:20 Riyadh (in Arabic: "review the updates for 6 hours and see the updates they need, based on the updates being made"). The watch measured when GitHub actually starts each scheduled workflow. Three pages that depend on a time of day still waited for GitHub's schedule:
 - the Pre-Open Check;
@@ -25,9 +25,10 @@ GitHub community reports describe the scheduler delaying or dropping cron runs b
 ## Changes
 | File | Change | Default chain hours (UTC) | Riyadh |
 |---|---|---|---|
-| `.github/workflows/pre_open_check.yml` v1.2.0 | `workflow_run` after "Exit Plan". A first step decides whether a chained run is due: weekdays (Mon-Fri UTC) and an hour in `TFB_PREOPEN_CHAIN_HOURS`. Every other step carries `if: steps.due.outputs.run == 'true'`. | `12 13` | about 15:40 and 16:40 |
+| `.github/workflows/pre_open_check.yml` v1.2.0 | `workflow_run` after "Exit Plan". A job `due` decides whether a chained run is due: weekdays (Mon-Fri UTC) and an hour in `TFB_PREOPEN_CHAIN_HOURS`. The page job runs only when it says so (`needs: due`, `if: needs.due.outputs.run == 'true'`), and holds the concurrency group. | `12 13` | about 15:40 and 16:40 |
 | `.github/workflows/news_board.yml` 1.1.0 | The same gate with `TFB_NEWS_BOARD_CHAIN_HOURS`. | `4 13` | about 07:35 (after the 07:30 e-mail run) and 16:40 |
 | `.github/workflows/trial_labels.yml` 1.1.0 | The same gate with `TFB_TRIAL_LABELS_CHAIN_HOURS`. | `5 9 14` | about 08:40, 12:40 and 17:40 |
+| `.github/workflows/news_macro_gate.yml` 1.1.1 | The same two-job layout for the chain it has had since 16 Nov: same hours, same writes. | `6 9 12 13 16 19` (unchanged) | - |
 | `.github/workflows/ci.yml` 1.1.91 | `tests/test_page_chains.py` added to the blocking lean lane. | - | - |
 | `tests/test_page_chains.py` (new), `tests/test_news_board.py` N7, `tests/test_trial_labels.py` L7 | C1 wiring, C2 the gate run in bash with a fixed clock, C3 the pre-open window in both DST regimes. N7 and L7 pin the new trigger. | - | - |
 
@@ -40,17 +41,28 @@ Rules kept in every file:
   - In winter (open 14:30 UTC), the 13:4x run lands inside the window about 45 minutes before the open, and the 12:4x run prints "nothing to do".
   - In summer (open 13:30 UTC), the 12:4x run lands before the open. The 13:40 - 13:45 run reads inside the window's 15 minutes after the open, and later runs read outside it.
 
+## Review fix (Codex P2, PR 1043)
+**Finding.** With the gate as the first step, every chained run entered the workflow's concurrency group before the gate decided. Two failures followed:
+- In the Pre-Open Check (`cancel-in-progress: true`), a run that was not due could cancel a scheduled or dispatched check that was still inside the window. This held even with the Variable at `off`.
+- With `cancel-in-progress: false` (News Board, Trial Labels, News & Macro Gate), it could replace a pending run that would publish, because GitHub keeps one pending run per group.
+
+**Fix.** The gate is now its own job `due`. The page job has `needs: due` and `if: needs.due.outputs.run == 'true'`, and the concurrency group moved from the workflow to the page job. A run that is not due never enters the group. News & Macro Gate 1.1.1 gets the same layout, and its evidence upload keeps `if: always()`.
+
 ## Pre-merge checks
-- **Tests.** test_page_chains 17/17. With test_news_board, test_trial_labels and test_pre_open_check: 59 passed, 1 skipped. The skip is the `exchange_calendars` import, the same on main. test_ci_required_verdict, test_workflow_audit_repairs and the three whole-tree workflow suites: 107 passed, 13 skipped (environment), the same as main.
-- **Mutants: 8 / 8 killed.**
+- **Tests.** test_page_chains 20/20 (the four chained pages). With test_news_board, test_trial_labels, test_pre_open_check and test_news_macro_gate: 322 passed, 1 skipped. The skip is the `exchange_calendars` import, the same on main. test_ci_required_verdict, test_workflow_audit_repairs and the three whole-tree workflow suites: 107 passed, 13 skipped (environment), the same as main.
+- **Mutants: 12 / 12 killed.**
   1. weekends allowed for the pre-open chain;
   2. the news hours moved;
-  3. the labels step left ungated;
-  4. every chained run due;
-  5. a wrong workflow name;
-  6. pre-open hours that miss summer;
-  7. a cron removed;
-  8. the hour read without the number check: "off" became hour 0, and "08" was read as octal.
+  3. the labels job left ungated;
+  4. the pre-open concurrency dropped;
+  5. the gate output ignored;
+  6. the news gate job left ungated;
+  7. the evidence upload left on the old step condition;
+  8. every chained run due;
+  9. a wrong workflow name;
+  10. pre-open hours that miss summer;
+  11. a cron removed;
+  12. the hour read without the number check: "off" became hour 0, and "08" was read as octal.
 - **Lint and audit.** The workflow audit reports errors=0, warnings=0, and ruff (E9, F63, F7, F82) is clean.
 
 ## Post-merge (lead)
