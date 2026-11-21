@@ -129,6 +129,13 @@ ENV names are derived statically from each entry's expression and the functions 
 | `evidence_gate` | `TFB_EVIDENCE_GATE` | '' | 'off' | not recorded |
 | `evidence_cohorts` | `TFB_EVIDENCE_DEMOTE_COHORTS` | None | - | not recorded |
 | `conservative_floor` | `TFB_CONSERVATIVE_GATE_SCORE_FLOOR`, `TFB_MARKET_REGIME`, `TFB_REGIME_BEAR_SCORE_DELTA`, `TFB_REGIME_BULL_SCORE_DELTA` | TFB_CONSERVATIVE_GATE_SCORE_FLOOR=68.0; TFB_MARKET_REGIME='neutral'; TFB_REGIME_BEAR_SCORE_DELTA=4.0; TFB_REGIME_BULL_SCORE_DELTA=0.0 | 68.0 | not recorded |
+| `market_gate` | `TFB_MARKET_GATE` | '' | 'off' | not recorded |
+| `market_gate_hold` | `TFB_MARKET_GATE_HOLD` | None | - | not recorded |
+| `market_gate_markets` | `TFB_MARKET_GATE_MARKETS` | None | - | not recorded |
+| `market_labels` | `TFB_MARKET_GATE` | '' | - | not recorded |
+| `selection_gate` | `TFB_SELECTION_GATE` | '' | 'off' | not recorded |
+| `selection_min_upside_pp` | `TFB_SELECTION_MIN_UPSIDE` | 15.0 | - | not recorded |
+| `selection_max_risk` | `TFB_SELECTION_MAX_RISK` | 30.0 | - | not recorded |
 
 #### Cross-key rules behind `env_combo`
 

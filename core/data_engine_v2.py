@@ -2,8 +2,67 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.160.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.161.0
 ================================================================================
+
+WHY v5.161.0 - NO NEW BUY IN A MARKET THAT IS NOT CALM; A SHARE ONLY WITH AN
+ANALYST CONSENSUS WELL ABOVE ITS PRICE AT LOW RISK
+(TFB_MARKET_GATE and TFB_SELECTION_GATE, each off | observe | enforce, default
+off = byte-identical; TFB_MARKET_GATE_HOLD default weak,stress,drawdown,
+crash_day; TFB_MARKET_GATE_MARKETS default us,sa,eu,jp,cn;
+TFB_SELECTION_MIN_UPSIDE default 15; TFB_SELECTION_MAX_RISK default 30)
+- EVIDENCE (owner, 21 Nov 2026 19:10 Riyadh: "MODEL EVIDENCE 47.60%
+  INVESTABLE hit rate, matured records ... since 2026-11-10: 11.1% (n 45)
+  ... need to improve"). The 2,384 matured INVESTABLE WIN / LOSS
+  Performance_Log records the tile reads (28 Jun - 13 Nov recordings), each
+  joined to the label its market carried at the last close before the
+  record (sql 99_v_market_condition; the market from the symbol as
+  core.market_condition.market_of reads it) and to that day's Signal_History
+  analyst target and risk score:
+                                   records  names  won    matured 11-21 Nov
+    all INVESTABLE                   2,384    219  47.6%  42.6% (383)
+    market calm                      1,150    141  52.5%  58.9% (146)
+    upside >= 15% and risk < 30        729     45  60.8%  45.3% (234)
+    both                               374     25  69.8%  63.2% (87)
+  The analyst target exists from 31 Aug 2026 (when Signal_History began
+  recording Target Price), so the two rows that need it cover Sep - Nov,
+  where all INVESTABLE won 45.3% (1,590) and calm alone 52.2% (791). Counted
+  once per symbol and week, both rules won 62.9% (59) against 44.2% (257).
+  From 31 Aug a share with no target won 36.7% outside Tadawul (60) and
+  20.9% on it (115); under 15% upside, 23.7% in calm markets (114) and 14.0%
+  in the others (164). Tadawul shares entered while TASI was in a drawdown
+  won 31.5% (533); 40 of the 45 records since 10 Nov were US shares entered
+  while the US was weak (4 won). By market, Sep - Nov, shares passing the
+  selection rule: US calm 68.8% (320) vs not calm 46.5% (269; matured 11-21
+  Nov 52.8% vs 30.9%); Tadawul calm 1 of 6, not calm 52.0% (50, 3 names);
+  the other markets 83.3% calm (48) vs 86.1% not calm (36) - the hold is
+  measured in the US; TFB_MARKET_GATE_MARKETS narrows it. Expect 60-70%
+  live: 25 names, one Sep - Nov stretch.
+- COST: far fewer INVESTABLE rows - under both rules 3-6 a day in the calm
+  US sessions of October, 0-1 a day since 15 Nov.
+- FIX: two DEMOTE-only tiers in _apply_investability_gate after the
+  evidence tier. [MARKET-HOLD]: a still-INVESTABLE row of the US (.US or a
+  bare ticker), Saudi (.SR or a bare four-digit code), European, Japanese
+  or Hong Kong / China market listed in TFB_MARKET_GATE_MARKETS whose
+  market label is in TFB_MARKET_GATE_HOLD becomes WATCHLIST / WATCH with
+  block_reason "Market on hold: <market> <label> as of <date>
+  (<figures>)". Commodities, currencies, indices, bonds, sukuk, crypto and
+  futures are never held; a fund on a held market is.
+  The labels come from the new core.market_condition 1.0.0: the rules of
+  99_v_market_condition on the Yahoo daily closes of SPY + VIX, ^TASI.SR
+  (rebuilt from hourly bars), ^STOXX, ^N225 and ^HSI, the last COMPLETED
+  session, refreshed every TFB_MARKET_CONDITION_TTL_SEC (1800) in a
+  background thread; a market with no label (not read yet, not read for 12
+  hours, not one of the five) never holds. [SELECTION]: a still-INVESTABLE
+  share (not an ETF, fund, commodity, currency, index, bond, sukuk, crypto
+  or future) with no analyst consensus price (target_mean_price, else
+  target_price), a consensus under TFB_SELECTION_MIN_UPSIDE above the
+  price, or a risk score at or over TFB_SELECTION_MAX_RISK becomes
+  WATCHLIST / WATCH with block_reason "Selection gate: ...". observe
+  appends market_hold_watch:<market>_<label> or selection_watch:<codes>
+  (substring-safe, at most one per family, replaced in place) and changes
+  no verdict. Never promotes; no column; surface_gate_states() reports
+  both modes, their knobs and the labels this process knows.
 
 WHY v5.160.0 - A COHORT THAT LOSES ON MATURED RECORDS IS NOT INVESTABLE
 (TFB_EVIDENCE_GATE off | observe | enforce, default off = byte-identical;
@@ -4509,7 +4568,14 @@ from core.financial_units import (
 #   INVESTABLE row in a listed MARKET:CONFIDENCE cohort (default SR:HIGH) is
 #   tagged (observe) or demoted to WATCHLIST (enforce). TFB_EVIDENCE_GATE
 #   default off = byte-identical. Tests: tests/test_de_evidence_cohort.py.
-__version__ = "5.160.0"
+# v5.161.0 (2026-11-21): [MARKET-HOLD] + [SELECTION] (see WHY v5.161.0). A
+#   still-INVESTABLE row whose market is not calm (core.market_condition
+#   1.0.0), or a share without an analyst consensus >= 15% over its price at
+#   risk < 30, is tagged (observe) or demoted to WATCHLIST (enforce).
+#   TFB_MARKET_GATE / TFB_SELECTION_GATE default off = byte-identical.
+#   Tests: tests/test_de_market_and_selection_gate.py,
+#   tests/test_market_condition.py.
+__version__ = "5.161.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -6488,6 +6554,13 @@ def surface_gate_states() -> Dict[str, Any]:
             "evidence_gate": _evidence_gate_mode(),                    # v5.160.0
             "evidence_cohorts": _evidence_cohorts_label(),             # v5.160.0
             "conservative_floor": _conservative_gate_score_floor(),    # v5.160.0 (v5.81.0 knob)
+            "market_gate": _market_gate_mode(),                        # v5.161.0
+            "market_gate_hold": _market_gate_hold_label(),             # v5.161.0
+            "market_gate_markets": _market_gate_markets_label(),       # v5.161.0
+            "market_labels": _market_labels_state(),                   # v5.161.0 ({} while off)
+            "selection_gate": _selection_gate_mode(),                  # v5.161.0
+            "selection_min_upside_pp": _selection_min_upside_pp(),     # v5.161.0
+            "selection_max_risk": _selection_max_risk(),               # v5.161.0
         }
     except Exception:
         return {}
@@ -7639,6 +7712,220 @@ def _evidence_cohorts_label() -> str:
         return ""
 
 
+# -- v5.161.0 [MARKET-HOLD] + [SELECTION] (see WHY v5.161.0) -------------------
+_MARKET_GATE_HOLD_DEFAULT: str = "weak,stress,drawdown,crash_day"
+_MARKET_GATE_HOLDABLE = ("crash_day", "drawdown", "stress", "weak")   # 'calm' can never hold
+_MARKET_GATE_MARKETS_DEFAULT: str = "us,sa,eu,jp,cn"
+_MARKET_GATE_KNOWN_MARKETS = ("us", "sa", "eu", "jp", "cn")           # core.market_condition.MARKETS
+_MARKET_HOLD_TAG: str = "market_hold_watch"   # substring-safe (no cap/forecast/target/roi/drop/reject)
+_SELECTION_TAG: str = "selection_watch"        # substring-safe, as above
+_SELECTION_MIN_UPSIDE_DEFAULT: float = 15.0    # analyst consensus over the price, percent points
+_SELECTION_MAX_RISK_DEFAULT: float = 30.0      # risk_score 0-100; a row AT the limit fails
+# instruments no stock-market condition or analyst consensus describes (the
+# v5.79.1 / v5.101.0 exemption words plus the two classes they never needed)
+_MARKET_HOLD_EXEMPT_TOKENS: Tuple[str, ...] = (
+    "commodity", "fx", "currency", "forex", "index", "fixed income", "sukuk", "bond", "crypto", "future")
+_SELECTION_EXEMPT_TOKENS: Tuple[str, ...] = _GATE_FUNDAMENTALS_EXEMPT_TOKENS + ("crypto", "future")
+_MC_MODULE: Any = None
+
+
+def _gate_mode_of(env_name: str) -> str:
+    """v5.161.0: off (default, also any unknown word) | observe | enforce - the
+    v5.160.0 vocabulary. Never raises."""
+    raw = (os.getenv(env_name) or "").strip().lower()
+    if raw in {"enforce", "on", "1", "true", "yes"}:
+        return "enforce"
+    if raw in {"observe", "shadow"}:
+        return "observe"
+    return "off"
+
+
+def _market_gate_mode() -> str:
+    """v5.161.0: TFB_MARKET_GATE."""
+    return _gate_mode_of("TFB_MARKET_GATE")
+
+
+def _selection_gate_mode() -> str:
+    """v5.161.0: TFB_SELECTION_GATE."""
+    return _gate_mode_of("TFB_SELECTION_GATE")
+
+
+def _market_gate_hold_labels() -> frozenset:
+    """v5.161.0: TFB_MARKET_GATE_HOLD, a comma list of the labels that hold a
+    market. Unset -> weak,stress,drawdown,crash_day (calm only buys); set but
+    blank -> nothing holds; an unknown word and 'calm' are skipped."""
+    raw = os.getenv("TFB_MARKET_GATE_HOLD")
+    if raw is None:
+        raw = _MARKET_GATE_HOLD_DEFAULT
+    words = (p.strip().lower() for p in str(raw).split(","))
+    return frozenset(w for w in words if w in _MARKET_GATE_HOLDABLE)
+
+
+def _market_gate_hold_label() -> str:
+    try:
+        return ",".join(w for w in _MARKET_GATE_HOLDABLE if w in _market_gate_hold_labels())
+    except Exception:
+        return ""
+
+
+def _market_gate_markets() -> frozenset:
+    """v5.161.0: TFB_MARKET_GATE_MARKETS, a comma list of the market ids the
+    hold covers. Unset -> us,sa,eu,jp,cn; set but blank -> none (the hold then
+    cannot fire); an unknown id is skipped."""
+    raw = os.getenv("TFB_MARKET_GATE_MARKETS")
+    if raw is None:
+        raw = _MARKET_GATE_MARKETS_DEFAULT
+    words = (p.strip().lower() for p in str(raw).split(","))
+    return frozenset(w for w in words if w in _MARKET_GATE_KNOWN_MARKETS)
+
+
+def _market_gate_markets_label() -> str:
+    try:
+        return ",".join(w for w in _MARKET_GATE_KNOWN_MARKETS if w in _market_gate_markets())
+    except Exception:
+        return ""
+
+
+def _selection_min_upside_pp() -> float:
+    """v5.161.0: TFB_SELECTION_MIN_UPSIDE in percent points (15) or as a
+    fraction (0.15 -> 15); not a positive number -> 15."""
+    v = _get_env_float("TFB_SELECTION_MIN_UPSIDE", _SELECTION_MIN_UPSIDE_DEFAULT)
+    if not (isinstance(v, float) and math.isfinite(v) and v > 0):
+        return _SELECTION_MIN_UPSIDE_DEFAULT
+    return round(v * 100.0, 4) if v < 1.0 else v
+
+
+def _selection_max_risk() -> float:
+    """v5.161.0: TFB_SELECTION_MAX_RISK, risk_score 0-100 (a row AT the limit
+    fails); outside (0, 100] -> 30."""
+    v = _get_env_float("TFB_SELECTION_MAX_RISK", _SELECTION_MAX_RISK_DEFAULT)
+    if not (isinstance(v, float) and math.isfinite(v) and 0 < v <= 100):
+        return _SELECTION_MAX_RISK_DEFAULT
+    return v
+
+
+def _market_condition_module() -> Any:
+    """v5.161.0: core.market_condition, imported on first use; None when it
+    cannot be imported (the hold then never fires - fail-open)."""
+    global _MC_MODULE
+    if _MC_MODULE is None:
+        try:
+            from core import market_condition as _mc  # stdlib only; reads nothing at import
+            _MC_MODULE = _mc
+        except Exception:
+            _MC_MODULE = False
+    return _MC_MODULE or None
+
+
+def _row_asset_words(row: Dict[str, Any]) -> Tuple[str, str]:
+    return (_safe_str(row.get("asset_class")).lower(), _safe_str(row.get("industry")).strip().lower())
+
+
+def _market_hold_of(row: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """v5.161.0: (market id, label, text) when the row's stock market currently
+    carries a holding label; None otherwise - a commodity / currency / index /
+    bond / sukuk / crypto / future row, a symbol of no read market, a market
+    not read yet or not read for 12 hours, a calm market. Never raises; never
+    waits on the network (core.market_condition refreshes in the background)."""
+    try:
+        asset_class, _industry = _row_asset_words(row)
+        if any(tok in asset_class for tok in _MARKET_HOLD_EXEMPT_TOKENS):
+            return None
+        mc = _market_condition_module()
+        if mc is None:
+            return None
+        mid = mc.market_of(row.get("symbol"))
+        if not mid or mid not in _market_gate_markets():
+            return None
+        info = mc.labels().get(mid)
+        if not info:
+            return None
+        label = str(info.get("label") or "")
+        if label not in _market_gate_hold_labels():
+            return None
+        return mid, label, str(info.get("text") or "%s %s" % (mid, label))
+    except Exception:
+        return None
+
+
+def _market_labels_state() -> Dict[str, Any]:
+    """v5.161.0: the labels known in this process for surface_gate_states;
+    {} while the market gate is off (nothing imported, nothing read)."""
+    try:
+        if _market_gate_mode() == "off":
+            return {}
+        mc = _market_condition_module()
+        return mc.state() if mc is not None else {}
+    except Exception:
+        return {}
+
+
+def _selection_applies(row: Dict[str, Any]) -> bool:
+    """v5.161.0: a company share - not an ETF / fund / commodity / currency /
+    index / bond / sukuk / crypto / future (asset class word or a fund-vehicle
+    industry label); a blank asset class counts as a share, as in the v5.79.1
+    fundamentals rule."""
+    asset_class, industry = _row_asset_words(row)
+    return not (any(tok in asset_class for tok in _SELECTION_EXEMPT_TOKENS)
+                or industry in _GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES)
+
+
+def _selection_check(row: Dict[str, Any], price: Optional[float]) -> Tuple[List[str], List[str]]:
+    """v5.161.0: (reasons, tag codes) for a share that fails the selection
+    rule: no analyst consensus price (target_mean_price, else the projected
+    target_price) or no price; consensus under TFB_SELECTION_MIN_UPSIDE above
+    the price; risk_score at or over TFB_SELECTION_MAX_RISK (a row without a
+    risk score passes that test, as the v5.81.0 risk cap does)."""
+    fails: List[str] = []
+    codes: List[str] = []
+    min_up = _selection_min_upside_pp()
+    max_rk = _selection_max_risk()
+    tgt = _as_float(row.get("target_mean_price"))
+    if tgt is None or tgt <= 0:
+        tgt = _as_float(row.get("target_price"))
+    if tgt is None or tgt <= 0 or price is None or price <= 0:
+        fails.append("no analyst consensus price")
+        codes.append("no_analyst_px")
+    else:
+        up = round((tgt / price - 1.0) * 100.0, 4)
+        if up < min_up:
+            fails.append("analyst upside %.1f%% < %g%%" % (up, min_up))
+            codes.append("upside_lt%g" % min_up)
+    rk = _as_float(row.get("risk_score"))
+    if rk is not None and rk >= max_rk:
+        fails.append("risk %.0f >= %g" % (rk, max_rk))
+        codes.append("risk_ge%g" % max_rk)
+    return fails, codes
+
+
+def _gate_watch_set(row: Dict[str, Any], family: str, tag: str) -> None:
+    """v5.161.0: keep at most ONE '<family>:...' warning on the row, in place.
+    tag '' removes the family's tags; a tag equal to the present one changes
+    nothing (a repeat pass is byte-identical); a different one replaces the
+    first in its position. Only called while the family's gate is armed."""
+    if not isinstance(row, dict):
+        return
+    parts = _mpc_warning_parts(row)
+    prefix = family + ":"
+    have = [p for p in parts if p.startswith(prefix)]
+    if not have and not tag:
+        return
+    if have == [tag]:
+        return
+    out: List[str] = []
+    placed = False
+    for p in parts:
+        if p.startswith(prefix):
+            if tag and not placed:
+                out.append(tag)
+                placed = True
+            continue
+        out.append(p)
+    if tag and not placed:
+        out.append(tag)
+    row["warnings"] = "; ".join(out)
+
+
 def _thin_history_guard_enabled() -> bool:
     """v5.82.0 (Fix W): master switch for the IPO / thin-history caution
     (default ON). Set TFB_THIN_HISTORY_GUARD to 0/false/off to disable."""
@@ -8738,6 +9025,44 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
                           "hit rate on matured records" % _ev_cohort)
             else:
                 _v573_append_warning(row, _EVIDENCE_OBSERVE_TAG + ":" + _ev_cohort.lower())
+
+    # -- v5.161.0 [MARKET-HOLD] (see WHY v5.161.0): no new buy in a market that
+    # is not calm. DEMOTE-only, after the evidence tier. off (default) ->
+    # nothing read, byte-identical; observe -> the substring-safe warning
+    # market_hold_watch:<market>_<label>, verdict unchanged; enforce ->
+    # WATCHLIST with "Market on hold: ...". A market with no label (not read
+    # yet, not read for 12 hours, not one of the five) never holds.
+    _mh_mode = _market_gate_mode()
+    if _mh_mode != "off":
+        _mh_tag = ""
+        if status == "INVESTABLE" and action == "INVEST":
+            _mh = _market_hold_of(row)
+            if _mh is not None:
+                if _mh_mode == "enforce":
+                    status, action = "WATCHLIST", "WATCH"
+                    reason = "Market on hold: %s" % _mh[2]
+                else:
+                    _mh_tag = "%s:%s_%s" % (_MARKET_HOLD_TAG, _mh[0], _mh[1])
+        _gate_watch_set(row, _MARKET_HOLD_TAG, _mh_tag)
+
+    # -- v5.161.0 [SELECTION] (see WHY v5.161.0): a share is INVESTABLE only
+    # with an analyst consensus at least TFB_SELECTION_MIN_UPSIDE (15%) above
+    # the price and a risk score under TFB_SELECTION_MAX_RISK (30). DEMOTE-only,
+    # shares only (funds, commodities, currencies, indices, bonds, sukuk,
+    # crypto and futures carry no consensus); same off / observe / enforce
+    # contract; observe tag selection_watch:<codes>.
+    _sel_mode = _selection_gate_mode()
+    if _sel_mode != "off":
+        _sel_tag = ""
+        if status == "INVESTABLE" and action == "INVEST" and _selection_applies(row):
+            _sel_fails, _sel_codes = _selection_check(row, cp)
+            if _sel_fails:
+                if _sel_mode == "enforce":
+                    status, action = "WATCHLIST", "WATCH"
+                    reason = "Selection gate: " + "; ".join(_sel_fails)
+                else:
+                    _sel_tag = _SELECTION_TAG + ":" + "+".join(_sel_codes)
+        _gate_watch_set(row, _SELECTION_TAG, _sel_tag)
 
     # -- v5.153.0 (WP-2b): settle-unresolved cap. Tag-driven (survives cache,
     # projection and a later switch of TFB_SETTLE_UNRESOLVED to off) and
