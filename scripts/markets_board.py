@@ -4,6 +4,28 @@ scripts/markets_board.py
 ================================================================================
 TFB Markets Board - the condition of every market, their order, and the score
 --------------------------------------------------------------------------------
+v1.2.0 (2026-11-21) - THE EVENTS AHEAD AND THEIR SCORECARD. Owner, 21 Nov 2026
+    11:03 Riyadh, item 5 of the build list: "News: a news reading per market;
+    forward event scenarios; momentum/surprise; influential figures of 19 Nov;
+    score every news signal." Two sections and one line, read from
+    v_event_scenarios, v_event_trial and v_event_trial_summary (views 1.21.0):
+    NEXT EVENT under the verdict - the first event ahead and what its earlier
+       ones did to the US and to oil;
+    7. EVENTS AHEAD - each Fed, ECB, Bank of Japan and OPEC+ meeting and each
+       tracked release of the next 14 days: the forecast, the chances of the
+       figure (above / in line / below, from the family's earlier figures), and
+       for the US, Saudi Arabia, oil, gold and bonds the median event-day move
+       of the earlier events with its middle 80 % band, the US move after a
+       figure above / below its forecast, the US chance of a big move, and the
+       market that moved most on such days; then the events of the last 7 days
+       against their band;
+    8. THE EVENTS SCORECARD - per family and for all, the backtest and the
+       forward test (from 23 Nov 2026): how often the band held (80 % for a true
+       band), whether the family's big-move chance beat any day's, how often the
+       direction after a figure held, whether the figure chances beat equal
+       thirds, with the reading of each period in one sentence.
+    Until views 1.21.0 are in BigQuery both sections say so and the rest of the
+    page is built all the same; any other refusal still fails the run.
 v1.1.0 (2026-11-21) - THE READY LIST AND THE SWITCH CHECK. Owner, 21 Nov 2026
     11:03 Riyadh, items 3 and 4 of the build list: "A ready list: each day the
     2-3 best qualified names from the top-ranked markets, each labelled with
@@ -93,7 +115,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts import news_board as nb
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -121,6 +143,20 @@ TRIAL_HEAD = ["Period", "Horizon", "Group", "Name-days", "Days", "Mean change %"
               "Rose %", "Worst 5 % %"]
 READY_N = 3
 PLAN_LABELS = ("crash_day", "drawdown", "stress", "weak", "calm")
+# 1.2.0: the events (views 1.21.0)
+EVENT_DAYS = 14                                         # the events of the next 14 days
+EVENT_BACK_DAYS = 7                                     # and the events of the last 7, against their band
+EVENT_MARKETS = ("us", "sa", "oil", "gold", "bonds")    # the markets shown beside each event
+EVENT_FORWARD_FROM = _dt.date(2026, 11, 23)             # v_event_trial: period 'forward' from 23 Nov 2026 (Riyadh)
+EVENT_HEAD = ["When (Riyadh)", "Event", "Forecast", "Previous", "Figure: above / in line / below %", "Earlier events",
+              "United States", "US if above / if below", "Saudi Arabia", "Oil", "Gold", "Bonds",
+              "US big-move chance %", "Moved most"]
+EVENT_LAST_HEAD = ["When (Riyadh)", "Event", "Figure", "Forecast", "Actual", "", "United States", "", "Saudi Arabia",
+                   "Oil", "Gold", "Bonds"]
+EVENT_TRIAL_HEAD = ["Period", "Family", "Events", "Band held %", "Band rows", "Big moves %", "Any day %",
+                    "Big-move skill", "Direction held %", "Direction rows", "Direction z", "Drift held %",
+                    "Drift rows", "Figure skill", "Figures", "Verdict"]
+EVENT_VIEWS = "v_event_scenarios, v_event_trial and v_event_trial_summary (apply_bq_views 1.21.0)"
 
 text, num, day, flag = nb.text, nb.num, nb.day, nb.flag
 
@@ -177,6 +213,39 @@ def sql_switch(ds: str) -> str:
 
 def sql_ready_trial(ds: str) -> str:
     return "SELECT * FROM `%s.v_ready_trial` ORDER BY period, horizon, grp" % ds
+
+
+def _ts(t: _dt.datetime) -> str:
+    """1.2.0: a moment for the SQL - a timezone-aware time, never 'now' inside the query."""
+    if not isinstance(t, _dt.datetime) or t.tzinfo is None:
+        raise ValueError("an aware time is needed")
+    return "TIMESTAMP '%s'" % t.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S+00")
+
+
+def sql_events_ahead(ds: str, now: _dt.datetime) -> str:
+    """1.2.0: the scenario of every event of the next EVENT_DAYS days, market by market."""
+    return ("SELECT event_id, family, family_name, kind, country, CAST(event_at AS STRING) AS event_at, period, "
+            "estimate, previous, market_order, market_id, market, n_prior, r1_p10, r1_p50, r1_p90, p_big, mean_abs_z, "
+            "n_above, n_below, r1_p50_above, r1_p50_below, n_fig, p_above, p_in_line, p_below "
+            "FROM `%s.v_event_scenarios` WHERE NOT is_out AND event_at >= %s "
+            "AND event_at < TIMESTAMP_ADD(%s, INTERVAL %d DAY) ORDER BY event_at, event_id, market_order"
+            % (ds, _ts(now), _ts(now), EVENT_DAYS))
+
+
+def sql_events_last(ds: str, now: _dt.datetime) -> str:
+    """1.2.0: the events of the last EVENT_BACK_DAYS days that are out, against their band, for the shown markets."""
+    return ("SELECT event_id, family_name, CAST(event_at AS STRING) AS event_at, figure, estimate, actual, market_id, "
+            "market_order, r1_pct, r1_p10, r1_p90, band_hit, move "
+            "FROM `%s.v_event_trial` WHERE event_at >= TIMESTAMP_SUB(%s, INTERVAL %d DAY) AND event_at < %s "
+            "AND market_id IN (%s) ORDER BY event_at DESC, event_id, market_order"
+            % (ds, _ts(now), EVENT_BACK_DAYS, _ts(now), ", ".join("'%s'" % m for m in EVENT_MARKETS)))
+
+
+def sql_events_summary(ds: str) -> str:
+    """1.2.0: the events scorecard, the all-markets lines of each family and of all families."""
+    return ("SELECT period, family, family_name, events, band_n, band_pct, big_n, big_pct, any_pct, big_skill, dir_n, "
+            "dir_pct, dir_z, drift_n, drift_pct, drift_z, fig_n, fig_skill, verdict "
+            "FROM `%s.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family" % ds)
 
 
 # ----------------------------------------------------------------------------- #
@@ -525,6 +594,203 @@ def trial_reading(trial: Sequence[Dict[str, Any]], period: str) -> str:
 
 
 # ----------------------------------------------------------------------------- #
+# 1.2.0: the events ahead, the last events and their scorecard (views 1.21.0)
+# ----------------------------------------------------------------------------- #
+def _at(v: Any) -> Optional[_dt.datetime]:
+    """A BigQuery TIMESTAMP as CAST(... AS STRING) gives it ('2026-11-29 12:00:00+00'), read to the minute, UTC."""
+    t = text(v)
+    try:
+        return _dt.datetime.strptime(t[:16], "%Y-%m-%d %H:%M").replace(tzinfo=UTC) if len(t) >= 16 else None
+    except ValueError:
+        return None
+
+
+def _when(v: Any) -> str:
+    t = _at(v)
+    if t is None:
+        return ""
+    r = t.astimezone(RIYADH)
+    return "%s %s" % (short_day(r.date(), year=False), r.strftime("%H:%M"))
+
+
+def _pp(v: Any) -> str:
+    x = num(v)
+    return "" if x is None else "%+.2f" % x
+
+
+def band_cell(r: Optional[Dict[str, Any]]) -> str:
+    """The median event-day move of the earlier events, with the middle 80 % band: '+0.12 (-0.81 .. +0.95)'."""
+    if not r or num(r.get("r1_p50")) is None:
+        return ""
+    return "%s (%s .. %s)" % (_pp(r.get("r1_p50")), _pp(r.get("r1_p10")), _pp(r.get("r1_p90")))
+
+
+def by_event(rows: Sequence[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]]:
+    """[(the event's first row, {market_id: row})], in the order the rows came."""
+    out: List[Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]] = []
+    seen: Dict[str, int] = {}
+    for r in rows:
+        eid = text(r.get("event_id"))
+        if not eid:
+            continue
+        if eid not in seen:
+            seen[eid] = len(out)
+            out.append((r, {}))
+        out[seen[eid]][1][text(r.get("market_id"))] = r
+    return out
+
+
+def event_name(r: Dict[str, Any]) -> str:
+    period = text(r.get("period"))
+    return text(r.get("family_name")) + (" - %s" % period if period else "")
+
+
+def figure_chances(r: Dict[str, Any]) -> str:
+    """The chances of the figure from the family's earlier figures: 'above 38 / in line 31 / below 31 (from 24)'."""
+    n = int(num(r.get("n_fig")) or 0)
+    if not n or num(r.get("p_above")) is None:
+        return "no forecast to read" if text(r.get("kind")) == "meeting" and num(r.get("estimate")) is None else ""
+    return "%d / %d / %d (from %d)" % (round(100 * num(r.get("p_above"))), round(100 * num(r.get("p_in_line"))),
+                                       round(100 * num(r.get("p_below"))), n)
+
+
+def after_figure(r: Optional[Dict[str, Any]]) -> str:
+    """The US median event-day move after a figure above / below its forecast, with the count: '-0.41 (9) / +0.38 (7)';
+    '' for a family with no figure on record (a meeting with no forecast)."""
+    if not r or not (int(num(r.get("n_above")) or 0) or int(num(r.get("n_below")) or 0)):
+        return ""
+    parts = []
+    for side in ("above", "below"):
+        n = int(num(r.get("n_" + side)) or 0)
+        parts.append("%s (%d)" % (_pp(r.get("r1_p50_" + side)), n) if n and num(r.get("r1_p50_" + side)) is not None
+                     else "none")
+    return " / ".join(parts)
+
+
+def moved_most(markets: Dict[str, Dict[str, Any]]) -> str:
+    best = max((r for r in markets.values() if num(r.get("mean_abs_z")) is not None),
+               key=lambda r: (num(r.get("mean_abs_z")), -(num(r.get("market_order")) or 99)), default=None)
+    return "" if best is None else "%s (%.1f normal days)" % (text(best.get("market")), num(best.get("mean_abs_z")))
+
+
+def event_rows(ahead: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    out = []
+    for first, mk in by_event(ahead):
+        us = mk.get("us")
+        n_prior = max((int(num(r.get("n_prior")) or 0) for r in mk.values()), default=0)
+        out.append([_when(first.get("event_at")), event_name(first), r2(first.get("estimate")),
+                    r2(first.get("previous")), figure_chances(first), n_prior,
+                    band_cell(us), after_figure(us), band_cell(mk.get("sa")), band_cell(mk.get("oil")),
+                    band_cell(mk.get("gold")), band_cell(mk.get("bonds")),
+                    "" if not us or num(us.get("p_big")) is None else round(100 * num(us.get("p_big"))),
+                    moved_most(mk)])
+    return out
+
+
+def last_cell(r: Optional[Dict[str, Any]]) -> str:
+    if not r or num(r.get("r1_pct")) is None:
+        return ""
+    hit = text(r.get("band_hit")).lower()
+    return "%s (%s)" % (_pp(r.get("r1_pct")), "inside the band" if hit == "true" else
+                        "OUTSIDE the band" if hit == "false" else "no band yet")
+
+
+def last_rows(last: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    out = []
+    for first, mk in by_event(last):
+        out.append([_when(first.get("event_at")), text(first.get("family_name")),
+                    text(first.get("figure")).replace("_", " ") or "no forecast", r2(first.get("estimate")),
+                    r2(first.get("actual")), "", last_cell(mk.get("us")), "", last_cell(mk.get("sa")),
+                    last_cell(mk.get("oil")), last_cell(mk.get("gold")), last_cell(mk.get("bonds"))])
+    return out
+
+
+def event_trial_rows(summary: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    out = []
+    for r in summary:
+        out.append([text(r.get("period")), text(r.get("family_name")), int(num(r.get("events")) or 0),
+                    r2(r.get("band_pct")), int(num(r.get("band_n")) or 0), r2(r.get("big_pct")), r2(r.get("any_pct")),
+                    r2(r.get("big_skill")), r2(r.get("dir_pct")), int(num(r.get("dir_n")) or 0), r2(r.get("dir_z")),
+                    r2(r.get("drift_pct")), int(num(r.get("drift_n")) or 0), r2(r.get("fig_skill")),
+                    int(num(r.get("fig_n")) or 0), text(r.get("verdict"))])
+    return out
+
+
+def event_reading(summary: Sequence[Dict[str, Any]], period: str) -> str:
+    """One sentence for `period` from its all-families line."""
+    line = next((r for r in summary if text(r.get("period")) == period and text(r.get("family")) == "all"), None)
+    n = int(num((line or {}).get("events")) or 0)
+    if period == "forward" and n < REVIEW_SESSIONS:
+        return ("EVENTS, FORWARD (from %s): %d event(s) scored so far - collecting; the owner reviews them with the "
+                "rest after %d sessions." % (short_day(EVENT_FORWARD_FROM), n, REVIEW_SESSIONS))
+    if not line:
+        return "EVENTS, %s: no event scored yet." % period.upper()
+    parts = []
+    band, band_n = num(line.get("band_pct")), int(num(line.get("band_n")) or 0)
+    if band is not None and band_n:
+        parts.append("the band of the earlier moves held %.0f %% of %d event-market rows (a true band holds 80 %%: %s)"
+                     % (band, band_n, "close" if 70 <= band <= 90 else "too narrow" if band < 70 else "too wide"))
+    big, anyp, skill = num(line.get("big_pct")), num(line.get("any_pct")), num(line.get("big_skill"))
+    if big is not None and anyp is not None and skill is not None:
+        parts.append("a big move came on %.0f %% of the event days against %.0f %% of any days, and the family's "
+                     "chance of one scored %+.2f against any day's (%s)" % (
+                         big, anyp, skill, "it told more" if skill > 0 else "it told nothing more"))
+    dn = int(num(line.get("dir_n")) or 0)
+    if dn and num(line.get("dir_pct")) is not None:
+        parts.append("the direction after a figure held %.0f %% of %d rows (z %+.2f)" % (
+            num(line.get("dir_pct")), dn, num(line.get("dir_z")) or 0.0))
+    else:
+        parts.append("no direction after a figure is scored yet")
+    fn, fs = int(num(line.get("fig_n")) or 0), num(line.get("fig_skill"))
+    if fn and fs is not None:
+        parts.append("the figure chances scored %+.2f against equal thirds over %d figures" % (fs, fn))
+    head = ("EVENTS, BACKTEST (the same rules read back on the archive, %d events)" % n if period == "backtest" else
+            "EVENTS, FORWARD (from %s, %d events)" % (short_day(EVENT_FORWARD_FROM), n))
+    return "%s: %s." % (head, "; ".join(parts))
+
+
+def next_event_line(ahead: Sequence[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """(what and when, what its earlier events did to the US and oil) for the first event ahead, or None."""
+    evs = by_event(ahead)
+    if not evs:
+        return None
+    first, mk = evs[0]
+    what = "%s, %s Riyadh" % (event_name(first), _when(first.get("event_at")))
+    bits = []
+    for m, word in (("us", "the US"), ("oil", "oil")):
+        r = mk.get(m)
+        if r and num(r.get("r1_p50")) is not None:
+            bits.append("%s moved a median %s %% (middle 80 %%: %s .. %s)" % (
+                word, _pp(r.get("r1_p50")), _pp(r.get("r1_p10")), _pp(r.get("r1_p90"))))
+    n = max((int(num(r.get("n_prior")) or 0) for r in mk.values()), default=0)
+    return what, ("on its %d earlier event(s) %s" % (n, " and ".join(bits)) if bits else
+                  "no earlier event of its kind to read yet")
+
+
+def _optional(session: Any, project: str, location: str, sql: str, query: Any) -> Optional[List[Dict[str, Any]]]:
+    """The rows of a view of apply_bq_views 1.21.0, or None while it is not in BigQuery yet (the sections say so and
+    the page is built all the same); any other refusal still fails the run."""
+    try:
+        return query(session, project, location, sql)
+    except RuntimeError as e:
+        if "Not found" not in text(e):
+            raise
+        _out("a view of apply_bq_views 1.21.0 is not in BigQuery yet: %s"
+             % sql.split("FROM `", 1)[1].split("`", 1)[0].rsplit(".", 1)[-1])
+        return None
+
+
+def event_counts(ahead: Optional[Sequence[Dict[str, Any]]], last: Optional[Sequence[Dict[str, Any]]],
+                 ev_summary: Optional[Sequence[Dict[str, Any]]]) -> str:
+    if ahead is None or last is None or ev_summary is None:
+        return "EVENTS: views 1.21.0 not in BigQuery yet"
+    return ("EVENTS ahead (%d days): %d event(s) with a scenario | last %d days: %d | event scorecard lines: backtest "
+            "%d, forward %d" % (EVENT_DAYS, len(by_event(ahead)), EVENT_BACK_DAYS, len(by_event(last)),
+                                sum(1 for r in ev_summary if text(r.get("period")) == "backtest"),
+                                sum(1 for r in ev_summary if text(r.get("period")) == "forward")))
+
+
+# ----------------------------------------------------------------------------- #
 # the page
 # ----------------------------------------------------------------------------- #
 HOW_TO = (
@@ -550,7 +816,10 @@ HOW_TO = (
 def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Sequence[Dict[str, Any]],
               built: str, ready: Sequence[Dict[str, Any]] = (), final: Optional[Dict[str, Tuple[str, str]]] = None,
               switch: Sequence[Dict[str, Any]] = (), trial: Sequence[Dict[str, Any]] = (),
-              rule: Optional[Dict[str, Any]] = None) -> List[List[Any]]:
+              rule: Optional[Dict[str, Any]] = None, events: Optional[Sequence[Dict[str, Any]]] = None,
+              last: Optional[Sequence[Dict[str, Any]]] = None,
+              ev_summary: Optional[Sequence[Dict[str, Any]]] = None) -> List[List[Any]]:
+    """1.2.0: events / last / ev_summary are None while views 1.21.0 are not in BigQuery (the sections say so)."""
     def line(*cells: Any) -> List[Any]:
         return (list(cells) + [""] * WIDTH)[:WIDTH]
 
@@ -572,6 +841,11 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
                  "v_market_rank | only the Today Action Plan gives orders" % (built, __version__, short_day(latest))),
             line("VERDICT", head, detail),
             line("US", us, "the Daily Plan holds a new US buy unless the US is calm (its own rule, unchanged)"),
+        ]
+        nxt = next_event_line(events or ())                                                     # 1.2.0
+        if nxt:
+            rows.append(line("NEXT EVENT", nxt[0], nxt[1] + " - section 7 has the next %d days" % EVENT_DAYS))
+        rows += [
             line(),
             line("1. THE MARKETS - open first, then the held ones, each group by trend score"),
             list(HEAD),
@@ -616,6 +890,38 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
     rows += [line(*r) for r in trial_rows(trial)] or [line("", "nothing has matured yet")]
     rows += [line(trial_reading(trial, p)) for p in PERIODS]
     rows.append(line())
+    # 1.2.0: the events ahead, the last events and their scorecard
+    rows.append(line("7. EVENTS AHEAD - the Fed, ECB, Bank of Japan and OPEC+ meetings and the tracked releases of the "
+                     "next %d days, each with what the earlier events of its kind did (v_event_scenarios: the median "
+                     "move on the event day, the middle 80 %% of those moves in brackets, in %%; for information - no "
+                     "order comes from this section)" % EVENT_DAYS))
+    if events is None:
+        rows.append(line("", "the event views are not in BigQuery yet: %s" % EVENT_VIEWS))
+    else:
+        rows.append(list(EVENT_HEAD) + [""] * (WIDTH - len(EVENT_HEAD)))
+        rows += [line(*r) for r in event_rows(events)] or [
+            line("", "no event with earlier ones of its kind in the next %d days" % EVENT_DAYS)]
+        rows.append(line("Figure = the release against its forecast, read against the family's own earlier misses "
+                         "(half of their usual size or more: above / below). US if above / if below = the median "
+                         "event-day move of the US after such a figure (the count in brackets). Big-move chance = how "
+                         "often the US moved a normal day's move or more on such days."))
+    rows.append(line("THE LAST %d DAYS - each event's move against its band (the middle 80 %% of the earlier moves)"
+                     % EVENT_BACK_DAYS))
+    if last is None:
+        rows.append(line("", "the event views are not in BigQuery yet: %s" % EVENT_VIEWS))
+    else:
+        rows.append(list(EVENT_LAST_HEAD) + [""] * (WIDTH - len(EVENT_LAST_HEAD)))
+        rows += [line(*r) for r in last_rows(last)] or [line("", "no event in the last %d days" % EVENT_BACK_DAYS)]
+    rows += [line(), line("8. THE EVENTS SCORECARD - each scenario against what came (v_event_trial_summary; a true "
+                          "band holds 80 %%; skill above 0 = better than any day's chance, or than equal thirds for "
+                          "the figure; z against a coin; forward from %s)" % short_day(EVENT_FORWARD_FROM))]
+    if ev_summary is None:
+        rows.append(line("", "the event views are not in BigQuery yet: %s" % EVENT_VIEWS))
+    else:
+        rows.append(list(EVENT_TRIAL_HEAD) + [""] * (WIDTH - len(EVENT_TRIAL_HEAD)))
+        rows += [line(*r) for r in event_trial_rows(ev_summary)] or [line("", "no event scored yet")]
+        rows += [line(event_reading(ev_summary, p)) for p in PERIODS]
+    rows.append(line())
     rows += [line(t) for t in HOW_TO]
     rows.append(line())
     return rows
@@ -647,14 +953,22 @@ def ready_counts(ready: Sequence[Dict[str, Any]], switch: Sequence[Dict[str, Any
                           ", ".join("%s %d" % kv for kv in sorted(states.items())) or "none", holdings, cands, len(trial)))
 
 
-def collect(session: Any, project: str, dataset: str, location: str, today: _dt.date, query: Any) -> Dict[str, Any]:
+def collect(session: Any, project: str, dataset: str, location: str, today: _dt.date, query: Any,
+            now: Optional[_dt.datetime] = None) -> Dict[str, Any]:
     ds = "%s.%s" % (project, dataset)
     days = by_day(query(session, project, location, sql_rank(ds, today)))
     summary = query(session, project, location, sql_summary(ds))
     ready = query(session, project, location, sql_ready(ds, today))                      # 1.1.0
     switch = query(session, project, location, sql_switch(ds))
     trial = query(session, project, location, sql_ready_trial(ds))
-    return {"days": days, "summary": summary, "ready": ready, "switch": switch, "trial": trial}
+    events = last = ev_summary = None                                                    # 1.2.0
+    if now is not None:
+        events = _optional(session, project, location, sql_events_ahead(ds, now), query)
+        if events is not None:
+            last = _optional(session, project, location, sql_events_last(ds, now), query)
+            ev_summary = _optional(session, project, location, sql_events_summary(ds), query)
+    return {"days": days, "summary": summary, "ready": ready, "switch": switch, "trial": trial, "events": events,
+            "last": last, "ev_summary": ev_summary}
 
 
 def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None, query=None) -> int:
@@ -680,14 +994,17 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         # 1.1.0: the Today Action Plan's own decision per stock, so the ready list never states another one
         final = read_final(_quota_call(lambda: _raw_read(book, FINAL_TAB, "A1:C400"), _SLEEP, _out,
                                        "reading %s" % FINAL_TAB))
-        data = collect(session, project, dataset, nb._env("TFB_BQ_LOCATION", "US"), now.astimezone(RIYADH).date(), query)
+        data = collect(session, project, dataset, nb._env("TFB_BQ_LOCATION", "US"), now.astimezone(RIYADH).date(), query,
+                       now=now)
     except Exception as e:  # noqa: BLE001 - one tab; a failed read leaves the previous tab in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
     _out("MARKETS %s" % counts(data["days"], data["summary"]))
     _out("%s | Final_Decisions: %d stock(s) read" % (ready_counts(data["ready"], data["switch"], data["trial"]), len(final)))
+    _out(event_counts(data["events"], data["last"], data["ev_summary"]))                  # 1.2.0
     page = page_rows(data["days"], data["summary"], now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M Riyadh"),
-                     data["ready"], final, data["switch"], data["trial"], plan_rule())
+                     data["ready"], final, data["switch"], data["trial"], plan_rule(), data["events"], data["last"],
+                     data["ev_summary"])
     if dry_run:
         _out("dry run: %d row(s) computed, nothing written" % len(page))
         return 0

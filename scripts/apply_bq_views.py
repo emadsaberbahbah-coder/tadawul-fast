@@ -2,8 +2,30 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.20.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.21.0 (program register C8, Phase 2)
 ================================================================================
+v1.21.0 (21 Nov 2026, the forward event scenarios). WHY (owner, 21 Nov 2026
+11:03 Riyadh, item 5 of the build list): "News: a news reading per market;
+forward event scenarios; momentum/surprise; influential figures of 19 Nov;
+score every news signal"; the design of 16 Nov 2026: each scenario carries
+its probability, is logged before the outcome and scored after it (Brier).
+Five new views, observe only, over econ_calendar (archive_econ_calendar
+1.0.0, a new source table): v_event_calendar (109) - the Fed, ECB, Bank of
+Japan and OPEC+ meetings on their official dates (2023-2027) and the tracked
+releases of the US, the euro area, Japan, China and Saudi Arabia, each figure
+against its forecast in units of the family's earlier misses (above / in line
+/ below); v_event_reactions (110) - each market's move from the close before
+an event to the first close after it, at each market's own close time, over 5
+closes, and after the event close, against its normal daily move;
+v_event_scenarios (111) - for each event, held or ahead, what the earlier
+events of its family did: the band of the event-day moves, the chance of a
+big move, the median move after a figure above / below its forecast, and the
+chances of the figure itself; v_event_trial (112) - each scenario against
+what came ('forward' from 23 Nov 2026); v_event_trial_summary (113) - the
+scorecard: the band against 80 %, the big-move chance against any day's, the
+direction and the drift after a figure against a coin, the figure chances
+against equal thirds. Research views: the live system never reads BigQuery.
+
 v1.20.0 (21 Nov 2026, the news by market and by person). WHY (owner, 21 Nov
 2026 11:03 Riyadh, item 5 of the build list): "News: a news reading per
 market; forward event scenarios; momentum/surprise; influential figures of
@@ -436,7 +458,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.20.0"
+__version__ = "1.21.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -459,7 +481,9 @@ MARKET_TABLES = frozenset({"market_series_daily"})
 DEEP_TABLES = frozenset({"symbol_bars_daily", "symbol_analyst_daily", "symbol_news"})
 # the table scripts/archive_news_themes.py merges (v1.14.0, the news loop; its 1.1.0 sources since v1.20.0)
 NEWS_TABLES = frozenset({"news_theme_daily", "news_entity_daily"})   # v1.20.0: the places and the people apart
-SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES
+# the change log scripts/archive_econ_calendar.py v1.0.0 appends (v1.21.0, the event scenarios)
+ECON_TABLES = frozenset({"econ_calendar"})
+SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")

@@ -2,8 +2,15 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.4.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.4.1 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.4.1 (2026-11-21) -- [FOMC-2027] THE FED'S REVISED 2027 SCHEDULE
+WHY: the Fed revised its tentative 2027 calendar on 12 Nov 2026 (federalreserve.gov, press release of that
+day): the 26-27 Oct 2027 meeting is for strategy and announces no decision, and the 7-8 Dec meeting moved to
+16-17 Nov. FOMC_DECISION_DAYS (read 28 Oct 2026) still held 27 Oct and 8 Dec 2027, so from October 2027 the
+gate would have named a rate decision on two days without one and missed 17 Nov. The list now ends 15 Sep,
+17 Nov 2027; nothing before 2027 changes. tests/test_bq_views.py checks it against v_event_calendar's FOMC days
+(views 1.21.0), which were written from the same pages.
 v1.4.0 (2026-11-19) -- [TRUCE-READ] FIGHTING BESIDE A TRADE TRUCE IS FIGHTING; A CEASEFIRE THAT IS BREAKING IS NOT EASING
 WHY (owner, 19 Nov 2026 16:09: "for what you are waiting for my decision go and select the best option"; the two
   readings v1.3.0 left open):
@@ -247,7 +254,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -350,12 +357,13 @@ GULF_ANCHORS = frozenset([
 
 # FOMC decision days (second day of each meeting; 14:00 America/New_York).
 # Source: federalreserve.gov calendar as summarised by fedratecalc.com, read
-# 28 Oct 2026 (2027 is the Fed's tentative schedule).
+# 28 Oct 2026 (2027 is the Fed's tentative schedule); v1.4.1: 2027 as the Fed
+# revised it on 12 Nov 2026 (no decision on 27 Oct; 8 Dec moved to 17 Nov).
 FOMC_DECISION_DAYS = (
     "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29",
     "2026-09-16", "2026-10-28", "2026-12-09",
     "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28",
-    "2027-09-15", "2027-10-27", "2027-12-08",
+    "2027-09-15", "2027-11-17",
 )
 FOMC_NAME_RE = re.compile(r"(fomc|interest rate decision|fed funds|federal funds|fed press conference|"
                           r"economic projections)", re.I)
