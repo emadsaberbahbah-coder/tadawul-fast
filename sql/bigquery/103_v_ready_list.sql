@@ -6,10 +6,16 @@
 -- page shows the same final decision; only the Today Action Plan gives
 -- orders." - "The Daily Plan's hold then works market by market. It follows
 -- the market an asset tracks, not the currency it trades in." Observe only.
--- QUALIFIED: a market-page row INVESTABLE with final action INVEST that meets
---   the Top 10 panel floors (reliability 70+, data quality 80+, no block
---   reason) - v_universe_latest's floors and v_hold_vs_switch's candidates;
---   one row per symbol and day (the day's last capture).
+-- QUALIFIED: the day's last copy of a name (the one captured last, whichever
+--   market page it is on) is INVESTABLE with final action INVEST and meets the
+--   Top 10 panel floors (reliability 70+, data quality 80+, no block reason) -
+--   v_universe_latest's floors, read the same way: the last copy first, then
+--   the floors, so a name whose last copy is blocked is out even when an
+--   earlier copy that day qualified (Codex P2, #1046).
+-- NOT A HOLDING: a name held that day (My_Portfolio's archived copy, a
+--   position above 0) is out - the ready list is for new money, like the Top
+--   10's gates and v_hold_vs_switch's candidates; the board's switch check
+--   compares each holding.
 -- THE MARKET IT TRACKS (a market_id of v_market_condition, first match wins):
 --   the market funds by name, listed in New York or without a suffix: KSA sa,
 --   VGK eu, EWJ jp, MCHI cn, GLD gold, IEF bonds, SPSK sukuk, VNQ reits_us;
@@ -41,9 +47,19 @@
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it. Observe only.
 CREATE OR REPLACE VIEW `{{DS}}.v_ready_list`
-OPTIONS (description = "TFB markets v1: one row per archived day and qualified name (INVESTABLE, INVEST, panel floors) - the market it tracks (not its currency), that market's state (v_market_rank: open / hold / not read), the day's ready order (open markets first, two names per market, then the market's rank and the name's expected return - the top 3 are the ready list), what it is waiting for, and the live US rule beside it. Observe only.")
+OPTIONS (description = "TFB markets v1: one row per archived day and qualified name (INVESTABLE, INVEST, panel floors, not held that day) - the market it tracks (not its currency), that market's state (v_market_rank: open / hold / not read), the day's ready order (open markets first, two names per market, then the market's rank and the name's expected return - the top 3 are the ready list), what it is waiting for, and the live US rule beside it. Observe only.")
 AS
-WITH u AS (
+WITH last_copy AS (
+  SELECT v.*
+  FROM `{{DS}}.v_universe` AS v
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, v.source_page) = 1
+),
+held AS (
+  SELECT DISTINCT p.snapshot_date, UPPER(p.symbol) AS symbol
+  FROM `{{DS}}.v_my_portfolio` AS p
+  WHERE p.position_qty > 0
+),
+u AS (
   SELECT
     v.snapshot_date,
     v.symbol,
@@ -58,12 +74,13 @@ WITH u AS (
     v.expected_roi_1m_pct,
     v.overall_score,
     UPPER(IFNULL(NULLIF(v.symbol_base, ''), REGEXP_EXTRACT(v.symbol, r'^([^.]+)'))) AS base
-  FROM `{{DS}}.v_universe` AS v
+  FROM last_copy AS v
+  LEFT JOIN held AS h ON h.snapshot_date = v.snapshot_date AND h.symbol = UPPER(v.symbol)
   WHERE UPPER(v.investability_status) = 'INVESTABLE'
     AND UPPER(v.final_action) = 'INVEST'
     AND COALESCE(v.reliability >= 70 AND v.data_quality >= 80, FALSE)
     AND v.block_reason IS NULL
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, v.source_page) = 1
+    AND h.symbol IS NULL
 ),
 mapped AS (
   SELECT

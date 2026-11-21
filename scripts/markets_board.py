@@ -13,11 +13,12 @@ v1.1.0 (2026-11-21) - THE READY LIST AND THE SWITCH CHECK. Owner, 21 Nov 2026
     holding's over the same period, after costs on both sides." Three sections
     are added, read from v_ready_list, v_hold_vs_switch and v_ready_trial
     (views 1.19.0):
-    4. THE READY LIST - every qualified name of the day in the ready order, the
-       market it tracks (not its currency) and that market's state, whether the
-       market rule and the live US rule would hold it, what it is waiting for,
-       and the Today Action Plan's own decision for it, copied from
-       Final_Decisions (so this page never states another decision).
+    4. THE READY LIST - every qualified name of the day in the ready order
+       (holdings are out: section 5 compares each), the market it tracks (not
+       its currency) and that market's state, whether the market rule and the
+       live US rule would hold it, what it is waiting for, and the Today Action
+       Plan's own decision for it, copied from Final_Decisions (so this page
+       never states another decision).
     5. THE SWITCH CHECK - each holding against the best qualified name of its
        market (v_hold_vs_switch: the forecast gap converted into what such a
        gap has been worth, both trades charged, the chance it ends ahead).
@@ -400,21 +401,34 @@ def switch_for(symbol: str, switch: Sequence[Dict[str, Any]]) -> Optional[Dict[s
 
 
 def waiting_text(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]]) -> str:
+    """What the name is waiting for. The Today Action Plan's decision is never contradicted: a BUY waits for nothing
+    (the market rule, observe only, is named beside it), and 'cash' is said only when that decision itself reports a
+    funding shortfall - any other WATCH or DO NOT INVEST keeps the plan's own reason (Codex P2, #1046)."""
     state = text(r.get("market_state"))
+    dec, do = final.get(text(r.get("symbol")).upper(), ("", ""))
+    unfunded = "not funded" in do.lower()
     if state == "hold":
-        return "a calmer market: %s is %s (%s)" % (text(r.get("market")), text(r.get("market_label")),
-                                                    text(r.get("market_waiting_for")) or "see section 1")
+        calmer = "a calmer market: %s is %s (%s)" % (text(r.get("market")), text(r.get("market_label")),
+                                                      text(r.get("market_waiting_for")) or "see section 1")
+        if dec == "BUY" and not unfunded:
+            return "nothing today: the Today Action Plan says BUY - %s (the market rule, observe only, would wait for %s)" % (
+                do or "see Final_Decisions", calmer)
+        return calmer
     if state != "open":
         return "a reading of its market: %s is not read yet" % (text(r.get("market_country")) or "its market")
     sw = switch_for(text(r.get("symbol")), switch)
     if sw:
         return "a switch: it would replace %s over %s (net %+.2f pp after both trades, chance %d %%) - the owner's review" % (
             text(sw.get("symbol")), text(sw.get("horizon")), num(sw.get("net_pp")) or 0.0, int(num(sw.get("chance_pct")) or 0))
-    dec, do = final.get(text(r.get("symbol")).upper(), ("", ""))
-    if dec == "BUY" and "not funded" not in do.lower():
+    if unfunded:
+        return "cash: %s" % do
+    if dec == "BUY":
         return "nothing: the Today Action Plan says BUY - %s" % (do or "see Final_Decisions")
-    return "cash: %s" % (do if "not funded" in do.lower() else
-                         "no free cash for it today (the Today Action Plan funds it when cash is free)")
+    if dec in ("HOLD", "SELL"):
+        return "nothing new: it is held - the Today Action Plan says %s - %s" % (dec, do or "see Final_Decisions")
+    if dec:
+        return "the Today Action Plan's own reason: %s - %s" % (dec, do or "see Final_Decisions")
+    return "a pick of today's plan: it is not on Final_Decisions (the plan has not picked it, so no cash is set for it)"
 
 
 def ready_row(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]],
@@ -564,7 +578,8 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
     day_txt = short_day(day(ready[0].get("snapshot_date"))) if ready else "none"
     in_ready = sum(1 for r in ready if flag(r.get("in_ready")))
     rows.append(line("4. THE READY LIST - the %d best qualified names of %s from the top-ranked markets (READY 1-%d), "
-                     "then every other qualified name in the same order; the decision is the Today Action Plan's own"
+                     "then every other qualified name in the same order (holdings are out: section 5 compares each); "
+                     "the decision is the Today Action Plan's own"
                      % (in_ready, day_txt, in_ready)))
     rows.append(line("Market rule = the hold read market by market (this page, observe only). Live US rule = the "
                      "Daily Plan's rule as configured (%s; %s; currencies %s). Only the Today Action Plan gives orders."

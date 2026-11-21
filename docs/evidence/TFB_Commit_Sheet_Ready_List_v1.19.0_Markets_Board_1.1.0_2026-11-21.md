@@ -27,7 +27,8 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
 ## What is built
 
 **`v_ready_list`** has one row per archived day and qualified name.
-- Qualified means: INVESTABLE, final action INVEST, and the Top 10 panel floors (reliability 70+, data quality 80+, no block reason). These are `v_universe_latest`'s floors. Each name has one row per day: the day's last capture.
+- Qualified means: the day's last copy of the name (captured last, whichever page it is on) is INVESTABLE, final action INVEST, and meets the Top 10 panel floors (reliability 70+, data quality 80+, no block reason). These are `v_universe_latest`'s floors, read the same way: the last copy first, then the floors. A name whose last copy is blocked is out, even if an earlier copy that day qualified (Codex P2 on #1046).
+- Not a holding: a name held that day (My_Portfolio's archived copy, a position above 0) is out. The ready list is for new money, like the Top 10's gates and `v_hold_vs_switch`'s candidates. Section 5 compares each holding.
 - The market a name tracks is read from the name, not its currency. First match wins:
   - the market funds by name: KSA, VGK, EWJ, MCHI, GLD, IEF, SPSK and VNQ (each to its market);
   - gold futures to gold, crude futures to oil;
@@ -42,7 +43,7 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
   - two names per market before any third;
   - then the market's rank, the name's 1-month expected return and its overall score.
   - The top 3 are the ready list.
-- Waiting for:
+- Waiting for (in the view):
   - "calmer market" when its market is on hold;
   - "cash or a switch" when its market is open;
   - "market not read".
@@ -66,12 +67,18 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
 
 **The Markets Board 1.1.0** adds three sections.
 - **4. The ready list.** Every qualified name in the ready order: its market and state, whether each rule would hold it, and what it is waiting for. The board also copies the Today Action Plan's own decision from `Final_Decisions`, so the page never states another decision. It reads that tab (A1:C400) and nothing else; it writes only `Markets_Board`.
+- **What it is waiting for never contradicts that decision** (Codex P2 on #1046):
+  - "cash" only when the plan's own words report a shortfall ("not funded");
+  - a BUY waits for nothing. In a held market the observe-only market rule is named beside it;
+  - any other WATCH or DO NOT INVEST keeps the plan's own reason;
+  - a held name reads "nothing new: it is held";
+  - a name not on `Final_Decisions` waits for a pick of today's plan.
 - **5. The switch check.**
 - **6. The scorecard**, with one sentence per period. The sentence first puts the ready list against the other qualified names, then each rule's held names against the ones it let through.
 
 ## Evidence (read 21 Nov 2026)
 
-**Today's ready list.** 23 names qualified on 21 Nov.
+**Today's ready list.** 22 names qualify on 21 Nov (one held name is out).
 - Every market is on hold, so all three ready names wait for a calmer market. They are one Tadawul name and two US REITs.
 - Five qualified names are in markets that are not read yet.
 
@@ -81,25 +88,27 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
 
 | Group (backtest) | 1W: name-days / mean / vs median / rose | 2W: name-days / mean / vs median / rose |
 |---|---|---|
-| All qualified | 1,174 / -0.36% / -0.23 / 50.2% | 746 / -1.06% / +0.22 / 39.3% |
-| Live US rule holds it | 746 / **-0.96%** / -0.86 / 44.1% | 463 / **-2.52%** / -1.20 / 25.7% |
+| All qualified | 1,148 / -0.44% / -0.30 / 50.2% | 729 / -1.11% / +0.14 / 39.5% |
+| Live US rule holds it | 720 / **-1.11%** / -1.00 / 43.9% | 446 / **-2.66%** / -1.38 / 25.6% |
 | Live US rule does not | 428 / **+0.69%** / +0.86 / 60.7% | 283 / **+1.35%** / +2.53 / 61.5% |
-| Market rule holds it | 788 / **-0.72%** / -0.61 / 45.8% | 492 / **-1.76%** / -0.45 / 32.5% |
-| Market rule does not | 386 / **+0.38%** / +0.54 / 59.1% | 254 / **+0.30%** / +1.51 / 52.4% |
-| Market open | 259 / +0.45% / +0.64 / 60.6% | 160 / -0.34% / +0.97 / 46.3% |
+| Market rule holds it | 768 / **-0.84%** / -0.73 / 45.8% | 479 / **-1.86%** / -0.58 / 32.4% |
+| Market rule does not | 380 / **+0.38%** / +0.56 / 58.9% | 250 / **+0.33%** / +1.52 / 53.2% |
+| Market open | 253 / +0.45% / +0.67 / 60.5% | 156 / -0.31% / +0.98 / 47.4% |
 | Market not read | 127 / +0.23% / +0.34 / 55.9% | 94 / +1.39% / +2.43 / 62.8% |
-| Ready list (top 3) | 43 / **-1.41%** / -0.64 / 27.9% | 22 / -1.27% / -0.04 / 36.4% |
-| Other qualified | 1,131 / -0.32% / -0.22 / 51.0% | 724 / -1.05% / +0.22 / 39.4% |
+| Ready list (top 3) | 43 / **-1.73%** / -0.97 / 23.3% | 22 / -1.27% / -0.04 / 36.4% |
+| Other qualified | 1,105 / -0.39% / -0.28 / 51.2% | 707 / -1.10% / +0.14 / 39.6% |
 
-Worst 5% over 1W: the live US rule's held names -10.83%, the ones it let through -6.73%; the market rule's -10.45% and -6.44%.
+Worst 5% over 1W: the live US rule's held names -10.95%, the ones it let through -6.73%; the market rule's -10.82% and -6.51%.
+
+The last-copy fix changed no figure on this archive; leaving holdings out changed the table above (the first draft counted them).
 
 **What the first read says, plainly.**
 - Both holds kept out the weaker names on these 15 days.
-- The live US rule separated them more than the market rule: 1.65 pp against 1.10 pp over 1W, and 3.87 pp against 2.06 pp over 2W. So the market-by-market rule has **not** shown it is better than the rule that is live.
-- The ready list's names did **worse** than the other qualified names: -1.41% against -0.32% over 1W, and only 28% rose. This matches the forecast baselines (IC -0.04; 1-month targets +2.99% against +0.66% realised). Ordering by expected return does not yet pick the stronger names.
+- The live US rule separated them more than the market rule: 1.80 pp against 1.22 pp over 1W, and 4.01 pp against 2.19 pp over 2W. So the market-by-market rule has **not** shown it is better than the rule that is live.
+- The ready list's names did **worse** than the other qualified names: -1.73% against -0.39% over 1W, and only 23% rose. This matches the forecast baselines (IC -0.04; 1-month targets +2.99% against +0.66% realised). Ordering by expected return does not yet pick the stronger names.
 - Fifteen days in one falling market is a first look, not a test. Nothing is switched on. The forward test from 23 Nov and the owner's review after 10 sessions decide.
 
-**Speed.** `v_ready_trial` with every view under it reads in under two minutes (486 MB, about 370 slot-seconds). The board's one-day read of the ready list is fast. The market scorecard (#1045) reads in under a minute.
+**Speed.** `v_ready_trial` with every view under it read in under two minutes on 21 Nov (486 MB), inside the board's 300-second wait. The board's one-day read of the ready list is fast. The market scorecard (#1045) reads in under a minute.
 
 ## The forward test
 
@@ -123,8 +132,9 @@ Worst 5% over 1W: the live US rule's held names -10.83%, the ones it let through
   - A failed `Final_Decisions` read.
   - The plan env in `markets_board.yml` equals `daily_plan.yml`'s.
   - A tie reads "no difference", and a missing mean makes no claim.
+  - The waiting words for every decision kind: cash only on "not funded"; the plan's own reason otherwise; a BUY in a held market. Seven mutants of `waiting_text` were run; all were killed.
 - `tests/test_bq_views.py`:
-  - V46 checks `v_ready_list`: the floors against `v_universe_latest`, every market fund of `v_market_condition` mapped to its market, the same REIT codes, equality joins only, the ready order, and the live rule against `daily_plan.yml`'s defaults.
+  - V46 checks `v_ready_list`: the last copy before the floors, the floors against `v_universe_latest`, holdings out (the same test as `v_hold_vs_switch`), every market fund of `v_market_condition` mapped to its market, the same REIT codes, equality joins only, the ready order, and the live rule against `daily_plan.yml`'s defaults.
   - V47 checks `v_ready_trial`: the outcome columns of `v_forward_universe`, the five groupings, one pass, the exact percentile, the forward date shared with the market trial and the board, and every group the board's sentence names.
   - V45 checks the file order through 104. The two PENDING pins are set.
 - The CI lean lane ran locally (counts in the PR).

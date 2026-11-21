@@ -108,13 +108,13 @@ def trow(period, h, grp, n, m, ex, up=50, p5=-4.0, days=15):
             "mean_excess_pp": str(ex), "up_pct": str(up), "p5_ret_pp": str(p5)}
 
 
-TRIAL = [trow("backtest", "1W", "all qualified", 1174, -0.36, -0.23),            # the first read, 21 Nov 2026
+TRIAL = [trow("backtest", "1W", "all qualified", 1148, -0.44, -0.30),            # the first read, 21 Nov 2026
          trow("backtest", "1W", "live US rule does not", 428, 0.69, 0.86),
-         trow("backtest", "1W", "live US rule holds it", 746, -0.96, -0.86),
-         trow("backtest", "1W", "market rule does not", 386, 0.38, 0.54),
-         trow("backtest", "1W", "market rule holds it", 788, -0.72, -0.61),
-         trow("backtest", "1W", "other qualified", 1131, -0.32, -0.22),
-         trow("backtest", "1W", "ready list (top 3)", 43, -1.41, -0.64)]
+         trow("backtest", "1W", "live US rule holds it", 720, -1.11, -1.00),
+         trow("backtest", "1W", "market rule does not", 380, 0.38, 0.56),
+         trow("backtest", "1W", "market rule holds it", 768, -0.84, -0.73),
+         trow("backtest", "1W", "other qualified", 1105, -0.39, -0.28),
+         trow("backtest", "1W", "ready list (top 3)", 43, -1.73, -0.97)]
 
 
 def payload(rows):
@@ -370,13 +370,13 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert page[sw_head + 1][3] == "1M" and page[sw_head + 2][3:10] == ["1M", 1.2, "CCC.HK", 3.4, 1.25, 66.0,
                                                                        "proven signal"]
     tr_head = page.index(mb.TRIAL_HEAD + [""] * (mb.WIDTH - len(mb.TRIAL_HEAD)))
-    assert page[tr_head + 1][:9] == ["backtest", "1W", "all qualified", 1174, 15, -0.36, -0.23, 50.0, -4.0]
+    assert page[tr_head + 1][:9] == ["backtest", "1W", "all qualified", 1148, 15, -0.44, -0.3, 50.0, -4.0]
     ready_text = [t for t in texts if t.startswith("READY LIST, BACKTEST")][0]
-    assert ready_text == ("READY LIST, BACKTEST: the ready list's names moved -1.41 % in the next week against -0.32 % "
-                          "for the other qualified names (43 and 1131 name-days) - it picked the weaker ones; the names "
-                          "the market rule held moved -0.72 % in the next week against +0.38 % for the ones it let "
-                          "through (788 and 386 name-days) - it held the weaker ones; the names the live US rule held "
-                          "moved -0.96 % in the next week against +0.69 % for the ones it let through (746 and 428 "
+    assert ready_text == ("READY LIST, BACKTEST: the ready list's names moved -1.73 % in the next week against -0.39 % "
+                          "for the other qualified names (43 and 1105 name-days) - it picked the weaker ones; the names "
+                          "the market rule held moved -0.84 % in the next week against +0.38 % for the ones it let "
+                          "through (768 and 380 name-days) - it held the weaker ones; the names the live US rule held "
+                          "moved -1.11 % in the next week against +0.69 % for the ones it let through (720 and 428 "
                           "name-days) - it held the weaker ones.")
     assert "READY LIST, FORWARD: nothing has matured yet" in " ".join(texts)
     out = capsys.readouterr().out
@@ -592,14 +592,38 @@ def test_m8_final_decisions_the_live_rule_and_the_waiting_words(monkeypatch):
     final = mb.read_final(FINALS)
     opened = rdy(1, "AAA.SR", "sa", "open", "calm", ccy="SAR")
     assert mb.waiting_text(opened, final, []) == "nothing: the Today Action Plan says BUY - Buy 12 at 31.5 (limit)"
-    assert mb.waiting_text(dict(opened, symbol="QQQ.SR"), final, []) == (
-        "cash: no free cash for it today (the Today Action Plan funds it when cash is free)")
+    assert mb.waiting_text(dict(opened, symbol="QQQ.SR"), final, []) == (                 # not picked: no cash claim
+        "a pick of today's plan: it is not on Final_Decisions (the plan has not picked it, so no cash is set for it)")
     assert mb.waiting_text(dict(opened, symbol="CCC.HK"), final, SWITCH).startswith("a switch: it would replace JJJ.US")
     keep_only = [r for r in SWITCH if r["verdict"] == "KEEP"]
-    assert mb.waiting_text(dict(opened, symbol="CCC.HK"), final, keep_only).startswith("cash: ")      # KEEP is no switch
+    assert mb.waiting_text(dict(opened, symbol="CCC.HK"), final, keep_only).startswith("a pick of today's plan")  # no switch
+    assert mb.waiting_text(dict(opened, symbol="BBB.US"), final, []) == (
+        "cash: Do not buy today: not funded (needs 9,000 SAR, 1,200 SAR left).")     # the plan's own shortfall: cash
+    # Codex P2 (#1046): every other WATCH / DO NOT INVEST keeps the plan's own reason - never 'cash'
+    other = mb.read_final(FINALS + [["VVV.US", "WATCH", "Do not buy yet: verify first - the quote is 3 days old."],
+                                    ["PPP.US", "WATCH", "Not today's pick: waiting for a seat."],
+                                    ["III.HK", "DO NOT INVEST", "Do not buy: the plan invalidated it today (stop)."],
+                                    ["NNN.US", "WATCH", ""],
+                                    ["FUN.US", "BUY", "Buy 5 shares; it is funded from the cash left."]])
+    assert mb.waiting_text(dict(opened, symbol="FUN.US"), other, []) == (             # only 'not funded' is a shortfall
+        "nothing: the Today Action Plan says BUY - Buy 5 shares; it is funded from the cash left.")
+    for sym, want in (("VVV.US", "the Today Action Plan's own reason: WATCH - Do not buy yet: verify first - the quote "
+                                 "is 3 days old."),
+                      ("PPP.US", "the Today Action Plan's own reason: WATCH - Not today's pick: waiting for a seat."),
+                      ("III.HK", "the Today Action Plan's own reason: DO NOT INVEST - Do not buy: the plan invalidated it "
+                                 "today (stop)."),
+                      ("NNN.US", "the Today Action Plan's own reason: WATCH - see Final_Decisions"),
+                      ("HHH.US", "nothing new: it is held - the Today Action Plan says HOLD - Keep the stop at 40")):
+        got = mb.waiting_text(dict(opened, symbol=sym), other, [])
+        assert got == want and "cash" not in got, (sym, got)
     held = rdy(4, "DDD.US", "reits_us", "hold", "drawdown")
     assert mb.waiting_text(dict(held, market_waiting_for=""), final, []) == (
         "a calmer market: US REITs is drawdown (see section 1)")
+    # a BUY in a held market waits for nothing: the decision stands, the observe-only market rule is named beside it
+    assert mb.waiting_text(dict(held, symbol="AAA.SR"), final, []) == (
+        "nothing today: the Today Action Plan says BUY - Buy 12 at 31.5 (limit) (the market rule, observe only, would "
+        "wait for a calmer market: US REITs is drawdown (x under its high))")
+    assert mb.waiting_text(dict(held, symbol="BBB.US"), final, []).startswith("a calmer market: ")  # unfunded, held
     assert mb.switch_rows(SWITCH)[0][:4] == ["HHH.US", "Name HHH.US", "KEEP", "1M"]       # no candidate: the 1-month row
     assert mb.switch_rows([sw("KKK.US", "3M", 4, "NO DATA", best=None)])[0][2:6] == ["NO DATA", "3M", 1.2, "none"]
     assert mb.trial_reading([], "backtest") == ("READY LIST, BACKTEST: nothing has matured yet - a name is scored a week "

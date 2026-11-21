@@ -282,7 +282,7 @@ INSTALLED = {
 PENDING = {
     # apply_bq_views 1.19.0 (21 Nov 2026): the ready list - every qualified name with the market it tracks, that
     # market's state, the day's ready order - and its scorecard on the names (observe only)
-    "v_ready_list": "19cc686ac4ccb440e72fe0121c990a43b1a944281cc4ada97168b2829ff7fe22",
+    "v_ready_list": "16acc91e12959ecd1b7b092a03f6c605445a49c341daec9bdeb8285489c065c2",
     "v_ready_trial": "c1a6d83a31feae9a302dc814016ea6347e650566f398ee843aa355245b9dd468",
     # apply_bq_views 1.18.0 (21 Nov 2026): the condition of every market, their order, the forward test and its
     # scorecard (observe only)
@@ -3111,15 +3111,26 @@ def case_v46():
     assert v.path.name == "103_v_ready_list.sql" and v.kind == "VIEW"
     assert names.index("v_ready_list") == names.index("v_market_trial_summary") + 1
     code = bv._code(v.template)
-    assert set(bv._REF.findall(code)) - {"v_ready_list"} == {"v_universe", "v_market_rank"}
+    assert set(bv._REF.findall(code)) - {"v_ready_list"} == {"v_universe", "v_market_rank", "v_my_portfolio"}
+    # not a holding: a name held that day is out (the ready list is for new money, like v_hold_vs_switch's candidates)
+    for frag in ("FROM `{{DS}}.v_my_portfolio` AS p\n  WHERE p.position_qty > 0",
+                 "LEFT JOIN held AS h ON h.snapshot_date = v.snapshot_date AND h.symbol = UPPER(v.symbol)",
+                 "AND h.symbol IS NULL\n),"):
+        assert frag in code, frag
+    assert "p.position_qty > 0" in bv._code(objs["v_hold_vs_switch"].template)          # the same holdings test
     # qualified = INVESTABLE + INVEST + the floors of v_universe_latest, one row per name and day (the last capture)
     floors = "COALESCE({0}.reliability >= 70 AND {0}.data_quality >= 80, FALSE)"
     assert floors.format("v") in code and floors.format("r") in bv._code(objs["v_universe_latest"].template)
     for frag in ("WHERE UPPER(v.investability_status) = 'INVESTABLE'", "AND UPPER(v.final_action) = 'INVEST'",
-                 "AND v.block_reason IS NULL",
-                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, "
-                 "v.source_page) = 1"):
+                 "AND v.block_reason IS NULL"):
         assert frag in code, frag
+    # the day's last copy first, then the floors (Codex P2, #1046): a name whose last copy is blocked stays out
+    assert ("WITH last_copy AS (\n  SELECT v.*\n  FROM `{{DS}}.v_universe` AS v\n"
+            "  QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, "
+            "v.source_page) = 1\n),") in code
+    assert ("FROM last_copy AS v\n  LEFT JOIN held AS h ON h.snapshot_date = v.snapshot_date AND h.symbol = "
+            "UPPER(v.symbol)\n  WHERE UPPER(v.investability_status) = 'INVESTABLE'") in code
+    assert code.count("QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol") == 1 and code.count("v_universe`") == 1
     # the market a name tracks: every market fund of v_market_condition by name, the futures, the listings
     cond = bv._code(objs["v_market_condition"].template)
     ids = [m for _, m, _, _ in re.findall(r"STRUCT\((\d+)(?: AS market_order)?, '([a-z_]+)'(?: AS market_id)?, "
