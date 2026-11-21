@@ -332,7 +332,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # regime views); research views, nothing live reads them.
     # 2026-11-21 (manifest pin only): 1.17.0 -> 1.18.0 (v_market_condition, v_market_rank, v_market_trial,
     # v_market_trial_summary - the condition of every market, observe only; three-digit file numbers).
-    ("apply_bq_views", "1.18.0", "bigquery looker views"),
+    # 2026-11-21 (manifest pin only): 1.18.0 -> 1.19.0 (v_ready_list, v_ready_trial - the ready list and its
+    # scorecard on the names, observe only).
+    ("apply_bq_views", "1.19.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -362,7 +364,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("trial_labels", "1.0.0", "trial labels"),
     # 2026-11-21 (new script, pinned on arrival): the Markets_Board tab - the condition of every market, their
     # order by trend and risk and the scorecard of the forward test, read from the market views (observe only).
-    ("markets_board", "1.0.0", "markets board"),
+    ("markets_board", "1.1.0", "markets board"),   # 2026-11-21: v1.1.0 the ready list, the switch check
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     ("news_macro_gate", "1.4.0", "news macro gate"),   # 2026-11-19: v1.4.0 [TRUCE-READ]

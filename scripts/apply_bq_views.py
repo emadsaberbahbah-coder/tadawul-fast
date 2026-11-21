@@ -2,8 +2,32 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.18.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.19.0 (program register C8, Phase 2)
 ================================================================================
+v1.19.0 (21 Nov 2026, the ready list). WHY (owner, 21 Nov 2026 11:03 Riyadh,
+items 3 and 4 of the build list): "A ready list: each day the 2-3 best
+qualified names from the top-ranked markets, each labelled with what it is
+waiting for (cash / calmer market / switch)" and "The Daily Plan's hold then
+works market by market. It follows the market an asset tracks, not the
+currency it trades in." Two new views, observe only: v_ready_list (103) - on
+each archived day every qualified name (INVESTABLE, INVEST, the panel floors,
+not held that day; the day's last copy first, then the floors) with the
+market it tracks (the market funds by name, US REITs, Tadawul REITs,
+Hong Kong / China, Tokyo, Europe; anything else not read yet), that market's
+state that day, the ready order (open markets first, two names per market,
+then the market's rank and the name's 1-month expected return; the top 3 are
+the ready list), what it waits for, and the live US rule beside it;
+v_ready_trial (104) - what those names did over the next week and two weeks
+(v_forward_universe), by the state of their market, on and off the ready list,
+and held or not by each rule. First read (names of 31 Oct - 14 Nov, 1 week,
+a falling stretch; windows overlap): the names the live US rule held moved
+-1.11 % against +0.69 % for the others (720 and 428 name-days); the market
+rule's held names -0.84 % against +0.38 % (768 and 380); the ready list's 43
+name-days -1.73 % against -0.39 % for the other qualified names - the list
+is not proven. The worst 5 % is exact (PERCENTILE_CONT). The switch check of
+item 4 is v_hold_vs_switch (1.9.0), shown beside them by markets_board 1.1.0.
+Research views: the live system never reads BigQuery.
+
 v1.18.0 (21 Nov 2026, a condition reading for every market). WHY (owner, 21
 Nov 2026 11:03 Riyadh, the build list after the voice call): "A condition
 reading for every market, with the same tests as v_market_regime ... A daily
@@ -384,7 +408,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.18.0"
+__version__ = "1.19.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
