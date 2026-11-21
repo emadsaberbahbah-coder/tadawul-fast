@@ -288,7 +288,7 @@ PENDING = {
     "v_news_trial_summary": "832a7677fd5408d617fc36578d708cff344d76d24095db62544cdc432ee2039c",
     # apply_bq_views 1.19.0 (21 Nov 2026): the ready list - every qualified name with the market it tracks, that
     # market's state, the day's ready order - and its scorecard on the names (observe only)
-    "v_ready_list": "16acc91e12959ecd1b7b092a03f6c605445a49c341daec9bdeb8285489c065c2",
+    "v_ready_list": "64f7822e70358028b8a09392636d4775be69dba0678d93f7f18685a7a9e8a15e",
     "v_ready_trial": "c1a6d83a31feae9a302dc814016ea6347e650566f398ee843aa355245b9dd468",
     # apply_bq_views 1.18.0 (21 Nov 2026): the condition of every market, their order, the forward test and its
     # scorecard (observe only)
@@ -3170,6 +3170,17 @@ def case_v46():
                  "IF(t.market_id IS NULL OR k.state IS NULL, 'not read', k.state) AS market_state",
                  "MAX(IF(k.market_id = 'us', k.label, NULL)) OVER (PARTITION BY k.as_of) AS us_label"):
         assert frag in code, frag
+    # Codex P2 (#1048): the 6 days run from the market's own close, which v_market_rank carries up to 6 days, to the
+    # day - for the market and for the US label beside it - so a close 12 days old cannot pass
+    for frag in ("k.date AS market_close,",
+                 "MAX(IF(k.market_id = 'us', k.date, NULL)) OVER (PARTITION BY k.as_of) AS us_close",
+                 "SELECT DISTINCT as_of, us_label, us_close",
+                 "LEFT JOIN mk_day AS k ON k.as_of = d.as_of AND k.market_id = t.market_id\n"
+                 "    AND DATE_DIFF(t.snapshot_date, k.market_close, DAY) <= 6\n),",
+                 "IF(DATE_DIFF(t.snapshot_date, d.us_close, DAY) <= 6, d.us_label, NULL) AS us_label"):
+        assert frag in code, frag
+    rank = bv._code(objs["v_market_rank"].template)
+    assert "    c.*,\n" in rank and "JOIN c ON c.market_id = fl.market_id AND c.date = fl.session" in rank  # carries date
     # the ready order: open, then held, then not read; two names a market first; the market's rank; the name
     for frag in ("ROW_NUMBER() OVER (PARTITION BY j.snapshot_date, j.market_id\n"
                  "                       ORDER BY j.expected_roi_1m_pct DESC NULLS LAST, j.overall_score DESC NULLS "

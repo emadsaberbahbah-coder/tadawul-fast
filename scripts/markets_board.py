@@ -401,34 +401,51 @@ def switch_for(symbol: str, switch: Sequence[Dict[str, Any]]) -> Optional[Dict[s
 
 
 def waiting_text(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]]) -> str:
-    """What the name is waiting for. The Today Action Plan's decision is never contradicted: a BUY waits for nothing
-    (the market rule, observe only, is named beside it), and 'cash' is said only when that decision itself reports a
-    funding shortfall - any other WATCH or DO NOT INVEST keeps the plan's own reason (Codex P2, #1046)."""
+    """What the name is waiting for. The Today Action Plan's decision comes first and is never contradicted (Codex P2,
+    #1046 and #1048): a funded BUY waits for nothing, a HOLD or SELL is held, 'cash' is said only when that decision
+    itself reports a funding shortfall, and any other WATCH or DO NOT INVEST keeps the plan's own reason. The market
+    rule and the switch check, both observe only, follow it in brackets. Only a name the plan has not picked waits for
+    them: a calmer market, a reading of its market, or a switch."""
+    sym = text(r.get("symbol"))
     state = text(r.get("market_state"))
-    dec, do = final.get(text(r.get("symbol")).upper(), ("", ""))
+    dec, do = final.get(sym.upper(), ("", ""))
     unfunded = "not funded" in do.lower()
+    calmer = "a calmer market: %s is %s (%s)" % (text(r.get("market")), text(r.get("market_label")),
+                                                  text(r.get("market_waiting_for")) or "see section 1")
+    unread = "a reading of its market: %s is not read yet" % (text(r.get("market_country")) or "its market")
+    sw = switch_for(sym, switch)
+    figures = (text(sw.get("symbol")), text(sw.get("horizon")), num(sw.get("net_pp")) or 0.0,
+               int(num(sw.get("chance_pct")) or 0)) if sw else ()
+    swap = "it would replace %s over %s, net %+.2f pp after both trades, chance %d %%, the owner's review" % figures \
+        if sw else ""
+    if not dec:                                       # not picked by the plan: the observe-only rules are its wait
+        if state == "hold":
+            first = calmer
+        elif state != "open":
+            first = unread
+        elif sw:
+            return ("a switch: it would replace %s over %s (net %+.2f pp after both trades, chance %d %%) - the "
+                    "owner's review" % figures)
+        else:
+            return ("a pick of today's plan: it is not on Final_Decisions (the plan has not picked it, so no cash is "
+                    "set for it)")
+        return first + (" (the switch check, observe only: %s)" % swap if swap else "")
+    notes = []
     if state == "hold":
-        calmer = "a calmer market: %s is %s (%s)" % (text(r.get("market")), text(r.get("market_label")),
-                                                      text(r.get("market_waiting_for")) or "see section 1")
-        if dec == "BUY" and not unfunded:
-            return "nothing today: the Today Action Plan says BUY - %s (the market rule, observe only, would wait for %s)" % (
-                do or "see Final_Decisions", calmer)
-        return calmer
-    if state != "open":
-        return "a reading of its market: %s is not read yet" % (text(r.get("market_country")) or "its market")
-    sw = switch_for(text(r.get("symbol")), switch)
-    if sw:
-        return "a switch: it would replace %s over %s (net %+.2f pp after both trades, chance %d %%) - the owner's review" % (
-            text(sw.get("symbol")), text(sw.get("horizon")), num(sw.get("net_pp")) or 0.0, int(num(sw.get("chance_pct")) or 0))
-    if unfunded:
-        return "cash: %s" % do
-    if dec == "BUY":
-        return "nothing: the Today Action Plan says BUY - %s" % (do or "see Final_Decisions")
+        notes.append("the market rule, observe only, would wait for " + calmer)
+    elif state != "open":
+        notes.append("the market rule, observe only, waits for " + unread)
+    if swap:
+        notes.append("the switch check, observe only: " + swap)
+    tail = " (%s)" % "; ".join(notes) if notes else ""
+    if dec == "BUY" and not unfunded:
+        return "nothing%s: the Today Action Plan says BUY - %s%s" % (
+            " today" if state == "hold" else "", do or "see Final_Decisions", tail)
     if dec in ("HOLD", "SELL"):
-        return "nothing new: it is held - the Today Action Plan says %s - %s" % (dec, do or "see Final_Decisions")
-    if dec:
-        return "the Today Action Plan's own reason: %s - %s" % (dec, do or "see Final_Decisions")
-    return "a pick of today's plan: it is not on Final_Decisions (the plan has not picked it, so no cash is set for it)"
+        return "nothing new: it is held - the Today Action Plan says %s - %s%s" % (dec, do or "see Final_Decisions", tail)
+    if unfunded:
+        return "cash: %s%s" % (do, tail)
+    return "the Today Action Plan's own reason: %s - %s%s" % (dec, do or "see Final_Decisions", tail)
 
 
 def ready_row(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]],

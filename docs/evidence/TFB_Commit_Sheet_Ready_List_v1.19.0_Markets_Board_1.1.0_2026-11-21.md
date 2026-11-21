@@ -1,6 +1,6 @@
 # Commit sheet - the ready list, the switch check and their scorecard (21 Nov 2026)
 
-Branch `feat/ready-list-and-switch`, stacked on `feat/market-condition-readings` (#1045). Merge #1045 first. Observe only: shown and logged, it controls no buy.
+Branch `feat/ready-list-and-switch` (#1046), carried to main by `fix/carry-1046-to-main` (#1048): #1046 was merged into the #1045 branch four minutes after #1045 had gone to main, so it never reached main. #1048 adds the two Codex P2 fixes of its review (marked below). Observe only: shown and logged, it controls no buy.
 
 | File | Version |
 |---|---|
@@ -37,7 +37,8 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
   - Tadawul REITs (4330-4350, the same codes as the Saudi REIT index) to Saudi REITs, any other Tadawul name to Saudi Arabia;
   - Hong Kong, Shanghai and Shenzhen to China / Hong Kong; Tokyo to Japan; a European listing to Europe (Turkey excepted);
   - anything else is "not read" (Korea, Thailand, Canada, Mexico, Australia, India, Qatar ...).
-- The market's state is `v_market_rank` on that day. A weekend or a morning before the archive uses the last day read, 6 days old at most. The states are open, hold or not read.
+- The market's state is `v_market_rank` on that day. A weekend or a morning before the archive uses the last day read. The states are open, hold or not read.
+- The 6-day limit runs from the market's own close to the day, for the market and for the US label beside it (Codex P2 on #1048). `v_market_rank` already carries a close up to 6 days, so measuring from the ranking day could let a close 12 days old through when the archive lags. On the archive of 21 Nov no reading was older than 6 days (242 day-market pairs checked; the oldest was 3 days), so no row changes today.
 - The day's ready order:
   - open markets first, then held ones, then names whose market is not read;
   - two names per market before any third;
@@ -67,12 +68,13 @@ and, for both: "Everything starts in observe mode: shown and logged, but it cont
 
 **The Markets Board 1.1.0** adds three sections.
 - **4. The ready list.** Every qualified name in the ready order: its market and state, whether each rule would hold it, and what it is waiting for. The board also copies the Today Action Plan's own decision from `Final_Decisions`, so the page never states another decision. It reads that tab (A1:C400) and nothing else; it writes only `Markets_Board`.
-- **What it is waiting for never contradicts that decision** (Codex P2 on #1046):
+- **What it is waiting for never contradicts that decision** (Codex P2 on #1046 and #1048). The decision is read first:
   - "cash" only when the plan's own words report a shortfall ("not funded");
-  - a BUY waits for nothing. In a held market the observe-only market rule is named beside it;
+  - a funded BUY waits for nothing, whatever its market's state and even when the switch check names it;
   - any other WATCH or DO NOT INVEST keeps the plan's own reason;
   - a held name reads "nothing new: it is held";
-  - a name not on `Final_Decisions` waits for a pick of today's plan.
+  - the market rule and the switch check, both observe only, follow the decision in brackets;
+  - only a name not on `Final_Decisions` waits for them: a calmer market, a reading of its market, a switch, or a pick of today's plan.
 - **5. The switch check.**
 - **6. The scorecard**, with one sentence per period. The sentence first puts the ready list against the other qualified names, then each rule's held names against the ones it let through.
 
@@ -133,16 +135,17 @@ The last-copy fix changed no figure on this archive; leaving holdings out change
   - The plan env in `markets_board.yml` equals `daily_plan.yml`'s.
   - A tie reads "no difference", and a missing mean makes no claim.
   - The waiting words for every decision kind: cash only on "not funded"; the plan's own reason otherwise; a BUY in a held market. Seven mutants of `waiting_text` were run; all were killed.
+  - #1048: the decision before the switch check and the market's reading - a funded BUY the switch check names, a BUY in a market not read, a DO NOT INVEST the switch check names, an unfunded name in a held market, and an unpicked name in a held market with a switch.
 - `tests/test_bq_views.py`:
-  - V46 checks `v_ready_list`: the last copy before the floors, the floors against `v_universe_latest`, holdings out (the same test as `v_hold_vs_switch`), every market fund of `v_market_condition` mapped to its market, the same REIT codes, equality joins only, the ready order, and the live rule against `daily_plan.yml`'s defaults.
+  - V46 checks `v_ready_list`: the 6 days measured from each market's own close (#1048), the last copy before the floors, the floors against `v_universe_latest`, holdings out (the same test as `v_hold_vs_switch`), every market fund of `v_market_condition` mapped to its market, the same REIT codes, equality joins only, the ready order, and the live rule against `daily_plan.yml`'s defaults.
   - V47 checks `v_ready_trial`: the outcome columns of `v_forward_universe`, the five groupings, one pass, the exact percentile, the forward date shared with the market trial and the board, and every group the board's sentence names.
   - V45 checks the file order through 104. The two PENDING pins are set.
 - The CI lean lane ran locally (counts in the PR).
 
 ## After the merge
 
-1. Merge #1045 first, then this PR.
-2. Run `bq_views.yml` mode `write` on main, then `verify`. Move the six PENDING pins (#1045's four and these two) to INSTALLED.
+1. #1045 is on main and its views are installed (21 Nov, 11:34 UTC, 70/70 match). Merge #1048.
+2. Run `bq_views.yml` mode `write` on main, then `verify`. Move the PENDING pins of the installed views to INSTALLED.
 3. The board then shows sections 4-6 on its next run. There is no Variable to set.
 
 ## Known limits

@@ -623,7 +623,29 @@ def test_m8_final_decisions_the_live_rule_and_the_waiting_words(monkeypatch):
     assert mb.waiting_text(dict(held, symbol="AAA.SR"), final, []) == (
         "nothing today: the Today Action Plan says BUY - Buy 12 at 31.5 (limit) (the market rule, observe only, would "
         "wait for a calmer market: US REITs is drawdown (x under its high))")
-    assert mb.waiting_text(dict(held, symbol="BBB.US"), final, []).startswith("a calmer market: ")  # unfunded, held
+    # Codex P2 (#1048): the decision first, the observe-only rules after it - an unfunded name in a held market
+    # waits for cash, as the plan says, and the market rule is named beside it
+    assert mb.waiting_text(dict(held, symbol="BBB.US"), final, []) == (
+        "cash: Do not buy today: not funded (needs 9,000 SAR, 1,200 SAR left). (the market rule, observe only, would "
+        "wait for a calmer market: US REITs is drawdown (x under its high))")
+    # a funded BUY that the switch check also names is still a BUY, and so is one in a market not read yet
+    buy_sw = mb.read_final(FINALS + [["CCC.HK", "BUY", "Buy 100 at 41.2 (limit)"]])
+    assert mb.waiting_text(dict(opened, symbol="CCC.HK"), buy_sw, SWITCH) == (
+        "nothing: the Today Action Plan says BUY - Buy 100 at 41.2 (limit) (the switch check, observe only: it would "
+        "replace JJJ.US over 1M, net +1.25 pp after both trades, chance 66 %, the owner's review)")
+    unread = rdy(6, "AAA.SR", None, "not read", ccy="SAR")
+    assert mb.waiting_text(unread, final, []) == (
+        "nothing: the Today Action Plan says BUY - Buy 12 at 31.5 (limit) (the market rule, observe only, waits for a "
+        "reading of its market: South Korea is not read yet)")                 # the fixture's unread market
+    # a DO NOT INVEST keeps its own reason even when the switch check names the name
+    dni_sw = mb.read_final(FINALS + [["CCC.HK", "DO NOT INVEST", "Do not buy: the plan invalidated it today (stop)."]])
+    assert mb.waiting_text(dict(opened, symbol="CCC.HK"), dni_sw, SWITCH).startswith(
+        "the Today Action Plan's own reason: DO NOT INVEST - Do not buy: the plan invalidated it today (stop). "
+        "(the switch check, observe only: it would replace JJJ.US")
+    # not picked, held market, a switch named: the market's wait first, the switch beside it
+    assert mb.waiting_text(dict(held, symbol="CCC.HK"), final, SWITCH) == (
+        "a calmer market: US REITs is drawdown (x under its high) (the switch check, observe only: it would replace "
+        "JJJ.US over 1M, net +1.25 pp after both trades, chance 66 %, the owner's review)")
     assert mb.switch_rows(SWITCH)[0][:4] == ["HHH.US", "Name HHH.US", "KEEP", "1M"]       # no candidate: the 1-month row
     assert mb.switch_rows([sw("KKK.US", "3M", 4, "NO DATA", best=None)])[0][2:6] == ["NO DATA", "3M", 1.2, "none"]
     assert mb.trial_reading([], "backtest") == ("READY LIST, BACKTEST: nothing has matured yet - a name is scored a week "

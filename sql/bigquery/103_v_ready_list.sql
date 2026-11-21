@@ -30,8 +30,11 @@
 --   (Turkey excepted); anything else NULL - its market is not read yet
 --   (Canada, Mexico, Korea, Thailand, Australia, India, Qatar ...).
 -- THE MARKET'S STATE: v_market_rank on the day - or on its last day, when the
---   day is after it (a weekend, the morning before the archive), 6 days at
---   most: market_state open / hold, or 'not read'.
+--   day is after it (a weekend, the morning before the archive): market_state
+--   open / hold, or 'not read'. The 6-day limit runs from the market's own
+--   close to the day, not from the ranking day: v_market_rank already carries a
+--   close up to 6 days, so a close up to 12 days old could otherwise pass
+--   (Codex P2, #1048). The US label beside it follows the same limit.
 -- THE DAY'S ORDER (ready_rank): open markets first, then held ones, then names
 --   whose market is not read; at most two names per market before any third
 --   (pos_in_market); then the market's own rank, the name's 1-month expected
@@ -113,7 +116,9 @@ mapped AS (
 mk_day AS (
   SELECT
     k.as_of, k.market_id, k.market, k.state, k.label, k.waiting_for, k.rank, k.verdict,
-    MAX(IF(k.market_id = 'us', k.label, NULL)) OVER (PARTITION BY k.as_of) AS us_label
+    k.date AS market_close,
+    MAX(IF(k.market_id = 'us', k.label, NULL)) OVER (PARTITION BY k.as_of) AS us_label,
+    MAX(IF(k.market_id = 'us', k.date, NULL)) OVER (PARTITION BY k.as_of) AS us_close
   FROM `{{DS}}.v_market_rank` AS k
 ),
 last_day AS (
@@ -121,7 +126,7 @@ last_day AS (
   FROM mk_day
 ),
 day_us AS (
-  SELECT DISTINCT as_of, us_label
+  SELECT DISTINCT as_of, us_label, us_close
   FROM mk_day
 ),
 dated AS (
@@ -139,10 +144,11 @@ joined AS (
     k.waiting_for AS market_waiting_for,
     k.rank AS market_rank,
     k.verdict AS market_verdict,
-    d.us_label
+    IF(DATE_DIFF(t.snapshot_date, d.us_close, DAY) <= 6, d.us_label, NULL) AS us_label
   FROM dated AS t
   LEFT JOIN day_us AS d ON d.as_of = t.look_day AND DATE_DIFF(t.snapshot_date, t.look_day, DAY) <= 6
   LEFT JOIN mk_day AS k ON k.as_of = d.as_of AND k.market_id = t.market_id
+    AND DATE_DIFF(t.snapshot_date, k.market_close, DAY) <= 6
 ),
 placed AS (
   SELECT
