@@ -426,7 +426,8 @@ def test_p6_workflow():
     assert env["TFB_PREOPEN_GAP_PCT"] == "${{ vars.TFB_PREOPEN_GAP_PCT || '3.0' }}"
     assert 'MODE="--dry-run"' in run_step["run"] and 'EXTRA="--ignore-window"' in run_step["run"]
     assert "python scripts/pre_open_check.py $MODE $EXTRA" in run_step["run"]
-    assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is True
+    assert wf["permissions"] == {"contents": "read"} and "concurrency" not in wf
+    assert job["concurrency"] == {"group": "tfb-pre-open-check", "cancel-in-progress": True}   # v1.2.0: on the page job
     src = (ROOT / "scripts" / "pre_open_check.py").read_text(encoding="utf-8")
     assert '__version__ = "1.1.0"' in src and "never silently GO" in src
     assert env["TFB_PREOPEN_BOARD_GUARD"] == "${{ vars.TFB_PREOPEN_BOARD_GUARD || 'enforce' }}"
