@@ -689,6 +689,10 @@ def news_verdict_lines(market_day: str, markets: Optional[List[Dict[str, Any]]],
     if trial is None:
         out.append("News signals on trial: %s." % NOT_SET_UP)
     else:
+        # Codex P2 (#1047): the headline counts the horizon section 10 shows, so a reading that holds at 5 closes only
+        # is not "held over 10 closes", one that holds at all three counts once, and the forward count waits for the
+        # 10-close outcomes to mature like the section's own lines.
+        trial = [r for r in trial if num(r.get("horizon")) == NEWS_TRIAL_HORIZON]
         fwd = [r for r in trial if text(r.get("period")) == "forward"]
         held = [r for r in trial if text(r.get("period")) == "backtest" and text(r.get("verdict")).startswith("holds")]
         days = max((int(num(r.get("days")) or 0) for r in fwd), default=0)

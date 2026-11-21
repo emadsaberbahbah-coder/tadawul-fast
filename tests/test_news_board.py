@@ -1111,6 +1111,17 @@ def test_n12_the_news_by_market_people_and_the_trial_are_read_from_their_views()
                  "reading holds over 10 closes."]
     held = [dict(NEWS_TRIAL_ROWS[1], verdict="holds: the expected way, t 2 or more")]
     assert nb.news_verdict_lines("", [], "", [], held)[2].endswith("backtest (not evidence): 1 reading(s) hold over 10 closes.")
+    # Codex P2 (#1047): the headline reads the horizon section 10 shows - a hold at 5 closes only is not a hold over
+    # 10, one that holds at all three horizons counts once, and the forward count waits for the 10-close outcomes
+    holds = "holds: the expected way, t 2 or more"
+    only5 = [dict(NEWS_TRIAL_ROWS[4], verdict=holds), dict(NEWS_TRIAL_ROWS[1])]
+    assert nb.news_verdict_lines("", [], "", [], only5)[2].endswith("backtest (not evidence): no reading holds over 10 closes.")
+    all3 = [dict(NEWS_TRIAL_ROWS[i], verdict=holds) for i in (1, 4, 5)]
+    assert nb.news_verdict_lines("", [], "", [], all3)[2].endswith("backtest (not evidence): 1 reading(s) hold over 10 closes.")
+    early = [nt_("forward", 5, "market_news", "favourable", 1, 9, 3, "0.5", "0.2", "0.3", None, "66.7",
+                 "collecting: 3 of 10 sessions"), dict(NEWS_TRIAL_ROWS[0])]
+    assert "forward from 2026-11-23, up to 1 of 10 sessions;" in nb.news_verdict_lines("", [], "", [], early)[2]
+    assert "no session counted yet;" in nb.news_verdict_lines("", [], "", [], early[:1])[2]
     none = nb.news_verdict_lines("", None, "", None, None)
     assert none == ["News by market: %s." % nb.NOT_SET_UP, "People in the news: %s." % nb.NOT_SET_UP,
                     "News signals on trial: %s." % nb.NOT_SET_UP]

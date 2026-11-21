@@ -1,6 +1,6 @@
 # Commit sheet - the news by market and by person, and every news signal on trial (21 Nov 2026)
 
-Branch `feat/news-per-market-and-people`, stacked on `feat/ready-list-and-switch` (#1046), which is stacked on `feat/market-condition-readings` (#1045). Merge #1045, then #1046, then this. Observe only: shown and logged, it controls no buy.
+Branch `feat/news-per-market-and-people`, against main. Its first commit is the #1046 carry of PR #1048 (see "After the merge"); the news work is the commits after it. Observe only: shown and logged, it controls no buy.
 
 | File | Version |
 |---|---|
@@ -81,6 +81,10 @@ What was done:
 3. The loader now sends the new sources to `news_entity_daily`. Test N13 holds the line: `news_theme_daily` keeps exactly the 14 themes of 19 Nov.
 4. The second fill (run 44898077288) loaded the same 58,708 rows into `news_entity_daily`. No installed view reads that table, so nothing changed.
 
+Two more, after the PR was opened:
+- **Codex P2: the headline counted every horizon.** The trial line under the verdict counted holds and forward sessions across 5, 10 and 20 closes, while it says "over 10 closes". It now reads only the 10-close lines that section 10 shows: a hold at 5 closes only is not counted, a hold at all three counts once, and the forward count waits for the 10-close outcomes. Four new asserts in `tests/test_news_board.py`.
+- **#1046 did not reach main.** It was merged into the #1045 branch at 10:29 UTC, four minutes after #1045 had gone to main (10:25 UTC); the repository keeps merged branches, so GitHub did not move #1046 onto main. PR #1048 carries it to main unchanged (same tree as the #1046 head 2ade742). This branch was replayed on that commit (same tree as before) and now targets main, so it cannot land on a side branch.
+
 ## Evidence (read 21 Nov 2026)
 
 **The fills.** Each fill read 125 GB (78.9 places, 43.2 people, 3.0 fighting), as the dry runs said: under a dollar each at on-demand rates. The daily window adds about 0.35 GB.
@@ -142,6 +146,7 @@ No person's spike reached a t of 1.1 over 10 closes. Several lean the same contr
   - the four PENDING pins.
 - `tests/test_news_board.py`, 25 tests:
   - the new sections, with figures from the first read;
+  - the verdict's trial line reads the 10-close horizon only (Codex P2);
   - the page before the views exist;
   - an empty window;
   - any other refusal fails the run.
@@ -149,8 +154,8 @@ No person's spike reached a t of 1.1 over 10 closes. Several lean the same contr
 
 ## After the merge
 
-1. Merge #1045, then #1046, then this PR.
-2. Run `bq_views.yml` mode `write` on main, then `verify`. Move the ten PENDING pins (#1045's four, #1046's two, these four) to INSTALLED.
+1. #1045 is on main, and its four views were installed on 21 Nov (`bq_views.yml` write, 11:34 UTC: 70/70 objects match). Merge #1048 (the #1046 carry), then this PR. If this PR is merged first, it brings #1048's content with it and #1048 is closed.
+2. Run `bq_views.yml` mode `write` on main, then `verify`. Move the PENDING pins of the installed views to INSTALLED.
 3. The daily news job then loads all five sources, the new ones into `news_entity_daily`. If the merge comes more than three days after 21 Nov, dispatch `bq_news_themes.yml` once with write, start 2026-11-21, max_gb 5 and sources `gdelt_events_places,gdelt_gkg_places,gdelt_gkg_people`, so the new table has no gap.
 4. The board shows sections 8-10 on its next run. There is no Variable to set.
 
