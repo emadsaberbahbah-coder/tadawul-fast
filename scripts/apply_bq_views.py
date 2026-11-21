@@ -2,8 +2,30 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.17.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.18.0 (program register C8, Phase 2)
 ================================================================================
+v1.18.0 (21 Nov 2026, a condition reading for every market). WHY (owner, 21
+Nov 2026 11:03 Riyadh, the build list after the voice call): "A condition
+reading for every market, with the same tests as v_market_regime ... A daily
+ranking of the markets by trend and risk ... When every market is weak, cash
+stays cash ... Accuracy: log and score everything. Observe for two weeks (10
+sessions), then review with the owner." Four new views, observe only:
+v_market_condition (99) - the five v_market_regime labels for eleven markets
+(US, Saudi Arabia, Europe, Japan, China / Hong Kong, gold, oil, bonds, sukuk,
+US REITs, Saudi REITs), the limits scaled to each market's normal volatility
+(k = normal yearly volatility / 16; the US unchanged: its labels equal
+v_market_regime's on all 755 sessions of the archive), what each is waiting
+for, and a trend score; v_market_rank (100) - each calendar day, each
+market's latest condition, open (calm) or hold, the day's order and the
+verdict (ALL ON HOLD - cash stays cash when none is open); v_market_trial
+(101) - each US session, each market's state and what its fund did over the
+next 5 and 10 closes from the first close after the day ('forward' from 23
+Nov 2026, 'backtest' before it); v_market_trial_summary (102) - the scorecard
+the 10-session review reads. File numbers may now have three digits
+(NNN_<object>.sql) and the files are applied in number order (99 before 100);
+the two-digit files keep their order. Research views: the live system never
+reads BigQuery; nothing in a score, a pick, a gate or an order changes.
+
 v1.17.0 (21 Nov 2026, the company news against its peers). WHY (owner, 21 Nov
 2026 02:20 Riyadh, in Arabic: "let us also review the news analysis and review
 the updates for 6 hours"). The review found every class of v_company_news_eval
@@ -362,7 +384,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.17.0"
+__version__ = "1.18.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -455,9 +477,17 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def file_order(path: Path) -> Tuple[int, str]:
+    """1.18.0: the files are applied in the order of their number (99 before
+    100), then by name; a name without a leading number sorts last (and fails
+    check_objects)."""
+    m = re.match(r"(\d+)_", path.name)
+    return (int(m.group(1)) if m else 10 ** 9, path.name)
+
+
 def load_objects(sql_dir: Path = SQL_DIR) -> List[SqlObject]:
     objs: List[SqlObject] = []
-    for path in sorted(sql_dir.glob("*.sql")):
+    for path in sorted(sql_dir.glob("*.sql"), key=file_order):
         text = path.read_text(encoding="utf-8")
         found = _CREATE.findall(_code(text))
         if len(found) != 1:
@@ -476,10 +506,10 @@ def check_objects(objs: Sequence[SqlObject]) -> List[str]:
     for o in objs:
         code = _code(o.template)
         label = o.path.name
-        if not re.fullmatch(r"\d\d_[a-z0-9_]+\.sql", label):
-            problems.append(f"{label}: file name must be NN_<object>.sql")
-        elif label[3:-4] != o.name:
-            problems.append(f"{label}: defines {o.name}, file name says {label[3:-4]}")
+        if not re.fullmatch(r"\d{2,3}_[a-z0-9_]+\.sql", label):
+            problems.append(f"{label}: file name must be NN_<object>.sql or NNN_<object>.sql")
+        elif label.split("_", 1)[1][:-4] != o.name:
+            problems.append(f"{label}: defines {o.name}, file name says {label.split('_', 1)[1][:-4]}")
         if PLACEHOLDER not in code:
             problems.append(f"{label}: no {PLACEHOLDER} placeholder")
         if re.search(r"project-[0-9a-f]{8}-|tfb_archive\.", code):

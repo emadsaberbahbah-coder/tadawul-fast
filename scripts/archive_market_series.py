@@ -2,8 +2,20 @@
 # scripts/archive_market_series.py
 """
 ================================================================================
-TFB Market Series - v1.2.0 (program register C8, Phase 2b: global markets page)
+TFB Market Series - v1.3.0 (program register C8, Phase 2b: global markets page)
 ================================================================================
+v1.3.0 (21 Nov 2026, a condition reading for every market): five series -
+15 ^STOXX (STOXX Europe 600, the Europe reading) and, in a new kind "Asset
+class ETF (USD)", 30 GLD (gold), 31 IEF (US Treasuries 7-10 years), 32 SPSK
+(global sukuk) and 33 VNQ (US REITs). WHY (owner, 21 Nov 2026 11:03 Riyadh,
+the build list after the voice call): "A condition reading for every market,
+with the same tests as v_market_regime ... Europe: STOXX Europe 600 (a buy
+would use VGK) ... Gold: gold price (buy GLD) ... Bonds: IEF ... Sukuk: SPSK
+... REITs: VNQ and Saudi REITs on Tadawul ... Confirm every ticker against
+the data provider first." The archive had the Euro Stoxx 50 but not the
+broad European index, and no bond, sukuk, gold-fund or REIT-fund series.
+v_market_condition (views 1.18.0) reads them; the Saudi REITs come from
+symbol_bars_daily (the 4330-4350 funds are in the deep set).
 v1.2.0 (8 Nov 2026, regime evidence): series 14 ^VIX, kind "Volatility
 index" (a level in volatility points, not a price: its "return" is the
 change of the level). WHY (owner, 8 Nov: "how we can avoid that in the
@@ -51,7 +63,9 @@ BigQuery; no decision, gate or count depends on this table.
 SERIES kinds: "Index" (local currency, price index), "Market ETF (USD)",
 "US sector ETF (USD)" and "World sector ETF (USD)" (one currency for a fair
 comparison; dividend-adjusted closes, so total return - SAR is pegged to the
-dollar), "Commodity (USD)" (front-month futures: Brent, WTI, gold).
+dollar), "Commodity (USD)" (front-month futures: Brent, WTI, gold),
+"Volatility index" (^VIX, v1.2.0) and "Asset class ETF (USD)" (one fund per
+asset class - gold, Treasuries, sukuk, US REITs - v1.3.0).
 series_id values are permanent: a retired series keeps its id, a new one
 takes the next free id (1..1000).
 
@@ -86,7 +100,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 TABLE = "market_series_daily"
 DEFAULT_DAYS = 1100
@@ -104,7 +118,7 @@ BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
 
 KINDS = ("Index", "Market ETF (USD)", "US sector ETF (USD)", "World sector ETF (USD)",
-         "Commodity (USD)", "Volatility index")
+         "Commodity (USD)", "Volatility index", "Asset class ETF (USD)")
 REGIONS = ("US", "Europe", "China", "Japan", "Gulf", "World", "Commodities")
 
 # (series_id, yahoo symbol, display name, region, country, kind, currency, sector)
@@ -123,6 +137,7 @@ SERIES: Tuple[Tuple[int, str, str, str, str, str, str, str], ...] = (
     (12, "^N225", "Nikkei 225", "Japan", "Japan", "Index", "JPY", ""),
     (13, "^TASI.SR", "Tadawul All Share (TASI)", "Gulf", "Saudi Arabia", "Index", "SAR", ""),
     (14, "^VIX", "CBOE Volatility Index (VIX)", "US", "United States", "Volatility index", "USD", ""),
+    (15, "^STOXX", "STOXX Europe 600", "Europe", "Europe", "Index", "EUR", ""),
     (20, "SPY", "US market ETF (SPY)", "US", "United States", "Market ETF (USD)", "USD", ""),
     (21, "VGK", "Europe ETF (VGK)", "Europe", "Europe", "Market ETF (USD)", "USD", ""),
     (22, "MCHI", "China ETF (MCHI)", "China", "China", "Market ETF (USD)", "USD", ""),
@@ -133,6 +148,12 @@ SERIES: Tuple[Tuple[int, str, str, str, str, str, str, str], ...] = (
     (27, "KWT", "Kuwait ETF (KWT)", "Gulf", "Kuwait", "Market ETF (USD)", "USD", ""),
     (28, "ACWI", "World ETF (ACWI)", "World", "World", "Market ETF (USD)", "USD", ""),
     (29, "EEM", "Emerging markets ETF (EEM)", "World", "Emerging markets", "Market ETF (USD)", "USD", ""),
+    # v1.3.0: one fund per asset class, dividend-adjusted (adj_close), for the market readings
+    (30, "GLD", "Gold ETF (GLD)", "Commodities", "", "Asset class ETF (USD)", "USD", "Precious metals"),
+    (31, "IEF", "US Treasury 7-10y ETF (IEF)", "US", "United States", "Asset class ETF (USD)", "USD",
+     "Treasury bonds"),
+    (32, "SPSK", "Global sukuk ETF (SPSK)", "World", "World", "Asset class ETF (USD)", "USD", "Sukuk"),
+    (33, "VNQ", "US REIT ETF (VNQ)", "US", "United States", "Asset class ETF (USD)", "USD", "Real Estate"),
     (40, "XLK", "US Technology (XLK)", "US", "United States", "US sector ETF (USD)", "USD", "Technology"),
     (41, "XLF", "US Financials (XLF)", "US", "United States", "US sector ETF (USD)", "USD", "Financials"),
     (42, "XLE", "US Energy (XLE)", "US", "United States", "US sector ETF (USD)", "USD", "Energy"),
