@@ -47,7 +47,7 @@ The 2,384 matured INVESTABLE WIN / LOSS `Performance_Log` records the tile reads
 
 | Market id | Reading | Symbols |
 |---|---|---|
-| `us` | SPY's price close and the VIX of the same day | `.US`, and a bare ticker (`GOOGL`; no suffix is the US, as `v_outcome_engine` reads it) |
+| `us` | SPY's price close and the VIX of the same day | `.US`, a bare ticker (`GOOGL`; no suffix is the US, as `v_outcome_engine` reads it), and a US share class (`BRK.B`, `HEI.A`: `core.symbols.normalize`'s LETTERS.LETTER, its exchange letters `.F .L .N .T .V` excepted; Codex P2) |
 | `sa` | Tadawul All Share `^TASI.SR` | `.SR`, a bare four-digit code |
 | `eu` | STOXX Europe 600 `^STOXX` | `.L .LSE .DE .XETRA .F .PA .AS .MI .MC .SW .BR .ST .HE .CO .OL .LS .IR .VI` |
 | `jp` | Nikkei 225 `^N225` | `.T .TSE .JP` |

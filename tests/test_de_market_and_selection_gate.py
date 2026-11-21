@@ -148,9 +148,13 @@ def test_g3_market_enforce_demotes(monkeypatch):
     assert out["block_reason"] == "Market on hold: the US market weak as of 2026-11-20"
     assert "market_hold_watch" not in warnings_of(out), "enforce writes the reason, not the tag"
     for symbol, held in (("2222.SR", True), ("1120", True), ("BBOX.L", False), ("7203.T", True),
-                         ("0700.HK", True), ("GOOGL", True), ("PEO.WA", False)):
+                         ("0700.HK", True), ("GOOGL", True), ("PEO.WA", False), ("BRK.B", True),
+                         ("BRK-B", True), ("BRK-B.US", True), ("ABC.V", False)):
         got = verdict(apply(investable_row(symbol=symbol)))
         assert (got == ("WATCHLIST", "WATCH")) is held, symbol
+    from core.symbols.normalize import normalize_symbol
+    assert normalize_symbol("BRK-B") == "BRK.B"
+    assert verdict(apply(investable_row(symbol=normalize_symbol("BRK-B")))) == ("WATCHLIST", "WATCH")
     for word in ("ENFORCE", " on ", "1", "true", "yes"):
         monkeypatch.setenv("TFB_MARKET_GATE", word)
         assert verdict(apply(investable_row())) == ("WATCHLIST", "WATCH"), word

@@ -41,8 +41,9 @@ TFB_SELECTION_MIN_UPSIDE default 15; TFB_SELECTION_MAX_RISK default 30)
 - COST: far fewer INVESTABLE rows - under both rules 3-6 a day in the calm
   US sessions of October, 0-1 a day since 15 Nov.
 - FIX: two DEMOTE-only tiers in _apply_investability_gate after the
-  evidence tier. [MARKET-HOLD]: a still-INVESTABLE row of the US (.US or a
-  bare ticker), Saudi (.SR or a bare four-digit code), European, Japanese
+  evidence tier. [MARKET-HOLD]: a still-INVESTABLE row of the US (.US, a
+  bare ticker or a share class such as BRK.B), Saudi (.SR or a bare
+  four-digit code), European, Japanese
   or Hong Kong / China market listed in TFB_MARKET_GATE_MARKETS whose
   market label is in TFB_MARKET_GATE_HOLD becomes WATCHLIST / WATCH with
   block_reason "Market on hold: <market> <label> as of <date>

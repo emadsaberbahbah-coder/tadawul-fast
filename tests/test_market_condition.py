@@ -49,6 +49,8 @@ def clean_cache(monkeypatch):
 @pytest.mark.parametrize("symbol,market", [
     ("2222.SR", "sa"), ("2222.sr", "sa"), ("1050", "sa"), (" 4190.SR ", "sa"),
     ("EFC.US", "us"), ("BRK-B.US", "us"), ("GOOGL", "us"), ("BRK-B", "us"),
+    ("BRK.B", "us"), ("HEI.A", "us"), ("bf.b", "us"),            # US share classes (normalize's LETTERS.LETTER)
+    ("ABC.V", ""), ("XYZ.N", ""), ("ABCDEF.B", ""),             # .V / .N are exchanges; six letters is no class
     ("BBOX.L", "eu"), ("ACA.PA", "eu"), ("SAP.XETRA", "eu"), ("GALP.LS", "eu"), ("NOVO-B.CO", "eu"),
     ("7203.T", "jp"), ("8306.TSE", "jp"),
     ("0700.HK", "cn"), ("600519.SS", "cn"), ("000001.SZ", "cn"), ("601318.SHG", "cn"),

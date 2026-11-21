@@ -99,12 +99,17 @@ _SUFFIX.update({s: "jp" for s in ("T", "TSE", "JP")})
 _SUFFIX.update({s: "cn" for s in ("HK", "SS", "SZ", "SHG", "SHE")})
 _TADAWUL_BARE = re.compile(r"^[0-9]{4}$")
 _US_BARE = re.compile(r"^[A-Z][A-Z0-9\-]{0,9}$")
+# core.symbols.normalize: a US share class is LETTERS.LETTER (BRK.B, HEI.A; normalize_symbol turns BRK-B into
+# BRK.B) unless the letter is one of its single-letter exchange suffixes (.F .L .N .T .V)
+_US_SHARE_CLASS = re.compile(r"^[A-Z]{1,5}\.[A-Z]$")
+_EXCHANGE_LETTERS = frozenset("FLNTV")
 
 
 def market_of(symbol: Any) -> str:
-    """The market id of a page symbol: '2222.SR' and a bare four-digit code -> 'sa', 'EFC.US' and a bare ticker
-    ('GOOGL', 'BRK-B'; no suffix is the US, as v_outcome_engine reads it) -> 'us', 'BBOX.L' -> 'eu', '7203.T' ->
-    'jp', '0700.HK' -> 'cn'; any other suffix or shape ('PEO.WA', 'GC=F', '^N225') -> '' (no market)."""
+    """The market id of a page symbol: '2222.SR' and a bare four-digit code -> 'sa'; 'EFC.US', a bare ticker
+    ('GOOGL', 'BRK-B'; no suffix is the US, as v_outcome_engine reads it) and a US share class ('BRK.B') -> 'us';
+    'BBOX.L' -> 'eu', '7203.T' -> 'jp', '0700.HK' -> 'cn'; any other suffix or shape ('PEO.WA', 'ABC.V', 'GC=F',
+    '^N225') -> '' (no market)."""
     s = str(symbol or "").strip().upper()
     if not s:
         return ""
@@ -112,7 +117,12 @@ def market_of(symbol: Any) -> str:
         return "sa"
     if "." not in s:
         return "us" if _US_BARE.match(s) else ""
-    return _SUFFIX.get(s.rsplit(".", 1)[1], "")
+    suffix = s.rsplit(".", 1)[1]
+    if suffix in _SUFFIX:
+        return _SUFFIX[suffix]
+    if _US_SHARE_CLASS.match(s) and suffix not in _EXCHANGE_LETTERS:
+        return "us"
+    return ""
 
 
 # ------------------------------------------------------------------ the rules
