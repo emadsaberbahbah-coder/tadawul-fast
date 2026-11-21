@@ -2,9 +2,23 @@
 # scripts/archive_econ_calendar.py
 """
 ================================================================================
-TFB Economic Calendar - v1.0.0 (the releases of six economies, history included,
-for the forward event scenarios)
+TFB Economic Calendar - v1.1.0 (the releases of six economies, history included,
+for the forward event scenarios, and the scenarios logged before their events)
 ================================================================================
+v1.1.0 (21 Nov 2026) - THE SCENARIO LOG. After each written run, the
+scenarios of the events of the next LOG_AHEAD_DAYS days, as v_event_scenarios
+(apply_bq_views 1.21.0) reads them on the calendar just loaded, are appended
+to event_scenario_log (DAY partitions on logged_at): the forecast, the
+family's usual miss, and for each market the band, the big-move chance, the
+medians after a figure and the figure chances. v_event_trial scores a
+forward event on the last scenario logged before it, never on one rebuilt
+after it: a later read of the calendar (a revised figure or forecast, a
+release EODHD drops) would otherwise change the scenario of an event already
+scored (Codex P2 on #1050). The table is created on the first written run;
+until the view exists the run says so and logs nothing (exit 0). The schedule
+logs three times a day: a US release (13:30 UTC) is scored on the 04:50 log,
+China's PMI (01:30 UTC) on the evening before. A dry run logs nothing.
+
 v1.0.0 (21 Nov 2026) - NEW. WHY (owner, 21 Nov 2026 11:03 Riyadh, item 5 of the
 build list: "News: a news reading per market; forward event scenarios;
 momentum/surprise; influential figures of 19 Nov; score every news signal"):
@@ -38,6 +52,9 @@ econ_calendar what changed:
 A release that did not change appends nothing, so the table records what was
 known when: the forecast before the figure, then the figure. A window that
 could not be read, or that came back empty, marks nothing gone.
+
+TABLE event_scenario_log (1.1.0) - see above: one row per event ahead and
+market per written run, appended by one INSERT ... SELECT from the view.
 
 BUDGET GUARD: the EODHD daily limit is shared with the live sync. Before
 reading, the job reads /api/user (free): the room is TFB_ECON_EODHD_MAX_SHARE
@@ -87,7 +104,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import archive_market_series as ams  # same folder: the BigQuery session and its helpers
 import archive_symbol_deep as asd    # same folder: the EODHD reader and its daily-budget guard
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 TABLE = "econ_calendar"
@@ -124,6 +141,36 @@ SCHEMA: List[Dict[str, str]] = [
     {"name": "source", "type": "STRING", "mode": "REQUIRED", "description": "eodhd_economic_events"},
     {"name": "run_id", "type": "STRING", "mode": "NULLABLE", "description": "GitHub Actions run id"},
 ]
+# 1.1.0: the scenarios of the events ahead, logged before their events for the forward trial (v_event_trial)
+LOG_TABLE = "event_scenario_log"
+LOG_VIEW = "v_event_scenarios"
+LOG_AHEAD_DAYS = 21
+_LOG_INT = ("n_prior", "n_big", "n_move", "n_above", "n_in_line", "n_below", "n_f5_above", "n_f5_below", "n_fig")
+LOG_SCENARIO = ("n_prior", "r1_p10", "r1_p50", "r1_p90", "n_big", "n_move", "p_big", "n_above", "n_in_line",
+                "n_below", "r1_p50_above", "r1_p50_in_line", "r1_p50_below", "f5_p50_above", "f5_p50_below",
+                "n_f5_above", "n_f5_below", "n_fig", "p_above", "p_in_line", "p_below")
+LOG_SCHEMA: List[Dict[str, str]] = [
+    {"name": "logged_at", "type": "TIMESTAMP", "mode": "REQUIRED",
+     "description": "when the scenario was logged: the fetched_at of the calendar read just before it"},
+    {"name": "run_id", "type": "STRING", "mode": "NULLABLE", "description": "GitHub Actions run id"},
+    {"name": "event_id", "type": "STRING", "mode": "REQUIRED", "description": "v_event_calendar.event_id"},
+    {"name": "family", "type": "STRING", "mode": "REQUIRED", "description": "the event family"},
+    {"name": "kind", "type": "STRING", "mode": "REQUIRED", "description": "meeting | release"},
+    {"name": "event_at", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "the event's time when logged (UTC)"},
+    {"name": "estimate", "type": "FLOAT", "mode": "NULLABLE", "description": "the forecast when logged"},
+    {"name": "surprise_sd", "type": "FLOAT", "mode": "NULLABLE",
+     "description": "the family's usual miss when logged (NULL before 6 earlier figures)"},
+    {"name": "market_id", "type": "STRING", "mode": "REQUIRED", "description": "the market"},
+] + [{"name": c, "type": "INTEGER" if c in _LOG_INT else "FLOAT", "mode": "NULLABLE",
+      "description": f"v_event_scenarios.{c} when logged"} for c in LOG_SCENARIO]
+LOG_COLUMNS = [f["name"] for f in LOG_SCHEMA]
+LOG_DESCRIPTION = ("TFB event scenarios logged before their events (v_event_scenarios on the calendar just loaded, "
+                   "the events of the next 21 days), one row per event and market per run, appended by "
+                   "scripts/archive_econ_calendar.py; v_event_trial scores a forward event on the last one logged "
+                   "before it. Research only: nothing live reads it.")
+CALENDAR_DESCRIPTION = ("TFB economic calendar (EODHD economic-events) of six economies, history included: a "
+                        "change log, one row per release per change (new / changed / gone), appended by "
+                        "scripts/archive_econ_calendar.py. Research only: nothing live reads it.")
 STAGE_SCHEMA = [f for f in SCHEMA if f["name"] != "status"]
 COLUMNS = [f["name"] for f in SCHEMA]
 STAGE_COLUMNS = [f["name"] for f in STAGE_SCHEMA]
@@ -371,11 +418,25 @@ def breakdown_sql(project: str, dataset: str, fetched_at: _dt.datetime) -> str:
             f"WHERE fetched_at = TIMESTAMP '{at}' GROUP BY status ORDER BY status")
 
 
+def log_sql(project: str, dataset: str, logged_at: _dt.datetime, run_id: str) -> str:
+    """1.1.0: the INSERT that logs the scenarios of the events of the next
+    LOG_AHEAD_DAYS days, as the view reads them on the calendar just loaded."""
+    at = logged_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+    rid = _safe_id(run_id)
+    rid_sql = f"'{rid}'" if rid else "CAST(NULL AS STRING)"
+    return (f"INSERT INTO `{project}.{dataset}.{LOG_TABLE}` ({', '.join(LOG_COLUMNS)})\n"
+            f"SELECT TIMESTAMP '{at}' AS logged_at, {rid_sql} AS run_id, {', '.join(LOG_COLUMNS[2:])}\n"
+            f"FROM `{project}.{dataset}.{LOG_VIEW}`\n"
+            f"WHERE NOT is_out AND event_at > TIMESTAMP '{at}'\n"
+            f"  AND event_at <= TIMESTAMP_ADD(TIMESTAMP '{at}', INTERVAL {LOG_AHEAD_DAYS} DAY)")
+
+
 # ------------------------------------------------------------------ BigQuery
-def schema_problems(table: Dict[str, Any]) -> List[str]:
-    """[] when an existing econ_calendar has SCHEMA's columns (name, type,
-    mode, in order) and the month partitioning on event_at."""
-    want = [(f["name"], f["type"], f["mode"]) for f in SCHEMA]
+def schema_problems(table: Dict[str, Any], schema: Optional[List[Dict[str, str]]] = None,
+                    part: Tuple[str, str] = ("MONTH", "event_at")) -> List[str]:
+    """[] when an existing table has `schema`'s columns (name, type, mode, in
+    order; econ_calendar's by default) and the partitioning `part`."""
+    want = [(f["name"], f["type"], f["mode"]) for f in (schema or SCHEMA)]
     got = []
     for f in ((table.get("schema") or {}).get("fields") or []):
         t = str(f.get("type") or "").upper()
@@ -385,35 +446,38 @@ def schema_problems(table: Dict[str, Any]) -> List[str]:
         diff = [f"{w} != {g}" for w, g in zip(want, got) if w != g]
         problems.append("columns differ: " + ("; ".join(diff[:5]) or f"{len(got)} columns, want {len(want)}"))
     tp = table.get("timePartitioning") or {}
-    if tp.get("type") != "MONTH" or tp.get("field") != "event_at":
-        problems.append("not partitioned by month on event_at")
+    if tp.get("type") != part[0] or tp.get("field") != part[1]:
+        problems.append(f"not partitioned by {part[0].lower()} on {part[1]}")
     return problems
 
 
-def ensure_table(session: Any, project: str, dataset: str) -> bool:
-    """True when econ_calendar was created now, False when it existed with the
-    right layout; RuntimeError when it exists with another one."""
+def ensure_table(session: Any, project: str, dataset: str, table: str = TABLE,
+                 schema: Optional[List[Dict[str, str]]] = None, part: Tuple[str, str] = ("MONTH", "event_at"),
+                 clustering: Sequence[str] = ("country", "event_type"),
+                 description: str = CALENDAR_DESCRIPTION) -> bool:
+    """True when `table` (econ_calendar by default) was created now, False when
+    it existed with the right layout; RuntimeError when it exists with another
+    one."""
+    schema = schema or SCHEMA
     base = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables"
-    resp = session.get(f"{base}/{TABLE}", timeout=60)
+    resp = session.get(f"{base}/{table}", timeout=60)
     if resp.status_code == 200:
-        problems = schema_problems(resp.json() or {})
+        problems = schema_problems(resp.json() or {}, schema, part)
         if problems:
-            raise RuntimeError(f"table {TABLE} differs from SCHEMA: {' | '.join(problems)}")
+            raise RuntimeError(f"table {table} differs from its SCHEMA: {' | '.join(problems)}")
         return False
     if resp.status_code != 404:
-        raise RuntimeError(f"table {TABLE}: {ams._err(resp)}")
+        raise RuntimeError(f"table {table}: {ams._err(resp)}")
     body = {
-        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": TABLE},
-        "schema": {"fields": SCHEMA},
-        "timePartitioning": {"type": "MONTH", "field": "event_at"},
-        "clustering": {"fields": ["country", "event_type"]},
-        "description": ("TFB economic calendar (EODHD economic-events) of six economies, history included: a "
-                        "change log, one row per release per change (new / changed / gone), appended by "
-                        "scripts/archive_econ_calendar.py. Research only: nothing live reads it."),
+        "tableReference": {"projectId": project, "datasetId": dataset, "tableId": table},
+        "schema": {"fields": schema},
+        "timePartitioning": {"type": part[0], "field": part[1]},
+        "clustering": {"fields": list(clustering)},
+        "description": description,
     }
     resp = session.post(base, json=body, timeout=60)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"create {TABLE}: {ams._err(resp)}")
+        raise RuntimeError(f"create {table}: {ams._err(resp)}")
     return True
 
 
@@ -497,6 +561,33 @@ def query_rows(session: Any, project: str, location: str, job: Dict[str, Any]) -
     if resp.status_code != 200:
         raise RuntimeError(f"results: {ams._err(resp)}")
     return [[c.get("v") for c in (r.get("f") or [])] for r in ((resp.json() or {}).get("rows") or [])]
+
+
+def log_scenarios(session: Any, project: str, dataset: str, location: str, logged_at: _dt.datetime, run_id: str,
+                  sleep: Callable[[float], None] = time.sleep) -> Tuple[str, int]:
+    """1.1.0: append the scenarios of the events ahead to event_scenario_log
+    (created on the first written run). Returns (a note for the run line, an
+    exit code): 0 when logged, or when the view is not in BigQuery yet; 2 on
+    any other error (the calendar rows are in all the same)."""
+    try:
+        made = ensure_table(session, project, dataset, LOG_TABLE, LOG_SCHEMA, ("DAY", "logged_at"),
+                            ("family", "market_id"), LOG_DESCRIPTION)
+    except Exception as exc:  # noqa: BLE001
+        _out(f"ERROR: scenario log: {str(exc)[:400]}")
+        return " | scenarios NOT logged (the log table)", 2
+    created = " (log table created)" if made else ""
+    try:
+        job = run_query(session, project, location, log_sql(project, dataset, logged_at, run_id), run_id, "log",
+                        sleep=sleep)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "Not found" in msg and LOG_VIEW in msg:
+            return (f" | scenarios not logged yet: {LOG_VIEW} is not in BigQuery (apply_bq_views 1.21.0)"
+                    f"{created}", 0)
+        _out(f"ERROR: scenario log: {msg[:400]}")
+        return f" | scenarios NOT logged{created}", 2
+    n = int(((job.get("statistics") or {}).get("query") or {}).get("numDmlAffectedRows") or 0)
+    return f" | {n} scenario row(s) logged{created}", 0
 
 
 # ------------------------------------------------------------------ run
@@ -589,8 +680,9 @@ def run(session: Any, *, token: str, project: str, dataset: str, location: str, 
         split = " (" + ", ".join(f"{s} {c}" for s, c in got) + ")" if got else ""
     except Exception as exc:  # noqa: BLE001 - the counts are a courtesy; the rows are in
         _out(f"breakdown not read: {str(exc)[:200]}")
-    print(head + f" | {n} row(s) appended{split}" + (" | table created" if created else "") + tail)
-    return 1 if failed or unread else 0
+    note, log_rc = log_scenarios(session, project, dataset, location, now, run_id, sleep=sleep)
+    print(head + f" | {n} row(s) appended{split}" + (" | table created" if created else "") + note + tail)
+    return max(1 if failed or unread else 0, log_rc)
 
 
 def _date(text: str, name: str) -> Optional[_dt.date]:

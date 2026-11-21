@@ -825,7 +825,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.4.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.4.1")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -850,9 +850,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.4.0"   # 2026-11-19: v1.4.0 [TRUCE-READ]
+    assert ng.__version__ == "1.4.1"   # 2026-11-19: v1.4.0 [TRUCE-READ]; 2026-11-21: v1.4.1 [FOMC-2027]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.4.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.4.1", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1552,3 +1552,17 @@ def test_g8_default_is_on(monkeypatch, armed):
     monkeypatch.delenv("TFB_NEWS_ISSUER_LINK", raising=False)
     (rc, rep), _sh = _run(http=_WrongNameHTTP(), write=False)
     assert rc == 0 and rep["issuer_link"]["mode"] == "on" and rep["issuer_link"]["unlinked"] == 1
+
+
+# ----------------------------------------------------------------------------- G13 (v1.4.1 [FOMC-2027])
+def test_g13_the_fed_revised_2027_schedule():
+    """The Fed's 12 Nov 2026 revision: no decision on 27 Oct 2027 (a strategy meeting), 8 Dec moved to 17 Nov; 2026
+    unchanged. A decision day is a Wednesday at 14:00 New York."""
+    days = [dt.date.fromisoformat(d) for d in ng.FOMC_DECISION_DAYS]
+    assert "2027-10-27" not in ng.FOMC_DECISION_DAYS and "2027-12-08" not in ng.FOMC_DECISION_DAYS
+    assert ng.FOMC_DECISION_DAYS[-2:] == ("2027-09-15", "2027-11-17") and len(ng.FOMC_DECISION_DAYS) == 15
+    assert [d for d in days if d.year == 2026] == [dt.date(2026, m, d) for m, d in (
+        (1, 28), (3, 18), (4, 29), (6, 17), (7, 29), (9, 16), (10, 28), (12, 9))]
+    assert days == sorted(days) and all(d.weekday() == 2 for d in days)
+    times = ng.fomc_decision_times()
+    assert times[-1] == dt.datetime(2027, 11, 17, 19, 0, tzinfo=dt.timezone.utc)       # 14:00 EST

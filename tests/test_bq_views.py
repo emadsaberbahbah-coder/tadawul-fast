@@ -273,13 +273,9 @@ INSTALLED = {
     # v_outcome_engine changes again in 1.7.0 and moves to PENDING)
     "v_outcome_calibration": "038aef710bcea57e18f2d8f417a7be79f9a609165130ed4098470c09148a949d",
     "v_board_archive": "406e8fb4eb5f5cc1b00f5f120bd4b7e3e682ae21868dffe50ac68bc4d5ff81bc",
-}
-# The objects apply_bq_views 1.6.0 and 1.7.0 add or change (8 Nov 2026), hashed
-# from the reviewed files: bq_views --verify after the next --write must find
-# these exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
-# Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
-# 341bd1f3a44d (1.5.0).
-PENDING = {
+    # apply_bq_views 1.6.0 - 1.20.0 (8 - 21 Nov 2026), installed by bq_views write runs and read back from
+    # INFORMATION_SCHEMA by bq_views write run 44910876350 (21 Nov 2026, 13:51 UTC, main ae8c899): 76/76 objects
+    # match their reviewed files. Kept with the notes they carried while pending.
     # apply_bq_views 1.20.0 (21 Nov 2026): the news by market and by person (news_entity_daily), every news signal
     # read against what the markets did next, and its scorecard (observe only)
     "v_market_news": "5ed47514ad0dad5468e0c3589043028982c898b98e2c3b2297010367309d91d6",
@@ -337,6 +333,17 @@ PENDING = {
     "v_regime_outcomes": "3a4c2de8caba465cf406f459358c7f6a492f4065e21a6d3327c3bec01c037188",
     "v_outcome_coverage": "fba5c320643c6ceecabb3b294b64527ffab44cb8b35cca89065b1386323e0f2b",
 }
+# The objects apply_bq_views 1.21.0 adds (21 Nov 2026), hashed from the reviewed files: bq_views --verify after the
+# next --write must find these exact bodies in INFORMATION_SCHEMA (then they move to INSTALLED).
+PENDING = {
+    # apply_bq_views 1.21.0 (21 Nov 2026): the forward event scenarios - the meetings and releases, each market's move
+    # around them, the scenarios from the earlier events of each family, the trial and its scorecard (observe only)
+    "v_event_calendar": "8149d12c6e35334edef0de87eb375ad278965a22eded8094a564cc63d0dd6ce2",
+    "v_event_reactions": "10d89bdd0e31593951118006848f3048b91ab4e21a7dcb3a6aa215d15048cfd6",
+    "v_event_scenarios": "73f28feb2afbd02f9a5d8845891872444bec24c5001b61d87beadcdb9f569fc6",
+    "v_event_trial": "518ab72be1b266a6a226ef038f1dd942b02d90c048257f947a30ac947e7fdd6d",
+    "v_event_trial_summary": "9ca3cbc11e11e53dda4f3a005a20218426bd5e75f8bb0c1539c7056c13e12dfb",
+}
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
     "v_board_episodes", "v_performance_log", "v_selection_log", "v_signal_history",
@@ -364,9 +371,10 @@ EXPECTED_ORDER = [
     "v_market_condition", "v_market_rank", "v_market_trial", "v_market_trial_summary",
     "v_ready_list", "v_ready_trial",
     "v_market_news", "v_people_news", "v_news_trial", "v_news_trial_summary",
+    "v_event_calendar", "v_event_reactions", "v_event_scenarios", "v_event_trial", "v_event_trial_summary",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 48)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 53)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3090,16 +3098,17 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.20.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.21.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.20.0"
+    assert bv.__version__ == "1.21.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-10:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-15:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
-                           "108_v_news_trial_summary.sql"]
-    assert files[:-9] == sorted(files[:-9])                                         # the two-digit order is unchanged
+                           "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
+                           "111_v_event_scenarios.sql", "112_v_event_trial.sql", "113_v_event_trial_summary.sql"]
+    assert files[:-14] == sorted(files[:-14])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3379,7 +3388,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 1
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 6
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3407,12 +3416,201 @@ def case_v51():
     assert "overlap" in v.template and "the live system never reads BigQuery" in v.template and "Observe only" in v.template
 
 
+import datetime as dt  # noqa: E402 - the event views' dates (1.21.0)
+import re  # noqa: E402
+
+
+def _event_view(name, number, refs):
+    objs = {o.name: o for o in bv.load_objects()}
+    v = objs[name]
+    assert v.path.name == "%d_%s.sql" % (number, name) and v.kind == "VIEW"
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {name} == refs, set(bv._REF.findall(code))
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+    return objs, code
+
+
+def case_v52():
+    """v_event_calendar (1.21.0): the Fed, ECB, Bank of Japan and OPEC+ meetings on their official dates and the
+    tracked releases of econ_calendar (its latest copy, gone ones out, one per family, period and day), each figure
+    against its forecast in units of the family's earlier misses. The Fed's days are the news gate's; the hand-kept
+    events calendar of the News Board agrees on every meeting it lists."""
+    import json as _json
+    import archive_econ_calendar as ec
+    from scripts import news_macro_gate as ng
+    objs, code = _event_view("v_event_calendar", 109, {"econ_calendar"})
+    names = [o.name for o in bv.load_objects()]
+    assert names.index("v_event_calendar") == names.index("v_news_trial_summary") + 1
+    days = {}
+    for body, block in re.findall(r"SELECT '([a-z]+)'(?: AS family)?, d.*?FROM UNNEST\(\[(.*?)\]\) AS d", code, re.S):
+        days[body] = [dt.date.fromisoformat(x) for x in re.findall(r"DATE '(\d{4}-\d{2}-\d{2})'", block)]
+    assert {k: len(v) for k, v in days.items()} == {"fomc": 39, "ecb": 40, "boj": 40, "opec": 31}
+    for k, v in days.items():
+        assert v == sorted(v) and len(set(v)) == len(v), k
+    # the Fed decides on a Wednesday (7 Nov 2024, a Thursday: the meeting followed the US election), the ECB on a Thursday
+    assert [d for d in days["fomc"] if d.weekday() != 2] == [dt.date(2024, 11, 7)]
+    assert all(d.weekday() == 3 for d in days["ecb"])
+    assert [d.isoformat() for d in days["fomc"] if d.year >= 2026] == list(ng.FOMC_DECISION_DAYS)
+    assert dt.date(2027, 10, 27) not in days["fomc"] and dt.date(2027, 11, 17) in days["fomc"]   # the 12 Nov revision
+    assert days["opec"][-1] == dt.date(2026, 11, 29)
+    for frag in ("TIMESTAMP(DATETIME(d, TIME '14:00:00'), 'America/New_York')",
+                 "TIMESTAMP(DATETIME(d, TIME '14:15:00'), 'Europe/Berlin')",
+                 "TIMESTAMP(DATETIME(d, TIME '12:00:00'), 'Asia/Tokyo')", "TIMESTAMP(DATETIME(d, TIME '12:00:00'), 'UTC')"):
+        assert frag in code, frag
+    # the hand-kept calendar (data/news_event_calendar.json) names the same decision days
+    cal = _json.loads((ROOT / "data" / "news_event_calendar.json").read_text(encoding="utf-8"))
+    words = {"fomc": "Federal Reserve", "ecb": "European Central Bank", "boj": "Bank of Japan", "opec": "OPEC+"}
+    checked = 0
+    for e in cal["events"]:
+        for body, word in words.items():
+            if word in e["title"] and e["status"] == "confirmed":
+                assert dt.date.fromisoformat(e["end"]) in days[body], (body, e["end"])
+                checked += 1
+    assert checked >= 4
+    # the releases: the loader's countries, EODHD's own names, one latest copy that is not gone
+    fam = _structs(code, "WITH fam AS (")
+    assert len(fam) == 15 and len({f[0] for f in fam}) == 15
+    assert {f[2].strip("'") for f in fam} <= set(ec.COUNTRIES)
+    # one per release: the period read without its year ("Oct. 2026" = "Oct"), a first estimate and its revisions
+    # (the same period within 120 days) merged, and the copy with a figure and a forecast preferred
+    per_re = re.search(r"REGEXP_REPLACE\(TRIM\(IFNULL\(l\.period, ''\)\), r'([^']+)', ''\) AS per", code)
+    assert per_re, "the period without its year"
+    strip = re.compile(per_re.group(1))
+    assert [strip.sub("", p) for p in ("Oct. 2026", "Oct", "Q3", "Q3 2025", "Sep, 2024", "2026")] == \
+        ["Oct", "Oct", "Q3", "Q3", "Sep", ""]
+    for frag in ("QUALIFY ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY fetched_at DESC, status) = 1",
+                 "WHERE status != 'gone'",
+                 "LAG(event_at) OVER (PARTITION BY family, per ORDER BY event_at, event_id), DAY) < 120",
+                 "SUM(starts) OVER (PARTITION BY family, per ORDER BY event_at, event_id) AS grp",
+                 "PARTITION BY family, per, IF(per = '', CAST(DATE(event_at) AS STRING), CAST(grp AS STRING))",
+                 "ORDER BY IF(actual IS NULL, 2, IF(estimate IS NULL, 1, 0)), event_at, fetched_at DESC, event_id) = 1",
+                 "ABS(TIMESTAMP_DIFF(l.event_at, m.event_at, HOUR)) <= 36",
+                 "ROWS BETWEEN 36 PRECEDING AND 1 PRECEDING", "IF(n_sd >= 6 AND sd > 0, ROUND(surprise / sd, 3), NULL)",
+                 "CASE WHEN surprise / sd >= 0.5 THEN 'above' WHEN surprise / sd <= -0.5 THEN 'below' ELSE 'in_line' END",
+                 "IF(kind = 'meeting', event_at <= CURRENT_TIMESTAMP(), actual IS NOT NULL) AS is_out"):
+        assert frag in code, frag
+    assert _labels(code, "figure") == {"above", "below", "in_line"}
+
+
+def case_v53():
+    """v_event_reactions (1.21.0): each market's move from the last close before an event to the first close after it,
+    each close at its own time, over 5 closes and after the event close, against the market's normal daily move. The
+    markets and their outcome series are v_market_trial's."""
+    objs, code = _event_view("v_event_reactions", 110, {"market_series_daily", "v_market_condition", "v_event_calendar"})
+    names = [o.name for o in bv.load_objects()]
+    assert names.index("v_event_reactions") == names.index("v_event_calendar") + 1
+    mk = _structs(code, "WITH mk AS (")
+    cond = _structs(bv._code(objs["v_market_condition"].template), "WITH mk AS (")
+    assert [(r[0], r[1], r[2]) for r in mk] == [(c[0], c[1], c[2]) for c in cond]
+    trial = bv._code(objs["v_market_trial"].template)
+    syms = re.search(r"s\.symbol IN \(([^)]*)\)", trial).group(1)
+    assert "s.symbol IN (%s)" % syms in code                                       # the same outcome series
+    zones = {r[1].strip("'"): (r[3].strip("'"), r[4].strip("'")) for r in mk}
+    assert zones["oil"] == ("'BZ=F'".strip("'"), "Europe/London") and zones["reits_sa"] == ("SA_REITS", "Asia/Riyadh")
+    assert {z for m, (_, z) in zones.items() if m not in ("oil", "reits_sa")} == {"America/New_York"}
+    for frag in ("TIME '16:00:00'", "TIME '19:30:00'", "TIME '15:00:00'",
+                 "s.close_at > e.event_at AND s.close_at <= TIMESTAMP_ADD(e.event_at, INTERVAL 10 DAY)",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY e.event_id, s.market_id ORDER BY s.n) = 1",
+                 "JOIN seq AS b ON b.market_id = p.market_id AND b.n = p.post_n - 1",
+                 "WHERE DATE_DIFF(p.event_close_day, b.date, DAY) <= 7",
+                 "ROWS BETWEEN 249 PRECEDING AND CURRENT ROW", "IF(r.n250 >= 120 AND r.sd250 > 0, r.sd250, NULL) AS sd1",
+                 "c.n BETWEEN r.post_n - 250 AND r.post_n - 1",
+                 "ROUND((SAFE_DIVIDE(c.px5, c.post_px) - 1) * 100, 4) AS f5_pct", "WHERE is_out"):
+        assert frag in code, frag
+    assert _labels(code, "move") == {"up", "down", "normal"}
+
+
+def case_v54():
+    """v_event_scenarios (1.21.0): for each event, held or ahead, the earlier events of its family only - the exact
+    band of their event-day moves, the big-move chance, the median move after each figure, the figure chances."""
+    objs, code = _event_view("v_event_scenarios", 111, {"v_event_calendar", "v_event_reactions"})
+    for frag in ("JOIN re AS r ON r.family = e.family AND r.event_at < e.event_at",
+                 "JOIN ev AS p ON p.family = e.family AND p.event_at < e.event_at AND p.is_out",
+                 "PERCENTILE_CONT(p.r1_pct, 0.1) OVER (PARTITION BY p.event_id, p.market_id) AS q10",
+                 "PERCENTILE_CONT(p.r1_pct, 0.9) OVER (PARTITION BY p.event_id, p.market_id) AS q90",
+                 "PERCENTILE_CONT(p.r1_pct, 0.5) OVER (PARTITION BY p.event_id, p.market_id, p.prior_figure) AS q50_fig",
+                 "ROUND(SAFE_DIVIDE(a.n_big + 1, a.n_move + 2), 4) AS p_big",
+                 "ROUND((f.f_above + 1) / (f.n_fig + 3), 4)", "ROUND((f.f_below + 1) / (f.n_fig + 3), 4)"):
+        assert frag in code, frag
+    assert "<=" not in code.split("pairs AS (", 1)[1].split("),", 1)[0]          # strictly earlier events
+    assert "APPROX_QUANTILES" not in code and "CURRENT_" not in code
+
+
+def case_v55():
+    """v_event_trial (1.21.0): each scenario against what came - the band, the big move against any day's, the
+    direction and the drift after a figure, the figure chances; 'forward' from 23 Nov 2026 00:00 Riyadh, scored on
+    the scenario logged last before the event (event_scenario_log, archive_econ_calendar 1.1.0; Codex P2 on #1050),
+    the backtest on scenarios rebuilt from today's calendar."""
+    objs, code = _event_view("v_event_trial", 112, {"v_event_scenarios", "v_event_reactions", "event_scenario_log"})
+    start = dt.datetime(2026, 11, 23, tzinfo=dt.timezone(dt.timedelta(hours=3))).astimezone(dt.timezone.utc)
+    assert "IF(event_at >= TIMESTAMP '%s+00', 'forward', 'backtest') AS trial" % start.strftime("%Y-%m-%d %H:%M:%S") in code
+    assert "event_scenario_log" in bv.SOURCE_TABLES
+    # the log: the last row before the event, per event and market; a forward row takes every scenario field from it
+    for frag in ("JOIN s0 ON s0.event_id = l.event_id AND s0.market_id = l.market_id AND l.logged_at < s0.event_at",
+                 "WHERE s0.trial = 'forward'",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY l.event_id, l.market_id ORDER BY l.logged_at DESC, "
+                 "l.run_id DESC) = 1",
+                 "CASE WHEN s0.trial = 'backtest' THEN 'rebuilt' WHEN lg.event_id IS NOT NULL THEN 'logged' "
+                 "ELSE 'not logged' END",
+                 "IF(s0.trial = 'forward', lg.estimate, s0.estimate) AS estimate",
+                 "IF(s0.trial = 'forward', ROUND(SAFE_DIVIDE(s0.actual - lg.estimate, lg.surprise_sd), 3), "
+                 "s0.surprise_z)",
+                 "CASE WHEN (s0.actual - lg.estimate) / lg.surprise_sd >= 0.5 THEN 'above'",
+                 "WHEN (s0.actual - lg.estimate) / lg.surprise_sd <= -0.5 THEN 'below' ELSE 'in_line' END",
+                 "LEFT JOIN lg USING (event_id, market_id)"):
+        assert frag in code, frag
+    import archive_econ_calendar as ec                                           # the log's own columns
+    for col in ("n_prior", "r1_p10", "r1_p50", "r1_p90", "n_move", "p_big", "n_above", "n_below", "r1_p50_above",
+                "r1_p50_below", "n_f5_above", "n_f5_below", "f5_p50_above", "f5_p50_below", "n_fig", "p_above",
+                "p_in_line", "p_below"):
+        assert f"IF(s0.trial = 'forward', lg.{col}, s0.{col}) AS {col}" in code, col
+        assert col in ec.LOG_COLUMNS, col
+    for frag in ("IF(n_prior >= 8, r1_pct BETWEEN r1_p10 AND r1_p90, NULL) AS band_hit",
+                 "IF(n_move >= 8 AND big IS NOT NULL, ROUND(POW(p_big - big, 2), 6), NULL) AS brier_big",
+                 "ROUND(POW(any_big - big, 2), 6), NULL) AS brier_any",
+                 "WHEN 'above' THEN IF(s.n_above >= 4, SIGN(s.r1_p50_above), NULL)",
+                 "WHEN 'below' THEN IF(s.n_f5_below >= 4, SIGN(s.f5_p50_below), NULL)",
+                 "IF(dir_sign IS NULL OR dir_sign = 0 OR r1_pct = 0, NULL, SIGN(r1_pct) = dir_sign) AS dir_hit",
+                 "IF(kind = 'release' AND n_fig >= 8 AND figure IS NOT NULL,", "WHERE is_out"):
+        assert frag in code, frag
+    assert "CURRENT_" not in code
+
+
+def case_v56():
+    """v_event_trial_summary (1.21.0): one pass over v_event_trial with GROUPING SETS - per period, family and market
+    and for all; the figure lines count each event once; forward lines collect until 10 events."""
+    objs, code = _event_view("v_event_trial_summary", 113, {"v_event_trial"})
+    names = [o.name for o in bv.load_objects()]
+    assert names.index("v_event_trial_summary") == len(names) - 1
+    assert code.count("`{{DS}}.v_event_trial`") == 1
+    for frag in ("GROUP BY GROUPING SETS ((period, family, market_id), (period, family), (period, market_id), (period))",
+                 "GROUP BY period, family, event_id", "ROUND(1 - AVG(brier_figure) / (2 / 3), 3) AS fig_skill",
+                 "ROUND(1 - SAFE_DIVIDE(AVG(IF(brier_any IS NULL, NULL, brier_big)), AVG(brier_any)), 3) AS big_skill",
+                 # the z against a coin: (hits - n/2) / sqrt(n/4) on a one-market line; on an all-markets line each
+                 # event's markets are summed first, so that an event counts once (its markets move together)
+                 "IF(dir_hit IS NULL, NULL, IF(dir_hit, 0.5, -0.5)) AS d_dir",
+                 "SAFE_DIVIDE(POW(SUM(d_dir) OVER (PARTITION BY period, event_id), 2), "
+                 "COUNT(*) OVER (PARTITION BY period, event_id))",
+                 "SAFE_DIVIDE(SUM(d_dir), SQRT(SUM(d_dir * d_dir))) AS dir_z_row",
+                 "SAFE_DIVIDE(SUM(d_dir), SQRT(SUM(w_dir))) AS dir_z_event",
+                 "ROUND(IF(g.g_market = 1, g.dir_z_event, g.dir_z_row), 2) AS dir_z",
+                 "ROUND(IF(g.g_market = 1, g.drift_z_event, g.drift_z_row), 2) AS drift_z",
+                 "COUNT(DISTINCT IF(dir_hit IS NULL, NULL, event_id)) AS dir_events",
+                 "WHEN r.period = 'forward' AND r.events < 10 THEN 'collecting'",
+                 "WHEN r.band_pct < 70 THEN 'too narrow' WHEN r.band_pct > 90 THEN 'too wide'",
+                 "CASE WHEN r.dir_events < 20 THEN 'too few' WHEN r.dir_z >= 2 THEN 'holds' ELSE 'not proven' END",
+                 "IF(r.market_id = 'all', f.fig_skill, NULL)"):
+        assert frag in code, frag
+    assert "CURRENT_" not in code
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
-         case_v48, case_v49, case_v50, case_v51]
+         case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56]
 
 
 def test_v1(): case_v1()
@@ -3466,6 +3664,11 @@ def test_v48(): case_v48()
 def test_v49(): case_v49()
 def test_v50(): case_v50()
 def test_v51(): case_v51()
+def test_v52(): case_v52()
+def test_v53(): case_v53()
+def test_v54(): case_v54()
+def test_v55(): case_v55()
+def test_v56(): case_v56()
 
 
 if __name__ == "__main__":

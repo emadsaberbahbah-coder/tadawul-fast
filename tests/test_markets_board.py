@@ -1,6 +1,7 @@
-"""scripts/markets_board.py v1.1.0 - the Markets_Board tab: the condition of every market, their order by trend and
-risk, the last 14 days, the scorecard of the forward test, and (1.1.0) the ready list, the switch check and the ready
-list's scorecard, observe-only. Pure functions, the SQL, full runs through
+"""scripts/markets_board.py v1.2.0 - the Markets_Board tab: the condition of every market, their order by trend and
+risk, the last 14 days, the scorecard of the forward test, (1.1.0) the ready list, the switch check and the ready
+list's scorecard, and (1.2.0) the next event, the events of the next 14 days with what the earlier ones did, the last
+7 days against their band and the events scorecard, observe-only. Pure functions, the SQL, full runs through
 the real BigQuery reader on a fake session and a fake workbook (no network), and the workflow's gate run in bash.
 Every figure here is invented."""
 from __future__ import annotations
@@ -117,6 +118,60 @@ TRIAL = [trow("backtest", "1W", "all qualified", 1148, -0.44, -0.30),           
          trow("backtest", "1W", "ready list (top 3)", 43, -1.73, -0.97)]
 
 
+def erow(eid, name, at, mid, n, p10, p50, p90, kind="release", period="Oct", est=None, prev=None, p_big=0.3, absz=0.9,
+         na=0, nb=0, a50=None, b50=None, nfig=0, pa=None, pi=None, pb=None):
+    return {"event_id": eid, "family": eid.split(":")[0], "family_name": name, "kind": kind, "country": "US",
+            "event_at": at, "period": period, "estimate": est, "previous": prev,
+            "market_order": str(mb.MARKETS.index(mid) + 1), "market_id": mid, "market": NAMES[mid], "n_prior": str(n),
+            "r1_p10": p10, "r1_p50": p50, "r1_p90": p90, "p_big": p_big, "mean_abs_z": absz, "n_above": str(na),
+            "n_below": str(nb), "r1_p50_above": a50, "r1_p50_below": b50, "n_fig": str(nfig), "p_above": pa,
+            "p_in_line": pi, "p_below": pb}
+
+
+PCE = "2026-11-25 13:30|US|Core PCE Price Index|mom|Oct"
+EVENTS = ([erow(PCE, "US core PCE prices (m/m)", "2026-11-25 13:30:00+00", m, 24, lo, mid, hi, est="0.2",
+                prev="0.3", na=9, nb=7, a50="-0.41" if m == "us" else None, b50="0.38" if m == "us" else None,
+                nfig=24, pa="0.3704", pi="0.3333", pb="0.2963", absz=z)
+           for m, lo, mid, hi, z in (("us", -0.9, 0.12, 1.05, 0.85), ("sa", -0.7, -0.05, 0.6, 0.6),
+                                     ("oil", -2.2, 0.3, 2.4, 0.7), ("gold", -1.0, 0.25, 1.4, 1.15),
+                                     ("bonds", -0.55, 0.08, 0.6, 0.95))]
+          + [erow("opec:2026-11-29", "OPEC+ meeting", "2026-11-29 12:00:00+00", m, 27, lo, mid, hi,
+                  kind="meeting", period=None, absz=z)
+             for m, lo, mid, hi, z in (("us", -1.2, 0.05, 1.1, 0.7), ("oil", -3.1, 0.4, 3.5, 1.35),
+                                       ("sa", -0.9, 0.1, 1.0, 0.8))])
+
+
+def lrow(mid, r1, p10, p90, hit):
+    return {"event_id": "2026-11-17 13:30|US|Retail Sales|mom|Oct", "family_name": "US retail sales (m/m)",
+            "event_at": "2026-11-17 13:30:00+00", "figure": "above", "estimate": "0.4", "actual": "0.6",
+            "market_id": mid, "market_order": str(mb.MARKETS.index(mid) + 1), "r1_pct": r1, "r1_p10": p10,
+            "r1_p90": p90, "band_hit": hit, "move": "normal"}
+
+
+LAST = [lrow("us", "-0.42", "-1.1", "0.9", "true"), lrow("sa", "0.1", None, None, None),
+        lrow("oil", "-3.1", "-2.0", "2.2", "false")]
+
+
+def esum(period, family, name, events, **kw):
+    r = {"period": period, "family": family, "family_name": name, "events": str(events), "not_logged": "0",
+         "band_n": "0",
+         "band_pct": None, "big_n": "0", "big_pct": None, "any_pct": None, "big_skill": None, "dir_n": "0",
+         "dir_events": "0", "dir_pct": None, "dir_z": None, "drift_n": "0", "drift_events": "0", "drift_pct": None,
+         "drift_z": None, "fig_n": "0",
+         "fig_skill": None, "verdict": "collecting" if period == "forward" else "band too few, direction too few"}
+    r.update({k: str(v) for k, v in kw.items()})
+    return r
+
+
+EV_SUMMARY = [esum("backtest", "all", "All families", 96, band_n=719, band_pct=71.2, big_n=564, big_pct=25.7,
+                   any_pct=24.9, big_skill=-0.078, dir_n=40, dir_events=6, dir_pct=55.0, dir_z=0.63, drift_n=38,
+                   drift_events=5, drift_pct=47.4,
+                   fig_n=60, fig_skill=0.041, verdict="band calibrated, direction not proven"),
+              esum("backtest", "opec", "OPEC+ meeting", 27, band_n=216, band_pct=74.5, big_n=192, big_pct=24.0,
+                   any_pct=24.8, big_skill=-0.06, verdict="band calibrated, direction too few"),
+              esum("forward", "all", "All families", 2)]
+
+
 def payload(rows):
     names = list(rows[0]) if rows else []
     return {"jobComplete": True, "schema": {"fields": [{"name": n} for n in names]},
@@ -124,21 +179,26 @@ def payload(rows):
 
 
 class Resp:
-    def __init__(self, body, status=200):
-        self._body, self.status_code, self.text = body, status, "refused"
+    def __init__(self, body, status=200, text="refused"):
+        self._body, self.status_code, self.text = body, status, text
 
     def json(self):
         return self._body
 
 
 class Session:
-    def __init__(self, rank=None, summary=None, fail=None, ready=None, switch=None, trial=None):
+    def __init__(self, rank=None, summary=None, fail=None, ready=None, switch=None, trial=None, events=None, last=None,
+                 ev_summary=None, no_event_views=False):
         self.sql, self.fail = [], fail
         self.rank = RANK if rank is None else rank
         self.summary = SUMMARY if summary is None else summary
         self.ready = READY if ready is None else ready
         self.switch = SWITCH if switch is None else switch
         self.trial = TRIAL if trial is None else trial
+        self.events = EVENTS if events is None else events                    # 1.2.0
+        self.last = LAST if last is None else last
+        self.ev_summary = EV_SUMMARY if ev_summary is None else ev_summary
+        self.no_event_views = no_event_views
 
     def post(self, url, timeout=None, json=None):
         sql = json["query"]
@@ -156,6 +216,13 @@ class Session:
             return Resp(payload(self.switch))
         if ".v_ready_trial`" in sql:
             return Resp(payload(self.trial))
+        for view, rows in ((".v_event_scenarios`", self.events), (".v_event_trial`", self.last),
+                           (".v_event_trial_summary`", self.ev_summary)):
+            if view in sql:
+                if self.no_event_views:
+                    return Resp({}, 404, "Not found: Table proj-1:tfb_archive%s was not found in location US"
+                                % view.rstrip("`"))
+                return Resp(payload(rows))
         raise AssertionError("unexpected query: %s" % sql[:80])
 
 
@@ -314,20 +381,24 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert mb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
     assert list(book.tabs) == ["Final_Decisions", "Markets_Board"] and book.tabs["Markets_Board"].updates == 1
     assert book.tabs["Final_Decisions"].ranges == ["A1:C400"] and book.tabs["Final_Decisions"].updates == 0
-    assert len(sess.sql) == 5 and ".v_market_rank`" in sess.sql[0] and ".v_market_trial_summary`" in sess.sql[1]
+    assert len(sess.sql) == 8 and ".v_market_rank`" in sess.sql[0] and ".v_market_trial_summary`" in sess.sql[1]
     assert [q.split("FROM `proj-1.tfb_archive.", 1)[1].split("`", 1)[0] for q in sess.sql[2:]] == [
-        "v_ready_list", "v_hold_vs_switch", "v_ready_trial"]
+        "v_ready_list", "v_hold_vs_switch", "v_ready_trial", "v_event_scenarios", "v_event_trial",
+        "v_event_trial_summary"]
     page = book.tabs["Markets_Board"].values
     assert all(len(r) == mb.WIDTH for r in page) and len(page) >= 160
     cells = cells_of(page)
     assert not any("None" in c or c.lower() in ("nan", "inf") for c in cells)
     assert page[0][0].startswith("MARKETS BOARD - ") and "OBSERVE ONLY" in page[0][0]
-    assert page[1][0] == ("Built 2026-11-21 11:40 Riyadh | markets_board 1.1.0 | as of Fri 20 Nov 2026 (each market's "
+    assert page[1][0] == ("Built 2026-11-21 11:40 Riyadh | markets_board 1.2.0 | as of Fri 20 Nov 2026 (each market's "
                           "latest close, 6 days at most) | BigQuery v_market_rank | only the Today Action Plan gives orders")
     assert page[2][:3] == ["VERDICT", "ALL ON HOLD - cash stays cash",
                            "none of the 10 markets with a fund is calm (oil is a reading only); every market on hold for "
                            "3 day(s) in a row, since Wed 18 Nov 2026"]
     assert page[3][:2] == ["US", "crash_day"]
+    assert page[4][:3] == ["NEXT EVENT", "US core PCE prices (m/m) - Oct, Wed 25 Nov 16:30 Riyadh",     # 1.2.0
+                           "on its 24 earlier event(s) the US moved a median +0.12 % (middle 80 %: -0.90 .. +1.05) and "
+                           "oil moved a median +0.30 % (middle 80 %: -2.20 .. +2.40) - section 7 has the next 14 days"]
     head = page.index(mb.HEAD)
     order = [r[1] for r in page[head + 1:head + 12]]
     assert order == ["Bonds", "Saudi Arabia", "US REITs", "Oil", "Europe", "Sukuk", "China / Hong Kong", "Japan", "Gold",
@@ -379,19 +450,47 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
                           "moved -1.11 % in the next week against +0.69 % for the ones it let through (720 and 428 "
                           "name-days) - it held the weaker ones.")
     assert "READY LIST, FORWARD: nothing has matured yet" in " ".join(texts)
+    # 1.2.0: the events ahead, the last 7 days and the events scorecard
+    ev_head = page.index(mb.EVENT_HEAD + [""] * (mb.WIDTH - len(mb.EVENT_HEAD)))
+    assert str(page[ev_head - 1][0]).startswith("7. EVENTS AHEAD - the Fed, ECB, Bank of Japan and OPEC+ meetings")
+    assert page[ev_head + 1][:14] == ["Wed 25 Nov 16:30", "US core PCE prices (m/m) - Oct", 0.2, 0.3,
+                                      "37 / 33 / 30 (from 24)", 24, "+0.12 (-0.90 .. +1.05)", "-0.41 (9) / +0.38 (7)",
+                                      "-0.05 (-0.70 .. +0.60)", "+0.30 (-2.20 .. +2.40)", "+0.25 (-1.00 .. +1.40)",
+                                      "+0.08 (-0.55 .. +0.60)", 30, "Gold (1.1 normal days)"]
+    assert page[ev_head + 2][:14] == ["Sun 29 Nov 15:00", "OPEC+ meeting", "", "", "no forecast to read", 27,
+                                      "+0.05 (-1.20 .. +1.10)", "", "+0.10 (-0.90 .. +1.00)", "+0.40 (-3.10 .. +3.50)",
+                                      "", "", 30, "Oil (1.4 normal days)"]
+    la_head = page.index(mb.EVENT_LAST_HEAD + [""] * (mb.WIDTH - len(mb.EVENT_LAST_HEAD)))
+    assert page[la_head + 1][:10] == ["Tue 17 Nov 16:30", "US retail sales (m/m)", "above", 0.4, 0.6, "",
+                                      "-0.42 (inside the band)", "", "+0.10 (no band yet)", "-3.10 (OUTSIDE the band)"]
+    et_head = page.index(mb.EVENT_TRIAL_HEAD + [""] * (mb.WIDTH - len(mb.EVENT_TRIAL_HEAD)))
+    assert page[et_head + 1][:16] == ["backtest", "All families", 96, 71.2, 719, 25.7, 24.9, -0.08, 55.0, 6, 0.63,
+                                      47.4, 5, 0.04, 60, "band calibrated, direction not proven"]   # events, not rows
+    assert page[et_head + 3][:3] == ["forward", "All families", 2] and page[et_head + 3][15] == "collecting"
+    ev_text = [x for x in texts if x.startswith("EVENTS, BACKTEST")][0]
+    assert ev_text == ("EVENTS, BACKTEST (the same rules read back on the archive, 96 events): the band of the earlier "
+                       "moves held 71 % of 719 event-market rows (a true band holds 80 %: close); a big move came on "
+                       "26 % of the event days against 25 % of any days, and the family's chance of one scored -0.08 "
+                       "against any day's (it told nothing more); the direction after a figure held 55 % of 40 rows "
+                       "over 6 events (z +0.63, each event once); the figure chances scored +0.04 against equal thirds "
+                       "over 60 figures.")
+    assert ("EVENTS, FORWARD (from Mon 23 Nov 2026): 2 event(s) scored so far - collecting; the owner reviews them "
+            "with the rest after 10 sessions.") in texts
     out = capsys.readouterr().out
     assert ("MARKETS as of 2026-11-20: 10 of 11 market(s) read, 0 of 10 open (ALL ON HOLD - cash stays cash); labels "
             "crash_day 3, drawdown 6, weak 1; scorecard rows: backtest 3, forward 0") in out
     assert ("READY 3 of 6 qualified (hold 2, not read 1, open 3) | switch check: 2 holding(s), 1 with a SWITCH CANDIDATE | "
             "ready scorecard rows: 7 | Final_Decisions: 3 stock(s) read") in out
-    assert "wrote the Markets_Board tab (82 row(s))" in out                    # the rows written before the blank tail
+    assert "wrote the Markets_Board tab (100 row(s))" in out                   # the rows written before the blank tail
+    assert ("EVENTS ahead (14 days): 2 event(s) with a scenario | last 7 days: 1 | event scorecard lines: backtest 2, "
+            "forward 1") in out
     for sym in ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "HHH", "JJJ", "ZZZ"):
         assert sym not in out, sym                                              # no symbol in the public run log
 
 
 def test_m5_empty_views_still_make_an_honest_tab(monkeypatch, capsys):
     _env(monkeypatch)
-    book, sess = Book(), Session(rank=[], summary=[], ready=[], switch=[], trial=[])
+    book, sess = Book(), Session(rank=[], summary=[], ready=[], switch=[], trial=[], events=[], last=[], ev_summary=[])
     assert mb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
     page = book.tabs["Markets_Board"].values
     assert "no market could be read from v_market_rank" in page[1][0]
@@ -399,8 +498,28 @@ def test_m5_empty_views_still_make_an_honest_tab(monkeypatch, capsys):
     cells = cells_of(page)
     assert "no qualified name in the last 7 days (v_ready_list)" in cells and "no holding read (v_hold_vs_switch)" in cells
     assert "nothing has matured yet" in cells
+    assert "no event with earlier ones of its kind in the next 14 days" in cells and "no event scored yet" in cells
+    assert "no event in the last 7 days" in cells and "EVENTS, BACKTEST: no event scored yet." in cells
     out = capsys.readouterr().out
     assert "MARKETS no market read" in out and "Final_Decisions: 0 stock(s) read" in out    # no tab: nothing read
+
+
+def test_m5_before_the_event_views_exist_the_page_is_built_all_the_same(monkeypatch, capsys):
+    """1.2.0: while views 1.21.0 are not in BigQuery, sections 7-8 say so, nothing else changes, and only the first
+    event view is asked for; any other refusal of an event view still fails the run (test M6)."""
+    _env(monkeypatch)
+    book, sess = world(), Session(no_event_views=True)
+    assert mb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
+    assert len(sess.sql) == 6 and ".v_event_scenarios`" in sess.sql[-1]
+    page = book.tabs["Markets_Board"].values
+    cells = cells_of(page)
+    msg = ("the event views are not in BigQuery yet: v_event_scenarios, v_event_trial and v_event_trial_summary "
+           "(apply_bq_views 1.21.0)")
+    assert cells.count(msg) == 3 and not any(r[0] == "NEXT EVENT" for r in page)
+    assert any(str(r[0]).startswith("7. EVENTS AHEAD") for r in page) and any(r[0] == "VERDICT" for r in page)
+    out = capsys.readouterr().out
+    assert "a view of apply_bq_views 1.21.0 is not in BigQuery yet: v_event_scenarios" in out
+    assert "EVENTS: views 1.21.0 not in BigQuery yet" in out and "wrote the Markets_Board tab" in out
 
 
 # ----------------------------------------------------------------------------- M6 off, dry run and failures
@@ -408,10 +527,11 @@ def test_m6_dry_run_off_switch_and_failures_write_nothing(monkeypatch, capsys):
     _env(monkeypatch)
     book, sess = world(), Session()
     assert mb.run_once(True, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert list(book.tabs) == ["Final_Decisions"] and len(sess.sql) == 5 and "dry run:" in capsys.readouterr().out
+    assert list(book.tabs) == ["Final_Decisions"] and len(sess.sql) == 8 and "dry run:" in capsys.readouterr().out
     assert mb.main(["--dry-run"], book=book, session=Session(), now=NOW, query=eb.bq_query) == 0
     assert list(book.tabs) == ["Final_Decisions"]
-    for view in ("v_market_rank", "v_market_trial_summary", "v_ready_list", "v_hold_vs_switch", "v_ready_trial"):
+    for view in ("v_market_rank", "v_market_trial_summary", "v_ready_list", "v_hold_vs_switch", "v_ready_trial",
+                 "v_event_scenarios`", "v_event_trial`", "v_event_trial_summary`"):          # 1.2.0: a refusal fails
         old = world(Markets_Board=Sheet([["old tab"]]))
         assert mb.run_once(False, book=old, session=Session(fail=view), now=NOW, query=eb.bq_query) == 2, view
         assert old.tabs["Markets_Board"].values == [["old tab"]] and old.tabs["Markets_Board"].updates == 0
@@ -466,7 +586,8 @@ def test_m6_a_quota_answer_is_waited_out(monkeypatch, capsys):
 
 # ----------------------------------------------------------------------------- M7 wiring
 WF = ROOT / ".github" / "workflows" / "markets_board.yml"
-ARCHIVES = ["\U0001F30D BigQuery Market Series", "\U0001F52C BigQuery Symbol Deep Data"]
+ARCHIVES = ["\U0001F30D BigQuery Market Series", "\U0001F52C BigQuery Symbol Deep Data",
+            "\U0001F5D3\ufe0f BigQuery Economic Calendar"]                       # 1.2.0: the economic calendar
 EXIT_PLAN = "\U0001F3AF Exit Plan"
 
 
@@ -482,8 +603,9 @@ def test_m7_workflow_manifest_and_read_only_scope():
     assert on["workflow_run"] == {"workflows": ARCHIVES + [EXIT_PLAN], "types": ["completed"]}
     names = {p.name: yaml.safe_load(p.read_text(encoding="utf-8"))["name"]
              for p in (ROOT / ".github" / "workflows").glob("*.yml")
-             if p.name in ("bq_markets.yml", "bq_symbol_deep.yml", "exit_plan.yml")}
-    assert names == {"bq_markets.yml": ARCHIVES[0], "bq_symbol_deep.yml": ARCHIVES[1], "exit_plan.yml": EXIT_PLAN}
+             if p.name in ("bq_markets.yml", "bq_symbol_deep.yml", "bq_econ_calendar.yml", "exit_plan.yml")}
+    assert names == {"bq_markets.yml": ARCHIVES[0], "bq_symbol_deep.yml": ARCHIVES[1],
+                     "bq_econ_calendar.yml": ARCHIVES[2], "exit_plan.yml": EXIT_PLAN}
     assert on["workflow_dispatch"]["inputs"]["dry_run"]["default"] is False
     assert wf["permissions"] == {"contents": "read"} and "concurrency" not in wf
     assert set(wf["jobs"]) == {"due", "board"} and "concurrency" not in wf["jobs"]["due"]
@@ -507,7 +629,8 @@ def test_m7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/markets_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert name in src or name.startswith("TFB_BQ_"), name
-    assert src.isascii() and mb.__version__ == "1.1.0" and "v1.1.0 (2026-11-21)" in src and "v1.0.0 (2026-11-21)" in src
+    assert src.isascii() and mb.__version__ == "1.2.0" and "v1.2.0 (2026-11-21)" in src and "v1.1.0 (2026-11-21)" in src
+    assert "v1.0.0 (2026-11-21)" in src
     assert ('("markets_board", "%s", "markets board")' % mb.__version__
             in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8"))
     assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src and mb.TAB == "Markets_Board"
@@ -520,6 +643,13 @@ def test_m7_workflow_manifest_and_read_only_scope():
     assert tuple(ids) == mb.MARKETS, ids
     assert mb.FORWARD_FROM.isoformat() in (ROOT / "sql/bigquery/101_v_market_trial.sql").read_text(encoding="utf-8")
     assert mb.FORWARD_FROM.isoformat() in (ROOT / "sql/bigquery/104_v_ready_trial.sql").read_text(encoding="utf-8")
+    # 1.2.0: the events shown are markets of the page; the forward test starts at 00:00 Riyadh of the board's date
+    assert set(mb.EVENT_MARKETS) <= set(mb.MARKETS) and mb.EVENT_FORWARD_FROM == mb.FORWARD_FROM
+    start = dt.datetime.combine(mb.EVENT_FORWARD_FROM, dt.time(0, 0), tzinfo=mb.RIYADH).astimezone(UTC)
+    trial_sql = (ROOT / "sql/bigquery/112_v_event_trial.sql").read_text(encoding="utf-8")
+    assert "TIMESTAMP '%s+00', 'forward', 'backtest'" % start.strftime("%Y-%m-%d %H:%M:%S") in trial_sql
+    summary_sql = (ROOT / "sql/bigquery/113_v_event_trial_summary.sql").read_text(encoding="utf-8")
+    assert "WHEN r.period = 'forward' AND r.events < %d THEN 'collecting'" % mb.REVIEW_SESSIONS in summary_sql
     # the Final_Decisions header the board needs is the Today Action Plan's own
     from scripts import today_action_plan as tap
     assert tap.FINAL_TAB == mb.FINAL_TAB and tap.FINAL_HEAD[:3] == ["Symbol", "Decision", "Do today"]
@@ -660,3 +790,64 @@ def test_m8_final_decisions_the_live_rule_and_the_waiting_words(monkeypatch):
                                                  "week against +0.25 % for the other qualified names (3 and 9 name-days) "
                                                  "- no difference.")
     assert mb.trial_reading(TRIAL, "forward").startswith("READY LIST, FORWARD: nothing has matured yet")  # by period
+
+
+# ----------------------------------------------------------------------------- M9 the events (1.2.0)
+def test_m9_event_sql_is_select_only_timed_and_reads_the_three_views():
+    a, b, c = mb.sql_events_ahead(DS, NOW), mb.sql_events_last(DS, NOW), mb.sql_events_summary(DS)
+    assert "FROM `proj-1.tfb_archive.v_event_scenarios` WHERE NOT is_out AND event_at >= TIMESTAMP '2026-11-21 08:40:00+00'" in a
+    assert "AND event_at < TIMESTAMP_ADD(TIMESTAMP '2026-11-21 08:40:00+00', INTERVAL 14 DAY)" in a
+    assert a.endswith("ORDER BY event_at, event_id, market_order")
+    assert "FROM `proj-1.tfb_archive.v_event_trial` WHERE event_at >= TIMESTAMP_SUB(TIMESTAMP '2026-11-21 08:40:00+00', " \
+           "INTERVAL 7 DAY) AND event_at < TIMESTAMP '2026-11-21 08:40:00+00'" in b
+    assert "AND market_id IN ('us', 'sa', 'oil', 'gold', 'bonds')" in b
+    assert c.endswith("FROM `proj-1.tfb_archive.v_event_trial_summary` WHERE market_id = 'all' ORDER BY period, family")
+    assert ", dir_n, dir_events, dir_pct, dir_z, drift_n, drift_events, drift_pct, drift_z, " in c   # events, each once
+    assert "SELECT period, family, family_name, events, not_logged, " in c
+    for sql in (a, b, c):
+        assert sql.startswith("SELECT ") and "CURRENT_" not in sql
+        assert not re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE)\b", sql, re.I)
+    with pytest.raises(ValueError):
+        mb.sql_events_ahead(DS, dt.datetime(2026, 11, 21, 8, 40))                   # a time with its zone, always
+    with pytest.raises(ValueError):
+        mb.sql_events_last(DS, TODAY)
+
+
+def test_m9_event_cells_and_readings():
+    assert mb._when("2026-11-29 12:00:00+00") == "Sun 29 Nov 15:00" and mb._when("") == "" and mb._when("x" * 16) == ""
+    assert mb._when("2026-11-20 13:30:00.123+00") == "Fri 20 Nov 16:30"
+    assert mb.band_cell(None) == "" and mb.band_cell({"r1_p50": None}) == ""
+    assert mb.band_cell({"r1_p10": "-1.234", "r1_p50": "0", "r1_p90": "2.5"}) == "+0.00 (-1.23 .. +2.50)"
+    assert mb.figure_chances({"n_fig": "0", "kind": "meeting", "estimate": None}) == "no forecast to read"
+    assert mb.figure_chances({"n_fig": "0", "kind": "release", "estimate": "0.2"}) == ""
+    assert mb.figure_chances({"n_fig": "3", "p_above": "0.5", "p_in_line": "0.3333", "p_below": "0.1667"}) == \
+        "50 / 33 / 17 (from 3)"
+    assert mb.after_figure({"n_above": "0", "n_below": "0"}) == "" and mb.after_figure(None) == ""
+    assert mb.after_figure({"n_above": "4", "r1_p50_above": "-0.5", "n_below": "0"}) == "-0.50 (4) / none"
+    assert mb.moved_most({}) == "" and mb.moved_most({"us": {"market": "United States", "mean_abs_z": None}}) == ""
+    tie = {"us": {"market": "United States", "mean_abs_z": "1.0", "market_order": "1"},
+           "oil": {"market": "Oil", "mean_abs_z": "1.0", "market_order": "7"}}
+    assert mb.moved_most(tie) == "United States (1.0 normal days)"                   # a tie goes to the first market
+    assert mb.next_event_line([]) is None
+    assert mb.next_event_line([dict(EVENTS[0], r1_p50=None)])[1] == "no earlier event of its kind to read yet"
+    assert [r[:2] for r in mb.event_rows(list(reversed(EVENTS)))] == [["Sun 29 Nov 15:00", "OPEC+ meeting"],
+                                                                     ["Wed 25 Nov 16:30", "US core PCE prices (m/m) - Oct"]]
+    assert mb.last_cell({"r1_pct": None}) == "" and mb.last_cell(None) == ""
+    assert mb.event_reading([], "backtest") == "EVENTS, BACKTEST: no event scored yet."
+    assert mb.event_reading([], "forward").startswith("EVENTS, FORWARD (from Mon 23 Nov 2026): 0 event(s) scored so far")
+    ten = [esum("forward", "all", "All families", 10, band_n=40, band_pct=95.0, big_n=0, dir_n=0)]
+    got = mb.event_reading(ten, "forward")
+    assert got.startswith("EVENTS, FORWARD (from Mon 23 Nov 2026, 10 events, each scored on the scenario logged before "
+                          "it): the band of the earlier moves held 95 % of 40 event-market rows (a true band holds 80 "
+                          "%: too wide)")
+    late = [esum("forward", "all", "All families", 3, not_logged=2)]          # 1.2.0: no scenario logged in time
+    assert mb.event_reading(late, "forward") == (
+        "EVENTS, FORWARD (from Mon 23 Nov 2026): 3 event(s) scored so far; 2 more came with no scenario logged before "
+        "them and are not scored - collecting; the owner reviews them with the rest after 10 sessions.")
+    assert got.endswith("; no direction after a figure is scored yet.")
+    narrow = [esum("backtest", "all", "All families", 30, band_n=200, band_pct=61.0, big_n=150, big_pct=40.0,
+                   any_pct=25.0, big_skill=0.12)]
+    assert "(a true band holds 80 %: too narrow)" in mb.event_reading(narrow, "backtest")
+    assert "and the family's chance of one scored +0.12 against any day's (it told more)" in \
+        mb.event_reading(narrow, "backtest")
+    assert mb.event_counts(None, [], []) == "EVENTS: views 1.21.0 not in BigQuery yet"

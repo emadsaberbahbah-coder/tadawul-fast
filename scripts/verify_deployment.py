@@ -336,7 +336,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # scorecard on the names, observe only).
     # 2026-11-21 (manifest pin only): 1.19.0 -> 1.20.0 (v_market_news, v_people_news, v_news_trial,
     # v_news_trial_summary - the news by market and by person and its scorecard, observe only).
-    ("apply_bq_views", "1.20.0", "bigquery looker views"),
+    # 2026-11-21 (manifest pin only): 1.20.0 -> 1.21.0 (v_event_calendar, v_event_reactions, v_event_scenarios,
+    # v_event_trial, v_event_trial_summary - the forward event scenarios and their scorecard, observe only).
+    ("apply_bq_views", "1.21.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -361,7 +363,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("archive_news_themes", "1.1.0", "bigquery news themes"),
     # 2026-11-21 (new script, pinned on arrival): the EODHD economic calendar of six economies, history
     # included, appended to BigQuery as a change log for the forward event scenarios; research table only.
-    ("archive_econ_calendar", "1.0.0", "bigquery economic calendar"),
+    # 2026-11-21: 1.0.0 -> 1.1.0 (after each written run, the scenarios of the events ahead are logged to
+    # event_scenario_log, so the forward trial scores what was said before each event).
+    ("archive_econ_calendar", "1.1.0", "bigquery economic calendar and the event scenario log"),
     # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).
@@ -373,10 +377,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("trial_labels", "1.0.0", "trial labels"),
     # 2026-11-21 (new script, pinned on arrival): the Markets_Board tab - the condition of every market, their
     # order by trend and risk and the scorecard of the forward test, read from the market views (observe only).
-    ("markets_board", "1.1.0", "markets board"),   # 2026-11-21: v1.1.0 the ready list, the switch check
+    # 2026-11-21: v1.1.0 the ready list, the switch check; v1.2.0 the events ahead and their scorecard (views 1.21.0).
+    ("markets_board", "1.2.0", "markets board"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
-    ("news_macro_gate", "1.4.0", "news macro gate"),   # 2026-11-19: v1.4.0 [TRUCE-READ]
+    ("news_macro_gate", "1.4.1", "news macro gate"),   # 2026-11-19: v1.4.0 [TRUCE-READ]; 2026-11-21: v1.4.1 [FOMC-2027]
     # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
     # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete

@@ -1,7 +1,8 @@
-"""scripts/archive_econ_calendar.py v1.0.0 - the EODHD economic calendar of six
+"""scripts/archive_econ_calendar.py v1.1.0 - the EODHD economic calendar of six
 economies, history included, appended to BigQuery as a change log (one row per
 release per change) for the forward event scenarios (owner, 21 Nov 2026, item 5
-of the build list).
+of the build list); 1.1.0 logs the scenarios of the events ahead after each
+written run, so the forward trial scores what was said before each event.
 
 REAL module; the stubs are the EODHD opener (economic-events and /api/user) and
 the HTTP session (a fake answering BigQuery datasets, tables, the resumable
@@ -36,14 +37,21 @@ E8  main: gate off (no request at all), missing project or key, bad dates, a
 E9  the workflow: three schedules, a dry-run dispatch by default, read-only
     repository, the gate armed with a kill switch, the EODHD secret, pinned
     actions
-E10 nothing here writes to the workbook; the only DML is the INSERT into
-    econ_calendar; the token never reaches the output
+E10 nothing here writes to the workbook; the only DML are the INSERTs into
+    econ_calendar and event_scenario_log; the token never reaches the output
+E11 the scenario log (1.1.0): after the calendar INSERT, event_scenario_log
+    (DAY partitions on logged_at, clustered by family and market) gets one
+    INSERT ... SELECT from v_event_scenarios of the events of the next 21 days
+    at the run's time, every column the view's own; before the view exists the
+    run says so and passes; any other error fails the run (exit 2) after the
+    calendar rows are in; a dry run logs nothing
 """
 from __future__ import annotations
 
 import datetime as dt
 import io
 import json
+import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -124,21 +132,27 @@ class FakeBQ:
     load, query jobs (DONE at once) and their results."""
 
     def __init__(self, table=None, dataset=True, dml_rows=7, breakdown=(("changed", "2"), ("new", "5")),
-                 insert_error=None):
-        self.table = table
+                 insert_error=None, log_table=None, log_error=None, log_rows=110):
+        self.tables = {ec.TABLE: table, ec.LOG_TABLE: log_table}
         self.dataset = dataset
         self.dml_rows = dml_rows
         self.breakdown = breakdown
         self.insert_error = insert_error
+        self.log_error, self.log_rows = log_error, log_rows
         self.calls, self.created, self.loads, self.queries = [], [], [], []
         self.uploads = {}
+
+    @property
+    def table(self):
+        return self.tables[ec.TABLE]
 
     def get(self, url, timeout=None, **_):
         self.calls.append(("GET", url))
         if url.endswith(f"/datasets/{DATASET}"):
             return Resp(200 if self.dataset else 404, {})
-        if url.endswith(f"/tables/{ec.TABLE}"):
-            return Resp(200, self.table) if self.table is not None else Resp(404, {})
+        for name in (ec.TABLE, ec.LOG_TABLE):
+            if url.endswith(f"/tables/{name}"):
+                return Resp(200, self.tables[name]) if self.tables[name] is not None else Resp(404, {})
         if "/queries/" in url:
             return Resp(200, {"rows": [{"f": [{"v": s}, {"v": n}]} for s, n in self.breakdown]})
         raise AssertionError("unexpected GET " + url)
@@ -147,7 +161,8 @@ class FakeBQ:
         self.calls.append(("POST", url))
         if url.endswith(f"/datasets/{DATASET}/tables"):
             self.created.append(json)
-            self.table = {"schema": json["schema"], "timePartitioning": json["timePartitioning"]}
+            self.tables[json["tableReference"]["tableId"]] = {"schema": json["schema"],
+                                                              "timePartitioning": json["timePartitioning"]}
             return Resp(200, json)
         if url.startswith(ec.BQ_UPLOAD) and "uploadType=resumable" in url:
             self.loads.append(json)
@@ -156,10 +171,12 @@ class FakeBQ:
             sql = json["configuration"]["query"]["query"]
             self.queries.append(sql)
             ref = json["jobReference"]
-            if sql.startswith("INSERT") and self.insert_error:
-                return Resp(200, {"jobReference": ref,
-                                  "status": {"state": "DONE", "errorResult": {"message": self.insert_error}}})
-            stats = {"query": {"numDmlAffectedRows": str(self.dml_rows)}} if sql.startswith("INSERT") else {}
+            is_log = sql.startswith(f"INSERT INTO `{PROJECT}.{DATASET}.{ec.LOG_TABLE}`")
+            err = self.log_error if is_log else (self.insert_error if sql.startswith("INSERT") else None)
+            if err:
+                return Resp(200, {"jobReference": ref, "status": {"state": "DONE", "errorResult": {"message": err}}})
+            rows = self.log_rows if is_log else self.dml_rows
+            stats = {"query": {"numDmlAffectedRows": str(rows)}} if sql.startswith("INSERT") else {}
             return Resp(200, {"jobReference": ref, "status": {"state": "DONE"}, "statistics": stats})
         raise AssertionError("unexpected POST " + url)
 
@@ -391,7 +408,8 @@ def test_e6_write(monkeypatch, capsys):
     rc, _ = _main(monkeypatch, ["--write", "--countries", "US,SA,JP"], s, make_opener(one_window))
     out = capsys.readouterr()
     assert rc == 0, out
-    (made,) = s.created
+    made, logt = s.created                                  # the calendar first, then the scenario log
+    assert made["tableReference"]["tableId"] == ec.TABLE and logt["tableReference"]["tableId"] == ec.LOG_TABLE
     assert made["timePartitioning"] == {"type": "MONTH", "field": "event_at"}
     assert made["clustering"] == {"fields": ["country", "event_type"]} and made["schema"]["fields"] == ec.SCHEMA
     (load,) = s.loads
@@ -405,13 +423,15 @@ def test_e6_write(monkeypatch, capsys):
                and r["source"] == ec.SOURCE for r in rows)
     nfp = [r for r in rows if r["event_type"] == "Non Farm Payrolls"][0]
     assert nfp["event_at"] == "2026-12-04T13:30:00.000000Z" and nfp["actual"] is None and nfp["estimate"] == 55.0
-    insert, breakdown = s.queries
+    insert, breakdown, log = s.queries
     assert insert.startswith(f"INSERT INTO `{PROJECT}.{DATASET}.{ec.TABLE}`")
+    assert log == ec.log_sql(PROJECT, DATASET, NOW, "4242")
     # US and SA returned releases: covered; JP came back empty: not covered
     assert "STRUCT('US' AS country, DATE '2026-11-18' AS d_from, DATE '2026-12-12' AS d_to)" in insert
     assert "STRUCT('SA' AS country" in insert and "'JP'" not in insert
     assert breakdown.startswith("SELECT status, COUNT(*)") and "TIMESTAMP '2026-11-21 14:10:07.654321+00:00'" in breakdown
-    assert "7 row(s) appended (changed 2, new 5) | table created" in out.out
+    assert ("7 row(s) appended (changed 2, new 5) | table created | 110 scenario row(s) logged (log table created)"
+            in out.out)
 
 
 def test_e6_failed_window_is_not_covered(monkeypatch, capsys):
@@ -419,16 +439,16 @@ def test_e6_failed_window_is_not_covered(monkeypatch, capsys):
     rc, _ = _main(monkeypatch, ["--write", "--countries", "US,SA"], s,
                   make_opener(one_window, fail={("SA", "2026-11-17")}))
     out = capsys.readouterr()
-    assert rc == 1 and not s.created
+    assert rc == 1 and [c["tableReference"]["tableId"] for c in s.created] == [ec.LOG_TABLE]
     insert = s.queries[0]
     assert "STRUCT('US' AS country" in insert and "'SA' AS country" not in insert
-    assert "table created" not in out.out
+    assert " | table created" not in out.out                                   # the calendar existed
 
 
 def test_e6_bigquery_errors(monkeypatch, capsys):
     bad = {"schema": {"fields": ec.SCHEMA[:-1]}, "timePartitioning": {"type": "MONTH", "field": "event_at"}}
     rc, _ = _main(monkeypatch, ["--write"], FakeBQ(table=bad), make_opener(one_window))
-    assert rc == 2 and "differs from SCHEMA" in capsys.readouterr().err
+    assert rc == 2 and "table econ_calendar differs from its SCHEMA" in capsys.readouterr().err
     rc, _ = _main(monkeypatch, ["--write"], FakeBQ(insert_error="boom"), make_opener(one_window))
     assert rc == 2 and "insert: boom" in capsys.readouterr().err
     rc, _ = _main(monkeypatch, ["--write"], FakeBQ(dataset=False), make_opener(one_window))
@@ -519,7 +539,67 @@ def test_e10_no_workbook_one_dml_no_token(monkeypatch, capsys):
     code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
     for word in ("DELETE FROM", "UPDATE `", "MERGE ", "DROP TABLE", "TRUNCATE TABLE", "CREATE OR REPLACE"):
         assert word not in code, word
-    assert code.count("INSERT INTO") == 1 and 'f"""INSERT INTO {t}' in code
+    assert code.count("INSERT INTO") == 2 and 'f"""INSERT INTO {t}' in code
+    assert 'f"INSERT INTO `{project}.{dataset}.{LOG_TABLE}`' in code             # 1.1.0: the scenario log
     rc, _ = _main(monkeypatch, ["--write", "--list-types"], FakeBQ(), make_opener(one_window))
     out = capsys.readouterr()
     assert rc == 0 and TOKEN not in out.out + out.err
+
+
+# ------------------------------------------------------------------ E11
+def test_e11_log_sql_and_its_columns():
+    sql = ec.log_sql(PROJECT, DATASET, NOW, "42;DROP")
+    at = "TIMESTAMP '2026-11-21 14:10:07.654321+00:00'"
+    assert sql.startswith(f"INSERT INTO `{PROJECT}.{DATASET}.event_scenario_log` ({', '.join(ec.LOG_COLUMNS)})\n")
+    assert f"SELECT {at} AS logged_at, '42DROP' AS run_id, {', '.join(ec.LOG_COLUMNS[2:])}\n" in sql
+    assert f"FROM `{PROJECT}.{DATASET}.v_event_scenarios`\nWHERE NOT is_out AND event_at > {at}\n" in sql
+    assert sql.endswith(f"AND event_at <= TIMESTAMP_ADD({at}, INTERVAL 21 DAY)") and ";" not in sql
+    assert "CAST(NULL AS STRING) AS run_id" in ec.log_sql(PROJECT, DATASET, NOW, "")
+    # every logged column is one v_event_scenarios gives, under the same name
+    view = (ROOT / "sql" / "bigquery" / "111_v_event_scenarios.sql").read_text(encoding="utf-8")
+    final = view.rsplit("\nSELECT\n", 1)[1].split("\nFROM ev AS e", 1)[0]
+    names = {re.split(r"[ .]", item.strip())[-1] for item in final.replace("\n", " ").split(",") if item.strip()}
+    assert set(ec.LOG_COLUMNS[2:]) <= names, set(ec.LOG_COLUMNS[2:]) - names
+    assert len(ec.LOG_COLUMNS) == len(set(ec.LOG_COLUMNS)) == 30
+    ints = {f["name"] for f in ec.LOG_SCHEMA if f["type"] == "INTEGER"}
+    assert ints == {"n_prior", "n_big", "n_move", "n_above", "n_in_line", "n_below", "n_f5_above", "n_f5_below", "n_fig"}
+    good = {"schema": {"fields": ec.LOG_SCHEMA}, "timePartitioning": {"type": "DAY", "field": "logged_at"}}
+    assert ec.schema_problems(good, ec.LOG_SCHEMA, ("DAY", "logged_at")) == []
+    assert ec.schema_problems(good) != []                                      # not the calendar's layout
+
+
+def test_e11_the_log_waits_for_the_view_and_fails_on_other_errors(monkeypatch, capsys):
+    s = FakeBQ(log_error="Not found: Table proj-x:tfb_archive.v_event_scenarios was not found in location US")
+    rc, _ = _main(monkeypatch, ["--write"], s, make_opener(one_window))
+    out = capsys.readouterr()
+    assert rc == 0, out
+    assert ("| scenarios not logged yet: v_event_scenarios is not in BigQuery (apply_bq_views 1.21.0) "
+            "(log table created)") in out.out
+    made = [c for c in s.created if c["tableReference"]["tableId"] == ec.LOG_TABLE][0]
+    assert made["timePartitioning"] == {"type": "DAY", "field": "logged_at"}
+    assert made["clustering"] == {"fields": ["family", "market_id"]} and made["schema"]["fields"] == ec.LOG_SCHEMA
+    s = FakeBQ(log_error="Access Denied: Table event_scenario_log")
+    rc, _ = _main(monkeypatch, ["--write"], s, make_opener(one_window))
+    out = capsys.readouterr()
+    assert rc == 2 and "ERROR: scenario log: log: Access Denied" in out.err
+    assert "7 row(s) appended" in out.out and "| scenarios NOT logged (log table created)" in out.out
+    bad = {"schema": {"fields": ec.LOG_SCHEMA[:-1]}, "timePartitioning": {"type": "DAY", "field": "logged_at"}}
+    s = FakeBQ(log_table=bad)
+    rc, _ = _main(monkeypatch, ["--write"], s, make_opener(one_window))
+    out = capsys.readouterr()
+    assert rc == 2 and "table event_scenario_log differs from its SCHEMA" in out.err
+    assert len(s.queries) == 2                                                 # the calendar's two, no log INSERT
+    # an existing log table, a failed window: the log still runs, the run fails for the window
+    good = {"schema": {"fields": ec.LOG_SCHEMA}, "timePartitioning": {"type": "DAY", "field": "logged_at"}}
+    s = FakeBQ(log_table=good)
+    rc, _ = _main(monkeypatch, ["--write", "--countries", "US,SA"], s,
+                  make_opener(one_window, fail={("SA", "2026-11-17")}))
+    out = capsys.readouterr()
+    assert rc == 1 and "| 110 scenario row(s) logged;" in out.out and "(log table created)" not in out.out
+
+
+def test_e11_a_dry_run_logs_nothing(monkeypatch, capsys):
+    s = FakeBQ()
+    rc, _ = _main(monkeypatch, [], s, make_opener(one_window))
+    assert rc == 0 and not s.queries and not s.created
+    assert "logged" not in capsys.readouterr().out

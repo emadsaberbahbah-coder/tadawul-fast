@@ -1,6 +1,14 @@
 # =============================================================================
 # 🧭 Markets Board - the condition of every market and their order, observe-only
 # -----------------------------------------------------------------------------
+# VERSION 1.2.0 (2026-11-21) -- THE EVENTS AHEAD AND THEIR SCORECARD
+# WHY: owner, 21 Nov 2026 11:03 Riyadh, item 5 of the build list ("forward event
+#       scenarios ... score every news signal"). scripts/markets_board.py 1.2.0
+#       adds the next event, the events of the next 14 days with what the
+#       earlier ones did, the last 7 days against their band, and the events
+#       scorecard (views 1.21.0). It also runs after each successful run of the
+#       economic calendar archive (bq_econ_calendar.yml), whose figures and
+#       forecasts the sections read. Nothing else changes.
 # VERSION 1.1.0 (2026-11-21) -- THE READY LIST AND THE SWITCH CHECK
 # WHY: owner, 21 Nov 2026 11:03 Riyadh, items 3 and 4 of the build list (a ready
 #       list of the 2-3 best qualified names from the top-ranked markets, each
@@ -40,7 +48,8 @@ on:
   schedule:
     - cron: "45 5 * * *"            # 08:45 Riyadh, the backstop
   workflow_run:
-    workflows: ["🌍 BigQuery Market Series", "🔬 BigQuery Symbol Deep Data", "🎯 Exit Plan"]
+    workflows: ["🌍 BigQuery Market Series", "🔬 BigQuery Symbol Deep Data", "🗓️ BigQuery Economic Calendar",
+                "🎯 Exit Plan"]
     types: [completed]
   workflow_dispatch:
     inputs:
