@@ -338,7 +338,7 @@ INSTALLED = {
 PENDING = {
     # apply_bq_views 1.21.0 (21 Nov 2026): the forward event scenarios - the meetings and releases, each market's move
     # around them, the scenarios from the earlier events of each family, the trial and its scorecard (observe only)
-    "v_event_calendar": "dee5ae60886db26eb44c76fbbef98c9f7f332c25cc2c429d608bc29e4e382d93",
+    "v_event_calendar": "66a43c94b1dac73bba43c24d420f12bd401185b168c00531ce39c4e453418014",
     "v_event_reactions": "10d89bdd0e31593951118006848f3048b91ab4e21a7dcb3a6aa215d15048cfd6",
     "v_event_scenarios": "634581da8d58f4c68edb51504cb3864235487b1e4a341f66db43f0c39dae6a26",
     "v_event_trial": "89b608a1322920a9122215b151b08e2ae9454d829082eb545d19573505cc7fc1",
@@ -3472,9 +3472,19 @@ def case_v52():
     fam = _structs(code, "WITH fam AS (")
     assert len(fam) == 15 and len({f[0] for f in fam}) == 15
     assert {f[2].strip("'") for f in fam} <= set(ec.COUNTRIES)
+    # one per release: the period read without its year ("Oct. 2026" = "Oct"), a first estimate and its revisions
+    # (the same period within 120 days) merged, and the copy with a figure and a forecast preferred
+    per_re = re.search(r"REGEXP_REPLACE\(TRIM\(IFNULL\(l\.period, ''\)\), r'([^']+)', ''\) AS per", code)
+    assert per_re, "the period without its year"
+    strip = re.compile(per_re.group(1))
+    assert [strip.sub("", p) for p in ("Oct. 2026", "Oct", "Q3", "Q3 2025", "Sep, 2024", "2026")] == \
+        ["Oct", "Oct", "Q3", "Q3", "Sep", ""]
     for frag in ("QUALIFY ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY fetched_at DESC, status) = 1",
                  "WHERE status != 'gone'",
-                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY f.family, IFNULL(l.period, ''), DATE(l.event_at)",
+                 "LAG(event_at) OVER (PARTITION BY family, per ORDER BY event_at, event_id), DAY) < 120",
+                 "SUM(starts) OVER (PARTITION BY family, per ORDER BY event_at, event_id) AS grp",
+                 "PARTITION BY family, per, IF(per = '', CAST(DATE(event_at) AS STRING), CAST(grp AS STRING))",
+                 "ORDER BY IF(actual IS NULL, 2, IF(estimate IS NULL, 1, 0)), event_at, fetched_at DESC, event_id) = 1",
                  "ABS(TIMESTAMP_DIFF(l.event_at, m.event_at, HOUR)) <= 36",
                  "ROWS BETWEEN 36 PRECEDING AND 1 PRECEDING", "IF(n_sd >= 6 AND sd > 0, ROUND(surprise / sd, 3), NULL)",
                  "CASE WHEN surprise / sd >= 0.5 THEN 'above' WHEN surprise / sd <= -0.5 THEN 'below' ELSE 'in_line' END",

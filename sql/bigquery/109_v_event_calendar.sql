@@ -25,10 +25,17 @@
 --   hours) when there is one: the new rate, the forecast and the previous
 --   rate, in %.
 -- THE RELEASES: the latest row of each release in econ_calendar that EODHD
---   still lists (status <> 'gone'), one per family, period and UTC day (the
---   one with a figure, then the latest read: a release moved within its day
---   under a new key counts once), for these families (EODHD's own country,
---   event and comparison):
+--   still lists (status <> 'gone'), ONE PER RELEASE: EODHD lists some
+--   releases twice, from two feeds, with the period written "Oct" and
+--   "Oct. 2026" (seen 21 Nov 2026 on US retail sales and Saudi CPI), and
+--   lists a first estimate with its revisions under the same period (US GDP:
+--   advance, second, third; a flash and its final). So the period is read
+--   without its year, and the releases of a family with the same period
+--   less than 120 days apart are one release: the earliest with a figure
+--   and a forecast, else the earliest with a figure, else the earliest.
+--   A family's same period comes back only a year later, so a year is never
+--   merged; without a period, one release per UTC day. The families
+--   (EODHD's own country, event and comparison):
 --   us_cpi     US Core Inflation Rate, mom      us_pce   US Core PCE Price Index, mom
 --   us_jobs    US Non Farm Payrolls             us_retail US Retail Sales, mom
 --   us_ism     US ISM Manufacturing PMI         us_ism_svc US ISM Services PMI
@@ -150,17 +157,34 @@ live AS (
   FROM latest
   WHERE status != 'gone'
 ),
-rel AS (
+rel0 AS (
   SELECT
     l.event_key AS event_id, f.family, f.family_name, 'release' AS kind, l.country, l.event_at,
-    'eodhd' AS source, l.event_type, l.period, l.actual, l.estimate, l.previous
+    'eodhd' AS source, l.event_type, l.period, l.actual, l.estimate, l.previous, l.fetched_at,
+    -- the period without its year: "Oct. 2026" and "Oct" are the same release
+    REGEXP_REPLACE(TRIM(IFNULL(l.period, '')), r'[.,]?\s*(19|20)[0-9]{2}$', '') AS per
   FROM live AS l
   JOIN fam AS f
     ON f.country = l.country AND REGEXP_CONTAINS(l.event_type, f.type_re) AND IFNULL(l.comparison, '') = f.comparison
-  -- one release per family, period and day: a release EODHD moved within its day under a new key counts once
+),
+rel1 AS (
+  SELECT
+    *,
+    -- a new release unless the family listed the same period less than 120 days before
+    IF(per != '' AND TIMESTAMP_DIFF(event_at, LAG(event_at) OVER (PARTITION BY family, per ORDER BY event_at, event_id), DAY) < 120,
+       0, 1) AS starts
+  FROM rel0
+),
+rel2 AS (
+  SELECT *, SUM(starts) OVER (PARTITION BY family, per ORDER BY event_at, event_id) AS grp
+  FROM rel1
+),
+rel AS (
+  SELECT event_id, family, family_name, kind, country, event_at, source, event_type, period, actual, estimate, previous
+  FROM rel2
   WHERE TRUE
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY f.family, IFNULL(l.period, ''), DATE(l.event_at)
-                             ORDER BY IF(l.actual IS NULL, 1, 0), l.fetched_at DESC, l.event_at DESC) = 1
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY family, per, IF(per = '', CAST(DATE(event_at) AS STRING), CAST(grp AS STRING))
+                             ORDER BY IF(actual IS NULL, 2, IF(estimate IS NULL, 1, 0)), event_at, fetched_at DESC, event_id) = 1
 ),
 rate AS (
   SELECT m.family, m.day, l.event_type, l.actual, l.estimate, l.previous
