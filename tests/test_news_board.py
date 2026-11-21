@@ -1,4 +1,4 @@
-"""scripts/news_board.py v1.0.0 - v1.2.0 - the News Board (news learning loop, phase B): the week's world news by theme, the
+"""scripts/news_board.py v1.0.0 - v1.3.0 - the News Board (news learning loop, phase B): the week's world news by theme, the
 sector tilt of both arms, the holdings beside their sector's tilt, the shadow list and the trial, read from the
 BigQuery news views on every run. Pure functions, the SQL builders, and full runs through the real BigQuery reader on
 a fake session and a fake workbook (no network). Every figure here is invented."""
@@ -124,6 +124,20 @@ def ce(signal, cls, matured, mean5, reading):
 EVAL_ROWS = [ce("company_news", "negative", 5, "3.19", "NO EDGE"), ce("company_news", "neutral", 187, "1.15", "NO EDGE"),
              ce("company_news", "positive", 51, "1.17", "NO EDGE"),
              ce("provider_sentiment", "positive", 391, "0.96", "BIASED (class > 90 %)")]
+
+
+# v1.3.0 [PEERS]: the view of apply_bq_views 1.17.0 also gives each class against the same-day US names
+def cp(signal, cls, matured, mean5, peer5, beat, reading, peers="491"):
+    return dict(ce(signal, cls, matured, mean5, reading), mean_5d_peer_pp=peer5, matured_5d_peer=str(matured),
+                beat_5d_peer_pct=beat, corr_5d_peer="0.019", peers=peers)
+
+
+PEER_ROWS = [cp("company_news", "negative", 5, "3.19", "2.55", "100.0", "NO EDGE", "492"),
+             cp("company_news", "neutral", 186, "1.16", "0.67", "61.8", "NO EDGE"),
+             cp("company_news", "positive", 52, "1.14", "0.69", "63.5", "NO EDGE", "490"),
+             cp("provider_sentiment", "positive", 391, "0.96", "0.49", "60.6", "BIASED (class > 90 %)")]
+UNKNOWN_COLUMN = ('{"error": {"code": 400, "message": "Unrecognized name: mean_5d_peer_pp at [1:88]", '
+                  '"status": "INVALID_ARGUMENT"}}')
 PORTFOLIO = [["MY PORTFOLIO"], [], ["Symbol", "Name"], ["aaa.us", "Alpha Bank"], ["BBB.PA", "Bravo Tech"], ["", ""],
              ["CCC.US", "Charlie Unknown"], ["AAA.US", "dup"], ["not a symbol", "x"], ["TOTAL", ""], ["DDD.US", ""]]
 
@@ -136,8 +150,8 @@ def payload(rows):
 
 
 class Resp:
-    def __init__(self, body, status=200):
-        self._body, self.status_code, self.text = body, status, "refused"
+    def __init__(self, body, status=200, txt="refused"):
+        self._body, self.status_code, self.text = body, status, txt
 
     def json(self):
         return self._body
@@ -146,8 +160,9 @@ class Resp:
 class Session:
     """Answers each query of the board by the view it reads; records the SQL."""
 
-    def __init__(self, trial=None, last_day="2026-11-18", fail=None, tilt=None, shadow=None):
+    def __init__(self, trial=None, last_day="2026-11-18", fail=None, tilt=None, shadow=None, old_view=False):
         self.sql, self.trial, self.last_day, self.fail = [], TRIAL_ROWS if trial is None else trial, last_day, fail
+        self.old_view = old_view                  # v1.3.0: v_company_news_eval as before apply_bq_views 1.17.0
         self.tilt, self.shadow = TILT_ROWS if tilt is None else tilt, SHADOW_ROWS if shadow is None else shadow
 
     def post(self, url, timeout=None, json=None):
@@ -171,7 +186,9 @@ class Session:
         if ".v_symbol_news_class`" in sql:
             return Resp(payload(COMPANY_ROWS))
         if ".v_company_news_eval`" in sql:
-            return Resp(payload(EVAL_ROWS))
+            if "mean_5d_peer_pp" not in sql:
+                return Resp(payload(EVAL_ROWS))
+            return Resp({}, 400, UNKNOWN_COLUMN) if self.old_view else Resp(payload(PEER_ROWS))
         raise AssertionError("unexpected query: %s" % sql[:80])
 
 
@@ -463,8 +480,12 @@ def test_n5_sql_is_select_only_dated_and_clean():
     assert "news_date >= DATE_SUB(DATE '2026-11-19', INTERVAL 6 DAY) AND news_date <= DATE '2026-11-19'" in company
     assert company.count("ORDER BY ABS(score) DESC, published_at DESC, title LIMIT 1)[SAFE_OFFSET(0)]") == 3
     assert "COUNTIF(relevance = 'company') AS company_items" in company and company.endswith("GROUP BY symbol")
-    assert sqls[8] == ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading "
+    assert sqls[8] == ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, corr_5d, reading, mean_5d_peer_pp, "
+                       "matured_5d_peer, beat_5d_peer_pct, corr_5d_peer, peers "
                        "FROM `proj-1.tfb_archive.v_company_news_eval` ORDER BY signal, class")
+    assert nb.sql_company_eval(DS, peers=False) == ("SELECT signal, class, matured_5d, mean_5d_excess_pp, beat_5d_pct, "
+                                                    "corr_5d, reading FROM `proj-1.tfb_archive.v_company_news_eval` "
+                                                    "ORDER BY signal, class")               # the 1.2.0 read
     assert nb.FORWARD == "forward from 2026-11-20" and nb.FORWARD_WEEK == dt.date(2026, 11, 16)
     view = (ROOT / "sql/bigquery/95_v_trial_news_overlay.sql").read_text(encoding="utf-8")
     assert "'%s'" % nb.FORWARD in view                                       # the label is the trial view's own
@@ -497,7 +518,7 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert all(len(r) == nb.WIDTH for r in page) and len(page) >= 120
     cells = [str(c) for r in page for c in r]
     assert not any("None" in c or c.lower() in ("nan", "+nan", "-nan", "inf") for c in cells)
-    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.2.0 | SHADOW")
+    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.3.0 | SHADOW")
     assert "only the Today Action Plan gives orders" in page[1][0]
     heads = [r[0] for r in page if re.match(r"^(VERDICT|\d\. )", str(r[0]))]
     assert [h.split(" - ")[0].split(" (")[0].split(" for ")[0] for h in heads] == [
@@ -628,7 +649,7 @@ def test_n7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/news_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.isascii() and nb.__version__ == "1.2.0" and "v1.2.0 (2026-11-20)" in src
+    assert src.isascii() and nb.__version__ == "1.3.0" and "v1.3.0 (2026-11-21)" in src
     assert '("news_board", "%s", "news board")' % nb.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src and nb.TAB == "News_Board"
     assert "PORTFOLIO_TAB, \"A1:B200\")" in src and src.count("_raw_read(") == 1          # one read, of two columns
@@ -907,10 +928,21 @@ def test_n10_classes_and_readings_follow_the_view_thresholds():
     assert rows[2]["note"] == "no headline in the archive for these 7 days" and rows[2]["provider"] == ""
     long = [dict(COMPANY_ROWS[0], top_title="x" * 200)]
     assert nb.company_rows([{"symbol": "AAA.US", "name": ""}], long)[0]["title"] == "x" * 160 + "..."
-    line = nb.company_record_line(EVAL_ROWS)
-    assert line == ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500): "
-                    "positive +1.17 pts on 51 day(s); neutral +1.15 pts on 187 day(s); negative +3.19 pts on 5 day(s) - "
-                    "reading: NO EDGE. The provider's own reading, scored the same way: BIASED (class > 90 %).")
+    line = nb.company_record_line(PEER_ROWS)                          # v1.3.0: the view of apply_bq_views 1.17.0
+    assert line == ("Record of the new classes (US names, the 5 sessions after the news day, against the same-day average "
+                    "of the US names, about 490 of them): positive +0.69 pts on 52 day(s), ahead on 63.5 %; neutral +0.67 "
+                    "pts on 186 day(s), ahead on 61.8 %; negative +2.55 pts on 5 day(s), ahead on 100.0 % - reading: NO "
+                    "EDGE. Against the S&P 500 instead: positive +1.14; neutral +1.16; negative +3.19 pts. The provider's "
+                    "own reading, scored the same way: BIASED (class > 90 %).")
+    old = nb.company_record_line(EVAL_ROWS)                            # the view before it: the 1.2.0 line, said so
+    assert old == ("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500; the "
+                   "comparison with the same-day US names comes with the next BigQuery views update): positive +1.17 pts "
+                   "on 51 day(s); neutral +1.15 pts on 187 day(s); negative +3.19 pts on 5 day(s) - reading: NO EDGE. "
+                   "The provider's own reading, scored the same way: BIASED (class > 90 %).")
+    empty = [dict(PEER_ROWS[2], mean_5d_peer_pp=None, matured_5d_peer="0", beat_5d_peer_pct=None)]
+    assert nb.company_record_line(empty).startswith("Record of the new classes (US names, the 5 sessions after the news "
+                                                    "day, against the same-day average of the US names, about 490 of "
+                                                    "them): positive: no matured day yet - reading: NO EDGE.")
     assert nb.company_record_line([]) == "Record of the new classes: no scored day yet."
 
 
@@ -940,3 +972,31 @@ def test_n10_the_page_shows_each_holding_and_the_log_shows_counts_only(capsys):
     assert "COMPANY NEWS 4 holding(s): 1 positive, 1 negative, 0 neutral, 2 without company news; Record of the new classes" in out
     for sym in ("AAA", "BBB", "CCC", "DDD", "Alpha", "Delta"):
         assert sym not in out, sym                                                         # holdings stay out of the run log
+
+
+# ----------------------------------------------------------------------------- N11 (v1.3.0 [PEERS]) the record against the peers
+def test_n11_the_record_reads_the_peers_and_waits_for_the_view(capsys):
+    book, sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session()
+    assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
+    firsts = [str(r[0]) for r in book.tabs["News_Board"].values]
+    assert any(c.startswith("Record of the new classes (US names, the 5 sessions after the news day, against the same-day "
+                            "average of the US names, about 490 of them): positive +0.69 pts on 52 day(s)") for c in firsts)
+    assert len(sess.sql) == 9 and "mean_5d_peer_pp" in sess.sql[8]
+    capsys.readouterr()
+    # the view before apply_bq_views 1.17.0: BigQuery does not know the peer columns - the 1.2.0 read, and the page says so
+    old_book, old_sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session(old_view=True)
+    assert nb.run_once(False, book=old_book, session=old_sess, now=NOW, query=eb.bq_query) == 0
+    out = capsys.readouterr().out
+    assert len(old_sess.sql) == 10 and "mean_5d_peer_pp" in old_sess.sql[8] and "mean_5d_peer_pp" not in old_sess.sql[9]
+    assert "the view has no peer columns yet (apply_bq_views 1.17.0 not applied); read against the S&P 500 only" in out
+    firsts = [str(r[0]) for r in old_book.tabs["News_Board"].values]
+    assert any(c.startswith("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500; "
+                            "the comparison with the same-day US names comes with the next BigQuery views update): "
+                            "positive +1.17 pts on 51 day(s)") for c in firsts)
+    for sym in ("AAA", "BBB", "CCC", "DDD"):
+        assert sym not in out                                                    # the log names no holding
+    # any other refusal of the peer read still fails the run and leaves the page as it was
+    kept = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Sheet([["old page"]])})
+    assert nb.run_once(False, book=kept, session=Session(fail="mean_5d_peer_pp"), now=NOW, query=eb.bq_query) == 2
+    assert kept.tabs["News_Board"].values == [["old page"]] and kept.tabs["News_Board"].updates == 0
+    assert "nothing written" in capsys.readouterr().out
