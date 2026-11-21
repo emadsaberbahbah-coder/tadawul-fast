@@ -334,7 +334,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v_market_trial_summary - the condition of every market, observe only; three-digit file numbers).
     # 2026-11-21 (manifest pin only): 1.18.0 -> 1.19.0 (v_ready_list, v_ready_trial - the ready list and its
     # scorecard on the names, observe only).
-    ("apply_bq_views", "1.19.0", "bigquery looker views"),
+    # 2026-11-21 (manifest pin only): 1.19.0 -> 1.20.0 (v_market_news, v_people_news, v_news_trial,
+    # v_news_trial_summary - the news by market and by person and its scorecard, observe only).
+    ("apply_bq_views", "1.20.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -360,7 +362,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-19 (new script, pinned on arrival): the News_Board page - the
     # week's news by theme, the sector tilt, the shadow list and the trial,
     # read from the news views (analysis only).
-    ("news_board", "1.3.0", "news board"),   # 2026-11-21: v1.3.0 [PEERS] the company news record against the same-day US names
+    # 2026-11-21: v1.3.0 [PEERS] the company news record against the same-day US names; v1.4.0 [MARKETS / PEOPLE]
+    # sections 8-10: the news by market and by person and every news signal on trial (apply_bq_views 1.20.0).
+    ("news_board", "1.4.0", "news board"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
