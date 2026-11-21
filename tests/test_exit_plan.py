@@ -21,6 +21,9 @@
       TAKE PROFIT stays for the day it was issued; live_quote for the Daily Plan
   X16 (1.4.0) a dividend whose tax is recorded in _Dividend_Log is counted net of that tax: the log parser, the
       rescaled bars, the entry and the rebased stop, the run with the gate on and off
+  X19 (1.6.0) [MARKET-TURN]: the gate and its labels; which holdings carry a market label; observe = a note, the
+      action unchanged; on = SELL; off = nothing read; the Market ledger column and a 1.5.0 ledger read as before;
+      the page rule line and summary; the workflow knobs
 
 Run: pytest -q tests/test_exit_plan.py
 """
@@ -988,5 +991,152 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.5.0"
-    assert '("exit_plan", "1.5.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.6.0"                                                 # 2026-11-21: 1.6.0
+    assert '("exit_plan", "1.6.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])
+CRASH = {"us": {"label": "crash_day", "day": dt.date(2026, 11, 10),
+                "text": "the US market on a crash day as of 2026-11-10 (S&P 500 fund -3.6% on the day)"},
+         "sa": {"label": "calm", "day": dt.date(2026, 11, 10), "text": "the Saudi market calm as of 2026-11-10"}}
+
+
+def test_x19_gate_and_labels(monkeypatch):
+    assert ep.market_turn_mode() == "observe" and K()["market_turn_labels"] == frozenset(ep.MARKET_TURN_HOLDABLE)
+    for raw, want in (("on", "on"), ("ENFORCE", "on"), ("off", "off"), ("0", "off"), ("observe", "observe"),
+                      ("maybe", "observe"), ("", "observe")):
+        monkeypatch.setenv("TFB_EXIT_MARKET_TURN", raw)
+        assert ep.market_turn_mode() == want, raw
+    monkeypatch.setenv("TFB_EXIT_MARKET_TURN_LABELS", " Crash_Day ,drawdown,calm,junk")
+    assert ep.market_turn_labels() == frozenset({"crash_day", "drawdown"})
+    monkeypatch.setenv("TFB_EXIT_MARKET_TURN_LABELS", "")
+    assert ep.market_turn_labels() == frozenset()
+
+
+def test_x19_which_holdings_carry_a_label():
+    k = K()
+    got = ep.market_turn("DDI.US", "Equity", CRASH, k)
+    assert got == {"market": "us", "label": "crash_day", "day": "2026-11-10", "text": CRASH["us"]["text"],
+                   "turned": True}
+    assert ep.market_turn("SUPN", "Equity", CRASH, k)["market"] == "us"                    # a bare ticker is the US
+    assert ep.market_turn("2222.SR", "Equity", CRASH, k)["turned"] is False                # calm never turns
+    assert ep.market_turn("BBOX.L", "Equity", CRASH, k) is None                            # Europe not read
+    assert ep.market_turn("RY.TO", "Equity", CRASH, k) is None                             # no read market
+    for asset in ("Commodity", "FX", "Index", "Sukuk", "Crypto", "Future", "Fixed Income / Sukuk"):
+        assert ep.market_turn("GLDX.US", asset, CRASH, k) is None, asset
+    assert ep.market_turn("SPY.US", "ETF", CRASH, k)["turned"] is True                    # a fund on a held market
+    k2 = K(market_turn_labels=frozenset({"drawdown"}))
+    assert ep.market_turn("DDI.US", "Equity", CRASH, k2)["turned"] is False
+
+
+def test_x19_observe_on_and_the_waits():
+    mt = ep.market_turn("DDI.US", "Equity", CRASH, K())
+    res = {"ok": True, "action": "HOLD", "why": ["+0.4R at the high"]}
+    ep.apply_market_turn(res, mt, K(market_turn="observe"))
+    assert res["action"] == "HOLD" and res["market"] == "us:crash_day:2026-11-10" and res["market_turned"]
+    assert res["why"][-1].startswith("market not calm (observe): the US market on a crash day as of 2026-11-10")
+    assert res["why"][-1].endswith("the market-turn rule would sell; nothing changes until TFB_EXIT_MARKET_TURN=on")
+    for before in ("HOLD", "TAKE PROFIT", "RAISE STOP", "REVIEW", "SELL"):
+        res = {"ok": True, "action": before, "why": ["x"]}
+        ep.apply_market_turn(res, mt, K(market_turn="on"))
+        assert res["action"] == "SELL" and res["why"][0].startswith("the market turned: the US market on a crash day")
+        assert res["why"][1] == "x"
+    calm = ep.market_turn("2222.SR", "Equity", CRASH, K())
+    res = {"ok": True, "action": "HOLD", "why": []}
+    ep.apply_market_turn(res, calm, K(market_turn="on"))
+    assert res == {"ok": True, "action": "HOLD", "why": [], "market": "sa:calm:2026-11-10"}
+    res = {"ok": True, "action": "HOLD", "why": [], "fresh": True}
+    ep.apply_market_turn(res, mt, K(market_turn="on"))
+    assert res["action"] == "HOLD" and not res.get("market_turned"), "no close since the purchase: it waits"
+    res = {"ok": False, "action": "CHECK", "why": ["no daily price history"]}
+    ep.apply_market_turn(res, mt, K(market_turn="on"))
+    assert res == {"ok": False, "action": "CHECK", "why": ["no daily price history"]}
+    ep.apply_market_turn(res, None, K(market_turn="on"))
+
+
+def _page(b):
+    return "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+
+
+def test_x19_run_observe_on_off(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    sent = []
+    monkeypatch.setenv("TFB_EXIT_MAIL", "1")
+    b = wbook()
+    assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a), market=CRASH) == 0
+    led = b.tabs["_Exit_Plan"].values
+    assert led[0] == ep.LEDGER_HEADERS and led[0][-1] == "Market" and len(led[0]) == 18
+    assert led[1][2] == "DDI.US" and led[1][13] == "TAKE PROFIT" and led[1][17] == "us:crash_day:2026-11-10"
+    page = _page(b)
+    assert "market not calm (observe): the US market on a crash day as of 2026-11-10" in page
+    assert "market not calm: 1 holding (observe)" in page
+    assert "Market turn (observe): a holding whose market is not calm (crash_day, drawdown, stress, weak) is " \
+           "flagged; its action does not change." in page
+    assert sent[-1][0] == "TFB Exit Plan 2026-11-11 - 2 actions: DDI.US take profit, GONE.US check"
+    monkeypatch.setenv("TFB_EXIT_MARKET_TURN", "on")
+    b2 = wbook()
+    assert ep.run(False, True, book=b2, now=NOW, opener=opener, mailer=lambda *a: sent.append(a), market=CRASH) == 0
+    led = b2.tabs["_Exit_Plan"].values
+    assert led[1][13] == "SELL" and led[1][17] == "us:crash_day:2026-11-10"
+    page = _page(b2)
+    assert "the market turned: the US market on a crash day" in page and "is a SELL." in page
+    assert "(observe)" not in page
+    assert sent[-1][0] == "TFB Exit Plan 2026-11-11 - 2 actions: DDI.US sell, GONE.US check"
+    # off: no read, no note, the Market column empty
+    monkeypatch.setenv("TFB_EXIT_MARKET_TURN", "off")
+
+    def no_read(*a, **k):
+        raise AssertionError("TFB_EXIT_MARKET_TURN=off reads no market")
+
+    monkeypatch.setattr(ep, "read_market", no_read)
+    b3 = wbook()
+    assert ep.run(False, False, book=b3, now=NOW, opener=opener) == 0
+    led = b3.tabs["_Exit_Plan"].values
+    assert led[1][13] == "TAKE PROFIT" and led[1][17] == ""
+    assert "Market turn" not in _page(b3) and "market not calm" not in _page(b3)
+
+
+def test_x19_live_read_and_its_faults(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    calls = []
+
+    def op(req, timeout):
+        calls.append(req.full_url)
+        return opener(req, timeout)
+
+    b = wbook()
+    assert ep.run(False, False, book=b, now=NOW, opener=op) == 0                 # observe by default: a live read
+    assert any("/chart/SPY?" in u for u in calls) and any("%5ETASI.SR" in u for u in calls)
+    led = b.tabs["_Exit_Plan"].values
+    assert led[1][17] == "" and "market not calm" not in _page(b), "no label read: no note"
+    monkeypatch.setattr("core.market_condition.read", lambda **kw: 1 / 0)
+    assert ep.read_market(NOW, opener) == {}
+
+
+def test_x19_a_1_5_0_ledger_is_read_and_carried(monkeypatch):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    old_head = ep.LEDGER_HEADERS_V15
+    assert len(old_head) == 17 and "Market" not in old_head
+    key = "DDI.US|%s|100.0000" % days(30)[29].isoformat()
+    old_row = ["2026-11-10", "2026-11-10 07:35", "DDI.US", key, 100, 240, 108, 108, 3.0, 9.0, 95.0, 109.0, "no",
+               "HOLD", "", "2026-11-09", 1.0]
+    got = ep.parse_ledger([old_head, old_row])
+    assert len(got) == 1 and got[0]["Stop"] == 95.0 and got[0]["Market"] == ""
+    assert ep.parse_ledger([old_head[:-1], old_row]) == [], "any other header is not a ledger"
+    b = wbook()
+    b.tabs["_Exit_Plan"] = Sheet([old_head, old_row])
+    assert ep.run(False, False, book=b, now=NOW, opener=opener, market=CRASH) == 0
+    led = b.tabs["_Exit_Plan"].values
+    assert led[0] == ep.LEDGER_HEADERS
+    assert led[1][:17] == old_row and led[1][17] == ""                                 # the old row, kept as written
+    assert led[2][2] == "DDI.US" and led[2][17] == "us:crash_day:2026-11-10"
+    assert led[2][10] >= 95.0, "the stop of the 1.5.0 ledger still holds (it never moves down)"
+
+
+def test_x19_workflow_knobs():
+    wf = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
+    step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
+    assert step["env"]["TFB_EXIT_MARKET_TURN"] == "${{ vars.TFB_EXIT_MARKET_TURN || 'observe' }}"
+    assert step["env"]["TFB_EXIT_MARKET_TURN_LABELS"] == \
+        "${{ vars.TFB_EXIT_MARKET_TURN_LABELS || 'weak,stress,drawdown,crash_day' }}"
+    assert ep.MARKET_TURN_LABELS_DEFAULT == "weak,stress,drawdown,crash_day"
