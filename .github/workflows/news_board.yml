@@ -1,6 +1,18 @@
 # =============================================================================
 # 📰 News Board - the world news, the sector tilt it gives, and the trial
 # -----------------------------------------------------------------------------
+# VERSION 1.1.0 (2026-11-21) -- CHAIN: THE PAGE NO LONGER WAITS FOR GITHUB'S SCHEDULE
+# WHY: owner, 21 Nov 2026 02:20 Riyadh (in Arabic: review the updates and see
+#       the updates they need). Each of the three scheduled runs since 19 Nov
+#       started about 8 hours late (13:55 UTC slot at 21:55 and 21:38; the
+#       04:55 slot at 13:44); the 07:55 page reached the owner at 16:44.
+# WHAT: the board also runs after the Exit Plan workflow, which the workbook
+#       dispatches every hour (07:30 with the e-mail, then :35;
+#       apps_script/29_Page_Refresh_Dispatch.gs), when the UTC hour is one of
+#       TFB_NEWS_BOARD_CHAIN_HOURS (repository Variable; default "4 13" = about
+#       07:35 and 16:40 Riyadh; "off" = cron only). A chained run writes, like
+#       a scheduled one. The cron entries stay. Same rule as News & Macro Gate
+#       1.1.0.
 # VERSION 1.0.0 (2026-11-19)
 #
 # WHY: owner, 19 Nov 2026 ("build the new news and its effect in the file";
@@ -28,16 +40,15 @@ name: 📰 News Board
 on:
   schedule:
     - cron: "55 4,13 * * *"         # 07:55 and 16:55 Riyadh
+  workflow_run:
+    workflows: ["🎯 Exit Plan"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Compute and print only (write nothing)"
         type: boolean
         default: false
-
-concurrency:
-  group: tfb-news-board
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -53,7 +64,40 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
+  due:
+    name: 🕒 Is a chained run due this hour?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.due.outputs.run }}
+    steps:
+      - name: 🕒 Is a chained run due this hour?
+        id: due
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHAIN_HOURS: ${{ vars.TFB_NEWS_BOARD_CHAIN_HOURS || '4 13' }}
+        run: |
+          # CHAIN (2026-11-21): a run chained to the hourly Exit Plan works only in the listed UTC hours;
+          # schedule and dispatch always. "off" (or no number) = no chained run, cron only.
+          RUN=true
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            HOUR=$((10#$(date -u +%H)))
+            RUN=false
+            for h in $CHAIN_HOURS; do
+              if [[ "$h" =~ ^[0-9]+$ ]] && (( 10#$h == HOUR )); then RUN=true; fi
+            done
+            echo "Chained run at UTC hour $HOUR (hours: $CHAIN_HOURS): run=$RUN"
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
   board:
+    # CHAIN fix (Codex P2, PR 1043): the gate is its own job, so a chained run that is not
+    # due never enters this job's concurrency group and cannot cancel or replace a run that publishes.
+    needs: due
+    if: needs.due.outputs.run == 'true'
+    concurrency:
+      group: tfb-news-board
+      cancel-in-progress: false
     name: 📰 Read the news views and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 20

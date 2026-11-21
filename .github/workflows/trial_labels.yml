@@ -1,6 +1,19 @@
 # =============================================================================
 # 🧪 Trial Labels - what the open trials would do with each stock, observe-only
 # -----------------------------------------------------------------------------
+# VERSION 1.1.0 (2026-11-21) -- CHAIN: THE LABELS NO LONGER WAIT FOR GITHUB'S SCHEDULE
+# WHY: owner, 21 Nov 2026 02:20 Riyadh (in Arabic: review the updates and see
+#       the updates they need). The first scheduled slot (20 Nov 14:05 UTC,
+#       17:05 Riyadh) started at 21:45 UTC, 7 h 40 min late - the same delay
+#       as every scheduled page of this repository (News Board about 8 h,
+#       Pre-Open Check always after the US close) - so the labels in the rows
+#       of Top_10_Investments and Portfolio_Decision would stand still.
+# WHAT: the labels also run after the Exit Plan workflow, which the workbook
+#       dispatches every hour at :35 (apps_script/29_Page_Refresh_Dispatch.gs),
+#       when the UTC hour is one of TFB_TRIAL_LABELS_CHAIN_HOURS (repository
+#       Variable; default "5 9 14" = about 08:40, 12:40 and 17:40 Riyadh; "off"
+#       = cron only). A chained run writes, like a scheduled one. The cron
+#       entries stay. Same rule as News & Macro Gate 1.1.0.
 # VERSION 1.0.0 (2026-11-19)
 #
 # WHY: owner, 19 Nov 2026 18:46 Riyadh ("This new updat for news is linked
@@ -27,16 +40,15 @@ name: 🧪 Trial Labels
 on:
   schedule:
     - cron: "5 5,9,14 * * *"        # 08:05, 12:05 and 17:05 Riyadh
+  workflow_run:
+    workflows: ["🎯 Exit Plan"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Compute and print counts only (write nothing)"
         type: boolean
         default: false
-
-concurrency:
-  group: tfb-trial-labels
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -52,7 +64,40 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
+  due:
+    name: 🕒 Is a chained run due this hour?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.due.outputs.run }}
+    steps:
+      - name: 🕒 Is a chained run due this hour?
+        id: due
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHAIN_HOURS: ${{ vars.TFB_TRIAL_LABELS_CHAIN_HOURS || '5 9 14' }}
+        run: |
+          # CHAIN (2026-11-21): a run chained to the hourly Exit Plan works only in the listed UTC hours;
+          # schedule and dispatch always. "off" (or no number) = no chained run, cron only.
+          RUN=true
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            HOUR=$((10#$(date -u +%H)))
+            RUN=false
+            for h in $CHAIN_HOURS; do
+              if [[ "$h" =~ ^[0-9]+$ ]] && (( 10#$h == HOUR )); then RUN=true; fi
+            done
+            echo "Chained run at UTC hour $HOUR (hours: $CHAIN_HOURS): run=$RUN"
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
   labels:
+    # CHAIN fix (Codex P2, PR 1043): the gate is its own job, so a chained run that is not
+    # due never enters this job's concurrency group and cannot cancel or replace a run that publishes.
+    needs: due
+    if: needs.due.outputs.run == 'true'
+    concurrency:
+      group: tfb-trial-labels
+      cancel-in-progress: false
     name: 🧪 Read the trial views and label each stock
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -613,12 +613,13 @@ def test_n7_workflow_manifest_and_read_only_scope():
     raw = (ROOT / ".github/workflows/news_board.yml").read_text(encoding="utf-8")
     wf = yaml.safe_load(raw)
     on = wf[True] if True in wf else wf["on"]
-    assert on["schedule"] == [{"cron": "55 4,13 * * *"}] and set(on) == {"schedule", "workflow_dispatch"}
+    assert on["schedule"] == [{"cron": "55 4,13 * * *"}] and set(on) == {"schedule", "workflow_dispatch", "workflow_run"}
+    assert on["workflow_run"] == {"workflows": ["\U0001F3AF Exit Plan"], "types": ["completed"]}   # 1.1.0 CHAIN (test_page_chains)
     assert on["workflow_dispatch"]["inputs"]["dry_run"]["default"] is False
     assert wf["name"] == "\U0001F4F0 News Board" and wf["permissions"] == {"contents": "read"}
-    assert wf["concurrency"] == {"group": "tfb-news-board", "cancel-in-progress": False}
     job = wf["jobs"]["board"]
-    assert "if" not in job and job["timeout-minutes"] == 20
+    assert job["concurrency"] == {"group": "tfb-news-board", "cancel-in-progress": False} and "concurrency" not in wf
+    assert job["if"] == "needs.due.outputs.run == 'true'" and job["timeout-minutes"] == 20     # 1.1.0: the gate job decides
     step = [s for s in job["steps"] if "news_board.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_NEWS_BOARD"] == "${{ vars.TFB_NEWS_BOARD || 'on' }}"
     assert step["env"]["TFB_BQ_PROJECT"] == "${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}"
