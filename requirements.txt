@@ -84,42 +84,42 @@
 # ----------------------------------------------------------------------------
 # Web framework (FastAPI core)
 # ----------------------------------------------------------------------------
-fastapi==0.140.13
-starlette==1.3.1
-uvicorn[standard]==0.32.1
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn[standard]==0.54.0
 gunicorn==23.0.0
-anyio==4.14.2
-python-multipart==0.0.31
+anyio==4.15.1
+python-multipart==0.0.32
 
 # ----------------------------------------------------------------------------
 # Pydantic (models + settings)
 # ----------------------------------------------------------------------------
-pydantic==2.13.2
-pydantic-core==2.46.2
-pydantic-settings==2.14.2
-typing-extensions==4.15.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+pydantic-settings==2.16.2
+typing-extensions==4.16.0
 
 # ----------------------------------------------------------------------------
 # Performance (JSON, event loop, DNS, date parsing)
 # ----------------------------------------------------------------------------
-orjson==3.11.8
-uvloop==0.21.0; sys_platform != "win32"
-httptools==0.6.4; sys_platform != "win32"
+orjson==3.13.0
+uvloop==0.23.0; sys_platform != "win32"
+httptools==0.9.0; sys_platform != "win32"
 ciso8601==2.3.3; sys_platform != "win32"
 aiodns==3.6.1; sys_platform != "win32"
-rapidfuzz==3.14.5
+rapidfuzz==3.14.6
 
 # ----------------------------------------------------------------------------
 # Security / crypto
 # ----------------------------------------------------------------------------
 # v1.1.4: moved as a pair -- pyOpenSSL 26.4.0 requires cryptography>=49,<51.
-cryptography==50.0.0
+cryptography==50.0.2
 pyOpenSSL==26.4.0
 
 # ----------------------------------------------------------------------------
 # HTTP clients
 # ----------------------------------------------------------------------------
-httpx==0.27.2
+httpx==0.28.1
 # v1.1.3: direct wheel URL == httpcore 1.0.9 (see header). Satisfies
 # httpx 0.27.2's requirement httpcore>=1.0.0,<2.0.0.
 # v1.1.4: pip-audit skips URL pins; httpcore==1.0.9 audited on its own:
@@ -129,8 +129,8 @@ httpcore @ https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd6
 # (RFC 9113 6.5.2); 4.3.0 accepted it. The http2=True providers would then
 # log network_error...LocalProtocolError (see commit sheet, Known limits).
 h2==4.4.1
-requests==2.33.1
-aiohttp==3.14.4
+requests==2.34.2
+aiohttp==3.14.5
 websockets==13.1
 
 # ----------------------------------------------------------------------------
@@ -151,33 +151,33 @@ py-googletrans==4.0.0
 # gRPC / protobuf
 # ----------------------------------------------------------------------------
 protobuf==5.29.6
-grpcio==1.64.3
-grpcio-status==1.64.3
-googleapis-common-protos==1.64.0
-proto-plus==1.24.0
+grpcio==1.85.0
+grpcio-status==1.85.0
+googleapis-common-protos==1.76.0
+proto-plus==1.29.0
 
 # ----------------------------------------------------------------------------
 # Google APIs (Sheets pipeline)
 # ----------------------------------------------------------------------------
-google-api-python-client==2.194.0
-google-auth==2.49.2
-google-auth-httplib2==0.2.1
-google-auth-oauthlib==1.3.1
-google-api-core==2.30.3
-google-cloud-secret-manager==2.27.0
+google-api-python-client==2.201.0
+google-auth==2.62.0
+google-auth-httplib2==0.4.4
+google-auth-oauthlib==1.5.0
+google-api-core==2.43.1
+google-cloud-secret-manager==2.31.0
 gspread==6.2.1
 
 # ----------------------------------------------------------------------------
 # Cache layer
 # ----------------------------------------------------------------------------
 redis==5.3.1
-hiredis==3.3.1
+hiredis==3.5.0
 aiomcache==0.8.2
 
 # ----------------------------------------------------------------------------
 # Observability (protobuf 5.x compatible family)
 # ----------------------------------------------------------------------------
-prometheus-client==0.21.1
+prometheus-client==0.26.0
 opentelemetry-api==1.45.1
 opentelemetry-sdk==1.45.1
 opentelemetry-instrumentation==0.66b1
@@ -188,7 +188,7 @@ opentelemetry-exporter-otlp==1.45.1
 # ----------------------------------------------------------------------------
 # Config / env file loading
 # ----------------------------------------------------------------------------
-python-dotenv==1.2.2
+python-dotenv==1.2.4
 pyyaml==6.0.3
 
 # ============================================================================
@@ -197,11 +197,11 @@ pyyaml==6.0.3
 # ============================================================================
 
 # --- Rate limiting -----------------------------------------------------------
-slowapi==0.1.9
+slowapi==0.1.10
 limits==3.14.1
 
 # --- Auth / passwords --------------------------------------------------------
-PyJWT==2.15.0
+PyJWT==2.15.1
 passlib==1.7.4
 bcrypt==4.3.0
 
@@ -210,20 +210,20 @@ structlog==24.4.0
 loguru==0.7.3
 
 # --- Retry / resilience ------------------------------------------------------
-tenacity==9.1.4
+tenacity==9.2.1
 backoff==2.2.1
 
 # --- Database ----------------------------------------------------------------
-sqlalchemy==2.0.49
-asyncpg==0.30.0
+sqlalchemy==2.1.6
+asyncpg==0.32.0
 
 # --- Error monitoring --------------------------------------------------------
-sentry-sdk==2.58.0
+sentry-sdk==2.73.0
 
 # --- Scraping / feeds / NLP (news intelligence) ------------------------------
-beautifulsoup4==4.14.3
-lxml==6.1.0
-feedparser==6.0.12
+beautifulsoup4==4.15.0
+lxml==6.1.3
+feedparser==6.0.14
 
 # --- Async file / cache IO ---------------------------------------------------
 aiofiles==24.1.0
