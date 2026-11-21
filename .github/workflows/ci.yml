@@ -2,12 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.93 (2026-11-21) -- MARKETS BOARD
+# VERSION 1.1.94 (2026-11-21) -- ECONOMIC CALENDAR
 #
-# (1.1.92, 2026-11-21: VALIDATOR TRANSIENT READ; 1.1.91, 2026-11-21: PAGE
-# CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89, 2026-11-19: TRIAL LABELS;
-# 1.1.88, 2026-11-19: NEWS BOARD)
+# (1.1.93, 2026-11-21: MARKETS BOARD; 1.1.92, 2026-11-21: VALIDATOR TRANSIENT
+# READ; 1.1.91, 2026-11-21: PAGE CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY;
+# 1.1.89, 2026-11-19: TRIAL LABELS; 1.1.88, 2026-11-19: NEWS BOARD)
 #
+# v1.1.94: run tests/test_archive_econ_calendar.py (scripts/
+# archive_econ_calendar.py v1.0.0: the EODHD economic calendar of six
+# economies, history included, appended to BigQuery as a change log for the
+# forward event scenarios; workflow bq_econ_calendar.yml) in the blocking lean
+# lane.
 # v1.1.93: run tests/test_markets_board.py (scripts/markets_board.py v1.0.0:
 # the Markets_Board tab - the condition of every market, their order by trend
 # and risk and the scorecard of the forward test, observe-only; workflow
@@ -1233,6 +1238,7 @@ jobs:
             tests/test_trial_shadow_v2_rule.py \
             tests/test_archive_market_series.py \
             tests/test_archive_news_themes.py \
+            tests/test_archive_econ_calendar.py \
             tests/test_news_board.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
