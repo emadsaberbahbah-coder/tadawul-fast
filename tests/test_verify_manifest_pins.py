@@ -77,6 +77,7 @@ _MODULE_FILES = {
     "core.providers.yahoo_fundamentals_provider": "core/providers/yahoo_fundamentals_provider.py",
     "core.providers.calendar_provider": "core/providers/calendar_provider.py",
     "core.data_engine_v2": "core/data_engine_v2.py",
+    "core.market_condition": "core/market_condition.py",          # 2026-11-21: NEW 1.0.0
 }
 
 # the SCRIPTS manifest checks SCRIPT_VERSION, falling back to __version__

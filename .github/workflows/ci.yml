@@ -2,12 +2,22 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.94 (2026-11-21) -- ECONOMIC CALENDAR
+# VERSION 1.1.95 (2026-11-21) -- MARKET HOLD + SELECTION
 #
-# (1.1.93, 2026-11-21: MARKETS BOARD; 1.1.92, 2026-11-21: VALIDATOR TRANSIENT
-# READ; 1.1.91, 2026-11-21: PAGE CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY;
-# 1.1.89, 2026-11-19: TRIAL LABELS; 1.1.88, 2026-11-19: NEWS BOARD)
+# (1.1.94, 2026-11-21: ECONOMIC CALENDAR; 1.1.93, 2026-11-21: MARKETS BOARD;
+# 1.1.92, 2026-11-21: VALIDATOR TRANSIENT READ; 1.1.91, 2026-11-21: PAGE
+# CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89, 2026-11-19: TRIAL LABELS;
+# 1.1.88, 2026-11-19: NEWS BOARD)
 #
+# v1.1.95: run tests/test_market_condition.py (core/market_condition.py
+# v1.0.0: the live condition of the US / Saudi / European / Japanese / Hong
+# Kong markets, the rules of 99_v_market_condition on Yahoo closes, stdlib
+# only) in the blocking lean lane, and tests/test_de_market_and_selection_gate.py
+# (data_engine_v2 v5.161.0: TFB_MARKET_GATE and TFB_SELECTION_GATE
+# off|observe|enforce demote an INVESTABLE row whose market is not calm, or a
+# share without an analyst consensus >= 15% over its price at risk < 30;
+# off = byte-identical) next to the evidence-cohort suite in the blocking
+# data engine job.
 # v1.1.94: run tests/test_archive_econ_calendar.py (scripts/
 # archive_econ_calendar.py v1.0.0: the EODHD economic calendar of six
 # economies, history included, appended to BigQuery as a change log for the
@@ -1243,6 +1253,7 @@ jobs:
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \
+            tests/test_market_condition.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
@@ -1640,6 +1651,7 @@ jobs:
             tests/test_de_horizon_coherence_f6.py \
             tests/test_de_strict_invest_gate_fixp.py \
             tests/test_de_evidence_cohort.py \
+            tests/test_de_market_and_selection_gate.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \

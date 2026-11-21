@@ -191,13 +191,14 @@ def test_e7_health_surface(monkeypatch):
 
 def test_e8_version_and_manifest_pin():
     from core import data_engine_v2 as de
-    assert de.__version__ == "5.160.0"
+    # 2026-11-21: 5.161.0 (MARKET-HOLD + SELECTION, default off).
+    assert de.__version__ == "5.161.0"
     assert de._EVIDENCE_OBSERVE_TAG == "evidence_cohort_watch"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.data_engine_v2", "__version__", "5.160.0",' in vd
+    assert '("core.data_engine_v2", "__version__", "5.161.0",' in vd
     src = (_REPO / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
     assert src.count("WHY v5.160.0 - A COHORT THAT LOSES ON MATURED RECORDS IS NOT INVESTABLE") == 1
-    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.160.0" in src
+    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.161.0" in src
 
 
 if __name__ == "__main__":

@@ -245,7 +245,14 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-09 (manifest pin only): 5.159.2 -> 5.160.0 ([EVIDENCE-COHORT]:
     # TFB_EVIDENCE_GATE off|observe|enforce + TFB_EVIDENCE_DEMOTE_COHORTS,
     # default off = byte-identical; owner hit-rate review of 9 Nov).
-    ("core.data_engine_v2", "__version__", "5.160.0", "data engine"),
+    # 2026-11-21 (manifest pin only): 5.160.0 -> 5.161.0 ([MARKET-HOLD] +
+    # [SELECTION]: TFB_MARKET_GATE / TFB_SELECTION_GATE off|observe|enforce,
+    # default off = byte-identical; owner hit-rate request of 21 Nov).
+    ("core.data_engine_v2", "__version__", "5.161.0", "data engine"),
+    # 2026-11-21 (manifest pin only): NEW 1.0.0 - the live condition of the
+    # US / Saudi / European / Japanese / Hong Kong markets, read only by the
+    # engine's [MARKET-HOLD] tier (stdlib only; reads nothing at import).
+    ("core.market_condition", "__version__", "1.0.0", "market condition"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
