@@ -2,14 +2,18 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.91 (2026-11-21) -- VALIDATOR TRANSIENT READ
+# VERSION 1.1.92 (2026-11-21) -- VALIDATOR TRANSIENT READ
 #
-# (1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89, 2026-11-19: TRIAL LABELS; 1.1.88,
-# 2026-11-19: NEWS BOARD)
+# (1.1.91, 2026-11-21: PAGE CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89,
+# 2026-11-19: TRIAL LABELS; 1.1.88, 2026-11-19: NEWS BOARD)
 #
-# v1.1.91: run tests/test_validator_transient_read.py (scripts/validate_dashboard.py
+# v1.1.92: run tests/test_validator_transient_read.py (scripts/validate_dashboard.py
 # v1.3.5: a passing Sheets fault on the literal read is waited out, not scored as
 # a failed audit) in the blocking lean lane.
+# v1.1.91: run tests/test_page_chains.py (news_board.yml 1.1.0, trial_labels.yml
+# 1.1.0 and pre_open_check.yml v1.2.0 also run after the hourly Exit Plan, in the
+# UTC hours of their repository Variables, because GitHub started their
+# scheduled runs 8 hours late or after the US close) in the blocking lean lane.
 # v1.1.90: run tests/test_ibkr_history.py (scripts/ibkr_history.py v1.0.0:
 # _IBKR_NAV_History, _IBKR_Fills and _IBKR_Trades from the daily read-only IBKR
 # history file, for Portfolio_Decision_v2's return and trade record; workflow
@@ -1225,6 +1229,7 @@ jobs:
             tests/test_archive_news_themes.py \
             tests/test_news_board.py \
             tests/test_trial_labels.py \
+            tests/test_page_chains.py \
             tests/test_tfb_backtest_rank_evidence.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \

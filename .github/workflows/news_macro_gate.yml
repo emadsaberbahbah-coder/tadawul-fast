@@ -1,6 +1,15 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.1 (2026-11-21) -- THE HOUR GATE IS ITS OWN JOB (Codex P2 on PR 1043)
+# WHY: with the gate as the first step, every chained run entered the
+#       workflow's concurrency group before the gate decided. A run that
+#       was not due could become the pending run of the group and so
+#       replace a pending run that would publish (GitHub keeps one pending
+#       run per group). The gate is now the job 'due'; the job 'gate' runs
+#       only when it says so and holds the concurrency group. Same hours,
+#       same writes; News Board, Trial Labels and the Pre-Open Check follow
+#       the same rule from 21 Nov.
 # VERSION 1.1.0 (2026-11-16) -- THE GATE NO LONGER DEPENDS ON GITHUB'S SCHEDULE ALONE
 # WHY: GitHub delayed or dropped the cron runs: the 19:23 UTC run of 13 Nov
 #       started 00:21 UTC, the 12:47 run of 15 Nov started 14:17, and on
@@ -65,10 +74,6 @@ on:
         default: ""
         type: string
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -82,10 +87,12 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  gate:
-    name: 📰 Collect, grade and record the news & macro verdict
+  due:
+    name: 🕒 Is a chained run due this hour?
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.due.outputs.run }}
     steps:
       - name: 🕒 Is a chained run due this hour?
         id: due
@@ -105,24 +112,32 @@ jobs:
           fi
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
 
+  gate:
+    # 1.1.1 (Codex P2, PR 1043): the hour gate is its own job, so a chained run that is not
+    # due never enters this job's concurrency group and cannot replace a pending run that publishes.
+    needs: due
+    if: needs.due.outputs.run == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
+    name: 📰 Collect, grade and record the news & macro verdict
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
       - name: ⬇️ Checkout
-        if: steps.due.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: 🐍 Set up Python
-        if: steps.due.outputs.run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Install dependencies
-        if: steps.due.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install "google-auth==2.49.2" "requests==2.33.1"
 
       - name: 📰 Run the gate
-        if: steps.due.outputs.run == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -145,7 +160,7 @@ jobs:
           python scripts/news_macro_gate.py $MODE
 
       - name: 📎 Upload evidence
-        if: always() && steps.due.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: news-gate-${{ github.run_id }}

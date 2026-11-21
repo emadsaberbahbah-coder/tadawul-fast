@@ -1,4 +1,4 @@
-# Commit Sheet: the dashboard validator waits out a passing Sheets fault (validate_dashboard 1.3.5, ci.yml 1.1.91), 2026-11-21
+# Commit Sheet: the dashboard validator waits out a passing Sheets fault (validate_dashboard 1.3.5, ci.yml 1.1.92), 2026-11-21
 
 **Scope.** Owner, 21 Nov 2026 02:20 Riyadh (in Arabic: "review the updates for 6 hours and see the updates they need"). The watch found a sync that wrote its page in full but ended red on one passing Google answer. This is the read the Sheets fix of PR 1040 did not reach. No check, status, threshold or exit code changes. No score, gate, ticket or broker action changes.
 
@@ -15,7 +15,7 @@
 | `scripts/verify_deployment.py` | Pin `validate_dashboard` 1.3.5. |
 | `tests/test_validator_transient_read.py` (new) | T1 to T7, driving the real `validate()` and `_run_decision_surface` with fake reads and a fake wait. |
 | `tests/test_validate_dashboard_decision_surface.py` V6 | The version pin. |
-| `.github/workflows/ci.yml` 1.1.91 | The new file is in the blocking lean lane. |
+| `.github/workflows/ci.yml` 1.1.92 | The new file is in the blocking lean lane (1.1.91 went to PR 1043, merged first). |
 
 What the new tests cover:
 - One 500 is waited out (15 s) and the audit passes on the same range.
@@ -43,6 +43,6 @@ What the new tests cover:
 ## Post-merge (lead)
 - **Variables.** No variable. The next dispatched sync runs the new validator.
 - **Read-back.** A passing fault now shows as "v1.3.5 Sheets transient fault reading <page> (...); waiting 15 s, then read 1 of 2" in the leg's log, followed by a normal `scope.coverage` line.
-- **Merge order.** `ci.yml` here and in PR 1043 both move from 1.1.90 to 1.1.91. The second to merge takes 1.1.92 when main is merged into it; only the header lines differ.
+- **Merge order.** PR 1043 merged first and took `ci.yml` 1.1.91. Main was merged into this branch, so this PR is 1.1.92; only the header lines differed.
 
 Not a licensed financial adviser; the owner decides and executes every trade. No broker order; no executable count changes.
