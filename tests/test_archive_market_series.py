@@ -69,8 +69,10 @@ PROJECT, DATASET = "proj-x", "tfb_archive"
 PINNED_IDS = {
     1: "^GSPC", 2: "^IXIC", 3: "^DJI", 4: "^STOXX50E", 5: "^FTSE", 6: "^GDAXI", 7: "^FCHI",
     8: "000001.SS", 9: "399001.SZ", 10: "000300.SS", 11: "^HSI", 12: "^N225", 13: "^TASI.SR", 14: "^VIX",
+    15: "^STOXX",
     20: "SPY", 21: "VGK", 22: "MCHI", 23: "EWJ", 24: "KSA", 25: "UAE", 26: "QAT", 27: "KWT",
     28: "ACWI", 29: "EEM",
+    30: "GLD", 31: "IEF", 32: "SPSK", 33: "VNQ",
     40: "XLK", 41: "XLF", 42: "XLE", 43: "XLV", 44: "XLI", 45: "XLY", 46: "XLP", 47: "XLU",
     48: "XLB", 49: "XLRE", 50: "XLC",
     60: "BZ=F", 61: "CL=F", 62: "GC=F",
@@ -201,7 +203,7 @@ def _run(monkeypatch, argv, session, fetch, capsys=None):
 # --------------------------------------------------------------------------- M1
 def test_m1_series_integrity():
     ids = [s[0] for s in ms.SERIES]
-    assert len(ids) == len(set(ids)) == 49
+    assert len(ids) == len(set(ids)) == 54
     assert {s[0]: s[1] for s in ms.SERIES} == PINNED_IDS
     assert all(1 <= i <= ms.MAX_SERIES_ID for i in ids)
     syms = [s[1] for s in ms.SERIES]
@@ -218,6 +220,11 @@ def test_m1_series_integrity():
     assert local["^TASI.SR"] == "SAR" and local["^N225"] == "JPY" and local["000300.SS"] == "CNY"
     regions = {s[3] for s in ms.SERIES}
     assert {"US", "Europe", "China", "Gulf"} <= regions
+    # v1.3.0: one fund per asset class for the market readings, each with its asset class in `sector`
+    funds = {s[1]: (s[3], s[7]) for s in ms.SERIES if s[5] == "Asset class ETF (USD)"}
+    assert funds == {"GLD": ("Commodities", "Precious metals"), "IEF": ("US", "Treasury bonds"),
+                     "SPSK": ("World", "Sukuk"), "VNQ": ("US", "Real Estate")}, funds
+    assert local["^STOXX"] == "EUR" and ms.__version__ == "1.3.0"
     assert [r["symbol"] for r in ms.series_records("KSA, ^GSPC")] == ["KSA", "^GSPC"]
     with pytest.raises(ValueError):
         ms.series_records("NOPE")
