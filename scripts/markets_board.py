@@ -4,6 +4,28 @@ scripts/markets_board.py
 ================================================================================
 TFB Markets Board - the condition of every market, their order, and the score
 --------------------------------------------------------------------------------
+v1.1.0 (2026-11-21) - THE READY LIST AND THE SWITCH CHECK. Owner, 21 Nov 2026
+    11:03 Riyadh, items 3 and 4 of the build list: "A ready list: each day the
+    2-3 best qualified names from the top-ranked markets, each labelled with
+    what it is waiting for (cash / calmer market / switch). Every page shows the
+    same final decision; only the Today Action Plan gives orders." and "A switch
+    check: propose a swap only when a qualified name's expected return beats a
+    holding's over the same period, after costs on both sides." Three sections
+    are added, read from v_ready_list, v_hold_vs_switch and v_ready_trial
+    (views 1.19.0):
+    4. THE READY LIST - every qualified name of the day in the ready order, the
+       market it tracks (not its currency) and that market's state, whether the
+       market rule and the live US rule would hold it, what it is waiting for,
+       and the Today Action Plan's own decision for it, copied from
+       Final_Decisions (so this page never states another decision).
+    5. THE SWITCH CHECK - each holding against the best qualified name of its
+       market (v_hold_vs_switch: the forecast gap converted into what such a
+       gap has been worth, both trades charged, the chance it ends ahead).
+    6. THE READY LIST SCORECARD - what the qualified names did next, by the
+       state of their market, on and off the ready list, held or not by each
+       rule; its reading puts the ready list against the other qualified names
+       first, then each rule's held names against the ones it let through.
+    It now reads one tab, Final_Decisions!A1:C400, and nothing else.
 v1.0.0 (2026-11-21)
 
 WHY
@@ -38,7 +60,8 @@ WHAT IT WRITES (its tab Markets_Board; nothing else)
 
 SAFETY
     Read-only on BigQuery (SELECT only, through the Evidence Board's reader);
-    it reads no tab and writes only Markets_Board. Observe only: no decision,
+    it reads Final_Decisions!A1:C400 (1.1.0) and writes only Markets_Board.
+    No symbol is printed in the run log, only counts. Observe only: no decision,
     gate, list or order reads this page; the Daily Plan keeps its US rule;
     only the Today Action Plan gives orders. Nothing of the owner's account or
     holdings is read, written or printed. TFB_MARKETS_BOARD = on (default) |
@@ -49,7 +72,10 @@ SAFETY
 ENV
     DEFAULT_SPREADSHEET_ID, GOOGLE_SHEETS_CREDENTIALS, TFB_BQ_PROJECT,
     TFB_BQ_DATASET (default tfb_archive), TFB_BQ_LOCATION (default US),
-    TFB_MARKETS_BOARD.
+    TFB_MARKETS_BOARD; TFB_PLAN_REGIME, TFB_PLAN_REGIME_BLOCK and
+    TFB_PLAN_REGIME_CCY (1.1.0: the live US rule's own settings, passed by the
+    workflow with the Daily Plan's defaults, to say what that rule does with
+    each name).
 Exit: 0 written (or computed in a dry run, or switched off), 2 a query or the write failed.
 
 Not a licensed financial adviser; the owner decides and executes every trade.
@@ -66,7 +92,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts import news_board as nb
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -85,6 +111,15 @@ SHOW_DAYS = 14
 HORIZONS = (5, 10, 20)
 PERIODS = ("backtest", "forward")
 FUND_WORD = {"SA_REITS": "the REITs on Tadawul"}
+FINAL_TAB = "Final_Decisions"
+READY_HEAD = ["Ready", "Symbol", "Name", "Tracks", "Market state", "Market rule", "Live US rule", "Waiting for",
+              "Final decision (Today Action Plan)", "1-month expected %", "Overall score", "Currency", "Page"]
+SWITCH_HEAD = ["Holding", "Name", "Verdict", "Horizon", "Holding forecast %", "Best qualified name", "Its forecast %",
+               "Net after both trades, pp", "Chance it ends ahead %", "Why"]
+TRIAL_HEAD = ["Period", "Horizon", "Group", "Name-days", "Days", "Mean change %", "Against the day's median, pp",
+              "Rose %", "Worst 5 % %"]
+READY_N = 3
+PLAN_LABELS = ("crash_day", "drawdown", "stress", "weak", "calm")
 
 text, num, day, flag = nb.text, nb.num, nb.day, nb.flag
 
@@ -121,6 +156,26 @@ def sql_rank(ds: str, today: _dt.date) -> str:
 
 def sql_summary(ds: str) -> str:
     return "SELECT * FROM `%s.v_market_trial_summary` ORDER BY period, horizon" % ds
+
+
+def sql_ready(ds: str, today: _dt.date) -> str:
+    """1.1.0: the latest day of the ready list on or before `today` (6 days at most), in the ready order."""
+    return ("SELECT CAST(snapshot_date AS STRING) AS snapshot_date, symbol, name, source_page, currency, "
+            "market_country, market_id, market, market_state, market_label, market_waiting_for, market_rank, "
+            "ready_rank, in_ready, qualified, expected_roi_1m_pct, overall_score, waiting_for, us_label "
+            "FROM `%s.v_ready_list` WHERE snapshot_date > DATE_SUB(%s, INTERVAL 7 DAY) AND snapshot_date <= %s "
+            "QUALIFY snapshot_date = MAX(snapshot_date) OVER () ORDER BY ready_rank"
+            % (ds, nb._d(today), nb._d(today)))
+
+
+def sql_switch(ds: str) -> str:
+    """1.1.0: the switch check of every holding and horizon."""
+    return ("SELECT symbol, name, horizon, horizon_order, holding_forecast_pp, best_symbol, best_forecast_pp, net_pp, "
+            "chance_pct, verdict, reason FROM `%s.v_hold_vs_switch` ORDER BY symbol, horizon_order" % ds)
+
+
+def sql_ready_trial(ds: str) -> str:
+    return "SELECT * FROM `%s.v_ready_trial` ORDER BY period, horizon, grp" % ds
 
 
 # ----------------------------------------------------------------------------- #
@@ -297,6 +352,148 @@ def reading(period: str, summary: Sequence[Dict[str, Any]]) -> str:
 
 
 # ----------------------------------------------------------------------------- #
+# 1.1.0: the ready list and the switch check
+# ----------------------------------------------------------------------------- #
+def read_final(values: Sequence[Sequence[Any]]) -> Dict[str, Tuple[str, str]]:
+    """Final_Decisions!A1:C400 -> {SYMBOL: (decision, do today)}; {} when the header is not the expected one."""
+    if not values:
+        return {}
+    head = [text(c) for c in values[0]]
+    if head[:3] != ["Symbol", "Decision", "Do today"]:
+        return {}
+    out: Dict[str, Tuple[str, str]] = {}
+    for row in values[1:]:
+        cells = (list(row) + ["", "", ""])[:3]
+        sym = text(cells[0]).upper()
+        if sym and sym not in out:
+            out[sym] = (text(cells[1]).upper(), text(cells[2]))
+    return out
+
+
+def plan_rule() -> Dict[str, Any]:
+    """The live US rule's settings as the Daily Plan reads them (the workflow passes its Variables with the Daily
+    Plan's defaults): mode, the labels that hold a buy, the currencies held."""
+    mode = (os.environ.get("TFB_PLAN_REGIME") or "enforce").strip().lower()
+    block = [x.strip().lower() for x in (os.environ.get("TFB_PLAN_REGIME_BLOCK") or "weak,stress,drawdown,crash_day"
+                                         ).split(",") if x.strip().lower() in PLAN_LABELS and x.strip().lower() != "calm"]
+    ccy = [c.strip().upper() for c in (os.environ.get("TFB_PLAN_REGIME_CCY") or "USD").split(",") if c.strip()]
+    return {"mode": mode if mode in ("off", "observe", "enforce") else "off", "block": block, "ccy": ccy}
+
+
+def live_rule_word(r: Dict[str, Any], rule: Dict[str, Any]) -> str:
+    us = text(r.get("us_label"))
+    if rule["mode"] == "off":
+        return "off"
+    if not us:
+        return "US not read: does not hold it"
+    if text(r.get("currency")).upper() in rule["ccy"] and us in rule["block"]:
+        return "holds it (US %s)" % us if rule["mode"] == "enforce" else "observe: would hold it (US %s)" % us
+    return "does not hold it"
+
+
+def switch_for(symbol: str, switch: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The first SWITCH CANDIDATE row that would bring `symbol` in, else None."""
+    for r in switch:
+        if text(r.get("verdict")) == "SWITCH CANDIDATE" and text(r.get("best_symbol")).upper() == symbol.upper():
+            return r
+    return None
+
+
+def waiting_text(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]]) -> str:
+    state = text(r.get("market_state"))
+    if state == "hold":
+        return "a calmer market: %s is %s (%s)" % (text(r.get("market")), text(r.get("market_label")),
+                                                    text(r.get("market_waiting_for")) or "see section 1")
+    if state != "open":
+        return "a reading of its market: %s is not read yet" % (text(r.get("market_country")) or "its market")
+    sw = switch_for(text(r.get("symbol")), switch)
+    if sw:
+        return "a switch: it would replace %s over %s (net %+.2f pp after both trades, chance %d %%) - the owner's review" % (
+            text(sw.get("symbol")), text(sw.get("horizon")), num(sw.get("net_pp")) or 0.0, int(num(sw.get("chance_pct")) or 0))
+    dec, do = final.get(text(r.get("symbol")).upper(), ("", ""))
+    if dec == "BUY" and "not funded" not in do.lower():
+        return "nothing: the Today Action Plan says BUY - %s" % (do or "see Final_Decisions")
+    return "cash: %s" % (do if "not funded" in do.lower() else
+                         "no free cash for it today (the Today Action Plan funds it when cash is free)")
+
+
+def ready_row(r: Dict[str, Any], final: Dict[str, Tuple[str, str]], switch: Sequence[Dict[str, Any]],
+              rule: Dict[str, Any]) -> List[Any]:
+    rank = int(num(r.get("ready_rank")) or 0)
+    state = text(r.get("market_state"))
+    dec, do = final.get(text(r.get("symbol")).upper(), ("", ""))
+    return ["READY %d" % rank if flag(r.get("in_ready")) else rank, text(r.get("symbol")), text(r.get("name")),
+            text(r.get("market")) or "not read (%s)" % (text(r.get("market_country")) or "unknown"),
+            {"open": "OPEN", "hold": "HOLD (%s)" % text(r.get("market_label"))}.get(state, "NOT READ"),
+            {"open": "does not hold it", "hold": "holds it"}.get(state, "cannot read it"),
+            live_rule_word(r, rule), waiting_text(r, final, switch),
+            ("%s - %s" % (dec, do) if do else dec) if dec else "not on Final_Decisions",
+            r2(r.get("expected_roi_1m_pct")), r2(r.get("overall_score")), text(r.get("currency")),
+            text(r.get("source_page"))]
+
+
+def switch_rows(switch: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    """One row per holding: its SWITCH CANDIDATE row when there is one, else its 1-month row."""
+    by: Dict[str, List[Dict[str, Any]]] = {}
+    for r in switch:
+        by.setdefault(text(r.get("symbol")), []).append(r)
+    out = []
+    for sym in sorted(by):
+        rows = sorted(by[sym], key=lambda x: num(x.get("horizon_order")) or 9)
+        pick = ([r for r in rows if text(r.get("verdict")) == "SWITCH CANDIDATE"]
+                or [r for r in rows if text(r.get("horizon")) == "1M"] or rows)[0]
+        out.append([sym, text(pick.get("name")), text(pick.get("verdict")), text(pick.get("horizon")),
+                    r2(pick.get("holding_forecast_pp")), text(pick.get("best_symbol")) or "none",
+                    r2(pick.get("best_forecast_pp")), r2(pick.get("net_pp")), r2(pick.get("chance_pct")),
+                    text(pick.get("reason"))])
+    return out
+
+
+def trial_rows(trial: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    return [[text(r.get("period")), text(r.get("horizon")), text(r.get("grp")), int(num(r.get("n")) or 0),
+             int(num(r.get("days")) or 0), r2(r.get("mean_ret_pp")), r2(r.get("mean_excess_pp")), r2(r.get("up_pct")),
+             r2(r.get("p5_ret_pp"))] for r in trial]
+
+
+def _versus(x: float, y: float, worse: str, better: str) -> str:
+    return worse if x < y else better if x > y else "no difference"
+
+
+def trial_reading(trial: Sequence[Dict[str, Any]], period: str) -> str:
+    """One sentence for `period`, over one week: the ready list's names against the other qualified names, then the
+    names each rule held against the names it let through."""
+    by = {(text(r.get("period")), text(r.get("horizon")), text(r.get("grp"))): r for r in trial}
+
+    def pair(on: str, off: str) -> Optional[Tuple[float, float, int, int]]:
+        a, b = by.get((period, "1W", on)), by.get((period, "1W", off))
+        if not (a and b) or num(a.get("mean_ret_pp")) is None or num(b.get("mean_ret_pp")) is None:
+            return None
+        return (num(a.get("mean_ret_pp")), num(b.get("mean_ret_pp")), int(num(a.get("n")) or 0),
+                int(num(b.get("n")) or 0))
+
+    parts = []
+    got = pair("ready list (top 3)", "other qualified")
+    if got:
+        x, y, n1, n2 = got
+        parts.append("the ready list's names moved %+.2f %% in the next week against %+.2f %% for the other qualified "
+                     "names (%d and %d name-days) - %s" % (x, y, n1, n2, _versus(x, y, "it picked the weaker ones",
+                                                                                 "it picked the stronger ones")))
+    for rule, on, off in (("the market rule", "market rule holds it", "market rule does not"),
+                          ("the live US rule", "live US rule holds it", "live US rule does not")):
+        got = pair(on, off)
+        if got:
+            x, y, n1, n2 = got
+            parts.append("the names %s held moved %+.2f %% in the next week against %+.2f %% for the ones it let "
+                         "through (%d and %d name-days) - %s" % (rule, x, y, n1, n2,
+                                                                _versus(x, y, "it held the weaker ones",
+                                                                        "it held the stronger ones")))
+    if not parts:
+        return ("READY LIST, %s: nothing has matured yet - a name is scored a week after the day it was listed."
+                % period.upper())
+    return "READY LIST, %s: %s." % (period.upper(), "; ".join(parts))
+
+
+# ----------------------------------------------------------------------------- #
 # the page
 # ----------------------------------------------------------------------------- #
 HOW_TO = (
@@ -320,7 +517,9 @@ HOW_TO = (
 
 
 def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Sequence[Dict[str, Any]],
-              built: str) -> List[List[Any]]:
+              built: str, ready: Sequence[Dict[str, Any]] = (), final: Optional[Dict[str, Tuple[str, str]]] = None,
+              switch: Sequence[Dict[str, Any]] = (), trial: Sequence[Dict[str, Any]] = (),
+              rule: Optional[Dict[str, Any]] = None) -> List[List[Any]]:
     def line(*cells: Any) -> List[Any]:
         return (list(cells) + [""] * WIDTH)[:WIDTH]
 
@@ -360,6 +559,31 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
     rows += [line(*r) for r in score_table(summary)]
     rows += [line(reading(p, summary)) for p in PERIODS]
     rows.append(line())
+    # 1.1.0: the ready list, the switch check and the ready list's own scorecard
+    final, rule = final or {}, rule or plan_rule()
+    day_txt = short_day(day(ready[0].get("snapshot_date"))) if ready else "none"
+    in_ready = sum(1 for r in ready if flag(r.get("in_ready")))
+    rows.append(line("4. THE READY LIST - the %d best qualified names of %s from the top-ranked markets (READY 1-%d), "
+                     "then every other qualified name in the same order; the decision is the Today Action Plan's own"
+                     % (in_ready, day_txt, in_ready)))
+    rows.append(line("Market rule = the hold read market by market (this page, observe only). Live US rule = the "
+                     "Daily Plan's rule as configured (%s; %s; currencies %s). Only the Today Action Plan gives orders."
+                     % (rule["mode"], ", ".join(rule["block"]) or "no label", ", ".join(rule["ccy"]) or "none")))
+    rows.append(list(READY_HEAD) + [""] * (WIDTH - len(READY_HEAD)))
+    rows += [line(*ready_row(r, final, switch, rule)) for r in ready]
+    if not ready:
+        rows.append(line("", "no qualified name in the last 7 days (v_ready_list)"))
+    rows += [line(), line("5. THE SWITCH CHECK - each holding against the best qualified name of its market "
+                          "(v_hold_vs_switch: the forecast gap as worth what such a gap has been worth, both trades "
+                          "charged; SWITCH CANDIDATE only when proven, positive and 60 % likely - never an order)"),
+             list(SWITCH_HEAD) + [""] * (WIDTH - len(SWITCH_HEAD))]
+    rows += [line(*r) for r in switch_rows(switch)] or [line("", "no holding read (v_hold_vs_switch)")]
+    rows += [line(), line("6. THE READY LIST SCORECARD - what the qualified names did next (v_ready_trial: a week and "
+                          "two weeks, local currency, against the day's median name)"),
+             list(TRIAL_HEAD) + [""] * (WIDTH - len(TRIAL_HEAD))]
+    rows += [line(*r) for r in trial_rows(trial)] or [line("", "nothing has matured yet")]
+    rows += [line(trial_reading(trial, p)) for p in PERIODS]
+    rows.append(line())
     rows += [line(t) for t in HOW_TO]
     rows.append(line())
     return rows
@@ -380,11 +604,25 @@ def counts(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Seque
                sum(1 for k in idx if k[0] == "backtest"), sum(1 for k in idx if k[0] == "forward")))
 
 
+def ready_counts(ready: Sequence[Dict[str, Any]], switch: Sequence[Dict[str, Any]], trial: Sequence[Dict[str, Any]]) -> str:
+    states: Dict[str, int] = {}
+    for r in ready:
+        states[text(r.get("market_state"))] = states.get(text(r.get("market_state")), 0) + 1
+    holdings = len({text(r.get("symbol")) for r in switch})
+    cands = len({text(r.get("symbol")) for r in switch if text(r.get("verdict")) == "SWITCH CANDIDATE"})
+    return ("READY %d of %d qualified (%s) | switch check: %d holding(s), %d with a SWITCH CANDIDATE | ready scorecard "
+            "rows: %d" % (sum(1 for r in ready if flag(r.get("in_ready"))), len(ready),
+                          ", ".join("%s %d" % kv for kv in sorted(states.items())) or "none", holdings, cands, len(trial)))
+
+
 def collect(session: Any, project: str, dataset: str, location: str, today: _dt.date, query: Any) -> Dict[str, Any]:
     ds = "%s.%s" % (project, dataset)
     days = by_day(query(session, project, location, sql_rank(ds, today)))
     summary = query(session, project, location, sql_summary(ds))
-    return {"days": days, "summary": summary}
+    ready = query(session, project, location, sql_ready(ds, today))                      # 1.1.0
+    switch = query(session, project, location, sql_switch(ds))
+    trial = query(session, project, location, sql_ready_trial(ds))
+    return {"days": days, "summary": summary, "ready": ready, "switch": switch, "trial": trial}
 
 
 def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime] = None, query=None) -> int:
@@ -399,26 +637,32 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
     try:
         if query is None:
             from scripts.evidence_board import bq_query as query  # noqa: PLC0415 - one SELECT-only reader
+        if book is None:
+            from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
+            book = _open_book()
         if session is None:
             from scripts.archive_to_bigquery import make_session  # noqa: PLC0415
             session = make_session()
+        from scripts.daily_plan import _read as _raw_read  # noqa: PLC0415
+        from scripts.sheets_quota import call as _quota_call  # noqa: PLC0415
+        # 1.1.0: the Today Action Plan's own decision per stock, so the ready list never states another one
+        final = read_final(_quota_call(lambda: _raw_read(book, FINAL_TAB, "A1:C400"), _SLEEP, _out,
+                                       "reading %s" % FINAL_TAB))
         data = collect(session, project, dataset, nb._env("TFB_BQ_LOCATION", "US"), now.astimezone(RIYADH).date(), query)
     except Exception as e:  # noqa: BLE001 - one tab; a failed read leaves the previous tab in place
         _out("ERROR: %s: %s; nothing written" % (type(e).__name__, text(e)[:300]))
         return 2
     _out("MARKETS %s" % counts(data["days"], data["summary"]))
-    page = page_rows(data["days"], data["summary"], now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M Riyadh"))
+    _out("%s | Final_Decisions: %d stock(s) read" % (ready_counts(data["ready"], data["switch"], data["trial"]), len(final)))
+    page = page_rows(data["days"], data["summary"], now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M Riyadh"),
+                     data["ready"], final, data["switch"], data["trial"], plan_rule())
     if dry_run:
         _out("dry run: %d row(s) computed, nothing written" % len(page))
         return 0
     try:
-        if book is None:
-            from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
-            book = _open_book()
         from scripts.daily_plan import write_grid  # noqa: PLC0415
-        from scripts.sheets_quota import call as _quota_call  # noqa: PLC0415
         # one full overwrite: safe to send again after a quota answer
-        _quota_call(lambda: write_grid(book, TAB, page, WIDTH, 90), _SLEEP, _out, "writing %s" % TAB)
+        _quota_call(lambda: write_grid(book, TAB, page, WIDTH, 160), _SLEEP, _out, "writing %s" % TAB)
     except Exception as e:  # noqa: BLE001 - reported, with the exit code that marks the run failed
         _out("ERROR: %s: %s; the tab was not written" % (type(e).__name__, text(e)[:300]))
         return 2

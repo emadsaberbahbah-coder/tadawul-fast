@@ -280,6 +280,10 @@ INSTALLED = {
 # Installed bodies replaced: v_outcome_engine a7f75e0528a3 (1.5.0), v_outcome_coverage
 # 341bd1f3a44d (1.5.0).
 PENDING = {
+    # apply_bq_views 1.19.0 (21 Nov 2026): the ready list - every qualified name with the market it tracks, that
+    # market's state, the day's ready order - and its scorecard on the names (observe only)
+    "v_ready_list": "19cc686ac4ccb440e72fe0121c990a43b1a944281cc4ada97168b2829ff7fe22",
+    "v_ready_trial": "c1a6d83a31feae9a302dc814016ea6347e650566f398ee843aa355245b9dd468",
     # apply_bq_views 1.18.0 (21 Nov 2026): the condition of every market, their order, the forward test and its
     # scorecard (observe only)
     "v_market_condition": "73a161bea603ebe303c160438f3e74039da889df2ded39b0e76e3db623c74995",
@@ -352,9 +356,10 @@ EXPECTED_ORDER = [
     "v_c2_calls",
     "v_symbol_news_class", "v_company_news_eval",
     "v_market_condition", "v_market_rank", "v_market_trial", "v_market_trial_summary",
+    "v_ready_list", "v_ready_trial",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 42)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 44)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3073,14 +3078,14 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0: a file number may have three digits, and the files are applied in number order (99 before
-    100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.18.0"
+    """apply_bq_views 1.18.0 (kept in 1.19.0): a file number may have three digits, and the files are applied in number
+    order (99 before 100); every two-digit file keeps its place."""
+    assert bv.__version__ == "1.19.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-4:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
-                          "102_v_market_trial_summary.sql"]
-    assert files[:-3] == sorted(files[:-3])                                         # the two-digit order is unchanged
+    assert files[-6:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+                          "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql"]
+    assert files[:-5] == sorted(files[:-5])                                         # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3095,11 +3100,114 @@ def case_v45():
             assert any(needle in p for p in problems), (needle, problems)
 
 
+def case_v46():
+    """v_ready_list (1.19.0): each archived day, every qualified name (the panel floors) with the market it tracks -
+    not its currency - that market's state, the day's ready order (top 3 = the ready list), what it waits for, and
+    the live US rule beside it. Observe only."""
+    import re
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_ready_list"]
+    assert v.path.name == "103_v_ready_list.sql" and v.kind == "VIEW"
+    assert names.index("v_ready_list") == names.index("v_market_trial_summary") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_ready_list"} == {"v_universe", "v_market_rank"}
+    # qualified = INVESTABLE + INVEST + the floors of v_universe_latest, one row per name and day (the last capture)
+    floors = "COALESCE({0}.reliability >= 70 AND {0}.data_quality >= 80, FALSE)"
+    assert floors.format("v") in code and floors.format("r") in bv._code(objs["v_universe_latest"].template)
+    for frag in ("WHERE UPPER(v.investability_status) = 'INVESTABLE'", "AND UPPER(v.final_action) = 'INVEST'",
+                 "AND v.block_reason IS NULL",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY v.symbol, v.snapshot_date ORDER BY v.captured_at DESC, "
+                 "v.source_page) = 1"):
+        assert frag in code, frag
+    # the market a name tracks: every market fund of v_market_condition by name, the futures, the listings
+    cond = bv._code(objs["v_market_condition"].template)
+    ids = [m for _, m, _, _ in re.findall(r"STRUCT\((\d+)(?: AS market_order)?, '([a-z_]+)'(?: AS market_id)?, "
+                                          r"'([^']+)'(?: AS market)?, '([^']+)'", cond)]
+    for mid, fund in zip(ids, _mk_funds(cond)):
+        if fund not in ("", "SPY", "SA_REITS"):
+            assert "WHEN IFNULL(u.market_code, 'US') = 'US' AND u.base = '%s' THEN '%s'" % (fund, mid) in code, fund
+    mapped = set(re.findall(r"THEN '([a-z_]+)'", code.split("END AS market_id", 1)[0].split("CASE", 1)[1]))
+    assert mapped | {"reits_us", "us"} <= set(ids) and "oil" in mapped                # only markets that are read
+    reits = r"REGEXP_CONTAINS(symbol, r'^43(3[0-9]|4[0-9]|50)\.SR$')"
+    assert reits in cond and reits.replace("(symbol", "(u.symbol") in code           # the same Tadawul REITs
+    for frag in ("WHEN UPPER(IFNULL(u.asset_class, '')) != 'EQUITY' THEN NULL",
+                 "THEN IF(STARTS_WITH(UPPER(IFNULL(u.industry, '')), 'REIT'), 'reits_us', 'us')",
+                 "AND u.base NOT IN ('EFA', 'EEM', 'ACWI', 'VEA', 'VWO', 'IEFA', 'IEMG', 'SLV')",
+                 "WHEN u.market_code IN ('HK', 'SS', 'SZ') THEN 'cn'", "WHEN u.market_code = 'T' THEN 'jp'",
+                 "WHEN IFNULL(u.region, '') = 'Europe' AND IFNULL(u.market_code, '') != 'IS' THEN 'eu'",
+                 "ELSE NULL\n    END AS market_id"):
+        assert frag in code, frag
+    # the market's state that day - or on its last day, 6 days at most - by equality joins only
+    for frag in ("LEAST(m.snapshot_date, l.last_as_of) AS look_day",
+                 "LEFT JOIN day_us AS d ON d.as_of = t.look_day AND DATE_DIFF(t.snapshot_date, t.look_day, DAY) <= 6",
+                 "LEFT JOIN mk_day AS k ON k.as_of = d.as_of AND k.market_id = t.market_id",
+                 "IF(t.market_id IS NULL OR k.state IS NULL, 'not read', k.state) AS market_state",
+                 "MAX(IF(k.market_id = 'us', k.label, NULL)) OVER (PARTITION BY k.as_of) AS us_label"):
+        assert frag in code, frag
+    # the ready order: open, then held, then not read; two names a market first; the market's rank; the name
+    for frag in ("ROW_NUMBER() OVER (PARTITION BY j.snapshot_date, j.market_id\n"
+                 "                       ORDER BY j.expected_roi_1m_pct DESC NULLS LAST, j.overall_score DESC NULLS "
+                 "LAST, j.symbol)\n      AS pos_in_market",
+                 "ORDER BY CASE p.market_state WHEN 'open' THEN 0 WHEN 'hold' THEN 1 ELSE 2 END,",
+                 "IF(p.pos_in_market <= 2, 0, 1), p.market_rank NULLS LAST,",
+                 "o.ready_rank <= 3 AS in_ready",
+                 "CASE o.market_state WHEN 'hold' THEN 'calmer market' WHEN 'open' THEN 'cash or a switch'",
+                 "ELSE 'market not read' END AS waiting_for",
+                 "o.market_state = 'hold' AS market_rule_holds"):
+        assert frag in code, frag
+    # the live US rule beside it, with the Daily Plan's workflow defaults: every USD name unless the US is calm
+    assert "UPPER(IFNULL(o.currency, '')) = 'USD' AND IFNULL(o.us_label, 'calm') != 'calm' AS live_us_rule_holds" in code
+    wf = (ROOT / ".github" / "workflows" / "daily_plan.yml").read_text(encoding="utf-8")
+    for default in ("vars.TFB_PLAN_REGIME || 'enforce'", "vars.TFB_PLAN_REGIME_CCY || 'USD'",
+                    "vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day'"):
+        assert default in wf, default
+    assert "FOLLOWING" not in code and "LEAD(" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
+def case_v47():
+    """v_ready_trial (1.19.0): what the qualified names did over the next week and two weeks, by the state of their
+    market, on or off the ready list, held or not by each rule - one pass over the names, an exact worst 5 %."""
+    import markets_board as mb
+    objs = {o.name: o for o in bv.load_objects()}
+    names = [o.name for o in bv.load_objects()]
+    v = objs["v_ready_trial"]
+    assert v.path.name == "104_v_ready_trial.sql" and v.kind == "VIEW"
+    assert names.index("v_ready_trial") == names.index("v_ready_list") + 1
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_ready_trial"} == {"v_ready_list", "v_forward_universe"}
+    fwd = bv._code(objs["v_forward_universe"].template)
+    for col in ("AS base_date", "AS ret_pp", "AS market_median_pp"):
+        assert col in fwd, col                                                      # the outcome it reads
+    for frag in ("JOIN f ON f.symbol = r.symbol AND f.base_date = r.snapshot_date",
+                 "IF(r.snapshot_date >= DATE '2026-11-23', 'forward', 'backtest') AS period",
+                 "f.ret_pp - f.market_median_pp AS excess_pp",
+                 "FROM j, UNNEST([\n    'all qualified',\n    CONCAT('market ', j.market_state),",
+                 "IF(j.in_ready, 'ready list (top 3)', 'other qualified'),",
+                 "IF(j.market_rule_holds, 'market rule holds it', 'market rule does not'),",
+                 "IF(j.live_us_rule_holds, 'live US rule holds it', 'live US rule does not')",
+                 "PERCENTILE_CONT(g.ret_pp, 0.05) OVER (PARTITION BY g.period, g.horizon, g.grp) AS p5",
+                 "ROUND(MAX(p5), 2) AS p5_ret_pp", "GROUP BY period, horizon, grp"):
+        assert frag in code, frag
+    assert "UNION ALL" not in code and "APPROX_QUANTILES" not in code               # one pass; the same every read
+    # the forward test starts with the market trial's, on the day the board names
+    assert "DATE '2026-11-23'" in bv._code(objs["v_market_trial"].template)
+    assert mb.FORWARD_FROM.isoformat() == "2026-11-23"
+    # every group the board's reading names is a group of this view
+    import inspect
+    for grp in ("ready list (top 3)", "other qualified", "market rule holds it", "market rule does not",
+                "live US rule holds it", "live US rule does not"):
+        assert "'%s'" % grp in code and '"%s"' % grp in inspect.getsource(mb.trial_reading), grp
+    assert "FOLLOWING" not in code and "CURRENT_DATE" not in code
+    assert "the live system never reads BigQuery" in v.template and "Observe only" in v.template
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
-         case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45]
+         case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47]
 
 
 def test_v1(): case_v1()
@@ -3147,6 +3255,8 @@ def test_v42(): case_v42()
 def test_v43(): case_v43()
 def test_v44(): case_v44()
 def test_v45(): case_v45()
+def test_v46(): case_v46()
+def test_v47(): case_v47()
 
 
 if __name__ == "__main__":
