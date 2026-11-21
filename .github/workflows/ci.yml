@@ -2,11 +2,14 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.91 (2026-11-21) -- PAGE CHAINS
+# VERSION 1.1.92 (2026-11-21) -- VALIDATOR TRANSIENT READ
 #
-# (1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89, 2026-11-19: TRIAL LABELS; 1.1.88,
-# 2026-11-19: NEWS BOARD)
+# (1.1.91, 2026-11-21: PAGE CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89,
+# 2026-11-19: TRIAL LABELS; 1.1.88, 2026-11-19: NEWS BOARD)
 #
+# v1.1.92: run tests/test_validator_transient_read.py (scripts/validate_dashboard.py
+# v1.3.5: a passing Sheets fault on the literal read is waited out, not scored as
+# a failed audit) in the blocking lean lane.
 # v1.1.91: run tests/test_page_chains.py (news_board.yml 1.1.0, trial_labels.yml
 # 1.1.0 and pre_open_check.yml v1.2.0 also run after the hourly Exit Plan, in the
 # UTC hours of their repository Variables, because GitHub started their
@@ -1276,6 +1279,7 @@ jobs:
             tests/test_run_corporate_events.py \
             tests/test_provider_identity_probe.py \
             tests/test_validate_dashboard_decision_surface.py \
+            tests/test_validator_transient_read.py \
             tests/test_symbols_reader_thread_local.py \
             tests/test_sync_warnings_compact_wp6.py \
             tests/test_intraday_quote_refresh_contract.py \

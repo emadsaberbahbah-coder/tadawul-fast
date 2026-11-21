@@ -136,7 +136,7 @@ def test_v5_published_board_single_read(monkeypatch):
 
 
 def test_v6_version():
-    assert vd.SCRIPT_VERSION == "1.3.4"
+    assert vd.SCRIPT_VERSION == "1.3.5"   # 2026-11-21: v1.3.5 TRANSIENT-READ (tests/test_validator_transient_read.py)
 
 
 def test_v7_stamp_age(monkeypatch):
