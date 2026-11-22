@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "note": "Bindings whose authority could not be re-captured at the renewals of 6 and 13 November 2026. They stay expired and fill no Name. Listing one here only stops it from failing the daily expiry check until review_by_utc; retire the symbol or repair its source before that date. Changed only through a reviewed pull request.",
+  "acknowledged": [
+    {
+      "page": "Global_Markets",
+      "symbol": "PE&OLES.MX",
+      "reason": "caption_not_corroborated: the issuer page no longer carries the recorded caption",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "RCM.US",
+      "reason": "fetch_failed:HTTPError on its sec.gov sources; the binding's own state records the common stock as cancelled on 2024-11-19",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "SILK.US",
+      "reason": "fetch_failed:HTTPError on its sec.gov sources; the binding's own state records the common stock as suspended and cancelled in September 2024",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    },
+    {
+      "page": "Global_Markets",
+      "symbol": "VSME.US",
+      "reason": "directory_row_missing_or_ambiguous: the exact ticker row is no longer single and current in the Nasdaq directory",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "GXTG.US",
+      "reason": "fetch_failed:HTTPError on the issuer site; the binding's own state records the fund as renamed GXDW",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    },
+    {
+      "page": "Mutual_Funds",
+      "symbol": "VFLQ.US",
+      "reason": "identifier_not_corroborated; the binding's own state records the fund as terminated and delisted in November 2022",
+      "acknowledged_at_utc": "2026-11-22T00:00:00+00:00",
+      "review_by_utc": "2027-01-21T00:00:00+00:00"
+    }
+  ]
+}

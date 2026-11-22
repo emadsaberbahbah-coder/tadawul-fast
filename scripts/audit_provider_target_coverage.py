@@ -12,6 +12,31 @@ by 2-3 hours; Global_Markets provider-target share fell 27.5% -> 10.7%
 byte-identical prices, in the mirror direction of the 2026-08-16 event.
 Nothing in the system announced either event.
 
+v1.3.0 (2026-11-22): THE REFERENCE CAN NO LONGER DEADLOCK ON ITS OWN AGE.
+WHY: the alert was red on every scheduled run from 28 Oct to 22 Nov with one
+finding, CH_BASELINE_STALE (651 h on 21 Nov), while every page judged OK or
+STRUCTURAL_ZERO against that same reference (Market_Leaders 43.9% against
+35.3%, Global_Markets 53.5% against 52.9%). Two rules produced it:
+  (a) the verification clock moved only when every page was AT OR ABOVE its
+      reference, and the reference ratchets up to each new high, so three
+      ordinary days a fraction below a high aged it past 72 h;
+  (b) a stale reference is a CONTROL failure, and a CONTROL failure can never
+      refresh the reference, so once stale it stayed stale until an operator
+      dispatched a bootstrap.
+WHAT:
+  (a) a healthy run (no finding, every page OK / STRUCTURAL_ZERO / BOOTSTRAP)
+      refreshes the clock even when a page sits inside tolerance below its
+      reference. The reference VALUE is still never lowered, so drift keeps
+      accumulating against the true last-good share exactly as before.
+  (b) when staleness is the ONLY failure and every page is at or above its
+      reference with its rows intact, today's observation is at least as
+      healthy as the last verified one: the finding becomes the INFO note
+      BASELINE_STALE_REVERIFIED and the run is judged on its coverage. A page
+      below its reference, any other CONTROL or FAIL, a missing page,
+      bootstrap or acceptance keep 1.2.2 behaviour: still red, still for an
+      operator. Nothing is re-baselined downward and nothing is silent.
+Rollback: TFB_PTC_STALE_REVERIFY=0 restores (b) to 1.2.2; (a) has no switch.
+
 v1.2.2 (2026-11-14): a Sheets quota answer (HTTP 429) on a page read is waited
 out and the read tried again (scripts/sheets_quota.py: 65 s, at most twice),
 instead of reporting CH_READ_FAIL at once. The alert failed red on 11, 12
@@ -72,6 +97,8 @@ Env (invalid explicit values are control-health failures, not defaults):
   TFB_PTC_ZERO_PAGES          structural-zero page list
   TFB_PTC_PAGES               page list override
   TFB_PTC_BOOTSTRAP / TFB_PTC_ACCEPT_BASELINE / TFB_PTC_FREEZE  one-shots
+  TFB_PTC_STALE_REVERIFY      1 (default): a stale reference that every page
+                              still meets or beats is re-verified; 0 = 1.2.2
 """
 from __future__ import annotations
 
@@ -93,7 +120,7 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import resolve_reader, s  # noqa: E402
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 STATE_SCHEMA = 2
 DEFAULT_PAGES = ("Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds")
 DEFAULT_ZERO_PAGES = ("Commodities_FX", "Mutual_Funds")
@@ -189,7 +216,7 @@ class PageCoverage:
 
 @dataclass
 class Finding:
-    severity: str  # CONTROL | FAIL | WARN
+    severity: str  # CONTROL | FAIL | WARN | INFO (1.3.0: a note; never changes the exit code)
     code: str
     page: str
     message: str
@@ -211,6 +238,7 @@ class CoverageReport:
     baseline_update_detail: str = ""
     persist_status: str = "pending"
     fatal: Optional[str] = None
+    stale_reverified: bool = False  # 1.3.0
 
     @property
     def exit_code(self) -> int:
@@ -535,6 +563,49 @@ def validate_baseline(state: Optional[dict], sheet_masked: str, cfg: Config,
     return pages, findings, age_h
 
 
+def stale_reverify_enabled() -> bool:
+    """1.3.0: on unless TFB_PTC_STALE_REVERIFY is explicitly 0 / off / false / no."""
+    return (os.getenv("TFB_PTC_STALE_REVERIFY") or "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def reverify_stale_reference(report: CoverageReport, prior_pages: dict, cfg: Config,
+                             bootstrap: bool, accept: bool) -> bool:
+    """1.3.0: lift a staleness deadlock without lowering anything. Pure.
+
+    Only when CH_BASELINE_STALE is the single CONTROL/FAIL finding and every
+    page of the reference was measured today at or above its reference share,
+    judged OK or STRUCTURAL_ZERO, with at least min_rows rows. Then the stale
+    finding is replaced by an INFO note and the run is judged on coverage.
+    """
+    if bootstrap or accept or not stale_reverify_enabled():
+        return False
+    if not any(f.code == "CH_BASELINE_STALE" for f in report.findings):
+        return False
+    if any(f.severity in ("CONTROL", "FAIL") and f.code != "CH_BASELINE_STALE"
+           for f in report.findings):
+        return False
+    if not report.pages or set(report.pages) != set(prior_pages):
+        return False
+    for page, cov in report.pages.items():
+        ref_share = (prior_pages.get(page) or {}).get("share_pct")
+        share = cov.get("share_pct")
+        if cov.get("verdict") not in ("OK", "STRUCTURAL_ZERO"):
+            return False
+        if share is None or ref_share is None or float(share) < float(ref_share):
+            return False
+        if int(cov.get("rows") or 0) < int(cfg.min_rows):
+            return False
+    age = report.baseline_age_h
+    report.findings = [f for f in report.findings if f.code != "CH_BASELINE_STALE"]
+    report.findings.append(Finding(
+        "INFO", "BASELINE_STALE_REVERIFIED", "*",
+        f"baseline was {age:.1f}h old > max {cfg.baseline_max_age_h:.0f}h, and every page is at "
+        f"or above its reference share with its rows intact — this run re-verifies the "
+        f"reference; no value was lowered"))
+    report.stale_reverified = True
+    return True
+
+
 def next_last_good(report: CoverageReport, prior_pages: dict, accept: bool) -> tuple[dict, str]:
     """Eligibility-gated baseline advance. Pure.
 
@@ -604,6 +675,7 @@ def audit_pages(grids: dict[str, Any], baseline_state: Optional[dict],
         cov = measure_page(page, grid, read_error=read_errors.get(page, ""))
         rep.findings.extend(judge(cov, prior_pages.get(page), cfg, bootstrap))
         rep.pages[page] = asdict(cov)
+    reverify_stale_reference(rep, prior_pages, cfg, bootstrap, accept)  # 1.3.0
     new_pages, detail = next_last_good(rep, prior_pages, accept)
     rep.baseline_updated = new_pages != prior_pages
     rep.baseline_update_detail = detail if isinstance(detail, str) else "unchanged"
@@ -704,9 +776,13 @@ def save_last_good(path: str, rep: CoverageReport, sheet_masked: str) -> str:
     pages = getattr(rep, "_next_pages", None)
     if not isinstance(pages, dict) or not pages:
         return "kept: no eligible update"
-    # Equal healthy observations must refresh the verification clock without
-    # lowering the reference. A decline, WARN, failure or missing page cannot.
-    renewable = bool(rep.pages) and set(pages) == set(rep.pages) and not rep.findings
+    # A healthy observation refreshes the verification clock without lowering
+    # the reference. 1.3.0: that includes a page inside tolerance below its
+    # reference (verdict OK) - the reference keeps its higher value, so drift
+    # still accumulates against it. A WARN, a failure or a missing page cannot
+    # refresh it; an INFO note is not a finding against the run.
+    blocking = [f for f in rep.findings if f.severity != "INFO"]
+    renewable = bool(rep.pages) and set(pages) == set(rep.pages) and not blocking
     for page, cov in rep.pages.items():
         ref = pages.get(page) or {}
         share = cov.get("share_pct")
@@ -714,8 +790,10 @@ def save_last_good(path: str, rep: CoverageReport, sheet_masked: str) -> str:
             cov.get("verdict") in ("OK", "STRUCTURAL_ZERO", "BOOTSTRAP")
             and cov.get("rows", 0) >= rep.config.get("min_rows", 50)
             and share is not None and ref.get("share_pct") is not None
-            and float(share) >= float(ref["share_pct"])
         )
+    # 1.3.0: a run that re-verified a stale reference must also restart its
+    # clock, or the same reference is stale again on the next run.
+    renewable = renewable or bool(getattr(rep, "stale_reverified", False))
     if not rep.baseline_updated and not renewable:
         return "unchanged"
     old, error = load_state(path)
@@ -786,8 +864,18 @@ def selftest() -> int:
     checks.append(("bootstrap + missing baseline => exit 0, baseline written",
                    r.exit_code == 0 and getattr(r, "_next_pages").get("GM", {}).get("share_pct") == 40.0))
     stale = {**base, "generated_at_utc": "2020-01-01T00:00:00+00:00"}
+    r = audit_pages({"GM": P(48)}, stale, cfg)
+    checks.append(("stale baseline, page below its reference => exit 2",
+                   r.exit_code == 2 and not r.stale_reverified))
+    r = audit_pages({"GM": P(10)}, stale, cfg)
+    checks.append(("stale baseline and a collapse => exit 2, both reported",
+                   r.exit_code == 2 and {"CH_BASELINE_STALE", "PTC_SHARE_COLLAPSE"}
+                   <= {f.code for f in r.findings}))
     r = audit_pages({"GM": P(50)}, stale, cfg)
-    checks.append(("stale baseline => exit 2", r.exit_code == 2))
+    checks.append(("stale baseline, every page at or above it => re-verified, exit 0",
+                   r.exit_code == 0 and r.stale_reverified
+                   and [f.code for f in r.findings] == ["BASELINE_STALE_REVERIFIED"]
+                   and getattr(r, "_next_pages")["GM"]["share_pct"] == 50.0))
     r = audit_pages({"GM": P(50)}, {**base, "schema": 1}, cfg)
     checks.append(("schema mismatch => exit 2", r.exit_code == 2))
     zcfg = Config(); zcfg.floor_pct = 5.0; zcfg.zero_pages = ("CFX",)
@@ -871,7 +959,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[PTC v{VERSION}] mode={rep.mode} baseline_updated={rep.baseline_updated} "
           f"({rep.baseline_update_detail}) persist={rep.persist_status}")
     for f in rep.findings:
-        ann = "error" if f.severity in ("FAIL", "CONTROL") else "warning"
+        ann = ("error" if f.severity in ("FAIL", "CONTROL")
+               else "notice" if f.severity == "INFO" else "warning")
         print(f"::{ann}::{f.page} [{f.code}] {f.message}")
     if rep.fatal:
         print(f"::error::{rep.fatal}")
