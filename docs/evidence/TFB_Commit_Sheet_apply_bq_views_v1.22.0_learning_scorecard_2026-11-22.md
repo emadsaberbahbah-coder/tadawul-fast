@@ -71,4 +71,8 @@
 ## S6 - After merge
 1. Dispatch `bq_views.yml` with mode=write to install the view.
 2. The site's Learning page reads it and shows the forward rows as they fill.
-3. First forward reading: after 20 call days, about 18 Dec 2026.
+3. When the forward rows fill (horizons in the archive: 1W, 2W, 1M, 3M; measured on 22 Nov 2026, the latest scored 1W day was 13 Nov, nine days back):
+   - first forward rows: about 2 Dec 2026 (1W calls of 23 Nov);
+   - first reading at 20 scored call days, 1W, wide arms (B0, E1-E3, X1-X3, S1): the last days of December 2026;
+   - narrow arms (E4, E5) had calls on about half of the days in-sample, so they need roughly twice as long;
+   - 2W, 1M and 3M follow by their own horizon.
