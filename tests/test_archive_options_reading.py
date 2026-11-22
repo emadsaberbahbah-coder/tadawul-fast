@@ -1,4 +1,4 @@
-"""Tests for scripts/archive_options_reading.py (v1.0.1): the options reading of US stocks and ETFs.
+"""Tests for scripts/archive_options_reading.py (v1.0.2): the options reading of US stocks and ETFs.
 
 The fixture holds two real Cboe delayed-quote answers read on 22 Nov 2026 (prices of Friday 20 Nov), cut to a
 few expiries: TSN (a liquid chain) and SUPN (a thin chain whose own root carries the adjusted 26.87-type strikes
@@ -231,7 +231,7 @@ def test_o9_misses_are_counted_by_reason_never_named():
     browser headers Cboe's own pages send."""
     import io
     import urllib.error
-    assert op.__version__ == "1.0.1"
+    assert op.__version__ == "1.0.2"
     e403 = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
     e500 = urllib.error.HTTPError("u", 500, "x", {}, io.BytesIO(b""))
     assert [op.miss_reason(e) for e in (e403, e500, ValueError("bad json"), OSError("reset"))] == [
@@ -242,8 +242,28 @@ def test_o9_misses_are_counted_by_reason_never_named():
     assert op.read_chain("AAA", deny, waits.append, misses) is None and misses == ["http 403"] and waits == []
     def flaky(url):
         raise OSError("reset")
-    assert op.read_chain("AAA", flaky, waits.append, misses) is None and misses[-1] == "network" and len(waits) == 2
+    assert op.read_chain("AAA", flaky, waits.append, misses) is None and misses[-1] == "network" and waits == [2.0]   # two tries, one wait
     empty = lambda url: json.dumps({"data": {"options": []}}).encode()
     assert op.read_chain("AAA", empty, waits.append, misses) is None and misses[-1] == "no usable chain"   # #1060 review
-    assert len(waits) == 2                                                     # an empty answer is not retried
+    assert waits == [2.0]                                                      # an empty answer is not retried
     assert op.CBOE_HEADERS["Origin"] == "https://www.cboe.com" and "Mozilla/5.0 (Windows" in op.UA
+
+
+def test_o10_rate_limit_waits_and_retries():
+    """v1.0.2: a 429 waits 5, 10 and 20 seconds between four tries; a later success is kept; three readers."""
+    import io
+    import urllib.error
+    calls, waits = [], []
+    good = FIX["TSN"]
+    def limited(url):
+        calls.append(url)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b""))
+        return json.dumps(good).encode()
+    got = op.read_chain("TSN", limited, waits.append, [])
+    assert got and got["iv30"] == op.chain_features(good, "TSN")["iv30"] and waits == [5.0, 10.0] and len(calls) == 3
+    misses, waits = [], []
+    def always(url):
+        raise urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b""))
+    assert op.read_chain("TSN", always, waits.append, misses) is None
+    assert waits == [5.0, 10.0, 20.0] and misses == ["http 429"] and op.WORKERS == 3

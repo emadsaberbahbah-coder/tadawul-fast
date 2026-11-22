@@ -2,7 +2,7 @@
 # scripts/archive_options_reading.py
 """
 ================================================================================
-TFB Options Reading - v1.0.1 (22 Nov 2026) - what the options market says about a stock
+TFB Options Reading - v1.0.2 (23 Nov 2026) - what the options market says about a stock
 ================================================================================
 WHY (owner, 22 Nov 2026 19:53 Riyadh): "I need to add how future options and
 other options affect the current price and recommendations, as well we can
@@ -25,6 +25,11 @@ Accept JSON, Origin and Referer www.cboe.com), and a failed run counts its
 misses by reason (http 403, http 404, other http, network, unreadable,
 no usable chain) -
 counts only, never a symbol.
+
+v1.0.2 (23 Nov 2026): with the browser headers the run read 424 of 935
+chains; 490 of the misses were Cboe's rate limit (http 429). Three readers
+instead of six, and a name refused with 429 waits 5, 10 then 20 seconds and
+tries again (four tries in all) before it counts as missed.
 
 WHAT: once a day after the US close, for the US stocks TFB follows (the
 largest by market value, every name the engine rates INVESTABLE or a buy, and
@@ -90,7 +95,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 TABLE = "options_daily"
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
@@ -100,7 +105,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 CBOE_HEADERS = {"Accept": "application/json, text/plain, */*", "Origin": "https://www.cboe.com",
                 "Referer": "https://www.cboe.com/", "Accept-Language": "en-US,en;q=0.9"}
 DEFAULT_MAX = 900
-WORKERS = 6
+WORKERS = 3
 # ETFs read every day: the market, its sectors and the assets the readings use
 ETFS = ("SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
         "GLD", "TLT", "HYG", "EEM", "KSA")
@@ -350,7 +355,7 @@ def miss_reason(exc: BaseException) -> str:
 def read_chain(ticker: str, get: Callable[[str], bytes], sleep: Callable[[float], None],
                misses: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     why = "network"
-    for attempt in range(2):
+    for attempt in range(4):
         try:
             feats = chain_features(json.loads(get(CBOE_URL.format(sym=cboe_symbol(ticker)))), cboe_symbol(ticker))
             if feats is None:
@@ -361,7 +366,10 @@ def read_chain(ticker: str, get: Callable[[str], bytes], sleep: Callable[[float]
             why = miss_reason(exc)
             if why in ("http 403", "http 404"):
                 break
-            sleep(2.0 * (attempt + 1))
+            if why != "http 429" and attempt >= 1:          # two tries for a network fault, four for the rate limit
+                break
+            if attempt < 3:
+                sleep(5.0 * 2 ** attempt if why == "http 429" else 2.0 * (attempt + 1))
     if misses is not None:
         misses.append(why)
     return None
