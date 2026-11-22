@@ -85,6 +85,75 @@ class BaselineLifecycleTests(unittest.TestCase):
         self.assertEqual(ptc.save_last_good(self.path, report, "***"), "unchanged")
         self.assertEqual(Path(self.path).read_bytes(), before)
 
+    # ---- audit_provider_target_coverage 1.3.0: the reference cannot deadlock on its own age ----
+    def test_dip_inside_tolerance_renews_clock_but_never_the_reference(self):
+        self.save_base()
+        report = ptc.audit_pages({"GM": grid(47)}, self.base, self.cfg)
+        self.assertEqual(report.pages["GM"]["verdict"], "OK")
+        self.assertEqual(report.findings, [])
+        self.assertEqual(ptc.save_last_good(self.path, report, "***"), "written")
+        new = json.loads(Path(self.path).read_text())
+        self.assertEqual(new["pages"], self.base["pages"])            # still 50, not 47
+        self.assertEqual(new["generated_at_utc"], self.base["generated_at_utc"])
+        self.assertEqual(new["last_verified_at_utc"], report.generated_at_utc)
+        later = ptc.audit_pages({"GM": grid(39)}, new, self.cfg)      # drift is still measured against 50
+        self.assertEqual(later.exit_code, 1)
+
+    def test_stale_reference_met_by_every_page_is_reverified_and_its_clock_restarts(self):
+        base = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00"}
+        self.save_base(base)
+        report = ptc.audit_pages({"GM": grid(55)}, base, self.cfg)
+        self.assertEqual(report.exit_code, 0)
+        self.assertTrue(report.stale_reverified)
+        self.assertEqual([(f.severity, f.code) for f in report.findings], [("INFO", "BASELINE_STALE_REVERIFIED")])
+        self.assertEqual(report.payload()["recovery"]["action"], "NONE")
+        self.assertEqual(ptc.save_last_good(self.path, report, "***"), "written")
+        new = json.loads(Path(self.path).read_text())
+        self.assertEqual(new["pages"]["GM"]["share_pct"], 55.0)
+        self.assertEqual(new["last_verified_at_utc"], report.generated_at_utc)
+        again = ptc.audit_pages({"GM": grid(54)}, new, self.cfg)      # the next run is not stale again
+        self.assertEqual(again.exit_code, 0)
+        self.assertFalse(again.stale_reverified)
+        self.assertEqual(again.findings, [])
+
+    def test_stale_reference_stays_red_below_it_with_a_page_missing_or_switched_off(self):
+        base = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00"}
+        below = ptc.audit_pages({"GM": grid(48)}, base, self.cfg)      # OK verdict, yet under the reference
+        self.assertEqual(below.exit_code, 2)
+        self.assertFalse(below.stale_reverified)
+        self.assertIn("CH_BASELINE_STALE", [f.code for f in below.findings])
+        two = {**base, "pages": {**base["pages"], "ML": {"share_pct": 40.0, "rows": 200, "provider": 80}}}
+        partial = ptc.audit_pages({"GM": grid(60)}, two, self.cfg)     # the reference holds a page not measured today
+        self.assertEqual(partial.exit_code, 2)
+        self.assertFalse(partial.stale_reverified)
+        with patch.dict(os.environ, {"TFB_PTC_STALE_REVERIFY": "0"}):
+            off = ptc.audit_pages({"GM": grid(60)}, base, self.cfg)
+        self.assertEqual(off.exit_code, 2)
+        self.assertFalse(off.stale_reverified)
+
+    def test_stale_reference_with_a_small_page_or_another_control_is_not_reverified(self):
+        base = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00",
+                "pages": {"GM": {"share_pct": 50.0, "rows": 40, "provider": 20}}}
+        small = ptc.audit_pages({"GM": grid(50, rows=40)}, base, self.cfg)   # under min_rows: not judged, not trusted
+        self.assertFalse(small.stale_reverified)
+        self.assertEqual(small.exit_code, 2)
+        cfg = copy.deepcopy(self.cfg)
+        cfg.errors.append("TFB_PTC_DROP_PCT=-5 outside [0.1, 100.0]")
+        stale = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00", "config_hash": cfg.hash()}
+        bad = ptc.audit_pages({"GM": grid(60)}, stale, cfg)
+        self.assertFalse(bad.stale_reverified)
+        self.assertEqual(bad.exit_code, 2)
+
+    def test_reverified_run_under_freeze_passes_and_writes_nothing(self):
+        base = {**self.base, "generated_at_utc": "2020-01-01T00:00:00+00:00"}
+        self.save_base(base)
+        before = Path(self.path).read_bytes()
+        report = ptc.audit_pages({"GM": grid(60)}, base, self.cfg)
+        self.assertEqual(report.exit_code, 0)
+        with patch.dict(os.environ, {"TFB_PTC_FREEZE": "1"}):
+            self.assertEqual(ptc.save_last_good(self.path, report, "***"), "kept: frozen by TFB_PTC_FREEZE")
+        self.assertEqual(before, Path(self.path).read_bytes())
+
     def test_collapse_cannot_overwrite_existing_state(self):
         self.save_base()
         before = Path(self.path).read_bytes()

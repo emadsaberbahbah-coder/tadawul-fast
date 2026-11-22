@@ -250,3 +250,168 @@ def test_apply_renewal_cli_writes_validated_registry(tmp_path, capsys):
     nothing = tmp_path / "nothing.json"
     nothing.write_text(json.dumps(dict(base, bindings=[]), indent=2) + "\n", encoding="utf-8")
     assert renew.main(["--registry", str(reg), "--apply-renewal", str(nothing)]) == 3
+
+
+# --- v1.2.0 acknowledged held bindings ------------------------------------------
+
+def _expired_registry(tmp_path, symbols=("AAA.US", "BBB.US")):
+    reviewed = datetime.now(UTC) - timedelta(days=9)
+    items = []
+    for symbol in symbols:
+        item = _directory_binding()
+        item.update(symbol=symbol, reviewed_at_utc=reviewed.isoformat(),
+                    expires_at_utc=(reviewed + timedelta(days=7)).isoformat())
+        items.append(item)
+    path = tmp_path / "labels.json"
+    path.write_text(json.dumps(dict(_one(items[0]), bindings=items)), encoding="utf-8")
+    return path, [i["page"] + "|" + i["symbol"] for i in items]
+
+
+def _ack(tmp_path, keys, days=30, name=None):
+    review_by = (datetime.now(UTC) + timedelta(days=days)).isoformat()
+    rows = [{"page": k.split("|")[0], "symbol": k.split("|")[1], "reason": "fetch_failed:HTTPError",
+             "review_by_utc": review_by} for k in keys]
+    path = tmp_path / (name or renew.HELD_ACK_NAME)
+    path.write_text(json.dumps({"schema": 1, "acknowledged": rows}), encoding="utf-8")
+    return path
+
+
+# T13 an acknowledged held binding no longer fails the check; an unacknowledged one still does
+def test_check_passes_only_when_every_due_binding_is_acknowledged(tmp_path):
+    path, keys = _expired_registry(tmp_path)
+    report = tmp_path / "report.json"
+    assert renew.main(["--registry", str(path), "--check"]) == 1           # no list: 1.1.1 behaviour
+    _ack(tmp_path, keys[:1])
+    assert renew.main(["--registry", str(path), "--check", "--report", str(report)]) == 1
+    saved = json.loads(report.read_text())
+    assert saved["status"] == "EXPIRED" and saved["open"] == keys[1:] and saved["held_acknowledged"] == keys[:1]
+    assert saved["expired"] == sorted(keys)                                  # the raw facts are unchanged
+    _ack(tmp_path, keys)
+    assert renew.main(["--registry", str(path), "--check", "--report", str(report)]) == 0
+    saved = json.loads(report.read_text())
+    assert saved["status"] == "HELD_ACKNOWLEDGED" and saved["open"] == [] and saved["held_acknowledged"] == sorted(keys)
+    text = renew.render_step_summary(saved)
+    assert "HELD, acknowledged until" in text and "do not fail this check" in text
+
+
+# T14 an acknowledgement lapses on its own date, and one for a renewed binding is reported as unused
+def test_acknowledgement_lapses_and_unused_ones_are_listed(tmp_path):
+    path, keys = _expired_registry(tmp_path)
+    report = tmp_path / "report.json"
+    _ack(tmp_path, keys, days=-1)
+    assert renew.main(["--registry", str(path), "--check", "--report", str(report)]) == 1
+    saved = json.loads(report.read_text())
+    assert saved["acknowledgement_lapsed"] == sorted(keys) and saved["held_acknowledged"] == []
+    other = _ack(tmp_path, ["Global_Markets|ZZZ.US"], name="other.json")
+    assert renew.main(["--registry", str(path), "--check", "--held-ack", str(other), "--report", str(report)]) == 1
+    assert json.loads(report.read_text())["acknowledgement_unused"] == ["Global_Markets|ZZZ.US"]
+
+
+# T15 a malformed list can never turn the check green
+@pytest.mark.parametrize("body", [
+    "not json", "[]", '{"schema": 2, "acknowledged": []}', '{"schema": 1, "acknowledged": {}}',
+    '{"schema": 1, "acknowledged": [{"page": "P", "symbol": "S"}]}',
+    '{"schema": 1, "acknowledged": [{"page": "P", "symbol": "S", "reason": "r", "review_by_utc": "soon"}]}',
+    '{"schema": 1, "acknowledged": [{"page": "P", "symbol": "S", "reason": "r", "review_by_utc": "2099-01-01T00:00:00+00:00"},'
+    ' {"page": "P", "symbol": "S", "reason": "r", "review_by_utc": "2099-01-01T00:00:00+00:00"}]}',
+])
+def test_malformed_acknowledgement_list_is_fatal(tmp_path, body):
+    path, _ = _expired_registry(tmp_path)
+    (tmp_path / renew.HELD_ACK_NAME).write_text(body, encoding="utf-8")
+    assert renew.main(["--registry", str(path), "--check"]) == 2
+
+
+# T16 the shipped list is valid and names only bindings that exist in the shipped registry
+def test_shipped_acknowledgement_list_matches_the_registry():
+    ack = renew.load_held_ack(labels.REGISTRY_PATH.with_name(renew.HELD_ACK_NAME))
+    registry = json.loads(labels.REGISTRY_PATH.read_text(encoding="utf-8"))
+    known = {b["page"] + "|" + b["symbol"] for b in registry["bindings"]}
+    assert ack and set(ack) <= known
+    assert all(datetime.fromisoformat(row["review_by_utc"]) <= datetime(2027, 3, 1, tzinfo=UTC) for row in ack.values())
+
+
+# T17 workflow 1.2.0: the renewal runs on a schedule, never pushes to the default branch,
+# and merges by itself only behind the owner's Variable and token - through the pull request and its checks
+def test_workflow_schedules_the_renewal_and_gates_the_automatic_merge():
+    import yaml
+    from pathlib import Path
+    text = (Path(renew.__file__).resolve().parents[1] / ".github" / "workflows" / "name_label_renewal.yml").read_text(encoding="utf-8")
+    flow = yaml.safe_load(text)
+    crons = [row["cron"] for row in flow[True]["schedule"]]
+    assert crons == ["15 4 * * *", "40 21 * * 0,2,4"]
+    first = flow["jobs"]["name-label-renewal"]
+    assert "github.event.schedule == '40 21 * * 0,2,4' && 'renew' || 'check'" in first["env"]["MODE"]
+    assert first.get("permissions") is None and flow["permissions"] == {"contents": "read"}
+    publish = flow["jobs"]["publish-renewal"]
+    assert "github.event.schedule == '40 21 * * 0,2,4'" in publish["if"] and "inputs.publish_branch" in publish["if"]
+    step = publish["steps"][-1]
+    assert step["env"]["AUTOMERGE"] == "${{ vars.TFB_NAME_RENEWAL_AUTOMERGE || '' }}"
+    run = step["run"]
+    assert 'if [[ "${AUTOMERGE,,}" == "on" ]]' in run and run.index("gh pr merge") > run.index('"${AUTOMERGE,,}" == "on"')
+    assert 'git push -q origin "$BR"' in run and "git push origin main" not in run and "--force" not in run
+    assert 'startswith("name-label-renewal/")' in run and "gh pr close" in run
+    assert 'if [[ "$CHANGED" != "$REG" ]]' in run
+    # The default branch requires a pull request and its checks, and the job never merges around them: one merge
+    # command, with --auto (GitHub merges after the required checks), and no direct merge into the default branch.
+    gate = run.index('"${AUTOMERGE,,}" == "on"')
+    assert run.count("gh pr merge") == 1 and 'gh pr merge "$BR" --squash --auto --delete-branch' in run
+    assert "/merges" not in run and "gh api -X POST" not in run and "--admin" not in run
+    assert gate < run.index('if [[ "$CHANGED" != "$REG" ]]') < run.index("gh pr merge")
+    # the merge needs an open pull request and the owner's token (a pull request opened with the workflow's own
+    # token does not start CI by itself); with either missing it is left for a person
+    assert "PR_OPEN=0" in run and gate < run.index('elif [[ "$PR_OPEN" != "1" ]]') < run.index("gh pr merge")
+    assert gate < run.index('elif [[ "$HAS_TOKEN" != "1" ]]') < run.index("gh pr merge")
+    assert step["env"]["GH_TOKEN"] == "${{ secrets.TFB_RENEWAL_TOKEN || github.token }}"
+    assert step["env"]["HAS_TOKEN"] == "${{ secrets.TFB_RENEWAL_TOKEN != '' && '1' || '0' }}"
+    # the token reaches one step of the one job that may write, and no other
+    assert text.count("secrets.TFB_RENEWAL_TOKEN") == 2
+    assert publish["permissions"] == {"contents": "write", "pull-requests": "write"}
+
+
+# T18 (Codex P2 on #1055): an earlier renewal still open is carried into the new one before it is closed
+def _reg(*bindings):
+    return {"schema": "tfb.verified-name-labels/v1", "label_only": True, "current_authority_only": True, "bindings": list(bindings)}
+
+
+def _bind(symbol, reviewed, name="Acme Corp"):
+    at = datetime.fromisoformat(reviewed)
+    return {"page": "Global_Markets", "symbol": symbol, "name": name, "reviewed_at_utc": at.isoformat(),
+            "expires_at_utc": (at + timedelta(days=7)).isoformat(), "sources": [], "review_receipt_sha256": "x"}
+
+
+def test_carrying_an_earlier_renewal_keeps_what_this_run_held():
+    old, sun, tue = "2026-11-08T21:40:00+00:00", "2026-11-15T21:40:00+00:00", "2026-11-17T21:40:00+00:00"
+    main = _reg(_bind("A.US", old), _bind("B.US", old), _bind("C.US", old))
+    sunday = _reg(_bind("A.US", sun), _bind("B.US", sun), _bind("C.US", old))     # the earlier, unmerged renewal
+    tuesday = _reg(_bind("A.US", old), _bind("B.US", tue), _bind("C.US", old))    # this run: A.US held (a source failed)
+    merged, first = renew.apply_renewal(main, tuesday)
+    assert first["applied"] == ["Global_Markets|B.US"]
+    stamps = lambda reg: {b["symbol"]: b["reviewed_at_utc"] for b in reg["bindings"]}
+    assert stamps(merged) == {"A.US": old, "B.US": tue, "C.US": old}              # A.US would stay expired
+    carried, second = renew.apply_renewal(merged, sunday)
+    assert second["applied"] == ["Global_Markets|A.US"]                           # only what this run did not renew
+    assert stamps(carried) == {"A.US": sun, "B.US": tue, "C.US": old}             # B.US keeps the newer review
+    assert second["kept"] == {"Global_Markets|B.US": "not_newer", "Global_Markets|C.US": "not_newer"}
+    # a caption that changed on the default branch is never carried
+    renamed = _reg(_bind("A.US", old, name="Acme Holdings"), _bind("B.US", old), _bind("C.US", old))
+    assert renew.apply_renewal(renamed, sunday)[1]["kept"]["Global_Markets|A.US"] == "caption_changed_since_renewal"
+
+
+def test_workflow_carries_earlier_renewals_before_it_closes_them():
+    import yaml
+    from pathlib import Path
+    text = (Path(renew.__file__).resolve().parents[1] / ".github" / "workflows" / "name_label_renewal.yml").read_text(encoding="utf-8")
+    run = yaml.safe_load(text)["jobs"]["publish-renewal"]["steps"][-1]["run"]
+    carry = run.index('--apply-renewal "older_${N}.json"')
+    assert run.index('--apply-renewal "$NEW"') < carry < run.index('git switch -c "$BR"')      # carried before the commit
+    assert 'git fetch -q origin "refs/heads/${HEAD}"' in run and 'git show "FETCH_HEAD:${REG}"' in run
+    assert "(.isCrossRepository | not)" in run                                    # same-repository branches only
+    # closed only when read, applied (exit 0 or 3) and nothing but the registry changes
+    assert "for N in $COVERED; do" in run and "for N in $OLDER" not in run
+    assert run.count('COVERED="$COVERED $N"') == 1
+    cover = run.index('COVERED="$COVERED $N"')
+    assert run.index('if [[ "$ccode" -ne 0 && "$ccode" -ne 3 ]]; then') < run.index('elif [[ "$FILES" != "$REG" ]]; then') < cover
+    assert run.index("could not be read; it stays open") < carry
+    assert cover < run.index('git push -q origin "$BR"') < run.index("for N in $COVERED; do")  # closed after the push
+    assert 'carried from earlier renewals still open' in run
+

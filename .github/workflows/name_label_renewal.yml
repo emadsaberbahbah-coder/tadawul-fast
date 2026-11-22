@@ -1,6 +1,46 @@
 # =============================================================================
 # Verified Name Label Renewal - .github/workflows/name_label_renewal.yml
 # =============================================================================
+# VERSION 1.2.0 (2026-11-22) -- THE RENEWAL RUNS ITSELF
+# WHY: a renewal was a manual dispatch. It was dispatched on 21, 25 and 28 Oct,
+# 6 Nov and 13 Nov; nobody dispatched one after that, so all 122 renewable
+# captions expired on 20 Nov 21:32 UTC and the Names they fill went blank.
+# WHAT:
+#   1. A second schedule renews three times a week (Sun, Tue, Thu 21:40 UTC),
+#      well inside the seven-day life of a caption, and publishes the result
+#      as a READY pull request. A dispatched renewal still opens a draft.
+#   2. An earlier renewal pull request that is still open is closed as
+#      superseded when a newer one opens, so one renewal waits at a time.
+#      Its renewals are carried into the new one first: a run can hold a
+#      binding it renewed last time (a source that fails for a day), and
+#      closing the earlier pull request would otherwise throw that still
+#      valid renewal away (Codex P2 on #1055). Carrying uses the same
+#      --apply-renewal rule (unchanged caption, strictly newer review). An
+#      earlier pull request is closed only when its branch was read and
+#      applied and it changes nothing but the registry; otherwise it stays
+#      open.
+#   3. Optional hands-free merge. It needs three things, all the owner's:
+#        a. the repository secret TFB_RENEWAL_TOKEN - a fine-grained token
+#           for this repository only (Contents and Pull requests: read and
+#           write). The job opens the pull request with it. Why a token:
+#           this repository does not let Actions open pull requests (the
+#           run of 22 Nov pushed its branch and stopped there), and a pull
+#           request opened with the workflow's own token does not start CI
+#           by itself (GitHub holds those runs for a person's approval);
+#        b. the repository setting "Allow auto-merge";
+#        c. the repository Variable TFB_NAME_RENEWAL_AUTOMERGE = on.
+#      With all three the job asks GitHub to merge the pull request once the
+#      required checks pass (gh pr merge --auto --squash). CI always runs
+#      first: the default branch's rules require a pull request and its
+#      checks, and the job never merges around them. (The renewal of 22 Nov
+#      broke a test; a merge without CI would have put that on main.)
+#      With any of the three missing, nothing merges without a person: the
+#      pull request - or, without the token, the pushed branch - waits.
+#   4. renew_verified_name_labels 1.2.0: bindings listed in
+#      data/verified_name_labels_held.json no longer fail the daily check
+#      (they stay expired; see the script header).
+# Rollback: delete the second cron line; unset the Variable.
+#
 # VERSION 1.1.1 (2026-10-24) -- EXPIRED VS DUE-SOON RECOVERY EVIDENCE
 # Checks stay red while authority evidence is expired/due. An always-running
 # summary identifies each binding and distinguishes partial manual renewals
@@ -67,6 +107,7 @@ on:
         type: boolean
   schedule:
     - cron: "15 4 * * *"   # 07:15 Riyadh, daily expiry check
+    - cron: "40 21 * * 0,2,4"   # 1.2.0: renew Sun, Tue, Thu 21:40 UTC (00:40 Riyadh the next day)
 
 concurrency:
   group: tfb-name-label-renewal
@@ -81,12 +122,13 @@ defaults:
 
 jobs:
   name-label-renewal:
-    name: Name label ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
+    name: Name label ${{ github.event_name == 'schedule' && (github.event.schedule == '40 21 * * 0,2,4' && 'renew' || 'check') || inputs.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       PYTHONPATH: ${{ github.workspace }}
-      MODE: ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
+      # 1.2.0: the renew cron runs a renewal; every other schedule is the expiry check.
+      MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '40 21 * * 0,2,4' && 'renew' || 'check') || inputs.mode }}
       # 1.1.0: a repository SECRET is preferred (this repository is public and a
       # secret is masked in logs); the 1.0.0 repository Variable still works.
       TFB_SEC_USER_AGENT: ${{ secrets.TFB_SEC_USER_AGENT || vars.TFB_SEC_USER_AGENT }}
@@ -156,11 +198,11 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-  # 1.1.0: the only job with write permissions; renew dispatches only.
+  # 1.1.0: the only job with write permissions. 1.2.0: also after the renew cron.
   publish-renewal:
     name: Publish renewed registry to a review branch
     needs: name-label-renewal
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'renew' && inputs.publish_branch }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'renew' && inputs.publish_branch) || (github.event_name == 'schedule' && github.event.schedule == '40 21 * * 0,2,4') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -187,9 +229,14 @@ jobs:
           name: name-label-renewal-${{ github.run_id }}
           path: renewal_out
 
-      - name: Merge the renewal into the default branch, commit to a review branch, open a draft PR
+      - name: Merge the renewal into the default branch, commit to a review branch, open a PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          # 1.2.0: the owner's token when it is set (it can open the pull request and its CI
+          # starts by itself); otherwise the workflow's own token, as in 1.1.0.
+          GH_TOKEN: ${{ secrets.TFB_RENEWAL_TOKEN || github.token }}
+          HAS_TOKEN: ${{ secrets.TFB_RENEWAL_TOKEN != '' && '1' || '0' }}
+          SCHEDULED: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          AUTOMERGE: ${{ vars.TFB_NAME_RENEWAL_AUTOMERGE || '' }}
         run: |
           set -euo pipefail
           NEW=renewal_out/renewed_verified_name_labels.json
@@ -221,6 +268,44 @@ jobs:
           PY
           )
           read -r APPLIED KEPT <<< "$COUNTS"
+          # 1.2.0: renewals still open from earlier runs are superseded by this one - after their
+          # renewals are carried into it. A binding this run held may have been renewed by the earlier
+          # run, and that renewal is still valid; --apply-renewal takes it only where the caption is
+          # unchanged and its review is newer than what this registry now holds. Same-repository
+          # branches only. An earlier pull request is closed below only if it is listed in COVERED.
+          OLDER=$(gh pr list --state open --base "${{ github.event.repository.default_branch }}" \
+                    --json number,headRefName,isCrossRepository \
+                    --jq '.[] | select((.headRefName | startswith("name-label-renewal/")) and (.isCrossRepository | not)) | "\(.number) \(.headRefName)"' || true)
+          COVERED=""
+          CARRIED=0
+          while read -r N HEAD; do
+            [[ -n "${N:-}" ]] || continue
+            if ! git fetch -q origin "refs/heads/${HEAD}" || ! git show "FETCH_HEAD:${REG}" > "older_${N}.json" 2>/dev/null; then
+              echo "::warning::Earlier renewal #${N} could not be read; it stays open."
+              continue
+            fi
+            ccode=0
+            python scripts/renew_verified_name_labels.py --registry "$REG" \
+              --apply-renewal "older_${N}.json" --report "carry_${N}.json" || ccode=$?
+            # A pull request that changes anything besides the registry (a fix someone added to it)
+            # is never closed by this job: only its renewals are carried.
+            FILES=$(gh pr view "$N" --json files --jq '[.files[].path] | join(",")' || echo "?")
+            if [[ "$ccode" -eq 0 ]]; then
+              K=$(python -c "import json,sys; r=json.load(open(sys.argv[1])); a=r.get('applied'); print(len(a) if isinstance(a, list) else int(a or 0))" "carry_${N}.json")
+              CARRIED=$((CARRIED + K))
+              echo "::notice::Carried ${K} renewal(s) from the earlier renewal #${N}."
+            fi
+            if [[ "$ccode" -ne 0 && "$ccode" -ne 3 ]]; then
+              # The script writes the registry only after the merged file passed the production loader,
+              # so a refused carry leaves this registry as it was.
+              echo "::warning::Earlier renewal #${N} could not be applied (exit ${ccode}); it stays open."
+            elif [[ "$FILES" != "$REG" ]]; then
+              echo "::warning::Earlier renewal #${N} changes more than ${REG}; its renewals are carried and it stays open."
+            else
+              COVERED="$COVERED $N"       # exit 3 = nothing in it is newer than this registry
+            fi
+          done <<< "$OLDER"
+          rm -f older_*.json carry_*.json
           if git diff --quiet -- "$REG"; then
             echo "::notice::The merged registry is identical to the default branch; nothing to publish."
             exit 0
@@ -238,6 +323,7 @@ jobs:
             echo
             echo "- renewed: ${APPLIED}"
             echo "- kept unchanged (held, caption changed upstream, or not newer): ${KEPT}"
+            echo "- carried from earlier renewals still open (renewed there, held by this run): ${CARRIED}"
             echo
             echo "Every renewed binding was re-captured from its own public sources and re-checked by"
             echo "scripts/renew_verified_name_labels.py, then merged binding by binding into this default"
@@ -245,10 +331,44 @@ jobs:
             echo "directory_creation_time and the review digest change. The file passed the production"
             echo "loader. Review, then merge; the next sync fills the blank Names again."
           } > pr_body.md
-          if gh pr create --draft --base "${{ github.event.repository.default_branch }}" --head "$BR" \
+          # 1.2.0: a scheduled renewal opens a READY pull request (one click to merge);
+          # a dispatched one stays a draft, as in 1.1.0.
+          DRAFT="--draft"
+          if [[ "$SCHEDULED" == "1" ]]; then DRAFT=""; fi
+          PR_OPEN=0
+          if gh pr create $DRAFT --base "${{ github.event.repository.default_branch }}" --head "$BR" \
                --title "Renew verified name captions (${APPLIED} renewed, ${KEPT} kept)" \
                --body-file pr_body.md; then
-            echo "::notice::Draft PR opened from ${BR}."
+            PR_OPEN=1
+            echo "::notice::Pull request opened from ${BR}."
+          elif [[ "$HAS_TOKEN" == "1" ]]; then
+            echo "::warning::Branch ${BR} is pushed but the PR could not be opened with TFB_RENEWAL_TOKEN (expired, or without Pull requests: write?); open it from the branch."
           else
-            echo "::warning::Branch ${BR} is pushed but the PR could not be opened (the repository may forbid Actions-created PRs); open it from the branch."
+            echo "::warning::Branch ${BR} is pushed but the PR could not be opened: this repository does not let Actions open pull requests. Open it from the branch, or set the secret TFB_RENEWAL_TOKEN."
+          fi
+          # Only the earlier renewals whose content this branch now holds (COVERED), and only once this
+          # branch is pushed (it is, above).
+          for N in $COVERED; do
+            gh pr close "$N" --delete-branch \
+              --comment "Superseded by the renewal of run ${GITHUB_RUN_ID} (${BR}), which carries this one's renewals." \
+              || echo "::warning::Could not close the superseded renewal #${N}."
+          done
+          # 1.2.0: hands-free merge only when the owner switched it on - and only through the
+          # pull request, after its required checks. The job never merges around CI.
+          if [[ "${AUTOMERGE,,}" == "on" ]]; then
+            CHANGED=$(git diff --name-only "origin/${{ github.event.repository.default_branch }}" HEAD)
+            if [[ "$CHANGED" != "$REG" ]]; then
+              echo "::warning::The renewal branch changes more than ${REG}; left for review."
+            elif [[ "$PR_OPEN" != "1" ]]; then
+              echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but no pull request is open, so nothing can merge; see the warning above."
+            elif [[ "$HAS_TOKEN" != "1" ]]; then
+              echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but TFB_RENEWAL_TOKEN is not set: CI on this pull request waits for a person's approval, so it is left for review."
+            else
+              if [[ -n "$DRAFT" ]]; then gh pr ready "$BR" || true; fi
+              if gh pr merge "$BR" --squash --auto --delete-branch; then
+                echo "::notice::Renewal set to merge when its required checks pass (TFB_NAME_RENEWAL_AUTOMERGE=on): ${APPLIED} renewed, ${KEPT} kept."
+              else
+                echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but auto-merge was refused (is \"Allow auto-merge\" on in the repository settings?); the pull request stays open."
+              fi
+            fi
           fi

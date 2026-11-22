@@ -1,5 +1,12 @@
 name: Provider Target Coverage Alert
 
+# v1.2.0 (2026-11-22): audit_provider_target_coverage 1.3.0. The alert was red
+# on every scheduled run from 28 Oct to 22 Nov on CH_BASELINE_STALE alone while
+# every page judged OK against that reference. A stale reference that every
+# page still meets or beats is now re-verified by the run (INFO note
+# BASELINE_STALE_REVERIFIED), and a healthy run inside tolerance keeps the
+# verification clock moving. No reference value is ever lowered. Rollback of
+# the re-verification: repository Variable TFB_PTC_STALE_REVERIFY = 0.
 # v1.1.2 (2026-10-24): retain the red audit and expose the recovery prerequisite
 # in the job summary. Empty/missing references still require explicit reviewed
 # bootstrap; this workflow never initializes one merely to clear a failure.
@@ -111,6 +118,7 @@ jobs:
           TFB_PTC_BOOTSTRAP: ${{ github.event.inputs.bootstrap == 'true' && '1' || '0' }}
           TFB_PTC_ACCEPT_BASELINE: ${{ github.event.inputs.accept_baseline == 'true' && '1' || '0' }}
           TFB_PTC_FREEZE: ${{ vars.TFB_PTC_FREEZE || '0' }}
+          TFB_PTC_STALE_REVERIFY: ${{ vars.TFB_PTC_STALE_REVERIFY || '1' }}
         run: |
           python scripts/audit_provider_target_coverage.py \
             --state provider_target_last_good.json \
