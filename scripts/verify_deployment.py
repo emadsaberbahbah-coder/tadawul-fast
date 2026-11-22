@@ -403,7 +403,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("daily_plan", "1.10.1", "daily plan"),
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
-    ("exit_plan", "1.6.0", "exit plan"),   # 2026-11-21: 1.6.0 [MARKET-TURN] observe by default
+    ("exit_plan", "1.6.1", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.0", "holding read"),
