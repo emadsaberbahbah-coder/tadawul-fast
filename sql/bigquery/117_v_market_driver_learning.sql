@@ -7,6 +7,7 @@
 -- days / 5 of them are independent (indep_5d). lift_5d_pp = the state's mean minus the mean of every day.
 -- A state with indep_5d under 10 is 'too few days'. Every row is in-sample: the states were written on
 -- 22 Nov 2026 from common use, not fitted, but three years hold one or two market regimes - a guide, not proof.
+-- The latest sessions have no outcome yet: they count in no mean and no hit rate (review of #1059).
 -- is_now marks the state each driver is in on the latest day.
 -- Research only: no decision, gate or count reads this view.
 CREATE OR REPLACE VIEW `{{DS}}.v_market_driver_learning`
@@ -35,8 +36,8 @@ long AS (
   WHERE x.state IS NOT NULL
 ),
 base AS (
-  SELECT AVG(spy_next5_pct) AS b5, AVG(IF(spy_next5_pct > 0, 1, 0)) AS bh5, AVG(spy_next20_pct) AS b20,
-    AVG(IF(spy_next20_pct > 0, 1, 0)) AS bh20
+  SELECT AVG(spy_next5_pct) AS b5, AVG(IF(spy_next5_pct IS NULL, NULL, IF(spy_next5_pct > 0, 1, 0))) AS bh5, AVG(spy_next20_pct) AS b20,
+    AVG(IF(spy_next20_pct IS NULL, NULL, IF(spy_next20_pct > 0, 1, 0))) AS bh20
   FROM m WHERE spy_next5_pct IS NOT NULL
 ),
 now AS (
@@ -56,7 +57,7 @@ now AS (
 agg AS (
   SELECT driver, state, ANY_VALUE(ord) AS ord,
     COUNTIF(spy_next5_pct IS NOT NULL) AS days,
-    AVG(spy_next5_pct) AS mean_5d, AVG(IF(spy_next5_pct > 0, 1, 0)) AS hit_5d,
+    AVG(spy_next5_pct) AS mean_5d, AVG(IF(spy_next5_pct IS NULL, NULL, IF(spy_next5_pct > 0, 1, 0))) AS hit_5d,
     APPROX_QUANTILES(spy_next5_pct, 20)[OFFSET(1)] AS worst5_5d,
     AVG(spy_next20_pct) AS mean_20d, AVG(IF(spy_next20_pct IS NULL, NULL, IF(spy_next20_pct > 0, 1, 0))) AS hit_20d,
     COUNT(*) AS days_all, MIN(date) AS first_day, MAX(date) AS last_day

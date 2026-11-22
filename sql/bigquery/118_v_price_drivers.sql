@@ -12,7 +12,7 @@
 --   iv_hv_ratio      30-day implied over 30-day realised volatility: above 1.3 the market expects more movement
 --                    than the stock has shown (news ahead), below 0.8 less
 --   rs_1w_vs_sector_pp  the stock's move over about a week (TFB's snapshots 7 days apart) minus its US sector
---                    ETF over the same price days. Over a week, studies find reversal more often than momentum:
+--                    ETF over the same sessions (a snapshot dated D carries D's US close: the archive runs after it). Over a week, studies find reversal more often than momentum:
 --                    v_driver_learning measures which holds for TFB's names
 --   volume_ratio     the last session's volume over its 30-day average
 --   analyst_change_1m  the change of the analysts' consensus score over a month (v_symbol_analyst)
@@ -62,8 +62,8 @@ dd AS (
 etf_ret AS (
   -- each ETF's move between the last trading days before the two snapshot dates (the days whose prices they hold)
   SELECT e.symbol AS etf_symbol,
-    (SAFE_DIVIDE(ARRAY_AGG(IF(e.date < dd.d1, e.close, NULL) IGNORE NULLS ORDER BY e.date DESC LIMIT 1)[SAFE_OFFSET(0)],
-                 ARRAY_AGG(IF(e.date < dd.d0, e.close, NULL) IGNORE NULLS ORDER BY e.date DESC LIMIT 1)[SAFE_OFFSET(0)]) - 1) * 100 AS etf_r_pct
+    (SAFE_DIVIDE(ARRAY_AGG(IF(e.date <= dd.d1, e.close, NULL) IGNORE NULLS ORDER BY e.date DESC LIMIT 1)[SAFE_OFFSET(0)],
+                 ARRAY_AGG(IF(e.date <= dd.d0, e.close, NULL) IGNORE NULLS ORDER BY e.date DESC LIMIT 1)[SAFE_OFFSET(0)]) - 1) * 100 AS etf_r_pct
   FROM etf e CROSS JOIN dd
   GROUP BY e.symbol
 ),

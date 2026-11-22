@@ -350,9 +350,9 @@ PENDING = {
     # forces and their record, every stock's drivers beside its score, and each driver's record (research only)
     "v_options_reading": "75b9d7e7488f825a271f474c3b0ba06176e1eb71e0300395f1ff989466ddea16",
     "v_market_drivers": "02eae618a44e619d96f701987e67255c225478bd449ed959b1013e7589eebc41",
-    "v_market_driver_learning": "26a860e27f1551b1f7323ae24b47c452553d110fc5bb82a2391495fa7d17617c",
-    "v_price_drivers": "e04a451ac81bc4c062484f5911c5db97b6424ed58503e0efa6a13b815badab6f",
-    "v_driver_learning": "222a60304f2dd068adedc6afb8fbcd77fcda13058bba88a3a72c92241e26a385",
+    "v_market_driver_learning": "11fe865115ea0a67eff37e7a74ffbb8e6067f1a7160c55bf304a13c3bc1aae62",
+    "v_price_drivers": "bbecaf9802bbf3ed34a92c97d442307aee5774faccd7cb07a2494f3b500f7c16",
+    "v_driver_learning": "b89918e710f562686738410f23ea3465ccf30fa1ed4df4b1b001a4d8290a0459",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3730,6 +3730,10 @@ def case_v59():
     _, ml = _driver_view("v_market_driver_learning", 117, {"v_market_drivers"})
     assert "CASE WHEN a.days < 50 THEN 'too few days'" in ml and "CAST(FLOOR(a.days / 5) AS INT64) AS indep_5d" in ml
     assert "n.state IS NOT NULL AS is_now" in ml
+    # a session without its outcome yet is no loss: every hit rate leaves it out (#1059 review)
+    for col in ("spy_next5_pct", "spy_next20_pct"):
+        assert f"IF({col} > 0, 1, 0))" in ml and f"AVG(IF({col} > 0" not in ml, col
+    assert ml.count("IS NULL, NULL, IF(spy_next") == 4
 
 
 def case_v60():
@@ -3742,15 +3746,18 @@ def case_v60():
     for frag in ("ROUND(IFNULL(1.5 * opt_tilt, 0) - IF(short_ratio_z >= 2, 1, 0), 2) AS driver_tilt_pp",
                  "GREATEST(0, LEAST(100, overall_score + IFNULL(1.5 * opt_tilt, 0) - IF(short_ratio_z >= 2, 1, 0)))",
                  "WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 DAY)",
-                 "SAFE_DIVIDE(o.iv30, u.volatility_30d_pct) AS iv_hv_ratio"):
+                 "SAFE_DIVIDE(o.iv30, u.volatility_30d_pct) AS iv_hv_ratio",
+                 # the ETF closes of the same sessions as the stock's two snapshots, both included (#1059 review)
+                 "IF(e.date <= dd.d1, e.close, NULL)", "IF(e.date <= dd.d0, e.close, NULL)"):
         assert frag in pd, frag
+    assert "e.date < dd." not in pd
     for name in ("overall_score", "recommendation", "final_action"):                 # TFB's own fields, unchanged
         assert f" {name}," in pd or f" {name}\n" in pd, name
     _, dl = _driver_view("v_driver_learning", 119, {"v_universe", "v_options_reading"})
     for frag in ("AND market_code = 'US' AND market_cap >= 2e9 AND current_price > 0",
                  "JOIN px f ON f.symbol = p.symbol AND f.snapshot_date = DATE_ADD(p.snapshot_date, INTERVAL 7 DAY)",
-                 "AND o.snapshot_date BETWEEN DATE_SUB(r.snapshot_date, INTERVAL 6 DAY) AND "
-                 "DATE_SUB(r.snapshot_date, INTERVAL 1 DAY)",
+                 # the options reading of the snapshot's own session (both are dated by the US session; #1059 review)
+                 "AND o.snapshot_date BETWEEN DATE_SUB(r.snapshot_date, INTERVAL 6 DAY) AND r.snapshot_date",
                  "r.next_week_pct - AVG(r.next_week_pct) OVER (PARTITION BY r.snapshot_date) AS next_week_excess_pp",
                  "CORR(rank_v, rank_r) AS rank_ic", "WHERE n >= 20",
                  "COUNT(DISTINCT DATE_TRUNC(snapshot_date, WEEK(MONDAY))) AS weeks",

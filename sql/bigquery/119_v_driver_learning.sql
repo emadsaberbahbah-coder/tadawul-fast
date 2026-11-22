@@ -15,6 +15,9 @@
 --   'higher is better'         mean_ic >= 0.03 and the IC positive on 55% of days or more
 --   'lower is better'          mean_ic <= -0.03 and the IC positive on 45% of days or fewer
 --   'no edge yet'              otherwise
+-- ALIGNMENT: a snapshot's date is the UTC day the archive ran (23:05 UTC, after the US close), so its price is that
+-- session's close; the options collector (23:30 UTC) labels the same session with the same date. A snapshot takes
+-- the options reading of its own session, else the latest of the 6 days before (review of #1059).
 -- The options drivers have rows only from the first night bq_options ran: until then they read 'too few weeks'.
 -- 'score with drivers (shadow)' is v_price_drivers' observe-only score (overall + 1.5 x options tilt - 1 when
 -- short selling runs high); set beside 'TFB overall score', it shows whether the drivers would rank names better.
@@ -46,7 +49,7 @@ opt AS (
   FROM ret r
   JOIN `{{DS}}.v_options_reading` o
     ON o.symbol = r.symbol
-   AND o.snapshot_date BETWEEN DATE_SUB(r.snapshot_date, INTERVAL 6 DAY) AND DATE_SUB(r.snapshot_date, INTERVAL 1 DAY)
+   AND o.snapshot_date BETWEEN DATE_SUB(r.snapshot_date, INTERVAL 6 DAY) AND r.snapshot_date
   QUALIFY ROW_NUMBER() OVER (PARTITION BY r.symbol, r.snapshot_date ORDER BY o.snapshot_date DESC) = 1
 ),
 j AS (
