@@ -241,7 +241,11 @@ def key_set(symbols: Iterable[Any]) -> set:
 def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]], today: dt.date,
                  stale_days: int) -> Tuple[Dict[str, Dict[str, Any]], int]:
     """New streak state: a red row keeps or extends its streak (+1 on each new weekday); a row that
-    reads well again leaves the watch, so its count restarts. Returns (state, red_today)."""
+    reads well again leaves the watch, so its count restarts. Returns (state, red_today).
+    v1.1.0: an unreadable row (red) and a quality flag are two kinds of evidence, and each keeps its
+    own count. When a watched row changes kind, its count starts again that day: a stale bar of 98
+    sessions that becomes unreadable is 1 red day, not 99, so it still has to stay red for the full
+    red_days before the retirement rule can take it (Codex P2 on #1056)."""
     out: Dict[str, Dict[str, Any]] = {}
     iso, weekday = today.isoformat(), today.weekday() < 5
     red_n = 0
@@ -257,6 +261,8 @@ def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]]
             why = QUALITY + qwhy
         sym = r["symbol"]
         p = prev.get(sym) or {}
+        if p and str(p.get("reason") or "").startswith(QUALITY) != why.startswith(QUALITY):
+            p = {"name": p.get("name")}     # another kind of evidence: its own count starts today
         days = int(p.get("days") or 0)
         last = str(p.get("last") or "")
         if weekday and last != iso:
@@ -270,13 +276,15 @@ def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]]
 
 def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Optional[Iterable[str]],
                 retired: Iterable[str], us_active: Optional[set], red_days: int, min_rows: int,
-                retire_max: int, pending: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                retire_max: int, pending: int = 0,
+                taken: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """(retire, kept). Kept = red long enough but not retired, each with the reason.
     held None = My_Portfolio could not be found: holdings unknown, so nothing is retired (fail closed).
     pending = rows still on the page that _Retired_Symbols already lists for it; the sync removes them
-    together with this run's lines once its seam is armed, so they count against the floor first."""
+    together with this run's lines once its seam is armed, so they count against the floor first.
+    taken (v1.1.0) = slots of the same per-run cap and row floor already planned by an earlier pass."""
     held_k, retired_k = key_set(held or []), key_set(retired)
-    room = max(0, min(retire_max, rows_on_page - pending - min_rows))
+    room = max(0, min(retire_max - taken, rows_on_page - pending - taken - min_rows))
     retire: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
     for sym, w in sorted(watch.items(), key=lambda kv: (-int(kv[1].get("days") or 0), kv[0])):
@@ -933,18 +941,24 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
     except Exception as e:  # noqa: BLE001
         out["notes"].append(f"active US list unavailable ({type(e).__name__}) - no retirement or addition this run")
     us_active = set(us_list) if us_list is not None else None
-    retire_all, kept = plan_retire(watch, n_rows, held, retired, us_active,
-                                   cfg["red_days"], cfg["min_rows"], cfg["retire_max"], pending)
     # v1.1.0: a delisting found through a quality reason belongs to the park lane: written only when
-    # that lane is enforce, reported otherwise.
-    q_delisted = [r for r in retire_all if str(r.get("reason") or "").startswith(QUALITY)]
+    # that lane is enforce, reported otherwise. It is planned AFTER the unreadable rows and from the
+    # room they leave, so a lane that only observes can never take a slot (cap or row floor) from a
+    # retirement the main mode would write (Codex P2 on #1056).
+    quality_watch = {s: w for s, w in watch.items() if str(w.get("reason") or "").startswith(QUALITY)}
+    legacy_watch = {s: w for s, w in watch.items() if s not in quality_watch}
+    retire_legacy, kept = plan_retire(legacy_watch, n_rows, held, retired, us_active,
+                                      cfg["red_days"], cfg["min_rows"], cfg["retire_max"], pending)
+    q_delisted, kept_q = plan_retire(quality_watch, n_rows, held, retired, us_active, cfg["red_days"], cfg["min_rows"],
+                                     cfg["retire_max"], pending, taken=len(retire_legacy))
+    retire_all, kept = retire_legacy + q_delisted, kept + kept_q
     park: List[Dict[str, Any]] = []
     if lane_park != "off":
         park, out["kept_quality"] = plan_park(watch, retire_all, n_rows, held, retired, us_active,
                                               int(cfg.get("park_days", 20)), cfg["min_rows"], cfg["retire_max"], pending)
         seen = {i["symbol"] for i in park} | {i["symbol"] for i in out["kept_quality"]}
         kept = [k for k in kept if k["symbol"] not in seen]
-    retire = retire_all if park_writes else [r for r in retire_all if r not in q_delisted]
+    retire = retire_all if park_writes else retire_legacy
     out["retired"], out["kept_red"] = retire, kept
     out["parked"], out["quality_delisted"] = park, ([] if park_writes else q_delisted)
 

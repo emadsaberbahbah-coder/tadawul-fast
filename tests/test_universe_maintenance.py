@@ -1061,6 +1061,68 @@ def test_u16_observe_lanes_report_and_write_nothing_under_enforce():
     assert {"SGONE.US", "SLIVE.US"} <= {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:]}   # still watched
 
 
+def _seed_red(sh, days=15, last="2026-10-19"):
+    sh.tabs["_Universe_Watch"] = FakeWS("_Universe_Watch", [um.WATCH_HEADER,
+                                        ["DEAD.US", "2026-09-29", last, str(days), "identity_quarantined", "Dead Corp"]])
+
+
+@pytest.mark.parametrize("park,retired,quality", [
+    ("off", ["DEAD.US"], []),               # v1.0.0: the one slot goes to the unreadable row
+    ("observe", ["DEAD.US"], []),           # an observing lane takes no slot from it (it took the slot before the fix)
+    ("enforce", ["DEAD.US"], []),           # an armed lane shares the cap: the unreadable row first, SGONE.US next run
+])
+def test_u16_an_observing_park_lane_never_takes_a_retirement_slot(park, retired, quality):
+    """Codex P2 on #1056: with retire_max=1, DEAD.US (15 red days, delisted) and SGONE.US (a stale bar of 27 sessions,
+    delisted) compete for one slot. SGONE.US sorts first. Planned in one pass it took the slot and was then dropped
+    from the write list, so under park=observe nothing was retired."""
+    sh, eod = _bookq(), _eod11()
+    _seed_red(sh)
+    out = _run(sh, eod, _cfg11(mode="enforce", park=park, retire_max=1), TUE)
+    assert [r["symbol"] for r in out["retired"]] == retired
+    assert [r["symbol"] for r in out["quality_delisted"]] == quality
+    listed = [r[0] for r in sh.tabs["_Retired_Symbols"].values[len(RETIRED_DEFAULT):]]
+    assert listed == ["DEAD.US"]                                                     # written in every case
+    if park != "off":                                                                # SGONE.US waits, and says why
+        assert any(k["symbol"] == "SGONE.US" and "cap reached (1 per run" in k["why"] for k in out["kept_quality"])
+        assert "SGONE.US" in {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:]}   # still watched
+
+
+def test_u16_quality_delistings_use_the_room_the_retirements_leave():
+    watch_legacy = {"DEAD.US": _w(15)}
+    retire, _ = um.plan_retire(watch_legacy, 6600, [], [], set(), 10, 6512, 2)
+    assert [r["symbol"] for r in retire] == ["DEAD.US"]
+    quality = {"SGONE.US": _qw(27), "SGONE2.US": _qw(26)}
+    q, kept = um.plan_retire(quality, 6600, [], [], set(), 10, 6512, 2, 0, taken=len(retire))
+    assert [r["symbol"] for r in q] == ["SGONE.US"] and [k["symbol"] for k in kept] == ["SGONE2.US"]
+    # the row floor counts the earlier pass too: 6513 rows, floor 6512 -> one slot in all
+    q2, _ = um.plan_retire(quality, 6513, [], [], set(), 10, 6512, 25, 0, taken=1)
+    assert q2 == []
+    assert um.plan_retire(quality, 6600, [], [], set(), 10, 6512, 2)[0] == um.plan_retire(quality, 6600, [], [], set(), 10, 6512, 2, 0, taken=0)[0]
+
+
+def test_u14_a_change_of_evidence_restarts_the_count():
+    """Codex P2 on #1056: a stale bar of 98 sessions that becomes unreadable was a 99-day red streak on its first red
+    day, so the retirement rule could take it at once. Each kind of evidence now keeps its own count."""
+    mon, tue, wed = dt.date(2026, 10, 19), dt.date(2026, 10, 20), dt.date(2026, 10, 21)
+    stale = [{"symbol": "X.US", "name": "X", "warnings": "", "last_utc": "2026-10-19T01:00:00", "block": STALE.format(98)}]
+    w, n = um.update_watch({}, stale, mon, 2)
+    assert n == 0 and w["X.US"]["days"] == 98 and w["X.US"]["reason"].startswith(um.QUALITY)
+    red = [{"symbol": "X.US", "name": "X", "warnings": "acquisition_status:unavailable", "last_utc": "", "block": STALE.format(99)}]
+    w2, n2 = um.update_watch(w, red, tue, 2)
+    assert n2 == 1 and w2["X.US"]["days"] == 1 and w2["X.US"]["first"] == "2026-10-20"      # not 99
+    assert not w2["X.US"]["reason"].startswith(um.QUALITY) and w2["X.US"]["name"] == "X"
+    assert um.plan_retire(w2, 6600, [], [], set(), 10, 6512, 25)[0] == []                    # not retired on its first red day
+    w3, _ = um.update_watch(w2, red, wed, 2)
+    assert w3["X.US"]["days"] == 2 and w3["X.US"]["first"] == "2026-10-20"                   # the red streak then runs as before
+    # and back: a row red for 2 days that reads again with a 3-session stale bar starts its quality count
+    stale3 = [{"symbol": "X.US", "name": "X", "warnings": "", "last_utc": "2026-10-22T01:00:00", "block": STALE.format(3)}]
+    w4, n4 = um.update_watch(w3, stale3, dt.date(2026, 10, 22), 2)
+    assert n4 == 0 and w4["X.US"]["days"] == 3 and w4["X.US"]["first"] == "2026-10-22"
+    red15 = {"Y.US": {"first": "2026-09-29", "last": "2026-10-19", "days": 15, "reason": "identity_quarantined", "name": "Y"}}
+    stale1 = [{"symbol": "Y.US", "name": "Y", "warnings": "", "last_utc": "2026-10-20T01:00:00", "block": STALE.format(1)}]
+    assert um.update_watch(red15, stale1, tue, 2)[0]["Y.US"]["days"] == 1                    # 15 red days are not 15 stale ones
+
+
 # ---- U17 both lanes enforce --------------------------------------------------
 def test_u17_enforce_parks_retires_and_adds_new_listings_first():
     sh, eod = _bookq(), _eod11()

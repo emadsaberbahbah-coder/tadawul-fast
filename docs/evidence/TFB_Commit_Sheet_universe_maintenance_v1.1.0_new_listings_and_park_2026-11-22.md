@@ -30,8 +30,19 @@ Owner, 22 Nov 2026: new IPOs should be added automatically, the best missing com
 ## Evidence
 
 - `python scripts/universe_maintenance.py --selftest`: PASS (6 new checks).
-- `tests/test_universe_maintenance.py`: 88 passed (25 new: U14 to U20).
+- `tests/test_universe_maintenance.py`: 93 passed (30 new: U14 to U20, five of them for the two review findings below).
 - `python scripts/audit_repository_workflows.py`: errors=0 warnings=0.
+
+## Review findings on the first commit (Codex, 22 Nov) and what changed
+
+Both were reproduced with the workbook fixtures, and both were right.
+
+| Finding | Reproduced | Change |
+|---|---|---|
+| With the main mode at enforce and the park lane observing, a quality delisting took a slot of the per-run cap and was then dropped from the write list, so a real retirement waited | `retire_max=1`: DEAD.US (15 red days) and SGONE.US (stale bar, 27 sessions). Park off retired DEAD.US; park observe retired nothing | Unreadable rows are planned first. Quality delistings are planned after them, from the room they leave (`plan_retire(..., taken=)`). An observing lane can no longer take a slot |
+| A quality-watched row that became unreadable kept its quality count as a red streak: a stale bar of 98 sessions was a 99-day red streak on its first red day | `update_watch` on that row: days 99, retired at once | The two kinds of evidence keep separate counts. A change of kind restarts the count that day, in both directions |
+
+The four new tests fail on the first commit's script and pass on this one.
 
 ## What the owner does
 
