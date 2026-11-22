@@ -551,7 +551,7 @@ def test_u9_enforce_appends_retirements_and_additions():
     assert [r["symbol"] for r in out["retired"]] == ["DEAD.US"]
     tail = sh.tabs["_Retired_Symbols"].values[-1]
     assert tail[0] == "Global_Markets" and tail[1] == "DEAD.US" and tail[3] == "2026-10-20"
-    assert tail[2].startswith("universe_maintenance v1.0.0: delisted")
+    assert tail[2].startswith("universe_maintenance v1.1.0: delisted")
     assert "DEAD.US" not in {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:]}
     assert [r[0] for r in gm.values[last_row:]] == ["NEWA.US", "NEWB.US", "NEWC.US"]
     assert all(len([c for c in r if c != ""]) == 1 for r in gm.values[last_row:])     # column A only
@@ -891,3 +891,332 @@ def test_u13_workflow_passes_the_token_and_keeps_its_private_group():
     step = next(s for s in wf["jobs"]["universe-maintenance"]["steps"] if "--json-out" in s.get("run", ""))
     assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert "tadawul-production-write" not in json.dumps(wf["concurrency"])
+
+
+# =========================================================================== #
+# v1.1.0 -- new listings, stale price bars, the parked list                    #
+# =========================================================================== #
+GMQ_HEADER = ["Symbol", "Name", "Exchange", "Last Updated (UTC)", "Warnings", "Block Reason"]
+STALE = "Stale price bar (provider data {} session(s) old)"
+QUALITY_ROWS = [  # symbol, name, block reason  (every row reads well: fresh, no warning)
+    ("SGONE.US", "Stale Gone Corp", STALE.format(27)),          # absent from the active US list -> delisted
+    ("SLIVE.US", "Stale Live Corp", STALE.format(30)),          # still listed -> parked
+    ("SHELD.US", "Stale Held Corp", STALE.format(40)),          # held -> never parked
+    ("SNEW.US", "Stale New Corp", STALE.format(5)),             # watched, too recent
+    ("NOID.VN", "No Identity JSC", "Identity unverified — re-fetch required"),
+    ("FINE.US", "Fine Corp", "Engine recommends SELL"),         # an ordinary block reason is not a quality flag
+]
+IPOS = [
+    {"Code": "IPOA.US", "Name": "Ipoa Inc", "Exchange": "NASDAQ", "Date": "2026-09-01", "DealType": "Priced"},
+    {"Code": "IPOSMALL.US", "Name": "Too Long Code", "Exchange": "NYSE", "Date": "2026-09-02", "DealType": "Priced"},
+    {"Code": "IPOB.US", "Name": "Ipob Small Inc", "Exchange": "NYSE", "Date": "2026-09-03", "DealType": "Priced"},
+    {"Code": "IPOC.US", "Name": "Ipoc Inc", "Exchange": "NYSE", "Date": "2026-09-04", "DealType": "Priced"},
+    {"Code": "NEWA.US", "Name": "Newa Corp", "Exchange": "NYSE", "Date": "2026-09-05", "DealType": "Priced"},
+    {"Code": "IPOX.US", "Name": "Ipox Expected Inc", "Exchange": "NYSE", "Date": "2026-09-06", "DealType": "Expected"},
+    {"Code": "IPOY.US", "Name": "Ipoy Fresh Inc", "Exchange": "NYSE", "Date": "2026-10-10", "DealType": "Priced"},
+    {"Code": "IPOZ.US", "Name": "Ipoz Old Inc", "Exchange": "NYSE", "Date": "2026-01-10", "DealType": "Priced"},
+    {"Code": "IPOL.L", "Name": "London Listing plc", "Exchange": "LSE", "Date": "2026-09-01", "DealType": "Priced"},
+    {"Code": "IPOF.US", "Name": "Ipof Adr Co", "Exchange": "NYSE", "Date": "2026-09-07", "DealType": "Priced"},
+]
+IPO_LIST = {c: {"Type": "Common Stock", "Exchange": "NYSE", "Isin": f"US99999999{i:02d}"}
+            for i, c in enumerate(("IPOA", "IPOB", "IPOC", "IPOY", "IPOZ", "IPOF"))}
+IPO_FUND = {
+    "IPOA": {"General": {"CountryISO": "US", "Name": "Ipoa Inc"}, "Highlights": {"MarketCapitalization": 4.2e9}},
+    "IPOB": {"General": {"CountryISO": "US", "Name": "Ipob"}, "Highlights": {"MarketCapitalization": 3.0e8}},
+    "IPOC": {"General": {"CountryISO": "US", "Name": "Ipoc Inc"}, "Highlights": {"MarketCapitalization": 1.5e9}},
+    "NEWA": {"General": {"CountryISO": "US", "Name": "Newa Corp"}, "Highlights": {"MarketCapitalization": 8e11}},
+    "IPOF": {"General": {"CountryISO": "TW", "Name": "Ipof"}, "Highlights": {"MarketCapitalization": 9e9}},
+}
+
+
+class FakeEod11(FakeEod):
+    def __init__(self, *a, ipos=IPOS, fail_ipos=False, **kw):
+        super().__init__(*a, **kw)
+        self._ipos, self.fail_ipos, self.ipo_window = list(ipos), fail_ipos, None
+
+    def ipos(self, start, end):
+        self.calls["ipos"] += 1
+        self.ipo_window = (start, end)
+        if self.fail_ipos:
+            raise RuntimeError("EODHD calendar failed: HTTPError")
+        return [dict(r) for r in self._ipos]
+
+    def fundamentals_cap(self, code):
+        self.calls["fundamentals_cap"] += 1
+        f = IPO_FUND.get(code, {"General": {"CountryISO": "US", "Name": code}, "Highlights": {}})
+        return f
+
+
+def _gmq(n_plain=6600):
+    rows = [GMQ_HEADER] + [[f"P{i:04d}.US", f"Plain Company {i}", "NYSE", FRESH, "", ""] for i in range(n_plain)]
+    rows += [[s, nm, "NYSE", FRESH, w, ""] for s, nm, w in SPECIAL]
+    rows += [[s, nm, "NYSE", FRESH, "", b] for s, nm, b in QUALITY_ROWS]
+    return FakeWS("Global_Markets", rows, rows=len(rows) + 5)
+
+
+def _eod11(**kw):
+    extra = dict(CAND_LIST, **IPO_LIST)
+    extra.update({c: {"Type": "Common Stock", "Exchange": "NYSE", "Isin": "US0000000900"} for c in ("SLIVE", "SHELD", "SNEW", "FINE")})
+    return FakeEod11(_us_list(extra), CANDIDATES, CAND_FUND, **kw)
+
+
+def _bookq(**kw):
+    return _book(gm=_gmq(), portfolio=("Symbol", "HELD", "SHELD.US", "5023.SR"), **kw)
+
+
+def _cfg11(**over):
+    c = _cfg(ipo="observe", ipo_max=5, ipo_min_days=30, ipo_max_days=180, ipo_min_cap_m=1000, park="observe", park_days=20)
+    c.update(over)
+    return c
+
+
+# ---- U14 quality watch ------------------------------------------------------
+@pytest.mark.parametrize("block,expected", [
+    ("Stale price bar (provider data 98 session(s) old)", (True, "stale price bar (98 sessions)", 98)),
+    ("stale price bar (provider data 2 sessions old)", (True, "stale price bar (2 sessions)", 2)),
+    ("Identity unverified — re-fetch required", (True, "identity unverified", 0)),
+    ("Engine recommends SELL", (False, "", 0)), ("Conservative gate: overall 55 < 70", (False, "", 0)), ("", (False, "", 0)),
+    (None, (False, "", 0)),
+])
+def test_u14_quality_flag_reads_only_the_two_engine_reasons(block, expected):
+    assert um.quality_flag(block) == expected
+
+
+def test_u14_a_stale_bar_counts_its_own_sessions_and_red_today_stays_unreadable_rows_only():
+    sh, eod = _bookq(), _eod11()
+    out = _run(sh, eod, _cfg11(), TUE)
+    assert out["red_today"] == 4 and out["quality_today"] == 5
+    watch = {r[0]: r for r in sh.tabs["_Universe_Watch"].get_all_values()[1:] if r[0]}
+    assert watch["SGONE.US"][3] == "27" and watch["SGONE.US"][4] == "quality: stale price bar (27 sessions)"
+    assert watch["SNEW.US"][3] == "5" and watch["NOID.VN"][3] == "1" and watch["NOID.VN"][4] == "quality: identity unverified"
+    assert "FINE.US" not in watch and watch["DEAD.US"][4].startswith("identity_quarantined")
+
+
+def test_u14_park_lane_off_is_v1_0_0_exactly():
+    sh, eod = _bookq(), _eod11()
+    out = _run(sh, eod, _cfg11(park="off", ipo="off"), TUE)
+    watch = {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:] if r[0]}
+    assert watch == {"DEAD.US", "LIVEQ.US", "HELD", "GONE.L"} and out["quality_today"] == 0
+    assert out["parked"] == [] and out["quality_delisted"] == [] and out["ipo_added"] == [] and eod.calls["ipos"] == 0
+    report = sh.tabs["_Universe_Report"].get_all_values()
+    assert not any("PARK" in str(r[0]) or "NEW LISTING" in str(r[0]) for r in report if r)
+    # a v1.0.0 cfg (no lane keys at all) is the same
+    out0 = _run(_bookq(), _eod11(), _cfg(), TUE)
+    assert out0["lanes"] == {"ipo": "off", "park": "off"} and out0["quality_today"] == 0
+
+
+def test_u14_page_without_the_block_reason_column_still_runs():
+    out = _run(_book(), _eod11(), _cfg11(), TUE)                  # the v1.0.0 five-column page
+    assert out["quality_today"] == 0 and out["parked"] == [] and out["red_today"] == 4
+
+
+# ---- U15 park rules ---------------------------------------------------------
+def _qw(days, why="stale price bar (30 sessions)"):
+    return {"days": days, "reason": um.QUALITY + why, "name": "X"}
+
+
+def test_u15_park_rules_each_reason():
+    watch = {"A.US": _qw(30), "HELDQ.US": _qw(45), "YOUNG.US": _qw(19), "R.US": {"days": 60, "reason": "identity_quarantined"},
+             "N.L": {"days": 22, "reason": "quote_current_price_missing"}, "V.VN": _qw(21, "identity unverified"),
+             "GONE.US": _qw(33), "OLDRET.US": _qw(50)}
+    retire = [{"symbol": "GONE.US", "days": 33}]
+    park, kept = um.plan_park(watch, retire, 6600, ["HELDQ"], ["OLDRET.US"], {"A", "R", "HELDQ"}, 20, 6512, 25)
+    assert [p["symbol"] for p in park] == ["A.US", "N.L", "V.VN"]
+    assert park[0]["why"] == "parked: stale price bar (30 sessions) for 30 trading days"
+    assert park[1]["why"] == "parked: unreadable non-US line for 22 trading days"
+    assert {k["symbol"]: k["why"] for k in kept} == {"HELDQ.US": "held on My_Portfolio - never parked"}
+
+
+def test_u15_park_fails_closed_without_holdings_or_the_us_list_and_respects_floor_and_cap():
+    watch = {"A.US": _qw(30), "B.L": _qw(30, "identity unverified")}
+    park, kept = um.plan_park(watch, [], 6600, None, [], {"A"}, 20, 6512, 25)
+    assert park == [] and all("holdings unknown" in k["why"] for k in kept) and len(kept) == 2
+    park, kept = um.plan_park(watch, [], 6600, [], [], None, 20, 6512, 25)
+    assert [p["symbol"] for p in park] == ["B.L"] and "delisting not ruled out" in kept[0]["why"]
+    assert um.plan_park(watch, [], 6512, [], [], {"A"}, 20, 6512, 25)[0] == []                    # at the floor
+    assert len(um.plan_park(watch, [], 6513, [], [], {"A"}, 20, 6512, 25)[0]) == 1               # one seat above it
+    assert um.plan_park(watch, [{"symbol": "Z.US"}] * 25, 6600, [], [], {"A"}, 20, 6512, 25)[0] == []   # retirements used the cap
+    assert len(um.plan_park(watch, [], 6600, [], [], {"A"}, 20, 6512, 1)[0]) == 1
+
+
+# ---- U16 a lane in observe never writes, even under enforce ----------------
+def test_u16_observe_lanes_report_and_write_nothing_under_enforce():
+    sh, eod = _bookq(), _eod11()
+    gm = sh.tabs["Global_Markets"]
+    last_row = len(gm.values)
+    out = _run(sh, eod, _cfg11(mode="enforce"), TUE)
+    assert [r["symbol"] for r in out["retired"]] == []                               # SGONE.US is the park lane's
+    assert [r["symbol"] for r in out["quality_delisted"]] == ["SGONE.US"]
+    assert [p["symbol"] for p in out["parked"]] == ["SLIVE.US"]
+    assert {k["symbol"] for k in out["kept_quality"]} == {"SHELD.US"}
+    assert [a["symbol"] for a in out["ipo_added"]] == ["IPOA.US", "IPOC.US", "NEWA.US"]
+    assert sh.tabs["_Retired_Symbols"].values == RETIRED_DEFAULT                     # nothing listed
+    assert [r[0] for r in gm.values[last_row:]] == ["NEWA.US", "NEWB.US", "NEWC.US"]  # only the v1.0.0 lane wrote
+    report = sh.tabs["_Universe_Report"].get_all_values()
+    heads = [r[0] for r in report if r]
+    assert "WOULD ADD NEW LISTING (lane observe)" in heads and "WOULD PARK OR RETIRE FOR QUALITY (lane observe)" in heads
+    assert "QUALITY ROWS KEPT" in heads and "NEW LISTINGS NOT ADDED" in heads and "ADDED" in heads
+    log = sh.tabs["_Run_Log"].values[-1]
+    assert "would_add_new_listings=3" in log[5] and "would_park=2" in log[5] and "added=3" in log[5]
+    assert {"SGONE.US", "SLIVE.US"} <= {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:]}   # still watched
+
+
+# ---- U17 both lanes enforce --------------------------------------------------
+def test_u17_enforce_parks_retires_and_adds_new_listings_first():
+    sh, eod = _bookq(), _eod11()
+    gm = sh.tabs["Global_Markets"]
+    last_row = len(gm.values)
+    out = _run(sh, eod, _cfg11(mode="enforce", ipo="enforce", park="enforce"), TUE)
+    assert [r["symbol"] for r in out["retired"]] == ["SGONE.US"] and out["quality_delisted"] == []
+    listed = {r[0]: r[2] for r in sh.tabs["_Retired_Symbols"].values[len(RETIRED_DEFAULT):]}
+    assert set(listed) == {"SGONE.US", "SLIVE.US"}
+    assert listed["SGONE.US"] == "universe_maintenance v1.1.0: delisted: absent from the active US exchange list (red 27 trading days)"
+    assert listed["SLIVE.US"] == "universe_maintenance v1.1.0: parked: stale price bar (30 sessions) for 30 trading days"
+    assert all(r[4] == "Global_Markets" for r in sh.tabs["_Retired_Symbols"].values[len(RETIRED_DEFAULT):])
+    assert [r[0] for r in gm.values[last_row:]] == ["IPOA.US", "IPOC.US", "NEWA.US", "NEWB.US", "NEWC.US"]
+    assert [a["symbol"] for a in out["ipo_added"]] == ["IPOA.US", "IPOC.US", "NEWA.US"]
+    assert [a["symbol"] for a in out["added"]] == ["NEWB.US", "NEWC.US"]            # NEWA is added once, as a listing
+    watch = {r[0] for r in sh.tabs["_Universe_Watch"].get_all_values()[1:] if r[0]}
+    assert not {"SGONE.US", "SLIVE.US"} & watch and "SHELD.US" in watch
+    heads = [r[0] for r in sh.tabs["_Universe_Report"].get_all_values() if r]
+    assert "ADDED NEW LISTING" in heads and "PARKED" in heads
+    log = sh.tabs["_Run_Log"].values[-1]
+    assert "new_listings=3" in log[5] and "parked=1" in log[5] and "retired=1" in log[5]
+
+
+def test_u17_new_listings_share_the_weekly_room_with_the_top_1000_lane():
+    sh, eod = _bookq(), _eod11()
+    gm = sh.tabs["Global_Markets"]
+    last_row = len(gm.values)
+    _run(sh, eod, _cfg11(mode="enforce", ipo="enforce", park="off", add_max=3), TUE)
+    assert [r[0] for r in gm.values[last_row:]] == ["IPOA.US", "IPOC.US", "NEWA.US"]      # 2 listings + 1, not 2 + 3
+    sh2 = _bookq()
+    gm2 = sh2.tabs["Global_Markets"]
+    last2 = len(gm2.values)
+    _run(sh2, _eod11(), _cfg11(mode="enforce", ipo="enforce", park="off", ipo_max=1), TUE)
+    assert [r[0] for r in gm2.values[last2:]] == ["IPOA.US", "NEWA.US", "NEWB.US", "NEWC.US"]
+
+
+def test_u17_sync_in_flight_defers_the_new_lanes_too():
+    sh, eod = _bookq(), _eod11()
+    gm = sh.tabs["Global_Markets"]
+    before = json.dumps(gm.values)
+    out = _run(sh, eod, _cfg11(mode="enforce", ipo="enforce", park="enforce"), TUE, sync_check=lambda: True)
+    assert out["deferred"] is True and json.dumps(gm.values) == before
+    assert sh.tabs["_Retired_Symbols"].values == RETIRED_DEFAULT
+    heads = [r[0] for r in sh.tabs["_Universe_Report"].get_all_values() if r]
+    assert "ADDED NEW LISTING" not in heads and "PARKED" not in heads
+
+
+# ---- U18 the new-listing lane ------------------------------------------------
+def test_u18_candidates_are_priced_seasoned_us_listings_oldest_first():
+    c = um.ipo_candidates(IPOS + [{"Code": "IPOA.US", "Date": "2026-09-01", "DealType": "Priced", "Exchange": "NASDAQ"},
+                                  {"Code": "BARE", "Date": "2026-09-08", "DealType": "priced", "Exchange": "Nasdaq"},
+                                  {"Code": "NOVENUE", "Date": "2026-09-08", "DealType": "Priced", "Exchange": ""},
+                                  {"Code": "BADDATE.US", "Date": "soon", "DealType": "Priced", "Exchange": "NYSE"},
+                                  "junk"], TUE.date(), 30, 180)
+    assert [x["Code"] for x in c] == ["IPOA", "IPOB", "IPOC", "NEWA", "IPOF", "BARE"]
+    assert c[0] == {"Code": "IPOA", "Name": "Ipoa Inc", "MarketCap": None, "Date": "2026-09-01", "Exchange": "NASDAQ"}
+
+
+def test_u18_every_new_listing_filter_reports_its_reason():
+    sh, eod = _bookq(), _eod11()
+    out = _run(sh, eod, _cfg11(), TUE)
+    assert eod.ipo_window == (TUE.date() - dt.timedelta(days=180), TUE.date())
+    assert [(a["symbol"], a["market_cap"]) for a in out["ipo_added"]] == [("IPOA.US", 4.2e9), ("IPOC.US", 1.5e9), ("NEWA.US", 8e11)]
+    assert out["ipo_added"][0]["why"] == "new listing of 2026-09-01 on NASDAQ, missing from Global_Markets"
+    why = {s["symbol"]: s["why"] for s in out["ipo_skipped"]}
+    assert why["IPOB.US"] == "market value USD 300M is under the new-listing floor (USD 1,000M)"
+    assert why["IPOF.US"].startswith("foreign issuer (TW)")
+    assert out["ipo_seen"] == 5
+    # an observing lane leaves the top-1,000 lane exactly as v1.0.0 had it (NEWA is still its first addition)
+    assert [a["symbol"] for a in out["added"]] == ["NEWA.US", "NEWB.US", "NEWC.US"]
+
+
+def test_u18_unknown_market_value_is_not_added():
+    eod = _eod11(ipos=[{"Code": "IPOY.US", "Name": "No Highlights Inc", "Exchange": "NYSE", "Date": "2026-09-01", "DealType": "Priced"}])
+    out = _run(_bookq(), eod, _cfg11(), TUE)
+    assert out["ipo_added"] == [] and out["ipo_skipped"][0]["why"] == "market value unknown - not added this week"
+
+
+def test_u18_calendar_failure_is_a_note_and_the_top_1000_lane_goes_ahead():
+    sh, eod = _bookq(), _eod11(fail_ipos=True)
+    out = _run(sh, eod, _cfg11(), TUE)
+    assert out["ipo_added"] == [] and any("IPO calendar unavailable (RuntimeError)" in n for n in out["notes"])
+    assert [a["symbol"] for a in out["added"]] == ["NEWA.US", "NEWB.US", "NEWC.US"] and out["additions_ran"] is True
+    out2 = _run(_bookq(), FakeEod(_us_list(CAND_LIST), CANDIDATES, CAND_FUND), _cfg11(), TUE)    # a client with no calendar
+    assert any("no IPO calendar" in n for n in out2["notes"]) and len(out2["added"]) == 3
+
+
+def test_u18_calendar_is_read_only_in_the_weekly_additions_run():
+    sh, eod = _bookq(), _eod11()
+    _run(sh, eod, _cfg11(), TUE)
+    _run(sh, eod, _cfg11(), TUE + dt.timedelta(hours=11))
+    assert eod.calls["ipos"] == 1 and eod.calls["screener"] == 1
+
+
+def test_u18_eodhd_client_parses_the_calendar_and_fails_closed_on_another_shape(monkeypatch):
+    client = um.Eodhd("KEY")
+    seen = {}
+
+    def fake(path, params, timeout=90.0):
+        seen["path"], seen["params"] = path, params
+        return {"ipos": [{"code": "abc.us", "name": "Abc Inc", "exchange": "NASDAQ", "start_date": "2026-09-01 00:00:00", "deal_type": "Priced"},
+                         "junk", {"Code": "DEF.US", "Name": "Def", "Exchange": "NYSE", "Date": "2026-09-02", "DealType": "Expected"}]}
+    monkeypatch.setattr(client, "_json", fake)
+    rows = client.ipos(dt.date(2026, 5, 1), dt.date(2026, 10, 20))
+    assert seen == {"path": "calendar/ipos", "params": {"from": "2026-05-01", "to": "2026-10-20"}}
+    assert rows == [{"Code": "ABC.US", "Name": "Abc Inc", "Exchange": "NASDAQ", "Date": "2026-09-01", "DealType": "Priced"},
+                    {"Code": "DEF.US", "Name": "Def", "Exchange": "NYSE", "Date": "2026-09-02", "DealType": "Expected"}]
+    monkeypatch.setattr(client, "_json", lambda *a, **k: {"error": "plan"})
+    with pytest.raises(RuntimeError):
+        client.ipos(dt.date(2026, 5, 1), dt.date(2026, 10, 20))
+    monkeypatch.setattr(client, "_json", lambda path, params, timeout=90.0: {"General": {"CountryISO": "US"}, "Highlights": {"MarketCapitalization": 5}})
+    assert client.fundamentals_cap("ABC") == {"General": {"CountryISO": "US"}, "Highlights": {"MarketCapitalization": 5}}
+    monkeypatch.setattr(client, "_json", lambda path, params, timeout=90.0: ["unexpected"])
+    assert client.fundamentals_cap("ABC") == {"General": {}, "Highlights": {}}
+
+
+# ---- U19 settings and workflow ------------------------------------------------
+def test_u19_lane_switches_default_to_observe_and_clamp(monkeypatch):
+    for k in ("TFB_UNIVERSE_IPO", "TFB_UNIVERSE_PARK", "TFB_UNIVERSE_IPO_MAX", "TFB_UNIVERSE_IPO_MIN_DAYS",
+              "TFB_UNIVERSE_IPO_MAX_DAYS", "TFB_UNIVERSE_IPO_MIN_CAP_M", "TFB_UNIVERSE_PARK_DAYS"):
+        monkeypatch.delenv(k, raising=False)
+    s = um.settings()
+    assert (s["ipo"], s["park"], s["ipo_max"], s["ipo_min_days"], s["ipo_max_days"], s["ipo_min_cap_m"], s["park_days"]) == \
+        ("observe", "observe", 5, 30, 180, 1000, 20)
+    monkeypatch.setenv("TFB_UNIVERSE_IPO", " ENFORCE ")
+    monkeypatch.setenv("TFB_UNIVERSE_PARK", "yes")                 # not a mode: observe, never enforce
+    monkeypatch.setenv("TFB_UNIVERSE_IPO_MAX", "999")
+    monkeypatch.setenv("TFB_UNIVERSE_PARK_DAYS", "1")
+    s = um.settings()
+    assert (s["ipo"], s["park"], s["ipo_max"], s["park_days"]) == ("enforce", "observe", 50, 5)
+    monkeypatch.setenv("TFB_UNIVERSE_PARK", "off")
+    assert um.settings()["park"] == "off"
+
+
+def test_u19_workflow_maps_the_new_switches_and_keeps_the_floors_in_code():
+    job = _wf()["jobs"]["universe-maintenance"]
+    step = next(s for s in job["steps"] if "universe_maintenance.py" in s.get("run", "") and "--json-out" in s.get("run", ""))
+    env = step["env"]
+    for name in ("TFB_UNIVERSE_IPO", "TFB_UNIVERSE_PARK", "TFB_UNIVERSE_IPO_MAX", "TFB_UNIVERSE_IPO_MIN_DAYS",
+                 "TFB_UNIVERSE_IPO_MAX_DAYS", "TFB_UNIVERSE_IPO_MIN_CAP_M", "TFB_UNIVERSE_PARK_DAYS"):
+        assert env[name] == "${{ vars.%s }}" % name
+    assert not any(k in env for k in ("TFB_UNIVERSE_MIN_ROWS", "TFB_UNIVERSE_MAX_ROWS"))
+
+
+# ---- U20 the artifact of a public repository names no holding ---------------
+def test_u20_json_artifact_redacts_held_rows():
+    sh, eod = _bookq(), _eod11()
+    out = _run(sh, eod, _cfg11(), TUE)
+    assert any(k["symbol"] == "SHELD.US" for k in out["kept_quality"])
+    safe = um.for_artifact(out)
+    text = json.dumps(safe, default=str)
+    assert "SHELD" not in text and "Stale Held Corp" not in text
+    assert [k for k in safe["kept_quality"] if k["symbol"] == "(held)" and k["why"].startswith("held on My_Portfolio")]
+    assert any(k["symbol"] == "SHELD.US" for k in out["kept_quality"])                  # the run result itself is untouched
+    report = "\n".join(",".join(map(str, r)) for r in sh.tabs["_Universe_Report"].get_all_values())
+    assert "SHELD.US" in report                                    # the private report tab still names it
+    held_red = um.for_artifact({"kept_red": [{"symbol": "HELD", "name": "Held Company", "why": "held on My_Portfolio - never retired"},
+                                             {"symbol": "GONE.L", "name": "Gone plc", "why": "non-US line"}]})
+    assert [k["symbol"] for k in held_red["kept_red"]] == ["(held)", "GONE.L"]

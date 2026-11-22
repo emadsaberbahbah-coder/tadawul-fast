@@ -1,5 +1,40 @@
 #!/usr/bin/env python3
-"""scripts/universe_maintenance.py -- Global_Markets universe maintenance v1.0.0 (2026-10-20)
+"""scripts/universe_maintenance.py -- Global_Markets universe maintenance v1.1.0 (2026-11-22)
+
+v1.1.0 (2026-11-22) -- NEW LISTINGS, STALE PRICE BARS, AND A PARKED LIST.
+WHY (owner request, 22 Nov 2026): "new IPOs should be added automatically ... the bad symbols should be
+removed ... automatic, without need me". v1.0.0 adds only from the US top 1,000 by market value, so a
+new listing arrives only once it is that large; and it watches only rows the sync could not READ. On
+22 Nov the page carried 41 rows whose block reason is "Stale price bar (provider data N session(s)
+old)" (one 98 sessions old) and 26 whose identity has never verified: each is refreshed every day, so
+none was red, none was watched, and none could ever leave.
+WHAT (two new lanes, each with its own switch; v1.0.0 behaviour is unchanged when both are off):
+  4. NEW LISTINGS -- TFB_UNIVERSE_IPO = off | observe (DEFAULT) | enforce. In the weekly additions
+     run, EODHD's IPO calendar is read for the last TFB_UNIVERSE_IPO_MAX_DAYS (180) days. A PRICED US
+     listing that began trading at least TFB_UNIVERSE_IPO_MIN_DAYS (30) days ago, is missing from the
+     page and is worth at least TFB_UNIVERSE_IPO_MIN_CAP_M (1,000 = USD 1.0 billion) goes through
+     every v1.0.0 addition filter (Common Stock, NYSE / Nasdaq venue, same-company match,
+     _Retired_Symbols, foreign issuer, owner exclusion policy). At most TFB_UNIVERSE_IPO_MAX (5) a
+     week, inside the same weekly cap and row cap as the top-1,000 additions, and ahead of them.
+  5. QUALITY WATCH AND PARK -- TFB_UNIVERSE_PARK = off | observe (DEFAULT) | enforce. A row that reads
+     well but whose Block Reason is a stale price bar or an unverified identity joins `_Universe_Watch`
+     with a "quality:" reason. A stale bar counts its own sessions, so a bar 98 sessions old is 98
+     days of evidence on the first run. From there:
+       - a `.US` row absent from the active US list is retired by the v1.0.0 rule (delisted);
+       - any other quality row, and a non-US row unreadable for the same time, is PARKED once it
+         reaches TFB_UNIVERSE_PARK_DAYS (20) trading days: appended to `_Retired_Symbols` with a
+         reason that starts "parked", so the sync's retirement seam removes it.
+     Never parked: a held symbol, an unreadable `.US` row still on the active list (a data problem on
+     our side), anything past the shared per-run cap or below the row floor.
+     A parked row comes back the same way a retired one does: delete its `_Retired_Symbols` line and
+     paste the symbol into Global_Markets column A. v1.1.0 does not bring it back by itself.
+A lane in observe is computed and reported even when TFB_UNIVERSE_MAINT is enforce; it writes only
+when both the main mode and its own switch are enforce. Not in v1.1.0: additions outside the US (the
+row cap leaves 148 seats, the account funds US dollars only, and Market_Leaders is an owner-approved
+roster), and removal for low traded value (the row floor leaves room for 90 removals).
+Rollback: TFB_UNIVERSE_IPO=off and TFB_UNIVERSE_PARK=off give v1.0.0 exactly.
+
+--- v1.0.0 (2026-10-20) ---
 
 WHY (owner request, 20 Oct 2026): the Global_Markets universe is maintained by hand (the 18 Oct
 Top-200 additions paste, the 196-row retirement list of the same day). Dead tickers stay on the
@@ -65,7 +100,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 PAGE = "Global_Markets"
 WATCH_TAB = "_Universe_Watch"
 REPORT_TAB = "_Universe_Report"
@@ -82,6 +117,11 @@ US_LIST_MIN = 5000          # a shorter active US list is treated as a partial d
 RIYADH = dt.timedelta(hours=3)
 
 RED_RE = re.compile(r"acquisition_status:(unavailable|preserved)|identity_quarantined|quote_current_price_missing")
+# v1.1.0: rows that READ well and still cannot be used; the wording is the engine's own Block Reason.
+STALE_BAR_RE = re.compile(r"stale price bar \(provider data (\d+) session", re.I)
+IDENTITY_RE = re.compile(r"identity unverified", re.I)
+QUALITY = "quality: "
+LANES = ("off", "observe", "enforce")
 _US_CODE = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z])?$")
 _NAME_DROP = {
     "inc", "incorporated", "corp", "corporation", "co", "company", "plc", "ltd", "limited", "llc", "lp",
@@ -107,9 +147,22 @@ def env_int(name: str, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+def lane(name: str) -> str:
+    """v1.1.0 lane switch: off | observe | enforce; unset or unreadable = observe (reported, never written)."""
+    raw = (os.getenv(name) or "observe").strip().lower()
+    return raw if raw in LANES else "observe"
+
+
 def settings() -> Dict[str, Any]:
     wd = (os.getenv("TFB_UNIVERSE_ADD_WEEKDAY") or "SUN").strip().upper()[:3]
     return {
+        "ipo": lane("TFB_UNIVERSE_IPO"),
+        "ipo_max": env_int("TFB_UNIVERSE_IPO_MAX", 5, 0, 50),
+        "ipo_min_days": env_int("TFB_UNIVERSE_IPO_MIN_DAYS", 30, 5, 365),
+        "ipo_max_days": env_int("TFB_UNIVERSE_IPO_MAX_DAYS", 180, 30, 730),
+        "ipo_min_cap_m": env_int("TFB_UNIVERSE_IPO_MIN_CAP_M", 1000, 50, 1000000),
+        "park": lane("TFB_UNIVERSE_PARK"),
+        "park_days": env_int("TFB_UNIVERSE_PARK_DAYS", 20, 5, 120),
         "mode": mode(),
         "add_max": env_int("TFB_UNIVERSE_ADD_MAX", 25, 0, 200),
         "retire_max": env_int("TFB_UNIVERSE_RETIRE_MAX", 25, 0, 200),
@@ -146,6 +199,19 @@ def is_red(warnings: Any, last_utc: Any, today: dt.date, stale_days: int = 2) ->
     return False, ""
 
 
+def quality_flag(block: Any) -> Tuple[bool, str, int]:
+    """v1.1.0 (flagged, reason, sessions). A row the sync reads every day and still cannot use: its
+    price bar stopped N sessions ago, or its identity never verified. sessions = N for a stale bar."""
+    text = str(block or "")
+    m = STALE_BAR_RE.search(text)
+    if m:
+        n = int(m.group(1))
+        return True, f"stale price bar ({n} sessions)", n
+    if IDENTITY_RE.search(text):
+        return True, "identity unverified", 0
+    return False, "", 0
+
+
 def norm_name(name: Any) -> str:
     """Company identity for duplicate detection across lines, ADRs and share classes."""
     s = re.sub(r"[^a-z0-9 ]+", " ", str(name or "").lower().replace("&", " and "))
@@ -178,10 +244,17 @@ def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]]
     reads well again leaves the watch, so its count restarts. Returns (state, red_today)."""
     out: Dict[str, Dict[str, Any]] = {}
     iso, weekday = today.isoformat(), today.weekday() < 5
+    red_n = 0
     for r in rows:
         red, why = is_red(r.get("warnings"), r.get("last_utc"), today, stale_days)
-        if not red:
-            continue
+        sessions = 0
+        if red:
+            red_n += 1
+        else:
+            flagged, qwhy, sessions = quality_flag(r.get("block"))      # v1.1.0
+            if not flagged:
+                continue
+            why = QUALITY + qwhy
         sym = r["symbol"]
         p = prev.get(sym) or {}
         days = int(p.get("days") or 0)
@@ -189,9 +262,10 @@ def update_watch(prev: Dict[str, Dict[str, Any]], rows: Sequence[Dict[str, Any]]
         if weekday and last != iso:
             days += 1
             last = iso
+        days = max(days, sessions)          # a stale bar is its own evidence: N sessions old = N days
         out[sym] = {"first": p.get("first") or iso, "last": last or iso, "days": days,
                     "reason": why, "name": r.get("name") or p.get("name") or ""}
-    return out, len(out)
+    return out, red_n
 
 
 def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Optional[Iterable[str]],
@@ -231,6 +305,92 @@ def plan_retire(watch: Dict[str, Dict[str, Any]], rows_on_page: int, held: Optio
     return retire, kept
 
 
+def plan_park(watch: Dict[str, Dict[str, Any]], retire: Sequence[Dict[str, Any]], rows_on_page: int,
+              held: Optional[Iterable[str]], retired: Iterable[str], us_active: Optional[set],
+              park_days: int, min_rows: int, retire_max: int,
+              pending: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """v1.1.0 (park, kept). Rows the page cannot use for park_days trading days and that the
+    retirement rule left in place. A quality row of any market, or a non-US row the sync cannot read.
+    Never: a held symbol (nothing at all when holdings are unknown), a `.US` row that is only
+    unreadable while still on the active list, a `.US` quality row while the active list is
+    unavailable (it may be a delisting, which retires it properly), or past the room left under the
+    shared per-run cap and the row floor once this run's retirements are counted."""
+    held_k, retired_k = key_set(held or []), key_set(retired)
+    gone = {str(r["symbol"]).strip().upper() for r in retire}
+    room = max(0, min(retire_max - len(retire), rows_on_page - pending - min_rows - len(retire)))
+    park: List[Dict[str, Any]] = []
+    kept: List[Dict[str, Any]] = []
+    for sym, w in sorted(watch.items(), key=lambda kv: (-int(kv[1].get("days") or 0), kv[0])):
+        days = int(w.get("days") or 0)
+        su = sym.strip().upper()
+        reason = str(w.get("reason") or "")
+        quality = reason.startswith(QUALITY)
+        if days < park_days or su in gone or su in retired_k:
+            continue
+        if not quality and su.endswith(".US"):
+            continue                        # unreadable but listed: a data problem, never parked
+        item = {"symbol": sym, "name": w.get("name", ""), "days": days, "reason": reason}
+        cause = reason[len(QUALITY):] if quality else "unreadable non-US line"
+        if held is None:
+            kept.append(dict(item, why="My_Portfolio not found - holdings unknown, nothing parked"))
+        elif sym_keys(su) & held_k:
+            kept.append(dict(item, why="held on My_Portfolio - never parked"))
+        elif su.endswith(".US") and us_active is None:
+            kept.append(dict(item, why="US exchange list unavailable this run - delisting not ruled out"))
+        elif len(park) >= room:
+            kept.append(dict(item, why=f"cap reached ({retire_max} per run with retirements; floor {min_rows} rows) - next run"))
+        else:
+            park.append(dict(item, why=f"parked: {cause} for {days} trading days"))
+    return park, kept
+
+
+def ipo_candidates(ipos: Sequence[Dict[str, Any]], today: dt.date, min_days: int,
+                   max_days: int) -> List[Dict[str, Any]]:
+    """v1.1.0: priced US listings that began trading between min_days and max_days ago, oldest first,
+    in the shape plan_add ranks (Code, Name, MarketCap) plus Date and Exchange."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for r in ipos:
+        if not isinstance(r, dict) or str(r.get("DealType") or "").strip().lower() != "priced":
+            continue
+        code = str(r.get("Code") or "").strip().upper()
+        venue = str(r.get("Exchange") or "").strip().upper()
+        if code.endswith(".US"):
+            code = code[:-3]
+        elif "." in code or not any(v in venue for v in ("NYSE", "NASDAQ", "BATS", "AMEX")):
+            continue                        # another market's line, or a bare code with no US venue
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", str(r.get("Date") or "").strip())
+        if not m or not _US_CODE.match(code) or code in seen:
+            continue
+        try:
+            day = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        age = (today - day).days
+        if age < min_days or age > max_days:
+            continue
+        seen.add(code)
+        out.append({"Code": code, "Name": str(r.get("Name") or "").strip(), "MarketCap": None,
+                    "Date": day.isoformat(), "Exchange": str(r.get("Exchange") or "").strip()})
+    out.sort(key=lambda c: (c["Date"], c["Code"]))
+    return out
+
+
+def ipo_cap_check(min_cap_m: int) -> Callable[[Dict[str, Any], Optional[Dict[str, Any]]], Optional[str]]:
+    """v1.1.0: the market-value floor of a new listing, read from fundamentals Highlights."""
+    def check(cand: Dict[str, Any], fund: Optional[Dict[str, Any]]) -> Optional[str]:
+        hl = (fund or {}).get("Highlights") if isinstance(fund, dict) else None
+        try:
+            cap = float((hl or {}).get("MarketCapitalization"))
+        except (TypeError, ValueError):
+            return "market value unknown - not added this week"
+        cand["MarketCap"] = cap
+        if cap < min_cap_m * 1e6:
+            return f"market value USD {cap / 1e6:,.0f}M is under the new-listing floor (USD {min_cap_m:,}M)"
+        return None
+    return check
+
+
 def is_israeli(code: str, isin: Any, fundamentals: Optional[Dict[str, Any]], curated: Iterable[str]) -> Optional[str]:
     """Reason when the owner's 28 Jul 2026 exclusion applies, else None."""
     if code.upper() in {str(c).upper() for c in curated}:
@@ -261,8 +421,13 @@ def foreign_country(fundamentals: Optional[Dict[str, Any]]) -> Optional[str]:
 def plan_add(candidates: Sequence[Dict[str, Any]], page_symbols: Iterable[str], page_names: Iterable[str],
              retired: Iterable[str], us_list: Dict[str, Dict[str, Any]], curated: Iterable[str],
              fundamentals_of: Callable[[str], Dict[str, Any]], cap: int, fund_max: int = 120,
-             add_foreign: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
-    """(add, skipped, notes). candidates = screener rows ranked by market cap (Code, Name, MarketCap)."""
+             add_foreign: bool = False,
+             extra_check: Optional[Callable[[Dict[str, Any], Optional[Dict[str, Any]]], Optional[str]]] = None,
+             why_of: Optional[Callable[[int, Dict[str, Any]], str]] = None,
+             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """(add, skipped, notes). candidates = screener rows ranked by market cap (Code, Name, MarketCap).
+    v1.1.0: extra_check(candidate, fundamentals) may refuse a candidate that passed every other
+    filter (the new-listing value floor); why_of(rank, candidate) words the reason it is added."""
     have, retired_k = key_set(page_symbols), key_set(retired)
     names = {n for n in (norm_name(x) for x in page_names) if n}
     curated = list(curated)
@@ -316,10 +481,13 @@ def plan_add(candidates: Sequence[Dict[str, Any]], page_symbols: Iterable[str], 
                     why = "fundamentals: delisted"
                 elif fc and not add_foreign:
                     why = f"foreign issuer ({fc}) - add by hand if its home line is not on the page"
+                elif extra_check is not None:
+                    why = extra_check(c, fund)
+                    base["market_cap"] = c.get("MarketCap")
         if why:
             skipped.append(dict(base, why=why))
             continue
-        add.append(dict(base, why=f"US #{rank} by market cap, missing from {PAGE}"))
+        add.append(dict(base, why=why_of(rank, c) if why_of else f"US #{rank} by market cap, missing from {PAGE}"))
         have |= sym_keys(sym)
         if nn:
             names.add(nn)
@@ -432,6 +600,30 @@ class Eodhd:
         g = self._json(f"fundamentals/{code}.US", {"filter": "General"})
         return {"General": g if isinstance(g, dict) else {}}
 
+    def fundamentals_cap(self, code: str) -> Dict[str, Any]:
+        """v1.1.0: General plus Highlights (market value) in one call, for the new-listing lane."""
+        data = self._json(f"fundamentals/{code}.US", {"filter": "General,Highlights"})
+        data = data if isinstance(data, dict) else {}
+        pick = lambda k: data.get(k) if isinstance(data.get(k), dict) else {}  # noqa: E731
+        return {"General": pick("General"), "Highlights": pick("Highlights")}
+
+    def ipos(self, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
+        """v1.1.0: the IPO calendar between two dates (Code, Name, Exchange, Date, DealType)."""
+        data = self._json("calendar/ipos", {"from": start.isoformat(), "to": end.isoformat()})
+        rows = data.get("ipos") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise RuntimeError("EODHD calendar answered without an ipos list")
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            get = lambda *keys: next((r[k] for k in keys if r.get(k) not in (None, "")), "")  # noqa: E731
+            out.append({"Code": str(get("code", "Code")).strip().upper(), "Name": get("name", "Name"),
+                        "Exchange": get("exchange", "Exchange"),
+                        "Date": str(get("start_date", "date", "Date"))[:10],
+                        "DealType": str(get("deal_type", "DealType"))})
+        return out
+
 
 # --------------------------------------------------------------------------- #
 # Sheets                                                                      #
@@ -476,12 +668,16 @@ def _worksheet(sh, name: str):
 
 
 def read_page(ws) -> Tuple[List[Dict[str, Any]], int]:
-    """Global_Markets rows (Symbol, Name, Warnings, Last Updated (UTC)) and the last used row."""
+    """Global_Markets rows (Symbol, Name, Warnings, Last Updated (UTC)) and the last used row.
+    v1.1.0: Block Reason is read too when the page has that column ("block"; blank otherwise)."""
     header = [str(h).strip() for h in ws.row_values(1)]
     need = ["Symbol", "Name", "Warnings", "Last Updated (UTC)"]
     missing = [n for n in need if n not in header]
     if missing:
         raise RuntimeError(f"{PAGE} header is missing {missing}")
+    has_block = "Block Reason" in header
+    if has_block:
+        need = need + ["Block Reason"]
     cols = ws.batch_get([f"{_col_letter(header.index(n) + 1)}2:{_col_letter(header.index(n) + 1)}" for n in need])
     flat = [[(r[0] if r else "") for r in c] for c in cols]
     rows: List[Dict[str, Any]] = []
@@ -492,7 +688,8 @@ def read_page(ws) -> Tuple[List[Dict[str, Any]], int]:
         if not sym:
             continue
         last = i + 2
-        rows.append({"symbol": sym, "name": cell(1), "warnings": cell(2), "last_utc": cell(3)})
+        rows.append({"symbol": sym, "name": cell(1), "warnings": cell(2), "last_utc": cell(3),
+                     "block": cell(4) if has_block else ""})
     return rows, last
 
 
@@ -637,8 +834,9 @@ def append_retired(sh, tab: str, items: Sequence[Dict[str, Any]], today: str) ->
     rows = []
     for it in items:
         row = [""] * len(header)
+        tail = "" if str(it["why"]).startswith("parked") else f" (red {it['days']} trading days)"
         for k, v in (("symbol", it["symbol"]), ("retired on", today), ("page", PAGE),
-                     ("reason", f"universe_maintenance v{SCRIPT_VERSION}: {it['why']} (red {it['days']} trading days)")):
+                     ("reason", f"universe_maintenance v{SCRIPT_VERSION}: {it['why']}{tail}")):
             if k in header:
                 row[header.index(k)] = v
         rows.append(row)
@@ -667,12 +865,46 @@ def runlog(sh, now_utc: dt.datetime, status: str, msg: str, details: Dict[str, A
 # --------------------------------------------------------------------------- #
 # run                                                                         #
 # --------------------------------------------------------------------------- #
+def ipo_lane(eod, cfg: Dict[str, Any], rows: Sequence[Dict[str, Any]], retired: Sequence[str],
+             us_list: Dict[str, Dict[str, Any]], today: dt.date, room: int, out: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """v1.1.0: seasoned priced US listings missing from the page, through every addition filter and
+    the market-value floor. A calendar that cannot be read is a note, never an error: the top-1,000
+    additions of the same run go ahead."""
+    fetch = getattr(eod, "ipos", None)
+    if fetch is None:
+        out["notes"].append("new listings: this provider client has no IPO calendar")
+        return []
+    try:
+        raw = fetch(today - dt.timedelta(days=int(cfg.get("ipo_max_days", 180))), today)
+    except Exception as e:  # noqa: BLE001
+        out["notes"].append(f"new listings: IPO calendar unavailable ({type(e).__name__}) - retried next week")
+        return []
+    cands = ipo_candidates(raw, today, int(cfg.get("ipo_min_days", 30)), int(cfg.get("ipo_max_days", 180)))
+    out["ipo_seen"] = len(cands)
+    cap = min(int(cfg.get("ipo_max", 5)), room)
+    if cap <= 0:
+        return []
+    adds, skipped, notes = plan_add(
+        cands, [r["symbol"] for r in rows], [r["name"] for r in rows], retired, us_list, load_curated(),
+        getattr(eod, "fundamentals_cap", eod.fundamentals), cap, min(40, int(cfg["fund_max"])), cfg["add_foreign"],
+        extra_check=ipo_cap_check(int(cfg.get("ipo_min_cap_m", 1000))),
+        why_of=lambda rank, c: f"new listing of {c.get('Date')} on {c.get('Exchange') or 'a US venue'}, missing from {PAGE}")
+    out["ipo_added"], out["ipo_skipped"] = adds, skipped
+    out["notes"] += ["new listings: " + n for n in notes]
+    return adds
+
+
 def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = False,
         sync_check: Callable[[], Optional[bool]] = sync_in_flight) -> Dict[str, Any]:
     today, today_r = now_utc.date(), (now_utc + RIYADH).date()
     out: Dict[str, Any] = {"version": SCRIPT_VERSION, "mode": cfg["mode"], "today_utc": today.isoformat(),
                            "rows": 0, "red_today": 0, "added": [], "retired": [], "skipped_add": [],
-                           "kept_red": [], "notes": [], "additions_ran": False, "deferred": False, "wrote": False}
+                           "kept_red": [], "notes": [], "additions_ran": False, "deferred": False, "wrote": False,
+                           "ipo_added": [], "ipo_skipped": [], "parked": [], "quality_delisted": [], "kept_quality": []}
+    lane_ipo, lane_park = cfg.get("ipo", "off"), cfg.get("park", "off")     # v1.1.0 (a cfg without them = v1.0.0)
+    ipo_writes = cfg["mode"] == "enforce" and lane_ipo == "enforce"
+    park_writes = cfg["mode"] == "enforce" and lane_park == "enforce"
+    out["lanes"] = {"ipo": lane_ipo, "park": lane_park}
     # ---- reads (all before the first write: an unreadable tab stops the run with nothing written)
     ws = sh.worksheet(PAGE)
     rows, last_row = read_page(ws)
@@ -688,7 +920,10 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
     out["pending_retired"] = pending = pending_on_page(rows, retired_rows)
     prev_watch, watch_extent = read_watch(sh)
     last_add, last_mode, report_extent = read_state(sh)
-    watch, out["red_today"] = update_watch(prev_watch, rows, today, cfg["stale_days"])
+    # v1.1.0: with the park lane off, Block Reason is ignored, so only unreadable rows are watched (v1.0.0).
+    watch_rows = rows if lane_park != "off" else [dict(r, block="") for r in rows]
+    watch, out["red_today"] = update_watch(prev_watch, watch_rows, today, cfg["stale_days"])
+    out["quality_today"] = sum(1 for w in watch.values() if str(w.get("reason") or "").startswith(QUALITY))
     us_list: Optional[Dict[str, Dict[str, Any]]] = None
     try:
         us_list = eod.us_list()
@@ -697,9 +932,21 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
             us_list = None
     except Exception as e:  # noqa: BLE001
         out["notes"].append(f"active US list unavailable ({type(e).__name__}) - no retirement or addition this run")
-    retire, kept = plan_retire(watch, n_rows, held, retired, set(us_list) if us_list is not None else None,
-                               cfg["red_days"], cfg["min_rows"], cfg["retire_max"], pending)
+    us_active = set(us_list) if us_list is not None else None
+    retire_all, kept = plan_retire(watch, n_rows, held, retired, us_active,
+                                   cfg["red_days"], cfg["min_rows"], cfg["retire_max"], pending)
+    # v1.1.0: a delisting found through a quality reason belongs to the park lane: written only when
+    # that lane is enforce, reported otherwise.
+    q_delisted = [r for r in retire_all if str(r.get("reason") or "").startswith(QUALITY)]
+    park: List[Dict[str, Any]] = []
+    if lane_park != "off":
+        park, out["kept_quality"] = plan_park(watch, retire_all, n_rows, held, retired, us_active,
+                                              int(cfg.get("park_days", 20)), cfg["min_rows"], cfg["retire_max"], pending)
+        seen = {i["symbol"] for i in park} | {i["symbol"] for i in out["kept_quality"]}
+        kept = [k for k in kept if k["symbol"] not in seen]
+    retire = retire_all if park_writes else [r for r in retire_all if r not in q_delisted]
     out["retired"], out["kept_red"] = retire, kept
+    out["parked"], out["quality_delisted"] = park, ([] if park_writes else q_delisted)
 
     # ---- weekly additions (planned here; written below)
     prev_state = {"date": last_add.isoformat() if last_add else "", "n": "", "mode": last_mode}
@@ -722,9 +969,14 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
             cands = None
             out["notes"].append(f"US screener unavailable ({type(e).__name__}) - additions retried next run")
         if cands is not None:
-            adds, skipped, notes = plan_add(cands, [r["symbol"] for r in rows], [r["name"] for r in rows],
-                                            retired, us_list, load_curated(), eod.fundamentals, room,
-                                            cfg["fund_max"], cfg["add_foreign"])
+            # v1.1.0: new listings first. When that lane writes, its additions use the same weekly
+            # room and are not added twice; when it only observes, the top-1,000 lane is untouched.
+            ipo = ipo_lane(eod, cfg, rows, retired, us_list, today, room, out) if lane_ipo != "off" else []
+            taken = ipo if ipo_writes else []
+            adds, skipped, notes = plan_add(cands, [r["symbol"] for r in rows] + [a["symbol"] for a in taken],
+                                            [r["name"] for r in rows] + [a["name"] for a in taken],
+                                            retired, us_list, load_curated(), eod.fundamentals,
+                                            room - len(taken), cfg["fund_max"], cfg["add_foreign"])
             out["added"], out["skipped_add"] = adds, skipped
             out["notes"] += notes
             out["screened"] = len(cands)
@@ -732,7 +984,9 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
             out["additions_ran"] = True
 
     # ---- enforce writes: re-check the sync, marker first, then the page and the retirement list
-    if cfg["mode"] == "enforce" and (out["added"] or retire or state != prev_state):
+    page_adds = (out["ipo_added"] if ipo_writes else []) + out["added"]
+    listed = retire + (park if park_writes else [])
+    if cfg["mode"] == "enforce" and (page_adds or listed or state != prev_state):
         busy = sync_check()
         if busy is not False:
             out["deferred"] = True
@@ -743,11 +997,11 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
         else:
             if state != prev_state:
                 write_state(sh, state)
-            if out["added"]:
-                append_page_symbols(ws, last_row, [a["symbol"] for a in out["added"]])
-            if retire:
-                append_retired(sh, cfg["retire_tab"], retire, today.isoformat())
-                for it in retire:
+            if page_adds:
+                append_page_symbols(ws, last_row, [a["symbol"] for a in page_adds])
+            if listed:
+                append_retired(sh, cfg["retire_tab"], listed, today.isoformat())
+                for it in listed:
                     watch.pop(it["symbol"], None)
                 if cfg["retire_mode"] != "enforce":
                     out["notes"].append(f"TFB_SYNC_RETIRE_TAB={cfg['retire_mode']}: the sync removes listed rows only under enforce")
@@ -760,10 +1014,16 @@ def run(sh, eod, cfg: Dict[str, Any], now_utc: dt.datetime, force_add: bool = Fa
     runlog(sh, now_utc, status,
            f"[UNIVERSE-MAINT v{SCRIPT_VERSION}] mode={cfg['mode']} rows={n_rows} red={out['red_today']} "
            f"{'added' if applied else 'would_add'}={len(out['added'])} "
-           f"{'retired' if applied else 'would_retire'}={len(retire)}",
+           f"{'retired' if applied else 'would_retire'}={len(retire)}"
+           + (f" {'new_listings' if applied and ipo_writes else 'would_add_new_listings'}={len(out['ipo_added'])}"
+              if lane_ipo != "off" else "")
+           + (f" {'parked' if applied and park_writes else 'would_park'}={len(park) + len(out['quality_delisted'])}"
+              if lane_park != "off" else ""),
            {"added": [a["symbol"] for a in out["added"]], "retired": [r["symbol"] for r in retire],
             "kept_red": len(kept), "skipped_add": len(out["skipped_add"]), "pending_retired": pending,
-            "notes": out["notes"]})
+            "new_listings": [a["symbol"] for a in out["ipo_added"]],
+            "parked": [i["symbol"] for i in park] + [i["symbol"] for i in out["quality_delisted"]],
+            "kept_quality": len(out["kept_quality"]), "lanes": out["lanes"], "notes": out["notes"]})
     return out
 
 
@@ -779,17 +1039,34 @@ def report_lines(out: Dict[str, Any], cfg: Dict[str, Any], state: Dict[str, Any]
         [f"UNIVERSE MAINTENANCE v{SCRIPT_VERSION} - {PAGE}", f"mode {out['mode']}", f"run {out['today_utc']} (UTC)", banner],
         [STATE_LABEL, state.get("date", ""), state.get("n", ""), state.get("mode", "")],
         ["rows", out["rows"], "red today", out["red_today"], "floor / cap", f"{cfg['min_rows']} / {cfg['max_rows']}",
-         "already listed on _Retired_Symbols", out.get("pending_retired", 0)],
+         "already listed on _Retired_Symbols", out.get("pending_retired", 0), "quality rows watched", out.get("quality_today", 0)],
         [],
         [verb_add, "Name", "US rank by market cap", "Market cap", "Why"],
     ]
     L += [[a["symbol"], a["name"], a["rank"], a.get("market_cap") or "", a["why"]] for a in out["added"]] or [["(none)"]]
+    lanes = out.get("lanes") or {}
+    if lanes.get("ipo", "off") != "off":                                    # v1.1.0
+        wrote = enf and not deferred and lanes["ipo"] == "enforce"
+        L += [[], ["ADDED NEW LISTING" if wrote else f"WOULD ADD NEW LISTING (lane {lanes['ipo']})",
+                   "Name", "Market value (USD)", "Why", f"seasoned priced listings seen: {out.get('ipo_seen', 0)}"]]
+        L += [[a["symbol"], a["name"], a.get("market_cap") or "", a["why"]] for a in out.get("ipo_added", [])] or [["(none)"]]
     L += [[], [verb_ret, "Name", "Red trading days", "Last red reason", "Why"]]
     L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]] for r in out["retired"]] or [["(none)"]]
+    if lanes.get("park", "off") != "off":                                   # v1.1.0
+        wrote = enf and not deferred and lanes["park"] == "enforce"
+        L += [[], ["PARKED" if wrote else f"WOULD PARK OR RETIRE FOR QUALITY (lane {lanes['park']})",
+                   "Name", "Trading days", "Reason", "Why"]]
+        L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]]
+              for r in list(out.get("quality_delisted", [])) + list(out.get("parked", []))] or [["(none)"]]
+        L += [[], ["QUALITY ROWS KEPT", "Name", "Trading days", "Reason", "Why"]]
+        L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]] for r in out.get("kept_quality", [])[:150]] or [["(none)"]]
     L += [[], [f"RED {cfg['red_days']}+ TRADING DAYS, KEPT", "Name", "Red trading days", "Last red reason", "Why"]]
     L += [[r["symbol"], r["name"], r["days"], r["reason"], r["why"]] for r in out["kept_red"][:150]] or [["(none)"]]
     L += [[], ["NOT ADDED", "Name", "US rank", "Market cap", "Why"]]
     L += [[s["symbol"], s["name"], s["rank"], s.get("market_cap") or "", s["why"]] for s in out["skipped_add"][:150]] or [["(none)"]]
+    if lanes.get("ipo", "off") != "off":
+        L += [[], ["NEW LISTINGS NOT ADDED", "Name", "Market value (USD)", "Why"]]
+        L += [[s["symbol"], s["name"], s.get("market_cap") or "", s["why"]] for s in out.get("ipo_skipped", [])[:150]] or [["(none)"]]
     L += [[], ["NOTES"]] + ([[n] for n in out["notes"]] or [["(none)"]])
     return L
 
@@ -823,7 +1100,46 @@ def selftest() -> List[str]:
         bad.append("policy")
     if additions_due(d, "SUN", dt.date(2026, 10, 18), "observe", "observe") or not additions_due(d, "SUN", dt.date(2026, 10, 17), "observe", "observe"):
         bad.append("weekly cadence")
+    # v1.1.0
+    if (quality_flag("Stale price bar (provider data 27 session(s) old)") != (True, "stale price bar (27 sessions)", 27)
+            or quality_flag("Identity unverified — re-fetch required")[:2] != (True, "identity unverified")
+            or quality_flag("Engine recommends SELL")[0]):
+        bad.append("quality flag")
+    w2, n2 = update_watch({}, [{"symbol": "S.US", "warnings": "", "last_utc": "2026-10-20",
+                                "block": "Stale price bar (provider data 27 session(s) old)"}], d, 2)
+    if n2 != 0 or w2.get("S.US", {}).get("days") != 27 or not w2["S.US"]["reason"].startswith(QUALITY):
+        bad.append("quality watch")
+    pk, pkept = plan_park({"S.US": {"days": 27, "reason": QUALITY + "stale price bar (27 sessions)"},
+                           "R.US": {"days": 40, "reason": "identity_quarantined"},
+                           "N.L": {"days": 25, "reason": "quote_current_price_missing"},
+                           "H.US": {"days": 30, "reason": QUALITY + "identity unverified"},
+                           "Y.L": {"days": 19, "reason": QUALITY + "identity unverified"}},
+                          [], 6600, ["H.US"], [], {"S", "R", "H"}, 20, 6512, 25)
+    if [i["symbol"] for i in pk] != ["S.US", "N.L"] or [i["symbol"] for i in pkept] != ["H.US"]:
+        bad.append("park rules")
+    if plan_park({"S.US": {"days": 27, "reason": QUALITY + "x"}}, [], 6512, [], [], {"S"}, 20, 6512, 25)[0]:
+        bad.append("park floor")
+    c = ipo_candidates([{"Code": "NEW.US", "Name": "New Co", "Exchange": "NASDAQ", "Date": "2026-09-10", "DealType": "Priced"},
+                        {"Code": "SOON.US", "Exchange": "NYSE", "Date": "2026-10-15", "DealType": "Priced"},
+                        {"Code": "EXP.US", "Exchange": "NYSE", "Date": "2026-09-01", "DealType": "Expected"},
+                        {"Code": "ABC.L", "Exchange": "LSE", "Date": "2026-09-01", "DealType": "Priced"}], d, 30, 180)
+    if [x["Code"] for x in c] != ["NEW"]:
+        bad.append("new listings")
+    chk = ipo_cap_check(1000)
+    if chk({}, {"Highlights": {"MarketCapitalization": 2.5e9}}) is not None or chk({}, {"Highlights": {"MarketCapitalization": 4e8}}) is None or chk({}, {}) is None:
+        bad.append("new-listing value floor")
     return bad
+
+
+def for_artifact(out: Dict[str, Any]) -> Dict[str, Any]:
+    """v1.1.0: the run result as it may leave the workbook. The artifact of a public repository never
+    names a holding: a kept row whose reason is that it is held keeps the reason and loses its symbol
+    and name (the private report tab keeps both)."""
+    safe = dict(out)
+    for k in ("kept_red", "kept_quality"):
+        safe[k] = [dict(i, symbol="(held)", name="") if str(i.get("why") or "").startswith("held on My_Portfolio") else i
+                   for i in out.get(k, [])]
+    return safe
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -851,13 +1167,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out = run(open_sheet(), Eodhd(key, os.getenv("EODHD_BASE_URL") or "https://eodhd.com/api"), cfg,
               dt.datetime.now(dt.timezone.utc).replace(tzinfo=None), force_add=args.force_add)
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
+        Path(args.json_out).write_text(json.dumps(for_artifact(out), indent=1, default=str), encoding="utf-8")
     enf = cfg["mode"] == "enforce"
     lines = [f"## Universe maintenance v{SCRIPT_VERSION} ({cfg['mode']})", "",
              f"- rows {out['rows']}, red today {out['red_today']}",
              f"- {'added' if enf else 'would add'}: {', '.join(a['symbol'] for a in out['added']) or 'none'}",
              f"- {'retired' if enf else 'would retire'}: {', '.join(r['symbol'] for r in out['retired']) or 'none'}",
-             f"- red {cfg['red_days']}+ trading days but kept: {len(out['kept_red'])}"] + [f"- {n}" for n in out["notes"]]
+             f"- red {cfg['red_days']}+ trading days but kept: {len(out['kept_red'])}"]
+    lanes = out.get("lanes") or {}
+    if lanes.get("ipo", "off") != "off":
+        wrote = enf and lanes["ipo"] == "enforce" and not out.get("deferred")
+        lines.append(f"- new listings {'added' if wrote else 'that would be added'} (lane {lanes['ipo']}): "
+                     f"{', '.join(a['symbol'] for a in out['ipo_added']) or 'none'}")
+    if lanes.get("park", "off") != "off":
+        wrote = enf and lanes["park"] == "enforce" and not out.get("deferred")
+        named = [i["symbol"] for i in out["quality_delisted"]] + [i["symbol"] for i in out["parked"]]
+        lines.append(f"- quality rows {'parked or retired' if wrote else 'that would be parked or retired'} "
+                     f"(lane {lanes['park']}): {', '.join(named) or 'none'}; watched {out.get('quality_today', 0)}, "
+                     f"kept {len(out['kept_quality'])}")
+    lines += [f"- {n}" for n in out["notes"]]
     print("\n".join(lines))
     summary = os.getenv("GITHUB_STEP_SUMMARY")
     if summary:
