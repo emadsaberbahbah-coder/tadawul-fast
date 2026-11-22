@@ -347,7 +347,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v_news_trial_summary - the news by market and by person and its scorecard, observe only).
     # 2026-11-21 (manifest pin only): 1.20.0 -> 1.21.0 (v_event_calendar, v_event_reactions, v_event_scenarios,
     # v_event_trial, v_event_trial_summary - the forward event scenarios and their scorecard, observe only).
-    ("apply_bq_views", "1.21.0", "bigquery looker views"),
+    # 2026-11-22 (manifest pin only): 1.21.0 -> 1.22.0 (v_learning_scorecard - ten rule variants against their
+    # baseline on the scored calls, in-sample and forward from 23 Nov, research only).
+    ("apply_bq_views", "1.22.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
