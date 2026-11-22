@@ -345,7 +345,7 @@ PENDING = {
     "v_event_trial_summary": "9ca3cbc11e11e53dda4f3a005a20218426bd5e75f8bb0c1539c7056c13e12dfb",
     # apply_bq_views 1.22.0 (22 Nov 2026): the learning scorecard - ten rule variants fixed on 22 Nov, each against
     # its baseline on the scored calls, in-sample and forward from 23 Nov (research only)
-    "v_learning_scorecard": "14de3c55c333720a003f5be7531d117d837bee5c0cefd9fb2d511977849b59a4",
+    "v_learning_scorecard": "0505807dc0a18656b23df4a7c86c2000119247caf14ba65fac552527e26986ee",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3612,8 +3612,11 @@ def case_v56():
 
 def case_v57():
     """v_learning_scorecard (1.22.0): ten rule variants fixed on 22 Nov 2026, each against its baseline on the scored
-    calls. No look-ahead (the market label of the last close BEFORE the call, the signal recorded ON the day of the
-    call), the forward date written into the view, the reading only at 20 call days and 40 calls, research only."""
+    calls. No look-ahead (the market label of the last close BEFORE the call; the call's OWN signal snapshot, never a
+    later run of that day), the forward date written into the view, the reading only at 20 call days and 40 calls,
+    research only. Three review findings of 22 Nov (Codex P2 on #1058) are pinned here: the signal's day is the Riyadh
+    day, as the calls' is; the snapshot is the newest one not later than 60 seconds after the call; and the stop arms
+    are described as what mae_pct is - the lowest daily LOW after the recording day, not a close."""
     objs = {o.name: o for o in bv.load_objects()}
     v = objs["v_learning_scorecard"]
     assert v.path.name == "114_v_learning_scorecard.sql" and v.kind == "VIEW"
@@ -3626,8 +3629,21 @@ def case_v57():
     # the label a call is judged on is the one of its market's last close before the day of the call
     assert "AND c.date < o.recorded_date AND (c.next_date IS NULL OR c.next_date >= o.recorded_date)" in code
     assert code.count("LEAD(") == 1 and "LEAD(date) OVER (PARTITION BY market_id ORDER BY date) AS next_date" in code
-    assert "LEFT JOIN sig g ON g.symbol = o.symbol AND g.day = o.recorded_date" in code
-    assert "IFNULL(g.s.upside >= 15 AND g.s.risk < 30, FALSE) AS selected" in code       # no record that day = not kept
+    # the signal: dated as the calls are (Riyadh), and the call's own snapshot - the newest of the symbol that day
+    # which is not later than 60 seconds after the call (the engine writes the snapshot a second or two after it)
+    assert "DATE(recorded_at, 'Asia/Riyadh') AS day" in code and "DATE(recorded_at)" not in code
+    assert "ON g.symbol = b.symbol AND g.day = b.recorded_date" in code
+    assert "AND g.recorded_at <= TIMESTAMP_ADD(b.recorded_at, INTERVAL 60 SECOND)" in code
+    assert "ORDER BY g.recorded_at DESC LIMIT 1)[OFFSET(0)] AS s" in code and "GROUP BY b.record_id" in code
+    assert "LEFT JOIN pick g ON g.record_id = o.record_id" in code
+    assert "IFNULL(g.s.upside >= 15 AND g.s.risk < 30, FALSE) AS selected" in code       # no snapshot = not kept
+    # the stop arms say what mae_pct is: daily LOWS after the recording day (70_v_outcome_engine.sql), not closes
+    assert "lowest daily LOW after its recording day" in v.template and "lowest close" not in v.template
+    outcome = objs["v_outcome_engine"].template
+    assert "IFNULL(a.tb.low, 1e18)" in outcome and "SAFE_DIVIDE(c.win_low, c.entry_price)" in outcome
+    # the worst 5 % is exact, so two reads of the same rows agree
+    assert "APPROX_QUANTILES" not in code
+    assert "SAFE_OFFSET(CAST(FLOOR(0.05 * GREATEST(COUNTIF(kept) - 1, 0)) AS INT64))] AS p5" in code
     assert ("IF(o.recorded_date >= DATE '2026-11-23', 'forward from 2026-11-23', 'in-sample, not evidence') AS period"
             in code)
     arms = re.findall(r"STRUCT\('([A-Z]\d) ", code) + re.findall(r"'(S1) sell side", code)

@@ -19,13 +19,14 @@
 --   E2  the same without 'weak' on the list (stress, drawdown, crash_day)
 --   E3  B0 without Tadawul
 --   E4  the selection gate: an analyst target 15 % or more above the price
---       and a risk score under 30, both as Signal_History recorded them on
---       the day of the call (no record that day = not kept)
+--       and a risk score under 30, both as the call's own Signal_History
+--       snapshot recorded them (no snapshot = not kept; see NO LOOK-AHEAD)
 --   E5  E1 and E4 together (the two gates the engine enforces from 22 Nov)
 --   X1 / X2 / X3  B0 with a stop 5 % / 8 % / 10 % under the entry: a call
---       whose lowest close before its target date reached the stop is booked
---       at the stop, any other at its result (daily closes; no gap, no
---       commission, so an estimate)
+--       whose lowest daily LOW after its recording day, up to its target
+--       bar, reached the stop is booked at the stop, any other at its result
+--       (v_outcome_engine.mae_pct: a resting stop touched during a session;
+--       booked at the stop itself, so no gap and no commission - an estimate)
 --   S1  the sell side: calls rated SELL, STRONG SELL, REDUCE or AVOID, a hit
 --       when the share fell, against the buy-rated calls of the same day
 -- THE MEASURE: hit_pct = the share of the arm's calls with a result above
@@ -34,14 +35,20 @@
 -- the buy-rated calls, counted as a hit when they fell); lift_pp = the mean,
 -- over call days, of the arm's mean result minus the baseline's that day;
 -- t_stat = that mean over its standard error; worst5_pp = the 5th percentile
--- of the arm's results.
+-- of the arm's results (exact: the result at rank floor(5 % of (n - 1))).
 -- THE READING (fixed now): a forward row needs 20 call days and 40 calls;
 -- then BETTER THAN THE BASELINE at t >= 2, WORSE at t <= -2, else NO CLEAR
 -- DIFFERENCE. Even then the owner decides; nothing here changes a page, a
 -- gate or an order.
 -- NO LOOK-AHEAD: the market's label is the one of its last close BEFORE the
--- day of the call; the signal is the last one recorded for the symbol on
--- the day of the call; the reading is judged on unrounded statistics.
+-- day of the call. The signal is the call's own snapshot: the newest one of
+-- the symbol on the call's day (both dated in Riyadh time, as the calls
+-- are) that is not later than 60 seconds after the call. The engine writes
+-- a call and, a second or two later, its signal snapshot (measured 22 Nov
+-- 2026 on the 2,569 INVESTABLE buys: the nearest snapshot is within 12
+-- seconds for every one, and for 2,291 it follows the call), so 60 seconds
+-- takes the snapshot of the same run and never a later run of that day.
+-- The reading is judged on unrounded statistics.
 -- COLUMNS: period, horizon (1W / 2W / 1M / 3M / ALL), arm, calls, days,
 -- hit_pct, mean_pp, worst5_pp, base_calls, base_hit_pct, base_mean_pp,
 -- lift_pp, t_stat, first_day, last_day, reading.
@@ -56,27 +63,38 @@ WITH cond AS (
   FROM `{{DS}}.v_market_condition`
 ),
 sig AS (
-  SELECT symbol, DATE(recorded_at) AS day,
-    ARRAY_AGG(STRUCT(target_upside_pp AS upside, risk_score AS risk)
-              ORDER BY recorded_at DESC LIMIT 1)[OFFSET(0)] AS s
+  SELECT symbol, recorded_at, DATE(recorded_at, 'Asia/Riyadh') AS day,
+    target_upside_pp AS upside, risk_score AS risk
   FROM `{{DS}}.v_signal_history`
   WHERE recorded_at IS NOT NULL
-  GROUP BY symbol, day
+),
+base AS (
+  SELECT o.record_id, o.symbol, o.recorded_at, o.recorded_date, o.horizon, o.market, o.entry_stance AS stance,
+    o.engine_roi_pp AS roi, o.mae_pct,
+    IFNULL(o.entry_investability, '') = 'INVESTABLE' AS investable
+  FROM `{{DS}}.v_outcome_engine` o
+  WHERE o.in_engine_cohort AND o.engine_roi_pp IS NOT NULL AND o.entry_stance IN ('bullish', 'bearish')
+),
+pick AS (
+  SELECT b.record_id,
+    ARRAY_AGG(STRUCT(g.upside AS upside, g.risk AS risk) ORDER BY g.recorded_at DESC LIMIT 1)[OFFSET(0)] AS s
+  FROM base b
+  JOIN sig g
+    ON g.symbol = b.symbol AND g.day = b.recorded_date
+   AND g.recorded_at <= TIMESTAMP_ADD(b.recorded_at, INTERVAL 60 SECOND)
+  GROUP BY b.record_id
 ),
 calls AS (
-  SELECT o.record_id, o.recorded_date, o.horizon, o.market, o.entry_stance AS stance,
-    o.engine_roi_pp AS roi, o.mae_pct,
-    IFNULL(o.entry_investability, '') = 'INVESTABLE' AS investable,
+  SELECT o.record_id, o.recorded_date, o.horizon, o.market, o.stance, o.roi, o.mae_pct, o.investable,
     IFNULL(c.label, 'unread') AS label,
     IFNULL(g.s.upside >= 15 AND g.s.risk < 30, FALSE) AS selected,
     IF(o.recorded_date >= DATE '2026-11-23', 'forward from 2026-11-23', 'in-sample, not evidence') AS period
-  FROM `{{DS}}.v_outcome_engine` o
+  FROM base o
   LEFT JOIN cond c
     ON c.market_id = CASE o.market WHEN 'US' THEN 'us' WHEN 'Tadawul' THEN 'sa' WHEN 'Europe' THEN 'eu'
                                    WHEN 'London' THEN 'eu' WHEN 'Tokyo' THEN 'jp' WHEN 'Hong Kong' THEN 'cn' END
    AND c.date < o.recorded_date AND (c.next_date IS NULL OR c.next_date >= o.recorded_date)
-  LEFT JOIN sig g ON g.symbol = o.symbol AND g.day = o.recorded_date
-  WHERE o.in_engine_cohort AND o.engine_roi_pp IS NOT NULL AND o.entry_stance IN ('bullish', 'bearish')
+  LEFT JOIN pick g ON g.record_id = o.record_id
 ),
 arms AS (
   SELECT c.period, c.recorded_date, c.horizon, a.arm, a.kept, a.in_base, a.r, a.b
@@ -104,7 +122,9 @@ wide AS (
 tot AS (
   SELECT period, hz, arm,
     COUNTIF(kept) AS calls, COUNTIF(kept AND r > 0) AS wins, AVG(IF(kept, r, NULL)) AS mean_r,
-    APPROX_QUANTILES(IF(kept, r, NULL), 20 IGNORE NULLS)[SAFE_OFFSET(1)] AS p5,
+    -- exact, so two reads of the same rows agree: the result at rank floor(5 % of (n - 1)), counted from the worst
+    ARRAY_AGG(IF(kept, r, NULL) IGNORE NULLS ORDER BY IF(kept, r, NULL))[
+      SAFE_OFFSET(CAST(FLOOR(0.05 * GREATEST(COUNTIF(kept) - 1, 0)) AS INT64))] AS p5,
     COUNTIF(in_base) AS base_calls, COUNTIF(in_base AND b > 0) AS base_wins, AVG(IF(in_base, b, NULL)) AS base_mean,
     MIN(IF(kept, recorded_date, NULL)) AS first_day, MAX(IF(kept, recorded_date, NULL)) AS last_day
   FROM wide
