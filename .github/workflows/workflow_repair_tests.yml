@@ -112,6 +112,9 @@ jobs:
       TFB_PTC_ZERO_PAGES: ${{ vars.TFB_PTC_ZERO_PAGES || 'Commodities_FX,Mutual_Funds' }}
       TFB_PTC_PAGES: ${{ vars.TFB_PTC_PAGES || '' }}
       TFB_PTC_FREEZE: '1'
+      # audit_provider_target_coverage 1.3.0: a stale reference that every page
+      # still meets or beats is re-verified; this job stays frozen and writes nothing.
+      TFB_PTC_STALE_REVERIFY: ${{ vars.TFB_PTC_STALE_REVERIFY || '1' }}
       TFB_PTC_BOOTSTRAP: '0'
       TFB_PTC_ACCEPT_BASELINE: '0'
     steps:
