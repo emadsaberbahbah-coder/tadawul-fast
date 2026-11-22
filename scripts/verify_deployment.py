@@ -252,7 +252,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-21 (manifest pin only): NEW 1.0.0 - the live condition of the
     # US / Saudi / European / Japanese / Hong Kong markets, read only by the
     # engine's [MARKET-HOLD] tier (stdlib only; reads nothing at import).
-    ("core.market_condition", "__version__", "1.0.0", "market condition"),
+    # 2026-11-22 (manifest pin only): 1.0.0 -> 1.0.1 (state() warms the read and
+    # reports it; the browser User-Agent of yahoo_chart_provider).
+    ("core.market_condition", "__version__", "1.0.1", "market condition"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
