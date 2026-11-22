@@ -349,7 +349,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v_event_trial, v_event_trial_summary - the forward event scenarios and their scorecard, observe only).
     # 2026-11-22 (manifest pin only): 1.21.0 -> 1.22.0 (v_learning_scorecard - ten rule variants against their
     # baseline on the scored calls, in-sample and forward from 23 Nov, research only).
-    ("apply_bq_views", "1.22.0", "bigquery looker views"),
+    # 2026-11-22 (manifest pin only): 1.22.0 -> 1.23.0 (v_options_reading, v_market_drivers,
+    # v_market_driver_learning, v_price_drivers, v_driver_learning - the price drivers and their record, research
+    # only; options_daily as a source table).
+    ("apply_bq_views", "1.23.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -359,7 +362,12 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # "Volatility index", for the regime views).
     # 2026-11-21 (manifest pin only): 1.2.0 -> 1.3.0 (15 ^STOXX and the asset-class funds GLD, IEF, SPSK,
     # VNQ, for the market condition views).
-    ("archive_market_series", "1.3.0", "bigquery market series"),
+    # 2026-11-22 (manifest pin only): 1.3.0 -> 1.4.0 (the VIX curve, VVIX, SKEW, MOVE, index futures, Treasury
+    # yields, the dollar, credit and breadth funds, for the market driver views).
+    ("archive_market_series", "1.4.0", "bigquery market series"),
+    # 2026-11-22 (new script, pinned on arrival): the nightly options reading (Cboe's delayed chains) and FINRA's
+    # daily short volume for the names TFB holds, rates and the largest US names; research table only.
+    ("archive_options_reading", "1.0.0", "bigquery options reading"),
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.

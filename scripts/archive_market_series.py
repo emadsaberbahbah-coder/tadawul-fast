@@ -2,8 +2,26 @@
 # scripts/archive_market_series.py
 """
 ================================================================================
-TFB Market Series - v1.3.0 (program register C8, Phase 2b: global markets page)
+TFB Market Series - v1.4.0 (program register C8, Phase 2b: global markets page)
 ================================================================================
+v1.4.0 (22 Nov 2026, what moves prices beyond the stock itself): 21 series in
+the existing kind "Volatility index" and two new kinds. Volatility: 90 ^VIX9D,
+91 ^VIX3M, 92 ^VIX6M (the S&P 500 volatility curve: 9 days, 3 and 6 months),
+93 ^VVIX (the volatility of VIX), 94 ^SKEW (the price of crash protection),
+95 ^MOVE (Treasury volatility). "Index future (USD)": 100 ES=F, 101 NQ=F,
+102 YM=F, 103 RTY=F (front-month E-mini S&P 500, Nasdaq 100, Dow and Russell
+2000). "Rates, dollar and credit (USD)": 110 ^IRX (13-week bill), 111 ^FVX,
+112 ^TNX, 113 ^TYX (5, 10 and 30-year Treasury yields, in percent: the level
+is the reading, its "return" means nothing), 114 DX-Y.NYB (the dollar index),
+115 HYG (high-yield bonds), 116 LQD (investment-grade bonds), 117 TLT
+(long Treasuries), 118 RSP (equal-weight S&P 500, for breadth), 119 IWM
+(Russell 2000), 120 QQQ (Nasdaq 100). WHY (owner, 22 Nov 2026 19:53 Riyadh):
+"add how future options and other options affect the current price and
+recommendations ... also check other factors that affect current price and
+add them to our project". v_market_drivers (views 1.23.0) reads them: the
+shape of the volatility curve, the futures, rates, the dollar, credit spreads
+and breadth, each with its record against the next week of the market.
+Every symbol was read from the Yahoo chart API before it was added.
 v1.3.0 (21 Nov 2026, a condition reading for every market): five series -
 15 ^STOXX (STOXX Europe 600, the Europe reading) and, in a new kind "Asset
 class ETF (USD)", 30 GLD (gold), 31 IEF (US Treasuries 7-10 years), 32 SPSK
@@ -100,7 +118,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 TABLE = "market_series_daily"
 DEFAULT_DAYS = 1100
@@ -118,7 +136,8 @@ BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
 
 KINDS = ("Index", "Market ETF (USD)", "US sector ETF (USD)", "World sector ETF (USD)",
-         "Commodity (USD)", "Volatility index", "Asset class ETF (USD)")
+         "Commodity (USD)", "Volatility index", "Asset class ETF (USD)", "Index future (USD)",
+         "Rates, dollar and credit (USD)")
 REGIONS = ("US", "Europe", "China", "Japan", "Gulf", "World", "Commodities")
 
 # (series_id, yahoo symbol, display name, region, country, kind, currency, sector)
@@ -185,6 +204,30 @@ SERIES: Tuple[Tuple[int, str, str, str, str, str, str, str], ...] = (
     (79, "REET", "World Real Estate (REET)", "World", "World", "World sector ETF (USD)", "USD", "Real Estate"),
     (80, "IXP", "World Communication Services (IXP)", "World", "World", "World sector ETF (USD)", "USD",
      "Communication Services"),
+    # v1.4.0: the price drivers around the market - the volatility curve, index futures, rates, dollar, credit, breadth
+    (90, "^VIX9D", "CBOE S&P 500 9-day volatility (VIX9D)", "US", "United States", "Volatility index", "USD", ""),
+    (91, "^VIX3M", "CBOE S&P 500 3-month volatility (VIX3M)", "US", "United States", "Volatility index", "USD", ""),
+    (92, "^VIX6M", "CBOE S&P 500 6-month volatility (VIX6M)", "US", "United States", "Volatility index", "USD", ""),
+    (93, "^VVIX", "CBOE volatility of VIX (VVIX)", "US", "United States", "Volatility index", "USD", ""),
+    (94, "^SKEW", "CBOE SKEW index (tail-risk price)", "US", "United States", "Volatility index", "USD", ""),
+    (95, "^MOVE", "ICE BofA MOVE (Treasury volatility)", "US", "United States", "Volatility index", "USD", ""),
+    (100, "ES=F", "E-mini S&P 500 future (front month)", "US", "United States", "Index future (USD)", "USD", ""),
+    (101, "NQ=F", "E-mini Nasdaq 100 future (front month)", "US", "United States", "Index future (USD)", "USD", ""),
+    (102, "YM=F", "E-mini Dow future (front month)", "US", "United States", "Index future (USD)", "USD", ""),
+    (103, "RTY=F", "E-mini Russell 2000 future (front month)", "US", "United States", "Index future (USD)", "USD", ""),
+    (110, "^IRX", "US 13-week bill yield (%)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Rates"),
+    (111, "^FVX", "US 5-year Treasury yield (%)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Rates"),
+    (112, "^TNX", "US 10-year Treasury yield (%)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Rates"),
+    (113, "^TYX", "US 30-year Treasury yield (%)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Rates"),
+    (114, "DX-Y.NYB", "US dollar index (DXY)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Dollar"),
+    (115, "HYG", "High-yield bond ETF (HYG)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Credit"),
+    (116, "LQD", "Investment-grade bond ETF (LQD)", "US", "United States", "Rates, dollar and credit (USD)", "USD",
+     "Credit"),
+    (117, "TLT", "US Treasury 20y+ ETF (TLT)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Rates"),
+    (118, "RSP", "Equal-weight S&P 500 ETF (RSP)", "US", "United States", "Rates, dollar and credit (USD)", "USD",
+     "Breadth"),
+    (119, "IWM", "Russell 2000 ETF (IWM)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Breadth"),
+    (120, "QQQ", "Nasdaq 100 ETF (QQQ)", "US", "United States", "Rates, dollar and credit (USD)", "USD", "Breadth"),
 )
 
 SCHEMA: List[Dict[str, str]] = [

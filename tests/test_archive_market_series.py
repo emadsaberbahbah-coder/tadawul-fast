@@ -78,6 +78,10 @@ PINNED_IDS = {
     60: "BZ=F", 61: "CL=F", 62: "GC=F",
     70: "IXN", 71: "IXG", 72: "IXC", 73: "IXJ", 74: "EXI", 75: "RXI", 76: "KXI", 77: "JXI",
     78: "MXI", 79: "REET", 80: "IXP",
+    90: "^VIX9D", 91: "^VIX3M", 92: "^VIX6M", 93: "^VVIX", 94: "^SKEW", 95: "^MOVE",
+    100: "ES=F", 101: "NQ=F", 102: "YM=F", 103: "RTY=F",
+    110: "^IRX", 111: "^FVX", 112: "^TNX", 113: "^TYX", 114: "DX-Y.NYB", 115: "HYG", 116: "LQD", 117: "TLT",
+    118: "RSP", 119: "IWM", 120: "QQQ",
 }
 
 
@@ -203,7 +207,7 @@ def _run(monkeypatch, argv, session, fetch, capsys=None):
 # --------------------------------------------------------------------------- M1
 def test_m1_series_integrity():
     ids = [s[0] for s in ms.SERIES]
-    assert len(ids) == len(set(ids)) == 54
+    assert len(ids) == len(set(ids)) == 75
     assert {s[0]: s[1] for s in ms.SERIES} == PINNED_IDS
     assert all(1 <= i <= ms.MAX_SERIES_ID for i in ids)
     syms = [s[1] for s in ms.SERIES]
@@ -224,7 +228,14 @@ def test_m1_series_integrity():
     funds = {s[1]: (s[3], s[7]) for s in ms.SERIES if s[5] == "Asset class ETF (USD)"}
     assert funds == {"GLD": ("Commodities", "Precious metals"), "IEF": ("US", "Treasury bonds"),
                      "SPSK": ("World", "Sukuk"), "VNQ": ("US", "Real Estate")}, funds
-    assert local["^STOXX"] == "EUR" and ms.__version__ == "1.3.0"
+    assert local["^STOXX"] == "EUR" and ms.__version__ == "1.4.0"
+    # v1.4.0: the volatility curve, index futures, and rates / dollar / credit / breadth, each in its own kind
+    vol = {s[1] for s in ms.SERIES if s[5] == "Volatility index"}
+    assert vol == {"^VIX", "^VIX9D", "^VIX3M", "^VIX6M", "^VVIX", "^SKEW", "^MOVE"}, vol
+    assert {s[1] for s in ms.SERIES if s[5] == "Index future (USD)"} == {"ES=F", "NQ=F", "YM=F", "RTY=F"}
+    rdc = {s[1]: s[7] for s in ms.SERIES if s[5] == "Rates, dollar and credit (USD)"}
+    assert rdc["^TNX"] == "Rates" and rdc["DX-Y.NYB"] == "Dollar" and rdc["HYG"] == "Credit" and rdc["RSP"] == "Breadth"
+    assert all(s[3] == "US" for s in ms.SERIES if s[0] >= 90)
     assert [r["symbol"] for r in ms.series_records("KSA, ^GSPC")] == ["KSA", "^GSPC"]
     with pytest.raises(ValueError):
         ms.series_records("NOPE")

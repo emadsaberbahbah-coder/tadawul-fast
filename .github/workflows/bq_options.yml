@@ -1,0 +1,115 @@
+# =============================================================================
+# 📈 BigQuery Options Reading — what the options market says about each stock
+# =============================================================================
+# VERSION 1.0.0 (2026-11-22) -- owner request 22 Nov 2026 19:53 Riyadh: "add
+#       how future options and other options affect the current price and
+#       recommendations ... add this effect to our score and analysis".
+# scripts/archive_options_reading.py v1.0.0 reads, after the US close, the
+#       delayed option chain Cboe publishes for free (cdn.cboe.com, no key)
+#       for the US stocks TFB follows - its holdings, every name rated
+#       INVESTABLE or a buy, and the largest by market value (900 by default)
+#       - plus 20 ETFs, and FINRA's public short sale volume file of the same
+#       day (cdn.finra.org, no key). It keeps one row per name and trading day
+#       in BigQuery table tfb_archive.options_daily (implied volatility, the
+#       implied move to the front expiry, the 25-delta skew, the call-put
+#       volatility spread, put/call volume and open interest, the share sold
+#       short) and replaces that day's partition. NOTHING is written to the
+#       workbook and the live system never reads BigQuery; no decision, gate or
+#       count depends on it: views 1.23.0 score each reading against the next
+#       week and month, observe-only. The log prints counts only, never a symbol.
+# AUTH: the archive's service account (GOOGLE_SHEETS_CREDENTIALS) with BigQuery
+#       Data Editor + BigQuery Job User (granted by the owner on 27 Oct).
+# GATE: armed here (TFB_BQ_OPTIONS defaults to on); kill with the repository
+#       Variable TFB_BQ_OPTIONS=off. TFB_OPTIONS_MAX (Variable) changes how many
+#       of the largest names are read (default 900).
+# SCHEDULE: 23:30 UTC Monday to Friday (02:30 Riyadh): after the US close and
+#       after FINRA posts the day's short volume file. A manual dispatch is a
+#       dry run unless write=true.
+# =============================================================================
+name: 📈 BigQuery Options Reading
+
+on:
+  schedule:
+    # 23:30 UTC == 02:30 Asia/Riyadh (next calendar day), Monday to Friday.
+    - cron: "30 23 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Load into BigQuery? (default: dry-run — reads Cboe and FINRA and prints counts)"
+        required: false
+        default: false
+        type: boolean
+      max:
+        description: "How many of the largest US names to read beside the rated and held ones (1..3000)"
+        required: false
+        default: "900"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  options:
+    name: 📈 Load the options reading into BigQuery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 📈 Run the loader
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BQ_OPTIONS: ${{ vars.TFB_BQ_OPTIONS || 'on' }}
+          TFB_OPTIONS_MAX: ${{ vars.TFB_OPTIONS_MAX || '900' }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: "US"
+          INPUT_MAX: ${{ github.event.inputs.max }}
+        run: |
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — reading Cboe and FINRA, loading nothing (tick write=true to load)."
+          fi
+          MAX="${INPUT_MAX:-$TFB_OPTIONS_MAX}"
+          if [[ ! "$MAX" =~ ^[0-9]+$ ]]; then
+            echo "::error::max must be a whole number, got '${MAX}'"
+            exit 2
+          fi
+          python scripts/archive_options_reading.py $MODE --max "$MAX" 2>&1 | tee options_reading.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### 📈 BigQuery Options Reading (${MODE#--})"
+            echo ""
+            echo '```'
+            tail -n 20 options_reading.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
