@@ -31,21 +31,44 @@ NOW = _registry_clock()
 REVIEW_NOW = NOW
 
 
-def _binding_clock(symbol):
-    """One minute after this symbol's own lifecycle review.
+@pytest.fixture(autouse=True)
+def _one_review(monkeypatch, tmp_path):
+    """Every case reads a copy of the live registry in which each lifecycle binding carries one review.
 
-    The weekly renewal re-stamps only the bindings it can re-verify and holds
-    retired symbols (VFLQ.US left Mutual_Funds on 5 Nov 2026, so the renewal
-    of 6 Nov kept its 24 Oct review). The registry-wide clock then lands after
-    a held binding's expiry; a case about one binding is judged inside that
-    binding's own 7-day review window instead.
+    The weekly renewal re-stamps only the bindings it can re-verify and keeps the rest at their old review. A symbol
+    that left its page then shares no review window with the renewed ones:
+      - VFLQ.US left Mutual_Funds on 5 Nov 2026 and stayed at its 24 Oct review;
+      - GXTG.US stayed at its 6 Nov review, and the renewal of 22 Nov 2026 (run 45013078813) failed CI on the case
+        that reads ROG.SW and GXTG.US together - no single clock put both inside their review.
+    These cases are about what the collector does with a lifecycle binding that is inside its review, expired, or
+    invalid. Whether the live registry is fresh is the renewal check's job (renew_verified_name_labels.py --check),
+    not theirs. So each lifecycle binding of the copy is given one review, one minute before NOW; every other field is
+    the registry's own, and the receipt is recomputed by the registry's own rule. A case that passes its own
+    registry_path still reads that path.
     """
+    from core import news_identity_lifecycle
     from core import verified_name_labels as labels
     data = json.loads(labels.REGISTRY_PATH.read_text())
-    stamps = [datetime.fromisoformat(item["reviewed_at_utc"]) for item in data["bindings"]
-              if item.get("symbol") == symbol and "news_lifecycle" in (item.get("identifiers") or {})]
-    assert len(stamps) == 1, symbol
-    return stamps[0].astimezone(timezone.utc) + timedelta(minutes=1)
+    reviewed = NOW - timedelta(minutes=1)
+    for item in data["bindings"]:
+        if "news_lifecycle" in (item.get("identifiers") or {}):
+            item["reviewed_at_utc"] = reviewed.isoformat()
+            item["expires_at_utc"] = (reviewed + timedelta(days=7)).isoformat()
+            item["review_receipt_sha256"] = labels._binding_digest(item)
+    path = tmp_path / "registry_one_review.json"
+    path.write_text(json.dumps(data))
+    real = news_identity_lifecycle.load_news_lifecycle
+    monkeypatch.setattr(news_identity_lifecycle, "load_news_lifecycle",
+                        lambda *, now, registry_path=None: real(now=now, registry_path=registry_path or path))
+
+
+def _binding_clock(symbol):
+    """The clock of a case about one binding: NOW, inside the one review every lifecycle binding carries here."""
+    from core import verified_name_labels as labels
+    data = json.loads(labels.REGISTRY_PATH.read_text())
+    assert sum(1 for item in data["bindings"] if item.get("symbol") == symbol
+               and "news_lifecycle" in (item.get("identifiers") or {})) == 1, symbol
+    return NOW
 
 
 def test_irbo_legacy_caption_never_fetches_or_substitutes_arty(monkeypatch):
