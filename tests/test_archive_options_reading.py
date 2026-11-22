@@ -243,4 +243,7 @@ def test_o9_misses_are_counted_by_reason_never_named():
     def flaky(url):
         raise OSError("reset")
     assert op.read_chain("AAA", flaky, waits.append, misses) is None and misses[-1] == "network" and len(waits) == 2
+    empty = lambda url: json.dumps({"data": {"options": []}}).encode()
+    assert op.read_chain("AAA", empty, waits.append, misses) is None and misses[-1] == "no usable chain"   # #1060 review
+    assert len(waits) == 2                                                     # an empty answer is not retried
     assert op.CBOE_HEADERS["Origin"] == "https://www.cboe.com" and "Mozilla/5.0 (Windows" in op.UA

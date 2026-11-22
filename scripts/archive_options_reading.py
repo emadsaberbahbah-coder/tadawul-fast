@@ -22,7 +22,8 @@ v1.0.1 (22 Nov 2026, the first written run): every one of 935 chains failed
 from the GitHub runner and the log could not say why. The request now looks
 like the browser call Cboe's own quote pages make (a browser User-Agent,
 Accept JSON, Origin and Referer www.cboe.com), and a failed run counts its
-misses by reason (http 403, http 404, other http, network, unreadable) -
+misses by reason (http 403, http 404, other http, network, unreadable,
+no usable chain) -
 counts only, never a symbol.
 
 WHAT: once a day after the US close, for the US stocks TFB follows (the
@@ -351,7 +352,11 @@ def read_chain(ticker: str, get: Callable[[str], bytes], sleep: Callable[[float]
     why = "network"
     for attempt in range(2):
         try:
-            return chain_features(json.loads(get(CBOE_URL.format(sym=cboe_symbol(ticker)))), cboe_symbol(ticker))
+            feats = chain_features(json.loads(get(CBOE_URL.format(sym=cboe_symbol(ticker)))), cboe_symbol(ticker))
+            if feats is None:
+                why = "no usable chain"            # an answer, but no price, date or contracts to read
+                break
+            return feats
         except Exception as exc:  # noqa: BLE001 - one name never stops the others
             why = miss_reason(exc)
             if why in ("http 403", "http 404"):
