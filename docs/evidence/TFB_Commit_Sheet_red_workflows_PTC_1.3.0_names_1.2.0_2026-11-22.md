@@ -30,8 +30,17 @@
 **.github/workflows/name_label_renewal.yml 1.2.0**
 
 - A second schedule renews three times a week (Sun, Tue, Thu 21:40 UTC) and opens a ready pull request; an older renewal pull request still open is closed as superseded.
-- With the repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`, the job merges its own renewal after checking that it changes only the registry file. Unset, nothing merges without a person.
-- This repository does not let GitHub Actions open pull requests: run 45013078813 pushed its branch and the pull request (#1057) was opened by hand. So when no pull request can be opened and the Variable is on, the job merges the review branch through the merges API and deletes it. With the Variable unset, the branch waits and the run says so.
+- Hands-free merge, only through the pull request and its required checks. It needs three things, all the owner's:
+  - the repository secret `TFB_RENEWAL_TOKEN`: a fine-grained token for this repository only (Contents and Pull requests: read and write). The job opens the pull request with it;
+  - the repository setting "Allow auto-merge";
+  - the repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`.
+- With all three, the job checks that the branch changes only the registry file, then asks GitHub to merge the pull request once the required checks pass (`gh pr merge --auto --squash`).
+- Why a token. Two facts, read on 22 Nov 2026:
+  - this repository does not let GitHub Actions open pull requests: run 45013078813 pushed its branch and the pull request (#1057) was opened by hand;
+  - a pull request opened with the workflow's own token does not start CI by itself; GitHub holds those runs for a person's approval (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
+- Why never around CI. The default branch's ruleset requires a pull request, its checks and a linear history. And #1057 showed the need: that renewal broke a test (`tests/test_news_lifecycle.py`, fixed in #1057).
+- **Corrected on 22 Nov, second commit of this pull request:** the first version merged the review branch through the merges API when no pull request could be opened. The ruleset would have refused that, and a merge without CI is the wrong design. It is removed.
+- With any of the three missing, nothing merges without a person: the pull request, or without the token the pushed branch, waits and the run says why.
 
 **.github/workflows/provider_target_coverage.yml 1.2.0, workflow_repair_tests.yml**: map `TFB_PTC_STALE_REVERIFY` (default 1).
 
@@ -45,6 +54,6 @@
 ## What the owner does
 
 1. Merge this pull request, and the renewal pull request #1057 (run 45013078813).
-2. For a hands-free renewal: repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`. Without it, each scheduled renewal leaves a branch that needs its pull request opened and merged within about two days.
+2. For a hands-free renewal, all three: the secret `TFB_RENEWAL_TOKEN`, the setting "Allow auto-merge", and the Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`. Without them, each scheduled renewal (Sun, Tue, Thu) leaves a branch that needs its pull request opened and merged before the captions expire (seven days after their review). Not tested end to end: it needs the token. The first scheduled run after the three are set shows it.
 
 Expected after the merge: the next scheduled Provider Target Coverage run (06:20 UTC) passes with `BASELINE_STALE_REVERIFIED`; the name check passes once the renewal is merged.

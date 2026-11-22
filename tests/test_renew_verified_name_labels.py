@@ -331,7 +331,7 @@ def test_shipped_acknowledgement_list_matches_the_registry():
 
 
 # T17 workflow 1.2.0: the renewal runs on a schedule, never pushes to the default branch,
-# and merges by itself only behind the owner's Variable
+# and merges by itself only behind the owner's Variable and token - through the pull request and its checks
 def test_workflow_schedules_the_renewal_and_gates_the_automatic_merge():
     import yaml
     from pathlib import Path
@@ -351,8 +351,18 @@ def test_workflow_schedules_the_renewal_and_gates_the_automatic_merge():
     assert 'git push -q origin "$BR"' in run and "git push origin main" not in run and "--force" not in run
     assert 'startswith("name-label-renewal/")' in run and "gh pr close" in run
     assert 'if [[ "$CHANGED" != "$REG" ]]' in run
-    # the repository forbids Actions-created pull requests: the gated merge then goes through the merges API
+    # The default branch requires a pull request and its checks, and the job never merges around them: one merge
+    # command, with --auto (GitHub merges after the required checks), and no direct merge into the default branch.
     gate = run.index('"${AUTOMERGE,,}" == "on"')
-    assert run.index('repos/${GITHUB_REPOSITORY}/merges') > gate and run.index('if [[ "$CHANGED" != "$REG" ]]') > gate
-    assert run.index('if [[ "$CHANGED" != "$REG" ]]') < run.index('repos/${GITHUB_REPOSITORY}/merges')
-    assert "PR_OPEN=0" in run and 'elif [[ "$PR_OPEN" == "0" ]]' in run
+    assert run.count("gh pr merge") == 1 and 'gh pr merge "$BR" --squash --auto --delete-branch' in run
+    assert "/merges" not in run and "gh api -X POST" not in run and "--admin" not in run
+    assert gate < run.index('if [[ "$CHANGED" != "$REG" ]]') < run.index("gh pr merge")
+    # the merge needs an open pull request and the owner's token (a pull request opened with the workflow's own
+    # token does not start CI by itself); with either missing it is left for a person
+    assert "PR_OPEN=0" in run and gate < run.index('elif [[ "$PR_OPEN" != "1" ]]') < run.index("gh pr merge")
+    assert gate < run.index('elif [[ "$HAS_TOKEN" != "1" ]]') < run.index("gh pr merge")
+    assert step["env"]["GH_TOKEN"] == "${{ secrets.TFB_RENEWAL_TOKEN || github.token }}"
+    assert step["env"]["HAS_TOKEN"] == "${{ secrets.TFB_RENEWAL_TOKEN != '' && '1' || '0' }}"
+    # the token reaches one step of the one job that may write, and no other
+    assert text.count("secrets.TFB_RENEWAL_TOKEN") == 2
+    assert publish["permissions"] == {"contents": "write", "pull-requests": "write"}
