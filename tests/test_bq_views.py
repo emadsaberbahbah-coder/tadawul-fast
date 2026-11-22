@@ -343,6 +343,9 @@ PENDING = {
     "v_event_scenarios": "73f28feb2afbd02f9a5d8845891872444bec24c5001b61d87beadcdb9f569fc6",
     "v_event_trial": "518ab72be1b266a6a226ef038f1dd942b02d90c048257f947a30ac947e7fdd6d",
     "v_event_trial_summary": "9ca3cbc11e11e53dda4f3a005a20218426bd5e75f8bb0c1539c7056c13e12dfb",
+    # apply_bq_views 1.22.0 (22 Nov 2026): the learning scorecard - ten rule variants fixed on 22 Nov, each against
+    # its baseline on the scored calls, in-sample and forward from 23 Nov (research only)
+    "v_learning_scorecard": "0505807dc0a18656b23df4a7c86c2000119247caf14ba65fac552527e26986ee",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -372,9 +375,10 @@ EXPECTED_ORDER = [
     "v_ready_list", "v_ready_trial",
     "v_market_news", "v_people_news", "v_news_trial", "v_news_trial_summary",
     "v_event_calendar", "v_event_reactions", "v_event_scenarios", "v_event_trial", "v_event_trial_summary",
+    "v_learning_scorecard",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 53)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 54)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3098,17 +3102,18 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.21.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.22.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.21.0"
+    assert bv.__version__ == "1.22.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-15:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-16:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
-                           "111_v_event_scenarios.sql", "112_v_event_trial.sql", "113_v_event_trial_summary.sql"]
-    assert files[:-14] == sorted(files[:-14])                                       # the two-digit order is unchanged
+                           "111_v_event_scenarios.sql", "112_v_event_trial.sql", "113_v_event_trial_summary.sql",
+                           "114_v_learning_scorecard.sql"]
+    assert files[:-15] == sorted(files[:-15])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3388,7 +3393,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 6
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 7
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3582,7 +3587,7 @@ def case_v56():
     and for all; the figure lines count each event once; forward lines collect until 10 events."""
     objs, code = _event_view("v_event_trial_summary", 113, {"v_event_trial"})
     names = [o.name for o in bv.load_objects()]
-    assert names.index("v_event_trial_summary") == len(names) - 1
+    assert names.index("v_event_trial_summary") == names.index("v_learning_scorecard") - 1   # 1.22.0 adds one view after it
     assert code.count("`{{DS}}.v_event_trial`") == 1
     for frag in ("GROUP BY GROUPING SETS ((period, family, market_id), (period, family), (period, market_id), (period))",
                  "GROUP BY period, family, event_id", "ROUND(1 - AVG(brier_figure) / (2 / 3), 3) AS fig_skill",
@@ -3605,12 +3610,69 @@ def case_v56():
     assert "CURRENT_" not in code
 
 
+def case_v57():
+    """v_learning_scorecard (1.22.0): ten rule variants fixed on 22 Nov 2026, each against its baseline on the scored
+    calls. No look-ahead (the market label of the last close BEFORE the call; the call's OWN signal snapshot, never a
+    later run of that day), the forward date written into the view, the reading only at 20 call days and 40 calls,
+    research only. Three review findings of 22 Nov (Codex P2 on #1058) are pinned here: the signal's day is the Riyadh
+    day, as the calls' is; the snapshot is the newest one not later than 60 seconds after the call; and the stop arms
+    are described as what mae_pct is - the lowest daily LOW after the recording day, not a close."""
+    objs = {o.name: o for o in bv.load_objects()}
+    v = objs["v_learning_scorecard"]
+    assert v.path.name == "114_v_learning_scorecard.sql" and v.kind == "VIEW"
+    names = [o.name for o in bv.load_objects()]
+    assert names[-1] == "v_learning_scorecard"
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {"v_learning_scorecard"} == {"v_market_condition", "v_signal_history", "v_outcome_engine"}
+    assert "the live system never reads BigQuery" in v.template and "FIXED ON 22 NOV 2026 BEFORE ANY FORWARD DATA" in v.template
+    assert "CURRENT_" not in code and "FOLLOWING" not in code                 # no clock, no window that looks ahead
+    # the label a call is judged on is the one of its market's last close before the day of the call
+    assert "AND c.date < o.recorded_date AND (c.next_date IS NULL OR c.next_date >= o.recorded_date)" in code
+    assert code.count("LEAD(") == 1 and "LEAD(date) OVER (PARTITION BY market_id ORDER BY date) AS next_date" in code
+    # the signal: dated as the calls are (Riyadh), and the call's own snapshot - the newest of the symbol that day
+    # which is not later than 60 seconds after the call (the engine writes the snapshot a second or two after it)
+    assert "DATE(recorded_at, 'Asia/Riyadh') AS day" in code and "DATE(recorded_at)" not in code
+    assert "ON g.symbol = b.symbol AND g.day = b.recorded_date" in code
+    assert "AND g.recorded_at <= TIMESTAMP_ADD(b.recorded_at, INTERVAL 60 SECOND)" in code
+    assert "ORDER BY g.recorded_at DESC LIMIT 1)[OFFSET(0)] AS s" in code and "GROUP BY b.record_id" in code
+    assert "LEFT JOIN pick g ON g.record_id = o.record_id" in code
+    assert "IFNULL(g.s.upside >= 15 AND g.s.risk < 30, FALSE) AS selected" in code       # no snapshot = not kept
+    # the stop arms say what mae_pct is: daily LOWS after the recording day (70_v_outcome_engine.sql), not closes
+    assert "lowest daily LOW after its recording day" in v.template and "lowest close" not in v.template
+    outcome = objs["v_outcome_engine"].template
+    assert "IFNULL(a.tb.low, 1e18)" in outcome and "SAFE_DIVIDE(c.win_low, c.entry_price)" in outcome
+    # the worst 5 % is exact, so two reads of the same rows agree
+    assert "APPROX_QUANTILES" not in code
+    assert "SAFE_OFFSET(CAST(FLOOR(0.05 * GREATEST(COUNTIF(kept) - 1, 0)) AS INT64))] AS p5" in code
+    assert ("IF(o.recorded_date >= DATE '2026-11-23', 'forward from 2026-11-23', 'in-sample, not evidence') AS period"
+            in code)
+    arms = re.findall(r"STRUCT\('([A-Z]\d) ", code) + re.findall(r"'(S1) sell side", code)
+    assert arms == ["B0", "E1", "E2", "E3", "E4", "E5", "X1", "X2", "X3", "S1"], arms
+    hold = "label NOT IN ('weak', 'stress', 'drawdown', 'crash_day')"
+    assert code.count(hold) == 2 and "label NOT IN ('stress', 'drawdown', 'crash_day'), TRUE, roi, roi" in code
+    for stop in (5, 8, 10):                                                    # a stop books the stop, never better
+        assert f"IF(mae_pct <= -{stop}, -{stop}.0, roi), roi)" in code
+    assert "WHERE c.investable AND c.stance = 'bullish'" in code
+    assert "stance = 'bearish' AS kept, stance = 'bullish' AS in_base, -roi AS r, -roi AS b" in code
+    # the lift is a mean over call days of the arm's mean minus the baseline's, on days that have both
+    assert "AVG(IF(kept, r, NULL)) - AVG(IF(in_base, b, NULL)) AS d" in code
+    assert "HAVING COUNTIF(kept) > 0 AND COUNTIF(in_base) > 0" in code
+    assert "SAFE_DIVIDE(AVG(d), SAFE_DIVIDE(STDDEV_SAMP(d), SQRT(COUNT(*)))) AS t" in code
+    order = [code.index(x) for x in ("WHEN STARTS_WITH(t.arm, 'B0') THEN 'the baseline'",
+                                     "WHEN STARTS_WITH(t.period, 'in-sample') THEN 'in-sample, not evidence'",
+                                     "WHEN IFNULL(l.days, 0) < 20 OR t.calls < 40",
+                                     "WHEN l.t >= 2 THEN 'BETTER THAN THE BASELINE'",
+                                     "WHEN l.t <= -2 THEN 'WORSE THAN THE BASELINE'")]
+    assert order == sorted(order), order                                       # in-sample is never read as evidence
+    assert "l.t >= 2" in code and "ROUND(l.t, 2) AS t_stat" in code            # judged on the unrounded statistic
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
-         case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56]
+         case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57]
 
 
 def test_v1(): case_v1()
@@ -3669,6 +3731,7 @@ def test_v53(): case_v53()
 def test_v54(): case_v54()
 def test_v55(): case_v55()
 def test_v56(): case_v56()
+def test_v57(): case_v57()
 
 
 if __name__ == "__main__":

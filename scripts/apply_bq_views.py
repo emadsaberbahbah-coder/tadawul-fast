@@ -2,8 +2,28 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.21.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.22.0 (program register C8, Phase 2)
 ================================================================================
+v1.22.0 (22 Nov 2026, the learning scorecard). WHY (owner, 22 Nov 2026): "check
+the system is getting learning day over day and how we can improve and
+accelerate the learning ... how system can learn from the previous loss". The
+full review of that day found that the hit rate follows the market's
+condition, that stops caused most of the real loss, and that no rule is ever
+re-tested by itself: every finding so far was a one-off query. One new view,
+research only: v_learning_scorecard (114) - a list of ten rule variants fixed
+on 22 Nov before any forward data (the armed market hold list, the same
+without 'weak', without Tadawul, the selection gate, both gates, stops at 5 /
+8 / 10 % on daily closes, and the sell side against the buy side), each
+against its baseline on the scored calls of v_outcome_engine, the market
+label of v_market_condition at the last close BEFORE the call and the signal
+v_signal_history recorded on the day of the call. Per period ('in-sample,
+not evidence' / 'forward from 2026-11-23'), horizon and arm: calls, call
+days, hit rate, mean result, worst 5 %, the baseline's, the mean daily lift
+and its t; a forward row is read only at 20 call days and 40 calls (t >= 2
+BETTER, t <= -2 WORSE). A rule needs about 20 call days to be judged and that
+clock cannot be shortened; ten variants now run on it at once. No file of
+1.21.0 changes.
+
 v1.21.0 (21 Nov 2026, the forward event scenarios). WHY (owner, 21 Nov 2026
 11:03 Riyadh, item 5 of the build list): "News: a news reading per market;
 forward event scenarios; momentum/surprise; influential figures of 19 Nov;
@@ -475,7 +495,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.21.0"
+__version__ = "1.22.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
