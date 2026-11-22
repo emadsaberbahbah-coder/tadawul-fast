@@ -1,6 +1,15 @@
 # =============================================================================
 # Universe Maintenance - .github/workflows/universe_maintenance.yml
 # =============================================================================
+# VERSION 1.1.0 (2026-11-22) -- NEW LISTINGS AND THE PARKED LIST
+# scripts/universe_maintenance.py v1.1.0 adds two lanes, each with its own
+# repository Variable: TFB_UNIVERSE_IPO (priced US listings, seasoned 30 days,
+# worth USD 1 billion or more) and TFB_UNIVERSE_PARK (rows whose price bar went
+# stale or whose identity never verified). Unset, a lane OBSERVES: it is
+# computed and written to `_Universe_Report`, and writes nothing else, even
+# when TFB_UNIVERSE_MAINT is enforce. `off` gives v1.0.0 exactly. The seven new
+# Variables are mapped below; the row floor and cap stay in code.
+#
 # VERSION 1.0.0 (2026-10-20) -- NEW WORKFLOW
 #
 # WHY: owner request of 20 Oct 2026. Global_Markets was maintained by hand (the
@@ -197,6 +206,16 @@ jobs:
           TFB_UNIVERSE_ADD_FOREIGN: ${{ vars.TFB_UNIVERSE_ADD_FOREIGN }}
           TFB_UNIVERSE_RED_DAYS: ${{ vars.TFB_UNIVERSE_RED_DAYS }}
           TFB_UNIVERSE_RETIRE_MAX: ${{ vars.TFB_UNIVERSE_RETIRE_MAX }}
+          # v1.1.0 lanes: empty = observe (computed and reported, never written). A lane writes only
+          # when TFB_UNIVERSE_MAINT is enforce AND its own switch is enforce; off = v1.0.0 exactly.
+          TFB_UNIVERSE_IPO: ${{ vars.TFB_UNIVERSE_IPO }}
+          TFB_UNIVERSE_PARK: ${{ vars.TFB_UNIVERSE_PARK }}
+          # Optional tuning; empty = the script defaults (5 / 30 / 180 / 1000 / 20).
+          TFB_UNIVERSE_IPO_MAX: ${{ vars.TFB_UNIVERSE_IPO_MAX }}
+          TFB_UNIVERSE_IPO_MIN_DAYS: ${{ vars.TFB_UNIVERSE_IPO_MIN_DAYS }}
+          TFB_UNIVERSE_IPO_MAX_DAYS: ${{ vars.TFB_UNIVERSE_IPO_MAX_DAYS }}
+          TFB_UNIVERSE_IPO_MIN_CAP_M: ${{ vars.TFB_UNIVERSE_IPO_MIN_CAP_M }}
+          TFB_UNIVERSE_PARK_DAYS: ${{ vars.TFB_UNIVERSE_PARK_DAYS }}
         run: |
           set -euo pipefail
           if [[ -z "${DEFAULT_SPREADSHEET_ID:-}" ]]; then
