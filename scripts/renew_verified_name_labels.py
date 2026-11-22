@@ -29,6 +29,23 @@ The output is validated with the production loader before it is written.
 Exit codes: 0 every binding renewed (or --check clean), 1 some held or
 expiring soon, 2 fatal.
 
+v1.2.0 (2026-11-22) ACKNOWLEDGED HELD BINDINGS. WHY: the daily check had been
+red since 19 Oct for a reason no renewal could clear. Six bindings are held at
+every renewal because their authority can no longer be re-captured (a ticker
+gone from the Nasdaq directory, an issuer page that changed, a source that
+refuses the request), so they stay expired, and the check failed on them even
+on the days the other 122 were freshly renewed. A check that is always red
+hides the day the renewable bindings really lapse.
+WHAT: --check reads a small reviewed list beside the registry,
+verified_name_labels_held.json ({"schema": 1, "acknowledged": [{page, symbol,
+reason, review_by_utc}]}). A due or expired binding on that list, whose
+review_by_utc is still ahead, is reported as HELD_ACKNOWLEDGED and no longer
+fails the check; every other due binding fails it exactly as before. The
+acknowledgement lapses on its own date, after which the binding counts again.
+Nothing about a held binding changes: it stays expired, its caption still
+fills no Name, and the list reaches main only through a reviewed pull request.
+No file, or an empty list, is 1.1.1 behaviour. A malformed file is exit 2.
+
 v1.1.0 (2026-10-21) --apply-renewal RENEWED: merge a renewed registry (the
 artifact of a renew run) into --registry binding by binding. A binding takes
 the renewed copy only when every field other than the renewal fields
@@ -60,7 +77,9 @@ if str(ROOT) not in sys.path:
 
 from core import verified_name_labels as labels  # noqa: E402
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
+HELD_ACK_NAME = "verified_name_labels_held.json"
+HELD_ACK_SCHEMA = 1
 REVIEW_WINDOW = timedelta(days=7)
 MAX_BODY = 40_000_000
 DIRECTORY_FILES = {
@@ -275,21 +294,79 @@ def expiring(registry, *, now, within):
                   if datetime.fromisoformat(b["expires_at_utc"]) <= now + within)
 
 
-def expiry_report(registry, *, now, within):
-    """Separate expired authority evidence from the advance warning window."""
+def load_held_ack(path):
+    """1.2.0: the reviewed list of bindings whose authority cannot be re-captured.
+
+    Returns {"page|symbol": {"reason", "review_by_utc"}}. A missing file is an
+    empty list (1.1.1 behaviour); anything malformed raises ValueError, so a
+    broken list can never quietly turn the check green.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(data, dict) or data.get("schema") != HELD_ACK_SCHEMA
+            or not isinstance(data.get("acknowledged"), list)):
+        raise ValueError("expected {schema: %d, acknowledged: [...]}" % HELD_ACK_SCHEMA)
+    out = {}
+    for row in data["acknowledged"]:
+        if not isinstance(row, dict):
+            raise ValueError("each acknowledgement must be an object")
+        page, symbol, reason = (str(row.get(k) or "").strip() for k in ("page", "symbol", "reason"))
+        if not page or not symbol or not reason:
+            raise ValueError("each acknowledgement needs page, symbol and reason")
+        key = page + "|" + symbol
+        try:
+            review_by = datetime.fromisoformat(str(row.get("review_by_utc")))
+        except ValueError:
+            raise ValueError("review_by_utc is unreadable for " + key) from None
+        if review_by.tzinfo is None:
+            review_by = review_by.replace(tzinfo=UTC)
+        if key in out:
+            raise ValueError("duplicate acknowledgement for " + key)
+        out[key] = {"reason": reason, "review_by_utc": review_by.isoformat()}
+    return out
+
+
+def expiry_report(registry, *, now, within, acknowledged=None):
+    """Separate expired authority evidence from the advance warning window.
+
+    1.2.0: `acknowledged` (load_held_ack) names bindings that are known to be
+    held. While its review_by_utc is ahead, such a binding is listed under
+    held_acknowledged and left out of `open`, the list that fails the check.
+    """
     due = expiring(registry, now=now, within=within)
     expired = sorted(b["page"] + "|" + b["symbol"] for b in registry["bindings"]
                      if datetime.fromisoformat(b["expires_at_utc"]) <= now)
-    expired_keys = set(expired)
-    soon = [key for key in due if key not in expired_keys]
+    expired_keys, due_keys = set(expired), set(due)
+    ack = acknowledged or {}
+    live = {key for key, row in ack.items() if datetime.fromisoformat(row["review_by_utc"]) > now}
+    held = [key for key in due if key in live]
+    open_due = [key for key in due if key not in live]
+    open_expired = [key for key in open_due if key in expired_keys]
+    soon = [key for key in open_due if key not in expired_keys]
+    status = ("EXPIRED" if open_expired else "DUE_SOON" if soon
+              else "HELD_ACKNOWLEDGED" if held else "CLEAR")
+    if open_due:
+        action = ("Merge the open renewal pull request, or dispatch name_label_renewal.yml with "
+                  "mode=renew and publish_branch=true; re-capture each authority source and review "
+                  "the resulting branch. Held bindings stay unchanged; never extend their expiry by hand.")
+    elif held:
+        action = ("none: %d held binding(s) are acknowledged in %s until their review_by_utc; "
+                  "retire the symbol or repair its source before that date." % (len(held), HELD_ACK_NAME))
+    else:
+        action = "none"
     return {"version": VERSION, "checked_at_utc": now.isoformat(),
             "bindings": len(registry["bindings"]), "expiring_within_h": within.total_seconds() / 3600,
             "expiring": due, "expired": expired, "due_soon": soon,
-            "status": "EXPIRED" if expired else "DUE_SOON" if soon else "CLEAR",
+            "open": open_due, "held_acknowledged": held,
+            "held_reasons": {key: ack[key]["reason"] for key in held},
+            "held_review_by_utc": {key: ack[key]["review_by_utc"] for key in held},
+            "acknowledgement_lapsed": sorted(key for key in ack if key not in live and key in due_keys),
+            "acknowledgement_unused": sorted(key for key in ack if key not in due_keys),
+            "status": status,
             "registry_changed": False, "automatic_renewal": False,
-            "next_action": ("Dispatch name_label_renewal.yml with mode=renew and publish_branch=true; "
-                            "re-capture each authority source and review the resulting branch. "
-                            "Held bindings stay unchanged; never extend their expiry by hand.") if due else "none"}
+            "next_action": action}
 
 
 def render_step_summary(report):
@@ -304,9 +381,18 @@ def render_step_summary(report):
                 "A failed expiry check is an unresolved authority review, not a Python crash.", "",
                 "| Binding | Evidence status |", "|---|---|"]
         expired = set(report.get("expired") or [])
+        held = report.get("held_acknowledged") or []
+        held = set(held) if isinstance(held, list) else set()
+        review_by = report.get("held_review_by_utc") or {}
         for key in (report.get("expiring") or [])[:150]:
-            rows.append("| " + str(key).replace("|", " / ").replace("\n", " ") + " | "
-                        + ("EXPIRED" if key in expired else "DUE SOON") + " |")
+            if key in held:
+                state = "HELD, acknowledged until " + str((review_by.get(key) or "")[:10] or "its review date")
+            else:
+                state = "EXPIRED" if key in expired else "DUE SOON"
+            rows.append("| " + str(key).replace("|", " / ").replace("\n", " ") + " | " + state + " |")
+        if held:
+            rows += ["", "%d held binding(s) are acknowledged in `%s` and do not fail this check; "
+                     "they stay expired and fill no Name." % (len(held), HELD_ACK_NAME)]
         rows += ["", str(report.get("next_action", "Review the retained expiry evidence."))]
     else:
         renewed, held = report.get("renewed") or [], report.get("held") or {}
@@ -335,6 +421,9 @@ def main(argv=None):
     parser.add_argument("--check", action="store_true",
                         help="only report bindings expiring within --warn-hours; no network")
     parser.add_argument("--warn-hours", type=float, default=48.0)
+    parser.add_argument("--held-ack", metavar="PATH",
+                        help="v1.2.0: reviewed list of held bindings for --check "
+                             "(default: %s beside --registry)" % HELD_ACK_NAME)
     parser.add_argument("--apply-renewal", metavar="RENEWED",
                         help="v1.1.0: merge a renewed registry into --registry (see header); "
                              "writes --out (default: --registry)")
@@ -367,11 +456,17 @@ def main(argv=None):
         return 0 if report["applied"] else 3
     soon = expiring(registry, now=now, within=timedelta(hours=args.warn_hours))
     if args.check:
-        report = expiry_report(registry, now=now, within=timedelta(hours=args.warn_hours))
-        print(json.dumps({k: (len(v) if isinstance(v, list) else v) for k, v in report.items()}))
+        try:
+            ack = load_held_ack(args.held_ack or path.with_name(HELD_ACK_NAME))
+        except ValueError as exc:
+            print("::error::the held acknowledgement list is not usable: %s" % exc)
+            return 2
+        report = expiry_report(registry, now=now, within=timedelta(hours=args.warn_hours),
+                               acknowledged=ack)
+        print(json.dumps({k: (len(v) if isinstance(v, (list, dict)) else v) for k, v in report.items()}))
         if args.report:
             Path(args.report).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
-        return 1 if soon else 0
+        return 1 if report["open"] else 0
 
     started = time.monotonic()
     new, report = renew(registry, now=None, sec_user_agent=args.sec_user_agent.strip(),
