@@ -367,7 +367,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("archive_market_series", "1.4.0", "bigquery market series"),
     # 2026-11-22 (new script, pinned on arrival): the nightly options reading (Cboe's delayed chains) and FINRA's
     # daily short volume for the names TFB holds, rates and the largest US names; research table only.
-    ("archive_options_reading", "1.0.0", "bigquery options reading"),
+    # 2026-11-22: 1.0.0 -> 1.0.1 (the browser request Cboe's pages make; a failed run counts its misses by reason).
+    ("archive_options_reading", "1.0.1", "bigquery options reading"),
     # 2026-10-31 (C8 Phase 3; pin only): NEW scripts/archive_symbol_deep.py -
     # two-year candles (Yahoo), analyst consensus and per-symbol news (EODHD,
     # behind a daily-budget guard) for the portfolio / Top-10 / symbol pages.

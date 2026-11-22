@@ -1,4 +1,4 @@
-"""Tests for scripts/archive_options_reading.py (v1.0.0): the options reading of US stocks and ETFs.
+"""Tests for scripts/archive_options_reading.py (v1.0.1): the options reading of US stocks and ETFs.
 
 The fixture holds two real Cboe delayed-quote answers read on 22 Nov 2026 (prices of Friday 20 Nov), cut to a
 few expiries: TSN (a liquid chain) and SUPN (a thin chain whose own root carries the adjusted 26.87-type strikes
@@ -224,3 +224,26 @@ def test_o8_existing_table_checked():
     assert len(p) == 2 and "columns" in p[0] and "partitioned" in p[1]
     names = [f["name"] for f in op.SCHEMA]
     assert len(names) == len(set(names)) == 30 and names[:2] == ["snapshot_date", "symbol"]
+
+
+def test_o9_misses_are_counted_by_reason_never_named():
+    """v1.0.1: a failed run says why the chains were missed (counts only), and the Cboe request carries the
+    browser headers Cboe's own pages send."""
+    import io
+    import urllib.error
+    assert op.__version__ == "1.0.1"
+    e403 = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
+    e500 = urllib.error.HTTPError("u", 500, "x", {}, io.BytesIO(b""))
+    assert [op.miss_reason(e) for e in (e403, e500, ValueError("bad json"), OSError("reset"))] == [
+        "http 403", "other http", "unreadable", "network"]
+    misses, waits = [], []
+    def deny(url):
+        raise e403
+    assert op.read_chain("AAA", deny, waits.append, misses) is None and misses == ["http 403"] and waits == []
+    def flaky(url):
+        raise OSError("reset")
+    assert op.read_chain("AAA", flaky, waits.append, misses) is None and misses[-1] == "network" and len(waits) == 2
+    empty = lambda url: json.dumps({"data": {"options": []}}).encode()
+    assert op.read_chain("AAA", empty, waits.append, misses) is None and misses[-1] == "no usable chain"   # #1060 review
+    assert len(waits) == 2                                                     # an empty answer is not retried
+    assert op.CBOE_HEADERS["Origin"] == "https://www.cboe.com" and "Mozilla/5.0 (Windows" in op.UA
