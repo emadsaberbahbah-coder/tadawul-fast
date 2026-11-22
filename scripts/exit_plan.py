@@ -2,7 +2,38 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.5.0 (2026-11-18) - first written 2026-11-11 (1.0.0)
+VERSION 1.6.0 (2026-11-21) - first written 2026-11-11 (1.0.0)
+1.6.0 (2026-11-21): A HOLDING WHOSE MARKET IS NOT CALM IS FLAGGED FOR SALE
+    (owner, 21 Nov 22:45 Riyadh: "in the crash phase I think the system had
+    better say sell before the loss, and also wait for the better time to
+    buy"; 22:51: "consider my approval your choice of the best decision").
+    Measured that evening on the matured INVESTABLE Performance_Log records,
+    selling at the next close after the first close on which the stock's
+    market was not calm (weak, stress, drawdown or crash_day; the labels of
+    sql 99_v_market_condition), against holding to the target:
+      entered in a calm market (1,166): won 52.2% -> 54.1%, mean +0.49% ->
+        +0.61%, the worst 5% -13.6% -> -7.8%;
+      entered in a market not calm (1,367): 45.0% -> 47.6%, -1.24% ->
+        -0.27%, the worst 5% -16.1% -> -5.2%.
+    Selling only on drawdown / crash_day changed little for calm entries.
+    On the indices themselves, staying out whenever the market is not calm
+    halved the US drawdown over three years (-19% -> -8.7%) but cut its gain
+    from +53% to +31%: the rule protects a holding; it is not a reason to
+    sit in cash.
+    Now each holding of the US, Saudi, European, Japanese or Hong Kong /
+    China market (core.market_condition 1.0.0, read live from Yahoo on the
+    last completed session) carries its market's label. When the label is in
+    TFB_EXIT_MARKET_TURN_LABELS (default weak,stress,drawdown,crash_day):
+      observe (default): a note "market not calm (observe): ..." - the
+        action, the stop and the target do not change;
+      on: the action is SELL ("the market turned: ...").
+    Commodities, currencies, indices, bonds, sukuk, crypto and futures carry
+    no market label; a lot with no close since its purchase waits for one.
+    The ledger gains the column Market (market:label:date of the close
+    read), so the rule can be scored on the real book; a ledger written by
+    1.5.0 (17 columns) is read as before.
+    Gate: TFB_EXIT_MARKET_TURN = observe (default) | on | off (no read, the
+    1.5.0 page).
 1.5.0 (2026-11-18): THE STOP OF RECORD IS NEVER BELOW THE STOP WORKING AT THE
     BROKER (owner, 18 Nov 10:32 Riyadh: "do the best from your side", on the
     review of that morning). Read on the 09:22 Today Action Plan against the
@@ -177,7 +208,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -187,8 +218,14 @@ PAGE_WIDTH = 16
 MAX_LEDGER_ROWS = 3000
 LEDGER_HEADERS = [
     "Date", "Run At (Riyadh)", "Symbol", "Lot", "Entry", "Shares", "Last", "Highest Close", "ATR", "R",
-    "Stop", "Target", "TP1 Reached", "Action", "Tighten", "Bars To", "Basis",
+    "Stop", "Target", "TP1 Reached", "Action", "Tighten", "Bars To", "Basis", "Market",
 ]
+LEDGER_HEADERS_V15 = LEDGER_HEADERS[:17]             # 1.6.0: a 1.5.0 ledger has no Market column
+MARKET_TURN_LABELS_DEFAULT = "weak,stress,drawdown,crash_day"
+MARKET_TURN_HOLDABLE = ("crash_day", "drawdown", "stress", "weak")      # calm never turns
+# instruments no stock-market label describes (data_engine_v2 5.161.0 _MARKET_HOLD_EXEMPT_TOKENS)
+MARKET_TURN_EXEMPT = ("commodity", "fx", "currency", "forex", "index", "fixed income", "sukuk", "bond", "crypto",
+                      "future")
 INFO_COLS = ("Symbol", "Name", "Asset Class", "Current Price", "Forecast Price (1M)", "Forecast Reliability Score",
              "Confidence Score", "Target Price")
 YAHOO_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
@@ -221,6 +258,24 @@ def mode() -> str:
     return v if v in ("off", "observe", "on") else "off"
 
 
+def market_turn_mode() -> str:
+    """1.6.0: TFB_EXIT_MARKET_TURN = observe (default; also an unknown word) | on | off."""
+    v = _env("TFB_EXIT_MARKET_TURN", "observe").lower()
+    if v in ("on", "enforce", "1", "true", "yes"):
+        return "on"
+    if v in ("off", "0", "false", "no"):
+        return "off"
+    return "observe"
+
+
+def market_turn_labels() -> frozenset:
+    """1.6.0: TFB_EXIT_MARKET_TURN_LABELS, the labels that turn a market (calm and unknown words skipped)."""
+    raw = os.environ.get("TFB_EXIT_MARKET_TURN_LABELS")
+    if raw is None:
+        raw = MARKET_TURN_LABELS_DEFAULT
+    return frozenset(w for w in (p.strip().lower() for p in raw.split(",")) if w in MARKET_TURN_HOLDABLE)
+
+
 def knobs() -> Dict[str, Any]:
     k = {
         "atr_init": _env_num("TFB_EXIT_ATR_INIT", 3.0, 1.0, 6.0),
@@ -240,6 +295,8 @@ def knobs() -> Dict[str, Any]:
         "ibkr_max_h": _env_num("TFB_EXIT_IBKR_MAX_AGE_H", 30.0, 1.0, 240.0),      # 1.3.2
         "div_net": _env("TFB_EXIT_DIV_NET", "on").lower() not in ("off", "0", "false", "no"),   # 1.4.0
         "broker_floor": _env("TFB_EXIT_BROKER_FLOOR", "on").lower() not in ("off", "0", "false", "no"),   # 1.5.0
+        "market_turn": market_turn_mode(),                                                              # 1.6.0
+        "market_turn_labels": market_turn_labels(),
     }
     k["min_pct"] = min(k["min_pct"], k["max_pct"])
     k["trail_tight"] = min(k["trail_tight"], k["trail"])
@@ -523,6 +580,59 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     return res
 
 
+# 1.6.0 [MARKET-TURN] -------------------------------------------------------------
+def read_market(now: _dt.datetime, opener: Callable[..., Any]) -> Dict[str, Dict[str, Any]]:
+    """The label of each read market on its last completed session (core.market_condition 1.0.0, the rules of
+    sql 99_v_market_condition); {} on any fault - then no holding gets a market note."""
+    try:
+        from core import market_condition as mc  # noqa: PLC0415 - stdlib only
+        return mc.read(now=now, opener=opener, sleep=_SLEEP)
+    except Exception as e:  # noqa: BLE001
+        _out("market labels not read (%s): no market-turn note this run" % type(e).__name__)
+        return {}
+
+
+def market_of(symbol: str) -> str:
+    try:
+        from core import market_condition as mc  # noqa: PLC0415
+        return mc.market_of(symbol)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def market_turn(symbol: str, asset: str, labels: Dict[str, Dict[str, Any]], k: Dict[str, Any]
+                ) -> Optional[Dict[str, Any]]:
+    """{"market", "label", "day", "text", "turned"} for a holding of a read market; None for an instrument no
+    stock-market label describes (MARKET_TURN_EXEMPT), a symbol of no read market, or a market not read."""
+    if any(tok in (asset or "").lower() for tok in MARKET_TURN_EXEMPT):
+        return None
+    mid = market_of(symbol)
+    info = labels.get(mid) if mid else None
+    if not info or not info.get("label"):
+        return None
+    label = str(info["label"])
+    day = info.get("day")
+    return {"market": mid, "label": label, "day": day.isoformat() if hasattr(day, "isoformat") else text(day),
+            "text": text(info.get("text")) or "%s %s" % (mid, label), "turned": label in k["market_turn_labels"]}
+
+
+def apply_market_turn(res: Dict[str, Any], mt: Optional[Dict[str, Any]], k: Dict[str, Any]) -> None:
+    """res["market"] for the ledger; for a turned market the note (observe) or the SELL (on). A lot with no close
+    since its purchase waits for the first one, as the close rules do."""
+    if not mt or not res.get("ok"):
+        return
+    res["market"] = "%s:%s:%s" % (mt["market"], mt["label"], mt["day"])
+    if not mt["turned"] or res.get("fresh"):
+        return
+    res["market_turned"] = True
+    if k["market_turn"] == "on":
+        res["action"] = "SELL"
+        res["why"].insert(0, "the market turned: %s - sell (market-turn rule)" % mt["text"])
+    else:
+        res["why"].append("market not calm (observe): %s - the market-turn rule would sell; nothing changes until "
+                          "TFB_EXIT_MARKET_TURN=on" % mt["text"])
+
+
 def dividend_note(symbol: str, shares: Any, last: Any, ev: Dict[str, Any], k: Dict[str, Any]) -> str:
     """1.2.0 [DIV-TAX]: a holding with an ex-dividend inside TFB_EXIT_DIV_WARN_DAYS days. The price falls by the full
     dividend on the ex-date; a Saudi resident keeps it less the US withholding (TFB_EXIT_WHT_PCT on a US listing).
@@ -742,11 +852,26 @@ def tp1_flag(r: Dict[str, Any]) -> str:
 
 
 def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
+    """1.6.0: the 18-column ledger, or a 1.5.0 one (17 columns, no Market: read as '')."""
     rows = list(values)
-    if not rows or [text(c) for c in rows[0]][:len(LEDGER_HEADERS)] != LEDGER_HEADERS:
+    if not rows:
         return []
-    return [{h: (r[i] if i < len(r) else "") for i, h in enumerate(LEDGER_HEADERS)} for r in rows[1:] if any(
-        text(c) for c in r)]
+    head = [text(c) for c in rows[0]]
+    if head[:len(LEDGER_HEADERS)] == LEDGER_HEADERS:
+        names = LEDGER_HEADERS
+    elif head[:len(LEDGER_HEADERS_V15)] == LEDGER_HEADERS_V15:
+        names = LEDGER_HEADERS_V15
+    else:
+        return []
+    out = []
+    for r in rows[1:]:
+        if not any(text(c) for c in r):
+            continue
+        d = {h: (r[i] if i < len(r) else "") for i, h in enumerate(names)}
+        for h in LEDGER_HEADERS[len(names):]:
+            d[h] = ""
+        out.append(d)
+    return out
 
 
 def lot_key(symbol: str, lot: Dict[str, Any]) -> str:
@@ -795,6 +920,15 @@ def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date,
 ORDER = {"SELL": 0, "TAKE PROFIT": 1, "RAISE STOP": 2, "REVIEW": 3, "CHECK": 4, "HOLD": 5, "NO RULE": 6}
 
 
+def market_turn_rule(k: Dict[str, Any]) -> str:
+    """1.6.0: the page's words for the market-turn rule ('' while it is off)."""
+    if k.get("market_turn", "off") == "off":
+        return ""
+    labels = ", ".join(w for w in MARKET_TURN_HOLDABLE if w in k["market_turn_labels"]) or "none"
+    return (" Market turn (%s): a holding whose market is not calm (%s) %s." % (
+        k["market_turn"], labels, "is a SELL" if k["market_turn"] == "on" else "is flagged; its action does not change"))
+
+
 def page_rows(results: List[Dict[str, Any]], picks: List[Dict[str, Any]], info: Dict[str, Any],
               k: Dict[str, Any]) -> List[List[Any]]:
     w = PAGE_WIDTH
@@ -805,7 +939,8 @@ def page_rows(results: List[Dict[str, Any]], picks: List[Dict[str, Any]], info: 
          "after +1R the stop is at least the entry and trails %gxATR under the highest close (%gxATR on negative "
          "news, a falling forecast or a lost 20-day average after +2R); the stop never moves down; target = the "
          "next +1R step (sell half at the first)." % (k["atr_init"], k["min_pct"], k["max_pct"], k["sr_max_pct"],
-                                                      k["trail"], k["trail_tight"])],
+                                                      k["trail"], k["trail_tight"])
+         + market_turn_rule(k)],
         [info["summary"]],
         [],
         ["HOLDINGS (%d)" % len(results)],
@@ -956,8 +1091,9 @@ def _mail(subject: str, text_body: str, html_body: str) -> None:  # pragma: no c
 
 def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None,
         opener: Optional[Callable[..., Any]] = None, mailer: Optional[Callable[[str, str, str], None]] = None,
-        capture: Optional[Dict[str, Any]] = None) -> int:
-    """`capture` (1.3.2): a parsed IBKR capture; left out, the live run (no `book` given) reads the newest one."""
+        capture: Optional[Dict[str, Any]] = None, market: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+    """`capture` (1.3.2): a parsed IBKR capture; left out, the live run (no `book` given) reads the newest one.
+    `market` (1.6.0): the market labels ({market id: {"label", "day", "text"}}); left out, they are read live."""
     k = knobs()
     own_book = book is None
     write = mode() == "on" and not dry_run
@@ -1010,6 +1146,9 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         _out("IBKR capture not used for stops (%s); the workbook's broker tabs decide" % (
             capture.get("reason") or "older than %.0f h" % k["ibkr_max_h"]))
     info_map = read_info(grids)
+    labels: Dict[str, Dict[str, Any]] = {}
+    if k["market_turn"] != "off":                                                  # 1.6.0 [MARKET-TURN]
+        labels = market if market is not None else read_market(now, opener)
     bars_cache: Dict[str, Tuple[List[Bar], Optional[float]]] = {}
     now_ts = now.timestamp()
 
@@ -1041,6 +1180,8 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
         res = exit_levels(sym, lot["entry"], lot["date"], sym_bars, inf, prev, k, today)
         res.update({"name": inf.get("name") or lot["name"], "shares": lot["shares"], "lot": lot_key(sym, lot),
                     "broker_stop": stops.get(sym), "prev": prev})
+        if labels:                                                                     # 1.6.0 [MARKET-TURN]
+            apply_market_turn(res, market_turn(sym, inf.get("asset", ""), labels, k), k)
         if (news.get(sym) or {}).get("headline"):
             res["why"].append("latest negative item: %s" % news[sym]["headline"])
         if (news.get(sym) or {}).get("ignored"):                                       # 1.3.0 [NEWS-NOISE]
@@ -1063,6 +1204,9 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
                 stamp, bars_to.isoformat() if bars_to else "n/a", broker_note),
             "summary": "Today: " + (" · ".join("%s %d" % (a, counts[a]) for a in sorted(counts, key=lambda x: ORDER.get(
                 x, 9))) or "no holdings")}
+    turned = sum(1 for r in results if r.get("market_turned"))
+    if turned and k["market_turn"] == "observe":                                       # 1.6.0 [MARKET-TURN]
+        info["summary"] += " · market not calm: %d holding%s (observe)" % (turned, "" if turned == 1 else "s")
     for r in results:
         _out("%-9s %-11s last %s stop %s (was %s) target %s | %s" % (
             r["symbol"], r["action"], fmt(r.get("last")), fmt(r.get("stop")), fmt(r.get("prev_stop")),
@@ -1081,8 +1225,9 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
     new = [[day, stamp, r["symbol"], r.get("lot", ""), _round(r.get("entry")), r.get("shares"), _round(r.get("last")),
             _round(r.get("hc")), _round(r.get("atr")), _round(r.get("r")), _round(r.get("stop")),
             _round(r.get("target")), tp1_flag(r), r["action"], "; ".join(r.get("tighten") or []),
-            r["bars_to"].isoformat() if r.get("bars_to") else "", _round(r.get("basis"))] for r in results if r.get("ok")]
-    grid = [list(LEDGER_HEADERS)] + ([[d[h] for h in LEDGER_HEADERS] for d in keep] + new)[-MAX_LEDGER_ROWS:]
+            r["bars_to"].isoformat() if r.get("bars_to") else "", _round(r.get("basis")), r.get("market", "")]
+           for r in results if r.get("ok")]
+    grid = [list(LEDGER_HEADERS)] + ([[d.get(h, "") for h in LEDGER_HEADERS] for d in keep] + new)[-MAX_LEDGER_ROWS:]
     try:
         write_grid(book, LEDGER_TAB, grid, len(LEDGER_HEADERS), 200)
         write_grid(book, PAGE_TAB, page, PAGE_WIDTH, 60)
