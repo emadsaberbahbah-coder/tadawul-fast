@@ -346,6 +346,13 @@ PENDING = {
     # apply_bq_views 1.22.0 (22 Nov 2026): the learning scorecard - ten rule variants fixed on 22 Nov, each against
     # its baseline on the scored calls, in-sample and forward from 23 Nov (research only)
     "v_learning_scorecard": "0505807dc0a18656b23df4a7c86c2000119247caf14ba65fac552527e26986ee",
+    # apply_bq_views 1.23.0 (22 Nov 2026): the price drivers - the options reading of each name, the US market's
+    # forces and their record, every stock's drivers beside its score, and each driver's record (research only)
+    "v_options_reading": "75b9d7e7488f825a271f474c3b0ba06176e1eb71e0300395f1ff989466ddea16",
+    "v_market_drivers": "02eae618a44e619d96f701987e67255c225478bd449ed959b1013e7589eebc41",
+    "v_market_driver_learning": "11fe865115ea0a67eff37e7a74ffbb8e6067f1a7160c55bf304a13c3bc1aae62",
+    "v_price_drivers": "bbecaf9802bbf3ed34a92c97d442307aee5774faccd7cb07a2494f3b500f7c16",
+    "v_driver_learning": "b89918e710f562686738410f23ea3465ccf30fa1ed4df4b1b001a4d8290a0459",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -376,9 +383,10 @@ EXPECTED_ORDER = [
     "v_market_news", "v_people_news", "v_news_trial", "v_news_trial_summary",
     "v_event_calendar", "v_event_reactions", "v_event_scenarios", "v_event_trial", "v_event_trial_summary",
     "v_learning_scorecard",
+    "v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers", "v_driver_learning",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 54)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 59)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3102,18 +3110,20 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.22.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.23.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.22.0"
+    assert bv.__version__ == "1.23.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-16:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-21:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
                            "111_v_event_scenarios.sql", "112_v_event_trial.sql", "113_v_event_trial_summary.sql",
-                           "114_v_learning_scorecard.sql"]
-    assert files[:-15] == sorted(files[:-15])                                       # the two-digit order is unchanged
+                           "114_v_learning_scorecard.sql", "115_v_options_reading.sql",
+                           "116_v_market_drivers.sql", "117_v_market_driver_learning.sql",
+                           "118_v_price_drivers.sql", "119_v_driver_learning.sql"]
+    assert files[:-20] == sorted(files[:-20])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3393,7 +3403,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 7
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 12
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3621,7 +3631,7 @@ def case_v57():
     v = objs["v_learning_scorecard"]
     assert v.path.name == "114_v_learning_scorecard.sql" and v.kind == "VIEW"
     names = [o.name for o in bv.load_objects()]
-    assert names[-1] == "v_learning_scorecard"
+    assert names.index("v_learning_scorecard") == names.index("v_options_reading") - 1   # 1.23.0 adds five after it
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_learning_scorecard"} == {"v_market_condition", "v_signal_history", "v_outcome_engine"}
     assert "the live system never reads BigQuery" in v.template and "FIXED ON 22 NOV 2026 BEFORE ANY FORWARD DATA" in v.template
@@ -3667,12 +3677,106 @@ def case_v57():
     assert "l.t >= 2" in code and "ROUND(l.t, 2) AS t_stat" in code            # judged on the unrounded statistic
 
 
+def _driver_view(name, number, refs):
+    objs = {o.name: o for o in bv.load_objects()}
+    v = objs[name]
+    assert v.path.name == f"{number}_{name}.sql" and v.kind == "VIEW"
+    code = bv._code(v.template)
+    assert set(bv._REF.findall(code)) - {name} == refs, set(bv._REF.findall(code))
+    assert "Research only: no decision, gate or count reads this view." in v.template
+    assert "views 1.23.0" in v.template
+    return objs, code
+
+
+def case_v58():
+    """v_options_reading (1.23.0): reads the new source table options_daily (the nightly options collector); the
+    percentile needs 20 days of its own history; the short-volume z needs 10 earlier days and never counts the day
+    itself; the cross-sectional z-scores leave the ETFs out; the tilt is clamped to -3..+3."""
+    import archive_options_reading as op
+    assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
+    objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
+    names = [o.name for o in bv.load_objects()]
+    assert names[-5:] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+                          "v_driver_learning"]
+    for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
+                 "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
+                 "IF(short_n_20 >= 10, SAFE_DIVIDE(short_ratio_pct - short_mean_20, short_sd_20), NULL) AS short_z",
+                 "IF(is_etf, NULL, SAFE_DIVIDE(skew_25d_pp - AVG(IF(is_etf, NULL, skew_25d_pp)) OVER d",
+                 "GREATEST(-3, LEAST(3, IFNULL(z_cp, 0) - IFNULL(z_skew, 0) - 0.5 * IFNULL(z_pc, 0)))) AS tilt",
+                 "IFNULL(term_ratio >= 1.15 AND front_days <= 45, FALSE) AS event_priced",
+                 "WINDOW d AS (PARTITION BY snapshot_date)"):
+        assert frag in code, frag
+    assert "FOLLOWING" not in code and "CURRENT_" not in code            # nothing from a later day, no clock
+    schema = {c["name"] for c in op.SCHEMA}
+    for col in ("iv30", "atm_iv_front", "atm_iv_90d", "front_days", "implied_move_pct", "skew_25d_pp",
+                "cp_iv_spread_pp", "call_volume", "put_volume", "short_ratio_pct", "is_etf", "source", "captured_at"):
+        assert col in schema and col in code, col
+
+
+def case_v59():
+    """v_market_drivers and v_market_driver_learning (1.23.0): the market's forces from market_series_daily through
+    v_market_daily; z-scores from the previous 252 days only (never the day itself); the forward SPY returns are the
+    only look-ahead and appear only as outcomes; a state needs 50 days before it is read."""
+    import archive_market_series as ms
+    _, md = _driver_view("v_market_drivers", 116, {"v_market_daily"})
+    pinned = {s[1] for s in ms.SERIES}
+    for sym in ("^VIX9D", "^VIX3M", "^VIX6M", "^VVIX", "^SKEW", "^MOVE", "ES=F", "NQ=F", "DX-Y.NYB", "^TNX",
+                "^IRX", "HYG", "IEF", "RSP", "IWM", "BZ=F", "GC=F"):
+        assert f"'{sym}'" in md and sym in pinned, sym
+    used = set(re.findall(r"'([A-Z^][A-Z0-9^=.-]*)'", md.split("WHERE symbol IN (", 1)[1].split(")", 1)[0]))
+    assert used <= pinned and len(used) == 22, sorted(used - pinned)               # every symbol is collected
+    assert "WINDOW h AS (ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING)" in md
+    assert md.count("LEAD(") == 2 and "AS spy_next5_pct" in md and "AS spy_next20_pct" in md
+    _, ml = _driver_view("v_market_driver_learning", 117, {"v_market_drivers"})
+    assert "CASE WHEN a.days < 50 THEN 'too few days'" in ml and "CAST(FLOOR(a.days / 5) AS INT64) AS indep_5d" in ml
+    assert "n.state IS NOT NULL AS is_now" in ml
+    # a session without its outcome yet is no loss: every hit rate leaves it out (#1059 review)
+    for col in ("spy_next5_pct", "spy_next20_pct"):
+        assert f"IF({col} > 0, 1, 0))" in ml and f"AVG(IF({col} > 0" not in ml, col
+    assert ml.count("IS NULL, NULL, IF(spy_next") == 4
+
+
+def case_v60():
+    """v_price_drivers and v_driver_learning (1.23.0): the drivers sit beside TFB's own score and change nothing; the
+    observe-only score with drivers is overall + 1.5 x options tilt - 1 when short selling runs high, kept 0..100;
+    the record is the daily rank IC and the quintiles against the next week's excess return, read only at 8 weeks."""
+    _, pd = _driver_view("v_price_drivers", 118, {
+        "v_universe_latest", "v_universe", "v_market_daily", "v_options_reading", "v_symbol_analyst",
+        "v_signal_history", "v_market_drivers"})
+    for frag in ("ROUND(IFNULL(1.5 * opt_tilt, 0) - IF(short_ratio_z >= 2, 1, 0), 2) AS driver_tilt_pp",
+                 "GREATEST(0, LEAST(100, overall_score + IFNULL(1.5 * opt_tilt, 0) - IF(short_ratio_z >= 2, 1, 0)))",
+                 "WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 DAY)",
+                 "SAFE_DIVIDE(o.iv30, u.volatility_30d_pct) AS iv_hv_ratio",
+                 # the ETF closes of the same sessions as the stock's two snapshots, both included (#1059 review)
+                 "IF(e.date <= dd.d1, e.close, NULL)", "IF(e.date <= dd.d0, e.close, NULL)"):
+        assert frag in pd, frag
+    assert "e.date < dd." not in pd
+    for name in ("overall_score", "recommendation", "final_action"):                 # TFB's own fields, unchanged
+        assert f" {name}," in pd or f" {name}\n" in pd, name
+    _, dl = _driver_view("v_driver_learning", 119, {"v_universe", "v_options_reading"})
+    for frag in ("AND market_code = 'US' AND market_cap >= 2e9 AND current_price > 0",
+                 "JOIN px f ON f.symbol = p.symbol AND f.snapshot_date = DATE_ADD(p.snapshot_date, INTERVAL 7 DAY)",
+                 # the options reading of the snapshot's own session (both are dated by the US session; #1059 review)
+                 "AND o.snapshot_date BETWEEN DATE_SUB(r.snapshot_date, INTERVAL 6 DAY) AND r.snapshot_date",
+                 "r.next_week_pct - AVG(r.next_week_pct) OVER (PARTITION BY r.snapshot_date) AS next_week_excess_pp",
+                 "CORR(rank_v, rank_r) AS rank_ic", "WHERE n >= 20",
+                 "COUNT(DISTINCT DATE_TRUNC(snapshot_date, WEEK(MONDAY))) AS weeks",
+                 "WHEN IFNULL(a.weeks, 0) < 8 THEN 'too few weeks'",
+                 "WHEN a.mean_ic >= 0.03 AND a.ic_positive_share >= 0.55 THEN 'higher is better'",
+                 "WHEN a.mean_ic <= -0.03 AND a.ic_positive_share <= 0.45 THEN 'lower is better'"):
+        assert frag in dl, frag
+    assert "CURRENT_" not in dl                                                     # the record has no clock
+    drivers = re.findall(r"STRUCT\('([^']+)'", dl)
+    assert len(drivers) == 26 and drivers[:13] == drivers[13:], drivers             # the list and the record agree
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
-         case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57]
+         case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57,
+         case_v58, case_v59, case_v60]
 
 
 def test_v1(): case_v1()
@@ -3732,6 +3836,9 @@ def test_v54(): case_v54()
 def test_v55(): case_v55()
 def test_v56(): case_v56()
 def test_v57(): case_v57()
+def test_v58(): case_v58()
+def test_v59(): case_v59()
+def test_v60(): case_v60()
 
 
 if __name__ == "__main__":

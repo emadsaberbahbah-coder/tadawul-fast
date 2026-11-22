@@ -2,9 +2,16 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.95 (2026-11-21) -- MARKET HOLD + SELECTION
+# VERSION 1.1.96 (2026-11-22) -- OPTIONS READING
 #
-# (1.1.94, 2026-11-21: ECONOMIC CALENDAR; 1.1.93, 2026-11-21: MARKETS BOARD;
+# v1.1.96: run tests/test_archive_options_reading.py (scripts/
+# archive_options_reading.py v1.0.0: the nightly options reading of the US
+# stocks TFB follows - Cboe delayed chains and FINRA short volume - into
+# tfb_archive.options_daily; workflow bq_options.yml) in the blocking lean lane
+# right after tests/test_archive_market_series.py. Offline: the fetcher and the
+# BigQuery session are fakes. Nothing is removed and no existing entry moves.
+#
+# (1.1.95, 2026-11-21: MARKET HOLD + SELECTION; 1.1.94, 2026-11-21: ECONOMIC CALENDAR; 1.1.93, 2026-11-21: MARKETS BOARD;
 # 1.1.92, 2026-11-21: VALIDATOR TRANSIENT READ; 1.1.91, 2026-11-21: PAGE
 # CHAINS; 1.1.90, 2026-11-21: IBKR HISTORY; 1.1.89, 2026-11-19: TRIAL LABELS;
 # 1.1.88, 2026-11-19: NEWS BOARD)
@@ -1247,6 +1254,7 @@ jobs:
             tests/test_hold_vs_switch_rule.py \
             tests/test_trial_shadow_v2_rule.py \
             tests/test_archive_market_series.py \
+            tests/test_archive_options_reading.py \
             tests/test_archive_news_themes.py \
             tests/test_archive_econ_calendar.py \
             tests/test_news_board.py \

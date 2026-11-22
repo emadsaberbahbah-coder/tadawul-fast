@@ -2,8 +2,33 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.22.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.23.0 (program register C8, Phase 2)
 ================================================================================
+v1.23.0 (22 Nov 2026, the price drivers). WHY (owner, 22 Nov 2026 19:53
+Riyadh): "add how future options and other options affect the current price
+and recommendations ... add this effect to our score and analysis, also check
+other factors that effect current price and add them to our project". Five new
+views, research only, and one new source table, options_daily (scripts/
+archive_options_reading.py v1.0.0: Cboe's delayed chain and FINRA's daily
+short volume, read once a night for the names TFB holds, rates and the largest
+US names). v_options_reading (115): per name and day the implied volatility,
+its 1-year percentile and term ratio, the implied move to the front expiry and
+whether an event is priced, 25-delta put skew, call-minus-put IV, put/call
+volume and open interest, short volume and its z against 20 days, and an
+options tilt from the cross-section. v_market_drivers (116): the US market's
+forces per day from market_series_daily - the VIX curve (VIX9D, VIX3M, VIX6M),
+VVIX, SKEW, MOVE, index futures against cash, the 10y-3m curve, the dollar,
+credit (HYG/IEF), breadth (RSP/SPY), small caps - each with a state, and SPY's
+next 5 and 20 sessions. v_market_driver_learning (117): each driver state's
+record against SPY over about three years, in-sample. v_price_drivers (118):
+every stock on TFB's pages with its options reading, implied over realised
+volatility, the week against its sector ETF, volume against average, analysts'
+monthly change, days to earnings and the market's state, plus an observe-only
+score with drivers beside TFB's overall score. v_driver_learning (119): each
+stock-level driver's daily rank IC and quintile spread against the next week's
+excess return, read 'too few weeks' under 8 weeks. Nothing decides, gates or
+counts from them. No file of 1.22.0 changes.
+
 v1.22.0 (22 Nov 2026, the learning scorecard). WHY (owner, 22 Nov 2026): "check
 the system is getting learning day over day and how we can improve and
 accelerate the learning ... how system can learn from the previous loss". The
@@ -495,7 +520,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.22.0"
+__version__ = "1.23.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -521,7 +546,10 @@ NEWS_TABLES = frozenset({"news_theme_daily", "news_entity_daily"})   # v1.20.0: 
 # the change log scripts/archive_econ_calendar.py v1.0.0 appends, and the scenarios it logs before their events
 # from v1.1.0 (v1.21.0, the event scenarios)
 ECON_TABLES = frozenset({"econ_calendar", "event_scenario_log"})
-SOURCE_TABLES = ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
+# the table scripts/archive_options_reading.py v1.0.0 loads (v1.23.0, the price drivers)
+OPTIONS_TABLES = frozenset({"options_daily"})
+SOURCE_TABLES = (ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
+                 | OPTIONS_TABLES)
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
