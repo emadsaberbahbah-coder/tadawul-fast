@@ -51,6 +51,19 @@ could not be read for STALE_MAX_SEC, there is no label - and a gate that reads
 an unknown market never holds it.
 
 This module decides nothing by itself and writes nothing.
+
+v1.0.1 (22 Nov 2026) - THE READ IS WARMED AND REPORTED. On the first deploy
+(22 Nov 06:12 UTC, both gates on enforce) /health read market_labels {} for 16
+minutes: a worker reads the labels only when an INVESTABLE row reaches the
+market tier, and none had (Sunday, no page read since the boot), so the
+read-back could not tell a quiet worker from a failing read. Now state() - the
+engine's /health and startup line - also starts a refresh when one is due
+(never waiting on it), so each worker reads at its first health line, and it
+reports the last read: when, which markets were read, and for each one not
+read why ("query1...: HTTP 429", "no bars", "last session 2026-11-10 is more
+than 7 days old", "not enough closes for a label"). The Yahoo request carries
+the browser User-Agent of yahoo_chart_provider's raw chart transport, the
+one the engine already uses from Render. Labels and rules unchanged.
 ================================================================================
 """
 from __future__ import annotations
@@ -66,7 +79,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 LABELS = ("crash_day", "drawdown", "stress", "weak", "calm")
@@ -82,7 +95,9 @@ MARKET_NAMES = {"us": "the US market", "sa": "the Saudi market", "eu": "the Euro
                 "jp": "the Japanese market", "cn": "the Hong Kong market"}
 VIX = "^VIX"
 YAHOO_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
-YAHOO_UA = "Mozilla/5.0 (compatible; TFB-market-condition/1.0)"
+# 1.0.1: yahoo_chart_provider's _RAW_CHART_UA (its raw chart transport, the one that answers from Render)
+YAHOO_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36")
 DAILY_PATH = "/v8/finance/chart/{sym}?range=2y&interval=1d"
 HOURLY_PATH = "/v8/finance/chart/{sym}?range=730d&interval=1h"
 MIN_DAILY = 30
@@ -285,8 +300,14 @@ def _default_opener(req: urllib.request.Request, timeout: float):  # pragma: no 
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def _fetch(path: str, now_ts: float, opener: Callable[..., Any],
-           sleep: Callable[[float], None]) -> List[Tuple[_dt.date, float]]:
+def _why(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    return ("HTTP %s" % code) if code else type(exc).__name__
+
+
+def _fetch(path: str, now_ts: float, opener: Callable[..., Any], sleep: Callable[[float], None],
+           notes: Optional[List[str]] = None) -> List[Tuple[_dt.date, float]]:
+    """1.0.1: `notes` collects, per host tried, why it gave no bars."""
     for host in YAHOO_HOSTS:
         req = urllib.request.Request("https://" + host + path,
                                      headers={"User-Agent": YAHOO_UA, "Accept": "application/json"})
@@ -295,7 +316,11 @@ def _fetch(path: str, now_ts: float, opener: Callable[..., Any],
                 bars = _bars(json.loads(resp.read().decode("utf-8", "replace")), now_ts)
             if bars:
                 return bars
+            if notes is not None:
+                notes.append("%s: no bars" % host.split(".")[0])
         except Exception as exc:  # noqa: BLE001
+            if notes is not None:
+                notes.append("%s: %s" % (host.split(".")[0], _why(exc)))
             if getattr(exc, "code", None) == 404:
                 return []
         sleep(1.0)
@@ -303,34 +328,41 @@ def _fetch(path: str, now_ts: float, opener: Callable[..., Any],
 
 
 def series(ysym: str, now_ts: float, opener: Callable[..., Any],
-           sleep: Callable[[float], None] = time.sleep) -> List[Tuple[_dt.date, float]]:
+           sleep: Callable[[float], None] = time.sleep,
+           notes: Optional[List[str]] = None) -> List[Tuple[_dt.date, float]]:
     """The completed daily closes of one reading; rebuilt from hourly bars when the daily answer is short."""
     sym = urllib.parse.quote(ysym, safe="")
-    daily = _fetch(DAILY_PATH.format(sym=sym), now_ts, opener, sleep)
+    daily = _fetch(DAILY_PATH.format(sym=sym), now_ts, opener, sleep, notes)
     if len(daily) >= MIN_DAILY:
         return daily
-    hourly = _fetch(HOURLY_PATH.format(sym=sym), now_ts, opener, sleep)
+    hourly = _fetch(HOURLY_PATH.format(sym=sym), now_ts, opener, sleep, notes)
     return hourly if len(hourly) > len(daily) else daily
 
 
 def read(now: Optional[_dt.datetime] = None, opener: Optional[Callable[..., Any]] = None,
          sleep: Callable[[float], None] = time.sleep,
-         markets: Sequence[str] = tuple(MARKETS)) -> Dict[str, Dict[str, Any]]:
-    """{market id: {"label", "day", "text", "metrics"}} for each market read; a market not read is left out."""
+         markets: Sequence[str] = tuple(MARKETS),
+         missing: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+    """{market id: {"label", "day", "text", "metrics"}} for each market read; a market not read is left out, and
+    (1.0.1) `missing` gets the reason for it."""
     now = now or _dt.datetime.now(UTC)
     opener = opener or _default_opener
     now_ts = now.timestamp()
     out: Dict[str, Dict[str, Any]] = {}
     vix_bars: Optional[List[Tuple[_dt.date, float]]] = None
+    why: Dict[str, str] = {}
     for mid in markets:
         if mid not in MARKETS:
             continue
+        notes: List[str] = []
         try:
-            bars = series(MARKETS[mid][0], now_ts, opener, sleep)
+            bars = series(MARKETS[mid][0], now_ts, opener, sleep, notes)
             if len(bars) < 2:
+                why[mid] = "; ".join(dict.fromkeys(notes)) or "no bars"
                 continue
             day = bars[-1][0]
             if (now.astimezone(UTC).date() - day).days > MAX_AGE_DAYS:
+                why[mid] = "last session %s is more than %d days old" % (day.isoformat(), MAX_AGE_DAYS)
                 continue
             vix = None
             if mid == "us":
@@ -340,16 +372,20 @@ def read(now: Optional[_dt.datetime] = None, opener: Optional[Callable[..., Any]
             m = metrics([c for _, c in bars], vix, mid)
             label = classify(m)
             if label is None:
+                why[mid] = "not enough closes for a label (%d)" % len(bars)
                 continue
             out[mid] = {"label": label, "day": day, "text": describe(mid, label, m, day), "metrics": m}
-        except Exception:  # noqa: BLE001 - one market never stops the others
+        except Exception as exc:  # noqa: BLE001 - one market never stops the others
+            why[mid] = _why(exc)
             continue
+    if missing is not None:
+        missing.update(why)
     return out
 
 
 # ------------------------------------------------------------------ the cache
 _LOCK = threading.Lock()
-_STATE: Dict[str, Any] = {"labels": {}, "read_at": {}, "attempt_at": None, "running": False}
+_STATE: Dict[str, Any] = {"labels": {}, "read_at": {}, "attempt_at": None, "running": False, "last": None}
 
 
 def ttl_sec() -> int:
@@ -361,13 +397,19 @@ def ttl_sec() -> int:
 
 
 def _refresh(opener: Optional[Callable[..., Any]], sleep: Callable[[float], None]) -> None:
+    missing: Dict[str, str] = {}
     try:
-        got = read(opener=opener, sleep=sleep)
+        got = read(opener=opener, sleep=sleep, missing=missing)
         now_ts = time.time()
         with _LOCK:
             for mid, info in got.items():
                 _STATE["labels"][mid] = info
                 _STATE["read_at"][mid] = now_ts
+            _STATE["last"] = {"at": now_ts, "read": sorted(got), "missing": dict(sorted(missing.items()))}
+    except Exception as exc:  # noqa: BLE001
+        with _LOCK:
+            _STATE["last"] = {"at": time.time(), "read": [], "missing": {"all": _why(exc)}}
+        raise
     finally:
         with _LOCK:
             _STATE["running"] = False
@@ -421,16 +463,26 @@ def set_labels(values: Dict[str, Dict[str, Any]], at: Optional[float] = None) ->
 def reset() -> None:
     with _LOCK:
         _STATE["labels"], _STATE["read_at"] = {}, {}
-        _STATE["attempt_at"], _STATE["running"] = None, False
+        _STATE["attempt_at"], _STATE["running"], _STATE["last"] = None, False, None
 
 
 def state() -> Dict[str, Any]:
-    """For the engine's gate report: what is known, from when."""
+    """For the engine's gate report: what is known, from when - {market id: {"label", "day", "age_min"}} and, once
+    a read has been tried, "_read": {"ago_min", "read", "missing", "running"}. 1.0.1: it also starts a refresh when
+    one is due (in the background: it never waits), so a worker reads at its first health line."""
     try:
+        labels()
         now_ts = time.time()
         with _LOCK:
-            return {mid: {"label": info.get("label"), "day": str(info.get("day")),
-                          "age_min": int((now_ts - _STATE["read_at"].get(mid, now_ts)) / 60)}
-                    for mid, info in _STATE["labels"].items()}
+            out: Dict[str, Any] = {mid: {"label": info.get("label"), "day": str(info.get("day")),
+                                         "age_min": int((now_ts - _STATE["read_at"].get(mid, now_ts)) / 60)}
+                                   for mid, info in _STATE["labels"].items()}
+            last = _STATE["last"]
+            if last is not None or _STATE["running"]:
+                out["_read"] = {"ago_min": int((now_ts - last["at"]) / 60) if last else None,
+                                "read": list(last["read"]) if last else [],
+                                "missing": dict(last["missing"]) if last else {},
+                                "running": bool(_STATE["running"])}
+            return out
     except Exception:  # noqa: BLE001
         return {}

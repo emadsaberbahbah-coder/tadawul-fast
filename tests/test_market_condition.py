@@ -20,6 +20,9 @@ M6  labels: the cache - installed labels are served without a refresh, a
     stale market drops out, a blocking refresh fills it, TTL parsing, never
     raises; describe() text.
 M7  version, manifest pin, stdlib only, nothing started at import.
+M8  (1.0.1) state() starts a due read without waiting and reports the last one: when, which markets were read,
+    why each other one was not (HTTP status per host, no bars, too old, too few closes, a fault); the browser
+    User-Agent.
 """
 import datetime as dt
 import io
@@ -368,7 +371,7 @@ def test_m6_background_refresh_and_spawn_fault(monkeypatch):
 def test_m6_blocking_refresh_and_ttl(monkeypatch):
     calls = []
 
-    def fake_read(opener=None, sleep=None):
+    def fake_read(opener=None, sleep=None, missing=None):
         calls.append(1)
         return {"sa": {"label": "drawdown", "day": dt.date(2026, 11, 20), "text": "t", "metrics": {}}}
 
@@ -380,7 +383,7 @@ def test_m6_blocking_refresh_and_ttl(monkeypatch):
         monkeypatch.setenv("TFB_MARKET_CONDITION_TTL_SEC", raw)
         assert mc.ttl_sec() == want, raw
 
-    def boom(opener=None, sleep=None):
+    def boom(opener=None, sleep=None, missing=None):
         raise RuntimeError("down")
 
     mc.reset()
@@ -405,9 +408,9 @@ def test_m6_describe():
 
 # ---------------------------------------------------------------- M7
 def test_m7_version_pin_and_import_hygiene():
-    assert mc.__version__ == "1.0.0"
+    assert mc.__version__ == "1.0.1"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.market_condition", "__version__", "1.0.0", "market condition"),' in vd
+    assert '("core.market_condition", "__version__", "1.0.1", "market condition"),' in vd
     src = (_REPO / "core" / "market_condition.py").read_text(encoding="utf-8")
     import ast
     tree = ast.parse(src)
@@ -424,3 +427,47 @@ def test_m7_version_pin_and_import_hygiene():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------- M8 (1.0.1)
+def test_m8_state_warms_the_read_and_reports_it(monkeypatch):
+    started = []
+    monkeypatch.setattr(mc, "_spawn", lambda target, args: started.append(target))
+    assert mc.state() == {"_read": {"ago_min": None, "read": [], "missing": {}, "running": True}}
+    assert started == [mc._refresh], "the first health line starts the read"
+    assert "_read" in mc.state() and started == [mc._refresh], "one read at a time"
+    mc.reset()
+    now = dt.datetime.now(UTC)
+    last = now.date() - dt.timedelta(days=1)
+    fake = full_fake(last=last, drop=[("^HSI", "1d")])
+    fake.answers[("^N225", "1d")] = payload(daily_rows(wave(300), last - dt.timedelta(days=12), hour=0))
+    fake.answers[("^STOXX", "1d")] = payload(daily_rows(wave(40), last, hour=8))
+    monkeypatch.setattr(mc, "_default_opener", fake)
+    mc.labels(blocking=True, sleep=lambda s: None)
+    st = mc.state()
+    assert st["_read"]["read"] == ["sa", "us"] and st["_read"]["running"] is False and st["_read"]["ago_min"] == 0
+    miss = st["_read"]["missing"]
+    assert miss["cn"] == "query1: HTTP 404", miss                                # a 404 ends the host ladder
+    assert miss["jp"].startswith("last session ") and miss["jp"].endswith("is more than 7 days old")
+    assert miss["eu"] == "not enough closes for a label (40)"
+    assert st["us"]["label"] == "calm" and st["sa"]["age_min"] == 0
+
+
+def test_m8_notes_per_host_and_faults():
+    notes = []
+    fake = FakeYahoo({}, fail_hosts={"query1.finance.yahoo.com", "query2.finance.yahoo.com"})
+    assert mc.series("SPY", 0, fake, sleep=lambda s: None, notes=notes) == []
+    assert notes == ["query1: OSError", "query2: OSError", "query1: OSError", "query2: OSError"]
+    empty = {"chart": {"result": [{"meta": {}, "timestamp": [], "indicators": {"quote": [{"close": []}]}}]}}
+    notes = []
+    assert mc.series("SPY", 0, FakeYahoo({("SPY", "1d"): empty, ("SPY", "1h"): empty}), sleep=lambda s: None,
+                     notes=notes) == []
+    assert notes == ["query1: no bars", "query2: no bars", "query1: no bars", "query2: no bars"]
+    missing = {}
+    now = dt.datetime(2026, 11, 21, 12, tzinfo=UTC)
+    assert mc.read(now=now, opener=lambda req, timeout: 1 / 0, sleep=lambda s: None, missing=missing) == {}
+    assert missing == {m: "query1: ZeroDivisionError; query2: ZeroDivisionError" for m in mc.MARKETS}
+    req_seen = []
+    mc._fetch("/v8/finance/chart/SPY?range=2y&interval=1d", 0, lambda req, t: req_seen.append(req) or 1 / 0,
+              lambda s: None)
+    assert req_seen and req_seen[0].get_header("User-agent") == mc.YAHOO_UA and "Chrome/" in mc.YAHOO_UA
