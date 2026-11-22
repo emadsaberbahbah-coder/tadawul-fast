@@ -366,3 +366,52 @@ def test_workflow_schedules_the_renewal_and_gates_the_automatic_merge():
     # the token reaches one step of the one job that may write, and no other
     assert text.count("secrets.TFB_RENEWAL_TOKEN") == 2
     assert publish["permissions"] == {"contents": "write", "pull-requests": "write"}
+
+
+# T18 (Codex P2 on #1055): an earlier renewal still open is carried into the new one before it is closed
+def _reg(*bindings):
+    return {"schema": "tfb.verified-name-labels/v1", "label_only": True, "current_authority_only": True, "bindings": list(bindings)}
+
+
+def _bind(symbol, reviewed, name="Acme Corp"):
+    at = datetime.fromisoformat(reviewed)
+    return {"page": "Global_Markets", "symbol": symbol, "name": name, "reviewed_at_utc": at.isoformat(),
+            "expires_at_utc": (at + timedelta(days=7)).isoformat(), "sources": [], "review_receipt_sha256": "x"}
+
+
+def test_carrying_an_earlier_renewal_keeps_what_this_run_held():
+    old, sun, tue = "2026-11-08T21:40:00+00:00", "2026-11-15T21:40:00+00:00", "2026-11-17T21:40:00+00:00"
+    main = _reg(_bind("A.US", old), _bind("B.US", old), _bind("C.US", old))
+    sunday = _reg(_bind("A.US", sun), _bind("B.US", sun), _bind("C.US", old))     # the earlier, unmerged renewal
+    tuesday = _reg(_bind("A.US", old), _bind("B.US", tue), _bind("C.US", old))    # this run: A.US held (a source failed)
+    merged, first = renew.apply_renewal(main, tuesday)
+    assert first["applied"] == ["Global_Markets|B.US"]
+    stamps = lambda reg: {b["symbol"]: b["reviewed_at_utc"] for b in reg["bindings"]}
+    assert stamps(merged) == {"A.US": old, "B.US": tue, "C.US": old}              # A.US would stay expired
+    carried, second = renew.apply_renewal(merged, sunday)
+    assert second["applied"] == ["Global_Markets|A.US"]                           # only what this run did not renew
+    assert stamps(carried) == {"A.US": sun, "B.US": tue, "C.US": old}             # B.US keeps the newer review
+    assert second["kept"] == {"Global_Markets|B.US": "not_newer", "Global_Markets|C.US": "not_newer"}
+    # a caption that changed on the default branch is never carried
+    renamed = _reg(_bind("A.US", old, name="Acme Holdings"), _bind("B.US", old), _bind("C.US", old))
+    assert renew.apply_renewal(renamed, sunday)[1]["kept"]["Global_Markets|A.US"] == "caption_changed_since_renewal"
+
+
+def test_workflow_carries_earlier_renewals_before_it_closes_them():
+    import yaml
+    from pathlib import Path
+    text = (Path(renew.__file__).resolve().parents[1] / ".github" / "workflows" / "name_label_renewal.yml").read_text(encoding="utf-8")
+    run = yaml.safe_load(text)["jobs"]["publish-renewal"]["steps"][-1]["run"]
+    carry = run.index('--apply-renewal "older_${N}.json"')
+    assert run.index('--apply-renewal "$NEW"') < carry < run.index('git switch -c "$BR"')      # carried before the commit
+    assert 'git fetch -q origin "refs/heads/${HEAD}"' in run and 'git show "FETCH_HEAD:${REG}"' in run
+    assert "(.isCrossRepository | not)" in run                                    # same-repository branches only
+    # closed only when read, applied (exit 0 or 3) and nothing but the registry changes
+    assert "for N in $COVERED; do" in run and "for N in $OLDER" not in run
+    assert run.count('COVERED="$COVERED $N"') == 1
+    cover = run.index('COVERED="$COVERED $N"')
+    assert run.index('if [[ "$ccode" -ne 0 && "$ccode" -ne 3 ]]; then') < run.index('elif [[ "$FILES" != "$REG" ]]; then') < cover
+    assert run.index("could not be read; it stays open") < carry
+    assert cover < run.index('git push -q origin "$BR"') < run.index("for N in $COVERED; do")  # closed after the push
+    assert 'carried from earlier renewals still open' in run
+

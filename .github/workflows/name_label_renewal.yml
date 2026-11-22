@@ -11,6 +11,14 @@
 #      as a READY pull request. A dispatched renewal still opens a draft.
 #   2. An earlier renewal pull request that is still open is closed as
 #      superseded when a newer one opens, so one renewal waits at a time.
+#      Its renewals are carried into the new one first: a run can hold a
+#      binding it renewed last time (a source that fails for a day), and
+#      closing the earlier pull request would otherwise throw that still
+#      valid renewal away (Codex P2 on #1055). Carrying uses the same
+#      --apply-renewal rule (unchanged caption, strictly newer review). An
+#      earlier pull request is closed only when its branch was read and
+#      applied and it changes nothing but the registry; otherwise it stays
+#      open.
 #   3. Optional hands-free merge. It needs three things, all the owner's:
 #        a. the repository secret TFB_RENEWAL_TOKEN - a fine-grained token
 #           for this repository only (Contents and Pull requests: read and
@@ -260,6 +268,44 @@ jobs:
           PY
           )
           read -r APPLIED KEPT <<< "$COUNTS"
+          # 1.2.0: renewals still open from earlier runs are superseded by this one - after their
+          # renewals are carried into it. A binding this run held may have been renewed by the earlier
+          # run, and that renewal is still valid; --apply-renewal takes it only where the caption is
+          # unchanged and its review is newer than what this registry now holds. Same-repository
+          # branches only. An earlier pull request is closed below only if it is listed in COVERED.
+          OLDER=$(gh pr list --state open --base "${{ github.event.repository.default_branch }}" \
+                    --json number,headRefName,isCrossRepository \
+                    --jq '.[] | select((.headRefName | startswith("name-label-renewal/")) and (.isCrossRepository | not)) | "\(.number) \(.headRefName)"' || true)
+          COVERED=""
+          CARRIED=0
+          while read -r N HEAD; do
+            [[ -n "${N:-}" ]] || continue
+            if ! git fetch -q origin "refs/heads/${HEAD}" || ! git show "FETCH_HEAD:${REG}" > "older_${N}.json" 2>/dev/null; then
+              echo "::warning::Earlier renewal #${N} could not be read; it stays open."
+              continue
+            fi
+            ccode=0
+            python scripts/renew_verified_name_labels.py --registry "$REG" \
+              --apply-renewal "older_${N}.json" --report "carry_${N}.json" || ccode=$?
+            # A pull request that changes anything besides the registry (a fix someone added to it)
+            # is never closed by this job: only its renewals are carried.
+            FILES=$(gh pr view "$N" --json files --jq '[.files[].path] | join(",")' || echo "?")
+            if [[ "$ccode" -eq 0 ]]; then
+              K=$(python -c "import json,sys; r=json.load(open(sys.argv[1])); a=r.get('applied'); print(len(a) if isinstance(a, list) else int(a or 0))" "carry_${N}.json")
+              CARRIED=$((CARRIED + K))
+              echo "::notice::Carried ${K} renewal(s) from the earlier renewal #${N}."
+            fi
+            if [[ "$ccode" -ne 0 && "$ccode" -ne 3 ]]; then
+              # The script writes the registry only after the merged file passed the production loader,
+              # so a refused carry leaves this registry as it was.
+              echo "::warning::Earlier renewal #${N} could not be applied (exit ${ccode}); it stays open."
+            elif [[ "$FILES" != "$REG" ]]; then
+              echo "::warning::Earlier renewal #${N} changes more than ${REG}; its renewals are carried and it stays open."
+            else
+              COVERED="$COVERED $N"       # exit 3 = nothing in it is newer than this registry
+            fi
+          done <<< "$OLDER"
+          rm -f older_*.json carry_*.json
           if git diff --quiet -- "$REG"; then
             echo "::notice::The merged registry is identical to the default branch; nothing to publish."
             exit 0
@@ -277,6 +323,7 @@ jobs:
             echo
             echo "- renewed: ${APPLIED}"
             echo "- kept unchanged (held, caption changed upstream, or not newer): ${KEPT}"
+            echo "- carried from earlier renewals still open (renewed there, held by this run): ${CARRIED}"
             echo
             echo "Every renewed binding was re-captured from its own public sources and re-checked by"
             echo "scripts/renew_verified_name_labels.py, then merged binding by binding into this default"
@@ -288,10 +335,6 @@ jobs:
           # a dispatched one stays a draft, as in 1.1.0.
           DRAFT="--draft"
           if [[ "$SCHEDULED" == "1" ]]; then DRAFT=""; fi
-          # 1.2.0: renewals still open from earlier runs are superseded by this one.
-          OLDER=$(gh pr list --state open --base "${{ github.event.repository.default_branch }}" \
-                    --json number,headRefName \
-                    --jq '.[] | select(.headRefName | startswith("name-label-renewal/")) | .number' || true)
           PR_OPEN=0
           if gh pr create $DRAFT --base "${{ github.event.repository.default_branch }}" --head "$BR" \
                --title "Renew verified name captions (${APPLIED} renewed, ${KEPT} kept)" \
@@ -303,9 +346,11 @@ jobs:
           else
             echo "::warning::Branch ${BR} is pushed but the PR could not be opened: this repository does not let Actions open pull requests. Open it from the branch, or set the secret TFB_RENEWAL_TOKEN."
           fi
-          for N in $OLDER; do
+          # Only the earlier renewals whose content this branch now holds (COVERED), and only once this
+          # branch is pushed (it is, above).
+          for N in $COVERED; do
             gh pr close "$N" --delete-branch \
-              --comment "Superseded by the renewal of run ${GITHUB_RUN_ID} (${BR})." \
+              --comment "Superseded by the renewal of run ${GITHUB_RUN_ID} (${BR}), which carries this one's renewals." \
               || echo "::warning::Could not close the superseded renewal #${N}."
           done
           # 1.2.0: hands-free merge only when the owner switched it on - and only through the

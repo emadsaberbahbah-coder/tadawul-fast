@@ -30,6 +30,10 @@
 **.github/workflows/name_label_renewal.yml 1.2.0**
 
 - A second schedule renews three times a week (Sun, Tue, Thu 21:40 UTC) and opens a ready pull request; an older renewal pull request still open is closed as superseded.
+- Before an older renewal is closed, its renewals are carried into the new one (review finding, Codex P2 on #1055, fourth commit). A run can hold a binding it renewed last time, when a source fails for a day; closing the older pull request would throw that still-valid renewal away.
+  - Carrying uses the same `--apply-renewal` rule: unchanged caption, strictly newer review.
+  - An older pull request is closed only when its branch was read and applied and it changes nothing but the registry. Otherwise it stays open and the run says why.
+  - Simulated locally with a stub repository: this run held 2 bindings the older renewal had; both were carried; a pull request with an extra file stayed open; an unreadable one stayed open.
 - Hands-free merge, only through the pull request and its required checks. It needs three things, all the owner's:
   - the repository secret `TFB_RENEWAL_TOKEN`: a fine-grained token for this repository only (Contents and Pull requests: read and write). The job opens the pull request with it;
   - the repository setting "Allow auto-merge";
@@ -47,7 +51,7 @@
 ## Evidence
 
 - `python scripts/audit_provider_target_coverage.py --selftest`: 18 of 18.
-- `tests/test_workflow_audit_repairs.py`: 5 new lifecycle tests. `tests/test_renew_verified_name_labels.py`: T13 to T17.
+- `tests/test_workflow_audit_repairs.py`: 5 new lifecycle tests. `tests/test_renew_verified_name_labels.py`: T13 to T18 (30 tests).
 - On the shipped registry today: `--check` reports 122 open and 6 held acknowledged (exit 1 until the renewal #1057 is merged).
 - `python scripts/audit_repository_workflows.py`: errors=0 warnings=0.
 
