@@ -2,7 +2,7 @@
 # scripts/archive_options_reading.py
 """
 ================================================================================
-TFB Options Reading - v1.0.0 (22 Nov 2026) - what the options market says about a stock
+TFB Options Reading - v1.0.1 (22 Nov 2026) - what the options market says about a stock
 ================================================================================
 WHY (owner, 22 Nov 2026 19:53 Riyadh): "I need to add how future options and
 other options affect the current price and recommendations, as well we can
@@ -17,6 +17,13 @@ expects the price to travel to an expiry (earnings in particular). Whether
 those findings hold for TFB's names is for TFB's own record to show:
 v_options_reading and v_driver_learning (views 1.23.0) score every reading
 against the next week and month, observe-only.
+
+v1.0.1 (22 Nov 2026, the first written run): every one of 935 chains failed
+from the GitHub runner and the log could not say why. The request now looks
+like the browser call Cboe's own quote pages make (a browser User-Agent,
+Accept JSON, Origin and Referer www.cboe.com), and a failed run counts its
+misses by reason (http 403, http 404, other http, network, unreadable) -
+counts only, never a symbol.
 
 WHAT: once a day after the US close, for the US stocks TFB follows (the
 largest by market value, every name the engine rates INVESTABLE or a buy, and
@@ -82,12 +89,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 TABLE = "options_daily"
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
 FINRA_URL = "https://cdn.finra.org/equity/regsho/daily/CNMSshvol{ymd}.txt"
-UA = "Mozilla/5.0 (compatible; TFB-options-reading/1.0)"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/131.0.0.0 Safari/537.36")
+CBOE_HEADERS = {"Accept": "application/json, text/plain, */*", "Origin": "https://www.cboe.com",
+                "Referer": "https://www.cboe.com/", "Accept-Language": "en-US,en;q=0.9"}
 DEFAULT_MAX = 900
 WORKERS = 6
 # ETFs read every day: the market, its sectors and the assets the readings use
@@ -310,7 +320,10 @@ def parse_finra(text: str) -> Dict[str, Tuple[float, float]]:
 
 # --------------------------------------------------------------------- network
 def _default_get(url: str, timeout: float = 45.0) -> bytes:  # pragma: no cover - network
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip"})
+    headers = {"User-Agent": UA, "Accept-Encoding": "gzip"}
+    if "cboe.com" in url:
+        headers.update(CBOE_HEADERS)
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
         return gzip.decompress(raw) if r.headers.get("Content-Encoding") == "gzip" else raw
@@ -321,14 +334,31 @@ def cboe_symbol(ticker: str) -> str:
     return ticker.replace(".", "").replace("-", "").upper()
 
 
-def read_chain(ticker: str, get: Callable[[str], bytes], sleep: Callable[[float], None]) -> Optional[Dict[str, Any]]:
+def miss_reason(exc: BaseException) -> str:
+    """Why one chain could not be read, in a word the log can count (never the symbol)."""
+    code = getattr(exc, "code", None)
+    text = str(exc)
+    if isinstance(code, int) or re.search(r"HTTP Error \d{3}", text):
+        n = code if isinstance(code, int) else int(re.search(r"HTTP Error (\d{3})", text).group(1))
+        return f"http {n}" if n in (403, 404, 429) else "other http"
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "unreadable"
+    return "network"
+
+
+def read_chain(ticker: str, get: Callable[[str], bytes], sleep: Callable[[float], None],
+               misses: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    why = "network"
     for attempt in range(2):
         try:
             return chain_features(json.loads(get(CBOE_URL.format(sym=cboe_symbol(ticker)))), cboe_symbol(ticker))
         except Exception as exc:  # noqa: BLE001 - one name never stops the others
-            if "404" in str(exc) or "403" in str(exc):
-                return None
+            why = miss_reason(exc)
+            if why in ("http 403", "http 404"):
+                break
             sleep(2.0 * (attempt + 1))
+    if misses is not None:
+        misses.append(why)
     return None
 
 
@@ -532,8 +562,9 @@ def run(session: Any, *, project: str, dataset: str, location: str, names: Seque
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
     chains: Dict[str, Optional[Dict[str, Any]]] = {}
+    misses: List[str] = []
     with _cf.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futs = {pool.submit(read_chain, ticker_of(s), get, sleep): s for s, _ in names}
+        futs = {pool.submit(read_chain, ticker_of(s), get, sleep, misses): s for s, _ in names}
         for fut in _cf.as_completed(futs):
             try:
                 chains[futs[fut]] = fut.result()
@@ -548,6 +579,11 @@ def run(session: Any, *, project: str, dataset: str, location: str, names: Seque
     summary = (f"{got}/{len(names)} chains read; {len(rows)} rows for {day or '-'}"
                + (f"; {other} left out (another day)" if other else "")
                + f"; FINRA short volume for {with_short} ({finra_day or 'no file found'})")
+    if misses:
+        counts: Dict[str, int] = {}
+        for m in misses:
+            counts[m] = counts.get(m, 0) + 1
+        summary += "; misses: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     if got < len(names) / 2 or not rows:
         print(f"[options_reading v{__version__}] FAILED: {summary}")
         return 1
