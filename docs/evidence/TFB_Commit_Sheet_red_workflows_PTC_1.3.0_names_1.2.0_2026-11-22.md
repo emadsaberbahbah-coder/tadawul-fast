@@ -30,7 +30,8 @@
 **.github/workflows/name_label_renewal.yml 1.2.0**
 
 - A second schedule renews three times a week (Sun, Tue, Thu 21:40 UTC) and opens a ready pull request; an older renewal pull request still open is closed as superseded.
-- With the repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`, the job squash-merges its own pull request after checking that it changes only the registry file. Unset, nothing merges without a person.
+- With the repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`, the job merges its own renewal after checking that it changes only the registry file. Unset, nothing merges without a person.
+- This repository does not let GitHub Actions open pull requests: run 45013078813 pushed its branch and the pull request (#1057) was opened by hand. So when no pull request can be opened and the Variable is on, the job merges the review branch through the merges API and deletes it. With the Variable unset, the branch waits and the run says so.
 
 **.github/workflows/provider_target_coverage.yml 1.2.0, workflow_repair_tests.yml**: map `TFB_PTC_STALE_REVERIFY` (default 1).
 
@@ -38,12 +39,12 @@
 
 - `python scripts/audit_provider_target_coverage.py --selftest`: 18 of 18.
 - `tests/test_workflow_audit_repairs.py`: 5 new lifecycle tests. `tests/test_renew_verified_name_labels.py`: T13 to T17.
-- On the shipped registry today: `--check` reports 122 open and 6 held acknowledged (exit 1 until the renewal of run 45013078813 is merged).
+- On the shipped registry today: `--check` reports 122 open and 6 held acknowledged (exit 1 until the renewal #1057 is merged).
 - `python scripts/audit_repository_workflows.py`: errors=0 warnings=0.
 
 ## What the owner does
 
-1. Merge this pull request, and the renewal pull request opened by run 45013078813.
-2. Optional, for a hands-free renewal: repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`.
+1. Merge this pull request, and the renewal pull request #1057 (run 45013078813).
+2. For a hands-free renewal: repository Variable `TFB_NAME_RENEWAL_AUTOMERGE = on`. Without it, each scheduled renewal leaves a branch that needs its pull request opened and merged within about two days.
 
 Expected after the merge: the next scheduled Provider Target Coverage run (06:20 UTC) passes with `BASELINE_STALE_REVERIFIED`; the name check passes once the renewal is merged.

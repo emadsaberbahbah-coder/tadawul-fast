@@ -12,11 +12,15 @@
 #   2. An earlier renewal pull request that is still open is closed as
 #      superseded when a newer one opens, so one renewal waits at a time.
 #   3. Optional hands-free merge: with the repository Variable
-#      TFB_NAME_RENEWAL_AUTOMERGE = on, the job squash-merges its own pull
-#      request. The merge is safe to automate because --apply-renewal changes
-#      one file and can only re-stamp a caption that is byte-identical on the
-#      default branch, and the merged file has passed the production loader.
-#      Unset (the default), nothing merges without a person.
+#      TFB_NAME_RENEWAL_AUTOMERGE = on, the job merges its own renewal. The
+#      merge is safe to automate because --apply-renewal changes one file and
+#      can only re-stamp a caption that is byte-identical on the default
+#      branch, and the merged file has passed the production loader.
+#      This repository does not let Actions open pull requests (the run of
+#      22 Nov pushed its branch and stopped there), so when no pull request
+#      could be opened the job merges the review branch itself, through the
+#      merges API, and deletes it. Unset (the default), nothing merges
+#      without a person: the branch waits for someone to open its pull request.
 #   4. renew_verified_name_labels 1.2.0: bindings listed in
 #      data/verified_name_labels_held.json no longer fail the daily check
 #      (they stay expired; see the script header).
@@ -278,13 +282,14 @@ jobs:
           OLDER=$(gh pr list --state open --base "${{ github.event.repository.default_branch }}" \
                     --json number,headRefName \
                     --jq '.[] | select(.headRefName | startswith("name-label-renewal/")) | .number' || true)
+          PR_OPEN=0
           if gh pr create $DRAFT --base "${{ github.event.repository.default_branch }}" --head "$BR" \
                --title "Renew verified name captions (${APPLIED} renewed, ${KEPT} kept)" \
                --body-file pr_body.md; then
+            PR_OPEN=1
             echo "::notice::Pull request opened from ${BR}."
           else
             echo "::warning::Branch ${BR} is pushed but the PR could not be opened (the repository may forbid Actions-created PRs); open it from the branch."
-            exit 0
           fi
           for N in $OLDER; do
             gh pr close "$N" --delete-branch \
@@ -298,10 +303,24 @@ jobs:
               echo "::warning::The renewal branch changes more than ${REG}; left for review."
               exit 0
             fi
-            if [[ -n "$DRAFT" ]]; then gh pr ready "$BR" || true; fi
-            if gh pr merge "$BR" --squash --delete-branch; then
-              echo "::notice::Renewal merged (TFB_NAME_RENEWAL_AUTOMERGE=on): ${APPLIED} renewed, ${KEPT} kept."
+            if [[ "$PR_OPEN" == "1" ]]; then
+              if [[ -n "$DRAFT" ]]; then gh pr ready "$BR" || true; fi
+              if gh pr merge "$BR" --squash --delete-branch; then
+                echo "::notice::Renewal merged (TFB_NAME_RENEWAL_AUTOMERGE=on): ${APPLIED} renewed, ${KEPT} kept."
+              else
+                echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but the merge was refused; the pull request stays open."
+              fi
+            # No pull request could be opened: merge the review branch itself. Same one-file
+            # check above; the merges API refuses anything that does not merge cleanly.
+            elif gh api -X POST "repos/${GITHUB_REPOSITORY}/merges" \
+                   -f base="${{ github.event.repository.default_branch }}" -f head="$BR" \
+                   -f commit_message="Renew verified name captions: ${APPLIED} renewed, ${KEPT} kept (run ${GITHUB_RUN_ID})" \
+                   --silent; then
+              git push -q origin --delete "$BR" || true
+              echo "::notice::Renewal merged without a pull request (TFB_NAME_RENEWAL_AUTOMERGE=on): ${APPLIED} renewed, ${KEPT} kept."
             else
-              echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but the merge was refused; the pull request stays open."
+              echo "::warning::TFB_NAME_RENEWAL_AUTOMERGE=on but the merge was refused; branch ${BR} waits for a pull request."
             fi
+          elif [[ "$PR_OPEN" == "0" ]]; then
+            echo "::warning::Renewal branch ${BR} waits: open its pull request and merge it, or set TFB_NAME_RENEWAL_AUTOMERGE=on."
           fi

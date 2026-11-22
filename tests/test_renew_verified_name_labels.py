@@ -351,3 +351,8 @@ def test_workflow_schedules_the_renewal_and_gates_the_automatic_merge():
     assert 'git push -q origin "$BR"' in run and "git push origin main" not in run and "--force" not in run
     assert 'startswith("name-label-renewal/")' in run and "gh pr close" in run
     assert 'if [[ "$CHANGED" != "$REG" ]]' in run
+    # the repository forbids Actions-created pull requests: the gated merge then goes through the merges API
+    gate = run.index('"${AUTOMERGE,,}" == "on"')
+    assert run.index('repos/${GITHUB_REPOSITORY}/merges') > gate and run.index('if [[ "$CHANGED" != "$REG" ]]') > gate
+    assert run.index('if [[ "$CHANGED" != "$REG" ]]') < run.index('repos/${GITHUB_REPOSITORY}/merges')
+    assert "PR_OPEN=0" in run and 'elif [[ "$PR_OPEN" == "0" ]]' in run
