@@ -24,6 +24,8 @@
   X19 (1.6.0) [MARKET-TURN]: the gate and its labels; which holdings carry a market label; observe = a note, the
       action unchanged; on = SELL; off = nothing read; the Market ledger column and a 1.5.0 ledger read as before;
       the page rule line and summary; the workflow knobs
+  X20 (1.6.1) [LOG-PRIVACY]: on GitHub Actions the run log names no holding, price or pick; elsewhere, and with
+      TFB_EXIT_LOG_DETAIL=on, the full lines; the page, the ledger and the e-mail are unchanged
 
 Run: pytest -q tests/test_exit_plan.py
 """
@@ -77,6 +79,7 @@ def _env(monkeypatch):
         if name.startswith("TFB_EXIT_"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    monkeypatch.setenv("TFB_EXIT_LOG_DETAIL", "on")         # 1.6.1: the suite reads the detailed lines (X20: the rest)
 
 
 def lv(bars, entry=100.0, entry_date=None, info=None, prev=None, sym="AAA.US"):
@@ -991,8 +994,8 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.6.0"                                                 # 2026-11-21: 1.6.0
-    assert '("exit_plan", "1.6.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.6.1"                                                 # 2026-11-22: 1.6.1
+    assert '("exit_plan", "1.6.1", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])
@@ -1140,3 +1143,45 @@ def test_x19_workflow_knobs():
     assert step["env"]["TFB_EXIT_MARKET_TURN_LABELS"] == \
         "${{ vars.TFB_EXIT_MARKET_TURN_LABELS || 'weak,stress,drawdown,crash_day' }}"
     assert ep.MARKET_TURN_LABELS_DEFAULT == "weak,stress,drawdown,crash_day"
+
+
+# ----------------------------------------------------------------------------- X20 (1.6.1 [LOG-PRIVACY])
+def test_x20_the_run_log_names_no_holding_on_actions(monkeypatch, capsys):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_MAIL", "1")
+    monkeypatch.delenv("TFB_EXIT_LOG_DETAIL")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert ep.log_detail() is False
+    sent = []
+    b = wbook()
+    assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a), market=CRASH) == 0
+    out = capsys.readouterr().out
+    for word in ("DDI", "GONE", "5023", "TEN", "110.00", "100.00", "DoubleDown"):
+        assert word not in out, word
+    assert re.search(r"holding \d of 3: TAKE PROFIT \(market not calm\)", out)
+    assert "plan pick 1 of 1: levels computed" in out
+    assert "e-mail sent: TFB Exit Plan 2026-11-11 - 2 actions" in out
+    assert sent and "DDI.US" in sent[-1][0], "the e-mail itself is unchanged"
+    page = _page(b)
+    assert "DDI.US" in page and "market not calm (observe)" in page, "the page is unchanged"
+    assert b.tabs["_Exit_Plan"].values[1][2] == "DDI.US", "the ledger is unchanged"
+    assert ep.run(True, False, book=wbook(), now=NOW, opener=opener, market=CRASH) == 0
+    out = capsys.readouterr().out
+    assert "dry run - nothing written, nothing sent | TFB Exit Plan 2026-11-11 - 2 actions" in out and "DDI" not in out
+
+
+def test_x20_detail_elsewhere_and_by_choice(monkeypatch, capsys):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.delenv("TFB_EXIT_LOG_DETAIL")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert ep.log_detail() is True                                                   # a local run: the full lines
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    for raw, want in (("on", True), ("1", True), ("off", False), ("auto", False), ("", False), ("maybe", False)):
+        monkeypatch.setenv("TFB_EXIT_LOG_DETAIL", raw)
+        assert ep.log_detail() is want, raw
+    monkeypatch.setenv("TFB_EXIT_LOG_DETAIL", "on")
+    assert ep.run(True, False, book=wbook(), now=NOW, opener=opener, market=CRASH) == 0
+    out = capsys.readouterr().out
+    assert "DDI.US    TAKE PROFIT" in out and "PICK TEN.US" in out
+    wf = (ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_EXIT_LOG_DETAIL" not in wf, "the workflow keeps the default: no detail on Actions"

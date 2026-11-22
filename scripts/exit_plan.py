@@ -2,7 +2,19 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.6.0 (2026-11-21) - first written 2026-11-11 (1.0.0)
+VERSION 1.6.1 (2026-11-22) - first written 2026-11-11 (1.0.0)
+1.6.1 (2026-11-22): THE RUN LOG NAMES NO HOLDING (the owner's standing rule:
+    "Repo logs are public: no amounts, quantities, account numbers or
+    holdings' symbols in run logs"). Since 1.0.0 every run printed one line
+    per holding - its symbol, last close, stop, target and reasons - and the
+    plan picks with their levels, into the GitHub Actions log of a public
+    repository; the e-mail subject printed there named the holdings with an
+    action. Seen on the first 1.6.0 run (22 Nov 06:10 UTC). Now, on GitHub
+    Actions, each holding prints as "holding 3 of 8: HOLD (market not calm)",
+    each pick as "plan pick 1 of 2: levels computed", and the subject as its
+    count of actions; the page, the ledger and the e-mail are unchanged.
+    Gate: TFB_EXIT_LOG_DETAIL = auto (default: no detail on GitHub Actions,
+    the full lines elsewhere) | on | off.
 1.6.0 (2026-11-21): A HOLDING WHOSE MARKET IS NOT CALM IS FLAGGED FOR SALE
     (owner, 21 Nov 22:45 Riyadh: "in the crash phase I think the system had
     better say sell before the loss, and also wait for the better time to
@@ -208,7 +220,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -256,6 +268,17 @@ def _env_num(name: str, default: float, lo: float, hi: float) -> float:
 def mode() -> str:
     v = _env("TFB_EXIT_PLAN", "off").lower()
     return v if v in ("off", "observe", "on") else "off"
+
+
+def log_detail() -> bool:
+    """1.6.1: may the run log name holdings and their levels? TFB_EXIT_LOG_DETAIL = on | off | auto (default:
+    not on GitHub Actions, whose logs are public for this repository)."""
+    v = _env("TFB_EXIT_LOG_DETAIL", "auto").lower()
+    if v in ("on", "1", "true", "yes"):
+        return True
+    if v in ("off", "0", "false", "no"):
+        return False
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
 
 
 def market_turn_mode() -> str:
@@ -1207,18 +1230,29 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
     turned = sum(1 for r in results if r.get("market_turned"))
     if turned and k["market_turn"] == "observe":                                       # 1.6.0 [MARKET-TURN]
         info["summary"] += " · market not calm: %d holding%s (observe)" % (turned, "" if turned == 1 else "s")
-    for r in results:
-        _out("%-9s %-11s last %s stop %s (was %s) target %s | %s" % (
-            r["symbol"], r["action"], fmt(r.get("last")), fmt(r.get("stop")), fmt(r.get("prev_stop")),
-            fmt(r.get("target")), "; ".join(r["why"])))
-    for p in picks:
+    detail = log_detail()                                                              # 1.6.1 [LOG-PRIVACY]
+    for i, r in enumerate(results, 1):
+        if detail:
+            _out("%-9s %-11s last %s stop %s (was %s) target %s | %s" % (
+                r["symbol"], r["action"], fmt(r.get("last")), fmt(r.get("stop")), fmt(r.get("prev_stop")),
+                fmt(r.get("target")), "; ".join(r["why"])))
+        else:
+            _out("holding %d of %d: %s%s" % (i, len(results), r["action"],
+                                             " (market not calm)" if r.get("market_turned") else ""))
+    for i, p in enumerate(picks, 1):
         lv = p.get("levels") or {}
-        _out("PICK %-8s entry %s plan stop %s per-stock stop %s target %s" % (
-            p["symbol"], fmt(p.get("entry")), fmt(p.get("stop")), fmt(lv.get("stop")), fmt(lv.get("target"))))
+        if detail:
+            _out("PICK %-8s entry %s plan stop %s per-stock stop %s target %s" % (
+                p["symbol"], fmt(p.get("entry")), fmt(p.get("stop")), fmt(lv.get("stop")), fmt(lv.get("target"))))
+        else:
+            _out("plan pick %d of %d: levels %s" % (i, len(picks), "computed" if lv.get("ok") else "not computed"))
     page = page_rows(results, picks, info, k)
     subject, text_body, html_body = mail_bodies(results, picks, info)
+    n_act = sum(1 for r in results if r["action"] in ("SELL", "TAKE PROFIT", "RAISE STOP", "REVIEW", "CHECK"))
+    log_subject = subject if detail else "TFB Exit Plan %s - %d action%s" % (info["date"], n_act,
+                                                                           "" if n_act == 1 else "s")
     if not write:
-        _out("%s - nothing written, nothing sent | %s" % ("dry run" if dry_run else "observe", subject))
+        _out("%s - nothing written, nothing sent | %s" % ("dry run" if dry_run else "observe", log_subject))
         return 0
     day = today.isoformat()
     keep = [d for d in ledger if text(d["Date"]) != day]
@@ -1238,7 +1272,7 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
     if send and k["mail"]:
         try:
             (mailer or _mail)(subject, text_body, html_body)
-            _out("e-mail sent: %s" % subject)
+            _out("e-mail sent: %s" % log_subject)
         except Exception as e:  # noqa: BLE001
             _out("ERROR: e-mail not sent: %s" % type(e).__name__)
             return 4
