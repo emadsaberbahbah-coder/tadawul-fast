@@ -2,7 +2,15 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.6.1 (2026-11-22) - first written 2026-11-11 (1.0.0)
+VERSION 1.6.2 (2026-11-23) - first written 2026-11-11 (1.0.0)
+1.6.2 (2026-11-23): A QUOTA REFUSAL OF THE WRITE IS WAITED OUT (owner, 23 Nov
+    08:42 Riyadh: "check specially the workflows ... if there is any failing
+    ... update and try to improve"). The page jobs share one Google service
+    account and its per-minute quota; the reads already wait it out (1.3.1),
+    the two page writes did not. Both overwrite their whole range, so a quota
+    answer is now waited out and the writes tried again
+    (scripts/sheets_quota.call, 65 / 65 s); any other write error still stops
+    at "publication unconfirmed". Nothing else changes.
 1.6.1 (2026-11-22): THE RUN LOG NAMES NO HOLDING (the owner's standing rule:
     "Repo logs are public: no amounts, quantities, account numbers or
     holdings' symbols in run logs"). Since 1.0.0 every run printed one line
@@ -220,7 +228,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1262,9 +1270,13 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             r["bars_to"].isoformat() if r.get("bars_to") else "", _round(r.get("basis")), r.get("market", "")]
            for r in results if r.get("ok")]
     grid = [list(LEDGER_HEADERS)] + ([[d.get(h, "") for h in LEDGER_HEADERS] for d in keep] + new)[-MAX_LEDGER_ROWS:]
-    try:
+    from scripts import sheets_quota  # noqa: PLC0415
+
+    def publish() -> None:                     # both writes overwrite their whole range: safe to repeat (1.6.2)
         write_grid(book, LEDGER_TAB, grid, len(LEDGER_HEADERS), 200)
         write_grid(book, PAGE_TAB, page, PAGE_WIDTH, 60)
+    try:
+        sheets_quota.call(publish, _SLEEP, _out, "writing the Exit Plan")
     except Exception as e:  # noqa: BLE001
         _out("ERROR: publication unconfirmed: %s; read back before retrying" % type(e).__name__)
         return 3

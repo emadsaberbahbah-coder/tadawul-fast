@@ -4,6 +4,15 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
+v1.8.2 (2026-11-23)
+  1.8.2: THE RUN LOG NAMES NO HOLDING (owner, 23 Nov 2026 08:42 Riyadh: "review the full project and check specially
+         the workflows and if there is any failing or other issue please update and try to improve"; his standing
+         rule: "Repo logs are public: no amounts, quantities, account numbers or holdings' symbols in run logs").
+         Every run printed one FINAL line per stock - every holding among them - with its decision (18 lines on the
+         23 Nov 05:42 UTC run), and the ALIGN, STEP and picks lines named their symbols. On GitHub Actions they now
+         print as "final 3 of 18: HOLD (rule: Exit Plan)", "step 1 of 2: <kind>", "align 1 of 3: hard" and the count
+         of picks by status. Gate TFB_TAP_LOG_DETAIL = auto (default: no detail on GitHub Actions) | on | off. The
+         page, the Final_Decisions tab and every decision are unchanged.
 v1.8.1 (2026-11-20)
   1.8.1: A PASSING GOOGLE SERVER FAULT IS WAITED OUT LIKE THE QUOTA. The 20 Nov 20:22 UTC run (44810684039) stopped
          with "APIError [503]: The service is currently unavailable.; nothing written" and the page kept its older
@@ -275,7 +284,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -871,6 +880,17 @@ DECISIONS = ("SELL", "BUY", "HOLD", "WATCH", "DO NOT INVEST")
 _DEC_ORDER = {d: i for i, d in enumerate(DECISIONS)}
 
 
+def log_detail() -> bool:
+    """1.8.2: may the run log name the stocks? TFB_TAP_LOG_DETAIL = on | off | auto (default: not on GitHub Actions,
+    whose logs are public for this repository)."""
+    v = _env("TFB_TAP_LOG_DETAIL", "auto").lower()
+    if v in ("on", "1", "true", "yes"):
+        return True
+    if v in ("off", "0", "false", "no"):
+        return False
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
+
+
 def final_on() -> bool:
     return _env("TFB_TAP_FINAL", "on").lower() not in ("off", "0", "false", "no")
 
@@ -1351,6 +1371,15 @@ def placed_stop_text(p: Dict[str, Any], o_qty: float) -> str:
 
 
 _AMOUNT = re.compile(r"\d[\d,]*(?:\.\d+)? SAR")
+
+
+def _step_kind(s: Dict[str, Any]) -> str:
+    """1.8.2: a step in the public run log - its first words up to the symbol, never the symbol or an amount."""
+    do = text(s.get("do"))
+    sym = text(s.get("symbol"))
+    head = do.split(sym, 1)[0] if sym and sym in do else " ".join(do.split(" ")[:3])
+    head = re.sub(r"[A-Z0-9]{1,6}\.[A-Z]{1,3}\b|\d[\d,.]*", "#", head).strip(" :-·#")
+    return head[:40] or "action"
 
 
 def log_text(s: str) -> str:
@@ -2236,24 +2265,39 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             near = [" | ".join(_squash(c) for c in r if text(c))[:160] for r in got
                     if any(_squash(c) in ("Seat status", "Ticket SAR") for c in r)]
             _out("%s: no seats table found in %d row(s)%s" % (tab, len(got), "; nearest header: " + near[0] if near else ""))
-    for a in d["align"]:
-        _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"], log_text(a["main"]),
-                                                                 log_text(a["v2"])))
+    detail = log_detail()                                                            # 1.8.2 [LOG-PRIVACY]
+    for i, a in enumerate(d["align"], 1):
+        if detail:
+            _out("ALIGN %-9s %-5s plan: %s | main: %s | v2: %s" % (a["symbol"], a["level"], a["plan"],
+                                                                     log_text(a["main"]), log_text(a["v2"])))
+        else:
+            _out("align %d of %d: %s" % (i, len(d["align"]), a["level"]))
     if aligned:
         _out("news gate %s (%s) · cash %s (%s)" % (                  # no amount in the run log
             d["news"].get("verdict") or "not read", d["news"].get("at") or "-",
             "read" if d["cash"] is not None else "not read", d["cash_at"] or "-"))
     for i, s in enumerate(d["steps"], 1):
-        _out("STEP %d %-9s %s | %s" % (i, s["symbol"], log_text(s["do"]), log_text(s["levels"])))
+        if detail:
+            _out("STEP %d %-9s %s | %s" % (i, s["symbol"], log_text(s["do"]), log_text(s["levels"])))
+        else:
+            _out("step %d of %d: %s" % (i, len(d["steps"]), _step_kind(s)))
     if not d["steps"]:
         _out("no step today")
+    by_status: Dict[str, int] = {}
+    for p in d["picks"]:
+        by_status[p["status"]] = by_status.get(p["status"], 0) + 1
     _out("holdings %d · picks %d (%s) · pipeline %d · differences %d · old sources: %s · not read: %s" % (
-        len(d["holdings"]), len(d["picks"]), ", ".join("%s %s" % (p["symbol"], p["status"]) for p in d["picks"]) or "-",
+        len(d["holdings"]), len(d["picks"]),
+        (", ".join("%s %s" % (p["symbol"], p["status"]) for p in d["picks"]) if detail
+         else ", ".join("%s %d" % (k_, n_) for k_, n_ in sorted(by_status.items()))) or "-",
         len(d["pipeline"]), len(d["issues"]), ", ".join(d["stale"]) or "none", ", ".join(d["missing"]) or "none"))
     d["final"] = final_decisions(d, k["stop_tol"]) if aligned and final_on() else []      # 1.6.0
-    for r in d["final"]:
-        _out("FINAL %-9s %-13s rule: %s | analysis differs on: %s" % (r["symbol"], r["decision"], r["rule"],
-                                                                     ", ".join(r["differs"]) or "none"))
+    for i, r in enumerate(d["final"], 1):
+        if detail:
+            _out("FINAL %-9s %-13s rule: %s | analysis differs on: %s" % (r["symbol"], r["decision"], r["rule"],
+                                                                         ", ".join(r["differs"]) or "none"))
+        else:
+            _out("final %d of %d: %s (rule: %s)" % (i, len(d["final"]), r["decision"], r["rule"]))
     pg = page_layout(d, local.strftime("%Y-%m-%d %H:%M"), local.strftime("%a %d %b %Y"), k)
     rows = pg.rows
     if dry_run:

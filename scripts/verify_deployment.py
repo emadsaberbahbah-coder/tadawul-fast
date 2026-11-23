@@ -286,7 +286,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
     # vars.TFB_RELEASE_RENDER_HOLD default off; workflow-scoped, never on Render;
     # 1.3.1 is claimed by open PR #831).
-    ("release_decision_feed", "1.4.2", "gated audited decision-feed release (P0-1)"),
+    # 2026-11-23 (pin only): 1.4.2 -> 1.4.3 (a quota answer on the key-block read is tried a second time).
+    ("release_decision_feed", "1.4.3", "gated audited decision-feed release (P0-1)"),
     ("intraday_quote_refresh", "1.0.5", "witnessed partial quote refresh"),
     ("run_shadow_board", "1.6.0", "shadow board"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): NEW scripts/await_cockpit_receipts.py
@@ -412,16 +413,16 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.10.1", "daily plan"),
+    ("daily_plan", "1.10.2", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
-    ("exit_plan", "1.6.1", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding
+    ("exit_plan", "1.6.2", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding; 11-23: 1.6.2 write quota
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
-    ("holding_read", "1.0.0", "holding read"),
+    ("holding_read", "1.0.1", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota
     ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.8.1", "today action plan"),
+    ("today_action_plan", "1.8.2", "today action plan"),   # 2026-11-23: 1.8.2 the run log names no stock
     ("plan_archive", "1.1.1", "plan archive"),
     ("ibkr_capture", "1.2.0", "ibkr capture"),
     # 2026-11-21 (new script, pinned on arrival): _IBKR_NAV_History, _IBKR_Fills and _IBKR_Trades from the daily

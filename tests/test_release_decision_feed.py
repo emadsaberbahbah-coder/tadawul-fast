@@ -1399,7 +1399,7 @@ def case_n30_one_transient_read_fault_is_retried(mp, tmp_path):
     for raw, want in (("", 5.0), ("abc", 5.0), ("-3", 0.0), ("99", 30.0), ("nan", 5.0), ("2", 2.0)):
         mp.setenv(R.READ_RETRY_ENV, raw)
         assert R.read_retry_seconds() == want, raw
-    assert R.SCRIPT_VERSION == "1.4.2"
+    assert R.SCRIPT_VERSION == "1.4.3"
 
 
 def case_n31_quota_answer_is_retried_in_the_next_quota_minute(mp, tmp_path):
@@ -1432,6 +1432,47 @@ def case_n31_quota_answer_is_retried_in_the_next_quota_minute(mp, tmp_path):
     result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
                          now_utc=ctx.clock["now"], read_sleep=slept.append)
     assert result["exit_code"] == 0 and "429" in result["read_retried"] and slept == [65.0]
+
+
+def case_n34_a_quota_answer_is_tried_a_second_time(mp, tmp_path):
+    """v1.4.3 (sync run 45105656708, 23 Nov 2026 04:23 UTC: the one 65 s retry met the quota again)."""
+    quota = Exception("<HttpError 429 when requesting x returned \"Quota exceeded for quota metric 'Read requests'\">")
+    quota.resp = SimpleNamespace(status=429)
+
+    class Flaky(GoogleValues):
+        def __init__(self, *a, fault=quota, times=2, **k):
+            super().__init__(*a, **k)
+            self.fault, self.left = fault, times
+
+        def get(self, **kwargs):
+            if kwargs["range"] == final.KEY_RANGE and self.left > 0:
+                self.left -= 1
+                raise self.fault
+            return super().get(**kwargs)
+    mp.delenv(R.READ_RETRY_ENV, raising=False)
+    assert R.QUOTA_RETRIES == 2
+    assert [R.may_retry_read(quota, n) for n in (0, 1, 2)] == [True, True, False]
+    assert [R.may_retry_read(TimeoutError("timed out"), n) for n in (0, 1)] == [True, False]
+    assert not R.may_retry_read(ValueError("key block layout"), 0)
+    ctx, _ = released(mp, tmp_path)
+    service = Flaky()                                     # two quota answers, then a clean read
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    slept = []
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
+                         now_utc=ctx.clock["now"], read_sleep=slept.append)
+    assert result["exit_code"] == 0 and result["read_retries"] == 2 and slept == [65.0, 65.0]
+    service = Flaky(times=3)                              # three in a row: fail closed, zero writes
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    slept = []
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
+                         now_utc=ctx.clock["now"], read_sleep=slept.append)
+    assert result["exit_code"] == 3 and result["reasons"] == ["layout_or_read_failed"] and slept == [65.0, 65.0]
+    assert ctx.updates(service) == []
+    service = Flaky(fault=TimeoutError("The read operation timed out"), times=2)   # other faults: still one retry
+    service.rows[3][11:13] = [final.KEY, W2_VALUE]
+    result = R.supersede("synthetic-sheet", CURRENT_RUN, attempt="1", service=service,
+                         now_utc=ctx.clock["now"], read_sleep=lambda s: None)
+    assert result["exit_code"] == 3 and result["read_retries"] == 1
 
 
 def case_n29_supersede_faults_fail_closed(mp, tmp_path):

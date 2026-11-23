@@ -166,6 +166,7 @@ def _env(monkeypatch):
     for name in list(__import__("os").environ):
         if name.startswith("TFB_PLAN_") or name == "TFB_DAILY_PLAN":
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TFB_PLAN_LOG_DETAIL", "on")          # 1.10.2: the suite reads the detailed lines (Q1: the rest)
     monkeypatch.setenv("TFB_DAILY_PLAN", "on")
     # 1.8.0: the 10-11 Nov fixtures carry names at the forecast cap (ITRN.US 34.7%); the suites written before
     # the cap rule pin it off. test_c1-c5 at the end test the rule itself.
@@ -978,7 +979,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.10.1"
+    assert dp.__version__ == "1.10.2"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1401,3 +1402,60 @@ def test_g4_sector_limits_count_one_vocabulary():
     assert dp.SECTOR_FOLD == YAHOO_TO_GICS_SECTOR
     assert dp.sector_key(" Financial Services ") == "Financials" and dp.sector_key("Real Estate") == "Real Estate"
     assert dp.sector_key(None) == "" and dp.sector_key("") == ""
+
+
+
+# ----------------------------------------------------------------------------- Q1 (1.10.2 [QUOTA] [LOG-PRIVACY])
+class _Quota(Exception):
+    def __str__(self):
+        return "APIError: [429]: Quota exceeded for quota metric 'Read requests'"
+
+
+def test_q1_a_quota_refusal_waits_into_the_next_minute_and_the_write_is_tried_again(monkeypatch, capsys):
+    """23 Nov 05:21 UTC: three reads 20 s apart all fell inside the same quota minute; 22 Nov 20:29 UTC the write
+    met the quota. A read now waits 65 s after a quota answer, and the page writes are tried again on one."""
+    naps = []
+    monkeypatch.setattr(dp, "_SLEEP", naps.append)
+    b = book()
+    real_get = b.worksheet(dp.PAGE).get
+    calls = {"n": 0}
+
+    def flaky_get(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _Quota()
+        return real_get(*a, **kw)
+    monkeypatch.setattr(b.worksheet(dp.PAGE), "get", flaky_get)
+    real_write = dp.write_grid
+    wrote = {"n": 0}
+
+    def flaky_write(*a, **kw):
+        wrote["n"] += 1
+        if wrote["n"] == 1:
+            raise _Quota()
+        return real_write(*a, **kw)
+    monkeypatch.setattr(dp, "write_grid", flaky_write)
+    assert dp.main([], book=b, now=NOW, capture=cap_of(age_h=0.6)) == 0
+    out = capsys.readouterr().out
+    assert "retrying in 65 s" in out and "Sheets quota reached while writing the Daily Plan: waiting 65 s" in out
+    assert naps[:2] == [65.0, 65.0] and "wrote " in out
+
+
+def test_q1_the_run_log_names_no_pick_on_actions(monkeypatch, capsys):
+    monkeypatch.delenv("TFB_PLAN_LOG_DETAIL")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert dp.log_detail() is True                                                   # a local run: the full lines
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    for raw, want in (("on", True), ("1", True), ("off", False), ("auto", False), ("", False), ("maybe", False)):
+        monkeypatch.setenv("TFB_PLAN_LOG_DETAIL", raw)
+        assert dp.log_detail() is want, raw
+    monkeypatch.delenv("TFB_PLAN_LOG_DETAIL")
+    b = book()
+    assert dp.main([], book=b, now=NOW, capture=cap_of(age_h=0.6)) == 0
+    out = capsys.readouterr().out
+    picks = [r for r in _cut(b) if r[0] == "PICK"]
+    assert picks and re.search(r"plan pick 1 of %d: " % len(picks), out)
+    assert " qty " not in out and "  PICK " not in out
+    for r in _ledger(b):
+        if r[4] == "PICK":
+            assert ("%s " % r[6]) not in out, "the symbol is not in the log"
