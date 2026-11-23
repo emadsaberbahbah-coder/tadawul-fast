@@ -361,7 +361,7 @@ PENDING = {
     # state's record, and today's reading per stock beside TFB's view (research only)
     "v_news_trend_daily": "278af1f30782c4065f31594059f68716357f87d0eb8cf8a7091886a5b1b224b9",
     "v_news_trend_learning": "9db083a5dde518eaf5acba94aabc8f39f1514c195aa922ace6ad9100f91e37bd",
-    "v_news_understanding": "4cdfca3260f60ed4333c60c543f9574b8d092f61a340fb641eb1ea8867f2b7f6",
+    "v_news_understanding": "b25a0d8630cd4c79a1af5199776d73ac8d769cafc71f755235500606d416ad11",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3124,9 +3124,9 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.25.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.25.1): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.25.0"
+    assert bv.__version__ == "1.25.1"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
     assert files[-26:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
@@ -3846,9 +3846,9 @@ def case_v62():
     _, nd = _driver_view("v_news_trend_daily", 122,
                          {"market_series_daily", "v_symbol_news_class", "v_news_items", "symbol_bars_daily"}, "1.25.0")
     _, nl = _driver_view("v_news_trend_learning", 123, {"v_news_trend_daily"}, "1.25.0")
-    _, nu = _driver_view("v_news_understanding", 124,
-                         {"v_news_trend_daily", "v_news_trend_learning", "v_universe_latest", "v_projection_context"},
-                         "1.25.0")
+    # 1.25.1: the understanding reads the daily view and TFB's view only - joined to the record and the projection
+    # context too, BigQuery could not plan it ("too many subqueries"); those are read beside it
+    _, nu = _driver_view("v_news_understanding", 124, {"v_news_trend_daily", "v_universe_latest"}, "1.25.1")
     for frag in ("WHERE relevance = 'company' AND ENDS_WITH(symbol, '.US')",
                  "QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, news_date, IFNULL(cluster, item_id) ORDER BY published_at) = 1",
                  # a weekend item belongs to the next session
@@ -3879,7 +3879,9 @@ def case_v62():
     order = [nl.index(x) for x in ("THEN 'no expectation'", "THEN 'collecting'", "THEN 'works as expected'",
                                    "THEN 'opposite of expected'")]
     assert order == sorted(order)
-    for frag in ("WHERE k <= 5 AND state != 'quiet'", "WHERE trend_fit = 'all' AND horizon_sessions = 5",
+    assert nu.count("`{{DS}}.v_news_trend_daily`") == 1                              # 1.25.1: the daily view read once
+    for frag in ("SELECT t.*, DENSE_RANK() OVER (ORDER BY t.session_date DESC) AS k",
+                 "ARRAY_AGG(IF(k <= 5 AND state != 'quiet',",
                  "WHEN tfb_stance = expected THEN 'agrees with TFB'", "ELSE 'leans against TFB'",
                  # Codex P2 on #1065: 'STRONG SELL' and 'STRONG_SELL' are the same view
                  "WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1",
