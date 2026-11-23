@@ -2,8 +2,29 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.23.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.24.0 (program register C8, Phase 2)
 ================================================================================
+v1.24.0 (23 Nov 2026, the projection context). WHY (owner, 23 Nov 2026 10:03
+Riyadh): "make more deep analysis ... link the last updates ... news, future
+options, financial derivatives, any other related data and information that
+can support the projection accuracy". The review of that day found, on the
+2,569 scored INVESTABLE buy calls, that the promised return and the result
+were uncorrelated (r = -0.04), that a one-sigma range from realised
+volatility held about 57-59 % of the results instead of 68 %, and that the
+count of adverse US market states at the call (VIX 20 or more, VIX curve
+inverted, VVIX high, MOVE high, credit weakening, 10-year yield jumping)
+sorted the US calls (0 -> 62 % hit, 3 or more -> 30 %; in-sample). Two new
+views, research only: v_projection_context (120) - per stock the promise
+against its own one-sigma move (Cboe implied volatility when read, else
+realised), the one-month range, an observe-only shadow projection capped at
+0.7 sigma and the adverse states now; v_projection_scorecard (121) - five
+rules fixed on 23 Nov (B0 baseline, P1 at most 1 adverse state, P2 promise
+within 0.7 sigma, P3 both, P4 3 or more adverse states) on the scored US
+calls, in-sample and forward from 24 Nov, with a within-day lift for the
+stock rule, a between-days lift for the market rules and a kept-against-
+left-out lift clustered by call day for P3, every t overlap-adjusted (Codex
+P2 x2 on #1064). No file of 1.23.0 changes.
+
 v1.23.0 (22 Nov 2026, the price drivers). WHY (owner, 22 Nov 2026 19:53
 Riyadh): "add how future options and other options affect the current price
 and recommendations ... add this effect to our score and analysis, also check
@@ -520,7 +541,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

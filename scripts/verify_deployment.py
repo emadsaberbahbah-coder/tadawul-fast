@@ -353,7 +353,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-22 (manifest pin only): 1.22.0 -> 1.23.0 (v_options_reading, v_market_drivers,
     # v_market_driver_learning, v_price_drivers, v_driver_learning - the price drivers and their record, research
     # only; options_daily as a source table).
-    ("apply_bq_views", "1.23.0", "bigquery looker views"),
+    # 2026-11-23 (manifest pin only): 1.23.0 -> 1.24.0 (v_projection_context, v_projection_scorecard - the
+    # projection against its own sigma, the adverse market states and their record, research only).
+    ("apply_bq_views", "1.24.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).

@@ -353,6 +353,10 @@ PENDING = {
     "v_market_driver_learning": "11fe865115ea0a67eff37e7a74ffbb8e6067f1a7160c55bf304a13c3bc1aae62",
     "v_price_drivers": "bbecaf9802bbf3ed34a92c97d442307aee5774faccd7cb07a2494f3b500f7c16",
     "v_driver_learning": "b89918e710f562686738410f23ea3465ccf30fa1ed4df4b1b001a4d8290a0459",
+    # apply_bq_views 1.24.0 (23 Nov 2026): the projection context - each promise against its own one-sigma move,
+    # the adverse US market states, and the record of five fixed rules (research only)
+    "v_projection_context": "eaa8f6481530e94d5b2a47acd0acf380b7822d159ab7b78e35ae3ad94164b5b8",
+    "v_projection_scorecard": "f44c6cdefd5708823ae60c1d61fdd9da34cadf3d6497b85c03372667fd1c5a7f",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -384,9 +388,10 @@ EXPECTED_ORDER = [
     "v_event_calendar", "v_event_reactions", "v_event_scenarios", "v_event_trial", "v_event_trial_summary",
     "v_learning_scorecard",
     "v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers", "v_driver_learning",
+    "v_projection_context", "v_projection_scorecard",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 59)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 61)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -951,10 +956,12 @@ def case_v18():
         "v_news_signal_eval": {"symbol_bars_daily"},         # v1.10.0: each name's next 5 sessions
         "v_symbol_news_class": {"symbol_news"},              # v1.16.0: each headline re-read
         "v_company_news_eval": {"symbol_bars_daily"},        # v1.16.0: the next sessions after the news day
-        "v_market_condition": {"symbol_bars_daily"}}, used    # v1.18.0: the Saudi REITs (4330-4350) as one index
+        "v_market_condition": {"symbol_bars_daily"},          # v1.18.0: the Saudi REITs (4330-4350) as one index
+        "v_projection_scorecard": {"symbol_bars_daily"}}, used    # v1.24.0: each call's realised volatility before it
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
+    assert {"symbol", "date", "close", "captured_at"} <= cols["symbol_bars_daily"]        # what v_projection_scorecard reads
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
               "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):
@@ -3110,20 +3117,21 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.23.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.24.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.23.0"
+    assert bv.__version__ == "1.24.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-21:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-23:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
                            "111_v_event_scenarios.sql", "112_v_event_trial.sql", "113_v_event_trial_summary.sql",
                            "114_v_learning_scorecard.sql", "115_v_options_reading.sql",
                            "116_v_market_drivers.sql", "117_v_market_driver_learning.sql",
-                           "118_v_price_drivers.sql", "119_v_driver_learning.sql"]
-    assert files[:-20] == sorted(files[:-20])                                       # the two-digit order is unchanged
+                           "118_v_price_drivers.sql", "119_v_driver_learning.sql",
+                           "120_v_projection_context.sql", "121_v_projection_scorecard.sql"]
+    assert files[:-22] == sorted(files[:-22])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3403,7 +3411,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 12
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 14
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3677,14 +3685,14 @@ def case_v57():
     assert "l.t >= 2" in code and "ROUND(l.t, 2) AS t_stat" in code            # judged on the unrounded statistic
 
 
-def _driver_view(name, number, refs):
+def _driver_view(name, number, refs, version="1.23.0"):
     objs = {o.name: o for o in bv.load_objects()}
     v = objs[name]
     assert v.path.name == f"{number}_{name}.sql" and v.kind == "VIEW"
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {name} == refs, set(bv._REF.findall(code))
     assert "Research only: no decision, gate or count reads this view." in v.template
-    assert "views 1.23.0" in v.template
+    assert "views %s" % version in v.template
     return objs, code
 
 
@@ -3696,8 +3704,8 @@ def case_v58():
     assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
     objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
     names = [o.name for o in bv.load_objects()]
-    assert names[-5:] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
-                          "v_driver_learning"]
+    assert names[-7:-2] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+                            "v_driver_learning"]
     for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
                  "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
                  "IF(short_n_20 >= 10, SAFE_DIVIDE(short_ratio_pct - short_mean_20, short_sd_20), NULL) AS short_z",
@@ -3770,13 +3778,62 @@ def case_v60():
     assert len(drivers) == 26 and drivers[:13] == drivers[13:], drivers             # the list and the record agree
 
 
+def case_v61():
+    """v_projection_context and v_projection_scorecard (1.24.0): the promise against the stock's own one-sigma move
+    (Cboe implied volatility when read, else realised), the adverse US market states; five rules fixed on 23 Nov with
+    no look-ahead (the state and the volatility of the last close BEFORE the call), a within-day lift for the stock
+    rule and a between-days lift for the market rules, read only at 20 call days and 40 forward calls."""
+    names = [o.name for o in bv.load_objects()]
+    assert names[-2:] == ["v_projection_context", "v_projection_scorecard"]
+    _, pc = _driver_view("v_projection_context", 120, {"v_universe_latest", "v_options_reading", "v_market_drivers"},
+                         "1.24.0")
+    for frag in ("COALESCE(o.iv30, u.volatility_30d_pct) AS vol",
+                 "IF(vol > 0, vol * SQRT(21 / 252), NULL) AS sigma_1m", "IF(vol > 0, vol * SQRT(63 / 252), NULL) AS sigma_3m",
+                 "ROUND(SIGN(expected_roi_1m_pct) * LEAST(ABS(expected_roi_1m_pct), 0.7 * sigma_1m), 2) AS shadow_roi_1m_pct",
+                 "WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 DAY)",
+                 "IF(market_adverse_states >= 3 AND market_code = 'US', FORMAT("):
+        assert frag in pc, frag
+    adverse = ("vix_level_state IN ('20 to 30', '30 and over')", "vix_term_state = 'inverted'", "vvix_state = 'high'",
+               "move_state = 'high'", "credit_state = 'weakening'", "rates_state = 'yields jumping'")
+    _, sc = _driver_view("v_projection_scorecard", 121, {"v_outcome_engine", "v_market_drivers", "symbol_bars_daily"},
+                         "1.24.0")
+    for state in adverse:
+        assert state in pc and state in sc, state                                   # the same six states in both
+    for frag in ("WHERE engine_scored AND entry_investability = 'INVESTABLE' AND entry_stance = 'bullish' AND market = 'US'",
+                 # no look-ahead: the market close and the volatility bar BEFORE the call's recording day
+                 "LEFT JOIN md m ON c.recorded_date > m.date AND (m.next_date IS NULL OR c.recorded_date <= m.next_date)",
+                 "LEFT JOIN vol v ON v.symbol = c.symbol AND c.recorded_date > v.date",
+                 "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) * SQRT(252) * 100 AS v20",
+                 "IF(v.n20 >= 15 AND v.v20 > 0, v.v20 * SQRT(c.hd / 252), NULL) AS sigma",
+                 "IF(c.recorded_date >= DATE '2026-11-24', 'forward from 2026-11-24', 'in-sample, not evidence') AS period",
+                 "IFNULL(adverse <= 1, FALSE) AS calm", "IFNULL(SAFE_DIVIDE(p, sigma) <= 0.7, FALSE) AS measured",
+                 "AVG(IF(n_kept > 0, arm_mean, NULL)) - AVG(IF(n_kept = 0, day_mean, NULL)) AS timing_lift",
+                 # Codex P2 on #1064: overlapping windows - every t over SQRT(mean horizon in sessions), and the
+                 # forward reading waits for two horizon lengths of call days
+                 "ROUND(l.t / SQRT(t.hd), 2) AS t_stat", "ROUND(l.timing_t / SQRT(t.hd), 2) AS timing_t",
+                 "ROUND(SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v * t.hd)), 2) AS keep_vs_out_t",
+                 "WHEN IFNULL(l.days, 0) < GREATEST(20, 2 * t.hd) OR t.calls < 40 THEN 'collecting'",
+                 # Codex P2 on #1064: P3 (a market state AND a stock test) is read on kept against left-out calls,
+                 # the error clustered by call day
+                 "SUM(IF(kept, SAFE_DIVIDE(r - mk, nk), -SAFE_DIVIDE(r - mo, no_))) AS e",
+                 "SAFE_DIVIDE(COUNT(*), COUNT(*) - 1) * SUM(e * e) AS v",
+                 "WHEN STARTS_WITH(t.arm, 'P3') THEN SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v))"):
+        assert frag in sc, frag
+    assert sc.count("ELSE l.timing_t END / SQRT(t.hd)") == 2                         # both thresholds adjusted
+    arms = re.findall(r"STRUCT\('([A-Z]\d) ", sc)
+    assert arms == ["B0", "P1", "P2", "P3", "P4"], arms
+    order = [sc.index(x) for x in ("THEN 'the baseline'", "THEN 'in-sample, not evidence'", "THEN 'collecting'")]
+    assert order == sorted(order)                                                    # in-sample is never read as evidence
+    assert "CURRENT_" not in sc and "FOLLOWING" not in sc
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
          case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57,
-         case_v58, case_v59, case_v60]
+         case_v58, case_v59, case_v60, case_v61]
 
 
 def test_v1(): case_v1()
@@ -3839,6 +3896,7 @@ def test_v57(): case_v57()
 def test_v58(): case_v58()
 def test_v59(): case_v59()
 def test_v60(): case_v60()
+def test_v61(): case_v61()
 
 
 if __name__ == "__main__":
