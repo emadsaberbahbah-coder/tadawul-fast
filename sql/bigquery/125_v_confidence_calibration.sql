@@ -14,7 +14,9 @@
 --   mean_roi_pp                 the mean realised return
 --   bench_pp                    the mean return of the record's own market over the same dates: SPY for US,
 --                               ^TASI.SR for SA, ACWI otherwise (adjusted closes, the last close on or before the
---                               recording date and on or before the matured date - the target date while none)
+--                               recording date and on or before the target date - the session the outcome is
+--                               priced on; matured_at is when the tracker wrote it, often later - Codex P2 on #1068;
+--                               the matured date only where no target date is recorded)
 --   mean_excess_pp, beat_pct    the mean return above that market, and the share of records that beat it
 -- THE READING, per market and period, on the HIGH and MEDIUM rows (fixed on 24 Nov 2026): 'collecting' while either
 -- has under 30 records or under 10 days; 'inverted: HIGH below MEDIUM' when HIGH's hit rate is 10 points or more
@@ -25,7 +27,7 @@ OPTIONS (description = "TFB confidence calibration (views 1.26.0): the scored IN
 AS
 WITH p AS (
   SELECT symbol, UPPER(IFNULL(confidence, 'UNKNOWN')) AS confidence, recorded_date, win_flag, realized_roi_pp,
-    COALESCE(DATE(matured_at), DATE(target_at)) AS end_date,
+    COALESCE(DATE(target_at), DATE(matured_at)) AS end_date,
     CASE WHEN ENDS_WITH(symbol, '.SR') THEN 'SA' WHEN ENDS_WITH(symbol, '.US') THEN 'US' ELSE 'OTHER' END AS market,
     FORMAT_DATE('%Y-%m', recorded_month) AS month
   FROM `{{DS}}.v_performance_log`

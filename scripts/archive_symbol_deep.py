@@ -11,9 +11,9 @@ the news system had nothing on it - the core set follows what TFB likes (the
 holdings, the board, the ROI leaders), not what moves the market, and NVDA was
 a HOLD. Owner, 01:18: "Ok let's start".
 WHAT: with TFB_DEEP_NEWS_WIDE on (default) the set query adds two reasons,
-read from v_universe_latest (one row per symbol: equity on every page that
-carries it and never on the Mutual_Funds page, a positive market cap; the
-latest snapshot's change and 30-day volatility):
+read from v_universe, each page's latest night (one row per symbol: equity on
+every page that carries it and never on the Mutual_Funds page, a positive
+market cap; the latest change and 30-day volatility):
   * 'movers': listings in the top MOVERS_CAP_RANK (500) by market cap of their
     own market whose last change was at least MOVERS_MIN_MOVE (5 %) and at
     least MOVERS_MIN_Z (3) daily standard deviations (30-day volatility / sqrt
@@ -417,16 +417,20 @@ MATURED_SQL = (
 )
 
 
-# v1.3.0: one row per listing of the latest universe - equity on every page that carries it and never on
-# the Mutual_Funds page (SPY, IVV and VTI are labelled EQUITY there), a positive
-# market cap, the latest change and 30-day volatility, its market-cap rank in its own market
+# v1.3.0: one row per listing of the latest universe - read from v_universe, every page's own latest night, so a
+# symbol is equity on every page that carries it and never on the Mutual_Funds page (SPY, IVV and VTI are labelled
+# EQUITY there; v_universe_latest keeps one page per symbol and could hide that - Codex P2 on #1068); a positive
+# market cap; the latest change and 30-day volatility; its market-cap rank in its own market
 _UNI_SQL = (
     "SELECT symbol, market_code, mc, ch, v30, "
     "ROW_NUMBER() OVER (PARTITION BY market_code ORDER BY mc DESC, symbol) AS cap_rk FROM ("
     "SELECT symbol, ANY_VALUE(market_code) AS market_code, MAX(market_cap) AS mc, "
     "ARRAY_AGG(change_pct IGNORE NULLS ORDER BY captured_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ch, "
     "ARRAY_AGG(volatility_30d_pct IGNORE NULLS ORDER BY captured_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS v30 "
-    "FROM `{ds}.v_universe_latest` GROUP BY symbol "
+    "FROM (SELECT * FROM `{ds}.v_universe` "
+    "WHERE snapshot_date >= (SELECT DATE_SUB(MAX(snapshot_date), INTERVAL 7 DAY) FROM `{ds}.v_universe`) "
+    "QUALIFY snapshot_date = MAX(snapshot_date) OVER (PARTITION BY source_page)) "
+    "GROUP BY symbol "
     "HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') "
     "AND MAX(market_cap) > 0)"
 )

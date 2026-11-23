@@ -68,6 +68,21 @@ Owner's words (Riyadh time):
 
   Only 29 of the 100 largest have bars today; the mega set adds the rest from tonight's run.
 
+## Codex review of #1068 (three P2, all fixed)
+
+1. **Benchmark end date.** `matured_at` is when the tracker wrote the outcome, often after the target session it is
+   priced on. The benchmark now ends on `target_at`, and falls back to `matured_at` only where no target date is
+   recorded.
+2. **Fund membership.** `v_universe_latest` keeps one page per symbol, so an EQUITY-labelled fund with a newer
+   Global_Markets row could pass the filter. The wide sets and the shock-drop universe now read `v_universe`: each
+   page's latest night, every page checked. Re-run on BigQuery: 50 mega names (SPY and IVV out) and the same 21
+   movers.
+3. **Forward survivorship.** The shock-drop universe is now every company in the US top 100 on any night from 17 Nov
+   2026, so a company that leaves the 100 after its fall keeps its signals.
+   - A forward signal counts as evidence only when the company was in the 100 on a night 1 to 5 days before the
+     signal (its size known before the signal close).
+   - Otherwise it reads 'forward, not top 100 before the signal', which the learning view treats as not evidence.
+
 ## Nothing decides on this
 
 - The live system never reads BigQuery.

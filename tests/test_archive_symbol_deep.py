@@ -692,7 +692,11 @@ def test_d13_wide_query_and_gate(monkeypatch):
         tail = q[len(base):]
         assert tail.startswith("UNION ALL SELECT symbol, 'movers' FROM (") and tail.endswith(
             "WHERE market_code = 'US' AND cap_rk <= 50\n")
-        assert tail.count("FROM `p.d.v_universe_latest` GROUP BY symbol") == 2
+        # Codex P2 on #1068: every page's latest night from v_universe, not the one-page latest view
+        assert tail.count("FROM (SELECT * FROM `p.d.v_universe` WHERE snapshot_date >= (SELECT DATE_SUB(MAX(snapshot_date), "
+                          "INTERVAL 7 DAY) FROM `p.d.v_universe`) QUALIFY snapshot_date = MAX(snapshot_date) OVER "
+                          "(PARTITION BY source_page)) GROUP BY symbol ") == 2
+        assert "v_universe_latest" not in tail
         assert tail.count("HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') "
                           "AND MAX(market_cap) > 0") == 2
         assert "WHERE cap_rk <= 500 AND v30 > 0 AND ABS(ch) >= 5.0) WHERE z >= 3.0) WHERE rk <= 30\n" in tail

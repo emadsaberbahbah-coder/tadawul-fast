@@ -364,9 +364,9 @@ PENDING = {
     "v_news_understanding": "b25a0d8630cd4c79a1af5199776d73ac8d769cafc71f755235500606d416ad11",
     # apply_bq_views 1.26.0 (24 Nov 2026): confidence by market against the market's own return, and the
     # shock-drop shadow rule with its record (research only)
-    "v_confidence_calibration": "061c70bcb0f679b43d007476a0dff24eab598a215bb629b0cf00d171f4967845",
-    "v_shock_drop_events": "926b21e33396a14d9506efcab6fa67209b680ff1dc750e96036d326918d88691",
-    "v_shock_drop_learning": "e548b61e57f59a0edcd685497c01782d3213bd2dfcd3440d8aefbab6373c26e7",
+    "v_confidence_calibration": "2814c17be7530e132904341ea0ce8000f65efe560a56e7585dd23ba753a64a37",
+    "v_shock_drop_events": "2576f5d9f286f9d76e0b77d9a62590b54a2c9e7e894bde026272ea8a187ffa2e",
+    "v_shock_drop_learning": "7d551a93e69a4bd95845ea967622a1736f452664985c4ddd2ee5adbcf28b3bfc",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3910,14 +3910,15 @@ def case_v63():
     names = [o.name for o in bv.load_objects()]
     assert names[-3:] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
     _, cc = _driver_view("v_confidence_calibration", 125, {"v_performance_log", "market_series_daily"}, "1.26.0")
-    _, se = _driver_view("v_shock_drop_events", 126, {"v_universe_latest", "market_series_daily", "symbol_bars_daily"},
+    _, se = _driver_view("v_shock_drop_events", 126, {"v_universe", "market_series_daily", "symbol_bars_daily"},
                          "1.26.0")
     _, sl = _driver_view("v_shock_drop_learning", 127, {"v_shock_drop_events"}, "1.26.0")
     for frag in ("AND UPPER(entry_investability) = 'INVESTABLE' AND is_scored AND win_flag IS NOT NULL",
                  "WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM `{{DS}}.v_performance_log`)",
                  "CASE symbol WHEN 'SPY' THEN 'US' WHEN '^TASI.SR' THEN 'SA' ELSE 'OTHER' END AS market",
                  "WHERE symbol IN ('SPY', '^TASI.SR', 'ACWI')",
-                 "COALESCE(DATE(matured_at), DATE(target_at)) AS end_date",
+                 # Codex P2 on #1068: the benchmark ends on the session the outcome is priced on
+                 "COALESCE(DATE(target_at), DATE(matured_at)) AS end_date",
                  # the last market close on or before each date, never after
                  "LEFT JOIN bench b0 ON b0.market = p.market AND b0.date <= p.recorded_date",
                  "AND (b0.next_date IS NULL OR b0.next_date > p.recorded_date)",
@@ -3927,8 +3928,15 @@ def case_v63():
                  "WHEN pair_n < 2 OR pair_records < 30 OR pair_days < 10 THEN 'collecting'",
                  "WHEN high_hit <= medium_hit - 10 THEN 'inverted: HIGH below MEDIUM'"):
         assert frag in cc, frag
-    for frag in ("HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') "
-                 "AND MAX(market_cap) > 0))\n  WHERE cap_rk <= 100",
+    for frag in (# Codex P2 on #1068: every page of a night is checked (v_universe, not the one-page latest view),
+                 # and the 100 is read per night, so a company that leaves it after its fall keeps its signals
+                 "WHERE ENDS_WITH(symbol, '.US') AND snapshot_date >= DATE '2026-11-17'\n  GROUP BY snapshot_date, symbol\n"
+                 "  HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') AND MAX(market_cap) > 0",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY snapshot_date ORDER BY mc DESC, symbol) <= 100",
+                 # forward evidence only when the company was in the 100 on a night BEFORE the signal
+                 "m.snapshot_date BETWEEN DATE_SUB(k.date, INTERVAL 5 DAY) AND DATE_SUB(k.date, INTERVAL 1 DAY)",
+                 "WHEN member_before THEN 'forward from 2026-11-24'",
+                 "ELSE 'forward, not top 100 before the signal'",
                  "JOIN big g ON g.base = REGEXP_REPLACE(b.symbol, r'\\.US$', '')",
                  "SAFE_DIVIDE(x.close, MAX(x.close) OVER (w ROWS BETWEEN 15 PRECEDING AND CURRENT ROW)) - 1 AS dd",
                  "OVER (w ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING), 0) = 1 AS fall_before",
@@ -3937,10 +3945,11 @@ def case_v63():
                  "IF(f.armed AND f.close > f.prev_high, 'B after a confirmed turn', NULL)",
                  "QUALIFY IFNULL(s.i - LAG(s.i) OVER (PARTITION BY s.symbol, s.arm ORDER BY s.date), 999) > 20",
                  "ROUND(100 * (SAFE_DIVIDE(c20, close) - SAFE_DIVIDE(s20, s_close)), 2) AS f20_pp",
-                 "IF(date >= DATE '2026-11-24', 'forward from 2026-11-24', 'history, rule fixed before reading it')"):
+                 "WHEN date < DATE '2026-11-24' THEN 'history, rule fixed before reading it'"):
         assert frag in se, frag
     for frag in ("UNNEST([STRUCT(5 AS h, e.f5_pp AS f), (10, e.f10_pp), (20, e.f20_pp)]) AS hz",
                  "ROUND(SAFE_DIVIDE(s.e_mean, SAFE_DIVIDE(s.e_sd, SQRT(s.days))) / SQRT(GREATEST(a.h / 5, 1)), 2) AS t_adj",
+                 "WHEN period != 'forward from 2026-11-24' THEN 'in-sample, not evidence'",
                  "WHEN events < 10 OR days < 8 THEN 'collecting'"):
         assert frag in sl, frag
     order = [sl.index(x) for x in ("THEN 'in-sample, not evidence'", "THEN 'collecting'", "THEN 'works: beats SPY'")]
