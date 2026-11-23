@@ -2,8 +2,17 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.25.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.25.1 (program register C8, Phase 2)
 ================================================================================
+v1.25.1 (23 Nov 2026, the news understanding kept lean). After the 1.25.0
+deploy, BigQuery refused to plan a read of v_news_understanding ("too many
+subqueries or query is too complex"): it joined v_news_trend_learning and
+v_projection_context, which expanded v_news_trend_daily a second time beside
+the market views. v_news_understanding (124) now reads v_news_trend_daily and
+v_universe_latest only; each state's record (v_news_trend_learning) and the
+projection (v_projection_context) are read beside it, as the strategist's
+price_drivers tool does. No other file changes.
+
 v1.25.0 (23 Nov 2026, news and trend read together). WHY (owner, 23 Nov
 2026 12:34 Riyadh): "deep understanding of information ... analysis news ...
 using data and information and in same time use strategy and trend". A
@@ -561,7 +570,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.25.0"
+__version__ = "1.25.1"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

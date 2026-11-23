@@ -91,3 +91,34 @@ Research only: no decision, gate or count reads these views. Not investment advi
    - 'STRONG BUY' / 'STRONG SELL' (with a space, as `track_performance.py` writes them) fell through to "TFB holds".
    - Spaces and hyphens now read as underscores before the match.
    - A row with no recommendation gives no stance (NULL), so the agreement reads "TFB has no view today".
+
+## After the deploy: v_news_understanding kept lean (apply_bq_views 1.25.1)
+
+**Problem.** After the 1.25.0 views were written, a read of `v_news_understanding` failed after about 6 minutes with
+"Resources exceeded during query planning - too many subqueries or query is too complex".
+- The view joined `v_news_trend_learning` and `v_projection_context` beside `v_news_trend_daily`.
+- Its CTEs read the daily view twice.
+- So BigQuery expanded the daily view three times, plus the market views, in one plan.
+
+The other two views worked: `v_news_trend_daily` and `v_news_trend_learning` read in about a minute.
+
+**Fix**, in `124_v_news_understanding.sql` only:
+- It reads `v_news_trend_daily` once (DENSE_RANK in one pass), plus `v_universe_latest`.
+- The latest event is taken in the same pass as the headlines (an ARRAY_AGG of a STRUCT), not by a second CTE.
+- It no longer joins the record or the projection context. Those are read beside it.
+
+Checked on the archive: the new SQL runs in one call (about 83 slot-seconds).
+
+| State | Names |
+|---|---|
+| quiet lately | 31 |
+| routine news | 15 |
+| good news, price agreed | 5 |
+| news, price quiet | 5 |
+| big rise, no news | 5 |
+| good news, price fell | 1 |
+| bad news, price agreed | 1 |
+
+The strategist page (artifact version 1795429417-d8a0) now reads each stock's state record from
+`v_news_trend_learning` in its own query. It runs that query once for both the stock part and the market part, and
+attaches the record as `state_record`.
