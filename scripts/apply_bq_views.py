@@ -21,8 +21,9 @@ realised), the one-month range, an observe-only shadow projection capped at
 rules fixed on 23 Nov (B0 baseline, P1 at most 1 adverse state, P2 promise
 within 0.7 sigma, P3 both, P4 3 or more adverse states) on the scored US
 calls, in-sample and forward from 24 Nov, with a within-day lift for the
-stock rule and a between-days lift for the market rules. No file of 1.23.0
-changes.
+stock rule, a between-days lift for the market rules and a kept-against-
+left-out lift clustered by call day for P3, every t overlap-adjusted (Codex
+P2 x2 on #1064). No file of 1.23.0 changes.
 
 v1.23.0 (22 Nov 2026, the price drivers). WHY (owner, 22 Nov 2026 19:53
 Riyadh): "add how future options and other options affect the current price

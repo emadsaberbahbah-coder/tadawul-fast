@@ -356,7 +356,7 @@ PENDING = {
     # apply_bq_views 1.24.0 (23 Nov 2026): the projection context - each promise against its own one-sigma move,
     # the adverse US market states, and the record of five fixed rules (research only)
     "v_projection_context": "eaa8f6481530e94d5b2a47acd0acf380b7822d159ab7b78e35ae3ad94164b5b8",
-    "v_projection_scorecard": "25e656cf4a54fe51227c42ba1a361133b36ac184e2568720b66d583ee43514fe",
+    "v_projection_scorecard": "f44c6cdefd5708823ae60c1d61fdd9da34cadf3d6497b85c03372667fd1c5a7f",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3808,9 +3808,18 @@ def case_v61():
                  "IF(c.recorded_date >= DATE '2026-11-24', 'forward from 2026-11-24', 'in-sample, not evidence') AS period",
                  "IFNULL(adverse <= 1, FALSE) AS calm", "IFNULL(SAFE_DIVIDE(p, sigma) <= 0.7, FALSE) AS measured",
                  "AVG(IF(n_kept > 0, arm_mean, NULL)) - AVG(IF(n_kept = 0, day_mean, NULL)) AS timing_lift",
-                 "WHEN IFNULL(l.days, 0) < 20 OR t.calls < 40 THEN 'collecting'",
-                 "WHEN IF(STARTS_WITH(t.arm, 'P2'), l.t, l.timing_t) >= 2 THEN 'BETTER THAN THE BASELINE'"):
+                 # Codex P2 on #1064: overlapping windows - every t over SQRT(mean horizon in sessions), and the
+                 # forward reading waits for two horizon lengths of call days
+                 "ROUND(l.t / SQRT(t.hd), 2) AS t_stat", "ROUND(l.timing_t / SQRT(t.hd), 2) AS timing_t",
+                 "ROUND(SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v * t.hd)), 2) AS keep_vs_out_t",
+                 "WHEN IFNULL(l.days, 0) < GREATEST(20, 2 * t.hd) OR t.calls < 40 THEN 'collecting'",
+                 # Codex P2 on #1064: P3 (a market state AND a stock test) is read on kept against left-out calls,
+                 # the error clustered by call day
+                 "SUM(IF(kept, SAFE_DIVIDE(r - mk, nk), -SAFE_DIVIDE(r - mo, no_))) AS e",
+                 "SAFE_DIVIDE(COUNT(*), COUNT(*) - 1) * SUM(e * e) AS v",
+                 "WHEN STARTS_WITH(t.arm, 'P3') THEN SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v))"):
         assert frag in sc, frag
+    assert sc.count("ELSE l.timing_t END / SQRT(t.hd)") == 2                         # both thresholds adjusted
     arms = re.findall(r"STRUCT\('([A-Z]\d) ", sc)
     assert arms == ["B0", "P1", "P2", "P3", "P4"], arms
     order = [sc.index(x) for x in ("THEN 'the baseline'", "THEN 'in-sample, not evidence'", "THEN 'collecting'")]

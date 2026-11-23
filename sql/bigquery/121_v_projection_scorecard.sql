@@ -15,20 +15,28 @@
 --   P3  P1 and P2 together
 --   P4  B0 with 3 or more adverse states (the side the rule would leave out)
 -- THE MEASURE: hit_pct, mean_pp and their baseline; inside_1sigma_pct = the share of the arm's results inside -/+ one
--- realised sigma (68 % when the range is right). Two lifts, because the rules are of two kinds:
+-- realised sigma (68 % when the range is right). Three lifts, because the rules are of three kinds:
 --   lift_pp / t_stat            a rule that picks among the calls of the same day (P2): the mean over call days of the
 --                               arm's mean minus the baseline's that day, and that mean over its standard error
---   timing_lift_pp / timing_t   a rule on the market's state, the same for every call of a day (P1, P3, P4): the mean
---                               of the kept days' results minus the mean of the other days' results (day means; Welch
---                               t on the two sets of days). Within a day such a rule keeps all calls or none, so its
+--   timing_lift_pp / timing_t   a rule on the market's state, the same for every call of a day (P1, P4): the mean of
+--                               the kept days' results minus the mean of the other days' results (day means; Welch t
+--                               on the two sets of days). Within a day such a rule keeps all calls or none, so its
 --                               within-day lift is always 0
--- THE READING (fixed now): a forward row needs 20 call days and 40 calls; then BETTER THAN THE BASELINE at t >= 2,
--- WORSE at t <= -2, else NO CLEAR DIFFERENCE, on timing_t for P1, P3 and P4 and on t_stat for P2. In-sample rows read
--- 'in-sample, not evidence'.
+--   keep_vs_out_pp / keep_vs_out_t   a rule of both kinds (P3, a market state AND a stock test): the mean of the calls
+--                               it keeps minus the mean of the calls it leaves out, whichever the reason, with the
+--                               standard error clustered by call day (Codex P2 on #1064: P3 read on timing alone left
+--                               out the calls it rejects on the days it keeps, and read nothing when every day kept one)
+-- OVERLAP (Codex P2 on #1064): the results of calls made on neighbouring days share most of their window (a 1M call
+-- holds 21 sessions), so neighbouring days are not independent. Every t here is divided by SQRT(hd), hd = the mean
+-- horizon in sessions of the row's calls: about days / hd of the call days count as independent, as the overlap-
+-- adjusted t of v_trial_c2 and v_trial_shadow_v2 (they count calendar days; this view counts sessions, as its days are).
+-- THE READING (fixed now): a forward row needs the larger of 20 call days and two horizon lengths (2 x hd days), and
+-- 40 calls; then BETTER THAN THE BASELINE at t >= 2, WORSE at t <= -2, else NO CLEAR DIFFERENCE, on t_stat for P2,
+-- keep_vs_out_t for P3 and timing_t for P1 and P4. In-sample rows read 'in-sample, not evidence'.
 -- NO LOOK-AHEAD: the market state and the volatility are those of the last close BEFORE the call's recording day.
 -- Research only: no decision, gate or count reads this view.
 CREATE OR REPLACE VIEW `{{DS}}.v_projection_scorecard`
-OPTIONS (description = "TFB projection scorecard (views 1.24.0): five fixed rules on TFB's scored US buy calls - the baseline, at most 1 adverse US market state, the promise within 0.7 of the stock's own one-sigma move, both, and 3 or more adverse states - with hit rate, mean result, daily lift and its t against the baseline, and the share of results inside one sigma, in-sample and on new calls from 24 Nov 2026 - research only")
+OPTIONS (description = "TFB projection scorecard (views 1.24.0): five fixed rules on TFB's scored US buy calls - the baseline, at most 1 adverse US market state, the promise within 0.7 of the stock's own one-sigma move, both, and 3 or more adverse states - with hit rate, mean result, daily lift and its overlap-adjusted t against the baseline, and the share of results inside one sigma, in-sample and on new calls from 24 Nov 2026 - research only")
 AS
 WITH c AS (
   SELECT record_id, symbol, horizon, recorded_date, engine_roi_pp AS r, engine_win_flag AS w, target_roi_pp AS p,
@@ -76,7 +84,7 @@ k AS (
   FROM j
 ),
 long AS (
-  SELECT k.period, hz AS horizon, k.recorded_date, k.r, k.w, k.sigma, a.arm, a.kept
+  SELECT k.period, hz AS horizon, k.recorded_date, k.r, k.w, k.sigma, k.hd, a.arm, a.kept
   FROM k,
     UNNEST([k.horizon, 'ALL']) AS hz,
     UNNEST([
@@ -97,8 +105,29 @@ tot AS (
     AVG(r) AS base_mean,
     AVG(IF(kept AND sigma IS NOT NULL, IF(ABS(r) <= sigma, 1, 0), NULL)) AS inside,
     MIN(IF(kept, recorded_date, NULL)) AS first_day,
-    MAX(IF(kept, recorded_date, NULL)) AS last_day
+    MAX(IF(kept, recorded_date, NULL)) AS last_day,
+    AVG(IF(kept, NULL, r)) AS out_mean,
+    AVG(hd) AS hd
   FROM long
+  GROUP BY period, horizon, arm
+),
+lg AS (
+  SELECT long.*,
+    AVG(IF(kept, r, NULL)) OVER g AS mk, AVG(IF(kept, NULL, r)) OVER g AS mo,
+    COUNTIF(kept) OVER g AS nk, COUNTIF(NOT kept) OVER g AS no_
+  FROM long
+  WINDOW g AS (PARTITION BY period, horizon, arm)
+),
+kvo AS (
+  -- the clustered variance of (kept mean - left-out mean): each day's summed contribution, squared, G / (G - 1)
+  SELECT period, horizon, arm,
+    SAFE_DIVIDE(COUNT(*), COUNT(*) - 1) * SUM(e * e) AS v
+  FROM (
+    SELECT period, horizon, arm, recorded_date,
+      SUM(IF(kept, SAFE_DIVIDE(r - mk, nk), -SAFE_DIVIDE(r - mo, no_))) AS e
+    FROM lg
+    GROUP BY period, horizon, arm, recorded_date
+  )
   GROUP BY period, horizon, arm
 ),
 daily AS (
@@ -125,18 +154,24 @@ SELECT
   t.period, t.horizon, t.arm, t.calls, t.call_days,
   ROUND(100 * t.hit, 1) AS hit_pct, ROUND(t.mean_r, 2) AS mean_pp,
   ROUND(100 * t.base_hit, 1) AS base_hit_pct, ROUND(t.base_mean, 2) AS base_mean_pp,
-  ROUND(l.lift, 2) AS lift_pp, ROUND(l.t, 2) AS t_stat,
-  ROUND(l.timing_lift, 2) AS timing_lift_pp, ROUND(l.timing_t, 2) AS timing_t, l.other_days,
+  ROUND(l.lift, 2) AS lift_pp, ROUND(l.t / SQRT(t.hd), 2) AS t_stat,
+  ROUND(l.timing_lift, 2) AS timing_lift_pp, ROUND(l.timing_t / SQRT(t.hd), 2) AS timing_t, l.other_days,
+  ROUND(t.mean_r - t.out_mean, 2) AS keep_vs_out_pp,
+  ROUND(SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v * t.hd)), 2) AS keep_vs_out_t,
+  ROUND(t.hd, 1) AS horizon_sessions,
   ROUND(100 * t.inside, 1) AS inside_1sigma_pct,
   t.first_day, t.last_day,
   CASE
     WHEN STARTS_WITH(t.arm, 'B0') THEN 'the baseline'
     WHEN STARTS_WITH(t.period, 'in-sample') THEN 'in-sample, not evidence'
-    WHEN IFNULL(l.days, 0) < 20 OR t.calls < 40 THEN 'collecting'
-    WHEN IF(STARTS_WITH(t.arm, 'P2'), l.t, l.timing_t) >= 2 THEN 'BETTER THAN THE BASELINE'
-    WHEN IF(STARTS_WITH(t.arm, 'P2'), l.t, l.timing_t) <= -2 THEN 'WORSE THAN THE BASELINE'
+    WHEN IFNULL(l.days, 0) < GREATEST(20, 2 * t.hd) OR t.calls < 40 THEN 'collecting'
+    WHEN CASE WHEN STARTS_WITH(t.arm, 'P2') THEN l.t WHEN STARTS_WITH(t.arm, 'P3') THEN SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v))
+              ELSE l.timing_t END / SQRT(t.hd) >= 2 THEN 'BETTER THAN THE BASELINE'
+    WHEN CASE WHEN STARTS_WITH(t.arm, 'P2') THEN l.t WHEN STARTS_WITH(t.arm, 'P3') THEN SAFE_DIVIDE(t.mean_r - t.out_mean, SQRT(q.v))
+              ELSE l.timing_t END / SQRT(t.hd) <= -2 THEN 'WORSE THAN THE BASELINE'
     ELSE 'NO CLEAR DIFFERENCE'
   END AS reading
 FROM tot t
 LEFT JOIN lift l USING (period, horizon, arm)
+LEFT JOIN kvo q USING (period, horizon, arm)
 WHERE t.calls > 0 OR STARTS_WITH(t.period, 'forward');
