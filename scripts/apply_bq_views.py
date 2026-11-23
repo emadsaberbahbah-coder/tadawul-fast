@@ -2,8 +2,28 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.24.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.25.0 (program register C8, Phase 2)
 ================================================================================
+v1.25.0 (23 Nov 2026, news and trend read together). WHY (owner, 23 Nov
+2026 12:34 Riyadh): "deep understanding of information ... analysis news ...
+using data and information and in same time use strategy and trend". A
+headline alone carried no edge in TFB's record (v_company_news_eval) and a
+price alone is a trend; research reads them together (Chan 2003: a move with
+news continues, a large move without news reverses; Tetlock 2011 and
+Lopez-Lira and Tang 2023: news the price has not answered drifts its way).
+Three new views, research only: v_news_trend_daily (122) - per US stock TFB
+follows the company news of and per session from 1 Oct 2026, the company
+news score from both feeds, the price answer against SPY over two sessions
+and its z, the trend before, a state fixed from that research before the
+data was read, its expected direction and fit with the trend, and the
+returns against SPY over the next 1 / 5 / 10 / 20 sessions; v_news_trend_
+learning (123) - each state's record by period, trend fit and horizon, with
+an overlap-adjusted t over dates and a fixed reading (only sessions from 24
+Nov 2026 count as evidence); v_news_understanding (124) - per stock today:
+the latest state, headlines, trend, the expected move and its record, TFB's
+own view, the agreement between them and the projection context, in one
+line. No file of 1.24.0 changes.
+
 v1.24.0 (23 Nov 2026, the projection context). WHY (owner, 23 Nov 2026 10:03
 Riyadh): "make more deep analysis ... link the last updates ... news, future
 options, financial derivatives, any other related data and information that
@@ -541,7 +561,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.24.0"
+__version__ = "1.25.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
