@@ -361,7 +361,7 @@ PENDING = {
     # state's record, and today's reading per stock beside TFB's view (research only)
     "v_news_trend_daily": "278af1f30782c4065f31594059f68716357f87d0eb8cf8a7091886a5b1b224b9",
     "v_news_trend_learning": "9db083a5dde518eaf5acba94aabc8f39f1514c195aa922ace6ad9100f91e37bd",
-    "v_news_understanding": "3ed257415ad33a018d811881f1f0468c0139f9e2567f5d7a8eac057ea0ea085a",
+    "v_news_understanding": "b25a0d8630cd4c79a1af5199776d73ac8d769cafc71f755235500606d416ad11",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3879,7 +3879,9 @@ def case_v62():
     order = [nl.index(x) for x in ("THEN 'no expectation'", "THEN 'collecting'", "THEN 'works as expected'",
                                    "THEN 'opposite of expected'")]
     assert order == sorted(order)
-    for frag in ("WHERE k <= 5 AND state != 'quiet'",
+    assert nu.count("`{{DS}}.v_news_trend_daily`") == 1                              # 1.25.1: the daily view read once
+    for frag in ("SELECT t.*, DENSE_RANK() OVER (ORDER BY t.session_date DESC) AS k",
+                 "ARRAY_AGG(IF(k <= 5 AND state != 'quiet',",
                  "WHEN tfb_stance = expected THEN 'agrees with TFB'", "ELSE 'leans against TFB'",
                  # Codex P2 on #1065: 'STRONG SELL' and 'STRONG_SELL' are the same view
                  "WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1",
