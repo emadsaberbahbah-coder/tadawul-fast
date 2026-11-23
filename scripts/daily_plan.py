@@ -223,6 +223,12 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.10.3 (23 Nov 2026): OPENING THE WORKBOOK WAITS OUT THE QUOTA TOO. The Daily Plan run
+45123566985 (23 Nov 06:3x UTC) ended "cannot open workbook: APIError" at its first call: opening the book reads its
+metadata, which counts against the same per-minute Sheets quota, and it was the one read never retried. It now goes
+through scripts/sheets_quota.call (a quota answer waits 65 s, twice at most), and the error line names the HTTP status
+when there is one (no value of the workbook).
+
 1.10.2 (2026-11-23): THE QUOTA IS WAITED OUT, AND THE RUN LOG NAMES NO PICK.
 (owner, 23 Nov 2026 08:42 Riyadh: "review the full project and check
 specially the workflows and if there is any failing or other issue please
@@ -273,7 +279,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.10.2"
+__version__ = "1.10.3"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -326,6 +332,15 @@ def log_detail() -> bool:
     if v in ("off", "0", "false", "no"):
         return False
     return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
+
+
+def _status_of(e: BaseException) -> str:
+    """1.10.3: the HTTP status of a Sheets error for the run log, e.g. " [429]" (never a value of the workbook)."""
+    code = getattr(getattr(e, "response", None), "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+    if code is None:
+        m = re.search(r"\[(\d{3})\]", str(e))
+        code = m.group(1) if m else None
+    return " [%s]" % code if code else ""
 
 
 def _out(msg: str) -> None:
@@ -1226,9 +1241,10 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     if book is None:
         from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
         try:
-            book = _open_book()
+            from scripts import sheets_quota  # noqa: PLC0415
+            book = sheets_quota.call(_open_book, _SLEEP, _out, "opening the workbook")   # 1.10.3
         except Exception as e:  # noqa: BLE001
-            _out("ERROR: cannot open workbook: %s" % type(e).__name__)
+            _out("ERROR: cannot open workbook: %s%s" % (type(e).__name__, _status_of(e)))
             return 2, False
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:

@@ -994,8 +994,8 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.6.2"                                                 # 2026-11-23: 1.6.2
-    assert '("exit_plan", "1.6.2", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.6.3"                                                 # 2026-11-23: 1.6.3
+    assert '("exit_plan", "1.6.3", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])

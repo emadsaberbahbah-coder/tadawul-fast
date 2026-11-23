@@ -2,7 +2,12 @@
 """
 scripts/holding_read.py - TFB Holding Read
 ==========================================
-VERSION 1.0.1 (2026-11-23) - first written 2026-11-18 (1.0.0)
+VERSION 1.0.2 (2026-11-23) - first written 2026-11-18 (1.0.0)
+1.0.2 (23 Nov 2026): OPENING THE WORKBOOK WAITS OUT THE QUOTA TOO. The Daily Plan run
+    45123566985 (23 Nov 06:3x UTC) ended "cannot open workbook: APIError" at its first call: opening the book reads its
+    metadata, which counts against the same per-minute Sheets quota, and it was the one read never retried. It now goes
+    through scripts/sheets_quota.call (a quota answer waits 65 s, twice at most), and the error line names the HTTP status
+    when there is one (no value of the workbook).
 1.0.1 (2026-11-23): THE RUN LOG NAMES NO HOLDING, AND A QUOTA REFUSAL OF THE WRITE IS WAITED OUT (owner, 23 Nov
     08:42 Riyadh: "review the full project and check specially the workflows ... if there is any failing or other
     issue please update and try to improve"). Every run since 1.0.0 printed one line per holding - its symbol and
@@ -84,7 +89,7 @@ from scripts.exit_plan import (  # noqa: E402
     split_open_session, yahoo_symbol,
 )
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 PAGE_TAB = "Holding_Read"
@@ -127,6 +132,15 @@ SECTOR_FUNDS: Tuple[Tuple[str, str], ...] = (
     (r"software|information technology", "XLK"),
 )
 OFFER_RE = re.compile(r"tender offer|to be acquired|merger agreement|take[- ]private|buyout|acquisition offer", re.I)
+
+
+def _status_of(e: BaseException) -> str:
+    """1.0.2: the HTTP status of a Sheets error for the run log, e.g. " [429]" (never a value of the workbook)."""
+    code = getattr(getattr(e, "response", None), "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+    if code is None:
+        m = re.search(r"\[(\d{3})\]", str(e))
+        code = m.group(1) if m else None
+    return " [%s]" % code if code else ""
 
 
 def _out(msg: str) -> None:
@@ -633,9 +647,10 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     if book is None:
         from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
         try:
-            book = _open_book()
+            from scripts import sheets_quota  # noqa: PLC0415
+            book = sheets_quota.call(_open_book, _SLEEP, _out, "opening the workbook")   # 1.0.2
         except Exception as e:  # noqa: BLE001
-            _out("ERROR: cannot open workbook: %s" % type(e).__name__)
+            _out("ERROR: cannot open workbook: %s%s" % (type(e).__name__, _status_of(e)))
             return 2
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:

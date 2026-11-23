@@ -413,13 +413,13 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
-    ("daily_plan", "1.10.2", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log
+    ("daily_plan", "1.10.3", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
-    ("exit_plan", "1.6.2", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding; 11-23: 1.6.2 write quota
+    ("exit_plan", "1.6.3", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding; 11-23: 1.6.2 write quota, 1.6.3 open
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
-    ("holding_read", "1.0.1", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota
+    ("holding_read", "1.0.2", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
     ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
     ("today_action_plan", "1.8.2", "today action plan"),   # 2026-11-23: 1.8.2 the run log names no stock
