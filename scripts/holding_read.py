@@ -2,7 +2,16 @@
 """
 scripts/holding_read.py - TFB Holding Read
 ==========================================
-VERSION 1.0.0 (2026-11-18)
+VERSION 1.0.1 (2026-11-23) - first written 2026-11-18 (1.0.0)
+1.0.1 (2026-11-23): THE RUN LOG NAMES NO HOLDING, AND A QUOTA REFUSAL OF THE WRITE IS WAITED OUT (owner, 23 Nov
+    08:42 Riyadh: "review the full project and check specially the workflows ... if there is any failing or other
+    issue please update and try to improve"). Every run since 1.0.0 printed one line per holding - its symbol and
+    its last session against the market and its group - into the GitHub Actions log of a public repository (the
+    owner's standing rule: no holdings' symbols in run logs). On GitHub Actions each holding now prints as
+    "holding 3 of 8: GROUP | <read>"; gate TFB_HREAD_LOG_DETAIL = auto (default: no detail on GitHub Actions) | on |
+    off. And 22 Nov 20:27 UTC the run ended "publication unconfirmed: APIError" on the Sheets per-minute quota:
+    the two page writes overwrite their whole range, so a quota answer is now waited out and the writes tried again
+    (scripts/sheets_quota.call, 65 / 65 s). The page and the ledger are unchanged.
 
 WHY (owner, Wed 18 Nov 2026 09:36 Riyadh: "check what happened to my investments as there is now 2 days loss ...
 add two new [fields] to the analysis of my portfolio: the main news that affected the last day's performance of
@@ -75,7 +84,7 @@ from scripts.exit_plan import (  # noqa: E402
     split_open_session, yahoo_symbol,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 PAGE_TAB = "Holding_Read"
@@ -92,6 +101,18 @@ HISTORY_PATH = "/v8/finance/chart/{sym}?range={rng}&interval=1d"
 READ_ATTEMPTS = 3
 READ_RETRY_S = 20
 _SLEEP = time.sleep
+
+
+def log_detail() -> bool:
+    """1.0.1: may the run log name the holdings? TFB_HREAD_LOG_DETAIL = on | off | auto (default: not on GitHub
+    Actions, whose logs are public for this repository)."""
+    v = (os.environ.get("TFB_HREAD_LOG_DETAIL") or "auto").strip().lower()
+    if v in ("on", "1", "true", "yes"):
+        return True
+    if v in ("off", "0", "false", "no"):
+        return False
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
+
 
 UP_READS = ("REBOUND MORE LIKELY", "RISE MORE LIKELY TO CONTINUE", "UP MORE LIKELY")
 DOWN_READS = ("FURTHER FALL MORE LIKELY", "PULLBACK MORE LIKELY", "DOWN MORE LIKELY")
@@ -681,18 +702,26 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                 stamp, sessions[-1].isoformat() if sessions else "n/a", gate.get("verdict") or "not read",
                 " (%s)" % gate["market"] if gate.get("market") else "", __version__),
             "score": score_line(dict(score(keep), open=score(keep)["open"] + len(ok)))}
-    for r in results:
-        _out("%-9s %-13s stock %s market %s group %s | %s%s" % (
-            r["symbol"], r["driver"], pct(r.get("r"), 2) or "n/a", pct(r.get("m"), 2) or "n/a",
-            pct(r.get("s"), 2) or "n/a", r.get("label") or "no read",
-            (" (up %.0f%% of %d)" % (r["p"], r["n"])) if r.get("p") is not None else ""))
+    detail = log_detail()                                                            # 1.0.1 [LOG-PRIVACY]
+    for i, r in enumerate(results, 1):
+        if detail:
+            _out("%-9s %-13s stock %s market %s group %s | %s%s" % (
+                r["symbol"], r["driver"], pct(r.get("r"), 2) or "n/a", pct(r.get("m"), 2) or "n/a",
+                pct(r.get("s"), 2) or "n/a", r.get("label") or "no read",
+                (" (up %.0f%% of %d)" % (r["p"], r["n"])) if r.get("p") is not None else ""))
+        else:
+            _out("holding %d of %d: %s | %s" % (i, len(results), r["driver"], r.get("label") or "no read"))
     _out("%d earlier read(s) marked; %s" % (marked, info["score"]))
     if not write:
         _out("%s - nothing written" % ("dry run" if dry_run else "observe"))
         return 0
-    try:
+    from scripts import sheets_quota  # noqa: PLC0415
+
+    def publish() -> None:                     # both writes overwrite their whole range: safe to repeat (1.0.1)
         write_grid(book, LEDGER_TAB, grid, len(LEDGER_HEADERS), 200)
         write_grid(book, PAGE_TAB, page_rows(results, info), PAGE_WIDTH, 40)
+    try:
+        sheets_quota.call(publish, _SLEEP, _out, "writing the Holding Read")
     except Exception as e:  # noqa: BLE001
         _out("ERROR: publication unconfirmed: %s; read back before retrying" % type(e).__name__)
         return 3

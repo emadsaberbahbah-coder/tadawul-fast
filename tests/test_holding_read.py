@@ -66,6 +66,7 @@ def _env(monkeypatch):
     for name in list(__import__("os").environ):
         if name.startswith("TFB_HREAD") or name == "TFB_HOLDING_READ":
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TFB_HREAD_LOG_DETAIL", "on")         # 1.0.1: the suite reads the detailed lines (P1: the rest)
     monkeypatch.setattr(hr, "_SLEEP", lambda s: None)
 
 
@@ -399,7 +400,7 @@ def test_h8_run(monkeypatch, capsys):
     assert all("range=5y" in u for u in CALLS) and len(CALLS) == len(set(CALLS))  # each series is fetched once
     page = book.tabs["Holding_Read"].values
     assert page[0][0].startswith("HOLDING READ") and page[4][:len(hr.PAGE_HEAD)] == hr.PAGE_HEAD   # the blank row is dropped by the fake
-    assert "last session 2026-11-17 · news gate NO_NEW_ENTRY (SPX -1.03%, VIX 25.5) · holding_read 1.0.0" in page[1][0]
+    assert "last session 2026-11-17 · news gate NO_NEW_ENTRY (SPX -1.03%, VIX 25.5) · holding_read " + hr.__version__ in page[1][0]
     rows = {r[0]: r for r in page[5:]}
     assert list(rows) == ["5023.SR", "AAA.US", "BBB.US", "GONE.US"]                # the inactive lot is not read
     a = rows["AAA.US"]
@@ -474,6 +475,47 @@ def test_h9_the_public_log_carries_no_quantity_or_value(monkeypatch, capsys):
     assert "AAA.US    SECTOR" in out and "stock -2.20% market -1.00% group -1.90%" in out
 
 
+# ----------------------------------------------------------------------------- P1 (1.0.1 [LOG-PRIVACY] [QUOTA])
+def test_p1_the_run_log_names_no_holding_on_actions(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_HOLDING_READ", "on")
+    monkeypatch.delenv("TFB_HREAD_LOG_DETAIL")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert hr.log_detail() is True                                                   # a local run: the full lines
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    for raw, want in (("on", True), ("1", True), ("off", False), ("auto", False), ("", False), ("maybe", False)):
+        monkeypatch.setenv("TFB_HREAD_LOG_DETAIL", raw)
+        assert hr.log_detail() is want, raw
+    monkeypatch.delenv("TFB_HREAD_LOG_DETAIL")
+    book = wbook()
+    assert hr.run(False, book=book, now=NOW, opener=opener) == 0
+    out = capsys.readouterr().out
+    assert "AAA" not in out and "BBB" not in out and "stock -2.20%" not in out
+    assert re.search(r"holding \d of 4: SECTOR \| NO EDGE", out) and "holding 1 of 4: NOT READ" in out
+    assert "AAA.US" in [r[0] for r in book.tabs["Holding_Read"].values], "the page is unchanged"
+
+
+def test_p1_a_quota_refusal_of_the_write_is_waited_out(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_HOLDING_READ", "on")
+    naps = []
+    monkeypatch.setattr(hr, "_SLEEP", naps.append)
+    real, seen = hr.write_grid, {"n": 0}
+
+    class Quota(Exception):
+        def __str__(self):
+            return "APIError: [429]: Quota exceeded for quota metric 'Write requests'"
+
+    def once(*a, **kw):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise Quota()
+        return real(*a, **kw)
+    monkeypatch.setattr(hr, "write_grid", once)
+    assert hr.run(False, book=wbook(), now=NOW, opener=opener) == 0
+    out = capsys.readouterr().out
+    assert "Sheets quota reached while writing the Holding Read: waiting 65 s, then try 1 of 2" in out
+    assert 65.0 in naps and "wrote " in out
+
+
 # ----------------------------------------------------------------------------- H10
 def test_h10_workflow_manifest_ci():
     wf = yaml.safe_load((ROOT / ".github/workflows/holding_read.yml").read_text(encoding="utf-8"))
@@ -500,7 +542,7 @@ def test_h10_workflow_manifest_ci():
         assert env[name] == "${{ vars.%s || '%s' }}" % (name, default), name
     assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is False
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.0"
+    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.1"
     ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     assert any("tests/test_holding_read.py" in s.get("run", "") for s in ci["jobs"]["lean-unit"]["steps"])
     k = hr.knobs()

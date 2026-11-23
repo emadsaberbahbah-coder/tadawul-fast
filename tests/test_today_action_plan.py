@@ -173,6 +173,7 @@ def _env(monkeypatch):
     for name in list(__import__("os").environ):
         if name.startswith("TFB_TAP_") or name == "TFB_TODAY_PLAN":
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TFB_TAP_LOG_DETAIL", "on")           # 1.8.2: the suite reads the detailed lines (L1: the rest)
 
 
 # ----------------------------------------------------------------------------- T1 readers
@@ -1887,7 +1888,7 @@ def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeyp
         assert tap.day_order_on() is want, value
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
-    assert tap.__version__ == "1.8.1"
+    assert tap.__version__ == "1.8.2"
 
 
 def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
@@ -2056,3 +2057,26 @@ def test_v181_passing_server_fault_is_waited_out(capsys):
         tap.with_retry(lambda: (_ for _ in ()).throw(APIError("[503]: x")), 0, slept.append, "x")
     with pytest.raises(ValueError):
         tap.with_retry(lambda: (_ for _ in ()).throw(ValueError("[500] in a cell")), 3, slept.append, "x")
+
+
+# ----------------------------------------------------------------------------- L1 (1.8.2 [LOG-PRIVACY])
+def test_l1_the_run_log_names_no_stock_on_actions(monkeypatch, capsys):
+    """On GitHub Actions (public logs) the FINAL, STEP, ALIGN and picks lines carry counts and decisions only."""
+    monkeypatch.delenv("TFB_TAP_LOG_DETAIL")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert tap.log_detail() is True                                                  # a local run: the full lines
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    for raw, want in (("on", True), ("1", True), ("off", False), ("auto", False), ("", False), ("maybe", False)):
+        monkeypatch.setenv("TFB_TAP_LOG_DETAIL", raw)
+        assert tap.log_detail() is want, raw
+    monkeypatch.delenv("TFB_TAP_LOG_DETAIL")
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=plan_capture()) == 0
+    out = capsys.readouterr().out
+    for sym in ("SUPN", "GLPI", "DDI", "IBOC", "5023", "NMM", "EFC", "MBIN", "TEN.US", "ZTO"):
+        assert sym not in out, sym
+    assert "FINAL " not in out and "STEP " not in out and " shares" not in out and " SAR" not in out
+    _head, rows = _final(book)
+    assert re.search(r"final 1 of %d: [A-Z ]+ \(rule: " % len(rows), out)
+    assert re.search(r"step 1 of \d+: ", out)
+    assert rows["SUPN.US"]["Decision"] == "HOLD", "the decisions are unchanged"

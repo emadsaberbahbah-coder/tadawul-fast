@@ -223,6 +223,26 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.10.2 (2026-11-23): THE QUOTA IS WAITED OUT, AND THE RUN LOG NAMES NO PICK.
+(owner, 23 Nov 2026 08:42 Riyadh: "review the full project and check
+specially the workflows and if there is any failing or other issue please
+update and try to improve"). Two of the last day's runs ended red on the
+Google Sheets per-minute read quota, which every job shares through one
+service account: 22 Nov 20:29 UTC "publication unconfirmed: APIError" and
+23 Nov 05:21 UTC "cannot read the workbook: APIError" after three reads 20 s
+apart - all inside the same quota minute. Now a read refused for the quota
+(or a passing 5xx) waits 65 s, into a new quota minute
+(scripts/sheets_quota.wait_for_transient), and the two page writes, which
+overwrite their whole range and so are safe to repeat, are tried again on a
+quota answer (sheets_quota.call, 65 / 65 s). Any other write error still
+stops at "publication unconfirmed". The run log on GitHub Actions - public
+for this repository - prints "plan pick 2 of 3: <status>" instead of the
+symbol, quantity, entry and stop, and the count of live prices instead of
+the names and prices (the owner's standing rule: no amounts, quantities or
+holdings' symbols in run logs). Gate TFB_PLAN_LOG_DETAIL = auto (default:
+no detail on GitHub Actions) | on | off. The page and the ledger are
+unchanged.
+
 1.10.1 (2026-11-19): ONE SECTOR VOCABULARY FOR THE SECTOR LIMITS (owner, 19 Nov
 01:18 Riyadh: "make full review ... check data for better alignment").
 Found in that review: a held name's sector comes from the source pages, which
@@ -253,7 +273,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.10.1"
+__version__ = "1.10.2"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -295,6 +315,17 @@ OK_OUTPUTS = ("EXECUTABLE", "QUALIFIED_UNFUNDED", "HELD", "WITHHELD", "NO_TRADE"
 
 
 _SLEEP = time.sleep
+
+
+def log_detail() -> bool:
+    """1.10.2: may the run log name the picks and their levels? TFB_PLAN_LOG_DETAIL = on | off | auto (default:
+    not on GitHub Actions, whose logs are public for this repository)."""
+    v = (os.environ.get("TFB_PLAN_LOG_DETAIL") or "auto").strip().lower()
+    if v in ("on", "1", "true", "yes"):
+        return True
+    if v in ("off", "0", "false", "no"):
+        return False
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
 
 
 def _out(msg: str) -> None:
@@ -1214,9 +1245,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             if missing or attempt == READ_ATTEMPTS:
                 _out("ERROR: cannot read the workbook: %s; nothing written" % type(e).__name__)
                 return 2, False
+            from scripts.sheets_quota import wait_for_transient  # noqa: PLC0415
+            wait = wait_for_transient(e, attempt) or READ_RETRY_S      # 1.10.2: the quota is counted per minute
             _out("read failed (%s) - attempt %d of %d, retrying in %d s" % (
-                type(e).__name__, attempt, READ_ATTEMPTS, READ_RETRY_S))
-            _SLEEP(READ_RETRY_S)
+                type(e).__name__, attempt, READ_ATTEMPTS, wait))
+            _SLEEP(wait)
     sources = read_sources(grids)
     day = today.isoformat()
     today_rows = [d for d in ledger if text(d["Plan Date"]) == day]
@@ -1301,9 +1334,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                     day, state["run_at"], quality, len(plan["picks"]), len(plan["pipeline"]), cash_from))
     if today_rows:
         live = live_overlay(today_rows, sources) if k["live"] else {}
-        if live:
+        if live and log_detail():
             _out("live prices for %s" % ", ".join("%s %s" % (s, fmt((sources.get(s) or {}).get("price")))
                                                   for s in sorted(live)))
+        elif live:
+            _out("live prices for %d plan row(s)" % len(live))                       # 1.10.2 [LOG-PRIVACY]
         refresh_status(today_rows, sources, cal, lots["held"], today, k["earn_days"], stamp, live,
                        now=now, max_age_h=k["quote_max_h"], need_time=k["quote_time"])
         first = today_rows[0]
@@ -1317,20 +1352,28 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
     else:
         info["headline"] = "Plan of %s · not cut yet · checked %s Riyadh" % (day, stamp)
         _out(info.get("no_picks", "no plan"))
-    for d in today_rows:
-        if text(d["Kind"]) == "PICK":
+    detail = log_detail()                                                            # 1.10.2 [LOG-PRIVACY]
+    picks_now = [d for d in today_rows if text(d["Kind"]) == "PICK"]
+    for i, d in enumerate(picks_now, 1):
+        if detail:
             _out("  PICK %s qty %s entry %s stop %s -> %s (%s)" % (
                 text(d["Symbol"]), fmt(d["Qty"], 0), fmt(d["Entry"]), fmt(d["Stop"]), text(d["Status"]),
                 text(d["Status Reason"])))
+        else:
+            _out("  plan pick %d of %d: %s" % (i, len(picks_now), text(d["Status"]) or "-"))
     page = page_rows(today_rows, prev_picks, info)
     if not write:
         _out("%s - nothing written" % ("dry run" if dry_run else "observe"))
         return 0, bool(today_rows)
     all_rows = older + today_rows
     grid = [list(LEDGER_HEADERS)] + [[d[h] for h in LEDGER_HEADERS] for d in all_rows][-MAX_LEDGER_ROWS:]
-    try:
+    from scripts import sheets_quota  # noqa: PLC0415
+
+    def publish() -> None:                     # both writes overwrite their whole range: safe to repeat (1.10.2)
         write_grid(book, LEDGER_TAB, grid, len(LEDGER_HEADERS), 200)
         write_grid(book, PAGE_TAB, page, PAGE_WIDTH, 80)
+    try:
+        sheets_quota.call(publish, _SLEEP, _out, "writing the Daily Plan")
     except Exception as e:  # noqa: BLE001
         _out("ERROR: publication unconfirmed: %s; read back before retrying" % type(e).__name__)
         return 3, bool(today_rows)

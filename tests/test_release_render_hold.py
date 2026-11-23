@@ -439,7 +439,7 @@ def case_h10_gate_vocabulary_and_constants(mp, tmp_path):
     assert R._RENDER_HOLD_REASONS <= vocabulary
     assert vocabulary - R._RENDER_HOLD_REASONS == {
         "run_id_not_source", "not_strict", "coverage_summary_not_zero", "cockpit_run_stamps_missing"}
-    assert R.SCRIPT_VERSION == "1.4.2"
+    assert R.SCRIPT_VERSION == "1.4.3"
 
 
 def _base_module(tmp_path):
