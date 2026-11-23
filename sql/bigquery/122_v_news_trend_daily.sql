@@ -36,13 +36,15 @@
 -- they exist. period: 'forward from 2026-11-24' for sessions from 24 Nov 2026, else 'history, rules fixed before
 -- reading it'.
 -- COVERAGE: the US symbols with at least one company headline in either feed (the holdings, the boards and the ROI
--- leaders: the EODHD news budget covers about 100 names); prices from symbol_bars_daily (adjusted closes).
+-- leaders: the EODHD news budget covers about 100 names); prices from symbol_bars_daily and SPY from
+-- market_series_daily, adjusted closes on both sides.
 -- Research only: no decision, gate or count reads this view.
 CREATE OR REPLACE VIEW `{{DS}}.v_news_trend_daily`
 OPTIONS (description = "TFB news and trend by session (views 1.25.0): for each US stock TFB follows the company news of, each session from 1 Oct 2026 - the company news score and items, the price answer against SPY over two sessions and its z, the trend before, a state fixed from research before the data was read (news the price agreed with, refused or did not answer yet, big moves without news) with its expected direction and fit with the trend, and the returns against SPY over the next 1, 5, 10 and 20 sessions - research only")
 AS
 WITH spy AS (
-  SELECT date, close
+  -- adjusted closes on both sides, as v_company_news_eval (Codex P2 on #1065: SPY's dividend drop is not a move)
+  SELECT date, COALESCE(adj_close, close) AS close
   FROM `{{DS}}.market_series_daily`
   WHERE symbol = 'SPY' AND close > 0
   QUALIFY ROW_NUMBER() OVER (PARTITION BY date ORDER BY captured_at DESC) = 1

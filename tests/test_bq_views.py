@@ -359,9 +359,9 @@ PENDING = {
     "v_projection_scorecard": "f44c6cdefd5708823ae60c1d61fdd9da34cadf3d6497b85c03372667fd1c5a7f",
     # apply_bq_views 1.25.0 (23 Nov 2026): company news, the price's answer and the trend read together, each
     # state's record, and today's reading per stock beside TFB's view (research only)
-    "v_news_trend_daily": "bbc882af9190d35992277085a71763eeefe670eea55ee1efb272afe2a063db28",
+    "v_news_trend_daily": "278af1f30782c4065f31594059f68716357f87d0eb8cf8a7091886a5b1b224b9",
     "v_news_trend_learning": "9db083a5dde518eaf5acba94aabc8f39f1514c195aa922ace6ad9100f91e37bd",
-    "v_news_understanding": "3287f7270a2ea8819b9f0e80cfe3ad023b9e483fdafdd608251f53e314b3d188",
+    "v_news_understanding": "4cdfca3260f60ed4333c60c543f9574b8d092f61a340fb641eb1ea8867f2b7f6",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3881,8 +3881,13 @@ def case_v62():
     assert order == sorted(order)
     for frag in ("WHERE k <= 5 AND state != 'quiet'", "WHERE trend_fit = 'all' AND horizon_sessions = 5",
                  "WHEN tfb_stance = expected THEN 'agrees with TFB'", "ELSE 'leans against TFB'",
-                 "WHEN recommendation IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1"):
+                 # Codex P2 on #1065: 'STRONG SELL' and 'STRONG_SELL' are the same view
+                 "WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1",
+                 "WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('BUY', 'STRONG_BUY', 'ACCUMULATE', 'ADD') THEN 1"):
         assert frag in nu, frag
+    # Codex P2 on #1065: SPY on the same adjusted basis as the stock
+    assert "SELECT date, COALESCE(adj_close, close) AS close\n  FROM `{{DS}}.market_series_daily`" in nd
+    assert "COALESCE(b.adj_close, b.close) AS close" in nd
     for code in (nd, nl, nu):
         assert "CURRENT_" not in code and "FOLLOWING" not in code
 

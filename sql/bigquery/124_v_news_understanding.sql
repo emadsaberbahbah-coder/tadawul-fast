@@ -11,7 +11,8 @@
 --   headlines      the top headline of each of the latest 3 sessions with company news in the last 10 sessions
 --   news_items_5s, news_score_5s   the company news of the last 5 sessions
 --   trend_now      the trend before the latest session (50-session average and 20-session change)
---   tfb_stance     +1 for a BUY-type recommendation, -1 for SELL / STRONG_SELL / REDUCE / AVOID, 0 for HOLD
+--   tfb_stance     +1 for a BUY-type recommendation, -1 for SELL / STRONG SELL / REDUCE / AVOID (spaces, hyphens
+--                  and underscores alike), 0 for HOLD, NULL when TFB has no recommendation
 --   agreement      how the expected move sits against TFB's view: 'agrees with TFB', 'leans against TFB',
 --                  'TFB holds, the news leans up' / '... down', 'no lean from the news'
 --   record_history / record_forward   the state's 5-session record in v_news_trend_learning (trend fit 'all'):
@@ -65,9 +66,11 @@ rec AS (
 ),
 u AS (
   SELECT symbol, name, sector, recommendation, final_action, overall_score, expected_roi_1m_pct,
+    -- 'STRONG BUY' and 'STRONG_BUY' are the same view (Codex P2 on #1065): spaces and hyphens read as underscores
     CASE
-      WHEN recommendation IN ('BUY', 'STRONG_BUY', 'ACCUMULATE', 'ADD') THEN 1
-      WHEN recommendation IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1
+      WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('BUY', 'STRONG_BUY', 'ACCUMULATE', 'ADD') THEN 1
+      WHEN REGEXP_REPLACE(UPPER(TRIM(recommendation)), r'[ -]+', '_') IN ('SELL', 'STRONG_SELL', 'REDUCE', 'AVOID', 'EXIT') THEN -1
+      WHEN recommendation IS NULL THEN NULL
       ELSE 0
     END AS tfb_stance
   FROM `{{DS}}.v_universe_latest`

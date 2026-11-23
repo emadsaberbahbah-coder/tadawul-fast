@@ -78,3 +78,16 @@ trend. It is not statistically clear on 23 dates. Everything stays observe-only.
 3. The strategist page reads the views as soon as they exist. Until then its parts say "not readable yet".
 
 Research only: no decision, gate or count reads these views. Not investment advice.
+
+## Codex follow-up (two P2 findings on the first commit)
+
+1. **SPY on the same adjusted basis as the stock.**
+   - The stock used adjusted closes and SPY raw closes. A window across SPY's ex-dividend date would then count SPY's
+     dividend drop as the stock beating the market.
+   - SPY now reads COALESCE(adj_close, close), as `v_company_news_eval` does.
+   - Re-run on the archive: the history table above is unchanged. No SPY ex-dividend date falls inside the scored
+     windows from 1 Oct.
+2. **Recommendation spellings.**
+   - 'STRONG BUY' / 'STRONG SELL' (with a space, as `track_performance.py` writes them) fell through to "TFB holds".
+   - Spaces and hyphens now read as underscores before the match.
+   - A row with no recommendation gives no stance (NULL), so the agreement reads "TFB has no view today".
