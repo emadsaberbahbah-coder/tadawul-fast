@@ -248,7 +248,11 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-21 (manifest pin only): 5.160.0 -> 5.161.0 ([MARKET-HOLD] +
     # [SELECTION]: TFB_MARKET_GATE / TFB_SELECTION_GATE off|observe|enforce,
     # default off = byte-identical; owner hit-rate request of 21 Nov).
-    ("core.data_engine_v2", "__version__", "5.161.0", "data engine"),
+    # 2026-11-23 (manifest pin only): 5.161.0 -> 5.162.0 ([GATE-EVIDENCE]:
+    # TFB_GATE_EVIDENCE off|observe|enforce, UNSET = observe (tags only); INVEST
+    # needs a BUY-family reco, a positive forecast and a risk reading; the
+    # reliability penalties read one warning tag at a time; audit of 23 Nov).
+    ("core.data_engine_v2", "__version__", "5.162.0", "data engine"),
     # 2026-11-21 (manifest pin only): NEW 1.0.0 - the live condition of the
     # US / Saudi / European / Japanese / Hong Kong markets, read only by the
     # engine's [MARKET-HOLD] tier (stdlib only; reads nothing at import).
