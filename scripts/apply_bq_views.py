@@ -2,8 +2,26 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.25.1 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.26.0 (program register C8, Phase 2)
 ================================================================================
+v1.26.0 (24 Nov 2026, confidence calibration and the shock-drop shadow rule).
+WHY (owner, 24 Nov 2026 01:07 Riyadh: "check now we are able to achieve our
+target" - the INVESTABLE hit rate above 70 %; 00:58: NVDA fell 39 % on its
+CEO's resignation and rose 31 % when he returned - "the stock became
+attractive to buy"; 01:11 "ok, no objection"; 01:18 "Ok let's start"). The
+check of that night: 47.7 % of the 2,389 scored INVESTABLE records rose, but
+58.0 % beat their own market; Saudi HIGH-confidence calls rose 23.8 % of the
+time against 53.8 % for Saudi MEDIUM. Three new views, research only:
+v_confidence_calibration (125) - the tile's population by market, confidence
+and month, the share that rose, the market's own return over the same dates
+(SPY, ^TASI.SR, ACWI), the share that beat it, and whether HIGH did better
+than MEDIUM; v_shock_drop_events (126) - the 100 largest US companies with
+bars falling 30 % within 15 sessions, entered at the first close of the fall
+(A) or after the first confirmed turn (B), scored against SPY over 5, 10 and
+20 sessions; v_shock_drop_learning (127) - that rule's record with a fixed
+reading (history is in-sample; forward from 24 Nov 2026). No file of 1.25.1
+changes.
+
 v1.25.1 (23 Nov 2026, the news understanding kept lean). After the 1.25.0
 deploy, BigQuery refused to plan a read of v_news_understanding ("too many
 subqueries or query is too complex"): it joined v_news_trend_learning and
@@ -570,7 +588,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.25.1"
+__version__ = "1.26.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

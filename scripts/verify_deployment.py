@@ -363,7 +363,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v_news_understanding - company news, the price's answer and the trend read together, and their record).
     # 2026-11-23 (manifest pin only): 1.25.0 -> 1.25.1 (v_news_understanding kept lean: BigQuery could not plan it
     # beside the record and the projection context).
-    ("apply_bq_views", "1.25.1", "bigquery looker views"),
+    # 2026-11-24 (manifest pin only): 1.25.1 -> 1.26.0 (v_confidence_calibration, v_shock_drop_events,
+    # v_shock_drop_learning - confidence by market and the share beating the market; the shock-drop shadow rule).
+    ("apply_bq_views", "1.26.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -387,7 +389,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-02 (same rule): 1.0.0 -> 1.1.0 (the symbols with an active
     # Performance_Log record join the bars load for the BigQuery outcome
     # engine; TFB_DEEP_OUTCOME_BARS, default off).
-    ("archive_symbol_deep", "1.2.0", "bigquery symbol deep data"),
+    # 2026-11-24 (pin only): 1.2.0 -> 1.3.0 (the 50 largest US equities and the day's big movers join the core
+    # news set, TFB_DEEP_NEWS_WIDE default on, core cap 200).
+    ("archive_symbol_deep", "1.3.0", "bigquery symbol deep data"),
     # 2026-11-19 (new script, pinned on arrival): the daily world-news themes
     # (GDELT) the news learning loop is taught from; research table only.
     # 2026-11-21: 1.0.0 -> 1.1.0 (three more sources: the fights, the share

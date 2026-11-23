@@ -241,6 +241,8 @@ def env(monkeypatch):
     monkeypatch.delenv("TFB_DEEP_EODHD", raising=False)
     monkeypatch.delenv("TFB_DEEP_EODHD_MAX_SHARE", raising=False)
     monkeypatch.delenv("TFB_DEEP_OUTCOME_BARS", raising=False)
+    # 1.3.0: the wide news sets are on by default; the earlier cases pin the v1.2.0 bytes with them off
+    monkeypatch.setenv("TFB_DEEP_NEWS_WIDE", "off")
     monkeypatch.setenv("GITHUB_RUN_ID", "777")
 
 
@@ -449,9 +451,11 @@ def test_d10_workflow():
                                             "github.event.inputs.outcome_bars == 'true' && 'on' || "
                                             "vars.TFB_DEEP_OUTCOME_BARS || 'off' }}")
     assert wf["jobs"]["deep"]["timeout-minutes"] == 45
-    assert asd.__version__ == "1.2.0"
+    assert asd.__version__ == "1.3.0"
     # 1.2.0: the matured calls follow their own Variable, on by default
     assert env["TFB_DEEP_OUTCOME_MATURED"] == "${{ vars.TFB_DEEP_OUTCOME_MATURED || 'on' }}"
+    # 1.3.0: the wide news sets follow their own Variable, on by default
+    assert env["TFB_DEEP_NEWS_WIDE"] == "${{ vars.TFB_DEEP_NEWS_WIDE || 'on' }}"
 
 
 # --------------------------------------------------------------------- D11
@@ -669,3 +673,79 @@ def test_d12b_matured_off_reads_the_v110_words(env, capsys, monkeypatch):
     bq3 = FakeBQ()
     _run_capture(["--write", "--extra", "AAPL.US"], bq3, capsys, fetch=bars_fetch(calls=[]), opener=make_opener(calls=[]))
     assert "status IN ('matured'" not in bq3.queries[0]
+
+
+# --------------------------------------------------------------------- D13
+WIDE_ROWS = [("NVDA.US", "mega"), ("AAPL.US", "mega"), ("FRST.US", "mega"), ("INTU.US", "movers"),
+             ("3008.SR", "movers"), ("NVDA.US", "movers")]
+
+
+def test_d13_wide_query_and_gate(monkeypatch):
+    """1.3.0: wide on adds two unions (the movers of every market, the 50 largest US equities, both from one
+    row per symbol that is equity on every page and never a Mutual_Funds row); off is the v1.2.0 text."""
+    ds = "p.d"
+    for matured in (False, True):
+        base = asd.set_query(ds, matured)
+        assert asd.set_query(ds, matured, False) == base
+        q = asd.set_query(ds, matured, True)
+        assert q.startswith(base)
+        tail = q[len(base):]
+        assert tail.startswith("UNION ALL SELECT symbol, 'movers' FROM (") and tail.endswith(
+            "WHERE market_code = 'US' AND cap_rk <= 50\n")
+        # Codex P2 on #1068: every page's latest night from v_universe, not the one-page latest view
+        assert tail.count("FROM (SELECT * FROM `p.d.v_universe` WHERE snapshot_date >= (SELECT DATE_SUB(MAX(snapshot_date), "
+                          "INTERVAL 7 DAY) FROM `p.d.v_universe`) QUALIFY snapshot_date = MAX(snapshot_date) OVER "
+                          "(PARTITION BY source_page)) GROUP BY symbol ") == 2
+        assert "v_universe_latest" not in tail
+        assert tail.count("HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') "
+                          "AND MAX(market_cap) > 0") == 2
+        assert "WHERE cap_rk <= 500 AND v30 > 0 AND ABS(ch) >= 5.0) WHERE z >= 3.0) WHERE rk <= 30\n" in tail
+        assert "SAFE_DIVIDE(ABS(ch), v30 / SQRT(252)) AS z" in tail
+        assert "ARRAY_AGG(change_pct IGNORE NULLS ORDER BY captured_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ch" in tail
+        assert tail.count("\n") == 2 and ";" not in tail
+    for val in ("", "on", "1", "yes", "anything"):
+        monkeypatch.setenv("TFB_DEEP_NEWS_WIDE", val)
+        assert asd.news_wide_enabled(), val
+    for val in ("off", "0", "false", "no", " OFF "):
+        monkeypatch.setenv("TFB_DEEP_NEWS_WIDE", val)
+        assert not asd.news_wide_enabled(), val
+    monkeypatch.delenv("TFB_DEEP_NEWS_WIDE", raising=False)
+    assert asd.news_wide_enabled()
+
+
+def _rows(pairs):
+    return [{"symbol": s, "why": w} for s, w in pairs]
+
+
+def test_d13b_wide_sets_order_and_cap():
+    """Movers then mega after the extra symbols, deduplicated, under the cap; rows without them are v1.2.0's."""
+    core, deep = asd.build_sets(_rows(DEEP_ROWS + WIDE_ROWS), ["AAPL.US"], core_cap=asd.CORE_CAP_WIDE)
+    assert core == ["5023.SR", "FRST.US", "DDI.US", "R0.US", "R1.US", "R2.US", "AAPL.US",
+                    "INTU.US", "3008.SR", "NVDA.US"]
+    assert deep["INTU.US"] == "movers" and deep["NVDA.US"] == "movers" and deep["AAPL.US"] == "extra"
+    assert list(deep)[-2:] == ["R9.US", "2222.SR"]
+    assert asd.build_sets(_rows(DEEP_ROWS), ["AAPL.US"]) == \
+        asd.build_sets(_rows(DEEP_ROWS), ["AAPL.US"], core_cap=asd.CORE_CAP_WIDE)
+    many = [(f"M{i}.US", "mega") for i in range(300)]
+    core, deep = asd.build_sets(_rows(DEEP_ROWS + many), [], core_cap=asd.CORE_CAP_WIDE)
+    assert len(core) == 200 and core[-1] == "M193.US" and len(deep) <= 600
+    assert (asd.CORE_CAP, asd.CORE_CAP_WIDE, asd.MEGA_N, asd.MOVERS_N) == (120, 200, 50, 30)
+
+
+def test_d13c_wide_run_reads_and_logs(env, capsys, monkeypatch):
+    monkeypatch.delenv("TFB_DEEP_NEWS_WIDE", raising=False)   # the default: on
+    bq, calls, eod = FakeBQ(rows=DEEP_ROWS + WIDE_ROWS), [], []
+    rc, err, _ = _run_capture(["--write", "--extra", "AAPL.US"], bq, capsys,
+                              fetch=bars_fetch(calls=calls), opener=make_opener(calls=eod))
+    assert rc == 0
+    assert "UNION ALL SELECT symbol, 'mega' FROM (" in bq.queries[0]
+    assert "sets: core 10 (holdings, board, top-25 ROI, extra, movers, top-50 US), deep 12\n" in err
+    assert calls == ["5023.SR", "FRST", "DDI", "R0", "R1", "R2", "AAPL", "INTU", "3008.SR", "NVDA", "R9", "2222.SR"]
+    assert sum("/fundamentals/" in c for c in eod) == 10 and any("INTU.US" in c for c in eod)
+    # off: the query and the log are v1.2.0's
+    monkeypatch.setenv("TFB_DEEP_NEWS_WIDE", "off")
+    bq2 = FakeBQ(rows=DEEP_ROWS)
+    rc, err, _ = _run_capture(["--write", "--extra", "AAPL.US"], bq2, capsys,
+                              fetch=bars_fetch(calls=[]), opener=make_opener(calls=[]))
+    assert rc == 0 and "'mega'" not in bq2.queries[0] and "'movers'" not in bq2.queries[0]
+    assert "sets: core 7 (holdings, board, top-25 ROI, extra), deep 9\n" in err

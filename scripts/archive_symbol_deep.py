@@ -2,7 +2,32 @@
 # scripts/archive_symbol_deep.py
 """
 ================================================================================
-TFB Symbol Deep Data - v1.2.0 (program register C8, Phase 3)
+TFB Symbol Deep Data - v1.3.0 (program register C8, Phase 3)
+================================================================================
+v1.3.0 (2026-11-24) - WIDER NEWS: THE LARGEST US NAMES AND THE DAY'S BIG MOVERS
+--------------------------------------------------------------------------------
+WHY (owner, 24 Nov 2026 00:48 and 00:58 Riyadh): NVDA rose 31 % on 23 Nov and
+the news system had nothing on it - the core set follows what TFB likes (the
+holdings, the board, the ROI leaders), not what moves the market, and NVDA was
+a HOLD. Owner, 01:18: "Ok let's start".
+WHAT: with TFB_DEEP_NEWS_WIDE on (default) the set query adds two reasons,
+read from v_universe, each page's latest night (one row per symbol: equity on
+every page that carries it and never on the Mutual_Funds page, a positive
+market cap; the latest change and 30-day volatility):
+  * 'movers': listings in the top MOVERS_CAP_RANK (500) by market cap of their
+    own market whose last change was at least MOVERS_MIN_MOVE (5 %) and at
+    least MOVERS_MIN_Z (3) daily standard deviations (30-day volatility / sqrt
+    252), the largest move first, at most MOVERS_N (30) - every market, not only the US;
+  * 'mega': the MEGA_N (50) largest US equities by market cap.
+build_sets() puts them in the CORE set after the extra symbols (movers, then
+mega) and the core cap becomes CORE_CAP_WIDE (200); the deep set (bars) takes
+them in the same order. The analyst and news loads and the budget guard are
+unchanged: about 80 more symbols cost about 1,200 EODHD calls a night (1.2 %
+of the daily limit), still checked against TFB_DEEP_EODHD_MAX_SHARE.
+NOTHING decides on this: it is data for the news-and-trend views (observe).
+GATE: TFB_DEEP_NEWS_WIDE = on (default) | off. Off: the set query, the sets
+and every log line are the v1.2.0 ones, byte for byte. Rollback: the
+repository Variable TFB_DEEP_NEWS_WIDE=off.
 ================================================================================
 v1.2.0 (2026-11-19) - OUTCOME BARS FOR MATURED FORECASTS TOO
 --------------------------------------------------------------------------------
@@ -142,7 +167,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import archive_market_series as ams  # same folder: the Yahoo reader and the BigQuery session
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
@@ -151,6 +176,12 @@ EODHD_UA = "TFB-symbol-deep/1.0"
 BARS_DAYS = 760                 # two years of sessions and a margin
 DEEP_CAP = 600
 CORE_CAP = 120
+CORE_CAP_WIDE = 200             # v1.3.0: the core cap while TFB_DEEP_NEWS_WIDE is on
+MEGA_N = 50                     # v1.3.0: the largest US equities by market cap
+MOVERS_N = 30                   # v1.3.0: the day's unusual movers, every market
+MOVERS_CAP_RANK = 500           # v1.3.0: movers only among the 500 largest of their market
+MOVERS_MIN_MOVE = 5.0           # v1.3.0: percent
+MOVERS_MIN_Z = 3.0              # v1.3.0: daily standard deviations
 OUTCOME_CAP = 1600              # v1.1.0: symbols with an active forecast record (bars only)
 OUTCOME_REASON = "outcome"
 OUTCOME_TIME_S = 1500.0         # v1.1.0: the outcome set stops asking Yahoo after 25 minutes
@@ -260,6 +291,11 @@ def outcome_matured_enabled() -> bool:
     return _env("TFB_DEEP_OUTCOME_MATURED", "on").lower() not in ("off", "0", "false", "no")
 
 
+def news_wide_enabled() -> bool:
+    """v1.3.0: TFB_DEEP_NEWS_WIDE adds the largest US names and the big movers to the core set (default on)."""
+    return _env("TFB_DEEP_NEWS_WIDE", "on").lower() not in ("off", "0", "false", "no")
+
+
 def max_share() -> float:
     try:
         v = float(_env("TFB_DEEP_EODHD_MAX_SHARE", str(DEFAULT_MAX_SHARE)))
@@ -304,7 +340,8 @@ def build_sets(rows: Iterable[Dict[str, Any]], extra: Sequence[str],
                core_cap: int = CORE_CAP, deep_cap: int = DEEP_CAP
                ) -> Tuple[List[str], Dict[str, str]]:
     """(core, deep) from the set query's rows {symbol, why}: core = holdings,
-    board, roi25, extra (in that priority, at most core_cap); deep = core then
+    board, roi25, extra, then (v1.3.0, only when the query returned them)
+    movers and mega, in that priority, at most core_cap; deep = core then
     roi50 and leaders (at most deep_cap) as {symbol: reason}."""
     by: Dict[str, List[str]] = {}
     for r in rows:
@@ -317,7 +354,8 @@ def build_sets(rows: Iterable[Dict[str, Any]], extra: Sequence[str],
     core: List[str] = []
     deep: Dict[str, str] = {}
     for why, syms in (("hold", by.get("hold", [])), ("board", by.get("board", [])),
-                      ("roi25", by.get("roi25", [])), ("extra", list(extra))):
+                      ("roi25", by.get("roi25", [])), ("extra", list(extra)),
+                      ("movers", by.get("movers", [])), ("mega", by.get("mega", []))):
         for s in syms:
             if s not in deep and len(deep) < deep_cap:
                 deep[s] = why
@@ -379,10 +417,46 @@ MATURED_SQL = (
 )
 
 
-def set_query(ds: str, matured: bool) -> str:
-    """v1.2.0: the set query - the v1.1.0 text, plus the matured calls when asked."""
+# v1.3.0: one row per listing of the latest universe - read from v_universe, every page's own latest night, so a
+# symbol is equity on every page that carries it and never on the Mutual_Funds page (SPY, IVV and VTI are labelled
+# EQUITY there; v_universe_latest keeps one page per symbol and could hide that - Codex P2 on #1068); a positive
+# market cap; the latest change and 30-day volatility; its market-cap rank in its own market
+_UNI_SQL = (
+    "SELECT symbol, market_code, mc, ch, v30, "
+    "ROW_NUMBER() OVER (PARTITION BY market_code ORDER BY mc DESC, symbol) AS cap_rk FROM ("
+    "SELECT symbol, ANY_VALUE(market_code) AS market_code, MAX(market_cap) AS mc, "
+    "ARRAY_AGG(change_pct IGNORE NULLS ORDER BY captured_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ch, "
+    "ARRAY_AGG(volatility_30d_pct IGNORE NULLS ORDER BY captured_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS v30 "
+    "FROM (SELECT * FROM `{ds}.v_universe` "
+    "WHERE snapshot_date >= (SELECT DATE_SUB(MAX(snapshot_date), INTERVAL 7 DAY) FROM `{ds}.v_universe`) "
+    "QUALIFY snapshot_date = MAX(snapshot_date) OVER (PARTITION BY source_page)) "
+    "GROUP BY symbol "
+    "HAVING LOGICAL_AND(asset_class = 'EQUITY') AND LOGICAL_AND(source_page != 'Mutual_Funds') "
+    "AND MAX(market_cap) > 0)"
+)
+
+# v1.3.0: the day's big movers and the largest US names, appended to SET_SQL when TFB_DEEP_NEWS_WIDE is on
+WIDE_SQL = (
+    "UNION ALL SELECT symbol, 'movers' FROM (SELECT symbol, "
+    "ROW_NUMBER() OVER (ORDER BY z DESC, symbol) AS rk FROM (SELECT symbol, "
+    "SAFE_DIVIDE(ABS(ch), v30 / SQRT(252)) AS z FROM (" + _UNI_SQL + ") "
+    "WHERE cap_rk <= {cap_rank} AND v30 > 0 AND ABS(ch) >= {min_move}) WHERE z >= {min_z}) "
+    "WHERE rk <= {movers}\n"
+    "UNION ALL SELECT symbol, 'mega' FROM (" + _UNI_SQL + ") "
+    "WHERE market_code = 'US' AND cap_rk <= {mega}\n"
+)
+
+
+def set_query(ds: str, matured: bool, wide: bool = False) -> str:
+    """v1.2.0: the set query - the v1.1.0 text, plus the matured calls when asked;
+    v1.3.0: plus the movers and the largest US names when asked."""
     q = SET_SQL.format(ds=ds)
-    return q + MATURED_SQL.format(ds=ds, days=MATURED_DAYS) if matured else q
+    if matured:
+        q += MATURED_SQL.format(ds=ds, days=MATURED_DAYS)
+    if wide:
+        q += WIDE_SQL.format(ds=ds, cap_rank=MOVERS_CAP_RANK, min_move=MOVERS_MIN_MOVE,
+                             min_z=MOVERS_MIN_Z, movers=MOVERS_N, mega=MEGA_N)
+    return q
 
 
 # ----------------------------------------------------------------------- EODHD
@@ -703,16 +777,18 @@ def run(session: Any, *, project: str, dataset: str, location: str, extra: Seque
             _out(f"ERROR: dataset {project}.{dataset} not found")
             return 2
         matured_on = outcome_bars_enabled() and outcome_matured_enabled() and "bars" in stages   # v1.2.0
-        rows = run_query(session, project, location, set_query(f"{project}.{dataset}", matured_on))
+        wide_on = news_wide_enabled()   # v1.3.0, default on
+        rows = run_query(session, project, location, set_query(f"{project}.{dataset}", matured_on, wide_on))
     except Exception as exc:  # noqa: BLE001
         _out(f"ERROR: {str(exc)[:400]}")
         return 2
-    core, deep = build_sets(rows, extra)
+    core, deep = build_sets(rows, extra, core_cap=CORE_CAP_WIDE) if wide_on else build_sets(rows, extra)
     outcome_on = outcome_bars_enabled() and "bars" in stages   # v1.1.0, default off
     outcome = build_outcome_set(rows, deep) if outcome_on else {}
     day = now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d")
     captured_at = now.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    sets_msg = f"sets: core {len(core)} (holdings, board, top-25 ROI, extra), deep {len(deep)}"
+    sets_msg = (f"sets: core {len(core)} (holdings, board, top-25 ROI, extra, movers, top-{MEGA_N} US), deep {len(deep)}"
+                if wide_on else f"sets: core {len(core)} (holdings, board, top-25 ROI, extra), deep {len(deep)}")
     if outcome_on:
         sets_msg += f", outcome {len(outcome)} (" + ("active and matured" if matured_on else "active") + \
             " forecast records; bars only, best effort)"
