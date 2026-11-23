@@ -979,7 +979,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.10.2"
+    assert dp.__version__ == "1.10.3"
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1459,3 +1459,31 @@ def test_q1_the_run_log_names_no_pick_on_actions(monkeypatch, capsys):
     for r in _ledger(b):
         if r[4] == "PICK":
             assert ("%s " % r[6]) not in out, "the symbol is not in the log"
+
+
+
+# ----------------------------------------------------------------------------- Q2 (1.10.3, holding_read 1.0.2, exit_plan 1.6.3)
+@pytest.mark.parametrize("modname", ["scripts.daily_plan", "scripts.holding_read", "scripts.exit_plan"])
+def test_q2_opening_the_workbook_waits_out_the_quota(monkeypatch, capsys, modname):
+    """Run 45123566985 (23 Nov): "cannot open workbook: APIError" - the open is a metadata read under the same quota."""
+    import importlib
+    from scripts import run_calendar_sync as rcs
+    mod = importlib.import_module(modname)
+    naps, calls = [], {"n": 0}
+    monkeypatch.setattr(mod, "_SLEEP", naps.append)
+
+    def refuse(*a, **kw):
+        calls["n"] += 1
+        raise _Quota()
+    monkeypatch.setattr(rcs, "_open_book", refuse)
+    for gate in ("TFB_DAILY_PLAN", "TFB_HOLDING_READ", "TFB_EXIT_PLAN"):
+        monkeypatch.setenv(gate, "on")
+    if modname.endswith("daily_plan"):
+        code, _ = mod.run_once(True, None, NOW, None, None)
+    else:
+        code = mod.run(True, book=None, now=NOW) if modname.endswith("holding_read") else mod.run(True, False, book=None,
+                                                                                                    now=NOW)
+    out = capsys.readouterr().out
+    assert code == 2 and calls["n"] == 3 and naps == [65.0, 65.0]               # three tries, two waits into new minutes
+    assert "Sheets quota reached while opening the workbook: waiting 65 s, then try 1 of 2" in out
+    assert "cannot open workbook: _Quota [429]" in out

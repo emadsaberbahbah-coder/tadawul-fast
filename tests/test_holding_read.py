@@ -542,7 +542,7 @@ def test_h10_workflow_manifest_ci():
         assert env[name] == "${{ vars.%s || '%s' }}" % (name, default), name
     assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is False
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.1"
+    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.2"
     ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     assert any("tests/test_holding_read.py" in s.get("run", "") for s in ci["jobs"]["lean-unit"]["steps"])
     k = hr.knobs()

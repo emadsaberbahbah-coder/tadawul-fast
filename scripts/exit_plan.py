@@ -2,7 +2,12 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.6.2 (2026-11-23) - first written 2026-11-11 (1.0.0)
+VERSION 1.6.3 (2026-11-23) - first written 2026-11-11 (1.0.0)
+1.6.3 (23 Nov 2026): OPENING THE WORKBOOK WAITS OUT THE QUOTA TOO. The Daily Plan run
+    45123566985 (23 Nov 06:3x UTC) ended "cannot open workbook: APIError" at its first call: opening the book reads its
+    metadata, which counts against the same per-minute Sheets quota, and it was the one read never retried. It now goes
+    through scripts/sheets_quota.call (a quota answer waits 65 s, twice at most), and the error line names the HTTP status
+    when there is one (no value of the workbook).
 1.6.2 (2026-11-23): A QUOTA REFUSAL OF THE WRITE IS WAITED OUT (owner, 23 Nov
     08:42 Riyadh: "check specially the workflows ... if there is any failing
     ... update and try to improve"). The page jobs share one Google service
@@ -228,7 +233,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -255,6 +260,15 @@ READ_ATTEMPTS = 3
 READ_RETRY_S = 20
 _SLEEP = time.sleep
 NO_STOP_CLASSES = ("fixed income", "sukuk", "bond", "fund", "money market")
+
+
+def _status_of(e: BaseException) -> str:
+    """1.6.3: the HTTP status of a Sheets error for the run log, e.g. " [429]" (never a value of the workbook)."""
+    code = getattr(getattr(e, "response", None), "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+    if code is None:
+        m = re.search(r"\[(\d{3})\]", str(e))
+        code = m.group(1) if m else None
+    return " [%s]" % code if code else ""
 
 
 def _out(msg: str) -> None:
@@ -1135,9 +1149,10 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
     if book is None:
         from scripts.run_calendar_sync import _open_book  # noqa: PLC0415
         try:
-            book = _open_book()
+            from scripts import sheets_quota  # noqa: PLC0415
+            book = sheets_quota.call(_open_book, _SLEEP, _out, "opening the workbook")   # 1.6.3
         except Exception as e:  # noqa: BLE001
-            _out("ERROR: cannot open workbook: %s" % type(e).__name__)
+            _out("ERROR: cannot open workbook: %s%s" % (type(e).__name__, _status_of(e)))
             return 2
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:
