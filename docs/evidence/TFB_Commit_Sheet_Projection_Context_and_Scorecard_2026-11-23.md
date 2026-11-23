@@ -56,6 +56,6 @@ Run `bq_views` with write, then verify.
 
 ## The site (published 23 Nov, version 1795418172-74b5)
 
-`price_drivers` adds `projection` per stock and, with market true, `projection_record`. The tool description is 889 bytes, under the 1 KB limit.
+`price_drivers` adds `projection` per stock and, with market true, `projection_record`. The tool description is 906 bytes, under the 1 KB limit.
 
 Not investment advice; the owner decides and executes every trade.
