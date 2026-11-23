@@ -137,6 +137,7 @@ ENV names are derived statically from each entry's expression and the functions 
 | `selection_min_upside_pp` | `TFB_SELECTION_MIN_UPSIDE` | 15.0 | - | not recorded |
 | `selection_max_risk` | `TFB_SELECTION_MAX_RISK` | 30.0 | - | not recorded |
 | `gate_evidence` | `TFB_GATE_EVIDENCE` | '' | 'observe' | not recorded |
+| `rel_tags_exact` | `TFB_REL_TAGS_EXACT` | '' | False | not recorded |
 
 #### Cross-key rules behind `env_combo`
 

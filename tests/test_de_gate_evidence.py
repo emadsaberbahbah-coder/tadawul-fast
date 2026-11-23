@@ -9,9 +9,12 @@ E3  enforce: blank reco, no reco key, zero forecast prices, no risk reading, and
 E4  valid evidence that must still pass under enforce: an explicit 0 expected ROI, only a 12M forecast price,
     only a risk bucket, only a risk score, a STRONG_BUY / ACCUMULATE reco.
 E5  DEMOTE-only: an earlier BLOCKED / WATCHLIST verdict and its reason are never touched.
-E6  reliability: an unrelated market-cap note beside a forecast note costs nothing under enforce and is
-    tagged under observe; a real forecast / target cap tag still costs 20; a provider-target drop tag still
-    costs 15; a market-cap tag with a target word never counts.
+E6  reliability: an unrelated market-cap note beside a forecast note is tagged under observe AND enforce,
+    the legacy number kept; only TFB_REL_TAGS_EXACT=1 applies the exact reading (it costs nothing then); a
+    real forecast / target cap tag still costs 20; a provider-target drop tag still costs 15; a market-cap
+    tag with a target word never counts.
+E6b demote-only with the strict tier (Codex P2 on #1067): TFB_GATE_EVIDENCE enforce never promotes a row the
+    strict reliability floor held; TFB_REL_TAGS_EXACT is the separate switch that can.
 E7  tag lifecycle: the tag goes when the row is repaired; switching to off leaves rows untouched.
 E8  version, manifest pin, the WHY block and surface_gate_states.
 """
@@ -21,7 +24,7 @@ import pathlib
 import pytest
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
-FLAGS = ("TFB_GATE_EVIDENCE", "TFB_MARKET_GATE", "TFB_SELECTION_GATE", "TFB_EVIDENCE_GATE", "TFB_CONSERVATIVE_GATE",
+FLAGS = ("TFB_GATE_EVIDENCE", "TFB_REL_TAGS_EXACT", "TFB_MARKET_GATE", "TFB_SELECTION_GATE", "TFB_EVIDENCE_GATE", "TFB_CONSERVATIVE_GATE",
          "TFB_STRICT_INVEST_GATE", "TFB_CALIBRATION_ADJUST", "TFB_RELIABILITY_RECALIBRATION",
          "TFB_THIN_HISTORY_GUARD", "TFB_MARKET_REGIME")
 BANNED = ("cap", "forecast", "target", "roi", "drop", "reject")
@@ -148,23 +151,39 @@ def test_e5_demote_only(monkeypatch, change, status):
 
 def test_e6_reliability_reads_one_tag_at_a_time(monkeypatch):
     unrelated = "market_cap_subunit_normalized_to_major; forecast_source_cleared"
-    monkeypatch.delenv("TFB_GATE_EVIDENCE", raising=False)                  # observe: legacy number, tagged
-    row = gate(full_row(warnings=unrelated))
-    assert row["forecast_reliability_score"] == 70.0 and tags(row, "rel_tags_exact") == ["rel_tags_exact:+20"]
-    monkeypatch.setenv("TFB_GATE_EVIDENCE", "enforce")
+    for mode in (None, "enforce"):                                          # observe and enforce: legacy number, tagged
+        if mode:
+            monkeypatch.setenv("TFB_GATE_EVIDENCE", mode)
+        row = gate(full_row(warnings=unrelated))
+        assert row["forecast_reliability_score"] == 70.0 and tags(row, "rel_tags_exact") == ["rel_tags_exact:+20"]
+    monkeypatch.setenv("TFB_REL_TAGS_EXACT", "1")
     row = gate(full_row(warnings=unrelated))
     assert row["forecast_reliability_score"] == 90.0 and not tags(row, "rel_tags_exact")
+    monkeypatch.setenv("TFB_GATE_EVIDENCE", "off")                          # off wins: nothing exact at all
+    row = gate(full_row(warnings=unrelated))
+    assert row["forecast_reliability_score"] == 70.0 and not tags(row, "rel_tags_exact")
+    monkeypatch.setenv("TFB_GATE_EVIDENCE", "enforce")
     for real, rel in (("forecast_capped_at_ceiling", 70.0),
                       ("provider_target_capped_for_short_horizon_derivation", 70.0),
                       ("provider_target_12m_capped_to_phase_ii_ceiling", 70.0),
                       ("provider_target_dropped:implausible", 75.0),
                       ("market_cap_currency_suspect; target_mean_present", 90.0),
                       ("dq_capped; roi_note", 90.0)):
-        for mode in ("observe", "enforce"):
-            monkeypatch.setenv("TFB_GATE_EVIDENCE", mode)
-            row = gate(full_row(warnings=real))
-            if mode == "enforce" or rel == 70.0 or rel == 75.0:
-                assert row["forecast_reliability_score"] == rel, (real, mode, row["forecast_reliability_score"])
+        assert gate(full_row(warnings=real))["forecast_reliability_score"] == rel, real
+
+
+def test_e6b_evidence_enforce_never_promotes_through_the_strict_tier(monkeypatch):
+    monkeypatch.setenv("TFB_STRICT_INVEST_GATE", "1")
+    case = dict(forecast_confidence=0.8, warnings="market_cap_subunit_normalized_to_major; forecast_source_cleared")
+    monkeypatch.setenv("TFB_GATE_EVIDENCE", "off")
+    before = verdict(gate(full_row(**case)))
+    assert before[:2] == ("WATCHLIST", "WATCH") and before[3] == 60.0
+    for mode in ("observe", "enforce"):
+        monkeypatch.setenv("TFB_GATE_EVIDENCE", mode)
+        assert verdict(gate(full_row(**case))) == before, mode             # demote-only: the strict hold stands
+    monkeypatch.setenv("TFB_REL_TAGS_EXACT", "1")                          # the separate, promote-capable switch
+    row = gate(full_row(**case))
+    assert row["forecast_reliability_score"] == 80.0 and verdict(row)[:2] == ("INVESTABLE", "INVEST")
 
 
 def test_e7_tag_lifecycle(monkeypatch):
@@ -191,6 +210,9 @@ def test_e8_version_manifest_why_and_surface(monkeypatch):
     for raw, mode in (("", "observe"), ("off", "off"), ("0", "off"), ("enforce", "enforce"), ("junk", "observe")):
         monkeypatch.setenv("TFB_GATE_EVIDENCE", raw)
         assert de._gate_evidence_mode() == mode and de.surface_gate_states()["gate_evidence"] == mode
+    assert de.surface_gate_states()["rel_tags_exact"] is False
+    monkeypatch.setenv("TFB_REL_TAGS_EXACT", "1")
+    assert de.surface_gate_states()["rel_tags_exact"] is True
 
 
 if __name__ == "__main__":

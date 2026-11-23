@@ -23,12 +23,15 @@ every verdict and number unchanged; off -> byte-identical to v5.161.0)
   finite expected ROI, and a risk reading (risk_score or risk_bucket); else
   observe tags 'gate_evidence:<nr|np|nk>' and enforce demotes to WATCHLIST /
   WATCH, 'Evidence gate: ...'. (2) the soft-cap (-20, or -5 recalibrated) and
-  target-drop (-15) penalties read one tag at a time (market_cap* tags never
-  count); observe keeps the legacy numbers and tags 'rel_tags_exact:<+n>' with
-  the points the exact reading would give back; enforce uses the exact
-  reading. Both are DEMOTE-only or penalty-narrowing; neither can create an
-  INVEST.
-- ROLLBACK: TFB_GATE_EVIDENCE=off.
+  target-drop (-15) penalties can read one tag at a time (market_cap* tags
+  never count): with TFB_GATE_EVIDENCE observe or enforce the legacy numbers
+  stay and 'rel_tags_exact:<+n>' tags the points the exact reading would give
+  back; only TFB_REL_TAGS_EXACT=1 (default off) applies it. That switch is
+  apart because a narrower penalty raises reliability, which the strict tier
+  reads: it can promote a WATCHLIST row to INVEST (Codex P2 on #1067), so it
+  is the owner's separate decision. TFB_GATE_EVIDENCE itself is DEMOTE-only
+  in every mode.
+- ROLLBACK: TFB_GATE_EVIDENCE=off (and TFB_REL_TAGS_EXACT unset).
 
 WHY v5.161.0 - NO NEW BUY IN A MARKET THAT IS NOT CALM; A SHARE ONLY WITH AN
 ANALYST CONSENSUS WELL ABOVE ITS PRICE AT LOW RISK
@@ -6588,6 +6591,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "selection_min_upside_pp": _selection_min_upside_pp(),     # v5.161.0
             "selection_max_risk": _selection_max_risk(),               # v5.161.0
             "gate_evidence": _gate_evidence_mode(),                    # v5.162.0
+            "rel_tags_exact": _rel_tags_exact_enabled(),               # v5.162.0
         }
     except Exception:
         return {}
@@ -7814,6 +7818,17 @@ def _gate_evidence_check(row: Dict[str, Any], rec: str) -> List[str]:
     return missing
 
 
+def _rel_tags_exact_enabled() -> bool:
+    """v5.162.0: TFB_REL_TAGS_EXACT (default off) APPLIES the one-tag-at-a-time
+    reading of the soft-cap and target-drop reliability penalties. Kept apart
+    from TFB_GATE_EVIDENCE because a narrower penalty RAISES reliability, and
+    the strict tier reads that number: it can turn a WATCHLIST row into
+    INVEST (Codex P2 on #1067), which is a promotion and the owner's call.
+    Requires TFB_GATE_EVIDENCE not off."""
+    raw = (os.getenv("TFB_REL_TAGS_EXACT") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enforce"}
+
+
 def _warning_tag_names(row: Dict[str, Any]) -> List[str]:
     """v5.162.0: the row's warning tags, each cut at its first ':' or '=' and
     lower-cased, so a reader can match one tag rather than the whole string."""
@@ -8900,9 +8915,11 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         _rp.append("NF")
     _soft_cap_penalty = 5.0 if _recal else 20.0
     # v5.162.0 [GATE-EVIDENCE]: the same two penalties read one tag at a time.
-    # off -> the legacy substring test alone (byte-identical); observe -> the
-    # legacy test decides, the exact one is computed and any difference tagged;
-    # enforce -> the exact test decides.
+    # TFB_GATE_EVIDENCE off -> the legacy substring test alone (byte-identical);
+    # otherwise the exact reading is computed and any difference tagged, while
+    # the legacy test still decides. Only TFB_REL_TAGS_EXACT=1 lets the exact
+    # reading decide: it can raise reliability, so it is never part of the
+    # demote-only TFB_GATE_EVIDENCE (Codex P2 on #1067).
     _ge_mode = _gate_evidence_mode()
     _legacy_sc = "cap" in warns and ("forecast" in warns or "target" in warns or "roi" in warns)
     _legacy_pd = "provider_target" in warns and ("drop" in warns or "reject" in warns)
@@ -8910,7 +8927,8 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     if _ge_mode != "off":
         _ge_tags = _warning_tag_names(row)
         _exact_sc, _exact_pd = _soft_cap_tag_present(_ge_tags), _target_drop_tag_present(_ge_tags)
-    _use_sc, _use_pd = (_exact_sc, _exact_pd) if _ge_mode == "enforce" else (_legacy_sc, _legacy_pd)
+    _rel_exact_on = _ge_mode != "off" and _rel_tags_exact_enabled()
+    _use_sc, _use_pd = (_exact_sc, _exact_pd) if _rel_exact_on else (_legacy_sc, _legacy_pd)
     _rel_tag_delta = ((_soft_cap_penalty if _legacy_sc else 0.0) + (15.0 if _legacy_pd else 0.0)) \
         - ((_soft_cap_penalty if _exact_sc else 0.0) + (15.0 if _exact_pd else 0.0))
     if _use_sc:
@@ -9034,7 +9052,7 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
                     _ge_tag = _GATE_EVIDENCE_TAG + ":" + "+".join(_ge_missing)
         _gate_watch_set(row, _GATE_EVIDENCE_TAG, _ge_tag)
         _gate_watch_set(row, _REL_EXACT_TAG,
-                        "" if (_ge_mode == "enforce" or not _rel_tag_delta)
+                        "" if (_rel_exact_on or not _rel_tag_delta)
                         else _REL_EXACT_TAG + ":%+g" % _rel_tag_delta)
 
     # -- v5.104.0 (Fix AR): stale-provider-bar hard demotion (env-gated, ------
