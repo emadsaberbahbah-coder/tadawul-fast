@@ -21,7 +21,7 @@ OTHER_COMMIT = "f" * 40
 # 2026-10-28 (stacked): 5.159.2 (BB-1 accepts the verified Yahoo alias).
 # 2026-11-09: 5.160.0 (EVIDENCE-COHORT, default off).
 # 2026-11-21: 5.161.0 (MARKET-HOLD + SELECTION, default off); 2026-11-23: 5.162.0 (GATE-EVIDENCE).
-ENGINE = "5.162.0"
+ENGINE = "5.163.0"
 # 2026-10-13: analysis_sheet_rows 4.8.4 (route auth scope-path follow-up);
 # the CLI compares this with the source constant, so the pin moves in place.
 ROUTE = "4.8.4"

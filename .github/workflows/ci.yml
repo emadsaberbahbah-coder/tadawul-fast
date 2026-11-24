@@ -10,6 +10,14 @@
 # right after tests/test_sync_watchdog.py. Nothing is removed and no existing
 # entry moves.
 #
+# (1.1.98, 2026-11-24: LABEL TRUTH)
+# v1.1.98: run tests/test_de_label_truth.py (data_engine_v2 v5.163.0 and
+# scoring 5.11.5: TFB_LABEL_TRUTH off|observe|enforce, unset = observe; the
+# scored horizon on the row, one percent division, the leverage label on ratio
+# D/E, float not borrowed from outstanding shares, Country as text) in the
+# blocking data engine job right after tests/test_de_gate_evidence.py. Nothing
+# is removed and no existing entry moves.
+#
 # (1.1.97, 2026-11-23: GATE EVIDENCE)
 # v1.1.97: run tests/test_de_gate_evidence.py (data_engine_v2 v5.162.0:
 # TFB_GATE_EVIDENCE off|observe|enforce, unset = observe; INVEST needs a
@@ -1678,6 +1686,7 @@ jobs:
             tests/test_de_evidence_cohort.py \
             tests/test_de_market_and_selection_gate.py \
             tests/test_de_gate_evidence.py \
+            tests/test_de_label_truth.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \

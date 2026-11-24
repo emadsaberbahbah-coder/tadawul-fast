@@ -386,13 +386,13 @@ def test_g9_health_surface(monkeypatch):
 
 def test_g10_version_manifest_and_why():
     from core import data_engine_v2 as de
-    assert de.__version__ == "5.162.0"                                  # 5.162.0 [GATE-EVIDENCE] on top
+    assert de.__version__ == "5.163.0"                                  # 5.162.0 [GATE-EVIDENCE] on top
     assert (de._MARKET_HOLD_TAG, de._SELECTION_TAG) == ("market_hold_watch", "selection_watch")
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.data_engine_v2", "__version__", "5.162.0",' in vd
+    assert '("core.data_engine_v2", "__version__", "5.163.0",' in vd
     src = (_REPO / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
     assert src.count("WHY v5.161.0 - NO NEW BUY IN A MARKET THAT IS NOT CALM;") == 1
-    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.162.0" in src
+    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.163.0" in src
     assert de._MARKET_GATE_KNOWN_MARKETS == tuple(mc.MARKETS)
 
 

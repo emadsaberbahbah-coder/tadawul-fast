@@ -2,11 +2,20 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.11.4
+Scoring Module — v5.11.5
 FULL REVISED VERSION / CONFIDENCE-PENALTY-NEUTRAL-POINT
 ================================================================================
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
 (Top changelog condensed for working copy; code + inline comments verbatim.)
+
+WHY v5.11.5 (audit of 23 Nov 2026, finding 6; package 2 "truth in labels and
+units"): _as_fraction("200%") returned 0.02, the same as "2%" - _safe_float
+already divides an explicit percent string once and the points heuristic
+divided it again. The ROI reader was fixed the same way in v5.11.2 (P-129).
+With TFB_LABEL_TRUTH=enforce an explicit percent string keeps the single
+division ("200%" -> 2.0); unset / observe / off keep the legacy value, so
+scores are unchanged until the owner enforces (data_engine_v2 5.163.0 tags
+the affected fields in observe). Nothing else changes.
 
 WHY v5.11.4 (WP-03): the 2026-10-10 workbook publishes zero forecast
 prices for SHIB-USD (5.47e-6) and COMP-USD through fixed four-decimal
@@ -307,7 +316,7 @@ logger.addHandler(logging.NullHandler())
 # v5.11.3: value-bound margin receipts determine the economic unit for quality
 # scoring. Absent receipts keep the legacy parser; explicit invalid receipts
 # contribute no margin. Source values and all score thresholds stay unchanged.
-__version__ = "5.11.4"
+__version__ = "5.11.5"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -896,10 +905,23 @@ def _get_float(row: Mapping[str, Any], *keys: str) -> Optional[float]:
     return _safe_float(_get(row, *keys))
 
 
+def _label_truth_enforced() -> bool:
+    """v5.11.5: TFB_LABEL_TRUTH=enforce (also on/1/true/yes) - the same
+    vocabulary as data_engine_v2 5.163.0; anything else keeps the legacy."""
+    return str(os.getenv("TFB_LABEL_TRUTH") or "").strip().lower() in ("enforce", "on", "1", "true", "yes")
+
+
 def _as_fraction(value: Any) -> Optional[float]:
     f = _safe_float(value)
     if f is None:
         return None
+    # v5.11.5: an explicit "%" string was already divided once by _safe_float.
+    if _label_truth_enforced():
+        try:
+            if isinstance(value, str) and value.strip().endswith("%"):
+                return f
+        except Exception:
+            pass
     if abs(f) >= 1.5:
         return f / 100.0
     return f
