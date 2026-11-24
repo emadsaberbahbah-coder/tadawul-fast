@@ -2,8 +2,16 @@
 # scripts/archive_symbol_deep.py
 """
 ================================================================================
-TFB Symbol Deep Data - v1.3.0 (program register C8, Phase 3)
+TFB Symbol Deep Data - v1.3.1 (program register C8, Phase 3)
 ================================================================================
+v1.3.1 (2026-11-24) - THE LOADER SERVES THE HOURLY NEWS JOB
+--------------------------------------------------------------------------------
+ensure_table() and load() take an optional table spec, and load() an optional
+write disposition, so scripts/news_now.py 1.0.0 creates and loads its own two
+tables (symbol_news_intraday, news_now_log) with this tested loader instead of
+a copy. Every call of this script keeps the defaults (TABLES, WRITE_TRUNCATE);
+nothing this script loads changes.
+
 v1.3.0 (2026-11-24) - WIDER NEWS: THE LARGEST US NAMES AND THE DAY'S BIG MOVERS
 --------------------------------------------------------------------------------
 WHY (owner, 24 Nov 2026 00:48 and 00:58 Riyadh): NVDA rose 31 % on 23 Nov and
@@ -167,7 +175,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import archive_market_series as ams  # same folder: the Yahoo reader and the BigQuery session
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
 BQ_UPLOAD = "https://bigquery.googleapis.com/upload/bigquery/v2"
@@ -613,9 +621,11 @@ def table_problems(table: Dict[str, Any], schema: List[Dict[str, str]], part: Op
     return problems
 
 
-def ensure_table(session: Any, project: str, dataset: str, table: str) -> bool:
-    """True when created now; RuntimeError when it exists with another layout."""
-    schema, part, cluster, desc = TABLES[table]
+def ensure_table(session: Any, project: str, dataset: str, table: str,
+                 spec: Optional[Tuple[List[Dict[str, str]], Optional[str], List[str], str]] = None) -> bool:
+    """True when created now; RuntimeError when it exists with another layout.
+    v1.3.1: `spec` (schema, partition field, clustering, description) for a table not in TABLES."""
+    schema, part, cluster, desc = spec if spec is not None else TABLES[table]
     base = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables"
     resp = session.get(f"{base}/{table}", timeout=60)
     if resp.status_code == 200:
@@ -642,10 +652,14 @@ def ensure_table(session: Any, project: str, dataset: str, table: str) -> bool:
 def load(session: Any, project: str, dataset: str, location: str, table: str, day: Optional[str],
          rows: List[Dict[str, Any]], run_id: str, poll_s: float = 2.0, timeout_s: float = 600.0,
          sleep: Callable[[float], None] = time.sleep,
-         clock: Callable[[], float] = time.monotonic) -> int:
+         clock: Callable[[], float] = time.monotonic,
+         schema: Optional[List[Dict[str, str]]] = None, disposition: str = "WRITE_TRUNCATE") -> int:
     """WRITE_TRUNCATE `rows` into table (day=None: the whole table) or into
-    its day partition table$YYYYMMDD; the number of rows loaded."""
-    schema = TABLES[table][0]
+    its day partition table$YYYYMMDD; the number of rows loaded.
+    v1.3.1: `schema` for a table not in TABLES; disposition WRITE_APPEND adds the rows instead."""
+    if disposition not in ("WRITE_TRUNCATE", "WRITE_APPEND"):
+        raise ValueError(f"disposition {disposition!r}")
+    schema = schema if schema is not None else TABLES[table][0]
     target = table if day is None else f"{table}${day.replace('-', '')}"
     job_id = "tfb_deep_%s_%s_%s" % (table, re.sub(r"[^0-9A-Za-z_-]", "", run_id or "local") or "local",
                                      uuid.uuid4().hex[:8])
@@ -654,7 +668,7 @@ def load(session: Any, project: str, dataset: str, location: str, table: str, da
         "jobReference": {"projectId": project, "jobId": job_id, "location": location},
         "configuration": {"load": {
             "destinationTable": {"projectId": project, "datasetId": dataset, "tableId": target},
-            "sourceFormat": "NEWLINE_DELIMITED_JSON", "writeDisposition": "WRITE_TRUNCATE",
+            "sourceFormat": "NEWLINE_DELIMITED_JSON", "writeDisposition": disposition,
             "createDisposition": "CREATE_NEVER", "schema": {"fields": schema}, "maxBadRecords": 0,
         }, "labels": {"tfb": "symbol-deep"}},
     }
