@@ -258,7 +258,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # TFB_LABEL_TRUTH off|observe|enforce, unset = observe tags only - the
     # scored horizon on the row, one percent division, the leverage label on
     # ratio D/E, float not borrowed from outstanding shares, Country as text).
-    ("core.data_engine_v2", "__version__", "5.163.0", "data engine"),
+    # 2026-11-24 (manifest pin only): 5.163.0 -> 5.164.0 ([LABEL-TRUTH] the leverage label leaves lenders out:
+    # a finance sector or a mortgage REIT / mortgage finance industry is never flagged by the D/E ratio rule).
+    ("core.data_engine_v2", "__version__", "5.164.0", "data engine"),
     # 2026-11-21 (manifest pin only): NEW 1.0.0 - the live condition of the
     # US / Saudi / European / Japanese / Hong Kong markets, read only by the
     # engine's [MARKET-HOLD] tier (stdlib only; reads nothing at import).

@@ -170,6 +170,43 @@ def test_lt10_leverage_on_the_row(monkeypatch):
     assert "High leverage" in str(scored_row(monkeypatch, "enforce", debt_to_equity=180.0).get("top_risks"))
 
 
+# --------------------------------------------------------------------------- v5.164.0 lenders
+@pytest.mark.parametrize("sector,industry,lender", [
+    ("Financial Services", "Banks - Regional", True),       # BLX.US on the 24 Nov Top 10
+    ("Financial Services", "Banks - Diversified", True),    # SAN.MC
+    ("Real Estate", "REIT - Mortgage", True),               # LADR.US
+    ("Financial Services", "Credit Services", True),
+    ("Financials", None, True),
+    ("Financial Services", "Insurance - Life", True),
+    (None, "Mortgage Finance", True),
+    ("Real Estate", "REIT - Retail", False),                # an equity REIT: its debt is a leverage risk
+    ("Consumer Cyclical", "Auto Manufacturers", False),
+    ("Utilities", "Utilities - Regulated Electric", False),
+    (None, None, False),
+])
+def test_lt9b_lenders_are_never_flagged_by_the_ratio(sector, industry, lender):
+    from core import data_engine_v2 as de
+    assert de._label_truth_is_lender(sector, industry) is lender
+    assert de._label_truth_high_leverage(3.5, "enforce", sector, industry) == (not lender, "")
+    assert de._label_truth_high_leverage(3.5, "off", sector, industry) == (False, "")        # off: legacy, sector unread
+    flag, tag = de._label_truth_high_leverage(3.5, "observe", sector, industry)
+    assert flag is False and tag == ("" if lender else "label_truth_leverage:would_flag:observe")
+    # a legacy flag (D/E >= 100) on a lender: observe keeps it and says the ratio rule would clear it
+    flag, tag = de._label_truth_high_leverage(150.0, "observe", sector, industry)
+    assert flag is True and tag == ("label_truth_leverage:lender:observe" if lender else "")
+    assert de._label_truth_high_leverage(150.0, "enforce", sector, industry) == (not lender, "")
+    assert de._label_truth_high_leverage(150.0, "off", sector, industry) == (True, "")
+
+
+def test_lt10b_a_bank_on_the_row(monkeypatch):
+    bank = scored_row(monkeypatch, "enforce", debt_to_equity=3.5, sector="Financial Services",
+                      industry="Banks - Regional")
+    assert "High leverage" not in str(bank.get("top_risks"))
+    other = scored_row(monkeypatch, "enforce", debt_to_equity=3.5, sector="Consumer Cyclical",
+                       industry="Auto Manufacturers")
+    assert "High leverage" in str(other.get("top_risks"))
+
+
 # --------------------------------------------------------------------------- float
 def test_lt11_outstanding_shares_are_not_the_float(monkeypatch):
     from core import data_engine_v2 as de
@@ -211,11 +248,11 @@ def test_lt13_tags_avoid_the_reliability_words(monkeypatch):
 def test_lt14_version_manifest_why(monkeypatch):
     from core import data_engine_v2 as de
     from core import scoring
-    assert de.__version__ == "5.163.0" and scoring.__version__ == "5.11.5"
+    assert de.__version__ == "5.164.0" and scoring.__version__ == "5.11.5"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.data_engine_v2", "__version__", "5.163.0",' in vd
+    assert '("core.data_engine_v2", "__version__", "5.164.0",' in vd
     assert "(\"core.scoring\", \"__version__\", '5.11.5'," in vd
     src = (_REPO / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
     assert src.count("WHY v5.163.0 - TRUTH IN LABELS AND UNITS") == 1
-    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.163.0" in src
+    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.164.0" in src
     assert "WHY v5.11.5" in (_REPO / "core" / "scoring.py").read_text(encoding="utf-8")
