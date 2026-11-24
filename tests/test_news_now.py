@@ -1,4 +1,4 @@
-"""tests/test_news_now.py - scripts/news_now.py 1.1.0 (the hourly news and price reading, observe only)."""
+"""tests/test_news_now.py - scripts/news_now.py 1.1.1 (the hourly news and price reading, observe only)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -270,9 +270,9 @@ def test_a_full_run_reads_writes_and_logs_counts_only(capsys):
         assert word not in out, word
     assert "names: 4 (2 holding(s), 2 Top 10 name(s) not held)" in out
     assert not any("SECRET" in u for u in net.urls)
-    # EODHD: the budget first, then one news call per name, the last two days
+    # EODHD: the budget first, then one news call per name with a feed (v1.1.1: not 1030.SR), the last two days
     eod = [u for u in net.urls if "eodhd.com" in u]
-    assert "api/user" in eod[0] and len(eod) == 5 and all("from=2026-11-22" in u for u in eod[1:])
+    assert "api/user" in eod[0] and len(eod) == 4 and all("from=2026-11-22" in u for u in eod[1:])
     # BigQuery: the headlines replace today's partition; the log is appended
     assert bq.ensured == ["symbol_news_intraday", "news_now_log"]
     news, log = bq.loads
@@ -292,7 +292,7 @@ def test_a_full_run_reads_writes_and_logs_counts_only(capsys):
     assert s["state"] is None and s["price"] is None
     # the page
     page = book.tabs["News_Now"].values
-    assert page[0][0].startswith("NEWS NOW - ") and "SHADOW: analysis only" in page[1][0] and "news_now 1.1.0" in page[1][0]
+    assert page[0][0].startswith("NEWS NOW - ") and "SHADOW: analysis only" in page[1][0] and "news_now 1.1.1" in page[1][0]
     assert page[2][0] == "US session: open | prices at 2026-11-24 11:35 New York"
     assert page[3][0].startswith("NEWS NOW: 4 name(s) read (2 US with a state); 2 with company news since the last "
                                  "session, 1 with a lean for the next sessions, 1 leaning against TFB's view")
@@ -339,7 +339,8 @@ def test_budget_guard_and_switches(monkeypatch, capsys):
     assert rc == 0 and not any("api/news" in u for u in net.urls)
     assert any("EODHD budget guard" in str(r[0]) for r in book.tabs["News_Now"].values)
     assert [ld["table"] for ld in bq.loads] == ["news_now_log"]                   # nothing new: the day stays as it is
-    assert all(r["state"] is None and r["news_coverage"] == "not refreshed" for r in bq.loads[0]["rows"])
+    assert all(r["state"] is None and r["news_coverage"] == ("no feed" if r["symbol"].endswith(".SR") else "not refreshed")
+               for r in bq.loads[0]["rows"])
     monkeypatch.setenv("TFB_NEWS_NOW_EODHD", "off")
     rc, book, net, query, bq = run()
     assert rc == 0 and not any("eodhd" in u for u in net.urls)
@@ -373,7 +374,7 @@ def test_before_the_open_news_reads_as_unanswered():
 
 def test_source_is_ascii_and_versioned():
     src = Path(nn.__file__).read_text(encoding="utf-8")
-    assert src.isascii() and nn.__version__ == "1.1.0" and "v1.1.0 (2026-11-24)" in src
+    assert src.isascii() and nn.__version__ == "1.1.1" and "v1.1.1 (2026-11-24)" in src
     names = [f["name"] for f in nn.SCHEMA_LOG]
     assert len(names) == len(set(names)) and names[0] == "snapshot_date"
 
@@ -405,3 +406,16 @@ def test_tfb_view_from_a_fresh_snapshot_else_the_view(age, table):
     assert len(uni) == 1 and ("`proj-1.tfb_archive.%s`" % table) in uni[0]
     by = {r["symbol"]: r for r in bq.loads[-1]["rows"]}
     assert by["AAA.US"]["recommendation"] == "STRONG SELL"                       # the same rows either way
+
+
+def test_no_feed_market_is_not_called_and_not_a_failure(capsys):
+    """v1.1.1: a Saudi name gets no EODHD news call (EODHD has no company news for .SR); it reads 'no feed'."""
+    rc, book, net, query, bq = run(query=Query(board=("EEE.US", "AAA.US", "1030.SR")))
+    assert rc == 0
+    assert not any("1030.SR" in u for u in net.urls if "eodhd" in u)
+    assert "1 name(s) with no feed" in capsys.readouterr().out
+    by = {r["symbol"]: r for r in bq.loads[-1]["rows"]}
+    assert by["1030.SR"]["news_coverage"] == "no feed" and by["AAA.US"]["news_coverage"] == "fresh"
+    row = [r for r in book.tabs["News_Now"].values if str(r[0]).startswith("1030.SR")][0]
+    assert row[5] == "no company-news feed for this market"
+    assert not any("call(s) failed" in str(r[0]) for r in book.tabs["News_Now"].values)

@@ -431,13 +431,16 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-24 (new script, pinned on arrival): each holding and Top 10 name read again every hour of the US
     # session - company news since the last session against the price so far (observe only; News_Now tab).
     # 2026-11-24 (pin only): 1.0.0 -> 1.1.0 (TFB's view read from the fresh snap_universe_latest, else the view).
-    ("news_now", "1.1.0", "news now"),
+    # 2026-11-24 (pin only): 1.1.0 -> 1.1.1 (no EODHD news call for .SR names: no feed, not a failure).
+    ("news_now", "1.1.1", "news now"),
     # 2026-11-24 (new script, pinned on arrival): the heavy views computed once after each collector into snap_*
     # tables; readers take a snapshot younger than 30 hours, else the view.
     ("bq_snapshots", "1.0.0", "bigquery snapshots"),
     # 2026-11-24 (new script, pinned on arrival): every learning record in BigQuery read daily - proven, against,
     # collecting, what changed (observe only; Learning_Watch tab, learning_watch_log).
-    ("learning_watch", "1.0.0", "learning watch"),
+    # 2026-11-24 (pin only): 1.0.0 -> 1.0.1 (the calibration pair reading is AGAINST only on the HIGH row;
+    # counts shown without a sign).
+    ("learning_watch", "1.0.1", "learning watch"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),

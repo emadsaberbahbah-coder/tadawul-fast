@@ -4,6 +4,10 @@ scripts/news_now.py
 ================================================================================
 TFB News Now - each holding and Top 10 name, read again every hour of the US session
 --------------------------------------------------------------------------------
+v1.1.1 (2026-11-24)
+  1.1.1: no EODHD news call for a market EODHD has no company news for (NO_FEED_SUFFIXES: Saudi .SR - not one .SR
+         headline in symbol_news since the archive began; both calls failed on every run of 24 Nov). Such a name is
+         read 'no feed' - not a failed call, not in the budget, not 'not refreshed' - and the page says so.
 v1.1.0 (2026-11-24)
   1.1.0: [SNAPSHOTS] TFB's view (name and recommendation) is read from snap_universe_latest (scripts/bq_snapshots.py
          1.0.0) when it is there and younger than 30 hours, else from v_universe_latest as before: about 0.24 GB less
@@ -65,7 +69,7 @@ import archive_symbol_deep as asd  # noqa: E402 - same folder: EODHD reader, bud
 import bq_snapshots as bs  # noqa: E402 - same folder: the fresh snapshot or the view
 import news_board as nb  # noqa: E402 - same folder: holdings, board names, text helpers
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -78,6 +82,7 @@ NEWS_LIMIT = 20
 HIST_DAYS = 120                    # calendar days of daily bars: 50 sessions for the trend and 20 for the volatility
 SD_SESSIONS = 20                   # v_news_trend_daily: STDDEV over the 20 sessions before
 SPY = "SPY"
+NO_FEED_SUFFIXES = (".SR",)       # v1.1.1: EODHD serves no company news for these listings
 TABLE_NEWS = "symbol_news_intraday"
 TABLE_LOG = "news_now_log"
 SCHEMA_NEWS = asd.SCHEMA_NEWS      # the nightly feed's columns, so file 97's rules read it unchanged
@@ -348,7 +353,8 @@ def read_name(symbol: str, listed_as: str, stock: Optional[Dict[str, Any]], spy:
                            "state": None, "expected": None, "trend_fit": None, "agreement": None,
                            "news_items": None, "news_score": None, "top_headline": None,
                            "raw_items": raw_items, "note": "",
-                           "news_coverage": "fresh" if fresh else "not refreshed"}
+                           "news_coverage": "no feed" if symbol.endswith(NO_FEED_SUFFIXES)
+                           else "fresh" if fresh else "not refreshed"}
     row.update(price_answer(stock, spy) if symbol.endswith(".US") else
                {"daily_vol_pp": None, "trend": None, "reaction_pp": None, "reaction_z": None, "day_z": None,
                 "change_pct": None, "spy_change_pct": None})
@@ -429,7 +435,9 @@ def page_rows(rows: Sequence[Dict[str, Any]], stamp: str, ny_stamp: str, session
             news = "%d headline(s), not classified yet" % r["raw_items"] if r.get("raw_items") else ""
         else:
             news = "%d, score %s" % (r["news_items"], _sign(r["news_score"], 1)) if r["news_items"] else "none"
-            if r.get("news_coverage") != "fresh":
+            if r.get("news_coverage") == "no feed":
+                news = "no company-news feed for this market"
+            elif r.get("news_coverage") != "fresh":
                 news += " (not refreshed)"
         exp = r.get("expected")
         out.append(line(name, r["listed_as"], _sign(r.get("change_pct"), 2, " %"),
@@ -592,14 +600,16 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
     elif not token:
         notes.append("company news not refreshed this run (EODHD_API_KEY missing)")
     else:
-        ok, why = asd.budget_check(token, asd.COST_NEWS * len(syms), asd.max_share(), opener, today=day)
+        feed = [s for s in syms if not s.endswith(NO_FEED_SUFFIXES)]   # v1.1.1: no call where there is no feed
+        ok, why = asd.budget_check(token, asd.COST_NEWS * len(feed), asd.max_share(), opener, today=day)
         _out("EODHD budget: %s" % why)
         if not ok:
             notes.append("company news not refreshed this run (the EODHD budget guard: %s)" % why)
         else:
-            raw, failed = fetch_news(syms, token, day, captured_at, run_id, opener, sleep)
-            fresh = set(syms) - set(failed)
-            _out("news: %d headline(s) for %d name(s), %d call(s) failed" % (len(raw), len(syms), len(failed)))
+            raw, failed = fetch_news(feed, token, day, captured_at, run_id, opener, sleep)
+            fresh = set(feed) - set(failed)
+            _out("news: %d headline(s) for %d name(s), %d call(s) failed, %d name(s) with no feed" % (
+                len(raw), len(feed), len(failed), len(syms) - len(feed)))
             if failed:
                 notes.append("%d news call(s) failed: those names are read 'not refreshed' (no state)" % len(failed))
             if dry_run:
