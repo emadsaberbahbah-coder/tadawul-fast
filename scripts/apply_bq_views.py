@@ -2,8 +2,17 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.28.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.29.0 (program register C8, Phase 2)
 ================================================================================
+v1.29.0 (24 Nov 2026, snapshots of the heavy views). WHY (owner, 24 Nov 2026
+13:07 Riyadh: BigQuery more, faster, more accurate; 13:53 "Let's go with
+next"). scripts/bq_snapshots.py 1.0.0 computes v_universe_latest,
+v_news_understanding and v_news_trend_learning once after each collector into
+snap_* tables (SNAP_TABLES, declared as sources). One file changes:
+v_symbol_news_class_now (128) joins snap_universe_latest instead of
+v_universe_latest - the hourly read no longer recomputes the universe (about
+0.24 GB a read). The snapshots are refreshed before this version is applied.
+
 v1.28.0 (24 Nov 2026, the hourly news reading scored). WHY (owner, 24 Nov
 2026 12:17 Riyadh: "ok let's start the next stage" - the interim daily
 reading of the news record). Two new views, research only:
@@ -610,7 +619,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.28.0"
+__version__ = "1.29.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -640,8 +649,10 @@ ECON_TABLES = frozenset({"econ_calendar", "event_scenario_log"})
 OPTIONS_TABLES = frozenset({"options_daily"})
 # the tables scripts/news_now.py v1.0.0 creates and loads (v1.27.0, the hourly news reading)
 NOW_TABLES = frozenset({"symbol_news_intraday", "news_now_log"})
+# the snapshot tables scripts/bq_snapshots.py v1.0.0 writes (v1.29.0)
+SNAP_TABLES = frozenset({"snap_universe_latest", "snap_news_understanding", "snap_news_trend_learning"})
 SOURCE_TABLES = (ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
-                 | OPTIONS_TABLES | NOW_TABLES)
+                 | OPTIONS_TABLES | NOW_TABLES | SNAP_TABLES)
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")

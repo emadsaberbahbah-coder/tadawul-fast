@@ -1,4 +1,4 @@
-"""tests/test_news_now.py - scripts/news_now.py 1.0.0 (the hourly news and price reading, observe only)."""
+"""tests/test_news_now.py - scripts/news_now.py 1.1.0 (the hourly news and price reading, observe only)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -121,12 +121,16 @@ OLD_TODAY = [  # today's partition before the run: an item pushed off the provid
 
 class Query:
     def __init__(self, classified=CLASSIFIED, board=("EEE.US", "AAA.US", "1030.SR"), class_view=True, old=None,
-                 table=True):
+                 table=True, snap_age=None):
         self.sql, self.classified, self.board, self.class_view = [], classified, board, class_view
-        self.old, self.table = list(old or []), table
+        self.old, self.table, self.snap_age = list(old or []), table, snap_age
 
     def __call__(self, session, project, location, sql):
         self.sql.append(sql)
+        if "AS age_min FROM `" in sql:                                    # v1.1.0: the universe snapshot's age
+            if self.snap_age is None:
+                raise RuntimeError("BigQuery refused the query (HTTP 404): Not found: Table snap_universe_latest")
+            return [{"age_min": str(self.snap_age)}]
         if ".symbol_news_intraday`" in sql:
             if not self.table:
                 raise RuntimeError("BigQuery refused the query (HTTP 404): Not found: Table proj-1:tfb_archive.x")
@@ -137,7 +141,7 @@ class Query:
             if not self.class_view:
                 raise RuntimeError(NOT_FOUND)
             return [dict(r) for r in self.classified]
-        if "v_universe_latest" in sql:
+        if "_universe_latest`" in sql:
             return [dict(r) for r in UNIVERSE]
         raise AssertionError(sql)
 
@@ -288,7 +292,7 @@ def test_a_full_run_reads_writes_and_logs_counts_only(capsys):
     assert s["state"] is None and s["price"] is None
     # the page
     page = book.tabs["News_Now"].values
-    assert page[0][0].startswith("NEWS NOW - ") and "SHADOW: analysis only" in page[1][0] and "news_now 1.0.0" in page[1][0]
+    assert page[0][0].startswith("NEWS NOW - ") and "SHADOW: analysis only" in page[1][0] and "news_now 1.1.0" in page[1][0]
     assert page[2][0] == "US session: open | prices at 2026-11-24 11:35 New York"
     assert page[3][0].startswith("NEWS NOW: 4 name(s) read (2 US with a state); 2 with company news since the last "
                                  "session, 1 with a lean for the next sessions, 1 leaning against TFB's view")
@@ -369,7 +373,7 @@ def test_before_the_open_news_reads_as_unanswered():
 
 def test_source_is_ascii_and_versioned():
     src = Path(nn.__file__).read_text(encoding="utf-8")
-    assert src.isascii() and nn.__version__ == "1.0.0" and "v1.0.0 (2026-11-24)" in src
+    assert src.isascii() and nn.__version__ == "1.1.0" and "v1.1.0 (2026-11-24)" in src
     names = [f["name"] for f in nn.SCHEMA_LOG]
     assert len(names) == len(set(names)) and names[0] == "snapshot_date"
 
@@ -390,3 +394,14 @@ def test_workflow_chains_to_the_exit_plan_in_the_us_hours():
     assert env["EODHD_API_KEY"] == "${{ secrets.EODHD_API_KEY }}"
     assert wf["permissions"] == {"contents": "read"}
     assert wf["run-name"].startswith("${{ github.event_name == 'workflow_dispatch'")
+
+
+@pytest.mark.parametrize("age,table", [(45, "snap_universe_latest"), (2000, "v_universe_latest"),
+                                       (None, "v_universe_latest")])
+def test_tfb_view_from_a_fresh_snapshot_else_the_view(age, table):
+    rc, book, net, query, bq = run(query=Query(snap_age=age))
+    assert rc == 0
+    uni = [q for q in query.sql if "_universe_latest`" in q and "AS age_min" not in q]
+    assert len(uni) == 1 and ("`proj-1.tfb_archive.%s`" % table) in uni[0]
+    by = {r["symbol"]: r for r in bq.loads[-1]["rows"]}
+    assert by["AAA.US"]["recommendation"] == "STRONG SELL"                       # the same rows either way

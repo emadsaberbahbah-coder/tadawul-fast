@@ -371,7 +371,7 @@ PENDING = {
     # apply_bq_views 1.28.0 (24 Nov 2026): the hourly news reading scored against SPY, and its record (research only)
     "v_news_now_eval": "7d9046950a5325177f7368c69e9da072e1f7d9e3e1e2f8aefa25806aa717a6d9",
     "v_news_now_learning": "e369cafc130a7a5b82bad1d75f5597c4ae8a6ead7082a578516636690d112dc6",
-    "v_symbol_news_class_now": "6cb8eda4cc2202ebe2ca42ffdeb3c6eb200db60101c6dfe14176766ace55fca8",
+    "v_symbol_news_class_now": "38ff5cce252f76514b47b894eaaabd9f6483597dc539aae651493f0ce585f35c",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3138,9 +3138,9 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.28.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.29.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.28.0"
+    assert bv.__version__ == "1.29.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
     assert files[-32:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
@@ -3981,11 +3981,16 @@ def case_v64():
     assert nn.SCHEMA_NEWS is asd.SCHEMA_NEWS                                  # the same columns as the nightly feed
     objs = {o.name: o for o in bv.load_objects()}
     assert [o.name for o in bv.load_objects()][-3] == "v_symbol_news_class_now"
-    _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "v_universe_latest"}, "1.27.0")
+    _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "snap_universe_latest"}, "1.29.0")
     night = bv._code(objs["v_symbol_news_class"].template)
     desc = re.compile(r'OPTIONS \(description = "[^"]*"\)')
     same = desc.sub("D", night).replace("`{{DS}}.v_symbol_news_class`", "`{{DS}}.v_symbol_news_class_now`", 1) \
-        .replace("FROM `{{DS}}.symbol_news` AS n", "FROM `{{DS}}.symbol_news_intraday` AS n", 1)
+        .replace("FROM `{{DS}}.symbol_news` AS n", "FROM `{{DS}}.symbol_news_intraday` AS n", 1) \
+        .replace("LEFT JOIN `{{DS}}.v_universe_latest` AS u", "LEFT JOIN `{{DS}}.snap_universe_latest` AS u", 1)
+    # v1.29.0: the names come from the universe snapshot, the same rows as v_universe_latest
+    import bq_snapshots as bs
+    assert bs.SNAPSHOTS["snap_universe_latest"][0] == "v_universe_latest" and bv.SNAP_TABLES == set(bs.SNAPSHOTS)
+    assert set(v for v, _ in bs.SNAPSHOTS.values()) <= set(objs) and bv.SNAP_TABLES <= bv.SOURCE_TABLES
     assert desc.sub("D", now) == same
     assert "CURRENT_" not in now and "FOLLOWING" not in now
 
