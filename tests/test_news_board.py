@@ -210,13 +210,15 @@ BOARD_ROWS = [{"symbol": "EEE.US", "best": "1"}, {"symbol": "AAA.US", "best": "2
               {"symbol": "FFF.US", "best": "4"}]
 NOW_ROWS = [
     {"symbol": "AAA.US", "name": "Alpha Bank", "event_day": "2026-11-20", "state": "big rise, no news", "expected": "-1",
-     "reaction_pp": "3.46", "reaction_z": "2.23", "day_pp": "3.53", "day_z": "3.22", "trend_now": "down",
+     "reaction_pp": "3.46", "reaction_z": "2.23", "day_pp": "3.53", "day_z": "3.22", "trend_before": "up",
+     "trend_now": "down", "reaction_complete": "true",
      "top_headline": None, "recommendation": "BUY", "agreement": "leans against TFB"},
     {"symbol": "CCC.US", "name": "Charlie", "event_day": None, "state": "quiet", "expected": "0", "reaction_pp": None,
      "reaction_z": None, "day_pp": "0.2", "day_z": "0.1", "trend_now": "up", "top_headline": None,
      "recommendation": "HOLD", "agreement": "TFB holds, no lean"},
     {"symbol": "EEE.US", "name": "Echo", "event_day": "2026-11-23", "state": "good news, price agreed", "expected": "1",
-     "reaction_pp": "4.1", "reaction_z": "1.6", "day_pp": "4.2", "day_z": "1.9", "trend_now": "up",
+     "reaction_pp": "4.1", "reaction_z": "1.6", "day_pp": "4.2", "day_z": "1.9", "trend_before": "up",
+     "trend_now": "up", "reaction_complete": "false",
      "top_headline": "Echo raises guidance", "recommendation": "BUY", "agreement": "agrees with TFB"}]
 EVENT_ROWS = [dict(NOW_ROWS[2]), dict(NOW_ROWS[0])]
 STATE_RECORD_ROWS = [
@@ -1254,6 +1256,7 @@ def test_n12_news_now_rows_and_section(capsys):
             by.setdefault(str(r[0]).split(" - ")[0], r)
     a = by["AAA.US"]
     assert a[1] == "holding" and a[3] == "big rise, no news" and a[4] == "+3.46 pp (z +2.2) over 2 sessions"
+    assert a[5] == "up before the event; down now"                      # the trend the state was read against comes first
     assert a[6] == "down against SPY" and a[7] == "BUY" and a[8] == "LEANS AGAINST TFB"
     assert a[9] == "no forward event matured yet"                       # the history row never counts as the record
     c = by["CCC.US"]
@@ -1261,6 +1264,7 @@ def test_n12_news_now_rows_and_section(capsys):
     d = by["DDD.US"]
     assert d[1] == "holding" and d[3] == "" and d[10].startswith("not in the followed set yet")
     e = by["EEE.US"]
+    assert e[4] == "+4.10 pp (z +1.6) first session only, the next is still to come" and e[5] == "up"
     assert e[1] == "Top 10" and e[9] == "no clear edge | 24 event(s), 58% went the expected way, edge +0.61 pp"
     f = by["FFF.US"]
     assert f[1] == "Top 10" and f[10].startswith("not in the followed set yet")
@@ -1295,3 +1299,5 @@ def test_n12_proven_state_named_in_the_verdict():
     assert nb.record_text(None) == "no forward event matured yet"
     assert nb.answer_text({"day_pp": "-1.5", "day_z": "-0.4"}) == "-1.50 pp (z -0.4) on the day"
     assert nb.answer_text({}) == ""
+    assert nb.trend_text({"trend_before": "down", "trend_now": "up"}) == "up"      # no event: the trend now
+    assert nb.trend_text({"event_day": "2026-11-20", "trend_now": "flat"}) == "flat"   # no trend before recorded

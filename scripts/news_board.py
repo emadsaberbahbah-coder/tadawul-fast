@@ -770,12 +770,24 @@ def record_text(rec: Optional[Dict[str, Any]]) -> str:
 
 
 def answer_text(r: Dict[str, Any]) -> str:
-    """How the price answered: the 2-session reaction against SPY when the event has one, else the day's move."""
+    """How the price answered: the 2-session reaction against SPY when the event has one, else the day's move.
+    An event on the latest session has only its first day: the cell says the next session is still to come."""
     if num(r.get("reaction_pp")) is not None:
-        return "%s pp (z %s) over 2 sessions" % (fmt(r.get("reaction_pp"), 2, True), fmt(r.get("reaction_z"), 1, True))
+        done = text(r.get("reaction_complete")).lower() not in ("false", "0")
+        return "%s pp (z %s) %s" % (fmt(r.get("reaction_pp"), 2, True), fmt(r.get("reaction_z"), 1, True),
+                                    "over 2 sessions" if done else "first session only, the next is still to come")
     if num(r.get("day_pp")) is not None:
         return "%s pp (z %s) on the day" % (fmt(r.get("day_pp"), 2, True), fmt(r.get("day_z"), 1, True))
     return ""
+
+
+def trend_text(r: Dict[str, Any]) -> str:
+    """The trend before the shown event (the one its state was read against); the trend now beside it when it changed.
+    A name with no event shows the trend now."""
+    before, now = text(r.get("trend_before")), text(r.get("trend_now"))
+    if not text(r.get("event_day")) or not before:
+        return now
+    return before if not now or now == before else "%s before the event; %s now" % (before, now)
 
 
 def news_now_row(r: Dict[str, Any], why: str, records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -783,7 +795,7 @@ def news_now_row(r: Dict[str, Any], why: str, records: Dict[str, Dict[str, Any]]
     state = text(r.get("state")) or "quiet"
     return {"symbol": text(r.get("symbol")), "name": text(r.get("name")), "why": why,
             "event_day": text(r.get("event_day")), "state": state, "answer": answer_text(r),
-            "trend": text(r.get("trend_now")), "expected": EXPECTED_TEXT.get(exp, "") if exp is not None else "",
+            "trend": trend_text(r), "expected": EXPECTED_TEXT.get(exp, "") if exp is not None else "",
             "tfb": text(r.get("recommendation")), "agreement": AGREEMENT_TEXT.get(text(r.get("agreement")),
                                                                                text(r.get("agreement"))),
             "record": record_text(records.get(state)) if exp not in (None, 0) else "",
@@ -1354,7 +1366,7 @@ def sql_news_trial(ds: str) -> str:
 
 
 _NOW_COLS = ("symbol, name, CAST(latest_event_date AS STRING) AS event_day, state, expected, reaction_pp, reaction_z, "
-             "day_pp, day_z, trend_now, top_headline, recommendation, agreement")
+             "day_pp, day_z, trend_before, trend_now, reaction_complete, top_headline, recommendation, agreement")
 
 
 def sql_board_names(ds: str, today: _dt.date) -> str:
