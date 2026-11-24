@@ -2,8 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.97 (2026-11-23) -- GATE EVIDENCE
+# VERSION 1.1.99 (2026-11-24) -- COLLECTOR CATCH-UP
 #
+# v1.1.99: run tests/test_collector_catchup.py (scripts/collector_catchup.py
+# 1.0.0 and .github/workflows/collector_catchup.yml: one write dispatch for a
+# BigQuery collector whose cron slot GitHub missed or delivered past its grace)
+# right after tests/test_sync_watchdog.py. Nothing is removed and no existing
+# entry moves.
+#
+# (1.1.97, 2026-11-23: GATE EVIDENCE)
 # v1.1.97: run tests/test_de_gate_evidence.py (data_engine_v2 v5.162.0:
 # TFB_GATE_EVIDENCE off|observe|enforce, unset = observe; INVEST needs a
 # BUY-family recommendation, a positive forecast and a risk reading; the
@@ -1302,6 +1309,7 @@ jobs:
             tests/test_sync_stamp_repair.py \
             tests/test_sync_portfolio_route_capacity.py \
             tests/test_sync_watchdog.py \
+            tests/test_collector_catchup.py \
             tests/test_daily_plan.py \
             tests/test_market_regime.py \
             tests/test_today_action_plan.py \

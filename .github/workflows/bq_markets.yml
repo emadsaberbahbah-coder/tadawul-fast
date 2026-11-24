@@ -20,6 +20,9 @@
 #       manual dispatch is a dry run unless write=true.
 # =============================================================================
 name: 🌍 BigQuery Market Series
+# 2026-11-24: a manual run names its write mode, so scripts/collector_catchup.py can tell a
+# write from a dry run (Codex P2 on #1070); scheduled runs keep the plain name.
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('{0} (dispatch, write={1})', github.workflow, inputs.write) || github.workflow }}
 
 on:
   schedule:
