@@ -117,7 +117,8 @@ def test_workflow_follows_the_collectors():
                                                "🌍 BigQuery Market Series", "🗄️ BigQuery Looker Views"]
     assert "schedule" not in on and set(on["workflow_dispatch"]["inputs"]) == {"write", "only"}
     job = wf["jobs"]["snapshots"]
-    assert job["if"].startswith("github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'")
+    # Codex P2 on #1075: a part-failed collector may have loaded some sources - every finished run refreshes
+    assert job["if"] == "github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'skipped'"
     assert job["concurrency"] == {"group": "tfb-bq-snapshots", "cancel-in-progress": False}
     env = job["steps"][-1]["env"]
     assert env["TFB_BQ_SNAPSHOTS"] == "${{ vars.TFB_BQ_SNAPSHOTS || 'on' }}" and "EODHD_API_KEY" not in env

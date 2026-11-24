@@ -13,7 +13,8 @@
 # WHEN: after each successful run of the archive, the deep data, the market
 # series and the views (a changed view is snapshotted at once) - workflow_run -
 # or dispatched (write=true; 'only' limits the tables).
-# No cron. A failed collector run refreshes nothing.
+# No cron. A collector run that failed part-way refreshes too (it may have
+# loaded some sources); only a skipped run does not.
 #
 # READS: the three views (SELECT only). WRITES: the snap_* tables only.
 # Rollback: repository Variable TFB_BQ_SNAPSHOTS=off (the snapshots age and
@@ -52,7 +53,9 @@ env:
 
 jobs:
   snapshots:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Codex P2 on #1075: a collector that failed part-way may still have loaded some sources, so every finished run
+    # (success, failure or cancel) refreshes; only a skipped one does not.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'skipped'
     concurrency:
       group: tfb-bq-snapshots
       cancel-in-progress: false

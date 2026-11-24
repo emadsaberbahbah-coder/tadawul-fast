@@ -20,7 +20,7 @@ Their sources change only when a collector loads, so each read between two loads
 | File | Version | Change |
 |---|---|---|
 | `scripts/bq_snapshots.py` | new, 1.0.0 | Each view computed once into `snap_<name>` (query job, WRITE_TRUNCATE, clustered, with `snapshot_at`); `source_for()` returns the snapshot when it is under 30 hours old, else the view |
-| `.github/workflows/bq_snapshots.yml` | new, 1.0.0 | Runs after each successful archive, deep-data, market-series or views run; no cron |
+| `.github/workflows/bq_snapshots.yml` | new, 1.0.0 | Runs after each finished archive, deep-data, market-series or views run, failed ones included (they may have loaded part of their sources); no cron |
 | `scripts/news_now.py` | 1.0.0 -> 1.1.0 | TFB's view (name and recommendation) from the fresh snapshot, else the view |
 | `scripts/news_board.py` | 1.6.0 -> 1.7.0 | Sections 11 and 12 read the fresh snapshots, else the views |
 | `sql/bigquery/128_v_symbol_news_class_now.sql` | views 1.29.0 | Names from `snap_universe_latest` (the rest of file 97's rules unchanged; tested) |
