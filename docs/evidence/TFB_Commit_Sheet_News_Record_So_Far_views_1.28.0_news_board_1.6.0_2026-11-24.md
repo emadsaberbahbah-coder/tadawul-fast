@@ -27,6 +27,11 @@ appears only after the move cannot score itself.
 | `f1_pp` | from the session's close to the next session's close |
 | `f5_pp` | from the session's close to the close five sessions later |
 
+**Basis** (Codex P1 and P2 on #1073): both sides are read on the archive's adjusted closes as they stand when the view is
+read. The price at the reading is the archive's close of the session before, times (1 + the logged change), never the
+raw logged price, so a later dividend or split cannot move a scored outcome. The target sessions are SPY's, and each
+stock close is joined on exactly that date, so a missing bar leaves the outcome unscored.
+
 **Reading** (the same rules as `v_news_trend_learning`):
 
 - **collecting:** fewer than 20 events, or fewer than max(10, 2 x horizon) dates;

@@ -369,7 +369,7 @@ PENDING = {
     "v_shock_drop_learning": "7d551a93e69a4bd95845ea967622a1736f452664985c4ddd2ee5adbcf28b3bfc",
     # apply_bq_views 1.27.0 (24 Nov 2026): the hourly company headlines, classified with file 97's rules (research only)
     # apply_bq_views 1.28.0 (24 Nov 2026): the hourly news reading scored against SPY, and its record (research only)
-    "v_news_now_eval": "26eab86f6b6ae90a54be2bafc96788aaf99817aaf3508a145640a933a8c927b5",
+    "v_news_now_eval": "7d9046950a5325177f7368c69e9da072e1f7d9e3e1e2f8aefa25806aa717a6d9",
     "v_news_now_learning": "e369cafc130a7a5b82bad1d75f5597c4ae8a6ead7082a578516636690d112dc6",
     "v_symbol_news_class_now": "6cb8eda4cc2202ebe2ca42ffdeb3c6eb200db60101c6dfe14176766ace55fca8",
 }
@@ -4009,8 +4009,15 @@ def case_v65():
                  "SELECT date, COALESCE(adj_close, close) AS close\n  FROM `{{DS}}.market_series_daily`",
                  "SAFE_DIVIDE(sd.close, sp.close * (1 + r.spy_change_pct / 100))",
                  "LEFT JOIN spy sp ON sp.date = r.prev_date",
-                 "ROUND(100 * (SAFE_DIVIDE(q.c1, q.close) - SAFE_DIVIDE(sd.s1, sd.close)), 2) AS f1_pp",
-                 "ROUND(100 * (SAFE_DIVIDE(q.c5, q.close) - SAFE_DIVIDE(sd.s5, sd.close)), 2) AS f5_pp"):
+                 # Codex P1 on #1073: the price at the reading on the archive's adjusted basis, never the raw price
+                 "SAFE_DIVIDE(q.close, qp.close * (1 + r.change_pct / 100))",
+                 "LEFT JOIN bars qp ON qp.symbol = r.symbol AND qp.date = r.prev_date",
+                 # Codex P2 on #1073: SPY's sessions are the targets; a missing stock bar leaves the outcome unscored
+                 "LEAD(date) OVER w AS d1", "LEAD(date, 5) OVER w AS d5",
+                 "LEFT JOIN bars q1 ON q1.symbol = r.symbol AND q1.date = sd.d1",
+                 "LEFT JOIN bars q5 ON q5.symbol = r.symbol AND q5.date = sd.d5",
+                 "ROUND(100 * (SAFE_DIVIDE(q1.close, q.close) - SAFE_DIVIDE(sd.s1, sd.close)), 2) AS f1_pp",
+                 "ROUND(100 * (SAFE_DIVIDE(q5.close, q.close) - SAFE_DIVIDE(sd.s5, sd.close)), 2) AS f5_pp"):
         assert frag in ev, frag
     assert set(nn.SESSION_TEXT.values()) >= {"open", "closed today"}           # the states the event reads
     for frag in ("UNNEST([STRUCT(0 AS h, e.rest_pp AS f), (1, e.f1_pp), (5, e.f5_pp)]) AS hz",
@@ -4023,7 +4030,7 @@ def case_v65():
     assert order == sorted(order)
     for code in (ev, le):
         assert "CURRENT_" not in code and "FOLLOWING" not in code
-    assert ev.count("LEAD(") == 4                                              # the only look forward: the outcomes
+    assert ev.count("LEAD(") == 4 and "r.price" not in ev                     # the only look forward: SPY's targets
 
 
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
