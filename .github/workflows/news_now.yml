@@ -1,0 +1,137 @@
+# =============================================================================
+# 📰 News Now - each holding and Top 10 name, read again every hour of the US session
+# -----------------------------------------------------------------------------
+# VERSION 1.0.0 (2026-11-24)
+#
+# WHY: owner, 24 Nov 2026 10:10 Riyadh (in Arabic): the news analysis should
+# act on the reading of a stock's price now - not only in the 8 Dec review;
+# 10:20: "let us start". News Board section 11 reads the nightly feed twice a
+# day; this job reads the company news and the price within the hour.
+#
+# WHEN: after the Exit Plan workflow, which the workbook dispatches every hour
+# (apps_script/29_Page_Refresh_Dispatch.gs, :35 Riyadh), when the UTC hour is
+# one of TFB_NEWS_NOW_CHAIN_HOURS (repository Variable; default
+# "13 14 15 16 17 18 19 20 21" = 16:35 to 00:35 Riyadh, the US pre-open to the
+# close; "off" = no chained run) and the day is Monday to Friday (UTC). No
+# cron: GitHub's schedule starts this repository's runs hours late. A manual
+# dispatch writes only with write=true.
+#
+# READS: My_Portfolio, v_top10_board, EODHD news (5 calls a name, behind the
+# nightly job's budget guard), the Yahoo chart (no key), v_symbol_news_class_now
+# and v_universe_latest (about 0.5 GB a run).
+# WRITES: BigQuery symbol_news_intraday (today's partition) and news_now_log
+# (appended); the workbook tab News_Now. OBSERVE ONLY: no recommendation
+# changes and no order is placed. The run log prints counts only.
+# Rollback: repository Variable TFB_NEWS_NOW=off.
+# =============================================================================
+name: 📰 News Now
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('{0} (dispatch, write={1})', github.workflow, inputs.write) || github.workflow }}
+
+on:
+  workflow_run:
+    workflows: ["🎯 Exit Plan"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Load BigQuery and write the page (unticked = dry run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  due:
+    name: 🕒 Is a chained run due this hour?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.due.outputs.run }}
+    steps:
+      - name: 🕒 Is a chained run due this hour?
+        id: due
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHAIN_HOURS: ${{ vars.TFB_NEWS_NOW_CHAIN_HOURS || '13 14 15 16 17 18 19 20 21' }}
+        run: |
+          # A run chained to the hourly Exit Plan works only in the listed UTC hours, Monday to Friday;
+          # a dispatch always. "off" (or no number) = no chained run.
+          RUN=true
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            HOUR=$((10#$(date -u +%H)))
+            DOW=$(date -u +%u)
+            RUN=false
+            for h in $CHAIN_HOURS; do
+              if [[ "$h" =~ ^[0-9]+$ ]] && (( 10#$h == HOUR )); then RUN=true; fi
+            done
+            if (( DOW > 5 )); then RUN=false; fi
+            echo "Chained run at UTC hour $HOUR, weekday $DOW (hours: $CHAIN_HOURS): run=$RUN"
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
+  now:
+    # The gate is its own job, so a chained run that is not due never enters this job's
+    # concurrency group and cannot cancel or replace a run that publishes.
+    needs: due
+    if: needs.due.outputs.run == 'true'
+    concurrency:
+      group: tfb-news-now
+      cancel-in-progress: false
+    name: 📰 Read the news and the price, publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet gspread==6.2.1 "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 📰 Run news now
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
+          TFB_NEWS_NOW: ${{ vars.TFB_NEWS_NOW || 'on' }}
+          TFB_NEWS_NOW_EODHD: ${{ vars.TFB_NEWS_NOW_EODHD || 'on' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IN_WRITE: ${{ inputs.write }}
+        run: |
+          ARGS=()
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_WRITE" != "true" ]]; then
+            ARGS+=(--dry-run)
+            echo "Dry-run mode - reading the sources, writing nothing (tick write=true to write)."
+          fi
+          python scripts/news_now.py "${ARGS[@]}"

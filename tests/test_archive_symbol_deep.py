@@ -451,7 +451,7 @@ def test_d10_workflow():
                                             "github.event.inputs.outcome_bars == 'true' && 'on' || "
                                             "vars.TFB_DEEP_OUTCOME_BARS || 'off' }}")
     assert wf["jobs"]["deep"]["timeout-minutes"] == 45
-    assert asd.__version__ == "1.3.0"
+    assert asd.__version__ == "1.3.1"
     # 1.2.0: the matured calls follow their own Variable, on by default
     assert env["TFB_DEEP_OUTCOME_MATURED"] == "${{ vars.TFB_DEEP_OUTCOME_MATURED || 'on' }}"
     # 1.3.0: the wide news sets follow their own Variable, on by default

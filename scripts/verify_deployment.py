@@ -371,7 +371,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # beside the record and the projection context).
     # 2026-11-24 (manifest pin only): 1.25.1 -> 1.26.0 (v_confidence_calibration, v_shock_drop_events,
     # v_shock_drop_learning - confidence by market and the share beating the market; the shock-drop shadow rule).
-    ("apply_bq_views", "1.26.0", "bigquery looker views"),
+    # 2026-11-24 (manifest pin only): 1.26.0 -> 1.27.0 (v_symbol_news_class_now - the hourly headlines of
+    # scripts/news_now.py read with file 97's rules; NOW_TABLES symbol_news_intraday and news_now_log).
+    ("apply_bq_views", "1.27.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -397,7 +399,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # engine; TFB_DEEP_OUTCOME_BARS, default off).
     # 2026-11-24 (pin only): 1.2.0 -> 1.3.0 (the 50 largest US equities and the day's big movers join the core
     # news set, TFB_DEEP_NEWS_WIDE default on, core cap 200).
-    ("archive_symbol_deep", "1.3.0", "bigquery symbol deep data"),
+    # 2026-11-24 (pin only): 1.3.0 -> 1.3.1 (ensure_table / load take an optional spec and write disposition for
+    # scripts/news_now.py; every call of the nightly job keeps its defaults).
+    ("archive_symbol_deep", "1.3.1", "bigquery symbol deep data"),
     # 2026-11-19 (new script, pinned on arrival): the daily world-news themes
     # (GDELT) the news learning loop is taught from; research table only.
     # 2026-11-21: 1.0.0 -> 1.1.0 (three more sources: the fights, the share
@@ -416,6 +420,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-24 (pin only): 1.4.0 -> 1.5.0 ([NEWS NOW]: section 11, each holding and Top 10 name read with
     # the trend from v_news_understanding, its state's forward record; observe only).
     ("news_board", "1.5.0", "news board"),
+    # 2026-11-24 (new script, pinned on arrival): each holding and Top 10 name read again every hour of the US
+    # session - company news since the last session against the price so far (observe only; News_Now tab).
+    ("news_now", "1.0.0", "news now"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),

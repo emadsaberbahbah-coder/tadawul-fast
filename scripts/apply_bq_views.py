@@ -2,8 +2,20 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.26.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.27.0 (program register C8, Phase 2)
 ================================================================================
+v1.27.0 (24 Nov 2026, the hourly news reading). WHY (owner, 24 Nov 2026
+10:10 Riyadh, in Arabic: the news analysis should act on the reading of a
+stock's price now, through gathering, comparing and forecasting - not only in
+the 8 Dec review; 10:20: "let us start"). scripts/news_now.py 1.0.0 reads the
+company news of the holdings and the Top 10 names every hour of the US
+session into a new source table, symbol_news_intraday (with its own log,
+news_now_log). One new view, research only: v_symbol_news_class_now (128) -
+file 97's rules, unchanged, over the hourly table (the test holds that the two
+files differ only in the name, the source table and the description). The two
+tables are created by the job's first run; this view is applied after it. No
+file of 1.26.0 changes.
+
 v1.26.0 (24 Nov 2026, confidence calibration and the shock-drop shadow rule).
 WHY (owner, 24 Nov 2026 01:07 Riyadh: "check now we are able to achieve our
 target" - the INVESTABLE hit rate above 70 %; 00:58: NVDA fell 39 % on its
@@ -588,7 +600,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.26.0"
+__version__ = "1.27.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -616,8 +628,10 @@ NEWS_TABLES = frozenset({"news_theme_daily", "news_entity_daily"})   # v1.20.0: 
 ECON_TABLES = frozenset({"econ_calendar", "event_scenario_log"})
 # the table scripts/archive_options_reading.py v1.0.0 loads (v1.23.0, the price drivers)
 OPTIONS_TABLES = frozenset({"options_daily"})
+# the tables scripts/news_now.py v1.0.0 creates and loads (v1.27.0, the hourly news reading)
+NOW_TABLES = frozenset({"symbol_news_intraday", "news_now_log"})
 SOURCE_TABLES = (ARCHIVE_TABLES | MARKET_TABLES | DEEP_TABLES | NEWS_TABLES | ECON_TABLES
-                 | OPTIONS_TABLES)
+                 | OPTIONS_TABLES | NOW_TABLES)
 _CREATE = re.compile(
     r"CREATE OR REPLACE (VIEW|TABLE FUNCTION|FUNCTION) `\{\{DS\}\}\.([a-z][a-z0-9_]*)`")
 _REF = re.compile(r"`\{\{DS\}\}\.([a-z][a-z0-9_]*)`")

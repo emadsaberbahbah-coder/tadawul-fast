@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.100 (2026-11-24) -- NEWS NOW
+#
+# v1.1.100: run tests/test_news_now.py (scripts/news_now.py 1.0.0 and
+# .github/workflows/news_now.yml: each holding and Top 10 name read again
+# every hour of the US session, observe only) right after
+# tests/test_news_board.py. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.99 (2026-11-24) -- COLLECTOR CATCH-UP
 #
 # v1.1.99: run tests/test_collector_catchup.py (scripts/collector_catchup.py
@@ -1282,6 +1289,7 @@ jobs:
             tests/test_archive_news_themes.py \
             tests/test_archive_econ_calendar.py \
             tests/test_news_board.py \
+            tests/test_news_now.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \

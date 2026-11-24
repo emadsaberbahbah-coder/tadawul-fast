@@ -367,6 +367,8 @@ PENDING = {
     "v_confidence_calibration": "2814c17be7530e132904341ea0ce8000f65efe560a56e7585dd23ba753a64a37",
     "v_shock_drop_events": "2576f5d9f286f9d76e0b77d9a62590b54a2c9e7e894bde026272ea8a187ffa2e",
     "v_shock_drop_learning": "7d551a93e69a4bd95845ea967622a1736f452664985c4ddd2ee5adbcf28b3bfc",
+    # apply_bq_views 1.27.0 (24 Nov 2026): the hourly company headlines, classified with file 97's rules (research only)
+    "v_symbol_news_class_now": "6cb8eda4cc2202ebe2ca42ffdeb3c6eb200db60101c6dfe14176766ace55fca8",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -401,9 +403,10 @@ EXPECTED_ORDER = [
     "v_projection_context", "v_projection_scorecard",
     "v_news_trend_daily", "v_news_trend_learning", "v_news_understanding",
     "v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning",
+    "v_symbol_news_class_now",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 67)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 68)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3131,12 +3134,12 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.26.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.27.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.26.0"
+    assert bv.__version__ == "1.27.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-29:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-30:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
@@ -3147,8 +3150,9 @@ def case_v45():
                            "120_v_projection_context.sql", "121_v_projection_scorecard.sql",
                            "122_v_news_trend_daily.sql", "123_v_news_trend_learning.sql",
                            "124_v_news_understanding.sql", "125_v_confidence_calibration.sql",
-                           "126_v_shock_drop_events.sql", "127_v_shock_drop_learning.sql"]
-    assert files[:-28] == sorted(files[:-28])                                       # the two-digit order is unchanged
+                           "126_v_shock_drop_events.sql", "127_v_shock_drop_learning.sql",
+                           "128_v_symbol_news_class_now.sql"]
+    assert files[:-29] == sorted(files[:-29])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3428,7 +3432,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 20
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 21
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3721,7 +3725,7 @@ def case_v58():
     assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
     objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
     names = [o.name for o in bv.load_objects()]
-    assert names[-13:-8] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+    assert names[-14:-9] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
                             "v_driver_learning"]
     for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
                  "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
@@ -3801,7 +3805,7 @@ def case_v61():
     no look-ahead (the state and the volatility of the last close BEFORE the call), a within-day lift for the stock
     rule and a between-days lift for the market rules, read only at 20 call days and 40 forward calls."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-8:-6] == ["v_projection_context", "v_projection_scorecard"]
+    assert names[-9:-7] == ["v_projection_context", "v_projection_scorecard"]
     _, pc = _driver_view("v_projection_context", 120, {"v_universe_latest", "v_options_reading", "v_market_drivers"},
                          "1.24.0")
     for frag in ("COALESCE(o.iv30, u.volatility_30d_pct) AS vol",
@@ -3850,7 +3854,7 @@ def case_v62():
     was read; the outcome starts at the close AFTER the reaction window (no look-ahead); every t is overlap-adjusted;
     only sessions from 24 Nov 2026 are evidence; today's reading sits beside TFB's own view."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-6:-3] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
+    assert names[-7:-4] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
     _, nd = _driver_view("v_news_trend_daily", 122,
                          {"market_series_daily", "v_symbol_news_class", "v_news_items", "symbol_bars_daily"}, "1.25.0")
     _, nl = _driver_view("v_news_trend_learning", 123, {"v_news_trend_daily"}, "1.25.0")
@@ -3908,7 +3912,7 @@ def case_v63():
     the shock-drop shadow rule on the 100 largest US equities with bars, two ways of entering fixed before reading,
     the outcome from the signal close only, the history read as in-sample (survivorship), forward from 24 Nov 2026."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-3:] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
+    assert names[-4:-1] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
     _, cc = _driver_view("v_confidence_calibration", 125, {"v_performance_log", "market_series_daily"}, "1.26.0")
     _, se = _driver_view("v_shock_drop_events", 126, {"v_universe", "market_series_daily", "symbol_bars_daily"},
                          "1.26.0")
@@ -3960,13 +3964,34 @@ def case_v63():
         assert "CURRENT_" not in code
 
 
+def case_v64():
+    """v_symbol_news_class_now (1.27.0): the hourly headlines of scripts/news_now.py read with file 97's rules. The two
+    files differ ONLY in the view name, the source table (symbol_news_intraday) and the description, so the hourly
+    reading can never drift from the nightly one; the source tables are the job's own and declared in NOW_TABLES."""
+    import re
+    import archive_symbol_deep as asd
+    import news_now as nn
+    assert bv.NOW_TABLES == {nn.TABLE_NEWS, nn.TABLE_LOG} == {"symbol_news_intraday", "news_now_log"}
+    assert bv.NOW_TABLES <= bv.SOURCE_TABLES and not (bv.NOW_TABLES & bv.DEEP_TABLES)
+    assert nn.SCHEMA_NEWS is asd.SCHEMA_NEWS                                  # the same columns as the nightly feed
+    objs = {o.name: o for o in bv.load_objects()}
+    assert [o.name for o in bv.load_objects()][-1] == "v_symbol_news_class_now"
+    _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "v_universe_latest"}, "1.27.0")
+    night = bv._code(objs["v_symbol_news_class"].template)
+    desc = re.compile(r'OPTIONS \(description = "[^"]*"\)')
+    same = desc.sub("D", night).replace("`{{DS}}.v_symbol_news_class`", "`{{DS}}.v_symbol_news_class_now`", 1) \
+        .replace("FROM `{{DS}}.symbol_news` AS n", "FROM `{{DS}}.symbol_news_intraday` AS n", 1)
+    assert desc.sub("D", now) == same
+    assert "CURRENT_" not in now and "FOLLOWING" not in now
+
+
 CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8, case_v9, case_v10, case_v11,
          case_v12, case_v13, case_v14, case_v15, case_v16, case_v17, case_v18, case_v19, case_v20, case_v21,
          case_v22, case_v23, case_v24, case_v25, case_v26, case_v27,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
          case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57,
-         case_v58, case_v59, case_v60, case_v61, case_v62, case_v63]
+         case_v58, case_v59, case_v60, case_v61, case_v62, case_v63, case_v64]
 
 
 def test_v1(): case_v1()
@@ -4031,6 +4056,8 @@ def test_v59(): case_v59()
 def test_v60(): case_v60()
 def test_v61(): case_v61()
 def test_v62(): case_v62()
+def test_v63(): case_v63()
+def test_v64(): case_v64()
 
 
 if __name__ == "__main__":
