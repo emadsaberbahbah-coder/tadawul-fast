@@ -22,8 +22,10 @@ WHY (owner, 24 Nov 2026 09:08 Riyadh: "full session review ... deep check
   (scripts/sync_watchdog.py); the collectors had none.
 WHAT: for each collector in COLLECTORS, the latest slot whose grace has passed
   (slot + grace_h <= now, weekdays honoured, never older than LOOKBACK_H) is
-  checked against the collector's runs (schedule and workflow_dispatch events;
-  a run counts from the slot's time on):
+  checked against the collector's runs (a scheduled run, or a manual run whose
+  run name carries its write mark - "write=true", news: "dry_run=false" - since
+  a default manual dispatch of a BigQuery collector is a dry run; a run counts
+  from the slot's time on):
   - a run queued or in progress -> skip (it is coming);
   - a successful run since the slot -> ok;
   - no run since the slot -> missed: dispatch one write run;
@@ -61,16 +63,27 @@ LOOKBACK_H = 32.0          # a slot older than this is left alone (24 h between 
 # grace hours after the slot before it counts as missed, the dispatch inputs of a write run
 COLLECTORS: Tuple[Dict[str, Any], ...] = (
     {"file": "bq_markets.yml", "slots": ((22, 35),), "days": None, "grace_h": 3.0,
-     "inputs": {"write": "true"}},
+     "inputs": {"write": "true"}, "write_mark": "write=true"},
     {"file": "bq_archive.yml", "slots": ((23, 5),), "days": None, "grace_h": 5.0,
-     "inputs": {"write": "true"}},
+     "inputs": {"write": "true"}, "write_mark": "write=true"},
     {"file": "bq_options.yml", "slots": ((23, 30),), "days": (0, 1, 2, 3, 4), "grace_h": 4.0,
-     "inputs": {"write": "true"}},
+     "inputs": {"write": "true"}, "write_mark": "write=true"},
     {"file": "bq_symbol_deep.yml", "slots": ((0, 20),), "days": None, "grace_h": 6.0,
-     "inputs": {"write": "true"}},
+     "inputs": {"write": "true"}, "write_mark": "write=true"},
     {"file": "news_archive.yml", "slots": ((14, 0), (20, 0)), "days": None, "grace_h": 3.0,
-     "inputs": {}},
+     "inputs": {"dry_run": "false"}, "write_mark": "dry_run=false"},
 )
+
+
+def counts_as_collection(spec: Dict[str, Any], r: Dict[str, Any]) -> bool:
+    """PURE: a scheduled run always collects; a manual run collects only when its
+    run name (each collector's run-name, 24 Nov 2026) carries the write mark - a
+    default manual dispatch of a BigQuery collector is a dry run (Codex P2 on #1070)."""
+    if r.get("event") == "schedule":
+        return True
+    if r.get("event") == "workflow_dispatch":
+        return str(spec.get("write_mark") or "") in str(r.get("display_title") or r.get("name") or "")
+    return False
 
 
 def _out(msg: str) -> None:
@@ -111,7 +124,7 @@ def decide(spec: Dict[str, Any], runs: Sequence[Dict[str, Any]], now: _dt.dateti
     slot = due_slot(spec, now)
     if slot is None:
         return "wait", "no slot past its grace in the last %d h" % int(LOOKBACK_H)
-    prod = [r for r in (runs or []) if r.get("event") in PRODUCTION_EVENTS]
+    prod = [r for r in (runs or []) if r.get("event") in PRODUCTION_EVENTS and counts_as_collection(spec, r)]
     active = [r for r in prod if str(r.get("status") or "").lower() in ACTIVE_STATUSES]
     if active:
         return "skip", "run %s is %s" % (active[0].get("id"), active[0].get("status"))

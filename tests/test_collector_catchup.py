@@ -27,8 +27,11 @@ UTC = dt.timezone.utc
 SPEC = {c["file"]: c for c in cc.COLLECTORS}
 
 
-def run(rid, event, status, created, conclusion="success"):
-    return {"id": rid, "event": event, "status": status, "conclusion": conclusion, "created_at": created}
+def run(rid, event, status, created, conclusion="success", title=None):
+    if title is None:
+        title = "wf (dispatch, write=true)" if event == "workflow_dispatch" else "wf"
+    return {"id": rid, "event": event, "status": status, "conclusion": conclusion, "created_at": created,
+            "display_title": title}
 
 
 def at(s):
@@ -80,6 +83,30 @@ def test_c4_only_production_events():
               run(2, "push", "completed", "2026-11-24T05:00:00Z"),
               run(3, "workflow_run", "in_progress", "2026-11-24T06:00:00Z", None)]
     assert cc.decide(arc, others, now)[0] == "dispatch"
+
+
+def test_c4b_a_manual_dry_run_is_not_a_collection():
+    """Codex P2 on #1070: a default manual dispatch of a BigQuery collector is a dry run."""
+    mk, now = SPEC["bq_markets.yml"], at("2026-11-24 06:00")
+    dry = [run(1, "workflow_dispatch", "completed", "2026-11-24T01:00:00Z", title="🌍 BigQuery Market Series (dispatch, write=false)")]
+    assert cc.decide(mk, dry, now)[0] == "dispatch"
+    wet = [run(2, "workflow_dispatch", "completed", "2026-11-24T01:00:00Z", title="🌍 BigQuery Market Series (dispatch, write=true)")]
+    assert cc.decide(mk, wet, now)[0] == "ok"
+    active_dry = [run(3, "workflow_dispatch", "in_progress", "2026-11-24T05:59:00Z", None, title="x (dispatch, write=false)")]
+    assert cc.decide(mk, active_dry, now)[0] == "dispatch"                       # a dry run in flight is not coming data
+    news = SPEC["news_archive.yml"]
+    assert cc.decide(news, [run(4, "workflow_dispatch", "completed", "2026-11-24T04:00:00Z", title="news-archive (dispatch, dry_run=true)")], now)[0] == "dispatch"
+    assert cc.decide(news, [run(5, "workflow_dispatch", "completed", "2026-11-24T04:00:00Z", title="news-archive (dispatch, dry_run=false)")], now)[0] == "ok"
+
+
+def test_c4c_each_collector_names_its_write_mode():
+    for spec in cc.COLLECTORS:
+        wf = yaml.safe_load((ROOT / ".github" / "workflows" / spec["file"]).read_text(encoding="utf-8"))
+        rn = wf.get("run-name") or ""
+        key, val = spec["write_mark"].split("=")
+        assert "github.event_name == 'workflow_dispatch'" in rn and "inputs.%s" % key in rn, spec["file"]
+        assert "(dispatch, %s={1})" % key in rn and rn.endswith("|| github.workflow }}"), spec["file"]
+        assert spec["inputs"] == {key: val}                                         # the guard's own dispatch carries the mark
 
 
 # ---------------------------------------------------------------- C5 / C6
@@ -162,6 +189,8 @@ def test_c8_collectors_accept_the_inputs():
         inputs = (on.get("workflow_dispatch") or {}).get("inputs") or {}
         assert "workflow_dispatch" in on, spec["file"]
         assert set(spec["inputs"]) <= set(inputs), spec["file"]
+        for k, v in spec["inputs"].items():                                        # the input is a boolean the run-name prints
+            assert inputs[k]["type"] == "boolean" and v in ("true", "false"), spec["file"]
         hours = set()
         for c in on.get("schedule") or []:
             mm, hh = c["cron"].split()[:2]
