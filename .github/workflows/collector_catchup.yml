@@ -1,0 +1,59 @@
+# ============================================================================
+# TFB Collector Catch-up -- start a nightly data collector that missed its slot
+# ============================================================================
+# 2026-11-24 (v1.0.0): GitHub delivers the BigQuery collectors' crons hours
+# late or not at all (24 Nov: the archive had not started 7 hours after its
+# 23:05 UTC slot; SPY's last close in BigQuery was still Friday's; one
+# news_archive slot of 23 Nov never ran). scripts/collector_catchup.py checks
+# each collector's latest slot past its grace and dispatches ONE write run when
+# none has run since (one retry after a single failure; never a loop). Every
+# collector rewrites its day's partition, so a late scheduled run arriving
+# afterwards only rewrites the same day.
+# CLOCK: its own cron is late too, so it also runs after every Pre-Open Check,
+# which the sync chain starts on time (Apps Script dispatcher -> daily_sync).
+# GATE: repository variable TFB_COLLECTOR_CATCHUP = off | observe | on
+# (default observe: it reports what it would dispatch in the run summary).
+# Rollback: set TFB_COLLECTOR_CATCHUP=off.
+name: 🧲 Collector Catch-up
+
+on:
+  schedule:
+    - cron: "11 */2 * * *"
+  workflow_run:
+    workflows: ["⏰ Pre-Open Check"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: tfb-collector-catchup
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  catchup:
+    name: 🧲 Dispatch a collector only when its slot was missed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: 🧲 Check each collector's latest slot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TFB_COLLECTOR_CATCHUP: ${{ vars.TFB_COLLECTOR_CATCHUP || 'observe' }}
+        run: |
+          set -euo pipefail
+          python scripts/collector_catchup.py

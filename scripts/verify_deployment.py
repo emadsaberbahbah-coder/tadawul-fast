@@ -427,6 +427,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # min before the US open (ES=F + pre-market gap verdicts per ticket).
     ("pre_open_check", "1.1.0", "pre-open check tab"),
     ("sync_watchdog", "1.0.0", "sync watchdog"),
+    # 2026-11-24 (pin only): NEW scripts/collector_catchup.py 1.0.0 - one write
+    # dispatch for a BigQuery collector whose cron slot GitHub missed or
+    # delivered past its grace (TFB_COLLECTOR_CATCHUP, workflow default observe).
+    ("collector_catchup", "1.0.0", "collector catch-up"),
     ("daily_plan", "1.10.3", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
