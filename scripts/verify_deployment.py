@@ -373,7 +373,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # v_shock_drop_learning - confidence by market and the share beating the market; the shock-drop shadow rule).
     # 2026-11-24 (manifest pin only): 1.26.0 -> 1.27.0 (v_symbol_news_class_now - the hourly headlines of
     # scripts/news_now.py read with file 97's rules; NOW_TABLES symbol_news_intraday and news_now_log).
-    ("apply_bq_views", "1.27.0", "bigquery looker views"),
+    # 2026-11-24 (manifest pin only): 1.27.0 -> 1.28.0 (v_news_now_eval, v_news_now_learning - the hourly news
+    # reading scored against SPY for the rest of the session, 1 and 5 sessions, and its record).
+    ("apply_bq_views", "1.28.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -419,7 +421,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # sections 8-10: the news by market and by person and every news signal on trial (apply_bq_views 1.20.0).
     # 2026-11-24 (pin only): 1.4.0 -> 1.5.0 ([NEWS NOW]: section 11, each holding and Top 10 name read with
     # the trend from v_news_understanding, its state's forward record; observe only).
-    ("news_board", "1.5.0", "news board"),
+    # 2026-11-24 (pin only): 1.5.0 -> 1.6.0 ([INTERIM]: section 12, the forward news record so far - nightly and
+    # hourly - with its fixed reading and how far each state is from being read; observe only).
+    ("news_board", "1.6.0", "news board"),
     # 2026-11-24 (new script, pinned on arrival): each holding and Top 10 name read again every hour of the US
     # session - company news since the last session against the price so far (observe only; News_Now tab).
     ("news_now", "1.0.0", "news now"),
