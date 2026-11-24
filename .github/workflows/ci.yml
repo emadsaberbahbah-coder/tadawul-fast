@@ -2,6 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.102 (2026-11-24) -- BIGQUERY SNAPSHOTS
+#
+# v1.1.102: run tests/test_bq_snapshots.py (scripts/bq_snapshots.py 1.0.0 and
+# .github/workflows/bq_snapshots.yml: the heavy views computed once after each
+# collector; readers take a fresh snapshot, else the view) right after
+# tests/test_learning_watch.py. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.101 (2026-11-24) -- LEARNING WATCH
 #
 # v1.1.101: run tests/test_learning_watch.py (scripts/learning_watch.py 1.0.0
@@ -1298,6 +1305,7 @@ jobs:
             tests/test_news_board.py \
             tests/test_news_now.py \
             tests/test_learning_watch.py \
+            tests/test_bq_snapshots.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \

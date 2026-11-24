@@ -4,6 +4,11 @@ scripts/news_now.py
 ================================================================================
 TFB News Now - each holding and Top 10 name, read again every hour of the US session
 --------------------------------------------------------------------------------
+v1.1.0 (2026-11-24)
+  1.1.0: [SNAPSHOTS] TFB's view (name and recommendation) is read from snap_universe_latest (scripts/bq_snapshots.py
+         1.0.0) when it is there and younger than 30 hours, else from v_universe_latest as before: about 0.24 GB less
+         per run, and the classification view (apply_bq_views 1.29.0) joins the same snapshot. Owner, 24 Nov 2026
+         13:53: "Let's go with next" (BigQuery faster).
 v1.0.0 (2026-11-24)
   WHY: owner, 24 Nov 2026 10:10 Riyadh, in Arabic: the goal is for the news analysis to have an immediate effect on
        the reading of a stock's price now, through gathering, comparing and forecasting - not results on 8 December;
@@ -57,9 +62,10 @@ if _HERE not in sys.path:
 
 import archive_market_series as ams  # noqa: E402 - same folder: the Yahoo reader
 import archive_symbol_deep as asd  # noqa: E402 - same folder: EODHD reader, budget guard, BigQuery loader
+import bq_snapshots as bs  # noqa: E402 - same folder: the fresh snapshot or the view
 import news_board as nb  # noqa: E402 - same folder: holdings, board names, text helpers
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -522,10 +528,10 @@ def sql_classified(ds: str, symbols: Sequence[str], since: str) -> str:
             "AND symbol IN (%s) AND news_date >= DATE '%s'" % (ds, ", ".join("'%s'" % s for s in symbols), since))
 
 
-def sql_universe(ds: str, symbols: Sequence[str]) -> str:
-    return ("SELECT symbol, name, recommendation FROM `%s.v_universe_latest` WHERE symbol IN (%s) "
+def sql_universe(ds: str, symbols: Sequence[str], src: str = "v_universe_latest") -> str:
+    return ("SELECT symbol, name, recommendation FROM `%s.%s` WHERE symbol IN (%s) "
             "QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY captured_at DESC) = 1"
-            % (ds, ", ".join("'%s'" % s for s in symbols)))
+            % (ds, src, ", ".join("'%s'" % s for s in symbols)))
 
 
 # ----------------------------------------------------------------------------- #
@@ -634,7 +640,9 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
     since = (today_riyadh - _dt.timedelta(days=10)).isoformat()
     try:
         classified = nb.read_optional(session, project, location, sql_classified(ds, syms, since), query)
-        universe = {text(r.get("symbol")).upper(): r for r in query(session, project, location, sql_universe(ds, syms))}
+        src = bs.source_for("v_universe_latest", session, project, location, ds, query, note=_out)
+        universe = {text(r.get("symbol")).upper(): r for r in query(session, project, location,
+                                                                    sql_universe(ds, syms, src))}
     except Exception as e:  # noqa: BLE001
         _out("ERROR: %s while reading BigQuery; nothing written" % type(e).__name__)
         return 2

@@ -4,7 +4,12 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.6.0 (2026-11-24)
+v1.7.0 (2026-11-24)
+  1.7.0: [SNAPSHOTS] sections 11 and 12 read v_news_understanding and v_news_trend_learning from their snapshots
+         (scripts/bq_snapshots.py 1.0.0: computed once after each collector, about 0.37 GB a read each before) when
+         the snapshot is there and younger than 30 hours; otherwise from the views, as before. Owner, 24 Nov 2026
+         13:07 Riyadh: BigQuery faster; 13:53 "Let's go with next". The same rows, read in milliseconds instead of
+         recomputed; one small freshness read per snapshot and run.
   1.6.0: [INTERIM] section 12, THE NEWS RECORD SO FAR, observe only. Owner, 24 Nov 2026 12:17 Riyadh: "ok let's start
          the next stage" - the interim daily reading of the news record, so its progress is in front of the owner
          every day, not only on 8 Dec. Two records, each per state and horizon, with its fixed reading and how far it
@@ -133,7 +138,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -1466,25 +1471,25 @@ def sql_board_names(ds: str, today: _dt.date) -> str:
             % (ds, _d(today - _dt.timedelta(days=NEWS_NOW_BOARD_DAYS))))
 
 
-def sql_news_now(ds: str, symbols: Sequence[Any]) -> str:
+def sql_news_now(ds: str, symbols: Sequence[Any], src: str = "v_news_understanding") -> str:
     syms = clean_symbols(symbols)
     if not syms:
         raise ValueError("no symbol")
-    return "SELECT %s FROM `%s.v_news_understanding` WHERE symbol IN (%s)" % (
-        _NOW_COLS, ds, ", ".join("'%s'" % s for s in syms))
+    return "SELECT %s FROM `%s.%s` WHERE symbol IN (%s)" % (
+        _NOW_COLS, ds, src, ", ".join("'%s'" % s for s in syms))
 
 
-def sql_news_events(ds: str) -> str:
-    return ("SELECT %s FROM `%s.v_news_understanding` WHERE latest_event_date IS NOT NULL "
+def sql_news_events(ds: str, src: str = "v_news_understanding") -> str:
+    return ("SELECT %s FROM `%s.%s` WHERE latest_event_date IS NOT NULL "
             "AND state NOT IN ('routine news', 'quiet') "
             "ORDER BY latest_event_date DESC, ABS(IFNULL(reaction_z, day_z)) DESC, symbol LIMIT %d"
-            % (_NOW_COLS, ds, NEWS_NOW_EVENTS))
+            % (_NOW_COLS, ds, src, NEWS_NOW_EVENTS))
 
 
-def sql_news_state_record(ds: str) -> str:
+def sql_news_state_record(ds: str, src: str = "v_news_trend_learning") -> str:
     return ("SELECT period, state, trend_fit, horizon_sessions, events, days, edge_pp, right_pct, t_adj, reading "
-            "FROM `%s.v_news_trend_learning` WHERE trend_fit = 'all' AND horizon_sessions IN (%s)"
-            % (ds, ", ".join(str(h) for h in sorted(set(INTERIM_NIGHT_HORIZONS) | {NEWS_NOW_HORIZON}))))
+            "FROM `%s.%s` WHERE trend_fit = 'all' AND horizon_sessions IN (%s)"
+            % (ds, src, ", ".join(str(h) for h in sorted(set(INTERIM_NIGHT_HORIZONS) | {NEWS_NOW_HORIZON}))))
 
 
 def sql_news_now_learning(ds: str) -> str:
@@ -1531,9 +1536,13 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     board_rows = read_optional(session, project, location, sql_board_names(ds, today), query) or []
     board = clean_symbols(text(r.get("symbol")).upper() for r in board_rows)
     now_syms = clean_symbols([a for h in holdings for a in aliases(h["symbol"])] + [a for b in board for a in aliases(b)])
-    found_now = read_optional(session, project, location, sql_news_now(ds, now_syms), query) if now_syms else []
-    ev_rows = read_optional(session, project, location, sql_news_events(ds), query)
-    rec_rows = read_optional(session, project, location, sql_news_state_record(ds), query)
+    # v1.7.0 [SNAPSHOTS]: the snapshot when it is fresh, else the view
+    from scripts.bq_snapshots import source_for  # noqa: PLC0415
+    src_u = source_for("v_news_understanding", session, project, location, ds, query, note=_out)
+    src_l = source_for("v_news_trend_learning", session, project, location, ds, query, note=_out)
+    found_now = read_optional(session, project, location, sql_news_now(ds, now_syms, src_u), query) if now_syms else []
+    ev_rows = read_optional(session, project, location, sql_news_events(ds, src_u), query)
+    rec_rows = read_optional(session, project, location, sql_news_state_record(ds, src_l), query)
     records = state_records(rec_rows)
     interim = interim_rows(rec_rows, read_optional(session, project, location, sql_news_now_learning(ds), query))
     news_now = news_now_rows(holdings, board, found_now, records)

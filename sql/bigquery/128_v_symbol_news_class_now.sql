@@ -7,9 +7,12 @@
 -- morning after; this view classifies it within the hour, so scripts/news_now.py can read it against the price's
 -- answer so far today. tests/test_bq_views.py holds that this file is file 97 with only the name, the source table
 -- and the description changed - the rules can never drift apart.
+-- v1.29.0 (24 Nov 2026): the company names come from snap_universe_latest (scripts/bq_snapshots.py: v_universe_latest
+-- computed once after each collector) instead of recomputing v_universe_latest on every hourly read (about 0.24 GB
+-- a read); a name is the same until the next archive, and a snapshot older than a day still names the same company.
 -- Research only: no decision, gate or count reads this view. The live system never reads BigQuery.
 CREATE OR REPLACE VIEW `{{DS}}.v_symbol_news_class_now`
-OPTIONS (description = "TFB hourly company headlines (views 1.27.0) re-classified with the rules of v_symbol_news_class, unchanged: relevance, event type, direction, weight and score per symbol and article of the hourly news job. Research only: no decision, gate or count reads this view.")
+OPTIONS (description = "TFB hourly company headlines (views 1.29.0) re-classified with the rules of v_symbol_news_class, unchanged: relevance, event type, direction, weight and score per symbol and article of the hourly news job. Research only: no decision, gate or count reads this view.")
 AS
 WITH cfg AS (
   SELECT
@@ -85,7 +88,7 @@ base AS (
     REPLACE(IF(STRPOS(e.symbol, '.') > 0, REGEXP_EXTRACT(e.symbol, r'^(.*)\.[^.]+$'), e.symbol), '-UN', '.UN') AS tick,
     IF(STRPOS(e.symbol, '.') > 0, REGEXP_EXTRACT(e.symbol, r'\.([^.]+)$'), 'US') AS mk
   FROM e
-  LEFT JOIN `{{DS}}.v_universe_latest` AS u ON u.symbol = e.symbol
+  LEFT JOIN `{{DS}}.snap_universe_latest` AS u ON u.symbol = e.symbol
 ),
 keyed AS (
   SELECT b.*,
