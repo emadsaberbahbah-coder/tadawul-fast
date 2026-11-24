@@ -20,7 +20,9 @@ ROWS = {
     "v_confidence_calibration": [
         {"item": "SA | HIGH", "period": None, "reading": "inverted: HIGH below MEDIUM", "n": "449", "effect": "-2.93",
          "t": None},
-        {"item": "US | ALL", "period": None, "reading": None, "n": "1497", "effect": "1.21", "t": None}],
+        {"item": "US | ALL", "period": None, "reading": None, "n": "1497", "effect": "1.21", "t": None},
+        {"item": "SA | MEDIUM", "period": None, "reading": "inverted: HIGH below MEDIUM", "n": "171",
+         "effect": "2.19", "t": None}],
     "v_trial_c2": [
         {"item": "forward from 2026-11-20 | 1W | C2_MINUS_CHAMPION", "period": "forward from 2026-11-20",
          "reading": "collecting: 3 of 20 days, 12 of 40 calls", "n": "12", "effect": "0.4", "t": "0.6"},
@@ -159,8 +161,9 @@ def test_a_full_run(capsys):
     rc, book, query, bq = run()
     assert rc == 0
     out = capsys.readouterr().out
-    assert ("LEARNING WATCH: 7 row(s) in 4 record(s); PROVEN 1, AGAINST 2, collecting 1, neutral 1, in-sample 2; "
-            "5 new or changed since 2026-11-24; 1 record(s) not readable") in out
+    # v1.0.1: SA | MEDIUM carries the pair reading but is the better row - NEUTRAL, not AGAINST
+    assert ("LEARNING WATCH: 8 row(s) in 4 record(s); PROVEN 1, AGAINST 2, collecting 1, neutral 2, in-sample 2; "
+            "6 new or changed since 2026-11-24; 1 record(s) not readable") in out
     log = bq.loads[0]
     assert log["table"] == "learning_watch_log" and log["day"] == "2026-11-25" and log["disposition"] == "WRITE_TRUNCATE"
     by = {(r["view_name"], r["item"]): r for r in log["rows"]}
@@ -168,7 +171,7 @@ def test_a_full_run(capsys):
     assert by[("v_news_trend_learning", "forward from 2026-11-24 | good news, price agreed | all | 5")]["grp"] == "PROVEN"
     page = book.tabs["Learning_Watch"].values
     firsts = [str(r[0]) for r in page]
-    assert "OBSERVE ONLY" in page[1][0] and page[2][0].startswith("LEARNING WATCH: 7 row(s)")
+    assert "OBSERVE ONLY" in page[1][0] and page[2][0].startswith("LEARNING WATCH: 8 row(s)")
     assert "Not readable this run: v_driver_learning" in firsts
     i = firsts.index("1. CHANGED SINCE 2026-11-24")
     changed = page[i + 2:i + 4]
@@ -208,7 +211,7 @@ def test_dry_run_and_switch(monkeypatch):
 
 def test_source_and_workflow():
     src = Path(lw.__file__).read_text(encoding="utf-8")
-    assert src.isascii() and lw.__version__ == "1.0.0" and "v1.0.0 (2026-11-24)" in src
+    assert src.isascii() and lw.__version__ == "1.0.1" and "v1.0.1 (2026-11-24)" in src
     wf = yaml.safe_load(Path(".github/workflows/learning_watch.yml").read_text(encoding="utf-8"))
     on = wf[True] if True in wf else wf["on"]
     assert on["workflow_run"]["workflows"] == ["🎯 Exit Plan"] and "schedule" not in on
@@ -218,3 +221,11 @@ def test_source_and_workflow():
     env = [s for s in job["steps"] if s.get("name", "").startswith("🎓")][0]["env"]
     assert env["TFB_LEARNING_WATCH"] == "${{ vars.TFB_LEARNING_WATCH || 'on' }}" and "EODHD_API_KEY" not in env
     assert wf["permissions"] == {"contents": "read"}
+
+
+def test_pair_reading_and_counts():
+    """v1.0.1: the calibration's pair reading is AGAINST only on the HIGH row; a count has no sign."""
+    assert lw.group_of("v_confidence_calibration", "SA | HIGH", "inverted: HIGH below MEDIUM") == "AGAINST"
+    assert lw.group_of("v_confidence_calibration", "SA | MEDIUM", "inverted: HIGH below MEDIUM") == "NEUTRAL"
+    assert lw.group_of("v_signal_edge", "US | m | 1M", "inverse") == "AGAINST"            # other records unchanged
+    assert lw._count(230.0) == "230" and lw._count(None) == ""

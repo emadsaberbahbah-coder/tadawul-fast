@@ -4,6 +4,11 @@ scripts/learning_watch.py
 ================================================================================
 TFB Learning Watch - every learning record in BigQuery, read every day, in one place
 --------------------------------------------------------------------------------
+v1.0.1 (2026-11-24)
+  1.0.1: two fixes from the first live page (owner's workbook, 24 Nov 22:56 Riyadh). (a) v_confidence_calibration
+         reads the PAIR - 'inverted: HIGH below MEDIUM' stands on both rows of a market - so only the HIGH row is
+         AGAINST; the MEDIUM row is the better one and reads NEUTRAL (it showed SA | MEDIUM, +2.19 pts, as AGAINST).
+         (b) a sample size is a count, shown without a sign ('230', not '+230').
 v1.0.0 (2026-11-24)
   WHY: owner, 24 Nov 2026 13:07 Riyadh, in Arabic: how can BigQuery be used more, faster and more accurately - what do
        we need to develop? Item 1 of the answer: BigQuery holds 18 learning records open to pages (each signal, trial and gate
@@ -45,7 +50,7 @@ if _HERE not in sys.path:
 import archive_symbol_deep as asd  # noqa: E402 - same folder: the tested BigQuery loader
 import news_board as nb  # noqa: E402 - same folder: text helpers and the optional-view reader
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -109,6 +114,9 @@ GROUPS = ("PROVEN", "AGAINST", "COLLECTING", "NEUTRAL", "IN-SAMPLE")
 # records whose every row is in-sample by their own definition and that carry no period column (Codex P1 on #1074):
 # their readings describe history, never forward evidence
 IN_SAMPLE_VIEWS = frozenset({"v_driver_learning", "v_market_driver_learning"})
+# v1.0.1: a reading that judges a pair of rows names the one it is against: in v_confidence_calibration
+# 'inverted: HIGH below MEDIUM' is against the HIGH row; its MEDIUM row is the better one
+PAIR_READINGS = {"v_confidence_calibration": (re.compile(r"^inverted", re.I), re.compile(r"\|\s*HIGH$"))}
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 _IN_SAMPLE_PERIOD = re.compile(r"history|in-sample|backtest|before reading", re.I)
 # the fixed words, tried in this order (the first that matches decides)
@@ -147,6 +155,18 @@ def classify(reading: Any, period: Any = None) -> str:
     return "NEUTRAL"
 
 
+def group_of(view: str, item: str, reading: Any, period: Any = None) -> str:
+    """classify(), with the two per-record rules: an in-sample record is IN-SAMPLE; a pair reading is AGAINST only on
+    the row it names (v1.0.1)."""
+    if view in IN_SAMPLE_VIEWS:
+        return "IN-SAMPLE"
+    grp = classify(reading, period)
+    pair = PAIR_READINGS.get(view)
+    if grp == "AGAINST" and pair and pair[0].search(text(reading)) and not pair[1].search(item):
+        return "NEUTRAL"
+    return grp
+
+
 def sql_view(ds: str, entry: Tuple[str, str, Tuple[str, ...], str, str, str, Optional[str], str]) -> str:
     view, _, keys, reading, n, effect, t, where = entry
     key = "CONCAT(%s)" % ", ' | ', ".join("IFNULL(CAST(%s AS STRING), '-')" % k for k in keys)
@@ -178,7 +198,7 @@ def read_all(session: Any, project: str, location: str, ds: str, query: Any
             rows.append({"view_name": entry[0], "label": entry[1], "item": text(r.get("item")) or "-",
                          "reading": text(r.get("reading")) or None, "n": num(r.get("n")), "effect": num(r.get("effect")),
                          "t": num(r.get("t")),
-                         "grp": "IN-SAMPLE" if entry[0] in IN_SAMPLE_VIEWS else classify(r.get("reading"), r.get("period"))})
+                         "grp": group_of(entry[0], text(r.get("item")), r.get("reading"), r.get("period"))})
     return rows, missing
 
 
@@ -199,6 +219,11 @@ def changes(rows: Sequence[Dict[str, Any]], previous: Sequence[Dict[str, Any]]) 
 
 def _fmt(v: Optional[float], nd: int = 2) -> str:
     return "" if v is None else ("%+." + str(nd) + "f") % v
+
+
+def _count(v: Optional[float]) -> str:
+    """v1.0.1: a sample size is a count - no sign."""
+    return "" if v is None else "%d" % round(v)
 
 
 def tally(rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
@@ -236,7 +261,7 @@ def page_rows(rows: Sequence[Dict[str, Any]], changed: Sequence[Dict[str, Any]],
     if not changed:
         out.append(line("", "nothing new or changed" if prev_day else "the first day: tomorrow's run compares with today"))
     for r in changed:
-        out.append(line(r["label"], r["item"], r["grp"], r["reading"] or "", _fmt(r["n"], 0), _fmt(r["effect"]),
+        out.append(line(r["label"], r["item"], r["grp"], r["reading"] or "", _count(r["n"]), _fmt(r["effect"]),
                         _fmt(r["t"], 1), r["was"]))
     for no, grp, title in ((2, "PROVEN", "PROVEN - forward rows whose fixed reading says the signal works"),
                            (3, "AGAINST", "AGAINST - forward rows whose fixed reading says the signal works the "
@@ -246,7 +271,7 @@ def page_rows(rows: Sequence[Dict[str, Any]], changed: Sequence[Dict[str, Any]],
         if not sel:
             out.append(line("", "none"))
         for r in sorted(sel, key=lambda r: (r["view_name"], r["item"])):
-            out.append(line(r["label"], r["item"], r["grp"], r["reading"] or "", _fmt(r["n"], 0), _fmt(r["effect"]),
+            out.append(line(r["label"], r["item"], r["grp"], r["reading"] or "", _count(r["n"]), _fmt(r["effect"]),
                             _fmt(r["t"], 1)))
     out += [line(), line("4. EACH RECORD"), line("Record", "View", "Rows", *GROUPS)]
     for entry in REGISTRY:
