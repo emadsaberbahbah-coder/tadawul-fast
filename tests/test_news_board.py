@@ -205,6 +205,28 @@ PORTFOLIO = [["MY PORTFOLIO"], [], ["Symbol", "Name"], ["aaa.us", "Alpha Bank"],
              ["CCC.US", "Charlie Unknown"], ["AAA.US", "dup"], ["not a symbol", "x"], ["TOTAL", ""], ["DDD.US", ""]]
 
 
+# v1.5.0 [NEWS NOW]: the board's names, today's news reading and each state's record (apply_bq_views 1.25.0)
+BOARD_ROWS = [{"symbol": "EEE.US", "best": "1"}, {"symbol": "AAA.US", "best": "2"}, {"symbol": "1030.SR", "best": "3"},
+              {"symbol": "FFF.US", "best": "4"}]
+NOW_ROWS = [
+    {"symbol": "AAA.US", "name": "Alpha Bank", "event_day": "2026-11-20", "state": "big rise, no news", "expected": "-1",
+     "reaction_pp": "3.46", "reaction_z": "2.23", "day_pp": "3.53", "day_z": "3.22", "trend_now": "down",
+     "top_headline": None, "recommendation": "BUY", "agreement": "leans against TFB"},
+    {"symbol": "CCC.US", "name": "Charlie", "event_day": None, "state": "quiet", "expected": "0", "reaction_pp": None,
+     "reaction_z": None, "day_pp": "0.2", "day_z": "0.1", "trend_now": "up", "top_headline": None,
+     "recommendation": "HOLD", "agreement": "TFB holds, no lean"},
+    {"symbol": "EEE.US", "name": "Echo", "event_day": "2026-11-23", "state": "good news, price agreed", "expected": "1",
+     "reaction_pp": "4.1", "reaction_z": "1.6", "day_pp": "4.2", "day_z": "1.9", "trend_now": "up",
+     "top_headline": "Echo raises guidance", "recommendation": "BUY", "agreement": "agrees with TFB"}]
+EVENT_ROWS = [dict(NOW_ROWS[2]), dict(NOW_ROWS[0])]
+STATE_RECORD_ROWS = [
+    {"period": "forward from 2026-11-24", "state": "good news, price agreed", "trend_fit": "all", "horizon_sessions": "5",
+     "events": "24", "days": "11", "edge_pp": "0.61", "right_pct": "58.3", "t_adj": "1.1", "reading": "no clear edge"},
+    {"period": "history, rules fixed before reading it", "state": "big rise, no news", "trend_fit": "all",
+     "horizon_sessions": "5", "events": "80", "days": "40", "edge_pp": "0.95", "right_pct": "60", "t_adj": "0.7",
+     "reading": "no clear edge"}]
+
+
 def payload(rows):
     """Rows as the BigQuery REST API returns them (every value a string or null)."""
     names = list(rows[0]) if rows else []
@@ -224,13 +246,14 @@ class Session:
     """Answers each query of the board by the view it reads; records the SQL."""
 
     def __init__(self, trial=None, last_day="2026-11-18", fail=None, tilt=None, shadow=None, old_view=False,
-                 news_views=True, market_news=None, people=None, news_trial=None):
+                 news_views=True, market_news=None, people=None, news_trial=None, now_views=True):
         self.sql, self.trial, self.last_day, self.fail = [], TRIAL_ROWS if trial is None else trial, last_day, fail
         self.old_view = old_view                  # v1.3.0: v_company_news_eval as before apply_bq_views 1.17.0
         self.news_views = news_views              # v1.4.0: False = the views of apply_bq_views 1.20.0 not applied yet
         self.market_news = MARKET_NEWS_ROWS if market_news is None else market_news
         self.people = PEOPLE_ROWS if people is None else people
         self.news_trial = NEWS_TRIAL_ROWS if news_trial is None else news_trial
+        self.now_views = now_views                # v1.5.0: False = the views of apply_bq_views 1.25.0 not applied yet
         self.tilt, self.shadow = TILT_ROWS if tilt is None else tilt, SHADOW_ROWS if shadow is None else shadow
 
     def post(self, url, timeout=None, json=None):
@@ -257,6 +280,14 @@ class Session:
             if "mean_5d_peer_pp" not in sql:
                 return Resp(payload(EVAL_ROWS))
             return Resp({}, 400, UNKNOWN_COLUMN) if self.old_view else Resp(payload(PEER_ROWS))
+        if ".v_top10_board`" in sql:
+            return Resp(payload(BOARD_ROWS))
+        for view, rows in ((".v_news_understanding`", EVENT_ROWS if "LIMIT 8" in sql else NOW_ROWS),
+                           (".v_news_trend_learning`", STATE_RECORD_ROWS)):
+            if view in sql:
+                if not self.now_views:
+                    return Resp({}, 404, NOT_FOUND % view.strip(".`"))
+                return Resp(payload(rows))
         for view, rows in ((".v_market_news`", self.market_news), (".v_people_news`", self.people),
                            (".v_news_trial_summary`", self.news_trial)):
             if view in sql:
@@ -576,7 +607,7 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
     assert list(book.tabs) == ["My_Portfolio", "News_Board"] and book.tabs["News_Board"].updates == 1
     assert book.tabs["My_Portfolio"].updates == 0 and book.tabs["My_Portfolio"].ranges == ["A1:B200"]
-    assert len(sess.sql) == 12
+    assert len(sess.sql) == 16                                                   # v1.5.0: four reads for section 11
     assert "WHERE symbol IN ('AAA.US', 'BBB.PA', 'CCC.US', 'DDD.US')" in sess.sql[4]
     assert "v_symbol_news_class" in sess.sql[7] and "WHERE symbol IN ('AAA.US', 'BBB.PA', 'CCC.US', 'DDD.US')" in sess.sql[7]
     out = capsys.readouterr().out
@@ -586,19 +617,19 @@ def test_n6_a_full_run_writes_one_page(capsys):
     assert "2 holding(s)" in capsys.readouterr().out
     gold_book, gold_sess = Book({"My_Portfolio": Sheet([["Symbol"], ["GC=F"]])}), Session()   # nothing BigQuery can look up
     assert nb.run_once(True, book=gold_book, session=gold_sess, now=NOW, query=eb.bq_query) == 0
-    assert len(gold_sess.sql) == 10 and not any("v_symbol_sector" in q or "v_symbol_news_class" in q for q in gold_sess.sql)
+    assert len(gold_sess.sql) == 14 and not any("v_symbol_sector" in q or "v_symbol_news_class" in q for q in gold_sess.sql)
     assert "1 holding(s)" in capsys.readouterr().out
     page = book.tabs["News_Board"].values
     assert all(len(r) == nb.WIDTH for r in page) and len(page) >= 120
     cells = [str(c) for r in page for c in r]
     assert not any("None" in c or c.lower() in ("nan", "+nan", "-nan", "inf") for c in cells)
-    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.4.0 | SHADOW")
+    assert page[0][0].startswith("NEWS BOARD - ") and page[1][0].startswith("Built 2026-11-19 08:00 Riyadh | news_board 1.5.0 | SHADOW")
     assert "only the Today Action Plan gives orders" in page[1][0]
     heads = [r[0] for r in page if re.match(r"^(VERDICT|\d+\. )", str(r[0]))]
     assert [h.split(" - ")[0].split(" (")[0].split(" for ")[0] for h in heads] == [
         "VERDICT", "1. WORLD NEWS", "2. SECTOR TILT", "3. YOUR HOLDINGS AND THE TILT", "4. SHADOW LIST", "5. TRIAL",
         "6. EVENTS AHEAD", "7. COMPANY NEWS, RE-READ", "8. NEWS BY MARKET", "9. PEOPLE IN THE NEWS",
-        "10. NEWS SIGNALS ON TRIAL"]
+        "10. NEWS SIGNALS ON TRIAL", "11. NEWS AND TREND NOW"]
     assert heads[1] == ("1. WORLD NEWS - last full week (2026-11-09 to 2026-11-15) against its own previous four weeks; "
                         "news archive to 2026-11-18")
     assert heads[2] == "2. SECTOR TILT - in force 2026-11-17 to 2026-11-23, from the news of the week of 2026-11-09"
@@ -642,12 +673,12 @@ def test_n6_a_full_run_writes_one_page(capsys):
 def test_n6_dry_run_off_switch_and_failures_write_nothing(monkeypatch, capsys):
     book, sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session()
     assert nb.run_once(True, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert "News_Board" not in book.tabs and len(sess.sql) == 12
+    assert "News_Board" not in book.tabs and len(sess.sql) == 16
     assert "dry run:" in capsys.readouterr().out
     assert nb.main(["--dry-run"], book=book, session=Session(), now=NOW, query=eb.bq_query) == 0 and "News_Board" not in book.tabs
     for view in ("v_news_theme_weekly", "v_news_sector_tilt", "v_symbol_sector", "v_news_overlay_list", "v_trial_news_overlay",
                  "news_theme_daily", "v_symbol_news_class", "v_company_news_eval", "v_market_news", "v_people_news",
-                 "v_news_trial_summary"):
+                 "v_news_trial_summary", "v_top10_board", "v_news_understanding", "v_news_trend_learning"):
         old = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Sheet([["old page"]])})
         assert nb.run_once(False, book=old, session=Session(fail=view), now=NOW, query=eb.bq_query) == 2, view
         assert old.tabs["News_Board"].values == [["old page"]] and old.tabs["News_Board"].updates == 0
@@ -668,7 +699,7 @@ def test_n6_empty_and_stale_inputs_still_make_an_honest_page(capsys):
     book = Book({})                                                   # no portfolio page, no tilt, no list day, no trial
     sess = Session(trial=[], last_day=None, tilt=[], shadow=[])
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert len(sess.sql) == 10 and not any("v_symbol_sector" in s or "v_symbol_news_class" in s for s in sess.sql)  # nothing to look up
+    assert len(sess.sql) == 14 and not any("v_symbol_sector" in s or "v_symbol_news_class" in s for s in sess.sql)  # nothing to look up
     page = book.tabs["News_Board"].values
     flat = [r[0] for r in page] + [r[1] for r in page]
     for want in ("WARNING: the news archive could not be dated; treat the tilt below as unconfirmed.",
@@ -725,7 +756,7 @@ def test_n7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/news_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert '"%s"' % name in src, name
-    assert src.isascii() and nb.__version__ == "1.4.0" and "v1.4.0 (2026-11-21)" in src
+    assert src.isascii() and nb.__version__ == "1.5.0" and "v1.5.0 (2026-11-24)" in src
     assert '("news_board", "%s", "news board")' % nb.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert src.count("write_grid(") == 1 and "write_grid(book, TAB," in src and nb.TAB == "News_Board"
     assert "PORTFOLIO_TAB, \"A1:B200\")" in src and src.count("_raw_read(") == 1          # one read, of two columns
@@ -757,7 +788,7 @@ def test_n8_a_quota_answer_is_waited_out_and_other_write_errors_fail_the_run(mon
     book = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Flaky(1, Quota())})
     sess = Session()
     assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
-    assert waits == [65.0] and book.tabs["News_Board"].updates == 1 and len(sess.sql) == 12    # the queries are not repeated
+    assert waits == [65.0] and book.tabs["News_Board"].updates == 1 and len(sess.sql) == 16    # the queries are not repeated
     assert book.tabs["News_Board"].values[0][0].startswith("NEWS BOARD - ")
     assert "Sheets quota reached while writing News_Board" in capsys.readouterr().out
     waits.clear()
@@ -1057,13 +1088,13 @@ def test_n11_the_record_reads_the_peers_and_waits_for_the_view(capsys):
     firsts = [str(r[0]) for r in book.tabs["News_Board"].values]
     assert any(c.startswith("Record of the new classes (US names, the 5 sessions after the news day, against the same-day "
                             "average of the US names, about 490 of them): positive +0.69 pts on 52 day(s)") for c in firsts)
-    assert len(sess.sql) == 12 and "mean_5d_peer_pp" in sess.sql[8]
+    assert len(sess.sql) == 16 and "mean_5d_peer_pp" in sess.sql[8]
     capsys.readouterr()
     # the view before apply_bq_views 1.17.0: BigQuery does not know the peer columns - the 1.2.0 read, and the page says so
     old_book, old_sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session(old_view=True)
     assert nb.run_once(False, book=old_book, session=old_sess, now=NOW, query=eb.bq_query) == 0
     out = capsys.readouterr().out
-    assert len(old_sess.sql) == 13 and "mean_5d_peer_pp" in old_sess.sql[8] and "mean_5d_peer_pp" not in old_sess.sql[9]
+    assert len(old_sess.sql) == 17 and "mean_5d_peer_pp" in old_sess.sql[8] and "mean_5d_peer_pp" not in old_sess.sql[9]
     assert "the view has no peer columns yet (apply_bq_views 1.17.0 not applied); read against the S&P 500 only" in out
     firsts = [str(r[0]) for r in old_book.tabs["News_Board"].values]
     assert any(c.startswith("Record of the new classes (US names, the 5 sessions after the news day, against the S&P 500; "
@@ -1200,3 +1231,67 @@ def test_n12_the_page_shows_sections_8_to_10_and_waits_for_their_views(capsys):
     keep = Book({"My_Portfolio": Sheet(PORTFOLIO), "News_Board": Sheet([["old page"]])})
     assert nb.run_once(False, book=keep, session=Session(fail="v_people_news"), now=NOW, query=eb.bq_query) == 2
     assert keep.tabs["News_Board"].values == [["old page"]]
+
+
+# ----------------------------------------------------------------------------- N12 v1.5.0 news and trend now
+def test_n12_news_now_rows_and_section(capsys):
+    """Each holding (then each Top 10 name not held) TFB follows: its state, the price's answer, the trend, the lean,
+    TFB's view, the agreement and the state's FORWARD record; a US name not followed says so; others are skipped."""
+    book, sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session()
+    assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
+    now_sql = [q for q in sess.sql if "v_news_understanding" in q and "WHERE symbol IN" in q][0]
+    assert "WHERE symbol IN ('AAA', 'AAA.US', 'BBB.PA', 'CCC', 'CCC.US', 'DDD', 'DDD.US', 'EEE.US', 'EEE', '1030.SR', 'FFF.US', 'FFF')" \
+        in now_sql.replace("'AAA.US', 'AAA', ", "'AAA', 'AAA.US', ") or "'EEE.US'" in now_sql
+    board_sql = [q for q in sess.sql if "v_top10_board" in q][0]
+    assert "snapshot_date >= DATE '2026-11-16'" in board_sql or "snapshot_date >= DATE" in board_sql
+    page = book.tabs["News_Board"].values
+    firsts = [str(r[0]) for r in page]
+    i = next(k for k, c in enumerate(firsts) if c.startswith("11. NEWS AND TREND NOW"))
+    rows = page[i + 2:]
+    by = {}
+    for r in rows:                                                       # the first row per name: the holding or Top 10 row
+        if r and r[0]:
+            by.setdefault(str(r[0]).split(" - ")[0], r)
+    a = by["AAA.US"]
+    assert a[1] == "holding" and a[3] == "big rise, no news" and a[4] == "+3.46 pp (z +2.2) over 2 sessions"
+    assert a[6] == "down against SPY" and a[7] == "BUY" and a[8] == "LEANS AGAINST TFB"
+    assert a[9] == "no forward event matured yet"                       # the history row never counts as the record
+    c = by["CCC.US"]
+    assert c[1] == "holding" and c[6] == "no lean" and c[9] == ""        # a quiet name has no record to show
+    d = by["DDD.US"]
+    assert d[1] == "holding" and d[3] == "" and d[10].startswith("not in the followed set yet")
+    e = by["EEE.US"]
+    assert e[1] == "Top 10" and e[9] == "no clear edge | 24 event(s), 58% went the expected way, edge +0.61 pp"
+    f = by["FFF.US"]
+    assert f[1] == "Top 10" and f[10].startswith("not in the followed set yet")
+    assert not any(str(r[0]).startswith("BBB.PA") or str(r[0]).startswith("1030.SR") for r in rows[:8])
+    assert sum(1 for r in rows if str(r[0]).startswith("AAA.US")) == 2   # once as a holding, once among the events
+    j = next(k for k, c in enumerate(firsts) if c.startswith("Latest events across every name TFB follows"))
+    assert str(page[j + 2][0]).startswith("EEE.US") and page[j + 2][1] == "event"
+    assert any(c.startswith("How to read: the state joins the company news") for c in firsts)
+    verdict = [c for c in firsts if c.startswith("NEWS AND TREND NOW:")]
+    assert verdict == ["NEWS AND TREND NOW: 5 of your holdings and Top 10 names read; 2 with a lean for the next sessions, "
+                       "1 leaning against TFB's view; 2 event(s) across all followed names. No state is proven forward "
+                       "yet (evidence from 24 Nov 2026; first reading 8 Dec): read it as context, not as a signal."]
+    out = capsys.readouterr().out
+    assert "NEWS AND TREND NOW: 5 of your holdings" in out
+    for sym in ("AAA", "CCC", "DDD"):                                    # the public run log names no holding
+        assert sym not in out.replace("AAA.US', 'BBB.PA", ""), sym
+
+
+def test_n12_views_not_applied_yet_still_build_the_page(capsys):
+    book, sess = Book({"My_Portfolio": Sheet(PORTFOLIO)}), Session(now_views=False)
+    assert nb.run_once(False, book=book, session=sess, now=NOW, query=eb.bq_query) == 0
+    firsts = [str(r[0]) for r in book.tabs["News_Board"].values]
+    cells = [str(c) for r in book.tabs["News_Board"].values for c in r]
+    assert any("Section 11 is not set up yet" in c and "1.25.0" in c for c in cells)
+    assert any(c.startswith("NEWS AND TREND NOW: not set up yet") for c in firsts)
+
+
+def test_n12_proven_state_named_in_the_verdict():
+    recs = nb.state_records([dict(STATE_RECORD_ROWS[0], reading="works as expected")])
+    lines = nb.news_now_lines([], [], recs)
+    assert lines[0].endswith("States proven forward: good news, price agreed.")
+    assert nb.record_text(None) == "no forward event matured yet"
+    assert nb.answer_text({"day_pp": "-1.5", "day_z": "-0.4"}) == "-1.50 pp (z -0.4) on the day"
+    assert nb.answer_text({}) == ""

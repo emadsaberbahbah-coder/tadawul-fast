@@ -413,7 +413,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # read from the news views (analysis only).
     # 2026-11-21: v1.3.0 [PEERS] the company news record against the same-day US names; v1.4.0 [MARKETS / PEOPLE]
     # sections 8-10: the news by market and by person and every news signal on trial (apply_bq_views 1.20.0).
-    ("news_board", "1.4.0", "news board"),
+    # 2026-11-24 (pin only): 1.4.0 -> 1.5.0 ([NEWS NOW]: section 11, each holding and Top 10 name read with
+    # the trend from v_news_understanding, its state's forward record; observe only).
+    ("news_board", "1.5.0", "news board"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
