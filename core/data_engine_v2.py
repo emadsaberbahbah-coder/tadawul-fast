@@ -2,8 +2,51 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.162.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.163.0
 ================================================================================
+
+WHY v5.163.0 - TRUTH IN LABELS AND UNITS
+(TFB_LABEL_TRUTH = off | observe | enforce; UNSET -> observe: tags only, every
+value and verdict unchanged; off -> byte-identical to v5.162.0)
+- EVIDENCE (independent audit of 23 Nov 2026, findings 3, 6, 7 and 10, each
+  reproduced against main d05c6fc and the archive of 23 Nov):
+  * 6,856 of the 6,857 rows of Global_Markets and Market_Leaders show 365 days
+    / "1Y" while core.scoring used the one-month weights (no horizon on the
+    row -> Horizon.MONTH, its own label "3M", horizon_days_effective None);
+    _horizon_coherence_fill then fills 365 and the presentation layer derives
+    "1Y" from it.
+  * core.scoring._as_fraction("200%") = 0.02, the same as "2%": the explicit
+    percent is divided once by _safe_float and again by the points heuristic.
+  * "High leverage" tests debt_to_equity >= 100 while D/E is stored as a ratio
+    (median 0.47): 744 names with D/E 2 to 100 can never be flagged.
+  * float_shares lists sharesOutstanding among its aliases, so a provider
+    without a float publishes outstanding shares as the float.
+  * _dd_infer_dtype_fmt("country") types Country as a number ("count" inside
+    "country").
+- DESIGN (owner, 21 Nov 2026: everything starts in observe mode; 23 Nov: the
+  week plan, package 2; built on the morning of 24 Nov):
+  * horizon: _label_truth_horizon() at the end of _apply_page_row_backfill
+    reads the horizon the scorer used (horizon_days_effective, else its
+    horizon_label day / week / month / long -> 1D / 1W / 3M / 1Y and 1 / 6 /
+    90 / 365 days, the scorer's own labels). observe: tag
+    label_truth_horizon:<shown>d_vs_scored_<days>d:observe where the row's
+    days differ; enforce: horizon_days and invest_period_label take the scored
+    pair (horizon_days_effective too while blank) and the row is tagged
+    label_truth_horizon:<label>:enforce. Rescoring a stamped row reads 90 ->
+    Horizon.MONTH again, so the weights never change.
+  * percent: observe tags label_truth_percent:<field>:observe before scoring
+    wherever a field core.scoring reads with _as_fraction is an explicit
+    percent string of 150 % or more; enforce in core.scoring 5.11.5 keeps the
+    single division (TFB_LABEL_TRUTH=enforce read there).
+  * leverage: _build_top_factors_and_risks reads D/E as a ratio under enforce
+    (a value of 100 or more is percent points and is divided by 100; flagged at
+    2.0); observe tags label_truth_leverage:<would_flag|would_clear>:observe
+    where the two rules disagree.
+  * float: a float_shares value found only under sharesOutstanding is tagged
+    label_truth_float:outstanding:<mode>; enforce leaves float_shares blank.
+  * Data_Dictionary: enforce types country / countries as text.
+  Tags avoid every word the reliability penalty reads. surface_gate_states()
+  gains "label_truth".
 
 WHY v5.162.0 - INVEST ONLY ON AFFIRMATIVE EVIDENCE; RELIABILITY PENALTIES READ
 ONE WARNING TAG AT A TIME
@@ -4604,7 +4647,7 @@ from core.financial_units import (
 #   TFB_MARKET_GATE / TFB_SELECTION_GATE default off = byte-identical.
 #   Tests: tests/test_de_market_and_selection_gate.py,
 #   tests/test_market_condition.py.
-__version__ = "5.162.0"
+__version__ = "5.163.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -6592,6 +6635,7 @@ def surface_gate_states() -> Dict[str, Any]:
             "selection_max_risk": _selection_max_risk(),               # v5.161.0
             "gate_evidence": _gate_evidence_mode(),                    # v5.162.0
             "rel_tags_exact": _rel_tags_exact_enabled(),               # v5.162.0
+            "label_truth": _label_truth_mode(),                        # v5.163.0
         }
     except Exception:
         return {}
@@ -7799,6 +7843,107 @@ def _gate_evidence_mode() -> str:
     return "observe"
 
 
+def _label_truth_mode() -> str:
+    """v5.163.0: TFB_LABEL_TRUTH. Unset or blank -> observe; off/0/false/no ->
+    off; enforce/on/1/true/yes -> enforce; any other word -> observe."""
+    raw = (os.getenv("TFB_LABEL_TRUTH") or "").strip().lower()
+    if raw in {"off", "0", "false", "no", "disabled"}:
+        return "off"
+    if raw in {"enforce", "on", "1", "true", "yes"}:
+        return "enforce"
+    return "observe"
+
+
+# v5.163.0: the fields core.scoring reads through _as_fraction
+_LT_PERCENT_FIELDS: Tuple[str, ...] = (
+    "roe", "return_on_equity", "returnOnEquity", "roa", "return_on_assets", "returnOnAssets",
+    "revenue_growth_yoy", "revenue_growth", "growth_yoy", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "volatility_30d", "vol_30d", "max_drawdown_30d", "drawdown_30d",
+)
+
+
+def _label_truth_percent_tags(row: Dict[str, Any]) -> None:
+    """v5.163.0: before scoring, tag each explicit percent string of 150 % or
+    more that core.scoring's _as_fraction would divide twice. off -> no-op."""
+    mode = _label_truth_mode()
+    if mode == "off" or not isinstance(row, dict):
+        return
+    for key in _LT_PERCENT_FIELDS:
+        try:
+            val = row.get(key)
+            if not isinstance(val, str) or not val.strip().endswith("%"):
+                continue
+            num = float(val.strip()[:-1].strip().replace(",", ""))
+            if math.isfinite(num) and abs(num) >= 150.0:
+                _v573_append_warning(row, "label_truth_percent:%s:%s" % (key, mode))
+        except Exception:
+            continue
+
+
+# v5.163.0: core.scoring's own label and days for each horizon it scores with
+_LT_SCORED_LABEL: Dict[str, str] = {"day": "1D", "week": "1W", "month": "3M", "long": "1Y"}
+
+
+def _label_truth_scored_horizon(row: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """v5.163.0: (label, days) of the horizon the scorer used, or None when the
+    row was not scored. horizon_days_effective wins (the scorer read those
+    days); else the scorer's horizon_label maps to its own label."""
+    try:
+        hde = _as_float(row.get("horizon_days_effective"))
+        if hde is not None and hde > 0:
+            days = int(abs(hde))
+            return _hzc_label_for_days(days), days
+        label = _LT_SCORED_LABEL.get(_safe_str(row.get("horizon_label")).strip().lower())
+        if label is None:
+            return None
+        return label, _HZC_LABEL_TO_DAYS[label]
+    except Exception:
+        return None
+
+
+def _label_truth_horizon(out: Dict[str, Any]) -> None:
+    """v5.163.0: the row shows the horizon it was scored on. off -> no-op;
+    observe -> tag where the shown days differ; enforce -> stamp the scored
+    pair. Fail-soft."""
+    mode = _label_truth_mode()
+    if mode == "off" or not isinstance(out, dict):
+        return
+    try:
+        scored = _label_truth_scored_horizon(out)
+        if scored is None:
+            return
+        label, days = scored
+        shown = _as_float(out.get("horizon_days"))
+        if shown is not None and int(shown) == days:
+            return
+        if mode == "enforce":
+            out["horizon_days"] = days
+            out["invest_period_label"] = label
+            if out.get("horizon_days_effective") in (None, ""):
+                out["horizon_days_effective"] = days
+            _v573_append_warning(out, "label_truth_horizon:%s:enforce" % label)
+        else:
+            shown_txt = str(int(shown)) if shown is not None else "blank"
+            _v573_append_warning(out, "label_truth_horizon:%sd_vs_scored_%dd:observe" % (shown_txt, days))
+    except Exception:
+        pass
+
+
+def _label_truth_high_leverage(de: Optional[float], mode: str) -> Tuple[bool, str]:
+    """v5.163.0: (flag, observe tag or ''). Legacy: D/E >= 100. Enforce: D/E as
+    a ratio (100 or more is percent points, divided by 100), flagged at 2.0."""
+    legacy = de is not None and de >= 100
+    if mode == "off" or de is None:
+        return legacy, ""
+    ratio = de / 100.0 if de >= 100 else de
+    fixed = ratio >= 2.0
+    if mode == "enforce":
+        return fixed, ""
+    if fixed != legacy:
+        return legacy, "label_truth_leverage:%s:observe" % ("would_flag" if fixed else "would_clear")
+    return legacy, ""
+
+
 def _gate_evidence_check(row: Dict[str, Any], rec: str) -> List[str]:
     """v5.162.0: the evidence an INVEST verdict must stand on. Returns the
     missing items as short codes (lower case, chosen so no code contains a word
@@ -8096,6 +8241,10 @@ def _dd_infer_dtype_fmt(key: str, header: str) -> Tuple[str, str]:
     ' de' / bare 'forecast'); all corrected here."""
     k = (key or "").lower()
     kh = (k + " " + (header or "")).lower()
+    # v5.163.0: TFB_LABEL_TRUTH=enforce - "count" inside "country" is not a
+    # count; off/observe keep the legacy typing (nothing to tag on this page).
+    if _label_truth_mode() == "enforce":
+        kh = re.sub(r"countr(y|ies)", "nation", kh)
     if any(t in kh for t in ("timestamp", "datetime", "updated", "date", "time", "_at")):
         return "datetime", "yyyy-mm-dd hh:mm"
     if k.startswith("is_") or k.endswith("_flag") or k == "provider_engine_conflict":
@@ -9643,8 +9792,13 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     elif rsi is not None and rsi < 25:
         risks.append("Oversold (RSI)")
     de = _as_float(row.get("debt_to_equity"))
-    if de is not None and de >= 100:
+    # v5.163.0: TFB_LABEL_TRUTH - D/E is stored as a ratio; off/observe keep
+    # the legacy >= 100 test (observe tags where the ratio rule disagrees).
+    _lt_lev, _lt_tag = _label_truth_high_leverage(de, _label_truth_mode())
+    if _lt_lev:
         risks.append("High leverage")
+    if _lt_tag:
+        _v573_append_warning(row, _lt_tag)
     pe = _as_float(row.get("pe_ttm"))
     if pe is not None and pe >= 50:
         risks.append("Expensive valuation")
@@ -12982,6 +13136,7 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
             # off or a settlement iterate -> False, nothing is marked.
             _conf_derives = (not row.get("_f7_settlement_active")
                              and _f7_settle_mode() != "off" and _f7_conf_scorer_derives(row))
+            _label_truth_percent_tags(row)   # v5.163.0: off -> no-op
             patch = _scoring_compute_scores(row)
             if isinstance(patch, Mapping) and patch:
                 _f7_reject_scoring_patch_failures(row, patch)
@@ -16175,6 +16330,9 @@ def _extract_symbols_from_rows(rows: Sequence[Dict[str, Any]], limit: int = 5000
 _NULL_STRINGS: Set[str] = {"", "null", "none", "n/a", "na", "nan", "-", "--"}
 
 
+# v5.163.0: the float_shares aliases that are outstanding shares, not the float
+_LT_FLOAT_OUTSTANDING: frozenset = frozenset({"sharesOutstanding", "SharesOutstanding"})
+
 _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "symbol": ("symbol", "ticker", "code", "requested_symbol", "regularMarketSymbol"),
     "name": ("name", "shortName", "longName", "displayName", "companyName", "fundName", "description"),
@@ -17079,10 +17237,18 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         "symbol_normalized": symbol or requested_symbol,
         "requested_symbol": requested_symbol or symbol,
     }
+    _lt_mode = _label_truth_mode()   # v5.163.0
     for field, aliases in _CANONICAL_FIELD_ALIASES.items():
         for alias in (field,) + tuple(aliases):
             val = _lookup_alias_value(src, flat, alias)
             if not _is_blank_value(val):
+                # v5.163.0: outstanding shares are not the float; off ->
+                # the legacy alias, observe -> the legacy value and a tag,
+                # enforce -> float_shares stays blank.
+                if field == "float_shares" and alias in _LT_FLOAT_OUTSTANDING and _lt_mode != "off":
+                    _v573_append_warning(out, "label_truth_float:outstanding:%s" % _lt_mode)
+                    if _lt_mode == "enforce":
+                        break
                 out[field] = _json_safe(_to_scalar(val))
                 break
 
@@ -17515,6 +17681,8 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             inferred_name = _infer_display_name_from_symbol(sym)
             if inferred_name and (_safe_str(out.get("name")) in ("", sym)):
                 out["name"] = inferred_name
+
+    _label_truth_horizon(out)   # v5.163.0: off -> no-op
 
     return out
 
