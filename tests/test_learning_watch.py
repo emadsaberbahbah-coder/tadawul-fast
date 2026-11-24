@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -102,6 +103,21 @@ def test_every_registry_column_exists_in_its_view_file():
         for col in list(keys) + [reading, n, effect] + ([t] if t else []) + re.findall(r"^(\w+) =", where):
             assert re.search(r"\b%s\b" % col, src), (view, col)
     assert len(lw.REGISTRY) == 19 and len({e[0] for e in lw.REGISTRY}) == 19
+    # Codex P1 on #1074: a record that defines every row as in-sample is never read as evidence
+    declared = {view for view, *_ in lw.REGISTRY
+                if "every row is in-sample" in list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8").lower()}
+    assert declared == lw.IN_SAMPLE_VIEWS == {"v_driver_learning", "v_market_driver_learning"}
+
+
+def test_in_sample_records_never_prove(monkeypatch):
+    rows = {"v_driver_learning": [{"item": "momentum", "period": None, "reading": "higher is better", "n": "40",
+                                   "effect": "0.05", "t": "2.4"}],
+            "v_market_driver_learning": [{"item": "VIX | low", "period": None, "reading": "weaker than usual",
+                                          "n": "200", "effect": "-0.4", "t": None}]}
+    monkeypatch.setattr(sys.modules[__name__], "ROWS", rows)
+    got, missing = lw.read_all(object(), "p", "US", "p.d", Query(missing=()))
+    assert {(r["view_name"], r["grp"]) for r in got} == {("v_driver_learning", "IN-SAMPLE"),
+                                                         ("v_market_driver_learning", "IN-SAMPLE")}
 
 
 @pytest.mark.parametrize("reading,grp", [

@@ -16,7 +16,8 @@ v1.0.0 (2026-11-24)
     2. each row's reading is put in one of five groups by fixed words (classify): PROVEN (works / holds / beats /
        better / edge / ahead), AGAINST (opposite / inverted / worse / fails / inverse / loses / not ahead), COLLECTING
        (collecting / too few / thin / no edge yet), NEUTRAL (no clear edge, no edge, not proven, in order ...), and
-       IN-SAMPLE (a history or backtest row, a backtest 'candidate', or a reading that says so: never evidence);
+       IN-SAMPLE (a history or backtest row, a backtest 'candidate', a reading that says so, or any row of a record
+       that defines every row as in-sample - IN_SAMPLE_VIEWS: never evidence);
     3. the rows go to learning_watch_log (one partition per Riyadh day, replaced by a rerun the same day), and are
        compared with the latest earlier day: a row whose group changed is listed first;
     4. one page, Learning_Watch: the counts, what changed since the last day, every forward PROVEN and AGAINST row,
@@ -105,6 +106,9 @@ REGISTRY: List[Tuple[str, str, Tuple[str, ...], str, str, str, Optional[str], st
      "t_adj", ""),
 ]
 GROUPS = ("PROVEN", "AGAINST", "COLLECTING", "NEUTRAL", "IN-SAMPLE")
+# records whose every row is in-sample by their own definition and that carry no period column (Codex P1 on #1074):
+# their readings describe history, never forward evidence
+IN_SAMPLE_VIEWS = frozenset({"v_driver_learning", "v_market_driver_learning"})
 _ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 _IN_SAMPLE_PERIOD = re.compile(r"history|in-sample|backtest|before reading", re.I)
 # the fixed words, tried in this order (the first that matches decides)
@@ -173,7 +177,8 @@ def read_all(session: Any, project: str, location: str, ds: str, query: Any
         for r in got:
             rows.append({"view_name": entry[0], "label": entry[1], "item": text(r.get("item")) or "-",
                          "reading": text(r.get("reading")) or None, "n": num(r.get("n")), "effect": num(r.get("effect")),
-                         "t": num(r.get("t")), "grp": classify(r.get("reading"), r.get("period"))})
+                         "t": num(r.get("t")),
+                         "grp": "IN-SAMPLE" if entry[0] in IN_SAMPLE_VIEWS else classify(r.get("reading"), r.get("period"))})
     return rows, missing
 
 
