@@ -4,7 +4,16 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.5.0 (2026-11-24)
+v1.6.0 (2026-11-24)
+  1.6.0: [INTERIM] section 12, THE NEWS RECORD SO FAR, observe only. Owner, 24 Nov 2026 12:17 Riyadh: "ok let's start
+         the next stage" - the interim daily reading of the news record, so its progress is in front of the owner
+         every day, not only on 8 Dec. Two records, each per state and horizon, with its fixed reading and how far it
+         is from being read: the nightly news-and-trend states (v_news_trend_learning, forward from 24 Nov 2026,
+         1 and 5 sessions; read in the same query as section 11's records, which now asks for both horizons) and
+         the hourly News Now reading (v_news_now_learning, apply_bq_views 1.28.0: the rest of the session, 1 and 5
+         sessions). A record is 'collecting' under 20 events or under max(10, 2 x horizon) dates; the section says
+         how many of each it holds. One line under the verdict, in counts. Until the hourly view is in BigQuery the
+         section says so and the page is built all the same.
   1.5.0: [NEWS NOW] section 11, NEWS AND TREND NOW, observe only. Owner, 24 Nov 2026 10:10 Riyadh, in Arabic: the
          goal is for the news analysis to have an immediate effect on the reading of a stock's price now, through
          gathering, comparing and forecasting - not results on 8 December; 10:20: "if something is missing that we
@@ -124,7 +133,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -189,6 +198,9 @@ SIGNAL_READING_TEXT = {"favourable": "favourable", "neutral": "neutral", "unfavo
 NEWS_NOW_BOARD_DAYS = 3                                 # Top 10 names seated in the last 3 days
 NEWS_NOW_EVENTS = 8                                     # the latest events across every followed name
 NEWS_NOW_HORIZON = 5                                    # the state's record shown over 5 sessions
+INTERIM_NIGHT_HORIZONS = (1, 5)                         # v1.6.0: the nightly record's horizons in section 12
+INTERIM_MIN_EVENTS = 20                                 # the views' own 'collecting' rule: 20 events and
+HORIZON_TEXT = {0: "rest of the session", 1: "1 session", 5: "5 sessions"}   # max(10, 2 x h) dates
 NEWS_NOW_FORWARD = "forward from 2026-11-24"            # v_news_trend_learning's evidence period
 EXPECTED_TEXT = {1: "up against SPY", -1: "down against SPY", 0: "no lean"}
 AGREEMENT_TEXT = {"agrees with TFB": "agrees with TFB", "leans against TFB": "LEANS AGAINST TFB"}
@@ -843,6 +855,83 @@ def news_now_lines(rows: Optional[Sequence[Dict[str, Any]]], events: Optional[Se
                 "context, not as a signal.")]
 
 
+def _interim_row(source: str, r: Dict[str, Any]) -> Dict[str, Any]:
+    h = _int(r.get("horizon_sessions")) or 0
+    ev, days = _int(r.get("events")) or 0, _int(r.get("days")) or 0
+    need = max(10, 2 * h)
+    reading = text(r.get("reading")) or "not read"
+    right, edge, t = num(r.get("right_pct")), num(r.get("edge_pp")), num(r.get("t_adj"))
+    return {"source": source, "state": text(r.get("state")), "h": h,
+            "horizon": HORIZON_TEXT.get(h, "%d sessions" % h), "events": ev, "days": days,
+            "right": "%.0f%%" % right if right is not None else "",
+            "edge": "%s pp" % fmt(edge, 2, True) if edge is not None else "",
+            "t": fmt(t, 1, True) if t is not None else "", "reading": reading,
+            "progress": ("%d of %d events, %d of %d dates" % (min(ev, INTERIM_MIN_EVENTS), INTERIM_MIN_EVENTS,
+                                                             min(days, need), need)) if reading == "collecting" else ""}
+
+
+def interim_rows(night: Optional[Sequence[Dict[str, Any]]], hourly: Optional[Sequence[Dict[str, Any]]]
+                 ) -> Dict[str, Optional[List[Dict[str, Any]]]]:
+    """v1.6.0: section 12 - the forward rows of the nightly record (trend fit 'all', the states with an expected move,
+    1 and 5 sessions) and every row of the hourly record; None for a record whose view is not in BigQuery yet."""
+    def key(r: Dict[str, Any]) -> Tuple[int, int, str]:
+        return (0 if r["state"] == "all with a lean" else 1, r["h"], r["state"])
+    n = None if night is None else sorted(
+        (_interim_row("nightly", r) for r in night
+         if text(r.get("period")) == NEWS_NOW_FORWARD and text(r.get("trend_fit")) == "all"
+         and _int(r.get("horizon_sessions")) in INTERIM_NIGHT_HORIZONS
+         and text(r.get("state")) not in ("quiet", "routine news", "quiet lately")), key=key)
+    h = None if hourly is None else sorted((_interim_row("hourly", r) for r in hourly), key=key)
+    return {"nightly": n, "hourly": h}
+
+
+def interim_line(rec: Dict[str, Optional[List[Dict[str, Any]]]]) -> str:
+    """The line under the verdict, counts only."""
+    parts = []
+    for src, label in (("nightly", "nightly news-and-trend record"), ("hourly", "hourly News Now record")):
+        rows = rec.get(src)
+        if rows is None:
+            parts.append("%s: not set up yet" % label)
+            continue
+        proven = sorted({r["state"] for r in rows if r["reading"] == "works as expected"})
+        against = sorted({r["state"] for r in rows if r["reading"] == "opposite of expected"})
+        parts.append("%s: %d event(s) scored in %d state-horizon(s), %s%s" % (
+            label, sum(r["events"] for r in rows), len(rows),
+            ("proven: " + ", ".join(proven)) if proven else "none proven yet",
+            ("; opposite of expected: " + ", ".join(against)) if against else ""))
+    return "THE NEWS RECORD SO FAR (forward from 24 Nov 2026; first full reading 8 Dec): " + "; ".join(parts) + "."
+
+
+def interim_section_rows(data: Dict[str, Any], pad: Any) -> List[List[Any]]:
+    """v1.6.0: section 12."""
+    head = ["Record", "State", "Horizon", "Events", "Dates", "Went the expected way", "Edge vs SPY", "t",
+            "Reading", "Still to collect"]
+    out = [pad([]),
+           pad(["12. THE NEWS RECORD SO FAR - did each news state move the stock against SPY the way research "
+                "expected? Forward from 24 Nov 2026 only; a state is read once it holds 20 events over at least "
+                "max(10, 2 x horizon) dates, and switches nothing on before the owner's review."]),
+           pad(head)]
+    rec = data.get("interim") or {}
+    for src, label in (("nightly", "Nightly news and trend (v_news_trend_learning)"),
+                       ("hourly", "Hourly News Now (v_news_now_learning)")):
+        rows = rec.get(src)
+        if rows is None:
+            out.append(pad([label, "not set up yet: its BigQuery view is applied after the owner merges the change"]))
+        elif not rows:
+            out.append(pad([label, "no forward event has its outcome yet: the 1-session outcomes arrive the morning "
+                                   "after the next session closes, the 5-session ones a week later"]))
+        for r in rows or []:
+            out.append(pad([label, r["state"], r["horizon"], r["events"], r["days"], r["right"], r["edge"], r["t"],
+                            r["reading"].upper() if r["reading"] in ("works as expected", "opposite of expected")
+                            else r["reading"], r["progress"]]))
+    out.append(pad(["How to read: the edge is the mean return against SPY in the direction the state expected (above "
+                    "0 = it went that way); t is over distinct dates, each date's events averaged first. 'Works as "
+                    "expected' needs t of 2 or more. The nightly record starts from the close after the news; the "
+                    "hourly one from the first hourly reading of the session, for the rest of the session and then "
+                    "from its close. Observe only: no order comes from this section."]))
+    return out
+
+
 def news_now_section_rows(data: Dict[str, Any], pad: Any) -> List[List[Any]]:
     """v1.5.0: section 11."""
     head = ["Name", "Listed as", "Event day", "State", "Price answer vs SPY", "Trend", "Research expects",
@@ -1170,6 +1259,7 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
             pad([])]
     out += news_section_rows(data, pad)
     out += news_now_section_rows(data, pad)         # v1.5.0 [NEWS NOW]
+    out += interim_section_rows(data, pad)          # v1.6.0 [INTERIM]
     out += [pad([]),
             pad(["How to read: a theme is the share of the week's news on that subject, per 1,000 (the Iran, Russia and "
                  "US-China lines count events; the rest count news documents); a tone is an index where higher is more "
@@ -1393,8 +1483,14 @@ def sql_news_events(ds: str) -> str:
 
 def sql_news_state_record(ds: str) -> str:
     return ("SELECT period, state, trend_fit, horizon_sessions, events, days, edge_pp, right_pct, t_adj, reading "
-            "FROM `%s.v_news_trend_learning` WHERE trend_fit = 'all' AND horizon_sessions = %d"
-            % (ds, NEWS_NOW_HORIZON))
+            "FROM `%s.v_news_trend_learning` WHERE trend_fit = 'all' AND horizon_sessions IN (%s)"
+            % (ds, ", ".join(str(h) for h in sorted(set(INTERIM_NIGHT_HORIZONS) | {NEWS_NOW_HORIZON}))))
+
+
+def sql_news_now_learning(ds: str) -> str:
+    """v1.6.0: the hourly reading's record (apply_bq_views 1.28.0)."""
+    return ("SELECT state, horizon_sessions, events, symbols, days, edge_pp, right_pct, t_adj, reading "
+            "FROM `%s.v_news_now_learning`" % ds)
 
 
 def read_company_eval(session: Any, project: str, location: str, ds: str, query: Any) -> List[Dict[str, Any]]:
@@ -1437,13 +1533,16 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     now_syms = clean_symbols([a for h in holdings for a in aliases(h["symbol"])] + [a for b in board for a in aliases(b)])
     found_now = read_optional(session, project, location, sql_news_now(ds, now_syms), query) if now_syms else []
     ev_rows = read_optional(session, project, location, sql_news_events(ds), query)
-    records = state_records(read_optional(session, project, location, sql_news_state_record(ds), query))
+    rec_rows = read_optional(session, project, location, sql_news_state_record(ds), query)
+    records = state_records(rec_rows)
+    interim = interim_rows(rec_rows, read_optional(session, project, location, sql_news_now_learning(ds), query))
     news_now = news_now_rows(holdings, board, found_now, records)
     news_events = None if ev_rows is None else [news_now_row(r, "event", records) for r in ev_rows]
     market_day, markets = market_news_rows(mnews)
     people_day, people = people_rows(pnews)
     return {"news_now": news_now, "news_events": news_events,
-            "news_now_lines": news_now_lines(news_now, news_events, records),
+            "news_now_lines": news_now_lines(news_now, news_events, records) + [interim_line(interim)],
+            "interim": interim,
             "market_day": market_day, "markets": None if mnews is None else markets,
             "people_day": people_day, "people": None if pnews is None else people,
             "news_trial": None if ntrial is None else news_trial_rows(ntrial),

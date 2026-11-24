@@ -2,8 +2,18 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.27.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.28.0 (program register C8, Phase 2)
 ================================================================================
+v1.28.0 (24 Nov 2026, the hourly news reading scored). WHY (owner, 24 Nov
+2026 12:17 Riyadh: "ok let's start the next stage" - the interim daily
+reading of the news record). Two new views, research only:
+v_news_now_eval (129) - per US symbol and session, the FIRST News Now reading
+with refreshed news and an expected move, then the stock against SPY for the
+rest of that session, the next session and the next five (every outcome
+starts at or after the reading); v_news_now_learning (130) - that record per
+state and horizon with the measure and the fixed reading of
+v_news_trend_learning. No file of 1.27.0 changes.
+
 v1.27.0 (24 Nov 2026, the hourly news reading). WHY (owner, 24 Nov 2026
 10:10 Riyadh, in Arabic: the news analysis should act on the reading of a
 stock's price now, through gathering, comparing and forecasting - not only in
@@ -600,7 +610,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.27.0"
+__version__ = "1.28.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
