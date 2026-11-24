@@ -102,7 +102,7 @@ def test_every_registry_column_exists_in_its_view_file():
         src = f[0].read_text(encoding="utf-8")
         for col in list(keys) + [reading, n, effect] + ([t] if t else []) + re.findall(r"^(\w+) =", where):
             assert re.search(r"\b%s\b" % col, src), (view, col)
-    assert len(lw.REGISTRY) == 19 and len({e[0] for e in lw.REGISTRY}) == 19
+    assert len(lw.REGISTRY) == 18 and len({e[0] for e in lw.REGISTRY}) == 18
     # Codex P1 on #1074: a record that defines every row as in-sample is never read as evidence
     declared = {view for view, *_ in lw.REGISTRY
                 if "every row is in-sample" in list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8").lower()}

@@ -5,14 +5,14 @@ what do we need to develop? This is item 1 of the answer.
 
 ## Why
 
-BigQuery holds 19 learning records: every signal, trial and gate is scored against the market with a fixed
+BigQuery holds 18 learning records open to pages (the shadow score trial is left out: no page-building script may read it while it is in shadow mode): every signal, trial and gate is scored against the market with a fixed
 reading. None is seen until someone opens it, so a reading that turns "works" or "opposite" waits for a manual review.
 
 ## What changes
 
 | File | Version | Change |
 |---|---|---|
-| `scripts/learning_watch.py` | new, 1.0.0 | Reads the 19 views and stores the day's readings; writes the Learning_Watch tab |
+| `scripts/learning_watch.py` | new, 1.0.0 | Reads the 18 views and stores the day's readings; writes the Learning_Watch tab |
 | `.github/workflows/learning_watch.yml` | new, 1.0.0 | Chained to the hourly Exit Plan at UTC 9 (12:35 Riyadh); no cron |
 | `scripts/verify_deployment.py` | pin | learning_watch 1.0.0 |
 | `.github/workflows/ci.yml` | 1.1.101 | `tests/test_learning_watch.py` after `tests/test_news_now.py` |
@@ -31,7 +31,7 @@ reading. None is seen until someone opens it, so a reading that turns "works" or
    | NEUTRAL | no clear edge, not proven, in order, and so on |
    | IN-SAMPLE | history, backtest or "candidate" rows; never evidence |
 
-   Every reading word the 19 views can produce is tested.
+   Every reading word the 18 views can produce is tested.
 3. **Store and compare.** The day's rows go to `learning_watch_log` (one partition per Riyadh day; a rerun replaces it)
    and are compared with the last earlier day.
 4. **Write the page.** One page, Learning_Watch:
@@ -48,7 +48,7 @@ reading. None is seen until someone opens it, so a reading that turns "works" or
 
 ## Cost
 
-19 view reads a day, roughly 4-8 GB in all (several views cost 0.2-0.5 GB each). That is about 3% of the monthly
+18 view reads a day, roughly 4-8 GB in all (several views cost 0.2-0.5 GB each). That is about 3% of the monthly
 free tier per day.
 
 ## After merge (my side)

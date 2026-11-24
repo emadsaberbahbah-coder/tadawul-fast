@@ -6,9 +6,11 @@ TFB Learning Watch - every learning record in BigQuery, read every day, in one p
 --------------------------------------------------------------------------------
 v1.0.0 (2026-11-24)
   WHY: owner, 24 Nov 2026 13:07 Riyadh, in Arabic: how can BigQuery be used more, faster and more accurately - what do
-       we need to develop? Item 1 of the answer: BigQuery holds 19 learning records (each signal, trial and gate
+       we need to develop? Item 1 of the answer: BigQuery holds 18 learning records open to pages (each signal, trial and gate
        scored against the market with a fixed reading), and none is seen until someone opens it. A reading that turns
        'works' or 'opposite' waits for a manual review. This job reads them all every day.
+  NOT READ: the shadow score trial - while it is in shadow mode no page-building script may name it (its own test
+  holds that); its reading stays where it is.
   WHAT, each run (chained to the hourly Exit Plan at the UTC hours of TFB_LEARNING_WATCH_CHAIN_HOURS, default 9 =
   12:35 Riyadh, after the night's collectors; or dispatched):
     1. each view of REGISTRY is read with one SELECT of its key columns, its reading, its sample size, its effect and
@@ -77,8 +79,6 @@ REGISTRY: List[Tuple[str, str, Tuple[str, ...], str, str, str, Optional[str], st
      "t_stat", ""),
     ("v_trial_c2", "Trial C-2 against the champion", ("period", "horizon", "arm"), "reading", "calls", "edge_pp",
      "t_adj", ""),
-    ("v_trial_shadow_v2", "Shadow score v2 against the current score", ("period", "market_group", "horizon"),
-     "reading", "days", "ic_diff", "t_adj", ""),
     ("v_trial_news_overlay", "News overlay against the list", ("period", "arm", "horizon", "line"), "reading", "names",
      "edge_pp", "t_adj", ""),
     ("v_projection_scorecard", "Projection rules", ("period", "horizon", "arm"), "reading", "calls", "lift_pp",

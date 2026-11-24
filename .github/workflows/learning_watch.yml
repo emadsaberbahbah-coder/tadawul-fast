@@ -4,7 +4,7 @@
 # VERSION 1.0.0 (2026-11-24)
 #
 # WHY: owner, 24 Nov 2026 13:07 Riyadh (in Arabic): how can BigQuery be used
-# more, faster and more accurately? BigQuery holds 19 learning records, each
+# more, faster and more accurately? BigQuery holds 18 learning records, each
 # with a fixed reading, and none is seen until someone opens it. This job
 # reads them all every day, stores the day's readings and lists what is
 # proven, what works against, and what changed since the last day.
@@ -16,7 +16,7 @@
 # cron: GitHub's schedule starts this repository's runs hours late. A manual
 # dispatch writes only with write=true.
 #
-# READS: the 19 learning views (SELECT only). WRITES: BigQuery
+# READS: the 18 learning views (SELECT only; not the shadow score trial). WRITES: BigQuery
 # learning_watch_log (today's partition) and the workbook tab Learning_Watch.
 # OBSERVE ONLY: nothing changes a recommendation, a gate or an order.
 # Rollback: repository Variable TFB_LEARNING_WATCH=off.
