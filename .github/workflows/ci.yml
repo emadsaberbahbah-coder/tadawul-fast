@@ -2,8 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.98 (2026-11-24) -- LABEL TRUTH
+# VERSION 1.1.99 (2026-11-24) -- COLLECTOR CATCH-UP
 #
+# v1.1.99: run tests/test_collector_catchup.py (scripts/collector_catchup.py
+# 1.0.0 and .github/workflows/collector_catchup.yml: one write dispatch for a
+# BigQuery collector whose cron slot GitHub missed or delivered past its grace)
+# right after tests/test_sync_watchdog.py. Nothing is removed and no existing
+# entry moves.
+#
+# (1.1.98, 2026-11-24: LABEL TRUTH)
 # v1.1.98: run tests/test_de_label_truth.py (data_engine_v2 v5.163.0 and
 # scoring 5.11.5: TFB_LABEL_TRUTH off|observe|enforce, unset = observe; the
 # scored horizon on the row, one percent division, the leverage label on ratio
@@ -1310,6 +1317,7 @@ jobs:
             tests/test_sync_stamp_repair.py \
             tests/test_sync_portfolio_route_capacity.py \
             tests/test_sync_watchdog.py \
+            tests/test_collector_catchup.py \
             tests/test_daily_plan.py \
             tests/test_market_regime.py \
             tests/test_today_action_plan.py \
