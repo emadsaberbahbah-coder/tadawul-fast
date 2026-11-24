@@ -4,7 +4,19 @@ scripts/news_board.py
 ================================================================================
 TFB News Board - the world news, the sector tilt it gives, and whether following it would have helped
 --------------------------------------------------------------------------------
-v1.4.0 (2026-11-21)
+v1.5.0 (2026-11-24)
+  1.5.0: [NEWS NOW] section 11, NEWS AND TREND NOW, observe only. Owner, 24 Nov 2026 10:10 Riyadh, in Arabic: the
+         goal is for the news analysis to have an immediate effect on the reading of a stock's price now, through
+         gathering, comparing and forecasting - not results on 8 December; 10:20: "if something is missing that we
+         can switch on now or start building, let us start". The news-and-trend reading of apply_bq_views 1.25.0
+         (v_news_understanding) was only on the strategist's site. Each holding and each Top 10 name of the last 3
+         days that TFB follows now shows, on this page after every sync: its latest news event, how the price
+         answered against SPY (pp and z), the trend, the move research expects over the next sessions, TFB's own
+         view and whether the two agree, the main headline, and that state's forward record over 5 sessions
+         (v_news_trend_learning) - so the reading is in front of the owner the same day while its record fills.
+         Then the 8 latest events across every followed name. A state counts as evidence only once its forward
+         record reads 'works as expected'; until then the section says so on every line. Until the views are in
+         BigQuery it says so and the page is built all the same. The run log prints counts only.
   1.4.0: [MARKETS / PEOPLE] three sections from the views of apply_bq_views 1.20.0, observe only. Owner, 21 Nov 2026
          11:03 Riyadh, item 5 of the build list: "News: a news reading per market; forward event scenarios;
          momentum/surprise; influential figures of 19 Nov; score every news signal." Section 8, NEWS BY MARKET: the
@@ -78,6 +90,9 @@ WHAT IT WRITES (its page News_Board; nothing else)
        spikes of the last 7 days, one row per person.
     10. NEWS SIGNALS ON TRIAL (v1.4.0): v_news_trial_summary over 10 closes,
        forward lines first, and the signals' rank correlation.
+    11. NEWS AND TREND NOW (v1.5.0): each holding and Top 10 name TFB follows
+       read with the trend (v_news_understanding) and its state's forward
+       record (v_news_trend_learning), then the latest events of every name.
 
 SAFETY
     Read-only on BigQuery (SELECT only) and on every tab but its own; the
@@ -109,7 +124,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -170,6 +185,13 @@ SIGNAL_READING_TEXT = {"favourable": "favourable", "neutral": "neutral", "unfavo
                        "surge_favourable": "a surge, favourable tone", "surge_unfavourable": "a surge, unfavourable tone",
                        "none": "no surge", "spike_positive": "a spike, positive tone",
                        "spike_negative": "a spike, negative tone", "quiet": "quiet"}
+# v1.5.0 [NEWS NOW]: the news read with the trend, per holding and Top 10 name (apply_bq_views 1.25.0)
+NEWS_NOW_BOARD_DAYS = 3                                 # Top 10 names seated in the last 3 days
+NEWS_NOW_EVENTS = 8                                     # the latest events across every followed name
+NEWS_NOW_HORIZON = 5                                    # the state's record shown over 5 sessions
+NEWS_NOW_FORWARD = "forward from 2026-11-24"            # v_news_trend_learning's evidence period
+EXPECTED_TEXT = {1: "up against SPY", -1: "down against SPY", 0: "no lean"}
+AGREEMENT_TEXT = {"agrees with TFB": "agrees with TFB", "leans against TFB": "LEANS AGAINST TFB"}
 _DOW = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MON = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 # feature -> (label, kind of news, short name)
@@ -718,6 +740,150 @@ def read_optional(session: Any, project: str, location: str, sql: str, query: An
 
 
 # ----------------------------------------------------------------------------- #
+# v1.5.0 [NEWS NOW]: section 11
+# ----------------------------------------------------------------------------- #
+def _int(v: Any) -> Optional[int]:
+    x = num(v)
+    return int(x) if x is not None else None
+
+
+def state_records(rows: Optional[Sequence[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """{state: its forward record over NEWS_NOW_HORIZON sessions} from v_news_trend_learning (trend fit 'all')."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows or []:
+        if text(r.get("period")) == NEWS_NOW_FORWARD and _int(r.get("horizon_sessions")) == NEWS_NOW_HORIZON \
+                and text(r.get("trend_fit")) == "all":
+            out[text(r.get("state"))] = r
+    return out
+
+
+def record_text(rec: Optional[Dict[str, Any]]) -> str:
+    """One cell: the state's forward record, or that none has matured yet."""
+    if not rec:
+        return "no forward event matured yet"
+    ev = _int(rec.get("events")) or 0
+    right = num(rec.get("right_pct"))
+    return "%s | %d event(s)%s%s" % (
+        text(rec.get("reading")) or "not read", ev,
+        ", %.0f%% went the expected way" % right if right is not None else "",
+        ", edge %s pp" % fmt(rec.get("edge_pp"), 2, True) if num(rec.get("edge_pp")) is not None else "")
+
+
+def answer_text(r: Dict[str, Any]) -> str:
+    """How the price answered: the 2-session reaction against SPY when the event has one, else the day's move.
+    An event on the latest session has only its first day: the cell says the next session is still to come."""
+    if num(r.get("reaction_pp")) is not None:
+        done = text(r.get("reaction_complete")).lower() not in ("false", "0")
+        return "%s pp (z %s) %s" % (fmt(r.get("reaction_pp"), 2, True), fmt(r.get("reaction_z"), 1, True),
+                                    "over 2 sessions" if done else "first session only, the next is still to come")
+    if num(r.get("day_pp")) is not None:
+        return "%s pp (z %s) on the day" % (fmt(r.get("day_pp"), 2, True), fmt(r.get("day_z"), 1, True))
+    return ""
+
+
+def trend_text(r: Dict[str, Any]) -> str:
+    """The trend before the shown event (the one its state was read against); the trend now beside it when it changed.
+    A name with no event shows the trend now."""
+    before, now = text(r.get("trend_before")), text(r.get("trend_now"))
+    if not text(r.get("event_day")) or not before:
+        return now
+    return before if not now or now == before else "%s before the event; %s now" % (before, now)
+
+
+def news_now_row(r: Dict[str, Any], why: str, records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    exp = _int(r.get("expected"))
+    state = text(r.get("state")) or "quiet"
+    return {"symbol": text(r.get("symbol")), "name": text(r.get("name")), "why": why,
+            "event_day": text(r.get("event_day")), "state": state, "answer": answer_text(r),
+            "trend": trend_text(r), "expected": EXPECTED_TEXT.get(exp, "") if exp is not None else "",
+            "tfb": text(r.get("recommendation")), "agreement": AGREEMENT_TEXT.get(text(r.get("agreement")),
+                                                                               text(r.get("agreement"))),
+            "record": record_text(records.get(state)) if exp not in (None, 0) else "",
+            "headline": text(r.get("top_headline"))[:160]}
+
+
+def news_now_rows(holdings: Sequence[Dict[str, str]], board: Sequence[str], found: Optional[Sequence[Dict[str, Any]]],
+                  records: Dict[str, Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """One row per holding, then per Top 10 name not held, in that order; a name TFB does not follow says so."""
+    if found is None:
+        return None
+    by = {text(r.get("symbol")).upper(): r for r in found}
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    listed = [(h["symbol"], "holding") for h in holdings] + [(b, "Top 10") for b in board]
+    for sym, why in listed:
+        hit = next((by[a] for a in aliases(sym) if a in by), None)
+        key = text(hit.get("symbol")).upper() if hit else sym.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        if hit:
+            out.append(news_now_row(hit, why, records))
+        elif market_of(sym) == "US":
+            out.append({"symbol": sym, "name": "", "why": why, "state": "", "event_day": "", "answer": "",
+                        "trend": "", "expected": "", "tfb": "", "agreement": "", "record": "",
+                        "headline": "not in the followed set yet (company news is collected for the holdings, the "
+                                    "board, the ROI leaders, the 50 largest US names and the day's big movers)"})
+    return out
+
+
+def news_now_lines(rows: Optional[Sequence[Dict[str, Any]]], events: Optional[Sequence[Dict[str, Any]]],
+                   records: Dict[str, Dict[str, Any]]) -> List[str]:
+    """The lines under the verdict: what section 11 holds today, in counts."""
+    if rows is None:
+        return ["NEWS AND TREND NOW: %s." % NOT_SET_UP.replace("1.20.0", "1.25.0")]
+    leaning = [r for r in rows if r.get("expected") and r["expected"] != "no lean"]
+    against = [r for r in rows if r.get("agreement") == AGREEMENT_TEXT["leans against TFB"]]
+    proven = sorted(s for s, rec in records.items() if text(rec.get("reading")) == "works as expected")
+    return ["NEWS AND TREND NOW: %d of your holdings and Top 10 names read; %d with a lean for the next sessions, "
+            "%d leaning against TFB's view; %d event(s) across all followed names. %s" % (
+                len(rows), len(leaning), len(against), len(events or []),
+                ("States proven forward: %s." % ", ".join(proven)) if proven else
+                "No state is proven forward yet (evidence from 24 Nov 2026; first reading 8 Dec): read it as "
+                "context, not as a signal.")]
+
+
+def news_now_section_rows(data: Dict[str, Any], pad: Any) -> List[List[Any]]:
+    """v1.5.0: section 11."""
+    head = ["Name", "Listed as", "Event day", "State", "Price answer vs SPY", "Trend", "Research expects",
+            "TFB's view", "Agreement", "State's record (5 sessions, forward)", "Main headline"]
+
+    def line(r: Dict[str, Any]) -> List[Any]:
+        name = r["symbol"] + (" - " + r["name"] if r.get("name") else "")
+        return pad([name, r["why"], r["event_day"], r["state"], r["answer"], r["trend"], r["expected"], r["tfb"],
+                    r["agreement"], r["record"], r["headline"]])
+
+    out = [pad([]),
+           pad(["11. NEWS AND TREND NOW - each holding and Top 10 name TFB follows: its latest company news, how the "
+                "price answered against SPY, the trend before it and the move research expects over the next "
+                "sessions, beside TFB's own view. Observe only: no order comes from this section."]),
+           pad(head)]
+    rows = data.get("news_now")
+    if rows is None:
+        out.append(pad(["", "Section 11 is %s." % NOT_SET_UP.replace("1.20.0", "1.25.0")]))
+    elif not rows:
+        out.append(pad(["", "No holding or Top 10 name to read."]))
+    for r in rows or []:
+        out.append(line(r))
+    out += [pad([]), pad(["Latest events across every name TFB follows (the %d most recent, largest first)"
+                          % NEWS_NOW_EVENTS]), pad(head)]
+    events = data.get("news_events")
+    if events is None:
+        out.append(pad(["", "Not read: %s." % NOT_SET_UP.replace("1.20.0", "1.25.0")]))
+    elif not events:
+        out.append(pad(["", "No news event in the last 5 sessions."]))
+    for r in events or []:
+        out.append(line(r))
+    out.append(pad(["How to read: the state joins the company news (both feeds) to the price's answer against SPY over "
+                    "two sessions and the trend before it. Research expects a move with news to continue, a big move "
+                    "without news to reverse, and news the price has not answered to drift its way (Chan 2003; "
+                    "Tetlock 2011). Each state's record counts only sessions from 24 Nov 2026; a state is evidence "
+                    "once it reads 'works as expected' (first reading 8 Dec 2026). Until then the lean is context: "
+                    "the decision stays with TFB's view and the Today Action Plan."]))
+    return out
+
+
+# ----------------------------------------------------------------------------- #
 # 5. Trial and the verdict
 # ----------------------------------------------------------------------------- #
 # ----------------------------------------------------------------------------- #
@@ -893,6 +1059,7 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
            pad([]), pad(["VERDICT"])]
     out += [pad([line]) for line in data["verdict"]]
     out += [pad([line]) for line in data.get("news_verdict") or []]
+    out += [pad([line]) for line in data.get("news_now_lines") or []]
     if data.get("next_event"):
         out.append(pad([data["next_event"]]))
 
@@ -1002,6 +1169,7 @@ def page_rows(data: Dict[str, Any], stamp: str) -> List[List[Any]]:
                  "and 0 for a price move that has already happened. POSITIVE at +1 or more, NEGATIVE at -1 or less."]),
             pad([])]
     out += news_section_rows(data, pad)
+    out += news_now_section_rows(data, pad)         # v1.5.0 [NEWS NOW]
     out += [pad([]),
             pad(["How to read: a theme is the share of the week's news on that subject, per 1,000 (the Iran, Russia and "
                  "US-China lines count events; the rest count news documents); a tone is an index where higher is more "
@@ -1197,6 +1365,38 @@ def sql_news_trial(ds: str) -> str:
             "ORDER BY period DESC, signal, horizon, expected DESC, reading" % ds)
 
 
+_NOW_COLS = ("symbol, name, CAST(latest_event_date AS STRING) AS event_day, state, expected, reaction_pp, reaction_z, "
+             "day_pp, day_z, trend_before, trend_now, reaction_complete, top_headline, recommendation, agreement")
+
+
+def sql_board_names(ds: str, today: _dt.date) -> str:
+    """v1.5.0: the Top 10 names of the last NEWS_NOW_BOARD_DAYS days, best seat first."""
+    return ("SELECT symbol, MIN(seat_rank) AS best FROM `%s.v_top10_board` WHERE snapshot_date >= %s "
+            "AND symbol IS NOT NULL GROUP BY symbol ORDER BY best, symbol LIMIT 20"
+            % (ds, _d(today - _dt.timedelta(days=NEWS_NOW_BOARD_DAYS))))
+
+
+def sql_news_now(ds: str, symbols: Sequence[Any]) -> str:
+    syms = clean_symbols(symbols)
+    if not syms:
+        raise ValueError("no symbol")
+    return "SELECT %s FROM `%s.v_news_understanding` WHERE symbol IN (%s)" % (
+        _NOW_COLS, ds, ", ".join("'%s'" % s for s in syms))
+
+
+def sql_news_events(ds: str) -> str:
+    return ("SELECT %s FROM `%s.v_news_understanding` WHERE latest_event_date IS NOT NULL "
+            "AND state NOT IN ('routine news', 'quiet') "
+            "ORDER BY latest_event_date DESC, ABS(IFNULL(reaction_z, day_z)) DESC, symbol LIMIT %d"
+            % (_NOW_COLS, ds, NEWS_NOW_EVENTS))
+
+
+def sql_news_state_record(ds: str) -> str:
+    return ("SELECT period, state, trend_fit, horizon_sessions, events, days, edge_pp, right_pct, t_adj, reading "
+            "FROM `%s.v_news_trend_learning` WHERE trend_fit = 'all' AND horizon_sessions = %d"
+            % (ds, NEWS_NOW_HORIZON))
+
+
 def read_company_eval(session: Any, project: str, location: str, ds: str, query: Any) -> List[Dict[str, Any]]:
     """v1.3.0: the record with the peers; if BigQuery does not know the peer columns yet (the view before
     apply_bq_views 1.17.0), the 1.2.0 read instead - any other refusal still fails the run."""
@@ -1231,9 +1431,20 @@ def collect(session: Any, project: str, dataset: str, location: str, holdings: S
     mnews = read_optional(session, project, location, sql_market_news(ds, today), query)
     pnews = read_optional(session, project, location, sql_people_news(ds, today), query)
     ntrial = read_optional(session, project, location, sql_news_trial(ds), query)
+    # v1.5.0 [NEWS NOW]: the holdings and the Top 10 names, read with the trend
+    board_rows = read_optional(session, project, location, sql_board_names(ds, today), query) or []
+    board = clean_symbols(text(r.get("symbol")).upper() for r in board_rows)
+    now_syms = clean_symbols([a for h in holdings for a in aliases(h["symbol"])] + [a for b in board for a in aliases(b)])
+    found_now = read_optional(session, project, location, sql_news_now(ds, now_syms), query) if now_syms else []
+    ev_rows = read_optional(session, project, location, sql_news_events(ds), query)
+    records = state_records(read_optional(session, project, location, sql_news_state_record(ds), query))
+    news_now = news_now_rows(holdings, board, found_now, records)
+    news_events = None if ev_rows is None else [news_now_row(r, "event", records) for r in ev_rows]
     market_day, markets = market_news_rows(mnews)
     people_day, people = people_rows(pnews)
-    return {"market_day": market_day, "markets": None if mnews is None else markets,
+    return {"news_now": news_now, "news_events": news_events,
+            "news_now_lines": news_now_lines(news_now, news_events, records),
+            "market_day": market_day, "markets": None if mnews is None else markets,
             "people_day": people_day, "people": None if pnews is None else people,
             "news_trial": None if ntrial is None else news_trial_rows(ntrial),
             "news_ic": ic_line(ntrial) if ntrial is not None else "",
@@ -1290,6 +1501,8 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         _out("EVENTS note: %s" % note)
     for line in data.get("news_verdict") or []:
         _out("NEWS %s" % line)
+    for line in data.get("news_now_lines") or []:        # v1.5.0: counts only, never a holding's name
+        _out(line)
     tally = {k: sum(1 for c in data["company"] if c["class"] == k) for k in NEWS_CLASS_TEXT}
     _out("COMPANY NEWS %d holding(s): %d positive, %d negative, %d neutral, %d without company news; %s" % (
         len(data["company"]), tally["positive"], tally["negative"], tally["neutral"], tally["none"], data["company_record"]))
