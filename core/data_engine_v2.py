@@ -2,8 +2,27 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.163.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.164.0
 ================================================================================
+
+WHY v5.164.0 - THE LEVERAGE LABEL LEAVES LENDERS OUT
+(TFB_LABEL_TRUTH as in v5.163.0; off -> byte-identical to v5.163.0)
+- EVIDENCE (owner's workbook of 24 Nov 2026 22:56 Riyadh, the observe tags of
+  v5.163.0): the ratio rule would flag 744 names "High leverage" (719 on
+  Global_Markets, 25 on Market_Leaders); 187 of the 719 are lenders - 153 in
+  the Financial Services sector (banks, credit, capital markets, insurers) and
+  34 mortgage REITs - and 3 of them sit on today's Top 10 (BLX.US, SAN.MC,
+  LADR.US). For a lender, debt against equity is the business (deposits and
+  borrowings fund the loan book), not a risk signal: the ratio is not read for
+  them in any standard analysis. The label feeds conviction_score (-8 points),
+  a 20 % weight of the Top 10 composite, so under enforce it would have moved
+  three seats on a label that does not apply to them.
+- CHANGE: _label_truth_high_leverage(de, mode, sector, industry) - a row whose
+  sector names finance ("Financial Services", "Financials") or whose industry
+  is a mortgage lender ("REIT - Mortgage", "Mortgage Finance") is never
+  flagged by the ratio rule; observe tags it label_truth_leverage:lender:observe
+  only where the legacy test flags it (would_clear). Every other row as in
+  v5.163.0. off is unchanged (the legacy >= 100 test, sector not read).
 
 WHY v5.163.0 - TRUTH IN LABELS AND UNITS
 (TFB_LABEL_TRUTH = off | observe | enforce; UNSET -> observe: tags only, every
@@ -4647,7 +4666,7 @@ from core.financial_units import (
 #   TFB_MARKET_GATE / TFB_SELECTION_GATE default off = byte-identical.
 #   Tests: tests/test_de_market_and_selection_gate.py,
 #   tests/test_market_condition.py.
-__version__ = "5.163.0"
+__version__ = "5.164.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -7929,7 +7948,18 @@ def _label_truth_horizon(out: Dict[str, Any]) -> None:
         pass
 
 
-def _label_truth_high_leverage(de: Optional[float], mode: str) -> Tuple[bool, str]:
+_LT_LENDER_SECTOR = re.compile(r"financ", re.I)
+_LT_LENDER_INDUSTRY = re.compile(r"reit\s*-\s*mortgage|mortgage finance", re.I)
+
+
+def _label_truth_is_lender(sector: Any, industry: Any) -> bool:
+    """v5.164.0: banks, credit, capital markets, insurers (a finance sector) and mortgage lenders (a mortgage REIT or
+    mortgage finance industry): debt against equity is their business, not a leverage risk."""
+    return bool(_LT_LENDER_SECTOR.search(_safe_str(sector)) or _LT_LENDER_INDUSTRY.search(_safe_str(industry)))
+
+
+def _label_truth_high_leverage(de: Optional[float], mode: str, sector: Any = None,
+                               industry: Any = None) -> Tuple[bool, str]:
     """v5.163.0: (flag, observe tag or ''). Legacy: D/E >= 100. Enforce: D/E as
     the ratio both providers deliver (EODHD total debt / total equity, Yahoo's
     debtToEquity as the archive shows it: medians 0.46 and 0.51 on 23 Nov 2026),
@@ -7938,9 +7968,12 @@ def _label_truth_high_leverage(de: Optional[float], mode: str) -> Tuple[bool, st
     legacy = de is not None and de >= 100
     if mode == "off" or de is None:
         return legacy, ""
-    fixed = de >= 2.0
+    lender = _label_truth_is_lender(sector, industry)
+    fixed = de >= 2.0 and not lender                  # v5.164.0: never for a lender
     if mode == "enforce":
         return fixed, ""
+    if lender and legacy:
+        return legacy, "label_truth_leverage:lender:observe"
     if fixed != legacy:
         return legacy, "label_truth_leverage:%s:observe" % ("would_flag" if fixed else "would_clear")
     return legacy, ""
@@ -9796,7 +9829,7 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     de = _as_float(row.get("debt_to_equity"))
     # v5.163.0: TFB_LABEL_TRUTH - D/E is stored as a ratio; off/observe keep
     # the legacy >= 100 test (observe tags where the ratio rule disagrees).
-    _lt_lev, _lt_tag = _label_truth_high_leverage(de, _label_truth_mode())
+    _lt_lev, _lt_tag = _label_truth_high_leverage(de, _label_truth_mode(), row.get("sector"), row.get("industry"))
     if _lt_lev:
         risks.append("High leverage")
     if _lt_tag:
