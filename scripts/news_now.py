@@ -14,9 +14,11 @@ v1.0.0 (2026-11-24)
     1. the names: the holdings (My_Portfolio, a plain ticker read as a US listing) and the Top 10 names of the last
        3 board days (v_top10_board), at most MAX_NAMES;
     2. their company news of the last NEWS_DAYS days from EODHD (the nightly job's reader, parser and daily-budget
-       guard: 5 calls a name, refused above TFB_DEEP_EODHD_MAX_SHARE of the daily limit) into symbol_news_intraday,
-       today's partition replaced as a whole - and only when every name answered, so a failed call never drops
-       the earlier items of the day;
+       guard: 5 calls a name, refused above TFB_DEEP_EODHD_MAX_SHARE of the daily limit) into symbol_news_intraday:
+       today's partition is rewritten as this run's items MERGED with the items already in it (Codex P2 on #1072),
+       so a headline pushed off the provider's first page, or a name whose call failed, keeps what the day held;
+       a name whose call failed (or every name, when the news was not refreshed) is read 'not refreshed' and gets
+       no state - an empty answer is never taken for 'no news';
     3. the price so far for each US name and SPY (Yahoo chart, no key): the regular session open now, closed today,
        or not open yet; the previous close on the adjusted basis;
     4. each headline re-read with file 97's rules (v_symbol_news_class_now, apply_bq_views 1.27.0), and each US name
@@ -99,6 +101,7 @@ SCHEMA_LOG: List[Dict[str, str]] = [
     {"name": "trend_fit", "type": "STRING", "mode": "NULLABLE", "description": "with the trend | against the trend | no clear trend"},
     {"name": "recommendation", "type": "STRING", "mode": "NULLABLE", "description": "TFB's recommendation (v_universe_latest)"},
     {"name": "agreement", "type": "STRING", "mode": "NULLABLE", "description": "the expected move against TFB's view"},
+    {"name": "news_coverage", "type": "STRING", "mode": "REQUIRED", "description": "fresh (this run asked EODHD) | not refreshed (no state)"},
     {"name": "run_id", "type": "STRING", "mode": "NULLABLE", "description": "GitHub Actions run id"},
 ]
 SPEC_NEWS = (SCHEMA_NEWS, "snapshot_date", ["symbol"],
@@ -325,8 +328,9 @@ def window_news(rows: Sequence[Dict[str, Any]], symbol: str, after: Optional[str
 
 def read_name(symbol: str, listed_as: str, stock: Optional[Dict[str, Any]], spy: Optional[Dict[str, Any]],
               classified: Optional[Sequence[Dict[str, Any]]], raw_items: int, universe: Dict[str, Dict[str, Any]],
-              today_riyadh: str) -> Dict[str, Any]:
-    """One name's reading. A name outside the US gets its news only (the state rules read a US name against SPY)."""
+              today_riyadh: str, fresh: bool = True) -> Dict[str, Any]:
+    """One name's reading. A name outside the US gets its news only (the state rules read a US name against SPY).
+    A name whose news was not refreshed this run gets no state: what is missing is not 'no news' (Codex P2, #1072)."""
     u = universe.get(symbol) or {}
     row: Dict[str, Any] = {"symbol": symbol, "listed_as": listed_as, "name": text(u.get("name")),
                            "recommendation": text(u.get("recommendation")) or None,
@@ -337,7 +341,8 @@ def read_name(symbol: str, listed_as: str, stock: Optional[Dict[str, Any]], spy:
                            "prev_close": round(stock["prev_close"], 4) if stock else None,
                            "state": None, "expected": None, "trend_fit": None, "agreement": None,
                            "news_items": None, "news_score": None, "top_headline": None,
-                           "raw_items": raw_items, "note": ""}
+                           "raw_items": raw_items, "note": "",
+                           "news_coverage": "fresh" if fresh else "not refreshed"}
     row.update(price_answer(stock, spy) if symbol.endswith(".US") else
                {"daily_vol_pp": None, "trend": None, "reaction_pp": None, "reaction_z": None, "day_z": None,
                 "change_pct": None, "spy_change_pct": None})
@@ -357,6 +362,9 @@ def read_name(symbol: str, listed_as: str, stock: Optional[Dict[str, Any]], spy:
         row["top_headline"] = text(top.get("title"))[:200]
     if not symbol.endswith(".US"):
         row["note"] = "news only: the state is read for US names against SPY"
+        return row
+    if not fresh:
+        row["note"] = "company news not refreshed this run: no state"
         return row
     if not stock or not spy:
         row["note"] = "no price from Yahoo this run"
@@ -415,6 +423,8 @@ def page_rows(rows: Sequence[Dict[str, Any]], stamp: str, ny_stamp: str, session
             news = "%d headline(s), not classified yet" % r["raw_items"] if r.get("raw_items") else ""
         else:
             news = "%d, score %s" % (r["news_items"], _sign(r["news_score"], 1)) if r["news_items"] else "none"
+            if r.get("news_coverage") != "fresh":
+                news += " (not refreshed)"
         exp = r.get("expected")
         out.append(line(name, r["listed_as"], _sign(r.get("change_pct"), 2, " %"),
                         _sign(r.get("reaction_pp"), 2, " pp"), _sign(r.get("day_z"), 1), news,
@@ -463,12 +473,12 @@ def fetch_chart(ysym: str, now: _dt.datetime, opener: Callable[..., Any], sleep:
 
 def fetch_news(names: Sequence[str], token: str, day: str, captured_at: str, run_id: str,
                opener: Callable[..., Any], sleep: Callable[[float], None], pause: float = 0.3
-               ) -> Tuple[List[Dict[str, Any]], int]:
-    """(rows, failed calls). The nightly reader and parser; the token never leaves _scrub."""
+               ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(rows, the names whose call failed). The nightly reader and parser; the token never leaves _scrub."""
     since = (_dt.date.fromisoformat(day) - _dt.timedelta(days=NEWS_DAYS)).isoformat()
     base = {"snapshot_date": day, "captured_at": captured_at, "run_id": run_id or None}
     rows: List[Dict[str, Any]] = []
-    failed = 0
+    failed: List[str] = []
     for sym in names:
         try:
             items = asd.parse_news(asd.eodhd_get("news", {"s": asd.eodhd_symbol(sym), "from": since,
@@ -476,9 +486,34 @@ def fetch_news(names: Sequence[str], token: str, day: str, captured_at: str, run
                                    NEWS_LIMIT)
             rows.extend(dict(base, symbol=sym, **it) for it in items)
         except Exception:  # noqa: BLE001 - counted; the message may name a holding, so it is not printed
-            failed += 1
+            failed.append(sym)
         sleep(pause)
     return rows, failed
+
+
+def sql_today_news(ds: str, day: str) -> str:
+    """The rows today's partition already holds, in the load's own formats (BigQuery returns a TIMESTAMP as epoch
+    seconds and every number as text)."""
+    return ("SELECT CAST(snapshot_date AS STRING) AS snapshot_date, symbol, "
+            "FORMAT_TIMESTAMP('%%Y-%%m-%%dT%%H:%%M:%%SZ', published_at) AS published_at, title, link, domain, polarity, "
+            "neg, neu, pos, tags, FORMAT_TIMESTAMP('%%Y-%%m-%%dT%%H:%%M:%%SZ', captured_at) AS captured_at, run_id "
+            "FROM `%s.%s` WHERE snapshot_date = DATE '%s'" % (ds, TABLE_NEWS, day))
+
+
+def merge_news(new: Sequence[Dict[str, Any]], old: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """This run's items, then every earlier item of the day it does not repeat (one per symbol and link, or title)."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for r in list(new) + [dict(o) for o in old]:
+        key = (text(r.get("symbol")).upper(), text(r.get("link")) or text(r.get("title")))
+        if not key[0] or not text(r.get("title")) or key in seen:
+            continue
+        seen.add(key)
+        row = {f["name"]: r.get(f["name"]) for f in SCHEMA_NEWS}
+        for k in ("polarity", "neg", "neu", "pos"):
+            row[k] = num(row[k])
+        out.append(row)
+    return out
 
 
 def sql_classified(ds: str, symbols: Sequence[str], since: str) -> str:
@@ -544,6 +579,7 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
 
     # 2. company news (EODHD, behind the nightly job's budget guard)
     raw: List[Dict[str, Any]] = []
+    fresh: set = set()                          # the names EODHD answered this run
     token = _env("EODHD_API_KEY")
     if _env("TFB_NEWS_NOW_EODHD", "on").lower() in ("off", "0", "false", "no"):
         notes.append("company news not refreshed this run (TFB_NEWS_NOW_EODHD is off)")
@@ -556,20 +592,30 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
             notes.append("company news not refreshed this run (the EODHD budget guard: %s)" % why)
         else:
             raw, failed = fetch_news(syms, token, day, captured_at, run_id, opener, sleep)
-            _out("news: %d headline(s) for %d name(s), %d call(s) failed" % (len(raw), len(syms), failed))
+            fresh = set(syms) - set(failed)
+            _out("news: %d headline(s) for %d name(s), %d call(s) failed" % (len(raw), len(syms), len(failed)))
             if failed:
-                notes.append("%d news call(s) failed: today's earlier headlines are kept, this run's are not loaded"
-                             % failed)
-            elif dry_run:
+                notes.append("%d news call(s) failed: those names are read 'not refreshed' (no state)" % len(failed))
+            if dry_run:
                 _out("dry run: %d headline row(s) not loaded" % len(raw))
             else:
                 try:
                     ensure(session, project, dataset, TABLE_NEWS, spec=SPEC_NEWS)
-                    n = load(session, project, dataset, location, TABLE_NEWS, day, raw, run_id, schema=SCHEMA_NEWS)
-                    _out("loaded %d headline row(s) into %s$%s" % (n, TABLE_NEWS, day.replace("-", "")))
+                    try:
+                        old = query(session, project, location, sql_today_news(ds, day))
+                    except RuntimeError as e:
+                        if "Not found" not in text(e):
+                            raise
+                        old = []
+                    merged = merge_news(raw, old)
+                    n = load(session, project, dataset, location, TABLE_NEWS, day, merged, run_id, schema=SCHEMA_NEWS)
+                    _out("loaded %d headline row(s) into %s$%s (%d new this run, %d kept from earlier runs)" % (
+                        n, TABLE_NEWS, day.replace("-", ""), len(raw), len(merged) - len(merge_news(raw, []))))
                 except Exception as e:  # noqa: BLE001
                     _out("ERROR: the headlines were not loaded (%s: %s)" % (type(e).__name__, text(e)[:200]))
-                    notes.append("this run's headlines were not loaded into BigQuery")
+                    notes.append("this run's headlines were not loaded into BigQuery: every name is read 'not "
+                                 "refreshed' (no state)")
+                    fresh = set()
 
     # 3. the price so far
     now_ts = int(now.timestamp())
@@ -593,8 +639,8 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
         _out("ERROR: %s while reading BigQuery; nothing written" % type(e).__name__)
         return 2
     raw_count = {s: sum(1 for r in raw if r["symbol"] == s) for s in syms}
-    rows = [read_name(s, w, charts.get(s), spy, classified, raw_count[s], universe, today_riyadh.isoformat())
-            for s, w in names]
+    rows = [read_name(s, w, charts.get(s), spy, classified, raw_count[s], universe, today_riyadh.isoformat(),
+                      fresh=s in fresh) for s, w in names]
     _out(verdict_line(rows))
 
     log = [{"snapshot_date": day, "captured_at": captured_at, "symbol": r["symbol"], "listed_as": r["listed_as"],
@@ -604,7 +650,8 @@ def run_once(dry_run: bool, book=None, session=None, now: Optional[_dt.datetime]
             "day_z": r["day_z"], "daily_vol_pp": r["daily_vol_pp"], "trend": r["trend"],
             "news_items": r["news_items"], "news_score": r["news_score"], "top_headline": r["top_headline"],
             "state": r["state"], "expected": r["expected"], "trend_fit": r["trend_fit"],
-            "recommendation": r["recommendation"], "agreement": r["agreement"], "run_id": run_id or None}
+            "recommendation": r["recommendation"], "agreement": r["agreement"],
+            "news_coverage": r["news_coverage"], "run_id": run_id or None}
            for r in rows]
     ny = now.astimezone(_ny_zone())
     page = page_rows(rows, now.astimezone(RIYADH).strftime("%Y-%m-%d %H:%M"), ny.strftime("%Y-%m-%d %H:%M"),

@@ -110,12 +110,27 @@ UNIVERSE = [{"symbol": "AAA.US", "name": "Alpha Bank", "recommendation": "STRONG
             {"symbol": "EEE.US", "name": "Echo", "recommendation": "BUY"}]
 
 
+OLD_TODAY = [  # today's partition before the run: an item pushed off the provider's first page, and a repeat
+    {"snapshot_date": "2026-11-24", "symbol": "AAA.US", "published_at": "2026-11-24T08:00:00Z", "title": "Alpha early item",
+     "link": "https://x.test/a0", "domain": "x.test", "polarity": "0.5", "neg": None, "neu": None, "pos": None,
+     "tags": None, "captured_at": "2026-11-24T13:35:00Z", "run_id": "70"},
+    {"snapshot_date": "2026-11-24", "symbol": "AAA.US", "published_at": "2026-11-24T12:00:00Z",
+     "title": "Alpha Bank raises full-year guidance", "link": "https://x.test/a1", "domain": "x.test", "polarity": "0.9",
+     "neg": None, "neu": None, "pos": None, "tags": None, "captured_at": "2026-11-24T13:35:00Z", "run_id": "70"}]
+
+
 class Query:
-    def __init__(self, classified=CLASSIFIED, board=("EEE.US", "AAA.US", "1030.SR"), class_view=True):
+    def __init__(self, classified=CLASSIFIED, board=("EEE.US", "AAA.US", "1030.SR"), class_view=True, old=None,
+                 table=True):
         self.sql, self.classified, self.board, self.class_view = [], classified, board, class_view
+        self.old, self.table = list(old or []), table
 
     def __call__(self, session, project, location, sql):
         self.sql.append(sql)
+        if ".symbol_news_intraday`" in sql:
+            if not self.table:
+                raise RuntimeError("BigQuery refused the query (HTTP 404): Not found: Table proj-1:tfb_archive.x")
+            return [dict(r) for r in self.old]
         if "v_top10_board" in sql:
             return [{"symbol": s, "best": str(i + 1)} for i, s in enumerate(self.board)]
         if "v_symbol_news_class_now" in sql:
@@ -287,17 +302,40 @@ def test_a_full_run_reads_writes_and_logs_counts_only(capsys):
     assert all(len(r) == nn.WIDTH for r in page)
 
 
-def test_failed_news_call_keeps_the_day_and_still_reads(capsys):
-    rc, book, net, query, bq = run(net=Net(fail_news={"BBB.US"}))
-    assert rc == 0 and [ld["table"] for ld in bq.loads] == ["news_now_log"]       # today's headlines are kept
+def test_the_day_is_merged_never_cut_to_the_first_page():
+    """Codex P2 on #1072: today's partition is this run's items plus every earlier item of the day it does not repeat."""
+    rc, book, net, query, bq = run(query=Query(old=OLD_TODAY))
+    news = bq.loads[0]
+    assert news["table"] == "symbol_news_intraday" and news["disposition"] == "WRITE_TRUNCATE"
+    assert [r["title"] for r in news["rows"]] == ["Alpha Bank raises full-year guidance", "Alpha early item"]
+    assert news["rows"][0]["run_id"] == "77" and news["rows"][1]["run_id"] == "70"   # the new copy wins a repeat
+    assert news["rows"][1]["polarity"] == 0.5 and news["rows"][1]["published_at"] == "2026-11-24T08:00:00Z"
+    sql = [q for q in query.sql if "symbol_news_intraday" in q][0]
+    assert "WHERE snapshot_date = DATE '2026-11-24'" in sql and "FORMAT_TIMESTAMP" in sql
+    rc, book, net, query, bq = run(query=Query(table=False))                     # the first run: no table to read
+    assert rc == 0 and len(bq.loads[0]["rows"]) == 1
+
+
+def test_a_failed_call_is_not_read_as_no_news(capsys):
+    """Codex P2 on #1072: a name EODHD did not answer is 'not refreshed' and gets no state; the others still load."""
+    rc, book, net, query, bq = run(net=Net(fail_news={"BBB.US"}, bbb_move=0.2), query=Query(old=OLD_TODAY))
+    assert rc == 0 and [ld["table"] for ld in bq.loads] == ["symbol_news_intraday", "news_now_log"]
     assert "1 call(s) failed" in capsys.readouterr().out
-    assert any("1 news call(s) failed" in str(r[0]) for r in book.tabs["News_Now"].values)
+    by = {r["symbol"]: r for r in bq.loads[-1]["rows"]}
+    assert by["BBB.US"]["news_coverage"] == "not refreshed" and by["BBB.US"]["state"] is None   # not 'big rise, no news'
+    assert by["AAA.US"]["news_coverage"] == "fresh" and by["AAA.US"]["state"] == "good news, price agreed"
+    page = book.tabs["News_Now"].values
+    assert any("1 news call(s) failed" in str(r[0]) for r in page)
+    bbb = [r for r in page if str(r[0]).startswith("BBB.US")][0]
+    assert bbb[5] == "none (not refreshed)" and bbb[6] == "company news not refreshed this run: no state"
 
 
 def test_budget_guard_and_switches(monkeypatch, capsys):
     rc, book, net, query, bq = run(net=Net(used=95000))
     assert rc == 0 and not any("api/news" in u for u in net.urls)
     assert any("EODHD budget guard" in str(r[0]) for r in book.tabs["News_Now"].values)
+    assert [ld["table"] for ld in bq.loads] == ["news_now_log"]                   # nothing new: the day stays as it is
+    assert all(r["state"] is None and r["news_coverage"] == "not refreshed" for r in bq.loads[0]["rows"])
     monkeypatch.setenv("TFB_NEWS_NOW_EODHD", "off")
     rc, book, net, query, bq = run()
     assert rc == 0 and not any("eodhd" in u for u in net.urls)
