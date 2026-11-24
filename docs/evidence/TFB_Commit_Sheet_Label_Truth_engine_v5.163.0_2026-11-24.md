@@ -26,13 +26,18 @@ One switch, `TFB_LABEL_TRUTH = off | observe | enforce`:
 |---|---|---|
 | Horizon (`_label_truth_horizon`, end of `_apply_page_row_backfill`) | `label_truth_horizon:<shown>d_vs_scored_<days>d:observe` where the row's days differ from the scored horizon | `horizon_days` and `invest_period_label` take the scored pair: month -> 3M / 90, week -> 1W / 6, day -> 1D / 1, long -> 1Y / 365. `horizon_days_effective` is also set while blank. A stamped row rescored reads 90 -> MONTH, so the weights never change. |
 | Percent (`core.scoring._as_fraction`) | `label_truth_percent:<field>:observe` before scoring, for an explicit percent string of 150 % or more | The explicit percent keeps one division ("200%" -> 2.0). |
-| Leverage (`_build_top_factors_and_risks`) | `label_truth_leverage:would_flag\|would_clear:observe` where the rules disagree | D/E read as a ratio (100 or more is percent points, divided by 100), flagged at 2.0. |
+| Leverage (`_build_top_factors_and_risks`) | `label_truth_leverage:would_flag:observe` where the ratio rule flags a name the legacy test misses | D/E read as the ratio both providers deliver (archive medians 0.46 EODHD, 0.51 Yahoo), flagged at 2.0. A ratio of 100 or more stays flagged. |
 | Float (`_canonicalize_provider_row`) | `label_truth_float:outstanding:observe`, legacy value kept | `float_shares` stays blank when only outstanding shares exist. |
 | Country (`_dd_infer_dtype_fmt`) | (nothing to tag on that page) | country / countries typed as text. |
 
 - No tag contains a word the reliability penalty reads (cap, forecast, target, roi, drop, reject).
 - `surface_gate_states()` gains `"label_truth"`.
 - `docs/render_env_contract.md` is regenerated.
+
+## Codex review of #1069 (two P2, both fixed)
+
+1. **Leverage units.** Magnitude was read as a unit: 150 was divided by 100 and lost its flag. EODHD computes D/E as total debt / total equity, so 150 can be a true ratio. Now every value is read as the ratio both providers deliver, flagged at 2.0, and nothing over 100 is cleared.
+2. **Float tag lost.** The float tag was written before the same alias loop mapped the provider's own `warnings` over it. It is now appended after the loop, and a test keeps both.
 
 ## Files
 

@@ -149,8 +149,9 @@ def test_lt8_percent_tag_only_for_big_explicit_strings(monkeypatch):
     (1.99, False, False),
     (2.0, False, True),          # ratio units: flagged under enforce
     (35.0, False, True),         # a bank-like ratio
-    (150.0, True, False),        # percent points 150 % = 1.5: legacy flags it wrongly
-    (250.0, True, True),         # percent points 250 % = 2.5
+    (150.0, True, True),         # Codex P2 on #1069: a true ratio of 150 stays flagged, magnitude is not a unit
+    (589.75, True, True),        # the largest on the 23 Nov page
+    (-3.0, False, False),        # negative equity: not this label
     (None, False, False),
 ])
 def test_lt9_leverage_reads_the_ratio(monkeypatch, de_value, legacy, fixed):
@@ -166,7 +167,7 @@ def test_lt10_leverage_on_the_row(monkeypatch):
     assert "High leverage" in str(scored_row(monkeypatch, "enforce", debt_to_equity=3.5).get("top_risks"))
     assert "High leverage" not in str(scored_row(monkeypatch, "enforce", debt_to_equity=0.4).get("top_risks"))
     assert "High leverage" in str(scored_row(monkeypatch, "off", debt_to_equity=180.0).get("top_risks"))
-    assert "High leverage" not in str(scored_row(monkeypatch, "enforce", debt_to_equity=180.0).get("top_risks"))
+    assert "High leverage" in str(scored_row(monkeypatch, "enforce", debt_to_equity=180.0).get("top_risks"))
 
 
 # --------------------------------------------------------------------------- float
@@ -182,6 +183,12 @@ def test_lt11_outstanding_shares_are_not_the_float(monkeypatch):
         b = de._canonicalize_provider_row(dict(both), "X.US", "X.US", "yahoo")
         assert b.get("float_shares") == 800 and tags(b) == [], mode                 # control: a real float
     assert de._LT_FLOAT_OUTSTANDING <= set(de._CANONICAL_FIELD_ALIASES["float_shares"])
+    # Codex P2 on #1069: the provider's own warnings, mapped by the same loop, keep the tag beside them
+    for mode in (None, "enforce"):
+        _mode(monkeypatch, mode)
+        c = de._canonicalize_provider_row({"symbol": "X.US", "currentPrice": 10, "sharesOutstanding": 1000,
+                                           "warnings": "provider_note"}, "X.US", "X.US", "yahoo")
+        assert "provider_note" in c["warnings"] and len(tags(c)) == 1, c["warnings"]
 
 
 # --------------------------------------------------------------------------- Data_Dictionary

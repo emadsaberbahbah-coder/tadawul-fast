@@ -38,10 +38,10 @@ value and verdict unchanged; off -> byte-identical to v5.162.0)
     wherever a field core.scoring reads with _as_fraction is an explicit
     percent string of 150 % or more; enforce in core.scoring 5.11.5 keeps the
     single division (TFB_LABEL_TRUTH=enforce read there).
-  * leverage: _build_top_factors_and_risks reads D/E as a ratio under enforce
-    (a value of 100 or more is percent points and is divided by 100; flagged at
-    2.0); observe tags label_truth_leverage:<would_flag|would_clear>:observe
-    where the two rules disagree.
+  * leverage: _build_top_factors_and_risks reads D/E as the ratio the
+    providers deliver under enforce, flagged at 2.0 (a ratio of 100 or more
+    stays flagged); observe tags label_truth_leverage:would_flag:observe where
+    the ratio rule flags a name the legacy >= 100 test misses.
   * float: a float_shares value found only under sharesOutstanding is tagged
     label_truth_float:outstanding:<mode>; enforce leaves float_shares blank.
   * Data_Dictionary: enforce types country / countries as text.
@@ -7931,12 +7931,14 @@ def _label_truth_horizon(out: Dict[str, Any]) -> None:
 
 def _label_truth_high_leverage(de: Optional[float], mode: str) -> Tuple[bool, str]:
     """v5.163.0: (flag, observe tag or ''). Legacy: D/E >= 100. Enforce: D/E as
-    a ratio (100 or more is percent points, divided by 100), flagged at 2.0."""
+    the ratio both providers deliver (EODHD total debt / total equity, Yahoo's
+    debtToEquity as the archive shows it: medians 0.46 and 0.51 on 23 Nov 2026),
+    flagged at 2.0. Magnitude is never read as a unit: a ratio of 150 stays
+    flagged (Codex P2 on #1069)."""
     legacy = de is not None and de >= 100
     if mode == "off" or de is None:
         return legacy, ""
-    ratio = de / 100.0 if de >= 100 else de
-    fixed = ratio >= 2.0
+    fixed = de >= 2.0
     if mode == "enforce":
         return fixed, ""
     if fixed != legacy:
@@ -17238,6 +17240,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         "requested_symbol": requested_symbol or symbol,
     }
     _lt_mode = _label_truth_mode()   # v5.163.0
+    _lt_float_tag = ""
     for field, aliases in _CANONICAL_FIELD_ALIASES.items():
         for alias in (field,) + tuple(aliases):
             val = _lookup_alias_value(src, flat, alias)
@@ -17246,11 +17249,15 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                 # the legacy alias, observe -> the legacy value and a tag,
                 # enforce -> float_shares stays blank.
                 if field == "float_shares" and alias in _LT_FLOAT_OUTSTANDING and _lt_mode != "off":
-                    _v573_append_warning(out, "label_truth_float:outstanding:%s" % _lt_mode)
+                    _lt_float_tag = "label_truth_float:outstanding:%s" % _lt_mode
                     if _lt_mode == "enforce":
                         break
                 out[field] = _json_safe(_to_scalar(val))
                 break
+    # v5.163.0: appended after the loop, so the provider's own warnings (mapped
+    # by the same loop) never overwrite it (Codex P2 on #1069)
+    if _lt_float_tag:
+        _v573_append_warning(out, _lt_float_tag)
 
     # v5.77.1: tag forecast_source = "provider_target" when upstream supplied an analyst target.
     # v5.77.2: switched alias matching from naive .lower() to _norm_key_loose() so snake_case
