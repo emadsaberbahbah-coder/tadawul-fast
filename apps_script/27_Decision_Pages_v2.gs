@@ -1,7 +1,18 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.7 (2026-11-25)
+ * Version: 1.4.8 (2026-11-25)
+ *   1.4.8: [EMPTY-FINISHED] A TOP 10 RENDER THAT FINISHED WITH NO SEAT IS THE LIVE BOARD (owner, Wed 25 Nov 2026 15:59
+ *          Riyadh: Top_10_Investments_v2 built 15:42 still showed the 02:17:42 run although the main page held the
+ *          15:22:11 run of the released sync 45602592475). Read at 16:05: Top_10_Investments read 'Last run 2026-11-25
+ *          15:22:11 | status: ok | output: EMPTY | sheets pool 9727 rows', Selected 0 / 10, Scanned 9,727, Passed 0 -
+ *          a render that ran to its end and seated nobody. The 1.4.1 [LAST-GOOD] rule read ANY board with no seat as a
+ *          render Google stopped, so this page printed the 02:17:42 board, its status line, 'output HELD' and the
+ *          amber 'did not finish' line. Now dp2T10LastGoodAction_ takes a second argument: with it, a board with no
+ *          seat whose status reads 'status: ok' and 'output: EMPTY' (and not 'running') is read live; the copy still
+ *          stands in for a board left 'running', in error or without a status. Script Property DP2_T10_EMPTY_LIVE =
+ *          0 / off / false / no = the 1.4.7 rule; anything else, absent or unreadable = on. Display only: no gate,
+ *          verdict, ticket, sizing, alert, order or broker call changes.
  *   1.4.7: [DIV-LOG] THE EXIT ENGINE READS THE LEDGER'S OWN DIVIDEND RECORD (full audit, Wed 25 Nov 2026 09:36
  *          Riyadh). The workbook exported that morning held, on _DP2_Exit_State, SUPN.US 'SELL NOW - stop 33.76 hit'
  *          with entry 35.45 and source 'yahoo (cached)', while the Exit Plan (entry 29.87, dividend-adjusted), the
@@ -549,7 +560,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.7';   // lockstep with the header
+var DP2_VERSION = '1.4.8';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -1527,11 +1538,20 @@ var DP2_T10_LAST_GOOD_PROP = 'DP2_T10_LAST_GOOD';   // 0 / off / false / no = th
 var DP2_T10_LAST_GOOD_SHEET = '_DP2_T10_LastGood';
 var DP2_T10_LG_MEMO_ = null;   // one read (and at most one copy) per execution
 function dp2T10LastGoodOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_T10_LAST_GOOD_PROP)).trim()); }
-/* PURE: what to do with a read of the main page -> 'keep' (copy it), 'use' (read the copy instead) or 'live'. */
-function dp2T10LastGoodAction_(parsed) {
+/* v1.4.8 [EMPTY-FINISHED]: a render that ran to its end and seated nobody is the live board, not a stopped render. */
+var DP2_T10_EMPTY_LIVE_PROP = 'DP2_T10_EMPTY_LIVE';   // 0 / off / false / no = the 1.4.7 rule; default on
+function dp2T10EmptyLiveOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_T10_EMPTY_LIVE_PROP)).trim()); }
+/* PURE: the cockpit's status line of a finished render with no candidate to seat. */
+function dp2T10EmptyFinished_(status) {
+  var s = dp2Str_(status);
+  return /\|\s*status:\s*ok\b/i.test(s) && /\|\s*output:\s*EMPTY\b/i.test(s) && !/running/i.test(s);
+}
+/* PURE: what to do with a read of the main page -> 'keep' (copy it), 'use' (read the copy instead) or 'live'.
+ * v1.4.8: emptyLive (DP2_T10_EMPTY_LIVE) reads a finished empty board live; without it, the 1.4.7 rule. */
+function dp2T10LastGoodAction_(parsed, emptyLive) {
   if (!parsed || !parsed.ok) return 'live';
   if (parsed.seats.length > 0 && !/running/i.test(parsed.status)) return 'keep';
-  if (parsed.seats.length === 0) return 'use';
+  if (parsed.seats.length === 0) return emptyLive && dp2T10EmptyFinished_(parsed.status) ? 'live' : 'use';
   return 'live';
 }
 function dp2ReadTop10_() {
@@ -1541,7 +1561,7 @@ function dp2ReadTop10_() {
   var live = dp2ParseTop10_(vals);
   if (!dp2T10LastGoodOn_()) return live;
   if (DP2_T10_LG_MEMO_ && DP2_T10_LG_MEMO_.liveStatus === live.status && DP2_T10_LG_MEMO_.liveSeats === live.seats.length) return DP2_T10_LG_MEMO_.out;
-  var act = dp2T10LastGoodAction_(live), out = live;
+  var act = dp2T10LastGoodAction_(live, dp2T10EmptyLiveOn_()), out = live;
   try {
     var lg = dp2Sheet_(DP2_T10_LAST_GOOD_SHEET, act === 'keep');
     if (act === 'keep' && lg) {
@@ -4835,6 +4855,19 @@ function dp2V147CoreOk_() {
     return !!(a && b && c);
   } catch (e) { return false; }
 }
+/* v1.4.8 [EMPTY-FINISHED]: the pure core on the 25 Nov status lines. */
+function dp2V148CoreOk_() {
+  try {
+    var done = 'Last run 2026-11-25 15:22:11 | status: ok | output: EMPTY | sheets pool 9727 rows';
+    var a = dp2T10EmptyFinished_(done) && !dp2T10EmptyFinished_('Last run 2026-11-25 08:44:11 | status: running\u2026') &&
+      !dp2T10EmptyFinished_('Last run 2026-11-25 02:17:42 | status: ok | output: HELD') && !dp2T10EmptyFinished_('');
+    var b = dp2T10LastGoodAction_({ ok: true, seats: [], status: done }, true) === 'live' &&
+      dp2T10LastGoodAction_({ ok: true, seats: [], status: done }, false) === 'use' &&
+      dp2T10LastGoodAction_({ ok: true, seats: [], status: 'Last run x | status: running\u2026' }, true) === 'use' &&
+      dp2T10LastGoodAction_({ ok: true, seats: [1], status: 'Last run x | status: ok | output: HELD' }, true) === 'keep';
+    return !!(a && b);
+  } catch (e) { return false; }
+}
 function dp2SelfTest() {
   dp2RunStart_();   // v1.2.23
   var checks = [];
@@ -4874,6 +4907,7 @@ function dp2SelfTest() {
   checks.push({ name: 'v1.4.5 core: a dividend net of the tax recorded for it (DP2_DIV_NET: ' + (dp2DivNetOn_() ? 'on' : 'off') + ')', ok: dp2V145CoreOk_() });
   checks.push({ name: 'v1.4.6 core: the return cell counts dividends received (DP2_RETURN_WITH_DIV: ' + (dp2ReturnColOn_() ? 'on' : 'off') + ')', ok: dp2V146CoreOk_() });
   checks.push({ name: 'v1.4.7 core: the exit engine reads the dividend log (DP2_DIV_LOG: ' + (dp2DivLogOn_() ? 'on' : 'off') + ')', ok: dp2V147CoreOk_() });
+  checks.push({ name: 'v1.4.8 core: a finished empty Top 10 render is the live board (DP2_T10_EMPTY_LIVE: ' + (dp2T10EmptyLiveOn_() ? 'on' : 'off') + ')', ok: dp2V148CoreOk_() });
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var slotN = 0; try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) slotN++; }); } catch (eSl) { slotN = 0; }
   if (slotN) { var slOk = dp2SlotCoreOk_(); checks.push({ name: 'refresh slots (' + DP2_SLOT_HANDLER_ + ' every ' + DP2_SLOT_EVERY_MIN_ + ' min): ' + dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_)).join(',') + ' \u00b7 core ' + (slOk ? 'ok' : 'FAIL') + ' (one page per execution, after the main-page render of the hour)', ok: slOk }); }   // v1.3.0

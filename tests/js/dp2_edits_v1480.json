@@ -1,0 +1,26 @@
+[
+ [
+  " * Version: 1.4.8 (2026-11-25)\n *   1.4.8: [EMPTY-FINISHED] A TOP 10 RENDER THAT FINISHED WITH NO SEAT IS THE LIVE BOARD (owner, Wed 25 Nov 2026 15:59\n *          Riyadh: Top_10_Investments_v2 built 15:42 still showed the 02:17:42 run although the main page held the\n *          15:22:11 run of the released sync 45602592475). Read at 16:05: Top_10_Investments read 'Last run 2026-11-25\n *          15:22:11 | status: ok | output: EMPTY | sheets pool 9727 rows', Selected 0 / 10, Scanned 9,727, Passed 0 -\n *          a render that ran to its end and seated nobody. The 1.4.1 [LAST-GOOD] rule read ANY board with no seat as a\n *          render Google stopped, so this page printed the 02:17:42 board, its status line, 'output HELD' and the\n *          amber 'did not finish' line. Now dp2T10LastGoodAction_ takes a second argument: with it, a board with no\n *          seat whose status reads 'status: ok' and 'output: EMPTY' (and not 'running') is read live; the copy still\n *          stands in for a board left 'running', in error or without a status. Script Property DP2_T10_EMPTY_LIVE =\n *          0 / off / false / no = the 1.4.7 rule; anything else, absent or unreadable = on. Display only: no gate,\n *          verdict, ticket, sizing, alert, order or broker call changes.\n *   1.4.7: [DIV-LOG]",
+  " * Version: 1.4.7 (2026-11-25)\n *   1.4.7: [DIV-LOG]"
+ ],
+ [
+  "var DP2_VERSION = '1.4.8';",
+  "var DP2_VERSION = '1.4.7';"
+ ],
+ [
+  "/* v1.4.8 [EMPTY-FINISHED]: a render that ran to its end and seated nobody is the live board, not a stopped render. */\nvar DP2_T10_EMPTY_LIVE_PROP = 'DP2_T10_EMPTY_LIVE';   // 0 / off / false / no = the 1.4.7 rule; default on\nfunction dp2T10EmptyLiveOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_T10_EMPTY_LIVE_PROP)).trim()); }\n/* PURE: the cockpit's status line of a finished render with no candidate to seat. */\nfunction dp2T10EmptyFinished_(status) {\n  var s = dp2Str_(status);\n  return /\\|\\s*status:\\s*ok\\b/i.test(s) && /\\|\\s*output:\\s*EMPTY\\b/i.test(s) && !/running/i.test(s);\n}\n/* PURE: what to do with a read of the main page -> 'keep' (copy it), 'use' (read the copy instead) or 'live'.\n * v1.4.8: emptyLive (DP2_T10_EMPTY_LIVE) reads a finished empty board live; without it, the 1.4.7 rule. */\nfunction dp2T10LastGoodAction_(parsed, emptyLive) {\n  if (!parsed || !parsed.ok) return 'live';\n  if (parsed.seats.length > 0 && !/running/i.test(parsed.status)) return 'keep';\n  if (parsed.seats.length === 0) return emptyLive && dp2T10EmptyFinished_(parsed.status) ? 'live' : 'use';\n  return 'live';\n}",
+  "/* PURE: what to do with a read of the main page -> 'keep' (copy it), 'use' (read the copy instead) or 'live'. */\nfunction dp2T10LastGoodAction_(parsed) {\n  if (!parsed || !parsed.ok) return 'live';\n  if (parsed.seats.length > 0 && !/running/i.test(parsed.status)) return 'keep';\n  if (parsed.seats.length === 0) return 'use';\n  return 'live';\n}"
+ ],
+ [
+  "  var act = dp2T10LastGoodAction_(live, dp2T10EmptyLiveOn_()), out = live;",
+  "  var act = dp2T10LastGoodAction_(live), out = live;"
+ ],
+ [
+  "/* v1.4.8 [EMPTY-FINISHED]: the pure core on the 25 Nov status lines. */\nfunction dp2V148CoreOk_() {\n  try {\n    var done = 'Last run 2026-11-25 15:22:11 | status: ok | output: EMPTY | sheets pool 9727 rows';\n    var a = dp2T10EmptyFinished_(done) && !dp2T10EmptyFinished_('Last run 2026-11-25 08:44:11 | status: running\\u2026') &&\n      !dp2T10EmptyFinished_('Last run 2026-11-25 02:17:42 | status: ok | output: HELD') && !dp2T10EmptyFinished_('');\n    var b = dp2T10LastGoodAction_({ ok: true, seats: [], status: done }, true) === 'live' &&\n      dp2T10LastGoodAction_({ ok: true, seats: [], status: done }, false) === 'use' &&\n      dp2T10LastGoodAction_({ ok: true, seats: [], status: 'Last run x | status: running\\u2026' }, true) === 'use' &&\n      dp2T10LastGoodAction_({ ok: true, seats: [1], status: 'Last run x | status: ok | output: HELD' }, true) === 'keep';\n    return !!(a && b);\n  } catch (e) { return false; }\n}\nfunction dp2SelfTest() {",
+  "function dp2SelfTest() {"
+ ],
+ [
+  "  checks.push({ name: 'v1.4.7 core: the exit engine reads the dividend log (DP2_DIV_LOG: ' + (dp2DivLogOn_() ? 'on' : 'off') + ')', ok: dp2V147CoreOk_() });\n  checks.push({ name: 'v1.4.8 core: a finished empty Top 10 render is the live board (DP2_T10_EMPTY_LIVE: ' + (dp2T10EmptyLiveOn_() ? 'on' : 'off') + ')', ok: dp2V148CoreOk_() });",
+  "  checks.push({ name: 'v1.4.7 core: the exit engine reads the dividend log (DP2_DIV_LOG: ' + (dp2DivLogOn_() ? 'on' : 'off') + ')', ok: dp2V147CoreOk_() });"
+ ]
+]
