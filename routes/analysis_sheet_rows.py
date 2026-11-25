@@ -2,12 +2,35 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.8.4  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.9.0  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+v4.9.0 (2026-11-25) [COMPACT-SHAPE]: an opt-in compact response. WHY (week
+plan, package 3): the default envelope carries every row as objects five
+times over (row_objects / items / records / data / quotes are one list,
+written out again keyed by header as display_row_objects / display_items /
+display_records / rows_dict_display) plus the matrix three times (rows /
+rows_matrix / matrix) and the contract seven times (headers,
+display_headers, sheet_headers, column_headers, keys, columns, fields). For a
+25-row page of 115 fields most of the bytes a caller receives are repeats.
+WHAT: a request carrying response_shape=market-objects.v1 (query string, GET
+or POST, or the POST body) gets {response_shape, status, request_id, version,
+page, route_family, contract: {keys, headers, count}, rows: [one object per
+row, keyed by the contract keys in contract order], count, detail, error,
+meta}. rows are the legacy row_objects, field for field: the compact form is
+cut from the finished legacy envelope (same projection, coherence pass and
+rank pass), nothing is recomputed; meta is the legacy meta plus
+"response_shape". The parameter is taken out of the body before the request
+is served, so the engine sees what it saw before. A request without the
+parameter, or with any other value, gets the v4.8.4 envelope byte for byte.
+No caller uses it yet; no ENV gate is needed because nothing changes unless a
+caller asks. Functions added 3 (_requested_response_shape,
+_without_response_shape, _compact_market_objects), removed 0. Rollback: git
+revert, or stop sending the parameter.
 
 v4.8.4 (2026-10-13, SECURITY): _auth_passed reads the routed path. It
 matched _is_public_path, and built the path it hands to auth_ok, from
@@ -397,7 +420,7 @@ except Exception:
 
 # v4.8.4 (2026-10-13, SECURITY): _auth_passed reads the ASGI scope path,
 # not the Host-derived request.url.path (see the module docstring).
-ANALYSIS_SHEET_ROWS_VERSION = "4.8.4"
+ANALYSIS_SHEET_ROWS_VERSION = "4.9.0"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -2195,6 +2218,53 @@ def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     return {str(k): _json_safe(row.get(k)) for k in keys}
 
 
+# v4.9.0 [COMPACT-SHAPE]: the one opt-in compact response shape.
+RESPONSE_SHAPE_COMPACT = "market-objects.v1"
+
+
+def _requested_response_shape(request: Any, body: Any) -> str:
+    """The response_shape a caller asked for ('' when none): the query string first, then the POST body."""
+    value: Any = ""
+    try:
+        value = request.query_params.get("response_shape") or ""
+    except Exception:
+        value = ""
+    if not value and isinstance(body, Mapping):
+        value = body.get("response_shape") or ""
+    return str(value or "").strip().lower()
+
+
+def _without_response_shape(body: Any) -> Any:
+    """The body as served before v4.9.0: the response_shape key taken out (a copy; the caller's dict is untouched)."""
+    if isinstance(body, Mapping) and "response_shape" in body:
+        return {k: v for k, v in body.items() if k != "response_shape"}
+    return body
+
+
+def _compact_market_objects(envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    """market-objects.v1: one contract and one list of row objects, cut from a finished legacy envelope."""
+    env = dict(envelope or {})
+    keys = [str(k) for k in (env.get("keys") or [])]
+    headers = [str(h) for h in (env.get("headers") or [])]
+    rows = [r for r in (env.get("row_objects") or []) if isinstance(r, Mapping)]
+    meta = dict(env.get("meta") or {})
+    meta["response_shape"] = RESPONSE_SHAPE_COMPACT
+    return {
+        "response_shape": RESPONSE_SHAPE_COMPACT,
+        "status": env.get("status"),
+        "request_id": env.get("request_id"),
+        "version": env.get("version"),
+        "page": env.get("page"),
+        "route_family": env.get("route_family"),
+        "contract": {"keys": keys, "headers": headers, "count": len(keys)},
+        "rows": [{k: r.get(k) for k in keys} for r in rows],
+        "count": len(rows),
+        "detail": env.get("detail", ""),
+        "error": env.get("error"),
+        "meta": meta,
+    }
+
+
 def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hdrs = list(headers or [])
     ks = list(keys or [])
@@ -3431,10 +3501,14 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
 async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
     start = time.time()
     request_id = _request_id(request, x_request_id)
+    # v4.9.0 [COMPACT-SHAPE]: read the opt-in, then serve the body as before.
+    shape = _requested_response_shape(request, body)
+    body = _without_response_shape(body)
+    compact = shape == RESPONSE_SHAPE_COMPACT
     merged_body = _merge_body_with_query(body, request)
     fallback_page = _normalize_page_flexible(_pick_page_from_body(merged_body) or "Market_Leaders")
     try:
-        return await _analysis_sheet_rows_impl_core(
+        result = await _analysis_sheet_rows_impl_core(
             request=request,
             body=body,
             mode=mode,
@@ -3445,6 +3519,7 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
             authorization=authorization,
             x_request_id=x_request_id,
         )
+        return _compact_market_objects(result) if compact else result
     except HTTPException:
         raise
     except Exception as e:
@@ -3456,7 +3531,7 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
         except Exception:
             pass
         headers, keys, _spec, schema_source = _resolve_contract(fallback_page)
-        return _payload_envelope(
+        fallback = _payload_envelope(
             page=fallback_page,
             route_family=_route_family_flexible(fallback_page),
             headers=headers,
@@ -3477,6 +3552,7 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
                 "_engine_error_class": e.__class__.__name__,
             },
         )
+        return _compact_market_objects(fallback) if compact else fallback
 
 
 # =============================================================================
@@ -3573,6 +3649,7 @@ async def analysis_sheet_rows(
 __all__ = [
     "router",
     "ANALYSIS_SHEET_ROWS_VERSION",
+    "RESPONSE_SHAPE_COMPACT",
     "CORE_ENGINE_SOURCE",
     "CORE_GET_SHEET_ROWS_SOURCE",
 ]

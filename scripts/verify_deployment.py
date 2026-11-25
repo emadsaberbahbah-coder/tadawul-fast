@@ -220,7 +220,8 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "1.20.0", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
-    ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.8.4",
+    # 2026-11-25 (pin only): 4.8.4 -> 4.9.0 (opt-in response_shape=market-objects.v1; default response unchanged).
+    ("routes.analysis_sheet_rows", "ANALYSIS_SHEET_ROWS_VERSION", "4.9.0",
      "analysis sheet publication route"),
     ("core.analysis.top10_selector", "TOP10_SELECTOR_VERSION", "4.31.2",
      "top10 selector"),

@@ -498,7 +498,8 @@ ROUTE_SITES = ["investment_advisor._auth_passed", "analysis_sheet_rows._auth_pas
 # file -> (version constant, expected version, auth function qualname)
 ROUTE_FILES = {
     "routes/investment_advisor.py": ("INVESTMENT_ADVISOR_VERSION", "2.18.1", "_auth_passed"),
-    "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.8.4", "_auth_passed"),
+    # 4.8.4 -> 4.9.0 (2026-11-25): opt-in compact response; _auth_passed and _request_scope_path untouched.
+    "routes/analysis_sheet_rows.py": ("ANALYSIS_SHEET_ROWS_VERSION", "4.9.0", "_auth_passed"),
     # 4.18.2 -> 4.19.0 (2026-10-28): post-earnings guard inputs forwarded on
     # the portfolio route; _auth_passed and _request_scope_path untouched.
     "routes/advanced_analysis.py": ("ADVANCED_ANALYSIS_VERSION", "4.19.0", "_auth_passed"),

@@ -51,13 +51,15 @@ def _load(kind):
         names.update({"_single_quote_handler", "_normalize_row", "_extract_from_raw", "_key_variants"})
     if kind == "analysis":
         names.add("_payload_envelope")
+        # analysis_sheet_rows 4.9.0: the opt-in compact response helpers the handler calls.
+        names.update({"_requested_response_shape", "_without_response_shape", "_compact_market_objects"})
     nodes = [n for n in tree.body
         if isinstance(n, ast.ImportFrom) and n.module == "core.secret_redaction"]
     nodes.extend(n for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names)
     for n in tree.body:
         if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in
-                {"ROUTER_VERSION", "ANALYSIS_SHEET_ROWS_VERSION"} for t in n.targets):
+                {"ROUTER_VERSION", "ANALYSIS_SHEET_ROWS_VERSION", "RESPONSE_SHAPE_COMPACT"} for t in n.targets):
             nodes.append(n)
     if kind == "enriched":
         nodes.extend(n for n in ast.walk(tree)

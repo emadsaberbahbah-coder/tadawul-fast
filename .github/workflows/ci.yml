@@ -2,8 +2,13 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.102 (2026-11-24) -- BIGQUERY SNAPSHOTS
+# VERSION 1.1.103 (2026-11-25) -- FAILED-BATCH LEDGER + COMPACT RESPONSE
 #
+# v1.1.103: run tests/test_analysis_compact_shape.py (routes/analysis_sheet_rows.py
+# 4.9.0, the opt-in market-objects.v1 response) in the route lane, and
+# tests/test_refresh_v1200_failed_ledger.py (apps_script/05_Refresh.gs 1.20.0,
+# the failed-batch ledger, one bounded retry and the PARTIAL status; node
+# harness) beside it. Both are also collected by the whole-suite job.
 # v1.1.102: run tests/test_bq_snapshots.py (scripts/bq_snapshots.py 1.0.0 and
 # .github/workflows/bq_snapshots.yml: the heavy views computed once after each
 # collector; readers take a fresh snapshot, else the view) right after
@@ -1610,6 +1615,8 @@ jobs:
             tests/test_eodhd_error_redaction.py \
             tests/test_margin_unit_cache_contract.py \
             tests/test_analysis_fallback_publication.py \
+            tests/test_analysis_compact_shape.py \
+            tests/test_refresh_v1200_failed_ledger.py \
             tests/test_reviewed_instrument_classes.py \
             tests/test_sukuk_industry_classification.py \
             tests/test_analysis_sheet_rows_rank_withheld.py \

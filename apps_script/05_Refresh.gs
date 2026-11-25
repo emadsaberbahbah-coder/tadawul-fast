@@ -1,8 +1,48 @@
 /**
  * 05_Refresh.gs
  * Tadawul Tracker — Refresh, Build, Validation, Sorting, Batch Refresh
- * Version: 1.19.0
+ * Version: 1.20.0
  *
+ * v1.20.0 (2026-11-25) - FAILED-BATCH LEDGER, ONE BOUNDED RETRY, PARTIAL STATUS
+ * --------------------------------------------------------------------------
+ * WHY (week plan, package 3, refresh reliability): a market page refreshes in
+ * chunks of symbols. When a chunk's fetch failed (backend error, timeout, an
+ * error thrown while writing), its symbols were counted once in failedBatches,
+ * the checkpoint moved past them and nothing ever came back for them in that
+ * run; the page then closed as WARN with 'completed with N failed batch(es)'
+ * and no record of WHICH symbols kept yesterday's row. A pause (timeout,
+ * manual priority, tripwire) lost even that count, and a resumed run could
+ * not know the chunk had failed.
+ * WHAT:
+ *  (1) LEDGER (always on, observe): every symbol of a failed chunk is kept in
+ *      checkpoint.failed {SYMBOL: attempts} - saved with the checkpoint, so it
+ *      survives a pause and a resume. A symbol comes off it only when its row
+ *      is written: one the response leaves out, the keep-last-good filter
+ *      withholds or the writer defers stays on it (Codex P2 on #1078). The run's log carries the count and the warnings name the
+ *      symbols still on it.
+ *  (2) ONE BOUNDED RETRY (Script Property REFRESH_FAILED_RETRY = on): each
+ *      failed symbol is put once more at the tail of the run (checkpoint
+ *      .retried keeps it to one retry), at most REFRESH_FAILED_RETRY_MAX_
+ *      symbols a run. The retry goes through the same fetch / guard / write
+ *      path as any chunk.
+ *  (3) PARTIAL STATUS (same property): a run that ends with symbols still on
+ *      the ledger closes as PARTIAL, naming them, instead of WARN or SUCCESS;
+ *      a failure that the retry recovered no longer turns the run WARN. Their
+ *      rows are never written, so the previous (last-good) values stay: the
+ *      upsert never deletes.
+ *  (4) A checkpoint now records baseCount, the length of the requested list;
+ *      isCheckpointCompatible_ compares that prefix, so a run paused after a
+ *      retry or a v1.13.0 requeue resumes where it stopped instead of starting
+ *      the page again, and a chunk stops at baseCount, so a first try never
+ *      shares a request with a symbol that already failed. A checkpoint
+ *      without baseCount is compared and cut as before.
+ * REFRESH_FAILED_RETRY unset / off / anything but on = observe: no retry, the
+ * status as in 1.19.0, one '[v1.20.0 FAILED-LEDGER observe]' warning line
+ * naming what the property would retry. Rollback: leave the property unset.
+ * ES5. ZERO functions removed; SIX functions added (_refreshFailedRetryMode_,
+ * _refreshNoteFailedChunk_, _refreshLedgerKey_, _refreshClearFailedChunk_,
+ * _refreshWrittenKeys_, _refreshFailedSymbols_).
+ * --------------------------------------------------------------------------
  * v1.18.1 — COCKPIT GUARD FAILS CLOSED + RUNTIME VERSION CONSTANT
  * --------------------------------------------------------------------------
  * (2026-08-11 suite review.)
@@ -777,7 +817,7 @@
  * Runtime constants
  * ========================================================= */
 /* v1.18.1: suite-standard runtime version (header kept in lockstep). */
-var REFRESH_VERSION = '1.19.0';
+var REFRESH_VERSION = '1.20.0';
 /* -----------------------------------------------------------------------------
  * v1.19.0 (2026-08-29) - BACKEND-HOLD PRE-WRITE TRIPWIRE (SPANNING-CHUNK FIX)
  * -----------------------------------------------------------------------------
@@ -832,6 +872,9 @@ var REFRESH_VERSION = '1.19.0';
 var REFRESH_BATCH_SIZE_DEFAULT_ = 10;
 var REFRESH_MAX_RUNTIME_MS_ = 240000;
 var REFRESH_CHECKPOINT_PREFIX_ = 'TFB_BATCH_CHECKPOINT::';
+/* v1.20.0 [FAILED-LEDGER]: one bounded retry of failed-batch symbols (property 'on'), else observe. */
+var REFRESH_FAILED_RETRY_PROPERTY_ = 'REFRESH_FAILED_RETRY';
+var REFRESH_FAILED_RETRY_MAX_ = 60;
 var REFRESH_STATUS_PANEL_BUFFER_COLS_ = 5;
 var REFRESH_STATUS_PANEL_SWEEP_ROWS_ = 10;
 var REFRESH_PANEL_LABEL_TOKENS_ = ['Status', 'Message', 'Warnings', 'Updated'];
@@ -4641,7 +4684,10 @@ function refreshPageInBatchesCore_(pageName, options) {
       batchSize: batchSize,
       symbols: symbols.slice(),
       nextIndex: 0,
-      totalSymbols: symbols.length
+      totalSymbols: symbols.length,
+      baseCount: symbols.length,   /* v1.20.0 */
+      failed: {},
+      retried: {}
     };
     saveBatchCheckpoint_(page.pageName, checkpoint);
   }
@@ -4665,6 +4711,12 @@ function refreshPageInBatchesCore_(pageName, options) {
   var totalSecondChance = 0;
   var totalPlacementAborted = 0;
   checkpoint.requeued = checkpoint.requeued || {};
+  /* v1.20.0 [FAILED-LEDGER] state: the ledger rides on the checkpoint. */
+  checkpoint.failed = checkpoint.failed || {};
+  checkpoint.retried = checkpoint.retried || {};
+  var failedRetryMode = _refreshFailedRetryMode_();
+  var totalRetried = 0;
+  var totalRecovered = 0;
   /* v1.14.0 KEEP-LAST-GOOD state: one identity read at batch start (each
    * symbol is written at most once per run, so the map stays accurate for
    * the whole loop; requeued guard-deferrals were never written). */
@@ -4807,7 +4859,14 @@ function refreshPageInBatchesCore_(pageName, options) {
         canonicalDrift: driftMissing.length
       };
     }
-    var chunk = checkpoint.symbols.slice(checkpoint.nextIndex, checkpoint.nextIndex + batchSize);
+    /* v1.20.0: a chunk never mixes the requested list with the retry/requeue tail (a first try never
+     * shares a request with a symbol that already failed). A checkpoint without baseCount is cut as before. */
+    var chunkEnd = checkpoint.nextIndex + batchSize;
+    if (typeof checkpoint.baseCount === 'number' && checkpoint.nextIndex < checkpoint.baseCount &&
+        chunkEnd > checkpoint.baseCount) {
+      chunkEnd = checkpoint.baseCount;
+    }
+    var chunk = checkpoint.symbols.slice(checkpoint.nextIndex, chunkEnd);
     /* v1.19.0: fingerprint the backend-hold row before the slow fetch. */
     var backendHoldSnap = _refreshBackendHoldSnapshot_();
     try {
@@ -4823,6 +4882,7 @@ function refreshPageInBatchesCore_(pageName, options) {
       if (!fetchResult || !fetchResult.ok) {
         failedBatches++;
         allWarnings.push('Batch failed: ' + chunk.join(', '));
+        totalRetried += _refreshNoteFailedChunk_(checkpoint, chunk, failedRetryMode, REFRESH_FAILED_RETRY_MAX_);   // v1.20.0
         checkpoint.nextIndex += chunk.length;
         saveBatchCheckpoint_(page.pageName, checkpoint);
 
@@ -4943,6 +5003,7 @@ function refreshPageInBatchesCore_(pageName, options) {
         var provSummary = _injectProvenanceFields_(rowObjects, fetchResult, page.pageName);
         totalProvenanceFilled += (provSummary.filledUtc || 0);
       }
+      var chunkWritten = {};   // v1.20.0: ledger keys of the rows this chunk wrote
       if (rows2d.length || rowObjects.length) {
         if (useHeaderMappedBatch && rowObjects.length === 0 && rows2d.length > 0) {
           _logEmptyRowObjectsWarning_(page.pageName, batchSize, chunk);
@@ -4984,6 +5045,8 @@ function refreshPageInBatchesCore_(pageName, options) {
             allWarnings.push('Unmapped sheet columns (left blank): ' + upsertResult.unmappedHeaders.join(', '));
           }
         }
+        chunkWritten = _refreshWrittenKeys_(rowObjects, rows2d, headers, useHeaderMappedBatch && rowObjects.length > 0,
+          upsertResult && typeof upsertResult === 'object' ? upsertResult.deferredSymbols : null);   // v1.20.0
         /* v1.13.0: our own writes moved the tail — re-baseline so the
          * tripwire trips only on FOREIGN changes, never on ourselves. */
         if (tripwireOn) {
@@ -5008,9 +5071,11 @@ function refreshPageInBatchesCore_(pageName, options) {
         allWarnings = allWarnings.concat(fetchResult.warnings);
       }
       successfulBatches++;
+      totalRecovered += _refreshClearFailedChunk_(checkpoint, chunk, chunkWritten);   // v1.20.0
     } catch (err) {
       failedBatches++;
       allWarnings.push(getRefreshErrorMessage_(err));
+      totalRetried += _refreshNoteFailedChunk_(checkpoint, chunk, failedRetryMode, REFRESH_FAILED_RETRY_MAX_);   // v1.20.0
     }
     checkpoint.nextIndex += chunk.length;
     saveBatchCheckpoint_(page.pageName, checkpoint);
@@ -5040,7 +5105,21 @@ function refreshPageInBatchesCore_(pageName, options) {
     }
   }
   allWarnings = uniqueStrings_(allWarnings);
+  /* v1.20.0 [FAILED-LEDGER]: read the ledger before the checkpoint goes. */
+  var unwrittenSymbols = _refreshFailedSymbols_(checkpoint);
   clearBatchCheckpoint_(page.pageName);
+  if (unwrittenSymbols.length || totalRetried) {
+    var ledgerList = unwrittenSymbols.slice(0, 20).join(',') +
+      (unwrittenSymbols.length > 20 ? ',...(+' + (unwrittenSymbols.length - 20) + ')' : '');
+    if (failedRetryMode === 'on') {
+      allWarnings.push('[v1.20.0 FAILED-LEDGER] retried=' + totalRetried + ' recovered=' + totalRecovered +
+        ' unwritten=' + unwrittenSymbols.length + (unwrittenSymbols.length ? ' (previous rows kept): ' + ledgerList : ''));
+    } else {
+      allWarnings.push('[v1.20.0 FAILED-LEDGER observe] ' + unwrittenSymbols.length +
+        ' symbol(s) in failed batches kept their previous rows: ' + ledgerList +
+        '; with REFRESH_FAILED_RETRY=on each would be retried once and the run would close PARTIAL if any stayed unwritten.');
+    }
+  }
   /* v1.13.0: surface the run's guard telemetry once. */
   if (totalDeferred || totalAppendAborted || totalSecondChance || totalPlacementAborted) {
     allWarnings.push('[v1.13.0 GUARDS] place_aborted=' + totalPlacementAborted +
@@ -5104,7 +5183,23 @@ function refreshPageInBatchesCore_(pageName, options) {
   var batchSeverity = failedBatches || verifyIssues || !postValidation.ok ? 'WARN' : 'INFO';
   var batchStatus = failedBatches || verifyIssues || !postValidation.ok ? 'WARN' : 'OK';
   var batchMsg;
-  if (failedBatches && verifyIssues) {
+  /* v1.20.0 [FAILED-LEDGER] mode 'on': the ledger, not the failed-batch count, decides. */
+  var ledgerOn = failedRetryMode === 'on';
+  if (ledgerOn) {
+    batchStatus = unwrittenSymbols.length ? 'PARTIAL' : (verifyIssues || !postValidation.ok ? 'WARN' : 'OK');
+    batchSeverity = batchStatus === 'OK' ? 'INFO' : 'WARN';
+  }
+  if (ledgerOn && unwrittenSymbols.length) {
+    batchMsg = 'Batch refresh partial: ' + unwrittenSymbols.length + ' symbol(s) stayed unwritten after one retry and keep their previous rows' +
+      (verifyIssues ? '; ' + verifyIssues + ' verify issue(s)' : '') + '.';
+  } else if (ledgerOn && !verifyIssues && postValidation.ok) {
+    batchMsg = totalRecovered ? 'Batch refresh completed successfully; the retry recovered ' + totalRecovered + ' symbol(s) of failed batches.'
+      : 'Batch refresh completed successfully.';
+  } else if (ledgerOn && verifyIssues) {
+    batchMsg = 'Batch refresh completed with ' + verifyIssues + ' verify issue(s).';
+  } else if (ledgerOn) {
+    batchMsg = 'Batch refresh completed but post-refresh validation found warnings.';
+  } else if (failedBatches && verifyIssues) {
     batchMsg = 'Batch refresh completed with ' + failedBatches + ' failed batch(es), ' + verifyIssues + ' verify issue(s), and validation status=' + postValidation.ok + '.';
   } else if (failedBatches) {
     batchMsg = 'Batch refresh completed with ' + failedBatches + ' failed batch(es).';
@@ -5115,8 +5210,9 @@ function refreshPageInBatchesCore_(pageName, options) {
   } else {
     batchMsg = 'Batch refresh completed successfully.';
   }
+  var batchPanelStatus = batchStatus === 'OK' ? 'SUCCESS' : (batchStatus === 'PARTIAL' ? 'PARTIAL' : 'WARN');   // v1.20.0
   writePageStatusPanel_(sheet, {
-    status: batchStatus === 'OK' ? 'SUCCESS' : 'WARN',
+    status: batchPanelStatus,
     message: batchMsg,
     warnings: allWarnings
   }, Math.max(readCurrentSheetHeaders_(sheet).length, 1), page.pageName);
@@ -5144,12 +5240,16 @@ function refreshPageInBatchesCore_(pageName, options) {
       appended: totalAppended,
       skipped: totalSkipped,
       keptLastGood: totalKeptLastGood,
+      failedLedger: unwrittenSymbols.length,
+      failedRetried: totalRetried,
+      failedRecovered: totalRecovered,
+      failedRetryMode: failedRetryMode,
       postValidationOk: postValidation.ok,
       path: useHeaderMappedBatch ? 'header-mapped' : (legacyPathRequested ? 'positional-forced' : 'positional')
     }
   );
   writePageStatus_(page.pageName, {
-    status: batchStatus === 'OK' ? 'SUCCESS' : 'WARN',
+    status: batchPanelStatus,
     message: batchMsg,
     endpoint: endpointUsed,
     httpCode: '',
@@ -5176,6 +5276,11 @@ function refreshPageInBatchesCore_(pageName, options) {
     skipped: totalSkipped,
     keptLastGood: totalKeptLastGood,
     keptLastGoodSymbols: klgWithheldAll,
+    partial: batchStatus === 'PARTIAL',
+    unwrittenSymbols: unwrittenSymbols,
+    failedRetried: totalRetried,
+    failedRecovered: totalRecovered,
+    failedRetryMode: failedRetryMode,
     path: useHeaderMappedBatch ? 'header-mapped' : (legacyPathRequested ? 'positional-forced' : 'positional'),
     canonicalDrift: driftMissing.length,
     postValidation: postValidation
@@ -5796,8 +5901,96 @@ function isCheckpointCompatible_(checkpoint, symbols, batchSize, pageName) {
   if (checkpoint.pageName !== pageName) return false;
   if (checkpoint.batchSize !== batchSize) return false;
   if (!Array.isArray(checkpoint.symbols)) return false;
+  /* v1.20.0: a retry or a requeue lengthens the list; the requested prefix decides. */
+  if (typeof checkpoint.baseCount === 'number' && checkpoint.baseCount === symbols.length &&
+      checkpoint.symbols.length >= symbols.length) {
+    return arraysEqual_(checkpoint.symbols.slice(0, symbols.length), symbols);
+  }
   if (checkpoint.symbols.length !== symbols.length) return false;
   return arraysEqual_(checkpoint.symbols, symbols);
+}
+/* v1.20.0 [FAILED-LEDGER]: 'on' = retry once and close PARTIAL; anything else = 'observe'. */
+function _refreshFailedRetryMode_() {
+  try {
+    var v = PropertiesService.getScriptProperties().getProperty(REFRESH_FAILED_RETRY_PROPERTY_);
+    return String(v === null || v === undefined ? '' : v).trim().toLowerCase() === 'on' ? 'on' : 'observe';
+  } catch (e) {
+    return 'observe';
+  }
+}
+/* v1.20.0 PURE (on the checkpoint object): the symbols of a failed chunk go on checkpoint.failed
+ * (attempts counted); in mode 'on' each one not yet retried is put once at the tail of the run,
+ * at most cap symbols a run. -> the number put back. */
+function _refreshNoteFailedChunk_(checkpoint, chunk, mode, cap) {
+  checkpoint.failed = checkpoint.failed || {};
+  checkpoint.retried = checkpoint.retried || {};
+  var added = 0;
+  var used = 0;
+  for (var k in checkpoint.retried) {
+    if (Object.prototype.hasOwnProperty.call(checkpoint.retried, k)) used++;
+  }
+  for (var i = 0; i < (chunk || []).length; i++) {
+    var sym = String(chunk[i] || '').trim().toUpperCase();
+    if (!sym) continue;
+    checkpoint.failed[sym] = (checkpoint.failed[sym] || 0) + 1;
+    if (mode !== 'on' || checkpoint.retried[sym] || used >= cap) continue;
+    checkpoint.retried[sym] = 1;
+    used++;
+    checkpoint.symbols.push(chunk[i]);
+    checkpoint.totalSymbols++;
+    added++;
+  }
+  return added;
+}
+/* v1.20.0 PURE: the key a requested symbol and a written row are matched on (upper case, a '.US' ending dropped). */
+function _refreshLedgerKey_(sym) {
+  return String(sym == null ? '' : sym).trim().toUpperCase().replace(/\.US$/, '');
+}
+/* v1.20.0 PURE: only the symbols of the chunk whose rows were written (written: {ledger key: 1}) come off the
+ * ledger; one the response left out, the keep-last-good filter withheld or the writer deferred stays on it
+ * (Codex P2 on #1078: a successful fetch is not a written row). */
+function _refreshClearFailedChunk_(checkpoint, chunk, written) {
+  if (!checkpoint.failed) return 0;
+  var cleared = 0;
+  for (var i = 0; i < (chunk || []).length; i++) {
+    var sym = String(chunk[i] || '').trim().toUpperCase();
+    if (!sym || !Object.prototype.hasOwnProperty.call(checkpoint.failed, sym)) continue;
+    if (!written || !Object.prototype.hasOwnProperty.call(written, _refreshLedgerKey_(sym))) continue;
+    delete checkpoint.failed[sym];
+    cleared++;
+  }
+  return cleared;
+}
+/* v1.20.0 PURE: the ledger keys of the rows handed to the writer, less the symbols it deferred. */
+function _refreshWrittenKeys_(rowObjects, rows2d, headers, useObjects, deferred) {
+  var out = {}, i;
+  if (useObjects) {
+    for (i = 0; i < (rowObjects || []).length; i++) {
+      var r = rowObjects[i] || {};
+      var s = r.symbol !== undefined && r.symbol !== null && r.symbol !== '' ? r.symbol : r.Symbol;
+      if (s !== undefined && s !== null && String(s).trim()) out[_refreshLedgerKey_(s)] = 1;
+    }
+  } else {
+    var col = -1;
+    for (i = 0; i < (headers || []).length; i++) {
+      if (String(headers[i] || '').trim().toLowerCase() === 'symbol') { col = i; break; }
+    }
+    for (i = 0; col >= 0 && i < (rows2d || []).length; i++) {
+      var v = (rows2d[i] || [])[col];
+      if (v !== undefined && v !== null && String(v).trim()) out[_refreshLedgerKey_(v)] = 1;
+    }
+  }
+  for (i = 0; i < (deferred || []).length; i++) delete out[_refreshLedgerKey_(deferred[i])];
+  return out;
+}
+/* v1.20.0 PURE: the symbols still on the ledger, sorted. */
+function _refreshFailedSymbols_(checkpoint) {
+  var out = [];
+  var f = (checkpoint && checkpoint.failed) || {};
+  for (var k in f) {
+    if (Object.prototype.hasOwnProperty.call(f, k)) out.push(k);
+  }
+  return out.sort();
 }
 function upsertRowsBySymbol_(sheet, headers, rows2d, preserveColumns, preserveOnEmptyColumns, options) {
   headers = headers || [];
