@@ -11,9 +11,13 @@
 --   universe    the US (.US) and Saudi (.SR) shares with daily bars in symbol_bars_daily - the names the project
 --               followed, not the whole market - each beside its market's own reading in market_series_daily
 --               (SPY, ^TASI.SR), adjusted closes, on the days both have a close
---   the fall    the first close whose 15-session return is -8 % or lower (the day before was above -8 %), one
---               event per stock in 20 sessions; a fall beyond -60 % or a later move of 150 % is left out as a data
---               error (an unadjusted split)
+--   the fall    a close whose 15-session return is -8 % or lower when the day before was above -8 % (a crossing);
+--               a share's first crossing is an event, and then the first crossing more than 20 sessions after the
+--               last EVENT (Codex P2 on #1085: the cooldown runs from the last kept event, never from a crossing
+--               that was itself left out). In SQL without recursion: per share the crossings as an array a; p1[i]
+--               the position of the first crossing more than 20 sessions after crossing i (-1: none); p2 .. p32
+--               that pointer doubled; r1 .. r6 the positions reached from the first crossing in up to 63 steps.
+--               A fall beyond -60 % or a later move of 150 % is left out as a data error (an unadjusted split)
 --   cause       the market's return over the same 15 sessions: 'with the market' at -5 % or lower, 'on its own' at
 --               -1 % or better, else 'mixed'
 --   verdict     'hard limit' at a fall of 15 % or more; 'wait' for a fall with the market that is at most 5 points
@@ -60,10 +64,36 @@ ev AS (
     AND 100 * (SAFE_DIVIDE(s.close, s.c_base) - 1) <= -8
     AND 100 * (SAFE_DIVIDE(s.c_prev, s.c_prev_base) - 1) > -8
 ),
+cand AS (
+  SELECT symbol, ARRAY_AGG(n ORDER BY n) AS a
+  FROM ev
+  GROUP BY symbol
+),
+h1 AS (
+  SELECT symbol, a,
+    ARRAY(SELECT IFNULL((SELECT MIN(k) FROM UNNEST(a) AS y WITH OFFSET k WHERE y > x + 20), -1)
+          FROM UNNEST(a) AS x WITH OFFSET i ORDER BY i) AS p1
+  FROM cand
+),
+h2 AS (SELECT *, ARRAY(SELECT IFNULL(p1[SAFE_OFFSET(v)], -1) FROM UNNEST(p1) AS v WITH OFFSET i ORDER BY i) AS p2 FROM h1),
+h4 AS (SELECT *, ARRAY(SELECT IFNULL(p2[SAFE_OFFSET(v)], -1) FROM UNNEST(p2) AS v WITH OFFSET i ORDER BY i) AS p4 FROM h2),
+h8 AS (SELECT *, ARRAY(SELECT IFNULL(p4[SAFE_OFFSET(v)], -1) FROM UNNEST(p4) AS v WITH OFFSET i ORDER BY i) AS p8 FROM h4),
+h16 AS (SELECT *, ARRAY(SELECT IFNULL(p8[SAFE_OFFSET(v)], -1) FROM UNNEST(p8) AS v WITH OFFSET i ORDER BY i) AS p16 FROM h8),
+h32 AS (SELECT *, ARRAY(SELECT IFNULL(p16[SAFE_OFFSET(v)], -1) FROM UNNEST(p16) AS v WITH OFFSET i ORDER BY i) AS p32 FROM h16),
+g1 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST([0, p1[OFFSET(0)]]) AS v WHERE v >= 0) AS r1 FROM h32),
+g2 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST(ARRAY_CONCAT(r1, ARRAY(SELECT IFNULL(p2[SAFE_OFFSET(u)], -1) FROM UNNEST(r1) AS u))) AS v WHERE v >= 0) AS r2 FROM g1),
+g3 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST(ARRAY_CONCAT(r2, ARRAY(SELECT IFNULL(p4[SAFE_OFFSET(u)], -1) FROM UNNEST(r2) AS u))) AS v WHERE v >= 0) AS r3 FROM g2),
+g4 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST(ARRAY_CONCAT(r3, ARRAY(SELECT IFNULL(p8[SAFE_OFFSET(u)], -1) FROM UNNEST(r3) AS u))) AS v WHERE v >= 0) AS r4 FROM g3),
+g5 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST(ARRAY_CONCAT(r4, ARRAY(SELECT IFNULL(p16[SAFE_OFFSET(u)], -1) FROM UNNEST(r4) AS u))) AS v WHERE v >= 0) AS r5 FROM g4),
+g6 AS (SELECT symbol, a, ARRAY(SELECT DISTINCT v FROM UNNEST(ARRAY_CONCAT(r5, ARRAY(SELECT IFNULL(p32[SAFE_OFFSET(u)], -1) FROM UNNEST(r5) AS u))) AS v WHERE v >= 0) AS r6 FROM g5),
+chain AS (
+  SELECT g.symbol, g.a[OFFSET(v)] AS n
+  FROM g6 g, UNNEST(g.r6) AS v
+),
 kept AS (
   SELECT e.*
   FROM ev e
-  QUALIFY IFNULL(e.n - LAG(e.n) OVER (PARTITION BY e.symbol ORDER BY e.date), 999) > 20
+  JOIN chain USING (symbol, n)
 ),
 path AS (
   SELECT k.symbol, k.date AS event_date, f.n - k.n AS d,

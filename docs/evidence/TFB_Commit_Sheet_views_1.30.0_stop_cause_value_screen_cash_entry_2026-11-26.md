@@ -12,7 +12,7 @@ The answer of that night proposed three things to measure before anything is swi
 ## Change
 | # | File | What it holds |
 |---|---|---|
-| 131 | `v_stop_cause_events` | US and Saudi shares with bars: the first close at −8 % over 15 sessions (one event per share in 20 sessions); the cause from the market's own 15 sessions (with the market ≤ −5 %, on its own ≥ −1 %, mixed); the verdict of the ladder under test (hard limit at −15 %, wait on a fall with the market inside 5 points, else stop stands); the next 5, 10, 20 sessions, the worst close, and the rule's own exits |
+| 131 | `v_stop_cause_events` | US and Saudi shares with bars: a close crossing −8 % over 15 sessions (a share's first crossing, then the first one more than 20 sessions after the last kept event); the cause from the market's own 15 sessions (with the market ≤ −5 %, on its own ≥ −1 %, mixed); the verdict of the ladder under test (hard limit at −15 %, wait on a fall with the market inside 5 points, else stop stands); the next 5, 10, 20 sessions, the worst close, and the rule's own exits |
 | 132 | `v_stop_cause_learning` | its record against selling at the fall, per period, market, cause, verdict and arm, with a fixed reading |
 | 133 | `v_value_screen` | each archived night, the US shares passing: market cap ≥ 2 bn, 0 < forward P/E ≤ 15, free cash flow > 0, quality ≥ 65, analyst upside ≥ 20 %, lower 35 % of the 52-week range, data quality ≥ 80, reliability ≥ 70 — beside the engine's label |
 | 134 | `v_trial_value_screen` | that list and the engine's INVESTABLE names against all liquid US names of the same night, 1W and 2W on |
@@ -31,15 +31,19 @@ Run on the archive on 26 Nov with the SQL of these files.
 
 | Market | Cause · verdict | Events | Days | Mean | Higher | Against the market | t by day |
 |---|---|---|---|---|---|---|---|
-| US | with the market · wait | 314 | 22 | +5.79 % | 72.0 % | −0.35 pts | 0.62 |
-| US | with the market · wait, the rule's exits | 314 | 22 | +3.64 % | 53.5 % | — | 0.92 |
-| US | on its own · stop stands | 1,535 | 343 | +0.74 % | 52.3 % | +0.44 pts | 1.15 |
-| US | on its own · hard limit | 86 | 70 | −9.59 % | 40.7 % | −9.75 pts | −1.60 |
-| Saudi | with the market · wait | 227 | 33 | +1.87 % | 58.1 % | +0.41 pts | 0.27 |
-| Saudi | on its own · stop stands | 358 | 122 | −3.04 % | 33.2 % | −1.72 pts | −0.87 |
-| Saudi | mixed · stop stands | 1,088 | 188 | −1.95 % | 38.1 % | −1.55 pts | −1.74 |
+| US | with the market · wait | 379 | 22 | +6.82 % | 73.4 % | +0.16 pts | 0.96 |
+| US | with the market · wait, the rule's exits | 379 | 22 | +4.41 % | 54.1 % | — | 1.22 |
+| US | mixed · stop stands | 770 | 81 | +2.55 % | 60.4 % | +1.53 pts | 1.47 |
+| US | on its own · stop stands | 1,767 | 359 | +0.68 % | 51.3 % | +0.37 pts | 1.45 |
+| US | on its own · hard limit | 112 | 83 | −9.73 % | 39.3 % | −9.77 pts | −1.93 |
+| Saudi | with the market · wait | 291 | 33 | +1.81 % | 56.7 % | +0.16 pts | 0.16 |
+| Saudi | with the market · wait, the rule's exits | 291 | 33 | −0.15 % | 34.0 % | — | −0.63 |
+| Saudi | on its own · stop stands | 412 | 136 | −2.49 % | 35.7 % | −1.41 pts | −0.90 |
+| Saudi | mixed · stop stands | 1,220 | 194 | −1.69 % | 39.3 % | −1.46 pts | −1.74 |
 
-What it says, and what it does not: after a fall with the market, US shares were higher 20 sessions later in 72 % of cases — but no better than the market itself (−0.35 points), on 22 days only, and nowhere near statistically clear (t 0.6). The gain is the market's rebound, not the share's. The rule's own exits cost about 2 points of it. A share that fell 15 % on its own kept falling (−9.6 %). Saudi shares that fell on their own or in a mixed fall kept falling. Nothing here reaches t 2.
+What it says, and what it does not: after a fall with the market, US shares were higher 20 sessions later in 73 % of cases — but level with the market itself (+0.16 points), on 22 days only, and not statistically clear (t 1.0). The gain is the market's rebound, not the share's. The rule's own exits cost about 2.4 points of it. A share that fell 15 % on its own kept falling (−9.7 %). Saudi shares that fell on their own or in a mixed fall kept falling, and for them the rule's exits gave nothing. Nothing here reaches t 2.
+
+Events are one per share per 20 sessions counted from the last kept event (Codex P2 on #1085; the first cut counted from the last crossing and held 314 US "wait" cases — the reading is the same).
 
 **Value screen against all liquid US names (19 nights, 31 Oct – 18 Nov, a falling market)**
 
@@ -65,10 +69,10 @@ Ten signals in three rising years. t between 1.1 and 1.9.
 ## Tests
 | Battery | Result |
 |---|---|
-| `tests/test_bq_views.py` (66; new `case_v66`) | order, kinds, pinned body hashes (six in PENDING), static checks, the fragments of each rule, history tested first in every reading, no clock, the ladder mirrored, the Exit Plan's knobs equal to the view's limits when both are in the tree |
+| `tests/test_bq_views.py` (66; new `case_v66`) | order, kinds, pinned body hashes (six in PENDING), static checks, the fragments of each rule, history tested first in every reading, no clock, the ladder mirrored, the cooldown's array steps mirrored in Python against the plain greedy rule (300 random cases, Codex's example, a row read on the archive), the Exit Plan's knobs equal to the view's limits when both are in the tree |
 | `tests/test_learning_watch.py` (+8 cases) | 21 records; each reading of the three views lands in its group forward and IN-SAMPLE for history |
 | `tests/test_verify_manifest_pins.py`, `tests/test_bq_snapshots.py` | pass |
-| BigQuery | each view's SELECT run on the archive on 26 Nov (results above) |
+| BigQuery | each view's SELECT run on the archive on 26 Nov (results above); the kept events of the 80 shares with the most crossings read back and checked by hand on three |
 
 ## After merge (no owner step)
 Claude dispatches `bq_views` write on main (six views created, 98 unchanged), then reads back `--verify`. The next Learning Watch run shows the three records under IN-SAMPLE; their forward rows start collecting from 26 Nov.

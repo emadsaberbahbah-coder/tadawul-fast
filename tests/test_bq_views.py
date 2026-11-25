@@ -374,7 +374,7 @@ PENDING = {
     "v_symbol_news_class_now": "38ff5cce252f76514b47b894eaaabd9f6483597dc539aae651493f0ce585f35c",
     # apply_bq_views 1.30.0 (26 Nov 2026): the stop judgment, the value screen and the cash entry - each a shadow
     # record with its fixed reading (research only)
-    "v_stop_cause_events": "ee96eadcf81f0f6673c29e49fe066ac6e2869bb427e819360a4a35898e7c8fa3",
+    "v_stop_cause_events": "8f5b013d247da32e99c8251bc8b281edc2364f9243cd1380864aa046c0a4cb70",
     "v_stop_cause_learning": "a434e428ae8d84619c3758ca1bb051b9f96f0e5aee43f63e81973f9b9e59f18f",
     "v_value_screen": "2c61919b54e971443bcf9d69c5a1160575587ddec3b08b8b8d6a57efd7c3384c",
     "v_trial_value_screen": "9b66d56d4f89c567d79e1688037198fb5a7a259f08014613364c1cdbdf8de94e",
@@ -4075,7 +4075,14 @@ def case_v66():
                  "LAG(x.close, 15) OVER w AS c_base, LAG(i.m_close, 15) OVER w AS m_base,",
                  "AND 100 * (SAFE_DIVIDE(s.close, s.c_base) - 1) <= -8",
                  "AND 100 * (SAFE_DIVIDE(s.c_prev, s.c_prev_base) - 1) > -8",
-                 "QUALIFY IFNULL(e.n - LAG(e.n) OVER (PARTITION BY e.symbol ORDER BY e.date), 999) > 20",
+                 # Codex P2 on #1085: the cooldown runs from the last KEPT event - per share the crossings as an
+                 # array, each one's next eligible crossing as a pointer, the pointer doubled, the chain from the first
+                 "SELECT symbol, ARRAY_AGG(n ORDER BY n) AS a",
+                 "ARRAY(SELECT IFNULL((SELECT MIN(k) FROM UNNEST(a) AS y WITH OFFSET k WHERE y > x + 20), -1)",
+                 "h32 AS (SELECT *, ARRAY(SELECT IFNULL(p16[SAFE_OFFSET(v)], -1) FROM UNNEST(p16) AS v WITH OFFSET i ORDER BY i) AS p32 FROM h16),",
+                 "g1 AS (SELECT *, ARRAY(SELECT DISTINCT v FROM UNNEST([0, p1[OFFSET(0)]]) AS v WHERE v >= 0) AS r1 FROM h32),",
+                 "SELECT g.symbol, g.a[OFFSET(v)] AS n",
+                 "JOIN chain USING (symbol, n)",
                  # the cause and the verdict, from figures known at the event close
                  "CASE WHEN k.m15 <= -5 THEN 'with the market' WHEN k.m15 >= -1 THEN 'on its own' ELSE 'mixed' END AS cause",
                  "WHEN k.s15 <= -15 THEN 'hard limit'",
@@ -4089,6 +4096,40 @@ def case_v66():
                  "CASE WHEN k.date < DATE '2026-11-26' THEN 'history, in-sample' ELSE 'forward from 2026-11-26' END AS period"):
         assert frag in se, frag
     assert "LEAD(" not in se and "FOLLOWING" not in se             # the path join is the only look forward
+    assert "QUALIFY IFNULL(e.n - LAG(e.n)" not in se               # never a cooldown from a crossing that was left out
+    # every CTE of the chain reads the one before it once: the plan stays linear (a join-based doubling was refused
+    # by BigQuery as too complex on 26 Nov)
+    for k, prev in (("h2", "h1"), ("h4", "h2"), ("h8", "h4"), ("h16", "h8"), ("h32", "h16"), ("g1", "h32"), ("g2", "g1"),
+                    ("g3", "g2"), ("g4", "g3"), ("g5", "g4"), ("g6", "g5")):
+        line = [x for x in se.splitlines() if x.startswith(k + " AS (")][0]
+        assert line.count(" FROM " + prev + ")") == 1 and line.rstrip().endswith("FROM " + prev + "),"), k
+
+    # the SQL's array steps, mirrored in Python, against the plain greedy rule
+    def greedy(ns, gap=20):
+        out = []
+        for n in sorted(ns):
+            if not out or n > out[-1] + gap:
+                out.append(n)
+        return out
+
+    def doubled(a, gap=20):
+        nxt = lambda v, p: p[v] if 0 <= v < len(p) else -1          # p[SAFE_OFFSET(v)], NULL -> -1
+        p = [next((k for k, y in enumerate(a) if y > x + gap), -1) for x in a]
+        ps = [p]
+        for _ in range(5):                                          # p2, p4, p8, p16, p32
+            ps.append([nxt(v, ps[-1]) for v in ps[-1]])
+        r = {v for v in (0, p[0]) if v >= 0}                        # r1
+        for q in ps[1:]:                                            # r2 .. r6
+            r |= {w for w in (nxt(u, q) for u in r) if w >= 0}
+        return sorted(a[v] for v in r)
+    import random
+    rnd = random.Random(26112026)
+    assert greedy([20, 35, 50, 65, 80]) == doubled([20, 35, 50, 65, 80]) == [20, 50, 80]     # Codex's own example
+    assert doubled([44, 55, 80, 82, 85, 101, 103, 117, 131, 141, 162]) == [44, 80, 101, 131, 162]   # read on the archive
+    for _ in range(300):
+        a = sorted(rnd.sample(range(16, 1400), rnd.randint(1, 120)))
+        assert doubled(a) == greedy(a), a
+    assert len(greedy(list(range(0, 1323, 21)))) == 63 == len(doubled(list(range(0, 1323, 21))))  # the 63-step reach
     for frag in ("UNNEST([STRUCT('hold 20 sessions' AS arm, e.r20_pct AS r), ('the rule under test', "
                  "IF(e.verdict = 'wait', e.rule_pct, NULL))]) AS a",
                  "WHERE a.r IS NOT NULL AND e.r20_pct IS NOT NULL",             # both arms on the matured events only
