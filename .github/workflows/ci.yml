@@ -1731,6 +1731,7 @@ jobs:
             tests/test_de_market_and_selection_gate.py \
             tests/test_de_gate_evidence.py \
             tests/test_de_label_truth.py \
+            tests/test_de_hold_prose_post_gate.py \
             tests/test_export_audit_v120.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \

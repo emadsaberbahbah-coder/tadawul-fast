@@ -201,12 +201,12 @@ def test_e7_tag_lifecycle(monkeypatch):
 
 def test_e8_version_manifest_why_and_surface(monkeypatch):
     from core import data_engine_v2 as de
-    assert de.__version__ == "5.164.0"
+    assert de.__version__ == "5.165.0"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.data_engine_v2", "__version__", "5.164.0",' in vd
+    assert '("core.data_engine_v2", "__version__", "5.165.0",' in vd
     src = (_REPO / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
     assert src.count("WHY v5.162.0 - INVEST ONLY ON AFFIRMATIVE EVIDENCE;") == 1
-    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.164.0" in src
+    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.165.0" in src
     for raw, mode in (("", "observe"), ("off", "off"), ("0", "off"), ("enforce", "enforce"), ("junk", "observe")):
         monkeypatch.setenv("TFB_GATE_EVIDENCE", raw)
         assert de._gate_evidence_mode() == mode and de.surface_gate_states()["gate_evidence"] == mode
