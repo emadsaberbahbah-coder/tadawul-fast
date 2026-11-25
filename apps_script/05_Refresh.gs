@@ -16,8 +16,9 @@
  * WHAT:
  *  (1) LEDGER (always on, observe): every symbol of a failed chunk is kept in
  *      checkpoint.failed {SYMBOL: attempts} - saved with the checkpoint, so it
- *      survives a pause and a resume. A symbol whose chunk later succeeds is
- *      taken off it. The run's log carries the count and the warnings name the
+ *      survives a pause and a resume. A symbol comes off it only when its row
+ *      is written: one the response leaves out, the keep-last-good filter
+ *      withholds or the writer defers stays on it (Codex P2 on #1078). The run's log carries the count and the warnings name the
  *      symbols still on it.
  *  (2) ONE BOUNDED RETRY (Script Property REFRESH_FAILED_RETRY = on): each
  *      failed symbol is put once more at the tail of the run (checkpoint
@@ -38,8 +39,9 @@
  * REFRESH_FAILED_RETRY unset / off / anything but on = observe: no retry, the
  * status as in 1.19.0, one '[v1.20.0 FAILED-LEDGER observe]' warning line
  * naming what the property would retry. Rollback: leave the property unset.
- * ES5. ZERO functions removed; FOUR functions added (_refreshFailedRetryMode_,
- * _refreshNoteFailedChunk_, _refreshClearFailedChunk_, _refreshFailedSymbols_).
+ * ES5. ZERO functions removed; SIX functions added (_refreshFailedRetryMode_,
+ * _refreshNoteFailedChunk_, _refreshLedgerKey_, _refreshClearFailedChunk_,
+ * _refreshWrittenKeys_, _refreshFailedSymbols_).
  * --------------------------------------------------------------------------
  * v1.18.1 — COCKPIT GUARD FAILS CLOSED + RUNTIME VERSION CONSTANT
  * --------------------------------------------------------------------------
@@ -5001,6 +5003,7 @@ function refreshPageInBatchesCore_(pageName, options) {
         var provSummary = _injectProvenanceFields_(rowObjects, fetchResult, page.pageName);
         totalProvenanceFilled += (provSummary.filledUtc || 0);
       }
+      var chunkWritten = {};   // v1.20.0: ledger keys of the rows this chunk wrote
       if (rows2d.length || rowObjects.length) {
         if (useHeaderMappedBatch && rowObjects.length === 0 && rows2d.length > 0) {
           _logEmptyRowObjectsWarning_(page.pageName, batchSize, chunk);
@@ -5042,6 +5045,8 @@ function refreshPageInBatchesCore_(pageName, options) {
             allWarnings.push('Unmapped sheet columns (left blank): ' + upsertResult.unmappedHeaders.join(', '));
           }
         }
+        chunkWritten = _refreshWrittenKeys_(rowObjects, rows2d, headers, useHeaderMappedBatch && rowObjects.length > 0,
+          upsertResult && typeof upsertResult === 'object' ? upsertResult.deferredSymbols : null);   // v1.20.0
         /* v1.13.0: our own writes moved the tail — re-baseline so the
          * tripwire trips only on FOREIGN changes, never on ourselves. */
         if (tripwireOn) {
@@ -5066,7 +5071,7 @@ function refreshPageInBatchesCore_(pageName, options) {
         allWarnings = allWarnings.concat(fetchResult.warnings);
       }
       successfulBatches++;
-      totalRecovered += _refreshClearFailedChunk_(checkpoint, chunk);   // v1.20.0
+      totalRecovered += _refreshClearFailedChunk_(checkpoint, chunk, chunkWritten);   // v1.20.0
     } catch (err) {
       failedBatches++;
       allWarnings.push(getRefreshErrorMessage_(err));
@@ -5937,18 +5942,46 @@ function _refreshNoteFailedChunk_(checkpoint, chunk, mode, cap) {
   }
   return added;
 }
-/* v1.20.0 PURE: a chunk that was fetched and written takes its symbols off the ledger. */
-function _refreshClearFailedChunk_(checkpoint, chunk) {
+/* v1.20.0 PURE: the key a requested symbol and a written row are matched on (upper case, a '.US' ending dropped). */
+function _refreshLedgerKey_(sym) {
+  return String(sym == null ? '' : sym).trim().toUpperCase().replace(/\.US$/, '');
+}
+/* v1.20.0 PURE: only the symbols of the chunk whose rows were written (written: {ledger key: 1}) come off the
+ * ledger; one the response left out, the keep-last-good filter withheld or the writer deferred stays on it
+ * (Codex P2 on #1078: a successful fetch is not a written row). */
+function _refreshClearFailedChunk_(checkpoint, chunk, written) {
   if (!checkpoint.failed) return 0;
   var cleared = 0;
   for (var i = 0; i < (chunk || []).length; i++) {
     var sym = String(chunk[i] || '').trim().toUpperCase();
-    if (sym && Object.prototype.hasOwnProperty.call(checkpoint.failed, sym)) {
-      delete checkpoint.failed[sym];
-      cleared++;
-    }
+    if (!sym || !Object.prototype.hasOwnProperty.call(checkpoint.failed, sym)) continue;
+    if (!written || !Object.prototype.hasOwnProperty.call(written, _refreshLedgerKey_(sym))) continue;
+    delete checkpoint.failed[sym];
+    cleared++;
   }
   return cleared;
+}
+/* v1.20.0 PURE: the ledger keys of the rows handed to the writer, less the symbols it deferred. */
+function _refreshWrittenKeys_(rowObjects, rows2d, headers, useObjects, deferred) {
+  var out = {}, i;
+  if (useObjects) {
+    for (i = 0; i < (rowObjects || []).length; i++) {
+      var r = rowObjects[i] || {};
+      var s = r.symbol !== undefined && r.symbol !== null && r.symbol !== '' ? r.symbol : r.Symbol;
+      if (s !== undefined && s !== null && String(s).trim()) out[_refreshLedgerKey_(s)] = 1;
+    }
+  } else {
+    var col = -1;
+    for (i = 0; i < (headers || []).length; i++) {
+      if (String(headers[i] || '').trim().toLowerCase() === 'symbol') { col = i; break; }
+    }
+    for (i = 0; col >= 0 && i < (rows2d || []).length; i++) {
+      var v = (rows2d[i] || [])[col];
+      if (v !== undefined && v !== null && String(v).trim()) out[_refreshLedgerKey_(v)] = 1;
+    }
+  }
+  for (i = 0; i < (deferred || []).length; i++) delete out[_refreshLedgerKey_(deferred[i])];
+  return out;
 }
 /* v1.20.0 PURE: the symbols still on the ledger, sorted. */
 function _refreshFailedSymbols_(checkpoint) {

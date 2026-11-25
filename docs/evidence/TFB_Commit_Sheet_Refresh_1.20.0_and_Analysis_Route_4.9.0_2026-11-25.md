@@ -14,7 +14,7 @@ A pause (timeout, manual priority, tripwire) lost even that count.
 **What changed.**
 1. **Ledger** (always on). This step only observes and logs.
    - `checkpoint.failed` records each symbol of a failed chunk with its number of attempts. It is saved with the checkpoint, so it survives a pause and a resume.
-   - A symbol whose chunk later succeeds is taken off the ledger.
+   - A symbol comes off the ledger only when its row is written. A symbol that the response leaves out, that the keep-last-good filter withholds, or that the writer defers stays on it (Codex P2 on #1078).
 2. **One bounded retry.** This needs Script Property `REFRESH_FAILED_RETRY = on`.
    - Each failed symbol is queued once more at the tail of the run. `checkpoint.retried` holds it to one retry.
    - At most `REFRESH_FAILED_RETRY_MAX_` symbols (60) are retried in a run.
@@ -30,17 +30,19 @@ A pause (timeout, manual priority, tripwire) lost even that count.
 
 **Observe mode** (property unset or anything but `on`): the run is the 1.19.0 run plus one warning line, `[v1.20.0 FAILED-LEDGER observe]`. That line names the symbols that kept their previous rows and says what `on` would do.
 
-**Code.** No function was removed. Four functions were added:
+**Code.** No function was removed. Six functions were added:
 - `_refreshFailedRetryMode_`
 - `_refreshNoteFailedChunk_`
+- `_refreshLedgerKey_`
 - `_refreshClearFailedChunk_`
+- `_refreshWrittenKeys_`
 - `_refreshFailedSymbols_`
 
 **Rollback:** leave the property unset.
 
-**Tests.** `tests/test_refresh_v1200_failed_ledger.js`, a node harness over the real file, collected through `tests/test_refresh_v1200_failed_ledger.py`. It passes 10/10:
-- **R1** – version lockstep; the function inventory is +4 and −0.
-- **R2** – golden negative: observe without a failure equals the 1.19.0 run. That covers fetches, writes, panel, status, log and return. The old file is rebuilt from the 14 hunks in `tests/js/refresh_edits_v1200.json` and pinned by SHA-256.
+**Tests.** `tests/test_refresh_v1200_failed_ledger.js`, a node harness over the real file, collected through `tests/test_refresh_v1200_failed_ledger.py`. It passes 11/11:
+- **R1** – version lockstep; the function inventory is +6 and −0.
+- **R2** – golden negative: observe without a failure equals the 1.19.0 run. That covers fetches, writes, panel, status, log and return. The old file is rebuilt from the hunks in `tests/js/refresh_edits_v1200.json` and pinned by SHA-256.
 - **R3** – observe with a failure adds exactly one line and makes no retry.
 - **R4** – `on`: a failure is recovered and the run closes SUCCESS.
 - **R5** – `on`: a persistent failure is retried once and the run closes PARTIAL; the failed symbols are never written.
@@ -49,6 +51,7 @@ A pause (timeout, manual priority, tripwire) lost even that count.
 - **R8** – a pause keeps the ledger and the retry tail, and the next run resumes rather than restarts.
 - **R9** – a checkpoint without `baseCount` is judged as in 1.19.0.
 - **R10** – the pure helpers.
+- **R11** – a retry that answers with no rows, or with only some rows, or a row the writer defers, keeps those symbols on the ledger; only written rows count as recovered.
 
 ## 2. routes/analysis_sheet_rows.py 4.8.4 -> 4.9.0 [COMPACT-SHAPE]
 

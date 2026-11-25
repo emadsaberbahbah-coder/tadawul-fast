@@ -6,9 +6,9 @@
  * PARTIAL, their previous rows kept; otherwise (observe) the run is the v1.19.0 one plus one warning line.
  *
  * Two trees over the REAL file, each in its own vm context: the delivered source (NEW) and the v1.19.0 file (OLD,
- * rebuilt from NEW by putting back the 14 hunks of tests/js/refresh_edits_v1200.json, SHA-256 pinned). Every
+ * rebuilt from NEW by putting back the hunks of tests/js/refresh_edits_v1200.json, SHA-256 pinned). Every
  * dependency of refreshPageInBatchesCore_ is a stub that records what the run did (fetches, writes, statuses, logs).
- *   R1 version lockstep and inventory: +4 functions, 0 removed
+ *   R1 version lockstep and inventory: +6 functions, 0 removed
  *   R2 GOLDEN NEGATIVE: observe, no failure = the v1.19.0 run (statuses, panel, writes, fetches, log, return)
  *   R3 observe with a failed batch = the v1.19.0 run plus one '[v1.20.0 FAILED-LEDGER observe]' line; no retry
  *   R4 on: a batch that fails once is retried and recovered; the run closes SUCCESS
@@ -18,6 +18,7 @@
  *   R8 a pause keeps the ledger and the retry tail in the checkpoint; the next run resumes, not restarts
  *   R9 isCheckpointCompatible_: a checkpoint without baseCount is judged as in v1.19.0
  *   R10 pure helpers
+ *   R11 a symbol comes off the ledger only when its row is written (Codex P2 on #1078)
  * The last line is 'PASS k/k' (exit 1 on any failure).
  */
 'use strict';
@@ -66,7 +67,7 @@ function load(src) {
 function run(src, o) {
   const ctx = load(src);
   const props = Object.assign({}, o.props || {});
-  const rec = {fetches: [], writes: [], panel: [], status: [], logs: []};
+  const rec = {fetches: [], writes: [], panel: [], status: [], logs: [], deferred: {}};
   let calls = 0;
   ctx.PropertiesService = {getScriptProperties: () => ({
     getProperty: (k) => (Object.prototype.hasOwnProperty.call(props, k) ? props[k] : null),
@@ -104,15 +105,18 @@ function run(src, o) {
       if (o.pauseAfter && calls >= o.pauseAfter) ctx.REFRESH_MAX_RUNTIME_MS_ = -1;
       const what = o.plan ? o.plan(chunk, calls) : 'ok';
       if (what === 'fail') return {ok: false};
+      const served = what === 'empty' ? [] : (what === 'first' ? chunk.slice(0, 1) : chunk);
       return {ok: true, endpointUsed: '/v1/analysis/sheet-rows', warnings: [],
-        normalized: {headers: HEADERS, keys: [], rows2d: [], rowObjects: chunk.map((s) => ({symbol: s, price: 1, _throw: what === 'throw'}))}};
+        normalized: {headers: HEADERS, keys: [], rows2d: [], rowObjects: served.map((s) => ({symbol: s, price: 1, _throw: what === 'throw'}))}};
     },
     dedupeRows2dBySymbol_: (r) => r,
     _injectProvenanceFields_: () => ({filledUtc: 0}),
     upsertRowsBySymbol_: (sh, h, r2, pc, pe, opt) => {
       if (opt.rowObjects.some((r) => r._throw)) throw new Error('write failed');
-      opt.rowObjects.forEach((r) => rec.writes.push(r.symbol));
-      return {updated: opt.rowObjects.length, appended: 0, skipped: 0};
+      const defer = (o.defer || []).filter((s) => opt.rowObjects.some((r) => r.symbol === s) && !rec.deferred[s]);
+      defer.forEach((s) => { rec.deferred[s] = 1; });
+      opt.rowObjects.forEach((r) => { if (defer.indexOf(r.symbol) < 0) rec.writes.push(r.symbol); });
+      return {updated: opt.rowObjects.length - defer.length, appended: 0, skipped: 0, deferredSymbols: defer};
     },
     _verifyCriticalFieldsAfterWrite_: () => ({ok: true}),
     getRefreshErrorMessage_: (e) => 'Error: ' + e.message,
@@ -138,13 +142,14 @@ const NEW_KEYS_OUT = ['partial', 'unwrittenSymbols', 'failedRetried', 'failedRec
 const strip = (obj, keys) => { const c = plain(obj); keys.forEach((k) => { delete c[k]; }); return c; };
 const lastLog = (r) => r.rec.logs[r.rec.logs.length - 1];
 
-test('R1 version lockstep and inventory (+4 functions, 0 removed)', () => {
+test('R1 version lockstep and inventory (+6 functions, 0 removed)', () => {
   ok(NEW.indexOf(' * Version: 1.20.0') >= 0 && NEW.indexOf("var REFRESH_VERSION = '1.20.0';") >= 0, 'version');
   ok(OLD, 'the v1.19.0 file could not be rebuilt (a hunk moved or the pin differs)');
   const fns = (s) => new Set((s.match(/^function ([A-Za-z0-9_$]+)\s*\(/gm) || []).map((x) => x.replace(/^function\s+|\s*\($/g, '')));
   const a = fns(OLD), b = fns(NEW);
   const added = [...b].filter((x) => !a.has(x)).sort(), removed = [...a].filter((x) => !b.has(x));
-  eq(added, ['_refreshClearFailedChunk_', '_refreshFailedRetryMode_', '_refreshFailedSymbols_', '_refreshNoteFailedChunk_']);
+  eq(added, ['_refreshClearFailedChunk_', '_refreshFailedRetryMode_', '_refreshFailedSymbols_', '_refreshLedgerKey_',
+    '_refreshNoteFailedChunk_', '_refreshWrittenKeys_']);
   eq(removed, []);
   ok(!/[^\x00-\x7F]/.test(NEW.split('v1.20.0 (2026-11-25)')[1].split(' * v1.18.1 ')[0]), 'the 1.20.0 header block is ASCII');
 });
@@ -269,7 +274,7 @@ test('R10 pure helpers', () => {
   eq(k.symbols, ['a', 'b', 'a']);
   eq(c._refreshNoteFailedChunk_(k, ['a', 'b'], 'on', 5), 1, 'a was retried already');
   eq(k.failed, {A: 3, B: 3});
-  eq(c._refreshClearFailedChunk_(k, ['b', 'z']), 1);
+  eq(c._refreshClearFailedChunk_(k, ['b', 'z'], {B: 1, Z: 1}), 1);
   eq(c._refreshFailedSymbols_(k), ['A']);
   eq(c._refreshFailedSymbols_(null), []);
   const props = {};
@@ -281,6 +286,36 @@ test('R10 pure helpers', () => {
   eq(c._refreshFailedRetryMode_(), 'observe');
   c.PropertiesService = {getScriptProperties: () => { throw new Error('x'); }};
   eq(c._refreshFailedRetryMode_(), 'observe');
+});
+
+test('R11 a symbol comes off the ledger only when its row is written (Codex P2 on #1078)', () => {
+  const on = {REFRESH_FAILED_RETRY: 'on'};
+  // the retry answers ok with no rows: nothing written, nothing recovered, PARTIAL
+  const a = run(NEW, {symbols: SYMS(2), batchSize: 2, props: on, plan: (c, n) => (n === 1 ? 'fail' : 'empty')});
+  eq(a.rec.writes, []);
+  eq([a.out.failedRecovered, a.out.unwrittenSymbols], [0, SYMS(2)]);
+  eq(a.rec.status[0].status, 'PARTIAL');
+  // the retry answers with the first row only: that one recovered, the other stays
+  const b = run(NEW, {symbols: SYMS(3), batchSize: 3, props: on, plan: (c, n) => (n === 1 ? 'fail' : 'first')});
+  eq(b.rec.writes, ['S001']);
+  eq([b.out.failedRecovered, b.out.unwrittenSymbols], [1, ['S002', 'S003']]);
+  eq(b.rec.status[0].status, 'PARTIAL');
+  // the writer defers a retried row: it stays until the v1.13.0 requeue writes it
+  const c = run(NEW, {symbols: SYMS(2), batchSize: 2, props: on, defer: ['S002'], plan: (ch, n) => (n === 1 ? 'fail' : 'ok')});
+  eq(c.rec.writes.slice().sort(), SYMS(2));
+  eq(c.out.unwrittenSymbols, []);
+  eq(c.rec.status[0].status, 'SUCCESS');
+  // observe: a successful fetch with a missing row still names the earlier failure
+  const d = run(NEW, {symbols: SYMS(4), batchSize: 2, plan: (ch, n) => (n === 1 ? 'fail' : 'ok')});
+  eq(d.out.unwrittenSymbols, ['S001', 'S002']);
+  const k = load(NEW);
+  eq(k._refreshLedgerKey_(' aapl.us '), 'AAPL');
+  eq(k._refreshWrittenKeys_([{symbol: 'A.US'}, {Symbol: 'b'}, {}], [], [], true, ['b']), {A: 1});
+  eq(k._refreshWrittenKeys_([], [['x', 'Y.US'], ['z', '']], ['Name', 'Symbol'], false, null), {Y: 1});
+  const cp2 = {failed: {'A.US': 1, B: 2}};
+  eq(k._refreshClearFailedChunk_(cp2, ['a.us', 'b'], {A: 1}), 1);
+  eq(cp2.failed, {B: 2});
+  eq(k._refreshClearFailedChunk_(cp2, ['b'], null), 0, 'no written keys, nothing cleared');
 });
 
 console.log((failed ? 'FAIL ' : 'PASS ') + passed + '/' + (passed + failed));

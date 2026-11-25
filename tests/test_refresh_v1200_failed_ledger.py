@@ -26,4 +26,4 @@ def test_refresh_v1200_failed_ledger_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("PASS 10/10"), result.stdout[-2000:]
+    assert result.stdout.rstrip().endswith("PASS 11/11"), result.stdout[-2000:]
