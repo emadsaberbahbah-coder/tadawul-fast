@@ -15,6 +15,11 @@
  *          - dp2ExitDivsFor_ takes it as a third source: an ex-date already listed (within DP2_EXIT_DIV_NEAR_D days)
  *            is not added twice; it must have arrived (<= today) and carry the quote's own currency (a blank log
  *            currency is never guessed). The net-of-tax rule of 1.4.5 then applies as before.
+ *          - dp2CachedCcy_ (pure): the bars cache keeps no quote currency, so a cached history came back with a
+ *            blank one, and a blank currency refused every dividend source in exactly the cached case this fixes
+ *            (Codex review of PR #1079). A cached history now takes the currency its market fixes: a US listing
+ *            USD (as the Stooq path already states), a .SR listing SAR; any other market stays blank, so no
+ *            dividend is applied there (the 1.4.6 rule). Gated by DP2_DIV_LOG with the rest (off = blank, as before).
  *          On the SUPN lot this gives entry 29.89 and a stop in today's price terms (the Exit Plan's own figures),
  *          and STNG's 0.75 of 13 Nov is counted the same way. Script Property DP2_DIV_LOG = 0 / off / false / no =
  *          the 1.4.6 engine; anything else, absent or unreadable = on. Analysis only: the final decision (Final_
@@ -2305,7 +2310,7 @@ function dp2LoadBars_(symbols, sinceDate) {
     } else {
       if (cache === null) cache = dp2BarsCacheRead_();
       var c = cache[sym];
-      res = (c && c.bars.length) ? { bars: c.bars, last: c.bars[c.bars.length - 1].c, ccy: '', marketState: '', source: (c.source || 'cache') + ' (cached)', key: c.key, fetched: c.fetched, stale: true, error: err.join(' · ') }
+      res = (c && c.bars.length) ? { bars: c.bars, last: c.bars[c.bars.length - 1].c, ccy: dp2DivLogOn_() ? dp2CachedCcy_(sym) : '', marketState: '', source: (c.source || 'cache') + ' (cached)', key: c.key, fetched: c.fetched, stale: true, error: err.join(' · ') }
                                  : { bars: [], last: null, ccy: '', marketState: '', source: '', key: key, fetched: '', stale: true, error: err.join(' · ') || 'no data' };
     }
     DP2X_MEMO_[sym] = res;
@@ -2750,6 +2755,14 @@ function dp2DivTab_() {
 /* v1.4.7 [DIV-LOG]: the ledger's dividend log as a dividend SOURCE for the exit engine (a cached chart carries none). */
 var DP2_DIV_LOG_PROP = 'DP2_DIV_LOG';           // 0 / off / false / no = the 1.4.6 engine; default on
 function dp2DivLogOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_DIV_LOG_PROP)).trim()); }
+/* PURE: the quote currency of a CACHED history (the cache sheet keeps none). Only the two whole-unit markets the book
+ * holds are named: a US listing quotes in USD, a .SR listing in SAR; anything else is blank (never guessed). */
+function dp2CachedCcy_(sym) {
+  var s = dp2Str_(sym).trim().toUpperCase();
+  if (!s) return '';
+  if (/\.SR$/.test(s)) return 'SAR';
+  return dp2IsUs_(s) ? 'USD' : '';
+}
 /* PURE: _Dividend_Log values -> { SYMBOL: [{ date 'yyyy-MM-dd', amount (per share), currency }] }, sorted by date. The
  * header row (one of the first 8) is found by name (Symbol, Ex-Date, Amount/Share; Ccy optional). Only a positive
  * per-share amount is a dividend (a tax row is negative); the first row per symbol and ex-date counts. */
@@ -4817,7 +4830,9 @@ function dp2V147CoreOk_() {
     var b = d.length === 1 && d[0].source === 'dividend log' && dp2ExitDivsFor_({ divs: [], ccy: 'USD' }, 'AAA.US', {}, '2026-03-09', log).length === 0 &&
       dp2ExitDivsFor_({ divs: [{ date: '2026-03-11', amount: 2, source: 'chart' }], ccy: 'USD' }, 'AAA.US', {}, '2026-03-12', log).length === 1 &&
       dp2ExitDivsFor_({ divs: [], ccy: 'SAR' }, 'AAA.US', {}, '2026-03-12', log).length === 0;
-    return !!(a && b);
+    var c = dp2CachedCcy_('aaa.us') === 'USD' && dp2CachedCcy_('AAA') === 'USD' && dp2CachedCcy_('2222.SR') === 'SAR' &&
+      dp2CachedCcy_('VOD.L') === '' && dp2CachedCcy_('') === '';
+    return !!(a && b && c);
   } catch (e) { return false; }
 }
 function dp2SelfTest() {

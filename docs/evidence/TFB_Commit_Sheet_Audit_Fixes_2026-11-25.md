@@ -14,8 +14,10 @@ change keeps a rollback switch; none changes a gate, ticket, sizing, order or br
 
 ## Tests
 
-- `tests/test_dp2_v1470_div_log.js` (+ `.py`): 5/5 - reversal to the pinned v1.4.6 file, golden negative (gate off =
-  v1.4.6), the SUPN shape on cached bars (v1.4.6 STOP_HIT; v1.4.7 entry 29.89, no SELL NOW), parser rules, 5 mutants.
+- `tests/test_dp2_v1470_div_log.js` (+ `.py`): 5/5 - reversal to the pinned v1.4.6 file (9 hunks), golden negative
+  (gate off = v1.4.6), the SUPN shape through the REAL cache fallback of `dp2LoadBars_` (every provider fails, the cache
+  answers: v1.4.6 blank currency and STOP_HIT; v1.4.7 USD, entry 29.89, no SELL NOW; gate off blank), parser rules,
+  `dp2CachedCcy_`, 8 mutants.
   Every older `tests/test_dp2_*.js` harness passes through the extended history chain (`tests/js/dp2_history.js`).
 - `tests/test_await_cockpit_receipts.py` 26/26 (read-fault case moved to 1.4.0; rollback case kept).
 - `tests/test_final_finding_codes.py` 3/3; `tests/test_final_decision_publication.py`, `tests/test_release_decision_feed.py` unchanged and green.
@@ -27,3 +29,12 @@ change keeps a rollback switch; none changes a gate, ticket, sizing, order or br
 
 1. Apps Script: paste `apps_script/27_Decision_Pages_v2.gs` 1.4.7 (leave `DP2_DIV_LOG` unset).
 2. Nothing else: the Python and workflow changes run from main.
+
+## Follow-up (Codex review of the first push)
+
+The cache fallback of `dp2LoadBars_` returned `ccy: ''`, and `dp2ExitDivsFor_` refuses every dividend source on a
+blank currency, so the dividend log would not have reached the SUPN lot in the very case it was built for; the first
+harness supplied `ccy: 'USD'` by hand and missed it. `dp2CachedCcy_` (pure, 1.4.7, same `DP2_DIV_LOG` gate) now names
+the currency the market fixes for a cached history: a US listing USD (as the Stooq path already states), a `.SR`
+listing SAR, any other market blank (no dividend applied, the 1.4.6 rule). The harness now runs the real fallback.
+The lean-lane import of `requests` in `tests/test_sheets_quota_client.py` moved behind `pytest.importorskip`.

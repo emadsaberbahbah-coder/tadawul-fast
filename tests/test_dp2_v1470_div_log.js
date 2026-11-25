@@ -9,10 +9,12 @@
  *   R0  oracle: reversal = v1.4.6; history chain; versions; both compile; +4 functions, 0 removed; ES5 / ASCII hunks
  *   R1  GOLDEN NEGATIVE: DP2_DIV_LOG off (five spellings) -> dp2DivLog_ is {} and dp2ExitDivsFor_ equals the v1.4.6
  *       function on every case; on, with no log row for the symbol -> equal too
- *   R2  the SUPN shape on cached bars: v1.4.6 applies no dividend and the trail reads a stop hit; v1.4.7 takes the
- *       ledger's 8.13 (net 5.691 after the 30% tax row), entry about 29.89, and the stop sits under the last price
+ *   R2  the SUPN shape on cached bars, through the REAL fallback of dp2LoadBars_ (every provider fails, the cache
+ *       answers; Codex review of PR #1079: that path returned a blank currency): v1.4.6 applies no dividend and
+ *       the trail reads a stop hit; v1.4.7 names USD for the cached US history, takes the ledger's 8.13 (net 5.691
+ *       after the 30% tax row), entry about 29.89, and the stop sits under the last price; gate off = blank, as before
  *   R3  the pure parser and the source rules (arrived, currency, no double count, a blank currency never guessed);
- *       the self-test line
+ *       dp2CachedCcy_ (US -> USD, .SR -> SAR, any other market blank); the self-test line
  *   R4  mutants: each guard removed is caught
  * The battery runs three times and the digests must match; the last line is 'PASS k/k' (exit 1 on any failure).
  */
@@ -93,12 +95,12 @@ function checkOracle() {
   eq(sha256(HISTORY.v1460Source(NEW)), V1460_SHA256, 'history chain');
   eq(sha256(HISTORY.v1450Source(NEW)), HISTORY.V1450_SHA256, 'the older chain still lands on v1.4.5');
   eq(HISTORY.v1460Source(OLD), OLD, 'a source that already is the v1.4.6 file is returned unchanged');
-  eq(EDITS.length, 8, 'eight hunks');
+  eq(EDITS.length, 9, 'nine hunks');
   ok(/ \* Version: 1\.4\.7 \(2026-11-25\)/.test(NEW) && /var DP2_VERSION = '1\.4\.7';/.test(NEW), 'version lockstep');
   ok(NEW.indexOf(' *   1.4.7: [DIV-LOG]') > 0 && NEW.indexOf(' *   1.4.6: [RETURN-COL]') > NEW.indexOf(' *   1.4.7: [DIV-LOG]'), 'the new WHY block is first and the 1.4.6 one is kept');
   const fns = s => new Set((s.match(/^function ([A-Za-z0-9_]+)\(/mg) || []).map(x => x.slice(9, -1)));
   const a = fns(OLD), b = fns(NEW);
-  deq([...b].filter(x => !a.has(x)).sort(), ['dp2DivLogFromValues_', 'dp2DivLogOn_', 'dp2DivLog_', 'dp2V147CoreOk_'], '+4 functions');
+  deq([...b].filter(x => !a.has(x)).sort(), ['dp2CachedCcy_', 'dp2DivLogFromValues_', 'dp2DivLogOn_', 'dp2DivLog_', 'dp2V147CoreOk_'], '+5 functions');
   deq([...a].filter(x => !b.has(x)), [], '0 removed');
   for (const [cur] of EDITS) {
     for (const line of cur.split('\n')) {
@@ -140,12 +142,28 @@ function checkGoldenNegative() {
   eq(Object.keys(on.dp2DivLog_()).length, 4, 'gate on: the log tab is read (four symbols)');
 }
 
+/* The REAL dp2LoadBars_ on its cache fallback: every provider throws, the bars cache answers for the symbol. */
+function cachedXb(c, sym, bars) {
+  const fail = () => { throw new Error('provider down (test)'); };
+  c.dp2FetchBackend_ = fail; c.dp2FetchYahoo_ = fail; c.dp2FetchStooq_ = fail;
+  c.dp2BarsCacheRead_ = () => { const o = {}; o[sym] = { bars: bars, source: 'yahoo', key: c.dp2YahooKey_(sym), fetched: '2026-11-20' }; return o; };
+  const r = c.dp2LoadBars_([sym], '2026-09-20')[sym];
+  ok(r && r.stale === true && r.source === 'yahoo (cached)' && r.bars.length === bars.length && !r.divs, 'the cache answered: ' + JSON.stringify(r && r.source));
+  return r;
+}
+
 function checkSupn() {
   const bars = supnBars(), entry = 35.45, entryDate = '2026-11-02', today = '2026-11-25';
   const old = load(OLD, {}, { _Dividend_Log: sheetOf(LOG) });
   const nw = load(NEW, {}, { _Dividend_Log: sheetOf(LOG) });
-  const xb = { bars: bars, ccy: 'USD' };                       // cached: no divs
+  const xo = cachedXb(old, 'SUPN.US', bars), xn = cachedXb(nw, 'SUPN.US', bars);
+  eq(xo.ccy, '', 'v1.4.6: a cached history has a blank currency');
+  eq(xn.ccy, 'USD', 'v1.4.7: a cached US history names USD');
+  eq(cachedXb(load(NEW, { DP2_DIV_LOG: 'off' }, {}), 'SUPN.US', bars).ccy, '', 'gate off: blank, as v1.4.6');
+  eq(cachedXb(load(NEW, {}, {}), '5023.SR', bars).ccy, 'SAR', 'a cached .SR history names SAR');
+  eq(cachedXb(load(NEW, {}, {}), 'VOD.L', bars).ccy, '', 'any other market stays blank');
   const run = (c, withLog) => {
+    const xb = c === old ? xo : xn;
     const tax = c.dp2DivTax_()['SUPN.US'];
     const divs = withLog ? c.dp2ExitDivsFor_(xb, 'SUPN.US', {}, today, c.dp2DivLog_()) : c.dp2ExitDivsFor_(xb, 'SUPN.US', {}, today);
     const adj = c.dp2ExitDivAdjust_(bars, entry, entryDate, c.dp2ExitDivsNet_(divs, tax, entryDate), today);
@@ -175,6 +193,8 @@ function checkPure() {
   deq(log['SUPN.US'], [{ date: '2026-11-03', amount: 8.13, currency: 'USD' }], 'the tax row is not a dividend');
   eq(log['5023.SR'].length, 1, 'one entry per symbol and ex-date (two lots)');
   eq(log['7030.SR'][0].currency, '', 'a blank currency stays blank');
+  deq(['SUPN.US', 'supn.us', 'AAPL', '2222.SR', '2222.sr', 'VOD.L', '7203.T', '', null].map(x => c.dp2CachedCcy_(x)),
+      ['USD', 'USD', 'USD', 'SAR', 'SAR', '', '', '', ''], 'dp2CachedCcy_: US -> USD, .SR -> SAR, anything else blank');
   const taxFirst = JSON.parse(JSON.stringify(c.dp2DivLogFromValues_([LOG_HDR, ['', 'MANUAL', 'AAA.US', '', '2026-03-10', -0.6, 10, -6, 'USD'],
     ['', 'AUTO', 'AAA.US', '', '2026-03-10', 2, 10, 20, 'USD'], ['', 'MANUAL', 'BBB.US', '', '2026-03-10', -0.6, 10, -6, 'USD']])));
   deq(taxFirst, { 'AAA.US': [{ date: '2026-03-10', amount: 2, currency: 'USD' }] }, 'a tax row listed first is still not the dividend');
@@ -203,7 +223,10 @@ function checkMutants() {
     ["e.currency !== ccy.toUpperCase()", "false"],
     ["if (!dup) out.push({ date: e.date, amount: e.amount, source: 'dividend log' });", "out.push({ date: e.date, amount: e.amount, source: 'dividend log' });"],
     ["if (!sym || !date || amt === null || !(amt > 0)) continue;", "if (!sym || !date || amt === null) continue;"],
-    ["if (Object.prototype.hasOwnProperty.call(seen, k)) continue;", ""]
+    ["if (Object.prototype.hasOwnProperty.call(seen, k)) continue;", ""],
+    ["ccy: dp2DivLogOn_() ? dp2CachedCcy_(sym) : '', marketState: ''", "ccy: '', marketState: ''"],
+    ["ccy: dp2DivLogOn_() ? dp2CachedCcy_(sym) : '', marketState: ''", "ccy: dp2CachedCcy_(sym), marketState: ''"],
+    ["if (/\\.SR$/.test(s)) return 'SAR';", ""]
   ];
   for (const [from, to] of muts) {
     ok(NEW.split(from).length === 2, 'mutant site unique: ' + from);
@@ -232,11 +255,11 @@ for (let round = 0; round < 3; round++) {
   passed = 0; failed = 0;
   const out = [];
   const log = console.log; console.log = m => out.push(m);
-  test('R0 oracle: reversal = v1.4.6 (SHA-256 pinned, history chain); versions; both compile; +4 functions, 0 removed; ES5 / ASCII hunks', checkOracle);
+  test('R0 oracle: reversal = v1.4.6 (SHA-256 pinned, history chain); versions; both compile; +5 functions, 0 removed; ES5 / ASCII hunks', checkOracle);
   test('R1 GOLDEN NEGATIVE: DP2_DIV_LOG off (five spellings) and every no-log call equal the v1.4.6 dividend sources', checkGoldenNegative);
-  test('R2 the SUPN shape on cached bars: v1.4.6 STOP_HIT; v1.4.7 entry 29.89 net of tax, stop under the last, no double count', checkSupn);
+  test('R2 the SUPN shape through the real cache fallback: v1.4.6 blank currency, STOP_HIT; v1.4.7 USD, entry 29.89 net of tax, stop under the last, no double count; gate off blank', checkSupn);
   test('R3 the pure parser, the source rules, the gate spellings and the self-test line', checkPure);
-  test('R4 mutants: five guards removed, each caught', checkMutants);
+  test('R4 mutants: eight guards removed, each caught', checkMutants);
   console.log = log;
   digests.push(sha256(out.join('\n')));
   if (round === 2) out.forEach(m => console.log(m));
