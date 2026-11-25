@@ -2,8 +2,26 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.29.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.30.0 (program register C8, Phase 2)
 ================================================================================
+v1.30.0 (26 Nov 2026, the stop judgment, the value screen and the cash
+entry). WHY (owner, 26 Nov 2026, Riyadh, in Arabic - 01:07: is the fall
+temporary or lasting, adjust the stops or keep them, "the system must have
+reason, wisdom and flexibility"; 01:22: "there is cash and the market is
+falling, so there are big chances ... but that is not used"; 01:37: "please
+do the required build now"). Six new views, research only, each rule fixed
+on 26 Nov 2026 and read as in-sample before that day:
+v_stop_cause_events (131) - US and Saudi shares falling 8 % in 15 sessions,
+the cause (with the market, on its own, mixed), the verdict of the ladder
+under test and the next 5, 10 and 20 sessions; v_stop_cause_learning (132) -
+its record against selling at the fall; v_value_screen (133) - the US shares
+passing a plain value screen each archived night, beside the engine's label;
+v_trial_value_screen (134) - that list and the engine's INVESTABLE names
+against all liquid US names, 1W and 2W on; v_cash_entry_events (135) - cash
+entered into SPY after the market's first not-calm reading, all at once, in
+three parts or after the first calm close; v_cash_entry_trial (136) - its
+record against cash. No file of 1.29.0 changes.
+
 v1.29.0 (24 Nov 2026, snapshots of the heavy views). WHY (owner, 24 Nov 2026
 13:07 Riyadh: BigQuery more, faster, more accurate; 13:53 "Let's go with
 next"). scripts/bq_snapshots.py 1.0.0 computes v_universe_latest,
@@ -619,7 +637,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.29.0"
+__version__ = "1.30.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

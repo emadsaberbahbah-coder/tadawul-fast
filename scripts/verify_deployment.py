@@ -380,7 +380,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # reading scored against SPY for the rest of the session, 1 and 5 sessions, and its record).
     # 2026-11-24 (manifest pin only): 1.28.0 -> 1.29.0 (SNAP_TABLES; v_symbol_news_class_now joins
     # snap_universe_latest).
-    ("apply_bq_views", "1.29.0", "bigquery looker views"),
+    # 2026-11-26 (manifest pin only): 1.29.0 -> 1.30.0 (v_stop_cause_events / _learning, v_value_screen,
+    # v_trial_value_screen, v_cash_entry_events / _trial - the stop judgment, the value screen and the cash entry,
+    # each recorded and scored, observe only).
+    ("apply_bq_views", "1.30.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -443,7 +446,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # collecting, what changed (observe only; Learning_Watch tab, learning_watch_log).
     # 2026-11-24 (pin only): 1.0.0 -> 1.0.1 (the calibration pair reading is AGAINST only on the HIGH row;
     # counts shown without a sign).
-    ("learning_watch", "1.0.1", "learning watch"),
+    # 2026-11-26 (pin only): 1.0.1 -> 1.1.0 (three records join the registry: the stop judgment, the value screen
+    # and the cash entry; 21 are read).
+    ("learning_watch", "1.1.0", "learning watch"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),

@@ -4,6 +4,13 @@ scripts/learning_watch.py
 ================================================================================
 TFB Learning Watch - every learning record in BigQuery, read every day, in one place
 --------------------------------------------------------------------------------
+v1.1.0 (2026-11-26)
+  1.1.0: three records join the registry (owner, 26 Nov 2026 01:37 Riyadh: "please do the required build now" - the
+         build of that night's review: keep the stops or adjust them, cash in a falling market, the chances the
+         labels do not show). v_stop_cause_learning (a fall with the market or on its own, and what holding did
+         after it), v_trial_value_screen (the nightly value screen and the engine's INVESTABLE names against all
+         liquid US names) and v_cash_entry_trial (cash entered into the S&P 500 fund after the first not-calm
+         reading, three ways). 21 records are read; nothing else changes.
 v1.0.1 (2026-11-24)
   1.0.1: two fixes from the first live page (owner's workbook, 24 Nov 22:56 Riyadh). (a) v_confidence_calibration
          reads the PAIR - 'inverted: HIGH below MEDIUM' stands on both rows of a market - so only the HIGH row is
@@ -50,7 +57,7 @@ if _HERE not in sys.path:
 import archive_symbol_deep as asd  # noqa: E402 - same folder: the tested BigQuery loader
 import news_board as nb  # noqa: E402 - same folder: text helpers and the optional-view reader
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -109,6 +116,13 @@ REGISTRY: List[Tuple[str, str, Tuple[str, ...], str, str, str, Optional[str], st
      "edge_pp", "t_adj", ""),
     ("v_shock_drop_learning", "Shock-drop rule", ("period", "arm", "horizon_sessions"), "reading", "events", "mean_pp",
      "t_adj", ""),
+    # v1.1.0 (views 1.30.0): the stop judgment, the value screen and the cash entry, each with its fixed reading
+    ("v_stop_cause_learning", "Stop judgment: a fall with the market or on its own",
+     ("period", "market", "cause", "verdict", "arm"), "reading", "events", "mean_pct", "t_adj", ""),
+    ("v_trial_value_screen", "Value screen against the US names", ("period", "horizon", "arm"), "reading", "days",
+     "edge_pp", "t_adj", ""),
+    ("v_cash_entry_trial", "Cash entry after a not-calm reading", ("period", "arm", "horizon_sessions"), "reading",
+     "events", "mean_pct", "t_adj", ""),
 ]
 GROUPS = ("PROVEN", "AGAINST", "COLLECTING", "NEUTRAL", "IN-SAMPLE")
 # records whose every row is in-sample by their own definition and that carry no period column (Codex P1 on #1074):
