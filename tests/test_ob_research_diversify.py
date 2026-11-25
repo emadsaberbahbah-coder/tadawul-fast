@@ -16,6 +16,7 @@ cases must then fail.
 from __future__ import annotations
 
 import copy
+import re
 import importlib.util
 import os
 import sys
@@ -112,16 +113,25 @@ def _funded(payload):
     return [(t["symbol"], t["suggested_sar"]) for t in payload["selected"]]
 
 
+_AGE_TEXT = re.compile(r"(\b|^)\d+(?:\.\d+)?m old")
+
+
 def _scrub_clock_fields(node):
     """Remove wall-clock derived leaves wherever they sit. The quote-freshness
     detail carries age_min = minutes since the quote instant rounded to 0.1,
     so two builds a few seconds apart can read 4.3 and 4.4 (the CI failure on
     2026-10-19, run 39230946600, a docs-only push): the field is not part of
-    the identity these tests pin."""
+    the identity these tests pin. The same age is also printed into the
+    quote-freshness text ("live 6m old"), rounded to the minute, so two builds
+    either side of a minute boundary read 6m and 7m (CI run 45575407083,
+    25 Nov 2026, a workflow-only PR): the number in that text is masked too."""
     if isinstance(node, dict):
         node.pop("age_min", None)
-        for v in node.values():
-            _scrub_clock_fields(v)
+        for k, v in list(node.items()):
+            if isinstance(v, str):
+                node[k] = _AGE_TEXT.sub(r"\1<n>m old", v)
+            else:
+                _scrub_clock_fields(v)
     elif isinstance(node, list):
         for v in node:
             _scrub_clock_fields(v)
