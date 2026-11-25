@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tfb_backtest.py — v1.1.1 (2026-10-08)
+tfb_backtest.py — v1.2.0 (2026-11-25)
 ================================================================================
+WHY v1.2.0 (external audit of 25 Nov, P1 "validation"): the CV Brier that decides
+SEPARATES shuffled rows at random into five folds. Cohorts recorded on the same
+day, and overlapping 1W/2W/1M windows, then sat on both sides of a fold, and the
+quintile cut points were fitted on every row, test rows included. That is a
+look-ahead: the score could only be earned by knowing later outcomes. v1.2.0
+scores in date order instead. Rows are cut into k+1 contiguous date blocks; each
+of the last k blocks is tested on a model fitted ONLY on rows whose outcome was
+known (Target Date, else Date Recorded + horizon) at least --embargo-days before
+the block's first entry date (purge + embargo). Quintile cuts are refitted on that
+training set. The baseline is scored on the same test rows with the training win
+rate (an out-of-sample prevalence baseline, identical cohort). The verdict uses
+the walk-forward gain; the random K-fold numbers stay in the report as a labelled
+legacy diagnostic. Rollback: --cv legacy (or TFB_BACKTEST_CV=legacy) restores the
+v1.1.1 verdict exactly. Functions added: 4 (_day, label_days, wf_brier, _cv_mode).
+
 WHY: the Strategy's rule is "register a hypothesis, backtest it, then change a
 weight or gate". H-28 (stated reliability predicts outcomes) was rejected by an
 ad-hoc computation; this makes that computation a repeatable instrument so any
@@ -32,6 +47,7 @@ USAGE
 Options: --edges "50,70,85" (numeric bands) --min-n 100 --json out.json --horizon 1W,2W,1M
          --filter "Origin Tab=Top_10_Investments" (repeatable, exact match)   [v1.1.0]
          --since 2026-08-01 / --until 2026-08-31  (Date Recorded window)       [v1.1.0]
+         --cv wf|legacy (default wf) --embargo-days 1                         [v1.2.0]
 READ-ONLY. No writes, ever.
 """
 from __future__ import annotations
@@ -39,6 +55,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import datetime as _dt
 import json
 import math
 import os
@@ -47,7 +64,7 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
                    "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
 
@@ -194,6 +211,9 @@ def spearman(a: List[float], b: List[float]) -> float:
 
 
 def cv_brier(groups: List[Any], ys: List[float], k: int = 5, shrink: float = 20.0, seed: int = 7) -> float:
+    """LEGACY (v1.1.1) random K-fold. Leaks time: same-day and overlapping-window
+    cohorts land on both sides of a fold. Kept only as a labelled diagnostic and
+    as the --cv legacy rollback; the verdict uses wf_brier()."""
     idx = list(range(len(ys)))
     random.Random(seed).shuffle(idx)
     folds = [set(idx[i::k]) for i in range(k)]
@@ -213,8 +233,102 @@ def cv_brier(groups: List[Any], ys: List[float], k: int = 5, shrink: float = 20.
     return brier(out)
 
 
+_HZ_DAYS = {"1W": 7, "2W": 14, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "3Y": 1095, "5Y": 1825}
+WF_MIN_TRAIN = 30
+
+
+def _day(v: Any) -> Optional[_dt.date]:
+    """v1.2.0: the YYYY-MM-DD prefix of a cell as a date; None when absent or invalid."""
+    t = _s(v)[:10]
+    try:
+        return _dt.date.fromisoformat(t) if len(t) == 10 else None
+    except ValueError:
+        return None
+
+
+def label_days(cohorts: List[Dict[str, str]]) -> Tuple[List[Optional[_dt.date]], List[Optional[_dt.date]]]:
+    """v1.2.0: (entry day, day the outcome became known) per cohort. The known day is
+    Target Date (Riyadh); without it, Date Recorded + the horizon's calendar days;
+    None when neither can be read (the row is then left out of the walk-forward)."""
+    entry, known = [], []
+    for r in cohorts:
+        e = _day(r.get("Date Recorded (Riyadh)"))
+        t = _day(r.get("Target Date (Riyadh)"))
+        if t is None and e is not None and _s(r.get("Horizon")) in _HZ_DAYS:
+            t = e + _dt.timedelta(days=_HZ_DAYS[_s(r.get("Horizon"))])
+        if e is not None and t is not None and t < e:
+            t = None
+        entry.append(e)
+        known.append(t)
+    return entry, known
+
+
+def wf_brier(ys: List[float], entry: List[Optional[_dt.date]], known: List[Optional[_dt.date]],
+             labeler_for: Any, k: int = 5, shrink: float = 20.0, embargo_days: int = 1,
+             min_train: int = WF_MIN_TRAIN) -> Dict[str, Any]:
+    """v1.2.0 purged walk-forward Brier of the group-calibrated probability.
+
+    Rows with an entry and a known day are ordered by entry day and cut into k+1
+    contiguous blocks (a day never straddles two blocks). Block j (j >= 1) is
+    scored with a model fitted on rows whose outcome was known on or before
+    (block start - embargo_days); ``labeler_for(train_idx)`` returns the group
+    labeller fitted on those rows only. The baseline is the training win rate,
+    scored on the same test rows. A fold with fewer than ``min_train`` training
+    rows is skipped. Returns brier, base_brier, gain, scored, folds, status."""
+    usable = sorted((i for i in range(len(ys)) if entry[i] is not None and known[i] is not None),
+                    key=lambda i: (entry[i], i))
+    out: Dict[str, Any] = {"wf_brier": None, "wf_base_brier": None, "wf_gain_vs_base": None,
+                           "wf_scored": 0, "wf_folds": 0, "wf_status": "insufficient_dated_rows"}
+    days = sorted({entry[i] for i in usable})
+    if len(usable) < 2 * min_train or len(days) < k + 1:
+        return out
+    target = len(usable) / (k + 1)
+    by_day: Dict[_dt.date, List[int]] = {}
+    for i in usable:
+        by_day.setdefault(entry[i], []).append(i)
+    blocks: List[List[int]] = [[] for _ in range(k + 1)]
+    done = 0
+    for d in days:
+        blocks[min(k, int(done // target))].extend(by_day[d])
+        done += len(by_day[d])
+    blocks = [b for b in blocks if b]
+    model, base = [], []
+    folds = 0
+    for test in blocks[1:]:
+        start = min(entry[i] for i in test)
+        cutoff = start - _dt.timedelta(days=max(0, int(embargo_days)))
+        train = [i for i in usable if known[i] <= cutoff and entry[i] < start]
+        if len(train) < min_train:
+            continue
+        folds += 1
+        label = labeler_for(train)
+        rate = sum(ys[i] for i in train) / len(train)
+        agg: Dict[Any, List[float]] = {}
+        for i in train:
+            a = agg.setdefault(label(i), [0.0, 0.0])
+            a[0] += ys[i]
+            a[1] += 1
+        for i in test:
+            s_, n_ = agg.get(label(i), [0.0, 0.0])
+            model.append(((s_ + rate * shrink) / (n_ + shrink) if n_ else rate, ys[i]))
+            base.append((rate, ys[i]))
+    if folds < 2 or not model:
+        out.update({"wf_folds": folds, "wf_status": "insufficient_training_history"})
+        return out
+    mb, bb = brier(model), brier(base)
+    out.update({"wf_brier": round(mb, 4), "wf_base_brier": round(bb, 4), "wf_gain_vs_base": round(bb - mb, 4),
+                "wf_scored": len(model), "wf_folds": folds, "wf_status": "ok"})
+    return out
+
+
+def _cv_mode(explicit: str = "") -> str:
+    """v1.2.0: wf (default) or legacy; --cv wins over TFB_BACKTEST_CV."""
+    raw = (explicit or os.getenv("TFB_BACKTEST_CV") or "wf").strip().lower()
+    return "legacy" if raw == "legacy" else "wf"
+
+
 def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[List[float]] = None,
-                    min_n: int = 100) -> Dict[str, Any]:
+                    min_n: int = 100, cv: str = "", embargo_days: int = 1) -> Dict[str, Any]:
     """Summarize one signal on the supplied decided, finite-return cohort.
 
     Numeric rank IC is a descriptive pooled association, not an out-of-sample
@@ -293,9 +407,30 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
     res["spread_z"] = round(z, 2)
     gain = base_brier - res["cv_brier_group_calibrated"]
     res["cv_gain_vs_base"] = round(gain, 4)
+    # v1.2.0: purged walk-forward on the same cohort; quintile cuts refitted per fold.
+    entry_all, known_all = label_days(cohorts)
+    entry = [entry_all[i] for i in keep]
+    known = [known_all[i] for i in keep]
+    if numeric and edges is None:
+        xk = [nums[i] for i in keep]
+
+        def labeler_for(train: List[int]):
+            qs = sorted(xk[i] for i in train)
+            cuts = [qs[int(len(qs) * q)] for q in (0.2, 0.4, 0.6, 0.8)]
+            return lambda i: 1 + sum(1 for c in cuts if xk[i] >= c)
+    else:
+        def labeler_for(train: List[int]):
+            return lambda i: groups[i]
+    res.update(wf_brier(y, entry, known, labeler_for, embargo_days=embargo_days))
+    res["cv_mode"] = _cv_mode(cv)
     # SEPARATES: out-of-sample Brier gain AND a spread that is not chance (z >= 3);
     # WEAK: one of the two; NONE: neither. Chance spreads across quintiles never reach z >= 3.
-    strong_gain, strong_spread = gain >= 0.002, (z >= 3.0 and spread >= 5.0)
+    # v1.2.0: the gain is the walk-forward gain (None -> no gain); legacy = the random K-fold.
+    if res["cv_mode"] == "legacy":
+        strong_gain = gain >= 0.002
+    else:
+        strong_gain = res["wf_status"] == "ok" and res["wf_gain_vs_base"] >= 0.002
+    strong_spread = z >= 3.0 and spread >= 5.0
     res["verdict"] = "SEPARATES" if (strong_gain and strong_spread) else ("WEAK" if (strong_gain or strong_spread) else "NONE")
     return res
 
@@ -309,7 +444,13 @@ def render(results: List[Dict[str, Any]], title: str) -> str:
         if "spearman_vs_roi" in r:
             ic_text = str(r["spearman_vs_roi"]) if r["spearman_vs_roi"] is not None else f"undefined ({r['spearman_status']})"
             lines.append(f"    Spearman vs ROI {ic_text}")
-        lines.append(f"    CV Brier group-calibrated {r['cv_brier_group_calibrated']} (gain vs base {r['cv_gain_vs_base']:+.4f}) | win spread {r['win_spread_pp']} pp (z={r['spread_z']})")
+        if r.get("wf_status") == "ok":
+            wf_txt = (f"Walk-forward Brier {r['wf_brier']} vs base {r['wf_base_brier']} "
+                      f"(gain {r['wf_gain_vs_base']:+.4f}, {r['wf_scored']} rows, {r['wf_folds']} folds)")
+        else:
+            wf_txt = f"Walk-forward Brier undefined ({r.get('wf_status', 'n/a')})"
+        lines.append(f"    {wf_txt} | win spread {r['win_spread_pp']} pp (z={r['spread_z']}) | verdict basis: {r.get('cv_mode', 'wf')}")
+        lines.append(f"    legacy random K-fold Brier {r['cv_brier_group_calibrated']} (gain {r['cv_gain_vs_base']:+.4f}; leaks time, diagnostic only)")
         lines.append(f"    {'group':14s}{'n':>6s}{'win%':>7s}{'meanROI%':>10s}{'medROI%':>9s}")
         for t in r["groups"][:12]:
             lines.append(f"    {t['group'][:14]:14s}{t['n']:6d}{t['win_pct']:7.1f}{t['mean_roi_pct']:10.2f}{t['median_roi_pct']:9.2f}")
@@ -336,14 +477,35 @@ def _selftest() -> int:
     for r in recs[1500:]:
         r["Date Recorded (Riyadh)"] = "2026-08-20 09:00:00"
     assert len(decided_cohorts(recs, since="2026-08-01")) == 1500 and len(decided_cohorts(recs, until="2026-07-31")) == 1500
+    # v1.2.0: spread the 3,000 cohorts over 60 entry days (1W horizon) for the walk-forward.
+    d0 = _dt.date(2026, 7, 1)
+    for i, r in enumerate(recs[:3000]):
+        r["Date Recorded (Riyadh)"] = (d0 + _dt.timedelta(days=i // 50)).isoformat() + " 09:00:00"
+    coh = decided_cohorts(recs)
     good = evaluate_signal(coh, "Good", edges=[50, 70, 85]); noise = evaluate_signal(coh, "Noise")
     cat = evaluate_signal(coh, "Cat")
     assert good["verdict"] == "SEPARATES" and good["win_spread_pp"] >= 20, good
     assert noise["verdict"] == "NONE", noise["verdict"]
     assert cat["verdict"] == "SEPARATES" and cat["type"] == "categorical", cat
     assert good["raw_brier_as_probability"] < noise["raw_brier_as_probability"]
+    assert good["wf_status"] == "ok" and good["wf_folds"] == 5 and good["wf_gain_vs_base"] > 0.002, good
+    # The leak the audit named: cohorts recorded on the same day share that day's market move. A label that
+    # only identifies the entry day "separates" under the random K-fold (the day's other cohorts sit in the
+    # training folds) but carries nothing for a day not yet seen, so the walk-forward gives it no gain.
+    rng = random.Random(3)
+    leak = []
+    for i in range(3000):
+        day = d0 + _dt.timedelta(days=i // 50)
+        p_win = 0.8 if (i // 50) % 2 == 0 else 0.3
+        leak.append({"Key": f"L{i}", "Status": "matured", "Outcome": "WIN" if rng.random() < p_win else "LOSS",
+                     "Realized ROI %": "1", "Horizon": "1W", "Day": day.isoformat(),
+                     "Date Recorded (Riyadh)": day.isoformat() + " 09:00:00"})
+    lk_wf, lk_legacy = evaluate_signal(leak, "Day"), evaluate_signal(leak, "Day", cv="legacy")
+    assert lk_legacy["cv_gain_vs_base"] >= 0.02 and lk_legacy["verdict"] == "WEAK", lk_legacy["verdict"]
+    assert lk_wf["wf_status"] == "ok" and lk_wf["wf_gain_vs_base"] < 0.002 and lk_wf["verdict"] == "NONE", lk_wf["verdict"]
     print(render([good, noise, cat], "selftest"))
-    print("selftest: PASS 4/4 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; filter/since/until)")
+    print("selftest: PASS 6/6 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
+          "filter/since/until; walk-forward 5 folds; an entry-day label gains under the legacy K-fold, not walk-forward)")
     return 0
 
 
@@ -361,6 +523,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--since", default="", help="Date Recorded >= YYYY-MM-DD (v1.1.0)")
     ap.add_argument("--until", default="", help="Date Recorded <= YYYY-MM-DD (v1.1.0)")
     ap.add_argument("--min-n", type=int, default=100)
+    ap.add_argument("--cv", default="", choices=["", "wf", "legacy"], help="verdict basis (v1.2.0; default wf)")
+    ap.add_argument("--embargo-days", type=int, default=1, help="walk-forward embargo after a known outcome (v1.2.0)")
     ap.add_argument("--json", default="")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
@@ -394,7 +558,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     coh = decided_cohorts(recs, hz, flt or None, a.since.strip(), a.until.strip())
     signals = a.signal or (DEFAULT_SIGNALS if a.all_signals else ["Entry Forecast Reliability"])
     edges = [float(x) for x in a.edges.split(",") if x.strip()] or None
-    results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n) for sg in signals if sg in hdr]
+    results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n,
+                               cv=a.cv, embargo_days=a.embargo_days) for sg in signals if sg in hdr]
     missing = [sg for sg in signals if sg not in hdr]
     scope = (f" | horizons {','.join(hz)}" if hz else "") + (f" | filter {flt}" if flt else "") + \
             (f" | since {a.since}" if a.since else "") + (f" | until {a.until}" if a.until else "")
