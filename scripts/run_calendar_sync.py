@@ -172,7 +172,12 @@ from zoneinfo import ZoneInfo
 # tab stays as the last ON run left it; readers decide by its as-of).
 # Functions added: _dividends_enabled, _dividends_sheet, parse_prior_div,
 # merge_dividends, build_div_rows, dividend_lane. Removed: 0.
-__version__ = "1.3.0"
+# v1.3.1 (2026-11-25): THE SHARED OPENER WAITS OUT THE SHEETS QUOTA. _open_book
+# (used by 15 page jobs) authorizes gspread with sheets_backoff 1.0.0's client:
+# every request, the open included, waits out an HTTP 429 (65 s + 0-20 s, at
+# most three times). TFB_SHEETS_BACKOFF=off in a job's env, or any
+# failure building the client, = the plain client of 1.3.0. Functions added: 0.
+__version__ = "1.3.1"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 _MAX_CALENDAR_BODY_ROWS = 5000
 
@@ -339,7 +344,14 @@ def _credentials():
 def _open_book():
     import gspread  # local import: CI only
     creds = _credentials()
-    gc = gspread.authorize(creds) if creds else gspread.service_account()
+    kw = {}
+    try:                                             # 1.3.1: every request waits out the Sheets quota (HTTP 429)
+        from scripts import sheets_backoff  # noqa: PLC0415
+        if sheets_backoff.backoff_on():
+            kw["http_client"] = sheets_backoff.quota_http_client()
+    except Exception:  # noqa: BLE001 - the plain client, exactly as in 1.3.0
+        kw = {}
+    gc = gspread.authorize(creds, **kw) if creds else gspread.service_account(**kw)
     sid = _env("DEFAULT_SPREADSHEET_ID") or _env("SPREADSHEET_ID")
     if not sid:
         raise RuntimeError("DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID not set")

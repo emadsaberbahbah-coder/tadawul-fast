@@ -1,5 +1,5 @@
 # =============================================================================
-# 🧾 Corporate Actions - repair_corporate_actions.py 1.1.0
+# 🧾 Corporate Actions - repair_corporate_actions.py 1.2.0
 # VERSION 1.0.0 (2026-11-14) - NEW WORKFLOW
 # WHY: the _Corporate_Actions register was header-only, so splits were never
 #   repaired: MBRX's 1-for-20 reverse split (20 Oct) left matured outcomes
@@ -83,6 +83,7 @@ jobs:
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TFB_CA_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || vars.TFB_CA_REPAIR || 'apply' }}
+          TFB_CA_WITNESS_BASIS: ${{ vars.TFB_CA_WITNESS_BASIS }}   # 1.2.0: off = hold every ambiguous row (1.1.1)
         run: |
           if [[ "$TFB_CA_REPAIR" == "apply" ]]; then
             python scripts/repair_corporate_actions.py --apply

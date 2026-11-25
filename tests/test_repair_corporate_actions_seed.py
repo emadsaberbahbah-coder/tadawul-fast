@@ -172,7 +172,7 @@ def test_r1_scan_writes_nothing_and_apply_writes_register_then_repairs(monkeypat
     assert cells[col("Entry Price") + "6"] == pytest.approx(8.0) and cells[col("Target Price") + "6"] == pytest.approx(10.0)
     assert cells[col("Current Price") + "6"] == pytest.approx(6.5)
     assert cells[col("Realized ROI %") + "6"] == pytest.approx(-18.75) and cells[col("Outcome") + "6"] == "LOSS"
-    assert cells[col("Notes") + "6"].startswith("ca_adjusted:v1.1.1:f=0.05")
+    assert cells[col("Notes") + "6"].startswith("ca_adjusted:v" + rca.SCRIPT_VERSION + ":f=0.05")
     assert "seed_rows=1" in b.tabs["_Run_Log"].appended[-1][5]
     # the next run: the register holds the row, so the seed adds nothing; the repaired row is tagged and skipped
     b.tabs["Performance_Log"].values[5][HDR.index("Notes")] = cells[col("Notes") + "6"]
@@ -212,7 +212,7 @@ def test_t1_long_notes_keep_every_character_and_the_tag(monkeypatch, tmp_path, c
     assert rca.main(["--apply", "--seed", str(seed), "--retag", str(_retag(tmp_path, []))]) == 0
     cells = {u["range"]: u["values"][0][0] for u in b.tabs["Performance_Log"].batches}
     note = cells[rca._col_letter(HDR.index("Notes")) + "2"]
-    assert note == LONG + " | ca_adjusted:v1.1.1:f=0.05" and len(note) > 700     # 1.1.0 cut this to 250
+    assert note == LONG + " | ca_adjusted:v" + rca.SCRIPT_VERSION + ":f=0.05" and len(note) > 700     # 1.1.0 cut this to 250
     b.tabs["Performance_Log"].values[1][HDR.index("Notes")] = note
     b.tabs["Performance_Log"].values[1][HDR.index("Entry Price")] = "8.0"
     capsys.readouterr()
@@ -261,7 +261,7 @@ def test_t3_apply_retags_and_never_rebases_a_listed_row(monkeypatch, tmp_path, c
     assert b.tabs["Performance_Log"].batches == []
     assert rca.main(["--apply", "--seed", str(seed), "--retag", str(rt)]) == 0
     cells = {u["range"]: u["values"][0][0] for u in b.tabs["Performance_Log"].batches}
-    assert cells == {rca._col_letter(HDR.index("Notes")) + "2": "FULL | ca_adjusted:v1.1.1:f=0.05:retag"}
+    assert cells == {rca._col_letter(HDR.index("Notes")) + "2": "FULL | ca_adjusted:v" + rca.SCRIPT_VERSION + ":f=0.05:retag"}
     assert "retag=1" in b.tabs["_Run_Log"].appended[-1][5]
     b.tabs["Performance_Log"].values[1][HDR.index("Notes")] = cells[rca._col_letter(HDR.index("Notes")) + "2"]
     capsys.readouterr()

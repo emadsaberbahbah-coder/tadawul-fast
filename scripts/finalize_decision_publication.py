@@ -31,7 +31,7 @@ from scripts.approved_universe_scope import (
 )
 from scripts.workflow_validation_scope import SOURCE_PAGES, strict_json
 
-SCRIPT_VERSION = "1.1.3"   # 1.1.3 (2026-11-05): Mutual_Funds baseline 2422 = the approved fund scope v2
+SCRIPT_VERSION = "1.2.0"   # 1.2.0 (2026-11-25): a red verdict names its findings (failing_codes). # 1.1.3 (2026-11-05): Mutual_Funds baseline 2422 = the approved fund scope v2
 KEY = "TFB Decision Feed"
 KEY_RANGE = "'_Status'!L1:M60"
 SELF_CHECK_KEYS = {"backend url", "last global update", "token loaded"}
@@ -354,6 +354,20 @@ async def run(spreadsheet_id: str, *, reader=None, registry=None,
     return result
 
 
+# 1.2.0 (2026-11-25) [FINDING-CODES] (full audit of 25 Nov 2026): 7 of the 42 scheduled syncs of 12-25 Nov ended red
+# here on the single blocker "decision_failed", and the log said only that - the findings were in an artifact the
+# audit could not open. Every failing decision finding is now printed as CODE@surface (codes and page names only, no
+# workbook value). Nothing else changes: the same audits, verdict, exit code and publication as 1.1.3.
+def failing_codes(result: dict) -> list:
+    """CODE@surface of every FAIL finding of the decision audit, in order. PURE."""
+    out = []
+    findings = (((result or {}).get("audits") or {}).get("decision") or {}).get("findings") or []
+    for f in findings if isinstance(findings, list) else []:
+        if isinstance(f, dict) and str(f.get("severity", "")).upper() == "FAIL":
+            out.append("%s@%s" % (str(f.get("code") or "?")[:60], str(f.get("surface") or "?")[:40]))
+    return out
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sheet-id", default=os.getenv("DEFAULT_SPREADSHEET_ID", ""))
@@ -372,6 +386,8 @@ def main(argv=None) -> int:
     except Exception as exc:
         result = {"script_version": SCRIPT_VERSION, "exit_code": 3,
                   "fatal": safe_error_text(exc), "feed_promoted": False}
+    if failing_codes(result):
+        print("[FINAL-DIAG] failing decision findings: " + ", ".join(failing_codes(result)), flush=True)
     text = json.dumps(result, ensure_ascii=False, default=str, indent=2)
     Path(args.json_out).write_text(text + "\n", encoding="utf-8")
     print(json.dumps({key: result.get(key) for key in (

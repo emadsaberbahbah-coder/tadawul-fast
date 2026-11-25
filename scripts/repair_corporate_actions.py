@@ -1,6 +1,27 @@
 """
 scripts/repair_corporate_actions.py — Performance_Log CA sweep & repair
 ========================================================================
+VERSION 1.2.0  (2026-11-25)  — THE OUTCOME'S OWN RECEIPT NAMES ITS EXIT SESSION
+WHY (full audit of 25 Nov 2026): S-1 criterion 5 has read "CA UNREPAIRED" since
+Granite REIT's 3-for-1 split of 24 Nov, on ONE row: the 1W outcome of
+GRT-UN.TO (row 30795) matured with Target Date 21 Nov and the Maturity stamp
+24 Nov, so the split falls between the two and 1.1.0 holds the row ("exit basis
+ambiguous, review by hand"). The shadow scorer's check counts a held row as an
+unrepaired one, so the gate stays FAIL until a person edits the row. The row
+already says which session its exit price came from: the tracker writes an
+[OUTCOME-WITNESS v1] receipt into Notes with "quote_session" (here 2026-11-23,
+the close before the split) and "price" (88.92 = the row's Current Price).
+WHAT: _finished_repair reads that receipt when the two ends disagree. The exit
+price is put on today's basis by the factor of the actions effective after the
+witnessed session, only when the receipt's price equals the row's Current
+Price (the receipt describes this exit price, not an older one) and the
+session lies between the two ends. Anything else is held exactly as in 1.1.1.
+The plan item records "exit_basis": "witness <date>". On the GRT row the entry
+87.49 and the exit 88.92 are both pre-split prices, so the ROI stays +1.63%
+and both prices move to the new basis (29.16 / 29.64).
+Rollback: repository variable TFB_CA_WITNESS_BASIS=off (1.1.1 behaviour).
+Functions added: 2 (_witness_session, _witness_on).
+
 VERSION 1.1.1  (2026-11-14)  — THE REPAIR TAG IS NEVER CUT OFF
 WHY: the first apply (run 43638975586) rebased 12 MBRX rows, but five of them
 already held long Notes (the outcome-price receipt, 600-769 characters) and
@@ -87,7 +108,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import corporate_actions as ca  # noqa: E402
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.2.0"
 _RIYADH = timezone(timedelta(hours=3))
 PL_TAB = "Performance_Log"
 
@@ -190,15 +211,48 @@ def _finished_repair(row: Sequence[Any], cols: Dict[str, Optional[int]], sym: st
         return {"held": "finished outcome without Target Date and Maturity Date: exit basis unknown"}
     lo, hi = min(target_on, matured_on), max(target_on, matured_on)
     f_lo, f_hi = ca.cumulative_factor(sym, lo, index), ca.cumulative_factor(sym, hi, index)
+    basis = None
     if abs(f_lo - f_hi) > 1e-12:
-        return {"held": f"an action falls between the target session {lo} and the maturity stamp {hi}: "
-                        "exit basis ambiguous, review by hand"}
+        q = _witness_session(str(_cell(row, cols.get("Notes")) or ""), cur) if _witness_on() else None   # 1.2.0
+        if q is None or not (lo <= q <= hi):
+            return {"held": f"an action falls between the target session {lo} and the maturity stamp {hi}: "
+                            "exit basis ambiguous, review by hand"}
+        f_hi, basis = ca.cumulative_factor(sym, q, index), "witness " + q.isoformat()
     cur_new = cur / f_hi
     roi_new = round((cur_new / entry_new - 1.0) * 100.0, 4)
     roi_old = ca._as_float(_cell(row, cols.get("Realized ROI %")))
     out: Dict[str, Any] = {"exit_old": cur, "exit_new": round(cur_new, 6), "roi_old": roi_old, "roi_new": roi_new,
                            "outcome_new": "WIN" if roi_new > 0 else ("LOSS" if roi_new < 0 else "BREAKEVEN")}
+    if basis:
+        out["exit_basis"] = basis                                         # 1.2.0
     return out
+
+
+_WITNESS_TAG = "[OUTCOME-WITNESS v1]"
+
+
+def _witness_on() -> bool:
+    """1.2.0: TFB_CA_WITNESS_BASIS = off / 0 / false / no restores the 1.1.1 hold."""
+    return os.environ.get("TFB_CA_WITNESS_BASIS", "").strip().lower() not in ("off", "0", "false", "no")
+
+
+def _witness_session(notes: str, exit_price: Optional[float]) -> Optional[date]:
+    """1.2.0: the quote session named by the row's [OUTCOME-WITNESS v1] receipt, when that receipt's price is the
+    row's exit price (relative difference under 1e-6); else None. The receipt is the tracker's JSON object that
+    follows the tag. PURE."""
+    i = notes.find(_WITNESS_TAG)
+    if i < 0 or not exit_price:
+        return None
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(notes[i + len(_WITNESS_TAG):].lstrip())
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    price = ca._as_float(obj.get("price"))
+    if price is None or abs(price - exit_price) > 1e-6 * max(abs(exit_price), 1.0):
+        return None
+    return ca._as_date(obj.get("quote_session"))
 
 
 def _tag_notes(notes_old: str, tag: str) -> str:
