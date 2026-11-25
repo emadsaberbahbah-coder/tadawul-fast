@@ -93,6 +93,7 @@ def test_workflow_is_dispatch_only_scans_by_default_and_backs_up_before_apply():
 @pytest.mark.parametrize("t10,pf,status", [(2, 30, "WARN"), (3, 40, "PASS"), (4, 40, "FAIL"), (2, 45, "FAIL"),
                                            (None, None, "PASS"), (3, 35, "WARN")])
 def test_sector_cap_tighter_is_warn_looser_is_fail(t10, pf, status):
+    pytest.importorskip("openpyxl")             # the export audit imports it at module level (lean CI has none)
     from scripts import tfb_export_audit as ea
     assert ea.SCRIPT_VERSION == "1.2.2"
     got, examples = ea.sector_cap_status(t10, pf, 3, 40.0)
