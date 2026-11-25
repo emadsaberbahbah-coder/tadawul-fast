@@ -1,0 +1,80 @@
+# =============================================================================
+# 🧹 Close Stale Pull Requests (owner-run) - VERSION 1.0.0 (2026-11-25)
+# -----------------------------------------------------------------------------
+# WHY: the full audit of 25 Nov 2026 found 163 open pull requests with no
+# activity for 30+ days (189 open in all). They hide the live work and slow
+# every PR list. Claude may not close pull requests itself, so this is a tool
+# the OWNER runs from the Actions tab (owner, 25 Nov 11:14 Riyadh, chose the
+# one-click workflow).
+# WHAT: manual dispatch only. mode = preview (default) lists the PR numbers
+# that would close; mode = close closes them with a short comment. A PR is
+# stale when its last update is older than `days` (default 30, never under
+# 14). A PR labelled `keep` is never touched. Branches are kept, so any PR
+# can be reopened. The log prints PR numbers and counts only (no titles:
+# repo logs are public).
+# ROLLBACK: reopen a PR from its page; disable this workflow in Actions.
+# =============================================================================
+name: 🧹 Close Stale Pull Requests (owner-run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview = list only; close = close them'
+        type: choice
+        options:
+          - preview
+          - close
+        default: preview
+      days:
+        description: 'Close pull requests with no activity for at least this many days (14 or more)'
+        type: string
+        default: '30'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: close-stale-prs
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: Close stale pull requests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: List, then close when asked
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          set -euo pipefail
+          case "$DAYS" in ''|*[!0-9]*) echo "::error::days must be a whole number"; exit 1;; esac
+          if [ "$DAYS" -lt 14 ]; then echo "::error::days must be 14 or more"; exit 1; fi
+          cutoff=$(date -u -d "-${DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+            --jq ".[] | select(.updated_at < \"$cutoff\") | select(([.labels[].name] | index(\"keep\")) | not) | .number" > stale.txt
+          n=$(grep -c . stale.txt || true)
+          echo "Open pull requests idle since before $cutoff (label 'keep' excluded): $n"
+          tr '\n' ' ' < stale.txt; echo
+          if [ "$MODE" != "close" ]; then
+            echo "Preview only: nothing closed. Run again with mode = close."
+            exit 0
+          fi
+          closed=0; failed=0
+          while read -r pr; do
+            [ -n "$pr" ] || continue
+            if gh pr close "$pr" -R "$REPO" -c "Closed as stale (no activity for ${DAYS}+ days) by the owner-run clean-up of 25 Nov 2026. The branch is kept; reopen if this is still needed."; then
+              closed=$((closed + 1))
+            else
+              failed=$((failed + 1)); echo "::warning::could not close #$pr"
+            fi
+            sleep 1
+          done < stale.txt
+          echo "Closed: $closed of $n (failed: $failed)"
+          if [ "$failed" -gt 0 ]; then exit 1; fi
