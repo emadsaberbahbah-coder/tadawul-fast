@@ -33,11 +33,13 @@ VERSION 1.7.0 (2026-11-26) - first written 2026-11-11 (1.0.0)
         stop on a fall with the market, while the stock stays within TFB_EXIT_SJ_MARGIN_PCT (5) points of its market
         and the loss from the entry stays under TFB_EXIT_SJ_HARD_PCT (15); in every other case the stop stands. The
         note shows when there is a fall to judge, the stop is within TFB_EXIT_SJ_NEAR_PCT (3) of the close, or the
-        action is SELL. Measured on the archive that night (US shares, first day a 15-session fall reached 8 %,
-        Oct 2024 - Nov 2026): fell with the market, 846 cases on 29 days - 70.9 % higher 20 sessions later, mean
-        +6.6 %; fell on their own, 3,447 cases on 375 days - 49.9 %, +2.9 %. Twenty-nine days is one kind of market,
-        not proof: the judgment is logged and scored (sql/bigquery v_stop_cause_events) before it may control
-        anything (owner's ground rules, 21 Nov).
+        action is SELL. Measured on the archive that night (US shares with bars, Oct 2024 - Nov 2026, one event per
+        share in 20 sessions; the SQL of sql/bigquery v_stop_cause_events): fell with the market inside the margin,
+        314 cases on 22 days - 72.0 % higher 20 sessions later, mean +5.8 %, but 0.4 points behind the market itself
+        and t 0.6 by day (the gain was the market's rebound, not the share's); fell on their own, 1,535 cases on 343
+        days - 52.3 %, +0.7 %; fell 15 % on their own, 86 cases - 40.7 %, -9.6 %. Twenty-two days is one kind of
+        market, not proof: the judgment is logged and scored (v_stop_cause_learning) before it may control anything
+        (owner's ground rules, 21 Nov).
         TFB_EXIT_STOP_JUDGMENT = observe (default) | off.
     The ledger gains a 19th column, Judgment ("with_market:wait:-9.2:-6.1", "offer:manual"); 1.6.x and 1.5.0
     ledgers are read as before. Nothing here places, changes or cancels an order.
