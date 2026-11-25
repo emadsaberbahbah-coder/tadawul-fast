@@ -102,7 +102,8 @@ def test_r3_predicate_exact_prefix_and_list_cells():
     assert not w("margin_publish:profit_margin:unresolved") and not w("rank_skipped_settle_unresolved")
     assert asr._RANK_WITHHELD_PREFIXES == ("f7_settle_failed:", "settle_unresolved:")
     # 2026-10-13: route auth scope-path follow-up (v4.8.4); pin moved in place.
-    assert asr.ANALYSIS_SHEET_ROWS_VERSION == "4.8.4"
+    # 2026-11-25: opt-in compact response (v4.9.0); pin moved in place.
+    assert asr.ANALYSIS_SHEET_ROWS_VERSION == "4.9.0"
 
 
 @_isolated
