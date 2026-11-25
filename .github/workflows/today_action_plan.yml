@@ -141,6 +141,7 @@ jobs:
           TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
           TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
           TFB_TAP_SOLD_AT_BROKER: ${{ vars.TFB_TAP_SOLD_AT_BROKER || 'on' }}
+          TFB_TAP_OFFERS: ${{ vars.TFB_TAP_OFFERS || 'on' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_TAP_STYLE: ${{ (github.event_name == 'workflow_dispatch' && inputs.plain) && 'off' || vars.TFB_TAP_STYLE || 'on' }}
