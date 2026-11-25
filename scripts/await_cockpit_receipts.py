@@ -2,6 +2,24 @@
 """Dispatch the audited decision-feed release as soon as both cockpits consumed
 a completed production sync (bounded, read-only wait).
 
+VERSION 1.4.0 (2026-11-25) -- THE WAIT-ONLY HANDSHAKE WAITS THROUGH READ TIME-OUTS
+
+WHY (full audit of 25 Nov 2026): sync 45539650359 (the 06:23 Riyadh slot)
+ended red on decision_failed. Its handshake read Portfolio_Decision's receipt
+for the run at the first poll, then met three Sheets reads in a row that
+timed out ("TimeoutError: The read operation timed out", the workbook busy
+with the cockpit renders) and stopped at 844 s, 16 minutes before its own
+30-minute bound. The audit judged Top_10_Investments at 07:37 without this
+run's receipt; the render that carried it landed at 07:47, and the Release
+Decision Feed accepted the same surfaces. A read fault is the busy workbook,
+not the absence of a render.
+WHAT: in --wait-only mode a read fault no longer ends the wait after
+MAX_FAULTS in a row: it is counted and the poll goes on until the receipts are
+read or the bound runs out (WAIT_ONLY_MAX_FAULTS = 30 consecutive faults is
+the backstop). The release mode (the dispatcher) keeps MAX_FAULTS = 3, and
+every receipt rule, bound and the audit after the wait are unchanged.
+Rollback: TFB_SYNC_AWAIT_FAULTS=3 (the 1.3.0 stop) or revert.
+
 VERSION 1.3.0 (2026-11-05) -- THE HANDSHAKE COVERS ONE RENDER RETRY
 (--wait-only bound: default 15 -> 30 minutes, hard cap 20 -> 35).
 
@@ -213,7 +231,7 @@ from scripts import audit_decision_surface_freshness as freshness  # noqa: E402
 from scripts import finalize_decision_publication as final  # noqa: E402
 from scripts import release_decision_feed as release  # noqa: E402
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 GATE_ENV = "TFB_RELEASE_AFTER_SYNC"
 PRIOR_ENV = "TFB_RELEASE_AFTER_SYNC_PRIOR"   # v1.2.0: strict (default) | release
 WAIT_ENV = "TFB_RELEASE_AFTER_SYNC_WAIT_MIN"
@@ -226,6 +244,17 @@ MIN_POLL_S = 30
 MAX_POLL_S = 600
 PROBE_MIN_S = 270
 MAX_FAULTS = 3
+WAIT_ONLY_MAX_FAULTS = 30          # 1.4.0: --wait-only polls on through read time-outs until its bound
+
+
+def _wait_only_max_faults() -> int:
+    """1.4.0: consecutive read faults that end a --wait-only wait; TFB_SYNC_AWAIT_FAULTS (1-60) wins."""
+    raw = os.environ.get("TFB_SYNC_AWAIT_FAULTS", "").strip()
+    try:
+        val = int(raw) if raw else WAIT_ONLY_MAX_FAULTS
+    except ValueError:
+        val = WAIT_ONLY_MAX_FAULTS
+    return max(1, min(val, 60))
 MAX_DISPATCH_FAILURES = 2
 # v1.1.0 --wait-only: the sync-render handshake (workflow gate, step-level 'if')
 WAIT_ONLY_MODE = "wait_only"
@@ -655,7 +684,7 @@ def _wait_notice(out: dict) -> str:
         moved = (out.get("last") or {}).get("moved") or []
         return "the cohort moved on (a newer run in %s)" % ",".join(str(item) for item in moved) + tail
     if out["outcome"] == "read_faults":
-        return "%d consecutive read faults (%s)" % (MAX_FAULTS, out["last_fault"]) + tail
+        return "%d consecutive read faults (%s)" % (_wait_only_max_faults(), out["last_fault"]) + tail
     return "%s (%s); the audit that follows decides." % (out["outcome"], ",".join(out["reasons"]))
 
 
@@ -729,10 +758,10 @@ def wait_only(sheet_id: Any, run_id: Any, *, max_min: Any = None, poll_s: Any = 
             grids = read_surfaces(service, sheet_id)
             verdict = evaluate_wait(run, grids[0], grids[1], grids[2])
             misses = 0
-        except Exception as exc:  # noqa: BLE001 - counted; three in a row end the wait
+        except Exception as exc:  # noqa: BLE001 - counted; 1.4.0: only the backstop ends the wait
             fault(exc)
             misses += 1
-            if misses >= MAX_FAULTS:
+            if misses >= _wait_only_max_faults():
                 return done(0, "read_faults", "read_faults")
         if verdict is not None:
             for name in ("pf", "t10"):

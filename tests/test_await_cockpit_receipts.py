@@ -1026,15 +1026,29 @@ def case_w19_wait_only_is_bounded_and_ends_early_on_evidence(mp, tmp_path):
     h = WaitHarness([state(t10_grid=t10("")), state(key=key_grid(gm_value=gm(NEWER)), t10_grid=t10(""))])
     result = h.wait()
     assert result["outcome"] == "stopped" and result["polls"] == 2
-    # read faults: one is retried; three in a row end the wait with exit 0
+    # read faults: one is retried; v1.4.0: three in a row no longer end the wait (25 Nov: the T10 receipt landed
+    # 10 minutes after the 1.3.0 handshake gave up on three read time-outs)
+    mp.delenv("TFB_SYNC_AWAIT_FAULTS", raising=False)
     h = WaitHarness([state()], read_faults=[TimeoutError("read timed out"), None])
     result = h.wait()
     assert result["outcome"] == "consumed" and result["polls"] == 2 and result["faults"] == 1
+    h = WaitHarness([state()], read_faults=[TimeoutError("1"), TimeoutError("2"), TimeoutError("3"), None])
+    result = h.wait()
+    assert result["outcome"] == "consumed" and result["polls"] == 4 and result["faults"] == 3
+    h = WaitHarness([state()], read_faults=[TimeoutError(str(i)) for i in range(40)])
+    result = h.wait()                                    # the backstop: 30 consecutive faults end it, inside the bound
+    assert result["exit_code"] == 0 and result["outcome"] == "read_faults" and result["polls"] == 30
+    assert result["notice"].startswith("30 consecutive read faults (TimeoutError: 29)")
+    mp.setenv("TFB_SYNC_AWAIT_FAULTS", "3")              # the rollback: the 1.3.0 stop
     h = WaitHarness([state()], read_faults=[TimeoutError("1"), TimeoutError("2"), TimeoutError("3")])
     result = h.wait()
     assert result["exit_code"] == 0 and result["outcome"] == "read_faults"
     assert result["reasons"] == ["read_faults"] and result["polls"] == 3
     assert result["notice"].startswith("3 consecutive read faults (TimeoutError: 3)")
+    for raw, want in (("", 30), ("0", 1), ("99", 60), ("x", 30), ("12", 12)):
+        mp.setenv("TFB_SYNC_AWAIT_FAULTS", raw)
+        assert W._wait_only_max_faults() == want, raw
+    mp.setenv("TFB_SYNC_AWAIT_FAULTS", "3")
     h = WaitHarness([state(t10_grid=t10(""))] * 4 + [state()],
                     read_faults=[TimeoutError("1"), TimeoutError("2"), None, TimeoutError("3"), None])
     result = h.wait()
@@ -1256,7 +1270,8 @@ def case_w23_handshake_step_contract(mp, tmp_path):
         for forbidden in ("--source-run-id", "release_decision_feed", "finalize_decision_publication",
                           "audit_decision_surface_freshness", "--publish", "dispatch"):
             assert forbidden not in step["run"], (path.name, forbidden)
-        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}"}
+        expected_env = {"TFB_SYNC_AWAIT_RENDER_MIN": "${{ vars.TFB_SYNC_AWAIT_RENDER_MIN || '30' }}",
+                        "TFB_SYNC_AWAIT_FAULTS": "${{ vars.TFB_SYNC_AWAIT_FAULTS }}"}     # v1.4.0: the fault rollback
         if path == FRESH_YML:
             expected_env["SOURCE_RUN_ID"] = "${{ github.event.workflow_run.id }}"
         assert step["env"] == expected_env, path.name

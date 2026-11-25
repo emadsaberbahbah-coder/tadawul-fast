@@ -1,7 +1,24 @@
 /**
  * 27_Decision_Pages_v2.gs
  * Emad Bahbah Financial Advisor — Decision Pages v2 renderer
- * Version: 1.4.6 (2026-11-19)
+ * Version: 1.4.7 (2026-11-25)
+ *   1.4.7: [DIV-LOG] THE EXIT ENGINE READS THE LEDGER'S OWN DIVIDEND RECORD (full audit, Wed 25 Nov 2026 09:36
+ *          Riyadh). The workbook exported that morning held, on _DP2_Exit_State, SUPN.US 'SELL NOW - stop 33.76 hit'
+ *          with entry 35.45 and source 'yahoo (cached)', while the Exit Plan (entry 29.87, dividend-adjusted), the
+ *          Today Action Plan and Final_Decisions read HOLD. Cause: the dividend adjustment (1.2.33, on since 1.4.0)
+ *          takes its dividends from the chart's own events and from Dividend_Events; a CACHED history carries no
+ *          events, and Dividend_Events lists only coming ex-dates, so the 8.13 USD special of 3 Nov reached neither
+ *          source and the ex-dividend gap read as a stop hit. The ledger already records every dividend the lots
+ *          were paid (_Dividend_Log, positive Amount/Share per symbol and ex-date). Now:
+ *          - dp2DivLogFromValues_ (pure): _Dividend_Log -> { SYMBOL: [{ date, amount per share, currency }] } from
+ *            the positive rows only (a tax row is negative), one entry per symbol and ex-date.
+ *          - dp2ExitDivsFor_ takes it as a third source: an ex-date already listed (within DP2_EXIT_DIV_NEAR_D days)
+ *            is not added twice; it must have arrived (<= today) and carry the quote's own currency (a blank log
+ *            currency is never guessed). The net-of-tax rule of 1.4.5 then applies as before.
+ *          On the SUPN lot this gives entry 29.89 and a stop in today's price terms (the Exit Plan's own figures),
+ *          and STNG's 0.75 of 13 Nov is counted the same way. Script Property DP2_DIV_LOG = 0 / off / false / no =
+ *          the 1.4.6 engine; anything else, absent or unreadable = on. Analysis only: the final decision (Final_
+ *          Decisions) and the SELL e-mail rule of 1.4.0 are unchanged; no gate, ticket, sizing, order or broker call.
  *   1.4.6: [RETURN-COL] A HOLDING'S RETURN CELL COUNTS THE DIVIDENDS IT RECEIVED (owner, Thu 19 Nov 2026 10:04 Riyadh:
  *          "still in some pages I see that SUPN.US showing high loss but the impact of the dividends received is not
  *          effective ... check and solve that now and in the future as well"). The holdings table's 'Unreal.' cell
@@ -527,7 +544,7 @@
  * CONVENTIONS: ES5 only; no onOpen here (01_Menu owns the menu).
  */
 'use strict';
-var DP2_VERSION = '1.4.6';   // lockstep with the header
+var DP2_VERSION = '1.4.7';   // lockstep with the header
 var DP2 = {
   SHEET_PD: 'Portfolio_Decision_v2',
   SHEET_T10: 'Top_10_Investments_v2',
@@ -2730,6 +2747,46 @@ function dp2DivTab_() {
     return dp2DivTabFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), 2000), Math.min(Math.max(sh.getLastColumn(), 1), 12)).getValues());
   } catch (e) { return {}; }
 }
+/* v1.4.7 [DIV-LOG]: the ledger's dividend log as a dividend SOURCE for the exit engine (a cached chart carries none). */
+var DP2_DIV_LOG_PROP = 'DP2_DIV_LOG';           // 0 / off / false / no = the 1.4.6 engine; default on
+function dp2DivLogOn_() { return !/^(0|off|false|no)$/i.test(dp2Str_(dp2Prop_(DP2_DIV_LOG_PROP)).trim()); }
+/* PURE: _Dividend_Log values -> { SYMBOL: [{ date 'yyyy-MM-dd', amount (per share), currency }] }, sorted by date. The
+ * header row (one of the first 8) is found by name (Symbol, Ex-Date, Amount/Share; Ccy optional). Only a positive
+ * per-share amount is a dividend (a tax row is negative); the first row per symbol and ex-date counts. */
+function dp2DivLogFromValues_(vals) {
+  var out = {}, seen = {}, hdr = -1, iS = -1, iD = -1, iA = -1, iC = -1, r, c, h, k;
+  vals = vals || [];
+  for (r = 0; r < vals.length && r < 8 && hdr < 0; r++) {
+    var s0 = -1, d0 = -1, a0 = -1, c0 = -1;
+    for (c = 0; c < (vals[r] || []).length; c++) {
+      h = dp2Str_(vals[r][c]).toLowerCase().replace(/[^a-z]/g, '');
+      if (h === 'symbol') s0 = c; else if (h === 'exdate') d0 = c; else if (h === 'amountshare') a0 = c; else if (h === 'ccy' || h === 'currency') c0 = c;
+    }
+    if (s0 >= 0 && d0 >= 0 && a0 >= 0) { hdr = r; iS = s0; iD = d0; iA = a0; iC = c0; }
+  }
+  if (hdr < 0) return out;
+  for (r = hdr + 1; r < vals.length; r++) {
+    var row = vals[r] || [], sym = dp2Str_(row[iS]).trim().toUpperCase(), date = dp2DateStr_(row[iD]), amt = dp2Num_(row[iA]);
+    if (!sym || !date || amt === null || !(amt > 0)) continue;
+    k = sym + '|' + date;
+    if (Object.prototype.hasOwnProperty.call(seen, k)) continue;
+    seen[k] = true;
+    if (!Object.prototype.hasOwnProperty.call(out, sym)) out[sym] = [];
+    out[sym].push({ date: date, amount: amt, currency: iC >= 0 ? dp2Str_(row[iC]).trim().toUpperCase() : '' });
+  }
+  for (k in out) { if (Object.prototype.hasOwnProperty.call(out, k)) out[k].sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); }); }
+  return out;
+}
+/* _Dividend_Log read once per Portfolio_Decision_v2 build for the exit engine; the gate off, any failure or an absent
+ * tab -> {} (the 1.4.6 sources only). */
+function dp2DivLog_() {
+  try {
+    if (!dp2DivLogOn_()) return {};
+    var sh = dp2Sheet_(DP2_DIVLOG_SHEET, false);
+    if (!sh || sh.getLastRow() < 2) return {};
+    return dp2DivLogFromValues_(sh.getRange(1, 1, Math.min(sh.getLastRow(), 3000), Math.min(Math.max(sh.getLastColumn(), 1), 12)).getValues());
+  } catch (e) { return {}; }
+}
 /* v1.4.5 [DIV-NET]: the portfolio ledger's dividend log. A positive Amount is a dividend, a negative Amount the tax
  * recorded for the same symbol and ex-date. */
 var DP2_DIVLOG_SHEET = '_Dividend_Log';
@@ -2826,7 +2883,7 @@ function dp2V145CoreOk_() {
 /* PURE: the dividends to adjust one lot's history by: the chart's own (xb.divs) first; the Dividend_Events row of the
  * same symbol fills an ex-date the chart does not list yet (none within DP2_EXIT_DIV_NEAR_D days of it), once it has
  * arrived (<= today) and only in the quote's own currency (a subunit quote never matches the upper-cased tab). */
-function dp2ExitDivsFor_(xb, sym, tab, today) {
+function dp2ExitDivsFor_(xb, sym, tab, today, log) {
   var out = (xb && xb.divs) ? xb.divs.slice() : [];
   var t = tab ? tab[dp2Str_(sym).trim().toUpperCase()] : null;
   var ccy = xb ? dp2Str_(xb.ccy) : '';
@@ -2834,6 +2891,14 @@ function dp2ExitDivsFor_(xb, sym, tab, today) {
     var near = false;
     for (var i = 0; i < out.length; i++) { if (Math.abs(dp2DayMs_(out[i].date) - dp2DayMs_(t.date)) <= DP2_EXIT_DIV_NEAR_D * 86400000) near = true; }
     if (!near) out.push({ date: t.date, amount: t.amount, source: 'Dividend_Events' });
+  }
+  var lg = log ? log[dp2Str_(sym).trim().toUpperCase()] : null;   // v1.4.7 [DIV-LOG]: the ledger's record, last
+  for (var j = 0; lg && j < lg.length; j++) {
+    var e = lg[j];
+    if (!e || !e.date || !today || e.date > today || !ccy || DP2_EXIT_SUBUNIT_.hasOwnProperty(ccy) || e.currency !== ccy.toUpperCase()) continue;
+    var dup = false;
+    for (var q = 0; q < out.length; q++) { if (Math.abs(dp2DayMs_(out[q].date) - dp2DayMs_(e.date)) <= DP2_EXIT_DIV_NEAR_D * 86400000) dup = true; }
+    if (!dup) out.push({ date: e.date, amount: e.amount, source: 'dividend log' });
   }
   out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
   return out;
@@ -3988,6 +4053,7 @@ function buildPortfolioDecisionV2() {
   try { xbars = dp2LoadBars_(eq.map(function (l) { return l.symbol; }), oldestEntry); } catch (eX) { xbars = {}; }   // v1.2.11: history back to the oldest entry
   // v1.2.33 [EXIT-SANITY]: the gate (read once per execution); the dividend tab and today's date only while it is on
   var xSan = dp2ExitSanityOn_(), divTab = xSan ? dp2DivTab_() : null, divTax = xSan ? dp2DivTax_() : null, xToday = xSan ? dp2Today_().slice(0, 10) : '';
+  var divLog = xSan ? dp2DivLog_() : null;   // v1.4.7 [DIV-LOG]
   // research allocation + rotation (shared with Top_10_Investments_v2; seat bars are memoized for that page)
   var alloc = null;
   try {
@@ -4151,7 +4217,7 @@ function buildPortfolioDecisionV2() {
       xMiss = dp2ExitAnchorMiss_(xb.bars, cost, entryDate);
       if (xMiss) x = null;
       else {
-        xDiv = dp2ExitDivAdjust_(xb.bars, cost, entryDate, dp2ExitDivsNet_(dp2ExitDivsFor_(xb, l.symbol, divTab, xToday), divTax ? divTax[dp2Str_(l.symbol).trim().toUpperCase()] : null, entryDate), xToday);   // v1.4.5 [DIV-NET]
+        xDiv = dp2ExitDivAdjust_(xb.bars, cost, entryDate, dp2ExitDivsNet_(dp2ExitDivsFor_(xb, l.symbol, divTab, xToday, divLog), divTax ? divTax[dp2Str_(l.symbol).trim().toUpperCase()] : null, entryDate), xToday);   // v1.4.5 [DIV-NET] + v1.4.7 [DIV-LOG]
         if (xDiv.applied.length) x = dp2ExitCompute_(xDiv.bars, xDiv.entry, entryDate, lastOv, dp2StopRuleFor_(entryDate)); else xDiv = null;
       }
     }
@@ -4740,6 +4806,20 @@ function buildTop10V2() {
 }
 
 /* ========================================================= self-test */
+/* v1.4.7 [DIV-LOG]: the pure core on a synthetic ledger (header, a dividend, its tax row, a duplicate lot row). */
+function dp2V147CoreOk_() {
+  try {
+    var log = dp2DivLogFromValues_([['Logged At', 'Type', 'Symbol', 'Lot Buy Date', 'Ex-Date', 'Amount/Share', 'Shares', 'Amount', 'Ccy'],
+      ['', 'AUTO', 'aaa.us', '2026-03-01', '2026-03-10', 2, 10, 20, 'USD'], ['', 'MANUAL', 'AAA.US', '2026-03-01', '2026-03-10', -0.6, 10, -6, 'USD'],
+      ['', 'AUTO', 'AAA.US', '2026-02-01', '2026-03-10', 2, 5, 10, 'USD']]);
+    var a = log['AAA.US'] && log['AAA.US'].length === 1 && log['AAA.US'][0].amount === 2 && log['AAA.US'][0].date === '2026-03-10';
+    var d = dp2ExitDivsFor_({ divs: [], ccy: 'USD' }, 'AAA.US', {}, '2026-03-12', log);
+    var b = d.length === 1 && d[0].source === 'dividend log' && dp2ExitDivsFor_({ divs: [], ccy: 'USD' }, 'AAA.US', {}, '2026-03-09', log).length === 0 &&
+      dp2ExitDivsFor_({ divs: [{ date: '2026-03-11', amount: 2, source: 'chart' }], ccy: 'USD' }, 'AAA.US', {}, '2026-03-12', log).length === 1 &&
+      dp2ExitDivsFor_({ divs: [], ccy: 'SAR' }, 'AAA.US', {}, '2026-03-12', log).length === 0;
+    return !!(a && b);
+  } catch (e) { return false; }
+}
 function dp2SelfTest() {
   dp2RunStart_();   // v1.2.23
   var checks = [];
@@ -4778,6 +4858,7 @@ function dp2SelfTest() {
   checks.push({ name: 'v1.4.4 cores: plan accept, total return, evidence recent (DP2_EVIDENCE_RECENT_DAYS: ' + (dp2EvidenceRecentDays_() ? dp2EvidenceRecentDays_() + ' d' : 'off') + ')', ok: dp2V144CoreOk_() });
   checks.push({ name: 'v1.4.5 core: a dividend net of the tax recorded for it (DP2_DIV_NET: ' + (dp2DivNetOn_() ? 'on' : 'off') + ')', ok: dp2V145CoreOk_() });
   checks.push({ name: 'v1.4.6 core: the return cell counts dividends received (DP2_RETURN_WITH_DIV: ' + (dp2ReturnColOn_() ? 'on' : 'off') + ')', ok: dp2V146CoreOk_() });
+  checks.push({ name: 'v1.4.7 core: the exit engine reads the dividend log (DP2_DIV_LOG: ' + (dp2DivLogOn_() ? 'on' : 'off') + ')', ok: dp2V147CoreOk_() });
   if (dp2RpOn_()) { var rpOk = dp2RpCoreOk_(); checks.push({ name: 'render priority (TFB_RENDER_PRIORITY): on \u00b7 core ' + (rpOk ? 'ok' : 'FAIL') + ' (yields to a running decision render; the page built longest ago goes first; a stopped cockpit render is named)', ok: rpOk }); }   // v1.2.34
   var slotN = 0; try { ScriptApp.getProjectTriggers().forEach(function (tr) { if (tr.getHandlerFunction() === DP2_SLOT_HANDLER_) slotN++; }); } catch (eSl) { slotN = 0; }
   if (slotN) { var slOk = dp2SlotCoreOk_(); checks.push({ name: 'refresh slots (' + DP2_SLOT_HANDLER_ + ' every ' + DP2_SLOT_EVERY_MIN_ + ' min): ' + dp2SlotHoursCore_(dp2Prop_(DP2_SLOT_HOURS_PROP_)).join(',') + ' \u00b7 core ' + (slOk ? 'ok' : 'FAIL') + ' (one page per execution, after the main-page render of the hour)', ok: slOk }); }   // v1.3.0

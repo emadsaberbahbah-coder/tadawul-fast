@@ -463,7 +463,7 @@ def test_d9_pure_helpers(monkeypatch):
         assert sync._dividends_enabled() is armed, word
     monkeypatch.setenv("TFB_CAL_DIVIDENDS_SHEET", "Divs_Test")
     assert sync._dividends_sheet() == "Divs_Test"
-    assert sync.__version__ == "1.3.0" and len(sync.DIV_HEADERS) == 10
+    assert sync.__version__ == "1.3.1" and len(sync.DIV_HEADERS) == 10
 
 
 def test_d10_workflow_mapping_and_pins():
@@ -474,7 +474,7 @@ def test_d10_workflow_mapping_and_pins():
     assert env["TFB_CAL_LAST_REPORT"] == "${{ vars.TFB_CAL_LAST_REPORT || 'off' }}"
     verifier = (ROOT / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
     assert '("core.providers.calendar_provider", "__version__", "1.4.0",' in verifier
-    assert '("run_calendar_sync", "1.3.0", "calendar sync"),' in verifier
+    assert '("run_calendar_sync", "1.3.1", "calendar sync"),' in verifier   # 2026-11-25: 1.3.1
     for path in (ROOT / "scripts" / "run_calendar_sync.py", ROOT / "core" / "providers" / "calendar_provider.py"):
         added = path.read_text(encoding="utf-8")
         assert "fetch_next_exdiv_detail" in added

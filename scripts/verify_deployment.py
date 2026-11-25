@@ -293,7 +293,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
 
     ("tfb_import_executions", "1.0.0", "offline execution replay"),
     ("tfb_reconcile_portfolio", "1.0.0", "read-only portfolio reconciliation"),
-    ("finalize_decision_publication", "1.1.3", "final decision-publication acceptance"),
+    ("finalize_decision_publication", "1.2.0", "final decision-publication acceptance"),
     # 2026-10-29 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (render settle,
     # TFB_RELEASE_RENDER_SETTLE default off; 1.2.1 is claimed by open PR #831).
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.3.0 -> 1.4.0 (render hold,
@@ -312,7 +312,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.1.0 -> 1.2.0 (the release's
     # own classify_prior for an older run's veto; vars.TFB_RELEASE_AFTER_SYNC_PRIOR,
     # default strict; workflow-scoped, never on Render).
-    ("await_cockpit_receipts", "1.3.0", "after-sync release dispatch (read-only wait)"),
+    ("await_cockpit_receipts", "1.4.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
     ("run_shadow_scorer", "1.9.7", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
@@ -342,7 +342,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-03 (pin only, SCRIPT_VERSION unchanged): 1.2.0 -> 1.3.0 (the
     # Dividend_Events tab behind vars.TFB_CAL_DIVIDENDS, default off;
     # workflow-scoped, never on Render).
-    ("run_calendar_sync", "1.3.0", "calendar sync"),
+    ("run_calendar_sync", "1.3.1", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
     ("archive_to_bigquery", "1.1.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
@@ -484,6 +484,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("ibkr_history", "1.0.0", "ibkr history"),
     ("cash_cells", "1.0.0", "cash cells"),
     ("sheets_quota", "1.1.0", "sheets quota"),
+    ("sheets_backoff", "1.0.0", "sheets backoff"),
     # 2026-10-28 (WP-05 read-back, P1-5; pin only): the read-only provider probe.
     ("provider_identity_probe", "1.0.0", "provider identity probe"),
 ]

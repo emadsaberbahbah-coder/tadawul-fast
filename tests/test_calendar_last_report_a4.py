@@ -350,7 +350,7 @@ def test_l7b_off_on_a_wide_tab_without_the_block_keeps_the_a_to_g_write(monkeypa
 
 def test_selftest_and_version():
     # 2026-11-03: v1.3.0 (Dividend_Events lane, gated off) stacked; pin moved
-    assert sync.__version__ == "1.3.0"
+    assert sync.__version__ == "1.3.1"   # 2026-11-25: 1.3.1 opens the book with the quota client
     out = subprocess.run([sys.executable, str(ROOT / "scripts" / "run_calendar_sync.py"), "--selftest"],
                          capture_output=True, text=True, timeout=120, cwd=str(ROOT))
     assert out.returncode == 0 and "SELFTEST 13/13" in out.stdout, out.stdout + out.stderr
