@@ -246,10 +246,18 @@ def _day(v: Any) -> Optional[_dt.date]:
         return None
 
 
+# v1.2.0 (review): an outcome is settled at the first exchange-session close at or after the target
+# (track_performance._outcome_target_session), so a weekend or holiday target is known later than its date.
+# Without a recorded Maturity Date the known day is padded by this many calendar days (a full weekend).
+AVAILABILITY_PAD_DAYS = 3
+
+
 def label_days(cohorts: List[Dict[str, str]]) -> Tuple[List[Optional[_dt.date]], List[Optional[_dt.date]]]:
-    """v1.2.0: (entry day, day the outcome became known) per cohort. The known day is
-    Target Date (Riyadh); without it, Date Recorded + the horizon's calendar days;
-    None when neither can be read (the row is then left out of the walk-forward)."""
+    """v1.2.0: (entry day, day the outcome became known) per cohort. The nominal target is Target
+    Date (Riyadh), else Date Recorded + the horizon's calendar days. The known day is the recorded
+    Maturity Date (when the outcome was finalised) if it is on or after that target; otherwise the
+    target + AVAILABILITY_PAD_DAYS, so a weekend or holiday target never enters training before the
+    session that settled it. None when no target can be read (the row then stays out of the walk-forward)."""
     entry, known = [], []
     for r in cohorts:
         e = _day(r.get("Date Recorded (Riyadh)"))
@@ -258,6 +266,9 @@ def label_days(cohorts: List[Dict[str, str]]) -> Tuple[List[Optional[_dt.date]],
             t = e + _dt.timedelta(days=_HZ_DAYS[_s(r.get("Horizon"))])
         if e is not None and t is not None and t < e:
             t = None
+        if t is not None:
+            m = _day(r.get("Maturity Date"))
+            t = m if (m is not None and m >= t) else t + _dt.timedelta(days=AVAILABILITY_PAD_DAYS)
         entry.append(e)
         known.append(t)
     return entry, known
@@ -477,7 +488,7 @@ def _selftest() -> int:
     for r in recs[1500:]:
         r["Date Recorded (Riyadh)"] = "2026-08-20 09:00:00"
     assert len(decided_cohorts(recs, since="2026-08-01")) == 1500 and len(decided_cohorts(recs, until="2026-07-31")) == 1500
-    # v1.2.0: spread the 3,000 cohorts over 60 entry days (1W horizon) for the walk-forward.
+    # v1.2.0: spread the 3,000 cohorts over 60 entry days (1W horizon, known 7 + 3 days later) for the walk-forward.
     d0 = _dt.date(2026, 7, 1)
     for i, r in enumerate(recs[:3000]):
         r["Date Recorded (Riyadh)"] = (d0 + _dt.timedelta(days=i // 50)).isoformat() + " 09:00:00"
@@ -488,7 +499,7 @@ def _selftest() -> int:
     assert noise["verdict"] == "NONE", noise["verdict"]
     assert cat["verdict"] == "SEPARATES" and cat["type"] == "categorical", cat
     assert good["raw_brier_as_probability"] < noise["raw_brier_as_probability"]
-    assert good["wf_status"] == "ok" and good["wf_folds"] == 5 and good["wf_gain_vs_base"] > 0.002, good
+    assert good["wf_status"] == "ok" and good["wf_folds"] >= 4 and good["wf_gain_vs_base"] > 0.002, good
     # The leak the audit named: cohorts recorded on the same day share that day's market move. A label that
     # only identifies the entry day "separates" under the random K-fold (the day's other cohorts sit in the
     # training folds) but carries nothing for a day not yet seen, so the walk-forward gives it no gain.
@@ -505,7 +516,7 @@ def _selftest() -> int:
     assert lk_wf["wf_status"] == "ok" and lk_wf["wf_gain_vs_base"] < 0.002 and lk_wf["verdict"] == "NONE", lk_wf["verdict"]
     print(render([good, noise, cat], "selftest"))
     print("selftest: PASS 6/6 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
-          "filter/since/until; walk-forward 5 folds; an entry-day label gains under the legacy K-fold, not walk-forward)")
+          "filter/since/until; walk-forward >= 4 folds; an entry-day label gains under the legacy K-fold, not walk-forward)")
     return 0
 
 

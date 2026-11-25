@@ -77,7 +77,8 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}   # _open_sheet decodes it only under its own name
         run: python scripts/repair_pit_legacy_rows.py --scan
 
       - name: 💾 Back up _PIT_Fundamentals (apply only)
@@ -85,7 +86,8 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}   # _open_sheet decodes it only under its own name
         run: python scripts/backup_sheet_tab.py --tab _PIT_Fundamentals --prefix _PIT_Backup_
 
       - name: 🧹 Repair (apply only)
@@ -93,5 +95,6 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}   # _open_sheet decodes it only under its own name
         run: python scripts/repair_pit_legacy_rows.py --apply

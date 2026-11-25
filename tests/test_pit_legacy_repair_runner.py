@@ -87,6 +87,10 @@ def test_workflow_is_dispatch_only_scans_by_default_and_backs_up_before_apply():
     assert "--apply" in steps[repair]["run"] and "--apply" not in "".join(
         s.get("run", "") for i, s in enumerate(steps) if i != repair)
     assert wf["permissions"] == {"contents": "read"}
+    for st in steps[scan:]:        # Codex review: each secret under its own name (_open_sheet decodes _B64 only there)
+        env = st.get("env", {})
+        assert env.get("GOOGLE_SHEETS_CREDENTIALS") == "${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}"
+        assert env.get("GOOGLE_SHEETS_CREDENTIALS_B64") == "${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}"
 
 
 # --- tfb_export_audit 1.2.2: a tighter sector cap is a WARN, a looser one a FAIL (same audit, P2) ---

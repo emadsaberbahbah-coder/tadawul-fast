@@ -37,7 +37,7 @@ def test_entry_day_label_gains_only_under_the_legacy_random_kfold():
     wf = backtest.evaluate_signal(rows, "Day")
     legacy = backtest.evaluate_signal(rows, "Day", cv="legacy")
     assert legacy["cv_gain_vs_base"] > 0.02          # the leak: same-day cohorts on both sides
-    assert wf["wf_status"] == "ok" and wf["wf_folds"] == 5
+    assert wf["wf_status"] == "ok" and wf["wf_folds"] >= 4   # block 1 has no outcome known yet (7 + 3 days)
     assert wf["wf_gain_vs_base"] <= 0.0005            # a day not yet seen carries nothing
     assert wf["verdict"] == "NONE" and legacy["verdict"] == "WEAK"
 
@@ -103,14 +103,35 @@ def test_stationary_quintile_signal_keeps_its_out_of_sample_gain():
     assert res["wf_status"] == "ok" and res["wf_gain_vs_base"] > 0.01 and res["verdict"] == "SEPARATES"
 
 
-def test_target_date_is_preferred_to_the_horizon():
+def test_known_day_is_the_maturity_date_else_the_padded_target():
     rows = [_cohort(1, D0, True, horizon="1W", **{"Target Date (Riyadh)": "2026-07-20 16:00:00"}),
             _cohort(2, D0, False, horizon="1M"),
             _cohort(3, D0, False, horizon=""),
-            _cohort(4, D0, True, **{"Target Date (Riyadh)": "2026-06-01"})]
+            _cohort(4, D0, True, **{"Target Date (Riyadh)": "2026-06-01"}),
+            # a Saturday target settled at Monday's close: the recorded Maturity Date governs
+            _cohort(5, D0, True, **{"Target Date (Riyadh)": "2026-07-11", "Maturity Date": "2026-07-13 23:10:00"}),
+            # a Maturity Date before the target is not evidence of availability: pad the target instead
+            _cohort(6, D0, True, **{"Target Date (Riyadh)": "2026-07-11", "Maturity Date": "2026-07-09"})]
     entry, known = backtest.label_days(rows)
-    assert known == [dt.date(2026, 7, 20), dt.date(2026, 7, 31), None, None]
-    assert entry == [D0] * 4
+    assert known == [dt.date(2026, 7, 23), dt.date(2026, 8, 3), None, None,
+                     dt.date(2026, 7, 13), dt.date(2026, 7, 14)]
+    assert entry == [D0] * 6
+
+
+def test_weekend_target_does_not_train_the_next_days_block():
+    # Codex review: a Saturday target must not enter training for a Sunday test block (outcome needs Monday).
+    ys = [1.0, 0.0, 1.0, 0.0]
+    sat, sun = dt.date(2026, 7, 11), dt.date(2026, 7, 12)
+    rows = [_cohort(i, dt.date(2026, 7, 4), bool(y), **{"Target Date (Riyadh)": sat.isoformat()}) for i, y in enumerate(ys[:2])]
+    rows += [_cohort(2 + i, sun, bool(y)) for i, y in enumerate(ys[2:])]
+    entry, known = backtest.label_days(rows)
+    calls = []
+
+    def labeler_for(train):
+        calls.append(sorted(train))
+        return lambda i: "g"
+    backtest.wf_brier(ys, entry, [k or sun for k in known], labeler_for, k=1, embargo_days=0, min_train=1)
+    assert calls == []          # padded to Tuesday: nothing is known before Sunday's block
 
 
 def test_selftest_passes():
