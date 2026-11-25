@@ -35,11 +35,11 @@ VERSION 1.7.0 (2026-11-26) - first written 2026-11-11 (1.0.0)
         note shows when there is a fall to judge, the stop is within TFB_EXIT_SJ_NEAR_PCT (3) of the close, or the
         action is SELL. Measured on the archive that night (US shares with bars, Oct 2024 - Nov 2026, one event per
         share in 20 sessions; the SQL of sql/bigquery v_stop_cause_events): fell with the market inside the margin,
-        314 cases on 22 days - 72.0 % higher 20 sessions later, mean +5.8 %, but 0.4 points behind the market itself
-        and t 0.6 by day (the gain was the market's rebound, not the share's); fell on their own, 1,535 cases on 343
-        days - 52.3 %, +0.7 %; fell 15 % on their own, 86 cases - 40.7 %, -9.6 %. Twenty-two days is one kind of
-        market, not proof: the judgment is logged and scored (v_stop_cause_learning) before it may control anything
-        (owner's ground rules, 21 Nov).
+        379 cases on 22 days - 73.4 % higher 20 sessions later, mean +6.8 %, but level with the market itself (+0.2
+        points) and t 1.0 by day (the gain was the market's rebound, not the share's); fell on their own, 1,767
+        cases on 359 days - 51.3 %, +0.7 %; fell 15 % on their own, 112 cases - 39.3 %, -9.7 %. Twenty-two days is
+        one kind of market, not proof: the judgment is logged and scored (v_stop_cause_learning) before it may
+        control anything (owner's ground rules, 21 Nov).
         TFB_EXIT_STOP_JUDGMENT = observe (default) | off.
     The ledger gains a 19th column, Judgment ("with_market:wait:-9.2:-6.1", "offer:manual"); 1.6.x and 1.5.0
     ledgers are read as before. Nothing here places, changes or cancels an order.
@@ -627,8 +627,9 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
             stop = frozen
         floored = carried = False
         res["tighten"] = []                              # nothing tightens a stop that is not in force
-    if offer:
-        target = min(target, offer["price"])
+        target = offer["price"]                          # Codex P2 on #1084: the offer price itself, also above the next R step
+    elif offer:
+        target = min(target, offer["price"])             # sale = rule: the price rule's target, capped at the offer
     res.update({"ok": True, "basis": f_e, "atr": a_now, "atr_entry": a_e, "atr_pct": a_now / last[4] * 100.0, "r": r,
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
                 "r_high": r_high, "stop": stop, "prev_stop": was_stop, "target": target, "tp1": tp1,

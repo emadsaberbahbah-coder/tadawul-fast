@@ -27,15 +27,15 @@ Date: 2026-11-26 (Thursday) · Lane: GitHub Actions page jobs (Python) · Gates:
 The registry file is read by the live run only (no workbook passed in), as the IBKR capture is: the suites stay independent of the file's content.
 
 ## Evidence for the judgment (archive, 26 Nov; in-sample - context, not evidence)
-US shares with daily bars, Oct 2024 – Nov 2026, the first close at −8 % over 15 sessions (one event per share in 20 sessions), then 20 sessions held; selling at the fall = 0. The SQL is `sql/bigquery/131_v_stop_cause_events.sql` of the views PR.
+US shares with daily bars, Oct 2024 – Nov 2026, a close crossing −8 % over 15 sessions (one event per share in 20 sessions, counted from the last kept event), then 20 sessions held; selling at the fall = 0. The SQL is `sql/bigquery/131_v_stop_cause_events.sql` of the views PR.
 
 | Cause · verdict of the rule under test | Cases | Days | Higher after 20 sessions | Mean | Against the market | t by day |
 |---|---|---|---|---|---|---|
-| with the market · wait | 314 | 22 | 72.0 % | +5.8 % | −0.4 pts | 0.6 |
-| on its own · stop stands | 1,535 | 343 | 52.3 % | +0.7 % | +0.4 pts | 1.2 |
-| on its own · hard limit (−15 %) | 86 | 70 | 40.7 % | −9.6 % | −9.8 pts | −1.6 |
+| with the market · wait | 379 | 22 | 73.4 % | +6.8 % | +0.2 pts | 1.0 |
+| on its own · stop stands | 1,767 | 359 | 51.3 % | +0.7 % | +0.4 pts | 1.5 |
+| on its own · hard limit (−15 %) | 112 | 83 | 39.3 % | −9.7 % | −9.8 pts | −1.9 |
 
-After a fall with the market the shares were higher in 72 % of cases, but no better than the market itself and on 22 days only: the gain was the market's rebound, and nothing here is statistically clear. So the judgment is a note and a ledger column; it changes no action. Its forward record (`v_stop_cause_learning`, read by Learning Watch) is reviewed with the owner before it may control anything (ground rules of 21 Nov: observe, log, score, review, then switch on only what proved itself).
+After a fall with the market the shares were higher in 73 % of cases, but level with the market itself and on 22 days only: the gain was the market's rebound, and nothing here is statistically clear. So the judgment is a note and a ledger column; it changes no action. Its forward record (`v_stop_cause_learning`, read by Learning Watch) is reviewed with the owner before it may control anything (ground rules of 21 Nov: observe, log, score, review, then switch on only what proved itself).
 
 ## Tests
 | Battery | Result |

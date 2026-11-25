@@ -165,6 +165,11 @@ def test_o2_manual_offer_freezes_the_stop_and_caps_the_target():
     assert lv(RISE[:-1] + [96.5], prev=PREV)["action"] == "SELL"
     assert low["action"] == "REVIEW" and low["stop"] == 97.0 and "in doubt" in low["why"][1]
     assert not any("at or below the stop" in w for w in low["why"])
+    # Codex P2 on #1084: the target IS the offer price, also when the price rule's next step is under it
+    flat = lv([100.0] * 40, {"offer": offer(announced=None)})
+    assert lv([100.0] * 40)["target"] == pytest.approx(109.0) and flat["target"] == 115.0 and flat["offer_held"]
+    assert lv([100.0] * 40, {"offer": offer(announced=None, sale="rule")})["target"] == pytest.approx(109.0)   # capped only
+    assert lv(RISE, {"offer": offer(price=105.0, sale="rule")}, PREV)["target"] == 105.0
     # no stop on record yet: the rule's stop of this close is the one frozen
     first = lv(RISE, {"offer": offer()})
     assert first["stop"] == pytest.approx(lv(RISE)["stop"]) and first["action"] == "HOLD"
