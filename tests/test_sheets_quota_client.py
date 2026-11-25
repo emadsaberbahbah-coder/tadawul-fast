@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 
 import pytest
-import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# The lean decision-layer suite installs neither requests nor gspread: skip there, run in the whole suite.
+requests = pytest.importorskip("requests")
 gspread = pytest.importorskip("gspread")
 from gspread.exceptions import APIError  # noqa: E402
 from gspread.http_client import HTTPClient  # noqa: E402
