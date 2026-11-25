@@ -14,7 +14,9 @@ NOW = dt.datetime(2026, 10, 3, 11, tzinfo=dt.timezone.utc)
 
 
 @pytest.mark.parametrize("clean,baseline", [
-    (False, "a674f9263b5aa25beee1ee0aec517afb6c84383b0b15d7a80aecec9f6d9f3f0d"),
+    # v1.2.2: the only change is sector_caps_vs_policy FAIL -> WARN on the fixture's tighter 2 / 30 panel
+    # (examples gain "; tighter", DECISION lane fail 4 -> 3, warn 1 -> 2, fix list one entry shorter).
+    (False, "bdefbd4503f4dbc69ef9425496e2cb1d8048519a8e1fb29ca409e581cfbccabf"),
     (True, "df70799b5cdb6370a27eec8cd974604f79cb9ddcd841d6a8546ff13363720ca9"),
 ])
 def test_default_payload_matches_v111_before_version_stamp(tmp_path, clean, baseline):

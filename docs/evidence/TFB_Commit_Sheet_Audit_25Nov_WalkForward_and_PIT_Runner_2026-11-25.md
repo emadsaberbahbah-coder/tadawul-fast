@@ -20,6 +20,7 @@ need no deploy:
 | `.github/workflows/pit_legacy_repair.yml` 1.0.0 (new) | Dispatch only. `scan` (default) prints counts. `apply` backs up the tab first, then runs `--apply` (the script refuses anomalies, > 78 realigns, > 11 deletions, or a grid that changed between reads). |
 | `scripts/backup_sheet_tab.py` 1.0.0 (new) | Copies a tab to a hidden `<prefix>YYYYMMDD` tab in the same workbook; never overwrites an existing backup. |
 | `tests/test_pit_legacy_repair_runner.py` (new, 4) | Backup naming/hiding/no-overwrite; workflow is dispatch-only, scan default, backup before apply. |
+| `scripts/tfb_export_audit.py` 1.2.1 → 1.2.2 | P2 audit rules: `sector_caps_vs_policy` FAILs only when a panel cap is looser than policy (a breached ceiling); the live tighter 2 names / 30 % panel is now a WARN (a policy difference to record). Pure helper `sector_cap_status`. Golden payload hash updated; the diff against 1.2.1 on the fixture is that one finding (and its lane/fix-list counts) only. |
 | `.github/workflows/ci.yml` | Runs the two new test files. |
 
 ## Behaviour and rollback

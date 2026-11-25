@@ -87,3 +87,13 @@ def test_workflow_is_dispatch_only_scans_by_default_and_backs_up_before_apply():
     assert "--apply" in steps[repair]["run"] and "--apply" not in "".join(
         s.get("run", "") for i, s in enumerate(steps) if i != repair)
     assert wf["permissions"] == {"contents": "read"}
+
+
+# --- tfb_export_audit 1.2.2: a tighter sector cap is a WARN, a looser one a FAIL (same audit, P2) ---
+@pytest.mark.parametrize("t10,pf,status", [(2, 30, "WARN"), (3, 40, "PASS"), (4, 40, "FAIL"), (2, 45, "FAIL"),
+                                           (None, None, "PASS"), (3, 35, "WARN")])
+def test_sector_cap_tighter_is_warn_looser_is_fail(t10, pf, status):
+    from scripts import tfb_export_audit as ea
+    assert ea.SCRIPT_VERSION == "1.2.2"
+    got, examples = ea.sector_cap_status(t10, pf, 3, 40.0)
+    assert got == status and len(examples) == (t10 not in (None, 3)) + (pf not in (None, 40))
