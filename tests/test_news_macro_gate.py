@@ -2312,12 +2312,34 @@ def test_g17_mask_public():
     scope = [{"symbol": "AX.US", "name": "Axos Financial, Inc."}, {"symbol": "5023.SR", "name": ""},
              {"symbol": "X", "name": "Co"}]
     toks = ng.mask_tokens(scope)
-    assert toks[0] == "Axos Financial, Inc." and {"AX.US", "AX", "5023.SR", "5023", "X"} <= set(toks)
+    assert toks[0] == "Axos Financial, Inc." and {"AX.US", "AX", "5023.SR", "X"} <= set(toks)
     assert "Co" not in toks                                         # a name under four characters is not masked
+    assert "5023" not in toks                                       # a numeric code alone: its full symbol is masked
     assert ng.mask_public("name AX.US finnhub: HTTP 429; AX up; MAX and TAXES stay; Axos Financial, Inc. said",
                           toks) == "name [name] finnhub: HTTP 429; [name] up; MAX and TAXES stay; [name] said"
-    assert ng.mask_public("5023.SR and 50230", toks) == "[name] and 50230"
+    assert ng.mask_public("5023.SR and 50230; 5023 items", toks) == "[name] and 50230; 5023 items"
     assert ng.mask_public("anything", []) == "anything" and ng.mask_public("", toks) == ""
+
+
+def test_g17_public_report_masks_strings_and_keeps_numbers():
+    """Codex P2 on #1095: a number equal to a Saudi code (an age of 2,222 minutes, scope 2222.SR) stays a number,
+    and the public report is valid JSON; a string naming the symbol is masked."""
+    rep = {"version": ng.__version__, "now": NOW, "scope": [{"symbol": "2222.SR", "name": "Saudi Aramco"},
+                                                           {"symbol": "AX.US", "name": ""},
+                                                           {"symbol": "1120", "name": ""}],   # a bare code
+           "gate": {"verdict": "GO", "names": {}, "drivers": [], "positives": []}, "clusters": [],
+           "source_ages": {"finnhub": {"n": 2222, "newest_min": 2222, "median_min": 5023}},
+           "sources_failed": {"finnhub": "name 2222.SR finnhub: HTTP 429; name AX.US finnhub: HTTP 429"},
+           "counts": {"collected": 2222, "classified": 1120}}
+    pub = ng.public_report(rep)
+    assert pub["counts"]["classified"] == 1120                     # a number equal to a bare-code symbol stays
+    assert pub["source_ages"]["finnhub"] == {"n": 2222, "newest_min": 2222, "median_min": 5023}
+    assert pub["counts"]["collected"] == 2222 and pub["now"] == NOW.astimezone(ng.UTC).isoformat()
+    assert pub["sources_failed"]["finnhub"] == "name [name] finnhub: HTTP 429; name [name] finnhub: HTTP 429"
+    assert "2222.SR" not in json.dumps(pub) and "Saudi Aramco" not in json.dumps(pub)
+    text = ng.render_digest(dict(rep, issuer_link=None, sources_ok={}, sources_detail={}, wrote=False,
+                                 mode="observe", counts={"collected": 2222, "classified": 0, "new": 0}), public=True)
+    assert "| finnhub | 2222 | 2222 | 5023 |" in text and "2222.SR" not in text
 
 
 def test_g17_the_public_log_names_no_holding_and_the_tabs_keep_everything(armed, monkeypatch, capsys):

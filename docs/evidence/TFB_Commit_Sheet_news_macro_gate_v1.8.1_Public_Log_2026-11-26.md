@@ -20,12 +20,17 @@ Found during the 26 Nov reviews of the Finnhub, Marketaux and Gemini dry runs; p
   - The scope line gives the count only: `scope 15: (names kept out of the public log)`.
   - The digest keeps the verdict, the drivers, the market-wide clusters, the item counts, the source table and the LLM line. The flagged names and the name clusters appear as counts, with a pointer to the tab that holds them.
   - The evidence .json is the same public cut: the scope and the flags as counts, the MACRO clusters only, and the issuer-link counts without examples.
-  - Every line printed passes `mask_public()`. It replaces each scope symbol, its ticker and its company name with `[name]`, whole words only, so `name <symbol> finnhub: HTTP 429` reads `name [name] finnhub: HTTP 429`. The reason stays.
+  - Every line printed passes `mask_public()`. It replaces each scope symbol, its letter ticker and its company name with `[name]`, whole words only, so `name <symbol> finnhub: HTTP 429` reads `name [name] finnhub: HTTP 429`. The reason stays.
 - **The workbook keeps every detail.** `_News_Gate`, `_News_Items` and `_Econ_Events` receive exactly the rows they did before; the test compares the whole workbook row for row.
 - **The mask belongs to one run.** `main()` clears it on the way out, even on an error.
 
 ## Tests
-- `tests/test_news_macro_gate.py`: 304 pass (297 earlier, one version line updated, plus 7 new). `tests/test_news_llm_reader.py`: 22 pass.
+- `tests/test_news_macro_gate.py`: 305 pass (297 earlier, one version line updated, plus 8 new). `tests/test_news_llm_reader.py`: 22 pass.
+- **Codex P2, fixed:** the first version masked the serialised JSON, so a number equal to a symbol could become `[name]` and break the file. Two changes fix it:
+  - The evidence .json now masks string values only; numbers stay numbers.
+  - A numeric Saudi code alone is not a token. Its full symbol (`<code>.SR`) is, so counts and ages in the digest stay readable.
+  
+  A new test runs a scope with a `.SR` symbol and a bare code beside numbers equal to both. The old masking fails it.
 - Both files also pass with `GITHUB_ACTIONS=true`. The test fixture pins the detail on, so CI and local runs read the same log.
 - The new G17 tests:
   - the switch in five forms;

@@ -14,7 +14,7 @@ WHAT: log_detail() - TFB_NEWS_GATE_LOG_DETAIL = on | off | auto (default auto: o
   step summary, evidence .md) keeps the verdict, the drivers, the market-wide clusters, the counts and the
   source health, and gives the flagged names and the name clusters as counts; the evidence .json is the same
   public cut (the issuer-link examples, which are name headlines, as counts); and every line printed passes
-  mask_public(), which replaces each scope symbol, its ticker and its company name with "[name]" (a failure
+  mask_public(), which replaces each scope symbol, its letter ticker and its company name with "[name]" (a failure
   note "<symbol>: HTTP 401" reads "[name]: HTTP 401"). The workbook tabs keep every detail - nothing written
   there changes.
 ROLLBACK: TFB_NEWS_GATE_LOG_DETAIL=on (repository Variable), or revert this file to v1.8.0.
@@ -603,19 +603,31 @@ def log_detail() -> bool:
 
 def mask_tokens(scope: Sequence[Dict[str, str]]) -> List[str]:
     """PURE: what a public log must not show - each scope symbol, its ticker (the part before the dot, two
-    characters or more) and its company name (four characters or more), longest first."""
+    characters or more, letters - a numeric Saudi code alone would mask counts and ages, and its full symbol
+    is masked) and its company name (four characters or more), longest first."""
     out = set()
     for s in scope:
         sym = str(s.get("symbol") or "").strip()
         if sym:
             out.add(sym)
             root = sym.split(".")[0]
-            if len(root) >= 2:
+            if len(root) >= 2 and not root.isdigit():
                 out.add(root)
         name = str(s.get("name") or "").strip()
         if len(name) >= 4:
             out.add(name)
     return sorted(out, key=lambda t: (-len(t), t))
+
+
+def _mask_values(obj: Any, tokens: Sequence[str]) -> Any:
+    """PURE: obj with every string value masked; numbers, booleans and keys stay as they are."""
+    if isinstance(obj, str):
+        return mask_public(obj, tokens)
+    if isinstance(obj, dict):
+        return {k: _mask_values(v, tokens) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_mask_values(v, tokens) for v in obj]
+    return obj
 
 
 def mask_public(text: str, tokens: Sequence[str]) -> str:
@@ -2457,8 +2469,10 @@ def public_report(rep: Dict[str, Any]) -> Dict[str, Any]:
     pub["clusters_about_names"] = len(rep["clusters"]) - len(pub["clusters"])
     if isinstance(rep.get("issuer_link"), dict):      # its examples are name headlines: counts only
         pub["issuer_link"] = {k: v for k, v in rep["issuer_link"].items() if k != "examples"}
-    tokens = mask_tokens(rep.get("scope") or [])
-    return json.loads(mask_public(json.dumps(pub, default=_json_default, ensure_ascii=True), tokens))
+    # the string values only, after a round trip that turns times into text (Codex P2 on #1095: masking the
+    # serialised JSON could turn a number into "[name]" and break it)
+    plain = json.loads(json.dumps(pub, default=_json_default, ensure_ascii=True))
+    return _mask_values(plain, mask_tokens(rep.get("scope") or []))
 
 
 def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
