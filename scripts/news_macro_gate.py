@@ -2,8 +2,34 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.11.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.12.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.12.0 (2026-11-27) -- [AUDIT-GUARDS] FIVE GUARDS FROM THE EXTERNAL ENGINEERING AUDIT OF 26 NOV 2026
+WHY (owner, 26 Nov 2026 23:38 Riyadh: an outside review of the whole project; its report, read and checked
+  against this code on main 65c7864, findings A1, A3, A4, A6 and E1 reproduced here):
+  (A1) an item with no publication date counted as published NOW in the 24 h / 72 h windows of evaluate():
+       one undated Google News headline about Iran gave CAUTION on a quiet day. Archive 19-26 Nov: none of
+       the 10,144 recorded items was undated or stamped in the future, so no recorded verdict changes.
+  (A3) the rumour rule (every member a rumour -> grade 4) applied only below grade 1: three rumours on three
+       domains with one wire were grade 1, and NO_NEW_ENTRY on a Gulf anchor. Archive: 44 rumour items, 8
+       of them high severity; no recorded verdict rested on them.
+  (A4) since 1.10.0 the grade counts origins, but a cluster's direction and the easing majority still
+       counted rows: a copied headline voted twice.
+  (A6) a market quote was used whatever its age, and an empty input looked like a calm one: no quotes and no
+       news gave GO with nothing said.
+  (E1) TFB_NEWS_GATE_LOG_DETAIL=on named the holdings on GitHub Actions, and the workflow passed extra symbols
+       through a repository Variable, which a public run log prints in its env block.
+WHAT: (A1) in_window(): a member counts only with a date, no older than the window and no more than one hour
+  ahead of the run. (A3) every member a rumour -> grade 4 unless one member is an official (tier A) source.
+  (A4) cluster direction and the easing majority are taken over origins(). (A6) parse_market() keeps the
+  quote's own time; evaluate() leaves out a quote older than MARKET_MAX_AGE_H (96 h: a long weekend) and
+  names it; the digest gains an "Inputs" line - market quotes used / stale / missing, news sources that
+  answered - and says when GO rests on missing inputs. (E1) on GitHub Actions the log never names a holding,
+  whatever TFB_NEWS_GATE_LOG_DETAIL says; the workflow reads extra symbols from a secret, not a Variable.
+  Verdict thresholds are unchanged. Not changed here (proposed to the owner): the exit plan's use of grade-3
+  name news to tighten a stop (audit C1), and an unnamed scope name passing the issuer link (A2).
+ROLLBACK: revert this file to v1.11.0.
+
 v1.11.0 (2026-11-26) -- [CENTRAL-BANKS] THREE MORE OFFICIAL FEEDS: BANK OF ENGLAND, BANK OF JAPAN, SWISS NATIONAL BANK
 WHY (owner, 26 Nov 2026 18:54 Riyadh, in Arabic: do the world market, the funds, commodities and currencies need
   the same care as the Saudi sources; 19:13: "if it is ready, build it now"): the official group read the Fed,
@@ -429,7 +455,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -674,12 +700,10 @@ def _out(msg: str) -> None:
 def log_detail() -> bool:
     """v1.8.1: may the run log name the scope's symbols? TFB_NEWS_GATE_LOG_DETAIL = on | off | auto (default:
     not on GitHub Actions, whose logs are public for this repository) - exit_plan 1.6.1's rule."""
+    if (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() == "true":
+        return False      # v1.12.0 (audit E1): the logs of this repository are public - never on Actions
     v = (os.environ.get("TFB_NEWS_GATE_LOG_DETAIL") or "auto").strip().lower()
-    if v in ("on", "1", "true", "yes"):
-        return True
-    if v in ("off", "0", "false", "no"):
-        return False
-    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
+    return v not in ("off", "0", "false", "no")
 
 
 def mask_tokens(scope: Sequence[Dict[str, str]]) -> List[str]:
@@ -1403,8 +1427,10 @@ def parse_market(payload: Any) -> Dict[str, Dict[str, Any]]:
                 return float(v)
             except (TypeError, ValueError):
                 return None
+        ts = num("timestamp")          # v1.12.0: the quote's own time (EODHD real-time: Unix seconds)
         out[code] = {"close": num("close"), "previous_close": num("previousClose"),
-                     "change_p": num("change_p")}
+                     "change_p": num("change_p"),
+                     "as_of": _dt.datetime.fromtimestamp(ts, UTC) if ts and ts > 0 else None}
     return out
 
 
@@ -1440,6 +1466,15 @@ def is_site_tail(tail: str, domain: str = "") -> bool:
     if len(label) >= 3 and (label in squashed or "".join(w[0] for w in words) == label):
         return True
     return squashed in _SITE_NAMES or words[0] in _SITE_NAMES or "".join(words[:2]) in _SITE_NAMES
+
+
+MARKET_MAX_AGE_H = 96.0     # v1.12.0 (audit A6): a market quote older than this is not used (a long weekend fits)
+
+
+def in_window(published: Any, since: _dt.datetime, now: _dt.datetime) -> bool:
+    """PURE, v1.12.0 (audit A1): a member counts in a window only with a date, no older than `since` and no
+    more than one hour ahead of the run (a clock off by minutes is tolerated, a stamp in the future is not)."""
+    return isinstance(published, _dt.datetime) and since <= published <= now + _dt.timedelta(hours=1)
 
 
 def origin_key(member: Dict[str, Any]) -> str:
@@ -1494,8 +1529,8 @@ def information_grade(members: Sequence[Dict[str, Any]]) -> int:
         grade = 2
     else:
         grade = 3
-    if members and all(m.get("rumor") for m in members) and grade > 1:
-        grade = 4
+    if members and all(m.get("rumor") for m in members) and "A" not in tiers:
+        grade = 4         # v1.12.0 (audit A3): also at grade 1 - three rumours are not a confirmation
     return grade
 
 
@@ -1509,7 +1544,7 @@ def cluster_items(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups.setdefault(key, []).append(it)
     clusters = []
     for (scope, etype, anchor), members in groups.items():
-        dirs = [m.get("direction", 0) for m in members]
+        dirs = [m.get("direction", 0) for m in origins(members)]     # v1.12.0 (audit A4): a copy votes once
         direction = 1 if sum(dirs) > 0 else (-1 if sum(dirs) < 0 else 0)
         sev = min((m.get("severity") or "L" for m in members), key=lambda s: _SEV_RANK.get(s, 3))
         pubs = [m["published"] for m in members if m.get("published")]
@@ -1610,8 +1645,19 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
         day = "today" if s["when"].astimezone(RIYADH).date() == now.astimezone(RIYADH).date() else s["when"].astimezone(RIYADH).strftime("%a %d %b")
         bump(1, f"scheduled: {s['event']} ({day} {when} Riyadh)")
 
-    spx = market.get("GSPC.INDX") or {}
-    vix = market.get("VIX.INDX") or {}
+    stale: List[str] = []
+
+    def quote(code: str) -> Dict[str, Any]:
+        """v1.12.0 (audit A6): a quote older than MARKET_MAX_AGE_H is not used, and is named."""
+        q = market.get(code) or {}
+        at = q.get("as_of")
+        if isinstance(at, _dt.datetime) and now - at > _dt.timedelta(hours=MARKET_MAX_AGE_H):
+            stale.append(f"{code} quote of {fmt_utc(at)} UTC")
+            return {}
+        return q
+
+    spx = quote("GSPC.INDX")
+    vix = quote("VIX.INDX")
     spx_chg, vix_lvl, vix_chg = spx.get("change_p"), vix.get("close"), vix.get("change_p")
     if spx_chg is not None and spx_chg <= -3.0:
         bump(2, f"market: S&P 500 {spx_chg:+.1f}% on the day")
@@ -1626,7 +1672,7 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
     for c in clusters:
         if c["scope"] != "MACRO":
             continue
-        recent = [m for m in c["members"] if (m.get("published") or now) >= since]
+        recent = [m for m in c["members"] if in_window(m.get("published"), since, now)]     # v1.12.0 (A1)
         if not recent:
             continue
         sites = {m.get("domain") for m in recent if m.get("domain")}
@@ -1640,12 +1686,12 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
             # The line lists the cluster for its other members only: they must outnumber the falling ones and
             # be confirmed on their own, and one of their headlines is quoted. A de-escalation cluster raises
             # nothing, as before.
-            falling = [m for m in recent if m.get("direction", 0) < 0]
+            falling = [m for m in origins(recent) if m.get("direction", 0) < 0]     # v1.12.0: over origins
             if not falling:
                 if grade <= 2:
                     positives.append(tag)
             else:
-                calm = [m for m in recent if m.get("direction", 0) >= 0]
+                calm = [m for m in origins(recent) if m.get("direction", 0) >= 0]
                 if len(calm) > len(falling) and information_grade(calm) <= 2:
                     lead = sorted(calm, key=lambda m: _TIER_RANK.get(m.get("tier", "F"), 9))[0]["title"]
                     positives.append(f"{c['event_type']}/{anchor} grade {information_grade(calm)}, "
@@ -1686,7 +1732,7 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
             if "2.02" in items and age_d <= 10:
                 flag(sym, "INFO", f"earnings released ({m['form']} 2.02, {age_d:.0f}d ago)")
         news = [m for m in c["members"] if m.get("source") != "edgar"
-                and (m.get("published") or now) >= now - _dt.timedelta(hours=72)]
+                and in_window(m.get("published"), now - _dt.timedelta(hours=72), now)]     # v1.12.0 (A1)
         if not news:
             continue
         grade = information_grade(news)
@@ -1704,7 +1750,8 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
                 uniq.append(f)
         names[sym] = uniq
     return {"verdict": VERDICTS[level], "drivers": drivers, "positives": positives,
-            "scheduled": sched, "market": {"spx_change_p": spx_chg, "vix": vix_lvl, "vix_change_p": vix_chg},
+            "scheduled": sched, "market": {"spx_change_p": spx_chg, "vix": vix_lvl, "vix_change_p": vix_chg,
+                                           "stale": stale},
             "names": names}
 
 
@@ -2598,6 +2645,7 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
                     if li and li.get("mode") != "off" else "")(rep.get("issuer_link")) + ". "
                  f"Sources OK: {', '.join(f'{k}={v}' for k, v in sorted(rep['sources_ok'].items())) or 'none'}. "
                  f"Failed: {'; '.join(f'{k}: {v}' for k, v in sorted(rep['sources_failed'].items())) or 'none'}.")
+    lines.append(inputs_line(rep))                                        # v1.12.0 (audit A6)
     detail, ages = rep.get("sources_detail") or {}, rep.get("source_ages") or {}
     if detail or ages:      # v1.5.0 [SOURCES]
         lines.append("")
@@ -2621,6 +2669,24 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
     lines.append("Not a licensed financial adviser; the owner decides and executes every trade.")
     text = "\n".join(lines) + "\n"
     return mask_public(text, mask_tokens(rep.get("scope") or [])) if public else text
+
+
+def inputs_line(rep: Dict[str, Any]) -> str:
+    """PURE, v1.12.0 (audit A6): what the verdict was computed from - the two market quotes (used, stale or
+    missing) and the news sources that answered - and a warning when GO rests on missing inputs."""
+    g = rep.get("gate") or {}
+    m = g.get("market") or {}
+    stale = " ".join(m.get("stale") or [])
+    def state(code: str, value: Any) -> str:
+        return "stale" if code in stale else ("used" if value is not None else "missing")
+    spx, vix = state("GSPC.INDX", m.get("spx_change_p")), state("VIX.INDX", m.get("vix"))
+    news = sorted(k for k in (rep.get("sources_ok") or {}) if k not in ("market", "econ"))
+    line = f"**Inputs:** S&P 500 {spx}, VIX {vix}; news sources that answered: {len(news)}"
+    if stale:
+        line += f" (left out as stale: {stale})"
+    if g.get("verdict") == "GO" and ("used" not in (spx, vix) or not news):
+        line += " - GO here rests on missing inputs, not on a calm market"
+    return line
 
 
 def public_report(rep: Dict[str, Any]) -> Dict[str, Any]:

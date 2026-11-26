@@ -368,7 +368,8 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("TFB_NEWS_GATE_LOG_DETAIL", "on")     # v1.8.1: the same log on CI as locally
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
               "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES",
-              "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"):
+              "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS",
+              "GITHUB_ACTIONS"):       # v1.12.0: on Actions the log is always public (test_g17 covers that)
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 
@@ -908,9 +909,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.11.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.11.0 [CENTRAL-BANKS]
+    assert ng.__version__ == "1.12.0"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.11.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.12.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1077,8 +1078,9 @@ TRADE_LISTS = ("trade_truce", "trade_relief", "trade_hedge")
 # (68bed4f2...); v1.9.0 [REVIEW-26NOV] changed one of them on purpose - a Gulf high-severity story confirmed by
 # one or two domains is CAUTION (test_g18) - and nothing else. v1.10.0 [ORIGINS] changed how the domains of a
 # rule are counted (a headline copied by several sites is one origin, test_g19); the thresholds are the same.
-RAISE_RULES_SHA = "854068c653086ccf4b6ab00e5fbfc023a80e9a86847f3f10d2eb0a8711a706f3"
-EVALUATE_SHA = "e51d566b601e68449a6e4b398aaef799f3bd3a5d809f9d9e57b9b8d32a12cf26"      # evaluate() of v1.4.0 [TRUCE-READ]
+# v1.12.0 [AUDIT-GUARDS]: undated / future members and stale market quotes are left out (test_g21); same thresholds.
+RAISE_RULES_SHA = "ddd2df4a29564e31b250c61b236ecbaa89f55f383e34434c46de13f28a623481"
+EVALUATE_SHA = "338ee0c5598df5351a43c78be88cd3a65c8d7b9fcb22fe5140b6340eb97d46b4"      # evaluate() of v1.4.0 [TRUCE-READ]
 
 # (headline, reading before v1.3.0, reading now, direction now). World headlines of 5 - 18 Nov 2026 (GDELT) and the
 # gate's own archive; the last block is written to probe the guards.
@@ -1784,14 +1786,15 @@ def test_g14_within_window_leaves_out_undated_and_old():
     assert kept == [rows[0], rows[1], rows[5]] and left == {"outside": 3, "undated": 1}
     kept72, left72 = ng.within_window(rows, NOW, 72.0)
     assert len(kept72) == 4 and left72 == {"outside": 2, "undated": 1}
-    # the reason: evaluate() reads a headline with no date as published now
+    # the reason it was needed: evaluate() read a headline with no date as published now. Since v1.12.0
+    # (audit A1) evaluate() leaves an undated member out as well, so the three undated wires raise nothing
     old = {"source": "press_rss", "scope": "MACRO", "title": HORMUZ_REUTERS, "url": "https://www.wsj.com/o",
            "domain": "wsj.com", "published": None}
     clf = ng.Classifier(ng.load_taxonomy())
     undated = ng.classify_all([dict(old, url="https://www.wsj.com/o%d" % n, domain=d, title=t) for n, (d, t) in
                                enumerate((("wsj.com", HORMUZ_REUTERS), ("reuters.com", "Missile strike on tanker near Hormuz"),
                                           ("apnews.com", "Tanker hit by missile in Strait of Hormuz")))], clf, QUIET)
-    assert ng.evaluate(ng.cluster_items(undated), [], {}, QUIET)["verdict"] == "NO_NEW_ENTRY"
+    assert ng.evaluate(ng.cluster_items(undated), [], {}, QUIET)["verdict"] == "GO"
 
 
 def _it(source, title, domain, scope="MACRO", url=None, memory=False, iid=None):
@@ -2312,7 +2315,8 @@ SECRETS_OF_THE_SCOPE = ("FRST.US", "FRST", "Primis Financial Corp.", "5023.SR", 
 
 
 @pytest.mark.parametrize("value,actions,public", [("auto", "true", True), ("auto", "", False), ("off", "", True),
-                                                  ("on", "true", False), ("junk", "true", True)])
+                                                  ("on", "true", True), ("junk", "true", True),
+                                                  ("on", "", False), ("off", "true", True)])   # v1.12.0: never on Actions
 def test_g17_log_detail(monkeypatch, value, actions, public):
     monkeypatch.setenv("TFB_NEWS_GATE_LOG_DETAIL", value)
     monkeypatch.setenv("GITHUB_ACTIONS", actions)
@@ -2660,3 +2664,85 @@ def test_g20_a_central_bank_release_is_collected_dated_and_official(armed):
     col2 = ng.Collector(http2, _sleep, NOW)
     assert [i["domain"] for i in col2.feeds("official_rss", "TFB research test@example.com")] == ["snb.ch"]
     assert col2.failed == {"official_rss": "boe: HTTP 403"}
+
+
+# ----------------------------------------------------------------------------- G21 (v1.12.0 [AUDIT-GUARDS])
+HORMUZ_ONE = "Iran fires missiles at tanker in Strait of Hormuz"
+
+
+def test_g21_a1_an_undated_or_future_member_counts_in_no_window():
+    assert ng.in_window(QUIET, QUIET - dt.timedelta(hours=24), QUIET)
+    assert ng.in_window(QUIET + dt.timedelta(minutes=59), QUIET - dt.timedelta(hours=24), QUIET)
+    assert not ng.in_window(QUIET + dt.timedelta(hours=2), QUIET - dt.timedelta(hours=24), QUIET)
+    assert not ng.in_window(None, QUIET - dt.timedelta(hours=24), QUIET)
+    assert not ng.in_window(QUIET - dt.timedelta(hours=25), QUIET - dt.timedelta(hours=24), QUIET)
+    clf = ng.Classifier(ng.load_taxonomy())
+    undated = {"source": "google_news", "scope": "MACRO", "title": HORMUZ_ONE, "url": "https://www.reuters.com/x",
+               "domain": "reuters.com", "published": None}
+    assert ng.evaluate(ng.cluster_items(ng.classify_all([undated], clf, QUIET)), [], {}, QUIET)["verdict"] == "GO"
+    dated = dict(undated, published=QUIET - dt.timedelta(hours=1))
+    assert ng.evaluate(ng.cluster_items(ng.classify_all([dated], clf, QUIET)), [], {}, QUIET)["verdict"] == "CAUTION"
+    future = dict(undated, published=QUIET + dt.timedelta(hours=5))
+    assert ng.evaluate(ng.cluster_items(ng.classify_all([future], clf, QUIET)), [], {}, QUIET)["verdict"] == "GO"
+    # a name's negative news is held to its 72 h window the same way
+    name = {"source": "google_news", "scope": "FRST.US", "title": "Primis Financial plunges after fraud probe",
+            "url": "https://www.reuters.com/n1", "domain": "reuters.com", "published": None}
+    two = [name, dict(name, url="https://apnews.com/n2", domain="apnews.com")]
+    assert ng.evaluate(ng.cluster_items(ng.classify_all(two, clf, QUIET)), [], {}, QUIET)["names"] == {}
+
+
+def test_g21_a3_three_rumours_are_not_a_confirmation():
+    rum = lambda d, t: {"domain": d, "tier": ng.tier_of(d), "rumor": True, "denial": False, "title": t}
+    three = [rum("reuters.com", "Iran said to weigh missile strike on tanker near Hormuz"),
+             rum("blog1.io", "Sources: Iran may hit tankers in Hormuz soon"),
+             rum("blog2.io", "Iranian strike on Hormuz shipping rumoured by traders")]
+    assert ng.information_grade(three) == 4                                  # was 1
+    assert ng.information_grade([rum("whitehouse.gov", "Administration is considering new Iran sanctions")]) == 1
+    assert ng.information_grade(three + [dict(three[0], rumor=False, title="Iran fires missiles at tanker near Hormuz")]) == 1
+    rows = [("https://www.reuters.com/r1", "Iran reportedly fires missiles at tanker near Hormuz, sources said", "reuters.com"),
+            ("https://blog1.io/r2", "Iran reportedly hits tanker near Hormuz, according to sources", "blog1.io"),
+            ("https://blog2.io/r3", "Missile strike on Hormuz tanker reportedly by Iran, people familiar say", "blog2.io")]
+    g = ng.evaluate(_clusters(_gulf(*rows), QUIET), [], {}, QUIET)
+    assert g["verdict"] == "CAUTION" and g["drivers"][0].startswith("macro (unconfirmed): war_escalation/hormuz grade 4")
+
+
+def test_g21_a4_a_copy_votes_once_on_direction():
+    up, down = "Primis Financial beats estimates and raises guidance", "Primis Financial misses estimates and cuts guidance"
+    items = [{"scope": "FRST.US", "event_type": "earnings", "direction": -1, "severity": "M", "tier": "B",
+              "domain": "reuters.com", "title": down, "published": QUIET},
+             {"scope": "FRST.US", "event_type": "earnings", "direction": 1, "severity": "M", "tier": "C",
+              "domain": "cnbc.com", "title": up, "published": QUIET}]
+    copies = [dict(items[1], domain=d, tier="F") for d in ("a.io", "b.io")]
+    assert ng.cluster_items(items)[0]["direction"] == 0
+    assert ng.cluster_items(items + copies)[0]["direction"] == 0        # was +1: the copies outvoted the wire
+    assert ng.cluster_items(items + [dict(items[1], title="Primis Financial lifts its outlook after strong quarter")])[0]["direction"] == 1
+
+
+def test_g21_a6_a_stale_quote_is_left_out_and_missing_inputs_are_said():
+    at = lambda h: int((QUIET - dt.timedelta(hours=h)).timestamp())
+    fresh = ng.parse_market([{"code": "VIX.INDX", "close": 40, "change_p": 3, "timestamp": at(20)},
+                             {"code": "GSPC.INDX", "close": 6000, "change_p": -0.4, "timestamp": at(20)}])
+    assert fresh["VIX.INDX"]["as_of"] == QUIET - dt.timedelta(hours=20)
+    assert ng.evaluate([], [], fresh, QUIET)["verdict"] == "NO_NEW_ENTRY"
+    old = ng.parse_market([{"code": "VIX.INDX", "close": 40, "change_p": 3, "timestamp": at(120)}])
+    g = ng.evaluate([], [], old, QUIET)
+    assert g["verdict"] == "GO" and g["market"]["vix"] is None and g["market"]["stale"][0].startswith("VIX.INDX quote of ")
+    assert ng.parse_market([{"code": "VIX.INDX", "close": 40}])["VIX.INDX"]["as_of"] is None   # no time: used, as before
+    assert ng.evaluate([], [], ng.parse_market([{"code": "VIX.INDX", "close": 40}]), QUIET)["verdict"] == "NO_NEW_ENTRY"
+    assert ng.MARKET_MAX_AGE_H == 96.0
+    rep = {"gate": g, "sources_ok": {"market": 1}}
+    assert ng.inputs_line(rep) == ("**Inputs:** S&P 500 missing, VIX stale; news sources that answered: 0 (left out as stale: "
+                                   + g["market"]["stale"][0] + ") - GO here rests on missing inputs, not on a calm market")
+    calm = {"gate": ng.evaluate([], [], fresh, QUIET) | {"verdict": "GO"}, "sources_ok": {"google_news": 9, "market": 2}}
+    assert ng.inputs_line(calm) == "**Inputs:** S&P 500 used, VIX used; news sources that answered: 1"
+
+
+def test_g21_a6_the_digest_says_what_the_verdict_was_computed_from(armed):
+    (rc, rep), _ = _run(http=FakeHTTP(en_rss=GNEWS_EN_RSS), write=False)
+    assert "**Inputs:** S&P 500 used, VIX used; news sources that answered: " in ng.render_digest(rep)
+
+
+def test_g21_e1_the_workflow_takes_extra_symbols_from_a_secret():
+    wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
+    assert "secrets.TFB_NEWS_GATE_SYMBOLS" in wf and "vars.TFB_NEWS_GATE_SYMBOLS" not in wf
+    assert "PUBLIC: shown in the run log, never type a holding" in wf
