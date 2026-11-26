@@ -96,6 +96,15 @@ percentage-floor basis distinct. A Top10 EXECUTABLE header over a held/zero
 ticket view is a presentation failure, not evidence of a feed release.
 Missing/ambiguous v2 evidence remains NOT_CHECKED. These checks certify no
 account balance or execution and perform no live Sheet or source update.
+
+WHY (v1.2.2, 2026-11-25): a tighter cap is not a breached ceiling
+----------------------------------------------------
+External audit of 25 Nov (P2 audit rules): the panels carry 2 names / 30 %
+per sector while this check's policy default is 3 / 40, so the export audit
+filed a FAIL for a cap that is stricter than policy. sector_caps_vs_policy now
+FAILs only when a panel cap is LOOSER than policy (a breached risk ceiling)
+and WARNs when it is tighter (an unversioned policy difference to record).
+Counts and the --sector-cap default are unchanged.
 """
 from __future__ import annotations
 
@@ -112,7 +121,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.2.2"
 
 try:
     import openpyxl
@@ -1124,12 +1133,8 @@ def check_cockpit(book, tz_offset, sector_cap):
     prow = book.rows("Portfolio_Decision") or []
     pf_pct = _num(_panel_value(prow, "PF: Max Sector %"))
     metrics.update(t10_max_per_sector=t10_n, pf_max_sector_pct=pf_pct)
-    bad = []
-    if t10_n is not None and t10_n != want_n:
-        bad.append(f"T10 Max Per Sector {t10_n:g} (policy {want_n})")
-    if pf_pct is not None and pf_pct != want_pct:
-        bad.append(f"PF Max Sector % {pf_pct:g} (policy {want_pct})")
-    out.append(F("b", "DECISION", "sector_caps_vs_policy", "PASS" if not bad else "FAIL", len(bad),
+    status, bad = sector_cap_status(t10_n, pf_pct, want_n, want_pct)
+    out.append(F("b", "DECISION", "sector_caps_vs_policy", status, len(bad),
                  f"policy {want_n} names / {want_pct} %", bad))
     findings, view_metrics = check_top10_v2_presentation(book)
     out.extend(findings)
@@ -1411,6 +1416,19 @@ def verdicts(findings):
                        "checks": len(fs)}
     overall = ["GREEN", "AMBER", "RED"][max(RANK[f["status"]] for f in findings)] if findings else "GREEN"
     return lanes, overall
+
+
+def sector_cap_status(t10_n, pf_pct, want_n, want_pct):
+    """v1.2.2 PURE: (status, examples). FAIL only when a panel cap is looser than policy (a breached
+    risk ceiling); WARN when it is tighter (a policy difference to record); PASS when both match or are absent."""
+    bad, looser = [], False
+    if t10_n is not None and t10_n != want_n:
+        looser |= t10_n > want_n
+        bad.append(f"T10 Max Per Sector {t10_n:g} (policy {want_n}; {'looser' if t10_n > want_n else 'tighter'})")
+    if pf_pct is not None and pf_pct != want_pct:
+        looser |= pf_pct > want_pct
+        bad.append(f"PF Max Sector % {pf_pct:g} (policy {want_pct}; {'looser' if pf_pct > want_pct else 'tighter'})")
+    return ("PASS" if not bad else ("FAIL" if looser else "WARN")), bad
 
 
 def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(3, 40.0),
