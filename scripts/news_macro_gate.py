@@ -2,8 +2,24 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.5.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.6.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.6.0 (2026-11-26) -- [FINNHUB] THE FINNHUB KEY THE PROJECT ALREADY HOLDS NOW READS NEWS
+WHY (owner, 26 Nov 2026 14:49: "I think it already exists but may be unused"): FINNHUB_API_KEY is set on
+  Render, where core/providers/finnhub_provider.py uses it as the last price fallback (quotes only). No
+  workflow passes it and no script reads Finnhub's news. Its free plan (personal use; 60 calls a minute,
+  30 a second) includes company news for North American issuers and the general market-news feed - an
+  aggregator that files each story with its own time, like the publishers' feeds of v1.5.0.
+WHAT: source `finnhub` (in NEW_SOURCES: folded, carried, issuer-linked like bing_news / yahoo_rss):
+  /news?category=general (market-wide, 24 h) and /company-news per US scope name (from 3 days back, 72 h).
+  The key travels in the X-Finnhub-Token header, never in a URL, and is scrubbed from every message. Each
+  request is asked once (12 s), 1.1 s apart; two failures in a row stop the source. An item is filed under
+  the publisher of its URL; an item whose URL is Finnhub's own redirect is filed under the publisher its
+  'source' names when that name is known (FINNHUB_SOURCE_DOMAINS), else under finnhub.io (tier D).
+  Without FINNHUB_API_KEY the source is skipped and named under Sources Failed ("FINNHUB_API_KEY not set").
+NOT IN THIS VERSION: verdict rules, taxonomy, tabs and headers are unchanged; observe-only as before.
+ROLLBACK: leave finnhub out of TFB_NEWS_GATE_SOURCES, or revert this file to v1.5.0.
+
 v1.5.0 (2026-11-26) -- [SOURCES] FIVE MORE SOURCES; A FEED THAT CANNOT BE READ IS NAMED, NOT COUNTED AS ZERO
 WHY (owner, 26 Nov 2026 12:42: add three to five news sources and make the gate stronger and faster): the
   archive of the gate's 137 runs (27 Oct - 26 Nov) shows it standing on one source. Google News carried
@@ -299,7 +315,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -317,9 +333,10 @@ EODHD_ECON = "https://eodhd.com/api/economic-events"
 EODHD_RT = "https://eodhd.com/api/real-time/{code}"
 BING_NEWS_RSS = "https://www.bing.com/news/search"                    # v1.5.0 [SOURCES]
 YAHOO_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline"        # v1.5.0 [SOURCES]
+FINNHUB_API = "https://finnhub.io/api/v1"                                # v1.6.0 [FINNHUB]
 
 # v1.5.0 [SOURCES]: five keyless sources beside the six of v1.0.0. FEED_GROUPS are read from FEEDS below.
-NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss")
+NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss", "finnhub")   # v1.6.0: finnhub
 FEED_GROUPS = ("press_rss", "official_rss", "gulf_rss")
 ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + NEW_SOURCES
 # v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
@@ -328,7 +345,7 @@ ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + N
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
-                   "official_rss": 75.0, "gulf_rss": 45.0}
+                   "official_rss": 75.0, "gulf_rss": 45.0, "finnhub": 45.0}
 BREAKER_FAILURES = 2
 # v1.5.0 [SOURCES]: a feed is asked once per run and never held longer than this; a reply larger than
 # MAX_FEED_BYTES is not parsed. Windows: what evaluate() can still use (24 h market-wide, 72 h for a name).
@@ -391,8 +408,17 @@ ECON_HEADER = ["Key", "Date (UTC)", "Country", "Event", "Comparison", "Period", 
 # move the verdict (evaluate(): 24 h for macro, 72 h for a name).
 MEMORY_HOURS = {"MACRO": 24.0, "NAME": 72.0}
 # v1.5.0 [SOURCES]: the new news sources are carried too; official feeds keep days of items and are re-read.
-MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss")
-ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss")
+MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub")
+ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "finnhub")
+# v1.6.0 [FINNHUB]: the publisher of a Finnhub item whose URL is Finnhub's own redirect, read from its 'source'
+FINNHUB_SOURCE_DOMAINS: Dict[str, str] = {
+    "reuters": "reuters.com", "bloomberg": "bloomberg.com", "cnbc": "cnbc.com", "marketwatch": "marketwatch.com",
+    "wsj": "wsj.com", "barrons": "barrons.com", "benzinga": "benzinga.com", "seekingalpha": "seekingalpha.com",
+    "yahoo": "yahoo.com", "motley fool": "fool.com", "zacks": "zacks.com", "tipranks": "tipranks.com",
+    "businesswire": "businesswire.com", "globenewswire": "globenewswire.com", "prnewswire": "prnewswire.com",
+    "investing.com": "investing.com", "forbes": "forbes.com", "fortune": "fortune.com", "ft": "ft.com",
+    "the fly": "thefly.com", "financial times": "ft.com",
+}
 _LEVEL_ORDER = {"BLOCK": 0, "WATCH": 1, "INFO": 2}
 
 VERDICTS = ("GO", "CAUTION", "NO_NEW_ENTRY")
@@ -426,6 +452,7 @@ SOURCE_TIERS: Dict[str, str] = {
     # D
     "yahoo.com": "D", "msn.com": "D", "seekingalpha.com": "D", "fool.com": "D",
     "bing.com": "D",   # v1.5.0: a Bing News link whose publisher could not be read
+    "finnhub.io": "D",  # v1.6.0: a Finnhub item whose publisher could not be read
     "zacks.com": "D", "tipranks.com": "D", "marketbeat.com": "D", "news.google.com": "D",
     "insidermonkey.com": "D", "simplywall.st": "D", "stocktitan.net": "D",
     "gurufocus.com": "D", "finviz.com": "D", "investorsobserver.com": "D",
@@ -953,6 +980,41 @@ def bing_target(link: str) -> str:
     except ValueError:
         pass
     return link
+
+
+def finnhub_symbol(symbol: str) -> str:
+    """v1.6.0 [FINNHUB] PURE: the ticker Finnhub's company news takes ('' = not asked: North American only)."""
+    s = str(symbol or "").strip().upper()
+    return s[:-3].replace("-", ".") if s.endswith(".US") and len(s) > 3 else ""
+
+
+def parse_finnhub(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
+    """v1.6.0 [FINNHUB] PURE: items of a /news or /company-news reply (a JSON list). Raises ValueError when the
+    reply is not that list, so a refusal is named under Sources Failed rather than counted as zero."""
+    if isinstance(payload, dict):
+        raise ValueError("not a news list: %s" % str(payload.get("error") or list(payload)[:3])[:60])
+    if not isinstance(payload, list):
+        raise ValueError("not a news list")
+    out = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        title = " ".join(str(row.get("headline") or "").split())
+        url = str(row.get("url") or "").strip()
+        if not title:
+            continue
+        try:
+            stamp = int(row.get("datetime") or 0)
+        except (TypeError, ValueError):
+            stamp = 0
+        published = _dt.datetime.fromtimestamp(stamp, UTC) if stamp > 0 else None
+        dom = domain_of(url)
+        if not dom or dom == "finnhub.io":
+            name = " ".join(str(row.get("source") or "").lower().split())
+            dom = FINNHUB_SOURCE_DOMAINS.get(name, "finnhub.io")
+        out.append({"source": "finnhub", "query": label, "scope": scope, "title": title, "url": url,
+                    "domain": dom, "published": published, "lang": "en"})
+    return out
 
 
 def yahoo_symbol(symbol: str) -> str:
@@ -1597,6 +1659,47 @@ class Collector:
         guard.close()
         return out
 
+    def finnhub(self, symbols: Sequence[str], key: str) -> List[Dict[str, Any]]:
+        """v1.6.0 [FINNHUB]: market news, then company news per US scope name. The key is sent as a header."""
+        if not key:
+            self._fail("finnhub", "FINNHUB_API_KEY not set")
+            return []
+        hdr = {"X-Finnhub-Token": key}
+        frm = (self.now - _dt.timedelta(days=3)).strftime("%Y-%m-%d")
+        to = self.now.strftime("%Y-%m-%d")
+        asks: List[Tuple[str, str, str, Dict[str, Any], float]] = [
+            ("MACRO", "market news finnhub", FINNHUB_API + "/news", {"category": "general"}, MACRO_WINDOW_H)]
+        for sym in symbols:
+            tick = finnhub_symbol(sym)
+            if tick:
+                asks.append((sym, f"name {sym} finnhub", FINNHUB_API + "/company-news",
+                             {"symbol": tick, "from": frm, "to": to}, NAME_WINDOW_H))
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "finnhub")
+        for i, (scope, label, url, params, hours) in enumerate(asks):
+            if not guard.allow():
+                continue
+            if i:
+                self.sleep(1.1)                          # 60 calls a minute on the free plan
+            try:
+                resp = self._get("finnhub", url, params=params, headers=hdr, attempts=1,
+                                 timeout=min(self.timeout, FEED_TIMEOUT_S))
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    raise ValueError("reply is not JSON")
+                got = parse_finnhub(payload, scope, label)
+                kept, left = within_window(got, self.now, hours)
+                self._tally("finnhub", asked=1, read=len(got), outside=left["outside"], undated=left["undated"])
+                out.extend(kept)
+                self._note("finnhub", len(kept))
+                guard.success()
+            except Exception as exc:
+                self._fail_part("finnhub", label, _scrub(str(exc), key))
+                guard.failure()
+        guard.close()
+        return out
+
     def feeds(self, group: str, sec_user_agent: str = "") -> List[Dict[str, Any]]:
         """The feeds of one group in FEEDS, each on its own: a feed that fails is named and the next one is
         read (they are different publishers, so there is no circuit breaker - only the group's time budget).
@@ -2220,6 +2323,11 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         got = col.bing_news(build_bing_queries(scope))
         raw.extend(got)
         stage("bing_news", len(got), t0)
+    if "finnhub" in sources:                                       # v1.6.0 [FINNHUB]
+        t0 = col.clock()
+        got = col.finnhub(symbols, _env("FINNHUB_API_KEY"))
+        raw.extend(got)
+        stage("finnhub", len(got), t0)
     if "yahoo_rss" in sources:
         t0 = col.clock()
         got = col.yahoo_rss(symbols)
