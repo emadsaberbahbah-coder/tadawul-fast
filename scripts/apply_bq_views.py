@@ -2,8 +2,19 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.32.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.33.0 (program register C8, Phase 2)
 ================================================================================
+v1.33.0 (27 Nov 2026, the reading before the entry). WHY (outside
+engineering audit the owner uploaded on 26 Nov 2026, finding D1; owner, 26
+Nov 2026 19:13 Riyadh, in Arabic: "if it is ready, build it now"):
+v_news_llm_days (141) entered at the first close after the news day, but the
+language model reads the gate's 72-hour name window, so 90 of the first 108
+name headlines were read one to three days after their news day - their
+entry close came before the reading. The entry is now the first close after
+both the news day and the New York date of the day's last reading
+(last_read_at, a new column), within 6 calendar days of that date. Both
+readers keep the same entry, so the duel stays fair. No other file changes.
+
 v1.32.0 (26 Nov 2026, the news read twice). WHY (owner, 26 Nov 2026 15:34
 Riyadh, in Arabic: "let us start with this too and see how we can develop
 the system, linked with BigQuery and the other files"): the gate's headlines
@@ -669,7 +680,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.32.0"
+__version__ = "1.33.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

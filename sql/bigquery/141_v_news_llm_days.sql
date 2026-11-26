@@ -7,8 +7,11 @@
 --              neutral otherwise (no event, or events that net to nothing)
 --   names      US names only (symbol ending '.US'), so each return can be set against one market
 --   news day   the Riyadh date of the headline (v_news_llm.news_date)
---   entry      the close of the first session AFTER the news day - never the news day's own close, which could come
---              before the headline (no look-ahead); the first bar within 6 calendar days, else the day has no move
+--   entry      the close of the first session AFTER the news day AND after the New York date the last of the day's
+--              headlines was read by the model (last_read_at) - never a close that came before the headline or
+--              before the reading (no look-ahead); the first bar within 6 calendar days of that date, else no move.
+--              (1.33.0, audit D1 of 26 Nov: the model reads the 72-hour name window, so most name headlines were
+--              read one to three days after their news day; the entry ignored that.)
 --   move       a name: its adjusted return over the next 1 and 5 sessions from that close minus the same-day average
 --              of every US name in symbol_bars_daily over the same sessions ("peers"), in percentage points.
 --              MACRO: the S&P 500 fund's (SPY) adjusted return over the next 1 and 5 sessions from the first SPY
@@ -17,18 +20,20 @@
 -- WHY (owner, 26 Nov 2026 15:34 Riyadh, in Arabic: "let us start with this too ... linked with BigQuery"): which of
 -- the two readings says more about the next sessions - read in v_news_llm_eval (each reader alone) and
 -- v_news_llm_duel (the days they disagree). (apply_bq_views 1.32.0)
--- Research only: no decision, gate or count reads this view. (views 1.32.0)
+-- Research only: no decision, gate or count reads this view. (views 1.32.0; entry after the reading: views 1.33.0)
 CREATE OR REPLACE VIEW `{{DS}}.v_news_llm_days`
 OPTIONS (description = "TFB news read twice - the word lists and the language model - summed per day and set against the next 1 and 5 sessions: a name against the same-day US names, MACRO against the S&P 500 fund. Research view, never an order.")
 AS
 WITH base AS (
   SELECT IF(is_macro, 'MACRO', 'COMPANY') AS kind, IFNULL(symbol, 'MACRO') AS symbol, news_date AS d,
-         rule_dir, llm_dir
+         rule_dir, llm_dir, read_at
   FROM `{{DS}}.v_news_llm`
   WHERE news_date IS NOT NULL AND (is_macro OR ENDS_WITH(symbol, '.US'))
 ),
 day_scores AS (
-  SELECT kind, symbol, d, COUNT(*) AS headlines, SUM(rule_dir) AS rules_x, SUM(llm_dir) AS model_x
+  SELECT kind, symbol, d, COUNT(*) AS headlines, SUM(rule_dir) AS rules_x, SUM(llm_dir) AS model_x,
+         MAX(read_at) AS last_read_at,
+         IFNULL(GREATEST(d, DATE(MAX(read_at), 'America/New_York')), d) AS after_d     -- 1.33.0 (audit D1)
   FROM base
   GROUP BY kind, symbol, d
 ),
@@ -55,7 +60,7 @@ name_entry AS (
          ARRAY_AGG(STRUCT(b.date AS date, (b.c1 / b.close - 1) * 100 AS r1, (b.c5 / b.close - 1) * 100 AS r5)
                    ORDER BY b.date ASC LIMIT 1)[OFFSET(0)] AS e
   FROM day_scores AS y
-  JOIN bars AS b ON b.symbol = y.symbol AND b.date > y.d AND b.date <= DATE_ADD(y.d, INTERVAL 6 DAY)
+  JOIN bars AS b ON b.symbol = y.symbol AND b.date > y.after_d AND b.date <= DATE_ADD(y.after_d, INTERVAL 6 DAY)
   WHERE y.kind = 'COMPANY' AND b.close > 0
   GROUP BY y.symbol, y.d
 ),
@@ -64,12 +69,12 @@ macro_entry AS (
          ARRAY_AGG(STRUCT(s.date AS date, (s.c1 / s.close - 1) * 100 AS r1, (s.c5 / s.close - 1) * 100 AS r5)
                    ORDER BY s.date ASC LIMIT 1)[OFFSET(0)] AS e
   FROM day_scores AS y
-  JOIN spy AS s ON s.date > y.d AND s.date <= DATE_ADD(y.d, INTERVAL 6 DAY)
+  JOIN spy AS s ON s.date > y.after_d AND s.date <= DATE_ADD(y.after_d, INTERVAL 6 DAY)
   WHERE y.kind = 'MACRO' AND s.close > 0
   GROUP BY y.d
 ),
 moves AS (
-  SELECT y.kind, y.symbol, y.d, y.headlines, y.rules_x, y.model_x,
+  SELECT y.kind, y.symbol, y.d, y.headlines, y.rules_x, y.model_x, y.last_read_at,
          IF(y.kind = 'MACRO', m.e.date, n.e.date) AS entry_date,
          IF(y.kind = 'MACRO', m.e.r1, n.e.r1 - p.p1) AS move_1d_pp,
          IF(y.kind = 'MACRO', m.e.r5, n.e.r5 - p.p5) AS move_5d_pp
@@ -81,7 +86,7 @@ moves AS (
 read_twice AS (
   SELECT r.reader, mv.kind, mv.symbol, mv.d AS news_date, mv.headlines, r.x AS score,
          CASE WHEN r.x >= 1 THEN 'positive' WHEN r.x <= -1 THEN 'negative' ELSE 'neutral' END AS class,
-         mv.entry_date, ROUND(mv.move_1d_pp, 4) AS move_1d_pp, ROUND(mv.move_5d_pp, 4) AS move_5d_pp
+         mv.last_read_at, mv.entry_date, ROUND(mv.move_1d_pp, 4) AS move_1d_pp, ROUND(mv.move_5d_pp, 4) AS move_5d_pp
   FROM moves AS mv
   CROSS JOIN UNNEST([STRUCT('rules' AS reader, mv.rules_x AS x), STRUCT('model' AS reader, mv.model_x AS x)]) AS r
 )
