@@ -1,6 +1,9 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.7 (2026-11-27) -- EXTRA SYMBOLS FROM A SECRET (news_macro_gate 1.12.0, audit E1)
+#       TFB_NEWS_GATE_SYMBOLS is read from secrets.TFB_NEWS_GATE_SYMBOLS (masked in the log) instead of a
+#       repository Variable (printed in the step's env block). The dispatch input stays, marked public.
 # VERSION 1.1.6 (2026-11-26) -- THE PUBLIC LOG KEEPS THE HOLDINGS OUT (news_macro_gate 1.8.1 [PUBLIC-LOG])
 #       The run step passes the Variable TFB_NEWS_GATE_LOG_DETAIL (on | off | auto, default auto: off on
 #       Actions). This repository is public: its logs, step summaries and artifacts name no holding.
@@ -88,7 +91,7 @@ on:
         default: ""
         type: string
       symbols:
-        description: "Extra symbols, SYM[:Name];SYM2 (added to holdings + the latest shadow-log day)"
+        description: "Extra symbols, SYM[:Name];SYM2 - PUBLIC: shown in the run log, never type a holding"
         required: false
         default: ""
         type: string
@@ -171,7 +174,7 @@ jobs:
           TFB_SEC_USER_AGENT: ${{ secrets.TFB_SEC_USER_AGENT || vars.TFB_SEC_USER_AGENT }}
           TFB_NEWS_GATE: ${{ vars.TFB_NEWS_GATE || 'observe' }}
           TFB_NEWS_GATE_SOURCES: ${{ github.event.inputs.sources || vars.TFB_NEWS_GATE_SOURCES || '' }}
-          TFB_NEWS_GATE_SYMBOLS: ${{ github.event.inputs.symbols || vars.TFB_NEWS_GATE_SYMBOLS || '' }}
+          TFB_NEWS_GATE_SYMBOLS: ${{ github.event.inputs.symbols || secrets.TFB_NEWS_GATE_SYMBOLS || '' }}   # 1.1.7: a secret is masked, a Variable is printed
           TFB_NEWS_GATE_EVIDENCE_DIR: news-gate-evidence
           TFB_NEWS_ISSUER_LINK: ${{ vars.TFB_NEWS_ISSUER_LINK || 'on' }}   # 1.0.1: news_macro_gate 1.1.0 [ISSUER-LINK]; on | observe | off
         run: |
