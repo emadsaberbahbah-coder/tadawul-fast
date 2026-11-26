@@ -2,8 +2,17 @@
 # scripts/archive_to_bigquery.py
 """
 ================================================================================
-TFB BigQuery Archive - v1.1.0 (program register C8, Phase 1)
+TFB BigQuery Archive - v1.2.0 (program register C8, Phase 1)
 ================================================================================
+v1.2.0 (26 Nov 2026, the news read twice): one more tab, header row 1 -
+_News_LLM, the language model's label of each headline the news gate read,
+beside the word lists' (scripts/news_llm_reader.py 1.0.0, observe only).
+WHY (owner, 26 Nov 2026 15:34 Riyadh, in Arabic: "let us start with this
+too ... linked with BigQuery and the other files"): the model is judged
+against what the prices did next (apply_bq_views 1.32.0, v_news_llm_eval
+and v_news_llm_duel), and that needs every day's labels kept. The tab
+exists from the gate's first written run after news_macro_gate 1.8.0
+(26 Nov 2026); the copy grows by at most a few hundred rows a day.
 v1.1.0 (31 Oct 2026, Looker pages 3-6): seven more tabs, all with header
 row 1 - the four market pages (Market_Leaders, Global_Markets, Mutual_Funds,
 Commodities_FX: one 115-column layout, core/sheets/schema_registry.py) and
@@ -71,7 +80,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # (tab, header_row): header_row is the 1-based row holding column names, 0 when
 # the tab is a multi-zone layout (title rows, several tables) - cells only.
@@ -94,6 +103,8 @@ TABS: Tuple[Tuple[str, int], ...] = (
     ("_News_Items", 1),
     ("_News_Gate", 1),
     ("_Econ_Events", 1),
+    # v1.2.0: the language model's reading of the gate's headlines
+    ("_News_LLM", 1),
 )
 MAX_ROWS_PER_TAB = 250_000
 MAX_COLS = 400

@@ -2,8 +2,24 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.31.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.32.0 (program register C8, Phase 2)
 ================================================================================
+v1.32.0 (26 Nov 2026, the news read twice). WHY (owner, 26 Nov 2026 15:34
+Riyadh, in Arabic: "let us start with this too and see how we can develop
+the system, linked with BigQuery and the other files"): the gate's headlines
+are now also read by a language model in observe mode (news_llm_reader
+1.0.0, tab _News_LLM), and it earns a place only if its reading says more
+about the next sessions than the word lists' does. A new source table,
+news_llm (archive_to_bigquery 1.2.0 copies the tab nightly), and four new
+views, research only: v_news_llm (140) - one row per labelled headline, both
+readings side by side; v_news_llm_days (141) - each reading summed per
+name-day (COMPANY, US names, against the same-day US names) and per news day
+(MACRO, against SPY), over the next 1 and 5 sessions from the first close
+after the news day (the method of v_company_news_eval); v_news_llm_eval
+(142) - each reading's scoreboard with a fixed reading; v_news_llm_duel
+(143) - the days the two part, and which was right. No file of 1.31.0
+changes.
+
 v1.31.0 (26 Nov 2026, the forward signal ledger). WHY (week plan of 23 Nov
 2026, package 4; owner, 23 Nov 2026: "go and Start build and daily in the
 moring start to build the remaing"): a rise is not a win when the market rose
@@ -653,7 +669,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.31.0"
+__version__ = "1.32.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -661,7 +677,7 @@ DEFAULT_DATASET = "tfb_archive"
 DEFAULT_LOCATION = "US"
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql" / "bigquery"
 BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
-# the tables scripts/archive_to_bigquery.py v1.1.0 creates (TABS -> table_name)
+# the tables scripts/archive_to_bigquery.py v1.2.0 creates (TABS -> table_name)
 ARCHIVE_TABLES = frozenset({
     "top_10_investments", "selection_log", "shadow_rank_log", "board_scorecard",
     "calendar_events", "signal_history", "performance_log", "my_portfolio",
@@ -669,6 +685,8 @@ ARCHIVE_TABLES = frozenset({
     # v1.2.0: the market pages and the news gate tabs (archive v1.1.0)
     "market_leaders", "global_markets", "mutual_funds", "commodities_fx",
     "news_items", "news_gate", "econ_events",
+    # v1.32.0: the language model's reading of the gate's headlines (archive v1.2.0)
+    "news_llm",
 })
 # the table scripts/archive_market_series.py v1.0.0 loads (global markets page)
 MARKET_TABLES = frozenset({"market_series_daily"})
