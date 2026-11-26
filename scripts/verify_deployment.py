@@ -349,7 +349,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # workflow-scoped, never on Render).
     ("run_calendar_sync", "1.3.1", "calendar sync"),
     # 2026-10-27 (C8 Phase 1; pin only): the read-only BigQuery archive.
-    ("archive_to_bigquery", "1.1.0", "bigquery archive"),
+    # 2026-11-26 (pin only): 1.1.0 -> 1.2.0 (the _News_LLM tab, the language
+    # model's reading of the news gate's headlines).
+    ("archive_to_bigquery", "1.2.0", "bigquery archive"),
     # 2026-10-29 (C8 Phase 2; pin only, SCRIPT_VERSION unchanged): NEW
     # scripts/apply_bq_views.py, the typed Looker views over the archive.
     # 2026-10-29 (C8 Phase 2b, same rule): 1.0.0 -> 1.1.0 (table functions and
@@ -391,7 +393,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (manifest pin only): 1.30.0 -> 1.31.0 (v_forward_signals, v_forward_signal_gates,
     # v_forward_signal_recon - every signal against the benchmark of its own market net of cost, the blocked winners
     # and the admitted losers per block reason, and the ledger's counts held to v_outcome_engine; research only).
-    ("apply_bq_views", "1.31.0", "bigquery looker views"),
+    # 2026-11-26 (pin only): 1.31.0 -> 1.32.0 (the news read twice: v_news_llm,
+    # v_news_llm_days, v_news_llm_eval, v_news_llm_duel; research only).
+    ("apply_bq_views", "1.32.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
