@@ -209,7 +209,9 @@ function run() {
     const w = makeWorld({ props: { TFB_GH_DISPATCH_TOKEN: TOKEN }, gmStamp: '2026-09-30 02:00:00+03:00', nowMs: Date.parse('2026-09-30T03:15:00Z') });
     const r = w.ctx.tfbDispatchDailySync();
     T('S9 daily_sync dispatch', r === 'OK:204' && /daily_sync\.yml\/dispatches$/.test(w.fetches[0].url), r);
-    T('S9 daily_sync payload = the scheduled page set (v1.1.1: + include_portfolio)', JSON.stringify(payload(w, 0)) === JSON.stringify({ ref: 'main', inputs: { run_mode: 'full_sync', include_portfolio: 'true' } }), JSON.stringify(payload(w, 0)));
+    const p9 = payload(w, 0); const id9 = p9.inputs.dispatch_id; delete p9.inputs.dispatch_id;   // v1.2.0: + this dispatch's own id
+    T('S9 daily_sync payload = the scheduled page set (v1.1.1: + include_portfolio)', JSON.stringify(p9) === JSON.stringify({ ref: 'main', inputs: { run_mode: 'full_sync', include_portfolio: 'true' } }), JSON.stringify(p9));
+    T('S9 daily_sync payload carries a dispatch id (v1.2.0)', /^gas-sync-[0-9a-z]+-[0-9a-z]{4}$/.test(String(id9)), String(id9));
     T('S9 daily_sync row Page', w.logRows[0][3] === 'daily_sync.yml' && w.logRows[0][2] === 'tfbDispatchDailySync');
     T('S9 v1.0.0 status still renders', /^SYNC-DISPATCH v1\.2\.0 \| token=present/.test(w.ctx.tfbSyncDispatchStatus()));
   }

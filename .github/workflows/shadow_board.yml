@@ -33,6 +33,12 @@ name: "🕶️ TFB Shadow Board"
 # read is empty or rendering; a settled first read costs nothing. Rollback:
 # set "0" (or delete the line) = v1.5.0's single read.
 # ============================================================================
+# 2026-11-26: input dispatch_id + run-name. 24_Sync_Dispatch 1.2.0 sends its own
+# id with a dispatch and finds ITS run by that id before it sends again after a
+# fault at GitHub. A run started without the id keeps GitHub's own name (an
+# empty run-name is ignored). No step reads the input.
+
+run-name: ${{ inputs.dispatch_id && format('{0} [{1}]', github.workflow, inputs.dispatch_id) || '' }}
 
 on:
   schedule:
@@ -46,6 +52,11 @@ on:
         default: "true"
         type: choice
         options: ["true", "false"]
+      dispatch_id:
+        description: "Dispatcher's own id for this run (24_Sync_Dispatch 1.2.0); printed in the run name, read by no step"
+        required: false
+        default: ""
+        type: string
 
 # ============================================================================
 # CONCURRENCY — SINGLE WRITE LEASE (v1.2.0)
