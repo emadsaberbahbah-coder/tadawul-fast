@@ -104,7 +104,9 @@ def test_every_registry_column_exists_in_its_view_file():
         src = f[0].read_text(encoding="utf-8")
         for col in list(keys) + [reading, n, effect] + ([t] if t else []) + re.findall(r"^(\w+) =", where):
             assert re.search(r"\b%s\b" % col, src), (view, col)
-    assert len(lw.REGISTRY) == 18 and len({e[0] for e in lw.REGISTRY}) == 18
+    assert len(lw.REGISTRY) == 22 and len({e[0] for e in lw.REGISTRY}) == 22          # v1.2.0: the gate record
+    assert [e[0] for e in lw.REGISTRY[-4:]] == ["v_stop_cause_learning", "v_trial_value_screen", "v_cash_entry_trial",
+                                                "v_forward_signal_gates"]
     # Codex P1 on #1074: a record that defines every row as in-sample is never read as evidence
     declared = {view for view, *_ in lw.REGISTRY
                 if "every row is in-sample" in list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8").lower()}
@@ -139,6 +141,61 @@ def test_in_sample_records_never_prove(monkeypatch):
     ("in-sample: shows why the rule was chosen, not evidence", "IN-SAMPLE")])
 def test_the_fixed_words(reading, grp):
     assert lw.classify(reading) == grp
+
+
+@pytest.mark.parametrize("view,reading,grp", [
+    ("v_stop_cause_learning", "works: waiting beat selling at the fall", "PROVEN"),
+    ("v_stop_cause_learning", "fails: waiting lost to selling at the fall", "AGAINST"),
+    ("v_stop_cause_learning", "works: selling at the fall was right", "PROVEN"),
+    ("v_stop_cause_learning", "fails: it rose after the fall", "AGAINST"),
+    ("v_trial_value_screen", "works: beats the US names", "PROVEN"),
+    ("v_trial_value_screen", "fails: trails the US names", "AGAINST"),
+    ("v_cash_entry_trial", "works: entering beat cash", "PROVEN"),
+    ("v_cash_entry_trial", "fails: entering lost to cash", "AGAINST")])
+def test_the_words_of_the_three_new_records(view, reading, grp):
+    """v1.1.0: every reading the three views of 26 Nov can give lands in the group it means, and only forward."""
+    sql = list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8")
+    assert "THEN '%s'" % reading in sql
+    assert lw.group_of(view, "x", reading, "forward from 2026-11-26") == grp
+    for period in ("history, in-sample", "history, rule fixed before reading it"):
+        assert lw.group_of(view, "x", reading, period) == "IN-SAMPLE"
+    for word, want in (("collecting", "COLLECTING"), ("no clear edge", "NEUTRAL"), ("in-sample, not evidence", "IN-SAMPLE")):
+        assert "'%s'" % word in sql and lw.group_of(view, "x", word, "forward from 2026-11-26") == want
+
+
+@pytest.mark.parametrize("reading,grp", [
+    ("works: the names kept out trailed their benchmark", "PROVEN"),
+    ("fails: the names kept out beat their benchmark", "AGAINST"),
+    ("works: the admitted names beat their benchmark", "PROVEN"),
+    ("fails: the admitted names trailed their benchmark", "AGAINST")])
+def test_the_words_of_the_gate_record(reading, grp):
+    """v1.2.0: every reading v_forward_signal_gates can give lands in the group it means, and only forward."""
+    view = "v_forward_signal_gates"
+    sql = list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8")
+    assert "THEN '%s'" % reading in sql
+    assert lw.group_of(view, "x", reading, "forward from 2026-11-26") == grp
+    assert lw.group_of(view, "x", reading, "history, tally fixed before reading it") == "IN-SAMPLE"
+    for word, want in (("collecting", "COLLECTING"), ("no clear edge", "NEUTRAL"), ("in-sample, not evidence", "IN-SAMPLE")):
+        assert "'%s'" % word in sql and lw.group_of(view, "x", word, "forward from 2026-11-26") == want
+    # the ledger writes the two periods the gate record reads, and no other
+    led = list(SQL_DIR.glob("*_v_forward_signals.sql"))[0].read_text(encoding="utf-8")
+    assert "THEN 'history, tally fixed before reading it' ELSE 'forward from 2026-11-26' END AS period" in led
+    assert "WHEN period != 'forward from 2026-11-26' THEN 'in-sample, not evidence'" in sql
+
+
+def test_the_gate_record_is_read_by_its_main_rows():
+    entry = lw.REGISTRY[-1]
+    assert entry[0] == "v_forward_signal_gates" and entry[2] == ("period", "market_group", "horizon", "gate",
+                                                                 "block_reason_class")
+    sql = lw.sql_view("p.d", entry)
+    assert sql.endswith("FROM `p.d.v_forward_signal_gates` WHERE block_reason_class IN ('(admitted)', '(all reasons)') "
+                        "OR with_outcome >= 30")
+    assert "SAFE_CAST(with_outcome AS FLOAT64) AS n" in sql and "SAFE_CAST(mean_active_net_pp AS FLOAT64) AS effect" in sql
+    assert "SAFE_CAST(t_adj AS FLOAT64) AS t" in sql and "CAST(period AS STRING) AS period" in sql
+    # the two fixed row names of the filter are the ones the view writes
+    gates = list(SQL_DIR.glob("*_v_forward_signal_gates.sql"))[0].read_text(encoding="utf-8")
+    led = list(SQL_DIR.glob("*_v_forward_signals.sql"))[0].read_text(encoding="utf-8")
+    assert "'(all reasons)'" in gates and "THEN '(admitted)'" in led
 
 
 def test_history_rows_are_never_evidence():
@@ -211,7 +268,7 @@ def test_dry_run_and_switch(monkeypatch):
 
 def test_source_and_workflow():
     src = Path(lw.__file__).read_text(encoding="utf-8")
-    assert src.isascii() and lw.__version__ == "1.0.1" and "v1.0.1 (2026-11-24)" in src
+    assert src.isascii() and lw.__version__ == "1.2.0" and "v1.2.0 (2026-11-26)" in src and "v1.1.0 (2026-11-26)" in src
     wf = yaml.safe_load(Path(".github/workflows/learning_watch.yml").read_text(encoding="utf-8"))
     on = wf[True] if True in wf else wf["on"]
     assert on["workflow_run"]["workflows"] == ["🎯 Exit Plan"] and "schedule" not in on
