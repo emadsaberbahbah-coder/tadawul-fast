@@ -38,6 +38,15 @@ Pinned here:
   G8 main(): --write without a spreadsheet id -> 2; evidence JSON +
      markdown; job summary appended; env symbols join the scope
   G9 ASCII-only module, version pin in verify_deployment, workflow shape
+  G14 (v1.5.0 [SOURCES]) five more sources: the feed reader (RSS 2.0, RSS 1.0,
+     Atom; bytes with a byte-order mark; a reply that is not a feed raises and
+     is named under Sources Failed - the Fed feed read 0 items in 134 runs
+     without a fault being named); Bing News items filed under their
+     publisher; Yahoo per name under the issuer-link rule; a dead feed does
+     not stop its group and is asked once; undated and old items left out;
+     one story from one publisher stays one member (fold_new_sources); the
+     new sources alone confirm a Gulf situation and carry it in the memory;
+     with every new feed empty the run equals the six-source run
 
 Run: python tests/test_news_macro_gate.py   or   pytest -q <this file>
 """
@@ -49,7 +58,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import pytest
 
@@ -165,16 +174,43 @@ MARKET = [{"code": "GSPC.INDX", "close": 6650.1, "previousClose": 6700.0, "chang
           {"code": "VIX.INDX", "close": 18.2, "previousClose": 17.0, "change_p": 7.06}]
 
 
+EMPTY_FEED = "<rss><channel></channel></rss>"
+
+
 class FakeHTTP:
-    def __init__(self, fail: Optional[Dict[str, int]] = None, econ_us=None, en_rss: str = ""):
+    def __init__(self, fail: Optional[Dict[str, int]] = None, econ_us=None, en_rss: str = "",
+                 feeds: Optional[Dict[str, Any]] = None):
         self.calls: List[str] = []
         self.fail = fail or {}
         self.econ_us = econ_us if econ_us is not None else ECON_US
         self.en_rss = en_rss
+        # v1.5.0 [SOURCES]: replies of the new sources, keyed by a FEEDS id, 'bing' / 'bing:<word in the
+        # search>' or 'yahoo:<code>'; text, bytes (served as .content) or a Resp. Unlisted = an empty feed.
+        self.feeds = feeds or {}
+        self.seen: List[Dict[str, Any]] = []
+
+    def _new_source(self, url, params):
+        if url == ng.BING_NEWS_RSS:
+            key = next((k for k in self.feeds if k.startswith("bing:") and k[5:] in params.get("q", "")), "bing")
+        elif url == ng.YAHOO_RSS:
+            key = "yahoo:" + params.get("s", "")
+        else:
+            key = next((f[0] for f in ng.FEEDS if f[2] == url), None)
+        if key is None:
+            return None
+        body = self.feeds.get(key, EMPTY_FEED)
+        if isinstance(body, Resp):
+            return body
+        if isinstance(body, bytes):
+            out = Resp(200, text="(bytes)")
+            out.content = body
+            return out
+        return Resp(200, text=body)
 
     def get(self, url, params=None, headers=None, timeout=None):
         params = params or {}
         self.calls.append(url)
+        self.seen.append({"url": url, "params": dict(params), "headers": dict(headers or {}), "timeout": timeout})
         for frag, code in self.fail.items():
             if frag in url:
                 if code == -1:
@@ -209,6 +245,9 @@ class FakeHTTP:
             return Resp(200, self.econ_us if params.get("country") == "US" else ECON_SA)
         if url.startswith("https://eodhd.com/api/real-time/"):
             return Resp(200, MARKET)
+        new = self._new_source(url, params)
+        if new is not None:
+            return new
         return Resp(404, text="no route")
 
 
@@ -800,9 +839,12 @@ def test_g7_failures_are_named_and_key_scrubbed(armed):
     for src in ("econ", "market"):
         assert src in rep["sources_failed"]
         assert KEY not in rep["sources_failed"][src]
-    (rc, rep), _ = _run(http=FakeHTTP(fail={"sec.gov": 500, "gdeltproject": 500, "news.google": 500,
-                                            "federalreserve": 500, "eodhd.com": 500}))
+    dead = {"sec.gov": 500, "gdeltproject": 500, "news.google": 500, "federalreserve": 500, "eodhd.com": 500,
+            "bing.com": 500, "yahoo.com": 500}
+    dead.update({urlparse(f[2]).hostname: 500 for f in ng.FEEDS})       # v1.5.0: the new sources too
+    (rc, rep), _ = _run(http=FakeHTTP(fail=dead))
     assert rc == 1 and rep["sources_ok"] == {}
+    assert set(rep["sources_failed"]) == set(ng.ALL_SOURCES)
 
 
 # ----------------------------------------------------------------------------- G8
@@ -825,7 +867,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.4.1")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.5.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -850,9 +892,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.4.1"   # 2026-11-19: v1.4.0 [TRUCE-READ]; 2026-11-21: v1.4.1 [FOMC-2027]
+    assert ng.__version__ == "1.5.0"   # 2026-11-21: v1.4.1 [FOMC-2027]; 2026-11-26: v1.5.0 [SOURCES]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.4.1", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.5.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1566,3 +1608,495 @@ def test_g13_the_fed_revised_2027_schedule():
     assert days == sorted(days) and all(d.weekday() == 2 for d in days)
     times = ng.fomc_decision_times()
     assert times[-1] == dt.datetime(2027, 11, 17, 19, 0, tzinfo=dt.timezone.utc)       # 14:00 EST
+
+
+# ----------------------------------------------------------------------------- G14 (v1.5.0 [SOURCES])
+OLD_SIX = ["edgar", "gdelt", "google_news", "fed_rss", "econ", "market"]
+HORMUZ_REUTERS = "Iran fires missiles at tanker in Strait of Hormuz"
+
+
+def _feed(*items, root="rss"):
+    """An RSS 2.0 reply: items are (title, link, date text or None)."""
+    body = "".join(f"<item><title>{t}</title><link>{u}</link>" + (f"<pubDate>{d}</pubDate>" if d else "") + "</item>"
+                   for t, u, d in items)
+    return f'<?xml version="1.0" encoding="UTF-8"?><{root} version="2.0"><channel>{body}</channel></{root}>'
+
+
+def _bing(url):
+    return "http://www.bing.com/news/apiclick.aspx?ref=FexRss&amp;aid=&amp;url=" + \
+        url.replace(":", "%3a").replace("/", "%2f") + "&amp;c=1&amp;mkt=en-us"
+
+
+ATOM = """<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><title>ECB publishes its decision</title><link rel="self" href="https://example.org/self"/>
+<link rel="alternate" href="https://www.ecb.europa.eu/press/pr/a1.html"/><updated>2026-10-28T09:20:49Z</updated></entry>
+<entry><title>Second entry</title><link href="https://www.ecb.europa.eu/press/pr/a2.html"/>
+<published>2026-10-28T12:20:49+03:00</published></entry></feed>"""
+RDF = """<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<item><title>Statement on monetary policy</title><link>https://www.ecb.europa.eu/b1.html</link>
+<dc:date>2026-10-28T08:00:00+00:00</dc:date></item></rdf:RDF>"""
+
+
+def test_g14_the_registry_is_whole():
+    ids = [f[0] for f in ng.FEEDS]
+    assert len(ids) == len(set(ids)) == 17
+    assert {f[1] for f in ng.FEEDS} == set(ng.FEED_GROUPS)
+    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 6, 4]
+    for fid, group, url, domain, lang, hours in ng.FEEDS:
+        assert url.startswith("https://") and lang in ("en", "ar") and hours in (24.0, 72.0)
+        assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
+        assert ng.domain_of("https://" + domain + "/x") == domain or domain == "ecb.europa.eu", fid
+    assert {ng.tier_of(f[3]) for f in ng.FEEDS if f[1] == "official_rss"} == {"A"}
+    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 11
+    assert set(ng.NEW_SOURCES) <= set(ng.SOURCE_BUDGET_S) and set(ng.FEED_GROUPS) < set(ng.NEW_SOURCES)
+    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss"}
+    assert ng.selected_sources("") == list(ng.ALL_SOURCES)
+    assert ng.selected_sources(",".join(OLD_SIX)) == OLD_SIX          # the rollback named in the header
+    assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 360   # the job has 20 minutes
+    wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
+    assert "blank = all: " + ",".join(ng.ALL_SOURCES) in wf
+
+
+def test_g14_the_reader_takes_rss_atom_and_rdf():
+    rss = _feed(("S&amp;amp;P 500 falls", "https://www.wsj.com/a", "Wed, 28 Oct 2026 09:00:00 GMT"),
+                ("BEA release", "https://apps.bea.gov/b", "Wed, 28 Oct 2026 08:30:00 EDT"),
+                ("Investing item", "https://www.investing.com/c", "2026-10-28 09:20:49"),
+                ("No date", "https://www.wsj.com/d", None),
+                ("Bad date", "https://www.wsj.com/e", "yesterday"),
+                ("", "https://www.wsj.com/f", "Wed, 28 Oct 2026 09:00:00 GMT"))
+    got = ng.parse_feed(rss, "MACRO", "t", "press_rss", "en")
+    assert [i["title"] for i in got] == ["S&P 500 falls", "BEA release", "Investing item", "No date", "Bad date"]
+    assert got[0]["domain"] == "wsj.com" and got[0]["source"] == "press_rss" and got[0]["query"] == "t"
+    assert got[0]["published"] == dt.datetime(2026, 10, 28, 9, 0, tzinfo=UTC)
+    assert got[1]["published"] == dt.datetime(2026, 10, 28, 12, 30, tzinfo=UTC)       # EDT
+    assert got[2]["published"] == dt.datetime(2026, 10, 28, 9, 20, 49, tzinfo=UTC)    # no zone = UTC
+    assert got[3]["published"] is None and got[4]["published"] is None
+    assert {i["domain"] for i in ng.parse_feed(rss, "MACRO", "t", "press_rss", "en", "marketwatch.com")} \
+        == {"marketwatch.com"}                                     # a publisher's feed names its publisher
+
+    atom = ng.parse_feed(ATOM, "MACRO", "ecb", "official_rss", "en")
+    assert [(i["title"], i["url"]) for i in atom] == [
+        ("ECB publishes its decision", "https://www.ecb.europa.eu/press/pr/a1.html"),   # rel=alternate, not self
+        ("Second entry", "https://www.ecb.europa.eu/press/pr/a2.html")]
+    assert atom[0]["published"] == dt.datetime(2026, 10, 28, 9, 20, 49, tzinfo=UTC)
+    assert atom[1]["published"] == dt.datetime(2026, 10, 28, 9, 20, 49, tzinfo=UTC)
+    rdf = ng.parse_feed(RDF, "MACRO", "ecb", "official_rss", "en")
+    assert len(rdf) == 1 and rdf[0]["published"] == dt.datetime(2026, 10, 28, 8, 0, tzinfo=UTC)
+
+    media = ('<rss xmlns:media="http://search.yahoo.com/mrss/"><channel><item><media:title>caption</media:title>'
+             '<title>The headline</title><link>https://www.cnbc.com/x</link></item></channel></rss>')
+    assert [i["title"] for i in ng.parse_feed(media, "MACRO", "t", "press_rss", "en")] == ["The headline"]
+    only_media = media.replace("<title>The headline</title>", "")
+    assert ng.parse_feed(only_media, "MACRO", "t", "press_rss", "en") == []
+    foreign = '<rss xmlns:x="urn:other"><channel><x:item><title>not a feed item</title></x:item></channel></rss>'
+    assert ng.parse_feed(foreign, "MACRO", "t", "press_rss", "en") == []
+    # only whole character references are undone: 'AT&T', 'M&A' and a bare '&not' are left as written
+    amp = _feed(("AT&amp;T and M&amp;A &amp;notes &amp;#8211; S&amp;amp;P &amp;quot;rally&amp;quot;", "https://www.wsj.com/a", None))
+    assert ng.parse_feed(amp, "MACRO", "t", "s", "en")[0]["title"] == 'AT&T and M&A &notes \u2013 S&P "rally"'
+    # the Google-News shape reads exactly as parse_rss() always read it
+    assert ng.parse_feed(GNEWS_RSS, "MACRO", "ar", "google_news", "ar") == ng.parse_rss(GNEWS_RSS, "MACRO", "ar", "google_news", "ar")
+    assert ng.parse_feed(EMPTY_FEED, "MACRO", "t", "s", "en") == []          # an empty feed is a feed
+
+
+def test_g14_a_byte_order_mark_no_longer_empties_a_feed():
+    """requests decodes a text/xml reply without a charset as ISO-8859-1, so a UTF-8 byte-order mark reached
+    the XML parser as three stray characters and parse_rss() returned [] - a silent zero."""
+    raw = b"\xef\xbb\xbf" + FED_RSS.encode("utf-8")
+    as_latin1 = raw.decode("iso-8859-1")
+    import xml.etree.ElementTree as ET
+    with pytest.raises(ET.ParseError):
+        ET.fromstring(as_latin1)                                   # what v1.4.1 handed the parser
+    for payload in (raw, bytearray(raw), as_latin1, chr(0xFEFF) + FED_RSS, "\n \n" + FED_RSS, b"\r\n" + FED_RSS.encode()):
+        assert len(ng.parse_feed(payload, "MACRO", "fed press", "fed_rss", "en")) == 2
+    ar = GNEWS_RSS.encode("utf-8")                                 # bytes keep the feed's own encoding
+    assert ng.parse_feed(ar, "MACRO", "ar", "google_news", "ar")[0]["title"] == AR["aramco_profit_up"]
+    assert len(ng.parse_rss(as_latin1, "MACRO", "fed press", "fed_rss", "en")) == 2
+
+
+@pytest.mark.parametrize("payload, why", [
+    ("<html><head><title>Access Denied</title></head><body>blocked</body></html>", "not a feed (root <html>)"),
+    ("<!DOCTYPE html><html><body>Just a moment...<br></body></html>", "not a feed ("),
+    ("<not xml", "not a feed ("),
+    ("", "empty reply"),
+    (b"", "empty reply"),
+    (None, "empty reply"),
+    ('<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY a "aaaa">]><rss><channel><item><title>&a;</title></item>'
+     '</channel></rss>', "declares XML entities"),
+    ('{"error": "rate limited"}', "not a feed ("),
+])
+def test_g14_a_reply_that_is_not_a_feed_raises(payload, why):
+    with pytest.raises(ValueError) as err:
+        ng.parse_feed(payload, "MACRO", "t", "press_rss", "en")
+    assert why in str(err.value)
+    assert all(ord(c) < 128 for c in str(err.value))
+    assert ng.parse_rss(payload, "MACRO", "t", "press_rss", "en") == []       # the old contract
+
+
+def test_g14_an_oversized_reply_is_not_parsed(monkeypatch):
+    monkeypatch.setattr(ng, "MAX_FEED_BYTES", 200)
+    with pytest.raises(ValueError) as err:
+        ng.parse_feed(_feed(*[("t%d" % n, "https://www.wsj.com/%d" % n, None) for n in range(20)]), "MACRO", "t", "s", "en")
+    assert "over the limit" in str(err.value)
+
+
+def test_g14_bing_target_and_yahoo_symbol():
+    pub = "https://www.reuters.com/world/middle-east/x-2026-11-26/"
+    click = _bing(pub).replace("&amp;", "&")
+    assert ng.bing_target(click) == pub and ng.domain_of(ng.bing_target(click)) == "reuters.com"
+    assert ng.bing_target("https://www.reuters.com/a?url=https://evil.example/x") == "https://www.reuters.com/a?url=https://evil.example/x"
+    assert ng.bing_target("https://notbing.com/apiclick.aspx?url=https%3a%2f%2fx.com%2f1") == "https://notbing.com/apiclick.aspx?url=https%3a%2f%2fx.com%2f1"
+    no_url = "http://www.bing.com/news/apiclick.aspx?ref=FexRss&c=1"
+    assert ng.bing_target(no_url) == no_url and ng.tier_of(ng.domain_of(no_url)) == "D"
+    assert ng.bing_target("http://www.bing.com/news/apiclick.aspx?url=javascript%3aalert(1)") \
+        == "http://www.bing.com/news/apiclick.aspx?url=javascript%3aalert(1)"
+    assert ng.bing_target("") == ""
+    assert [ng.yahoo_symbol(x) for x in ("supn.us", "BRK.B.US", "5023.SR", "VOD.L", ".US", "", "MACRO")] \
+        == ["SUPN", "BRK-B", "5023.SR", "", "", "", ""]
+
+
+def test_g14_within_window_leaves_out_undated_and_old():
+    def it(hours):
+        return {"title": "t", "published": None if hours is None else NOW - dt.timedelta(hours=hours)}
+    rows = [it(0), it(23.9), it(24.1), it(100), it(None), it(-0.9), it(-1.1)]
+    kept, left = ng.within_window(rows, NOW, 24.0)
+    assert kept == [rows[0], rows[1], rows[5]] and left == {"outside": 3, "undated": 1}
+    kept72, left72 = ng.within_window(rows, NOW, 72.0)
+    assert len(kept72) == 4 and left72 == {"outside": 2, "undated": 1}
+    # the reason: evaluate() reads a headline with no date as published now
+    old = {"source": "press_rss", "scope": "MACRO", "title": HORMUZ_REUTERS, "url": "https://www.wsj.com/o",
+           "domain": "wsj.com", "published": None}
+    clf = ng.Classifier(ng.load_taxonomy())
+    undated = ng.classify_all([dict(old, url="https://www.wsj.com/o%d" % n, domain=d) for n, d in
+                               enumerate(("wsj.com", "reuters.com", "apnews.com"))], clf, QUIET)
+    assert ng.evaluate(ng.cluster_items(undated), [], {}, QUIET)["verdict"] == "NO_NEW_ENTRY"
+
+
+def _it(source, title, domain, scope="MACRO", url=None, memory=False, iid=None):
+    row = {"source": source, "scope": scope, "title": title, "domain": domain,
+           "url": url or f"https://{domain}/{source}/{abs(hash(title)) % 997}", "published": NOW}
+    if memory:
+        row["memory"] = True
+    if iid:
+        row["id"] = iid
+    return row
+
+
+def test_g14_one_story_from_one_publisher_is_one_member():
+    g = _it("google_news", HORMUZ_REUTERS, "reuters.com")
+    b = _it("bing_news", HORMUZ_REUTERS + "!", "reuters.com")              # punctuation and case do not matter
+    p = _it("press_rss", HORMUZ_REUTERS.upper(), "reuters.com")
+    kept, left = ng.fold_new_sources([g, b, p])
+    assert kept == [g] and left == {"bing_news": 1, "press_rss": 1}
+    kept, left = ng.fold_new_sources([b, p, g])                            # whatever the order of collection
+    assert kept == [g] and left == {"bing_news": 1, "press_rss": 1}
+    kept, left = ng.fold_new_sources([b, p])                               # two new sources: the first keeps it
+    assert kept == [b] and left == {"press_rss": 1}
+    # another publisher, another scope, another headline: all members
+    others = [_it("bing_news", HORMUZ_REUTERS, "apnews.com"), _it("bing_news", HORMUZ_REUTERS, "reuters.com", scope="FRST.US"),
+              _it("press_rss", "Oil jumps after tanker attack", "reuters.com")]
+    kept, left = ng.fold_new_sources([g] + others)
+    assert kept == [g] + others and left == {}
+    # the six older sources are never left out, also when they repeat each other
+    gd = _it("gdelt", HORMUZ_REUTERS, "reuters.com")
+    kept, left = ng.fold_new_sources([gd, g, dict(g)])
+    assert len(kept) == 3 and left == {}
+    # a row recorded by an earlier run keeps the story against a fresh copy from another new source ...
+    mem = _it("bing_news", HORMUZ_REUTERS, "reuters.com", memory=True, iid="aaaa")
+    kept, left = ng.fold_new_sources([p, mem])
+    assert kept == [mem] and left == {"press_rss": 1}
+    # ... the same item met again is not a copy (classify_all keeps the fresh one on the same ID) ...
+    again = _it("bing_news", HORMUZ_REUTERS, "reuters.com", iid="aaaa")
+    kept, left = ng.fold_new_sources([again, mem])
+    assert kept == [again, mem] and left == {}
+    # ... and an older source that now carries the story takes it over from the recorded row
+    kept, left = ng.fold_new_sources([g, mem])
+    assert kept == [g] and left == {"bing_news": 1}
+    # nothing to compare without a publisher or a headline
+    blank = [_it("bing_news", HORMUZ_REUTERS, ""), _it("press_rss", HORMUZ_REUTERS, ""), _it("bing_news", " ?! ", "x.com"),
+             _it("press_rss", " ?! ", "x.com")]
+    assert ng.fold_new_sources(blank) == (blank, {})
+
+
+def test_g14_source_ages():
+    rows = [{"source": "bing_news", "published": NOW - dt.timedelta(minutes=m)} for m in (5, 65, 30)]
+    rows += [{"source": "press_rss", "published": NOW - dt.timedelta(minutes=m)} for m in (10, 20)]
+    rows += [{"source": "press_rss", "published": NOW + dt.timedelta(minutes=30)},       # ahead of the run: age 0
+             {"source": "bing_news", "published": NOW - dt.timedelta(minutes=1), "memory": True},
+             {"source": "edgar", "published": NOW - dt.timedelta(days=9)}, {"source": "gulf_rss", "published": None}]
+    assert ng.source_ages(rows, NOW) == {"bing_news": {"n": 3, "newest_min": 5, "median_min": 30},
+                                         "press_rss": {"n": 3, "newest_min": 0, "median_min": 10}}
+
+
+def test_g14_bing_searches():
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
+    bq = ng.build_bing_queries(scope)
+    macro = [q for q in bq if q[0] == "MACRO"]
+    assert [q[1] for q in macro] == ["geopolitics bing", "oil bing", "rates bing", "markets bing", "trade china bing",
+                                     "ai tech bing", "politics bing"]
+    assert all("when:" not in q[2] for q in bq) and macro[0][2] == '"Strait of Hormuz" OR Iran OR Houthi OR missile OR ceasefire'
+    assert [q[2] for q in macro] == [q.rsplit(" when:", 1)[0] for _l, q in ng.GNEWS_EN_QUERIES]
+    assert {q[0] for q in bq if q[0] != "MACRO"} == {"FRST.US", "5023.SR", "BADCO.US"}
+
+
+def _hours_ago(h):
+    return (NOW - dt.timedelta(hours=h)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+BING_GEO = _feed((HORMUZ_REUTERS, _bing("https://www.reuters.com/world/a1"), _hours_ago(2)),
+                 ("Old strike report", _bing("https://www.reuters.com/world/old"), _hours_ago(30)),
+                 ("Undated strike report", _bing("https://www.reuters.com/world/nodate"), None),
+                 ("Unreadable link story about a missile", "http://www.bing.com/news/apiclick.aspx?ref=FexRss", _hours_ago(1)))
+
+
+def test_g14_bing_news_files_each_item_under_its_publisher(armed):
+    http = FakeHTTP(feeds={"bing:Hormuz": BING_GEO,
+                           "bing:Primis": _feed(("Primis Financial shares fall after earnings miss",
+                                                 _bing("https://www.benzinga.com/p1"), _hours_ago(40)))})
+    col = ng.Collector(http, _sleep, NOW)
+    got = col.bing_news(ng.build_bing_queries(ng.read_scope(workbook(), FakeSheets.SID, 15)))
+    assert [(i["scope"], i["domain"], i["url"]) for i in got] == [
+        ("MACRO", "reuters.com", "https://www.reuters.com/world/a1"),
+        ("MACRO", "bing.com", "http://www.bing.com/news/apiclick.aspx?ref=FexRss"),
+        ("FRST.US", "benzinga.com", "https://www.benzinga.com/p1")]          # a name keeps 72 h
+    assert col.ok == {"bing_news": 3} and col.failed == {}
+    assert col.detail["bing_news"] == {"asked": 10, "read": 5, "outside": 1, "undated": 1}
+    asked = [c for c in http.seen if c["url"] == ng.BING_NEWS_RSS]
+    assert len(asked) == 10 and all(c["params"]["format"] == "rss" and c["params"]["qft"] == 'sortbydate="1"'
+                                    and c["timeout"] == ng.FEED_TIMEOUT_S for c in asked)
+
+
+def test_g14_a_dead_search_source_is_asked_once_per_search_and_stopped(armed):
+    http = FakeHTTP(fail={"bing.com": 503})
+    col = ng.Collector(http, _sleep, NOW)
+    assert col.bing_news(ng.build_bing_queries([])) == []
+    assert len(http.calls) == ng.BREAKER_FAILURES                  # no retry, and the breaker opens after two
+    assert col.ok == {} and col.failed["bing_news"].startswith("geopolitics bing: HTTP 503; oil bing: HTTP 503")
+    assert "circuit open after 2 consecutive failures; 5 queries skipped" in col.failed["bing_news"]
+    block = FakeHTTP(feeds={"bing": "<html><body>Unusual traffic</body></html>"})
+    col = ng.Collector(block, _sleep, NOW)
+    assert col.bing_news(ng.build_bing_queries([])) == [] and len(block.calls) == 2
+    assert "geopolitics bing: not a feed (root <html>)" in col.failed["bing_news"] and col.ok == {}
+
+
+def test_g14_yahoo_is_asked_per_listed_name_and_judged_by_the_issuer_rule(armed, monkeypatch):
+    monkeypatch.setenv("TFB_NEWS_ISSUER_LINK", "on")
+    feeds = {"yahoo:FRST": _feed(("Primis Financial (NASDAQ:FRST) shares fall after earnings miss",
+                                  "https://finance.yahoo.com/news/frst-1.html", _hours_ago(5)),
+                                 ("5 bank stocks to watch as rates fall", "https://finance.yahoo.com/news/list.html", _hours_ago(3)),
+                                 ("Primis Financial old story", "https://finance.yahoo.com/news/old.html", _hours_ago(80)))}
+    http = FakeHTTP(feeds=feeds)
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15) + [{"symbol": "VOD.L", "name": "Vodafone", "role": "env"}]
+    (rc, rep) = ng.run(http=http, sheets=None, sid="", now=NOW, write=False, sources=["yahoo_rss"], scope=scope,
+                       sleep=_sleep, run_id="r1", mode="observe")
+    asked = [c["params"] for c in http.seen if c["url"] == ng.YAHOO_RSS]
+    assert [p["s"] for p in asked] == ["FRST", "5023.SR", "BADCO"]            # VOD.L is not asked
+    assert all(p["region"] == "US" and p["lang"] == "en-US" for p in asked)
+    assert rc == 0 and rep["sources_ok"] == {"yahoo_rss": 2} and rep["sources_failed"] == {}
+    assert rep["sources_detail"]["yahoo_rss"] == {"asked": 3, "read": 3, "outside": 1, "undated": 0}
+    assert rep["issuer_link"]["checked"] == 2 and rep["issuer_link"]["unlinked"] == 1     # the list article is dropped
+    assert rep["counts"]["collected"] == 1
+    # yahoo.com is tier D: on its own it is grade 3 and raises no flag
+    assert rep["clusters"][0]["tier"] == "D" and rep["clusters"][0]["grade"] == 3 and rep["gate"]["names"] == {}
+
+
+def test_g14_one_dead_feed_does_not_stop_its_group(armed):
+    feeds = {"marketwatch": _feed(("Stocks slide as oil jumps", "https://www.marketwatch.com/s1", _hours_ago(1))),
+             "cnbc": Resp(403, text="Forbidden"),
+             "investing": "<html><body>Just a moment...</body></html>",
+             "nyt_business": _feed(("Fed officials signal patience", "https://www.nytimes.com/n1", _hours_ago(2)),
+                                   ("Yesterday's column", "https://www.nytimes.com/n0", _hours_ago(26))),
+             "seekingalpha": b"\xef\xbb\xbf" + _feed(("Wall Street opens lower", "https://seekingalpha.com/news/1",
+                                                     _hours_ago(0.2))).encode("utf-8")}
+    http = FakeHTTP(feeds=feeds)
+    col = ng.Collector(http, _sleep, NOW)
+    got = col.feeds("press_rss")
+    assert [(i["domain"], i["query"]) for i in got] == [("marketwatch.com", "marketwatch"), ("nytimes.com", "nyt_business"),
+                                                        ("seekingalpha.com", "seekingalpha")]
+    assert all(i["source"] == "press_rss" and i["scope"] == "MACRO" for i in got)
+    assert col.ok == {"press_rss": 3}
+    assert col.failed == {"press_rss": "cnbc: HTTP 403; investing: not a feed (root <html>)"}
+    assert col.detail["press_rss"] == {"asked": 5, "read": 4, "outside": 1, "undated": 0, "failed": 2}
+    press = [f for f in ng.FEEDS if f[1] == "press_rss"]
+    assert http.calls == [f[2] for f in press]                     # every feed asked once, in order: no retry
+    assert {c["timeout"] for c in http.seen} == {ng.FEED_TIMEOUT_S}
+    assert all("User-Agent" not in c["headers"] for c in http.seen)
+
+
+def test_g14_every_feed_of_a_group_failing_is_named_feed_by_feed(armed):
+    http = FakeHTTP(fail={urlparse(f[2]).hostname: -1 for f in ng.FEEDS if f[1] == "gulf_rss"})
+    col = ng.Collector(http, _sleep, NOW)
+    assert col.feeds("gulf_rss") == [] and col.ok == {}
+    note = col.failed["gulf_rss"]
+    assert [p.split(":")[0] for p in note.split("; ")] == ["asharq_business", "arabnews", "thenational", "aljazeera"]
+    assert len(http.calls) == 4 and len(note) <= 420
+
+
+def test_g14_sec_is_asked_with_the_declared_contact_or_not_at_all(armed):
+    http = FakeHTTP()
+    col = ng.Collector(http, _sleep, NOW)
+    col.feeds("official_rss", "TFB research test@example.com")
+    sec = [c for c in http.seen if "sec.gov" in c["url"]]
+    assert len(sec) == 1 and sec[0]["headers"]["User-Agent"] == "TFB research test@example.com"
+    assert all("User-Agent" not in c["headers"] for c in http.seen if "sec.gov" not in c["url"])
+    assert col.ok == {"official_rss": 0} and col.failed == {}
+    http2 = FakeHTTP()
+    col2 = ng.Collector(http2, _sleep, NOW)
+    col2.feeds("official_rss", "")
+    assert not [u for u in http2.calls if "sec.gov" in u] and len(http2.calls) == 5
+    assert col2.failed == {"official_rss": "sec_press: TFB_SEC_USER_AGENT not set"}
+
+
+def test_g14_a_group_keeps_to_its_time_budget(armed):
+    t = [0.0]
+
+    class SlowHTTP(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            t[0] += 30.0
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    http = SlowHTTP()
+    col = ng.Collector(http, _sleep, NOW, clock=lambda: t[0])
+    col.feeds("press_rss")
+    assert len(http.calls) == 3                                    # starts at 0, 30, 60 s of 75
+    assert col.failed["press_rss"] == "time budget 75s spent: 4 feeds not asked"
+
+    class SlowAndDead(SlowHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            super().get(url, params=params, headers=headers, timeout=timeout)
+            return Resp(403, text="Forbidden")
+
+    t[0] = 0.0
+    col = ng.Collector(SlowAndDead(), _sleep, NOW, clock=lambda: t[0])
+    col.feeds("press_rss")
+    assert col.failed["press_rss"] == ("marketwatch: HTTP 403; wsj_markets: HTTP 403; cnbc: HTTP 403; "
+                                       "time budget 75s spent: 4 feeds not asked")
+    assert col.detail["press_rss"] == {"failed": 3}
+
+
+def test_g14_the_fed_feed_is_read_from_bytes_and_a_block_page_is_named(armed):
+    """27 Oct - 26 Nov: fed_rss=0 in all 134 runs that answered, 12 - 15 Nov included, and no fault named."""
+    fresh = FED_RSS.replace("Tue, 27 Oct 2026 14:00:00 GMT", _hours_ago(20))
+
+    class Bytes(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            out = super().get(url, params=params, headers=headers, timeout=timeout)
+            if url == ng.FED_RSS:
+                out.content = b"\xef\xbb\xbf" + fresh.encode("utf-8")
+                out.text = out.content.decode("iso-8859-1")          # what requests gives without a charset
+            return out
+
+    col = ng.Collector(Bytes(), _sleep, NOW)
+    got = col.fed_rss()
+    assert [i["title"] for i in got] == ["Agencies issue joint statement on resolution plans"]
+    assert got[0]["domain"] == "federalreserve.gov" and col.ok == {"fed_rss": 1} and col.failed == {}
+
+    class Blocked(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            out = super().get(url, params=params, headers=headers, timeout=timeout)
+            if url in (ng.FED_RSS, ng.GNEWS_RSS):
+                out.text = "<html><head><title>Access Denied</title></head><body></body></html>"
+            return out
+
+    http = Blocked()
+    (rc, rep), _ = _run(http=http, write=False, sources=["fed_rss", "google_news", "market"])
+    assert rc == 0 and rep["sources_ok"] == {"market": 2}
+    assert rep["sources_failed"]["fed_rss"] == "not a feed (root <html>)"
+    assert rep["sources_failed"]["google_news"].startswith("saudi market ar: not a feed (root <html>)")
+    assert "circuit open after 2 consecutive failures" in rep["sources_failed"]["google_news"]
+    assert len([u for u in http.calls if u == ng.GNEWS_RSS]) == 2  # a block page now opens the breaker
+
+
+GULF_FEEDS = {
+    "bing:Hormuz": _feed((HORMUZ_REUTERS, _bing("https://www.reuters.com/world/a1"), _hours_ago(3))),
+    "wsj_markets": _feed(("Missile strike sets tanker ablaze near Hormuz", "https://www.wsj.com/w1", _hours_ago(2))),
+    "arabnews": _feed(("Tanker hit by missile in Strait of Hormuz", "https://www.arabnews.com/n1", _hours_ago(1))),
+}
+NEW_ONLY = ["bing_news", "press_rss", "gulf_rss", "market"]
+
+
+def _macro(rep):
+    return [d for d in rep["gate"]["drivers"] if d.startswith("macro")]
+
+
+def test_g14_the_new_sources_alone_confirm_a_gulf_situation_and_carry_it(armed):
+    """The archive shows the gate on one source (Google News). With Google and GDELT away, two licensed wires
+    and a Gulf paper reached through Bing and the publishers' feeds are the three domains of the rule."""
+    (rc, rep), sh = _run(http=FakeHTTP(feeds=GULF_FEEDS), sources=NEW_ONLY)
+    assert rc == 0 and rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    assert any(d.startswith("macro: war_escalation/hormuz grade 1, 3 sources") for d in rep["gate"]["drivers"])
+    rows = sh.tabs[ng.ITEMS_TAB][1:]
+    assert sorted((r[8], r[9], r[10]) for r in rows) == [("bing_news", "reuters.com", "B"), ("gulf_rss", "arabnews.com", "C"),
+                                                         ("press_rss", "wsj.com", "B")]
+    assert [r[13] for r in rows if r[8] == "bing_news"] == ["https://www.reuters.com/world/a1"]
+    gate = sh.tabs[ng.GATE_TAB][1]
+    assert gate[8] == "bing_news=1, gulf_rss=1, market=2, press_rss=1" and gate[9] == "" and gate[11] == "1.5.0"
+    # two hours later the feeds have moved on: the recorded rows still hold the situation ...
+    later = NOW + dt.timedelta(hours=2)
+    (rc2, rep2), _ = _run(http=FakeHTTP(), sheets=sh, now=later, sources=NEW_ONLY, write=False)
+    assert rep2["gate"]["verdict"] == "NO_NEW_ENTRY" and rep2["counts"]["carried"] == 3
+    # ... but not without their sources in the run, and not after the 24 h of the rule
+    assert _macro(rep2) == _macro(rep) != []
+    (_rc, rep3), _ = _run(http=FakeHTTP(), sheets=sh, now=later, sources=["market"], write=False)
+    assert rep3["gate"]["verdict"] == "CAUTION" and rep3["counts"]["carried"] == 0 and _macro(rep3) == []   # FOMC day
+    (_rc, rep4), _ = _run(http=FakeHTTP(), sheets=sh, now=NOW + dt.timedelta(hours=26), sources=NEW_ONLY, write=False)
+    assert rep4["gate"]["verdict"] == "GO" and rep4["counts"]["carried"] == 0
+    # two of the three are not enough, as for the older sources
+    two = {k: v for k, v in GULF_FEEDS.items() if k != "arabnews"}
+    (_rc, rep5), _ = _run(http=FakeHTTP(feeds=two), sources=NEW_ONLY, write=False)
+    assert rep5["gate"]["verdict"] == "CAUTION" and _macro(rep5) == []
+
+
+def test_g14_a_story_google_already_carries_is_not_counted_twice(armed):
+    same = {"bing:Hormuz": _feed((HORMUZ_REUTERS, _bing("https://www.reuters.com/world/a1"), _hours_ago(3)),
+                                 ("Tanker hit by missile in Strait of Hormuz", _bing("https://www.bbc.com/news/b3"), _hours_ago(3)),
+                                 ("Hormuz missile strike: what we know", _bing("https://www.ft.com/f1"), _hours_ago(2)))}
+    base_http = FakeHTTP(fail={"gdeltproject": 429}, en_rss=GNEWS_EN_RSS)
+    (_rc, base), _ = _run(http=base_http, write=False, sources=OLD_SIX)
+    (rc, rep), _ = _run(http=FakeHTTP(fail={"gdeltproject": 429}, en_rss=GNEWS_EN_RSS, feeds=same), write=False)
+
+    def hormuz(r):
+        return next(c for c in r["clusters"] if c["scope"] == "MACRO" and c["event_type"] == "war_escalation"
+                    and c["anchor"] == "hormuz")
+    assert len(hormuz(rep)["members"]) == len(hormuz(base)["members"]) + 1     # only the FT story is new
+    assert hormuz(rep)["domains"] == sorted(set(hormuz(base)["domains"]) | {"ft.com"})
+    assert rep["sources_detail"]["bing_news"]["repeated"] == 2 and rep["sources_ok"]["bing_news"] == 3
+    assert rep["counts"]["collected"] == base["counts"]["collected"] + 1
+    assert rep["gate"]["verdict"] == base["gate"]["verdict"] == "NO_NEW_ENTRY"
+
+
+def test_g14_with_every_new_feed_empty_the_run_equals_the_six_source_run(armed):
+    def strip(rep):
+        return {"gate": rep["gate"], "counts": rep["counts"], "issuer_link": rep["issuer_link"],
+                "clusters": [(c["id"], c["grade"], c["tier"], c["domains"], len(c["members"]), c["headline"])
+                             for c in rep["clusters"]]}
+    (rc_a, a), sh_a = _run(sources=OLD_SIX)
+    (rc_b, b), sh_b = _run()
+    assert rc_a == rc_b == 0 and strip(a) == strip(b)
+    assert sh_a.tabs[ng.ITEMS_TAB] == sh_b.tabs[ng.ITEMS_TAB] and sh_a.tabs[ng.ECON_TAB] == sh_b.tabs[ng.ECON_TAB]
+    ga, gb = sh_a.tabs[ng.GATE_TAB][1], sh_b.tabs[ng.GATE_TAB][1]
+    assert ga[:8] == gb[:8] and ga[9:] == gb[9:]                  # only the Sources OK cell differs
+    assert set(gb[8].split(", ")) == set(ga[8].split(", ")) | {"bing_news=0", "gulf_rss=0", "official_rss=0",
+                                                            "press_rss=0", "yahoo_rss=0"}
+    assert b["sources_detail"]["bing_news"] == {"asked": 10, "read": 0, "outside": 0, "undated": 0}
+    assert "sources_detail" in a and a["sources_detail"] == {} and set(a["source_ages"]) <= set(OLD_SIX)
+    assert a["sources_failed"] == b["sources_failed"]
+
+
+def test_g14_the_digest_and_the_evidence_carry_one_line_per_source(armed, monkeypatch, tmp_path):
+    feeds = dict(GULF_FEEDS, cnbc=Resp(403, text="Forbidden"))
+    (rc, rep), _ = _run(http=FakeHTTP(feeds=feeds), sources=NEW_ONLY, write=False)
+    assert rep["source_ages"] == {"bing_news": {"n": 1, "newest_min": 180, "median_min": 180},
+                                  "gulf_rss": {"n": 1, "newest_min": 60, "median_min": 60},
+                                  "press_rss": {"n": 1, "newest_min": 120, "median_min": 120}}
+    assert rep["sources_detail"]["press_rss"] == {"asked": 6, "read": 1, "outside": 0, "undated": 0, "failed": 1}
+    digest = ng.render_digest(rep)
+    assert "| Source | Dated items kept | Newest (min old) | Median (min old) |" in digest
+    assert "| bing_news | 1 | 180 | 180 | 0 / 0 / 0 | 0 |" in digest
+    assert "| press_rss | 1 | 120 | 120 | 0 / 0 / 0 | 1 |" in digest
+    assert "press_rss: cnbc: HTTP 403" in digest
+    ng.write_evidence(rep, str(tmp_path))
+    data = json.loads((tmp_path / "news_gate.json").read_text())
+    assert data["sources_detail"]["bing_news"]["asked"] == 10 and data["source_ages"]["gulf_rss"]["newest_min"] == 60
+    row = ng.gate_row(dict(rep, sources_failed={"press_rss": "x" * 420, "gulf_rss": "y" * 420, "bing_news": "z" * 420}))
+    assert len(row[9]) == 1000                                     # the failed-sources cell holds 1000 characters

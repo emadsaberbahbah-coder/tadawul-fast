@@ -1,6 +1,14 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.2 (2026-11-26) -- FIVE MORE SOURCES (news_macro_gate 1.5.0 [SOURCES])
+# WHY: the gate stood on one source (Google News); owner, 26 Nov 12:42: add
+#       three to five. WHAT: the script reads bing_news, yahoo_rss, press_rss,
+#       official_rss and gulf_rss beside the six older sources; blank
+#       TFB_NEWS_GATE_SOURCES still means all. Only the text of the 'sources'
+#       input changes here: same triggers, hours, permissions, steps and ENV.
+#       To leave the five out, set the Variable TFB_NEWS_GATE_SOURCES to
+#       edgar,gdelt,google_news,fed_rss,econ,market.
 # VERSION 1.1.1 (2026-11-21) -- THE HOUR GATE IS ITS OWN JOB (Codex P2 on PR 1043)
 # WHY: with the gate as the first step, every chained run entered the
 #       workflow's concurrency group before the gate decided. A run that
@@ -41,7 +49,7 @@
 #       A manual dispatch is a dry run unless write=true.
 # GATE: armed here (TFB_NEWS_GATE defaults to observe); kill with the
 #       repository Variable TFB_NEWS_GATE=off. TFB_NEWS_GATE_SOURCES limits
-#       the sources (default all six).
+#       the sources (default all; 1.1.2: eleven).
 # SECRETS: GOOGLE_SHEETS_CREDENTIALS (existing), EODHD_API_KEY (existing,
 #       economic events + S&P 500 / VIX), TFB_SEC_USER_AGENT (existing secret,
 #       or the Variable of the same name; EDGAR is skipped without it).
@@ -64,7 +72,7 @@ on:
         default: false
         type: boolean
       sources:
-        description: "Comma list of sources (blank = edgar,gdelt,google_news,fed_rss,econ,market)"
+        description: "Comma list of sources (blank = all: edgar,gdelt,google_news,fed_rss,econ,market,bing_news,yahoo_rss,press_rss,official_rss,gulf_rss)"
         required: false
         default: ""
         type: string
