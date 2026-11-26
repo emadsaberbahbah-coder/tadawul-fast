@@ -908,9 +908,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.8.1"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.8.1 [PUBLIC-LOG]
+    assert ng.__version__ == "1.9.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.9.0 [REVIEW-26NOV]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.8.1", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.9.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1073,9 +1073,11 @@ def test_g10_new_types_never_move_the_verdict():
 
 # ----------------------------------------------------------------------------- G11 (v1.3.0 [TRADE-RELIEF])
 TRADE_LISTS = ("trade_truce", "trade_relief", "trade_hedge")
-# evaluate() without its easing block: the rules that RAISE a verdict, byte-identical from v1.1.0 to now
-RAISE_RULES_SHA = "68bed4f220d1dcae14d5f17eb98ce609400e5d43ec580ae0ca151c2f82dc53ce"
-EVALUATE_SHA = "99430618bbb085518c3c81665d000dca0462eadef17255abc05e12b5ecdb8a4c"      # evaluate() of v1.4.0 [TRUCE-READ]
+# evaluate() without its easing block: the rules that RAISE a verdict. Byte-identical from v1.1.0 to v1.8.1
+# (68bed4f2...); v1.9.0 [REVIEW-26NOV] changed one of them on purpose - a Gulf high-severity story confirmed by
+# one or two domains is CAUTION (test_g18) - and nothing else.
+RAISE_RULES_SHA = "fd4d76d91f16448e7d742d2b2c2785aeb439343f33c9de231c1cabe6e070b63b"
+EVALUATE_SHA = "412d30f348522ca1bbfde95df7d918bd0cc47878a1d749eefc8d50e4735bd354"      # evaluate() of v1.4.0 [TRUCE-READ]
 
 # (headline, reading before v1.3.0, reading now, direction now). World headlines of 5 - 18 Nov 2026 (GDELT) and the
 # gate's own archive; the last block is written to probe the guards.
@@ -1954,13 +1956,17 @@ def test_g14_sec_is_asked_with_the_declared_contact_or_not_at_all(armed):
     col.feeds("official_rss", "TFB research test@example.com")
     sec = [c for c in http.seen if "sec.gov" in c["url"]]
     assert len(sec) == 1 and sec[0]["headers"]["User-Agent"] == "TFB research test@example.com"
-    assert all("User-Agent" not in c["headers"] for c in http.seen if "sec.gov" not in c["url"])
+    bls = [c for c in http.seen if "bls.gov" in c["url"]]          # v1.9.0: bls.gov asks robots for a contact too
+    assert len(bls) == 1 and bls[0]["headers"]["User-Agent"] == "TFB research test@example.com"
+    assert ng.CONTACT_DOMAINS == {"sec.gov", "bls.gov"}
+    assert all("User-Agent" not in c["headers"] for c in http.seen
+               if "sec.gov" not in c["url"] and "bls.gov" not in c["url"])
     assert col.ok == {"official_rss": 0} and col.failed == {}
     http2 = FakeHTTP()
     col2 = ng.Collector(http2, _sleep, NOW)
     col2.feeds("official_rss", "")
-    assert not [u for u in http2.calls if "sec.gov" in u] and len(http2.calls) == 5
-    assert col2.failed == {"official_rss": "sec_press: TFB_SEC_USER_AGENT not set"}
+    assert not [u for u in http2.calls if "sec.gov" in u or "bls.gov" in u] and len(http2.calls) == 4
+    assert col2.failed == {"official_rss": "sec_press: TFB_SEC_USER_AGENT not set; bls: TFB_SEC_USER_AGENT not set"}
 
 
 def test_g14_a_group_keeps_to_its_time_budget(armed):
@@ -2068,10 +2074,11 @@ def test_g14_the_new_sources_alone_confirm_a_gulf_situation_and_carry_it(armed):
     assert rep3["gate"]["verdict"] == "CAUTION" and rep3["counts"]["carried"] == 0 and _macro(rep3) == []   # FOMC day
     (_rc, rep4), _ = _run(http=FakeHTTP(), sheets=sh, now=NOW + dt.timedelta(hours=26), sources=NEW_ONLY, write=False)
     assert rep4["gate"]["verdict"] == "GO" and rep4["counts"]["carried"] == 0
-    # two of the three are not enough, as for the older sources
+    # two of the three are not enough for NO_NEW_ENTRY, as for the older sources; since v1.9.0 they are CAUTION
     two = {k: v for k, v in GULF_FEEDS.items() if k != "arabnews"}
     (_rc, rep5), _ = _run(http=FakeHTTP(feeds=two), sources=NEW_ONLY, write=False)
-    assert rep5["gate"]["verdict"] == "CAUTION" and _macro(rep5) == []
+    assert rep5["gate"]["verdict"] == "CAUTION"
+    assert [d[:57] for d in _macro(rep5)] == ["macro (few sources): war_escalation/hormuz grade 2, 2 sou"]
 
 
 def test_g14_a_story_google_already_carries_is_not_counted_twice(armed):
@@ -2385,3 +2392,119 @@ def test_g17_the_public_log_names_no_holding_and_the_tabs_keep_everything(armed,
     assert sh.tabs == sh_on.tabs                                            # the workbook keeps every detail
     assert any("FRST.US" in str(r) for r in sh.tabs[ng.ITEMS_TAB][1:])
     assert ng._PUBLIC_MASK == []                                            # the mask belongs to one run
+
+
+# ----------------------------------------------------------------------------- G18 (v1.9.0 [REVIEW-26NOV])
+def _gulf(*rows):
+    return ng.parse_gdelt(gdelt_articles([(u, t, "20261030T100000Z", d) for u, t, d in rows]), "MACRO", "geo")
+
+
+BLOG = ("https://someblog.io/x", "Unconfirmed reports of missile attack near Hormuz", "someblog.io")
+WIRE = ("https://www.reuters.com/w1", "Missile strike on tanker near Hormuz", "reuters.com")
+OFFICIAL = ("https://www.whitehouse.gov/o1", "Statement on the missile strike on a tanker near Hormuz", "whitehouse.gov")
+WIRE2 = ("https://apnews.com/w2", "Missiles hit tanker near Hormuz", "apnews.com")
+PAPER = ("https://www.bbc.com/w3", "Tanker hit by missile near Hormuz", "bbc.com")
+
+
+@pytest.mark.parametrize("rows,verdict,lead", [
+    ((BLOG,), "CAUTION", "macro (unconfirmed): war_escalation/hormuz grade 3, 1 sources"),
+    ((BLOG, WIRE), "CAUTION", "macro (few sources): war_escalation/hormuz grade 2, 2 sources"),      # was GO
+    ((WIRE,), "CAUTION", "macro (few sources): war_escalation/hormuz grade 2, 1 sources"),           # was GO
+    ((OFFICIAL,), "CAUTION", "macro (few sources): war_escalation/hormuz grade 1, 1 sources"),       # was GO
+    ((WIRE, WIRE2), "CAUTION", "macro (few sources): war_escalation/hormuz grade 2, 2 sources"),     # was GO
+    ((WIRE, WIRE2, PAPER), "NO_NEW_ENTRY", "macro: war_escalation/hormuz grade 1, 3 sources"),
+])
+def test_g18_more_confirmation_never_lowers_a_gulf_verdict(rows, verdict, lead):
+    """The gap of v1.0.0-v1.8.1: a blog alone gave CAUTION, the blog plus a wire GO, an official source alone GO."""
+    g = ng.evaluate(_clusters(_gulf(*rows), QUIET), [], {}, QUIET)
+    assert g["verdict"] == verdict and g["drivers"][0].startswith(lead), g["drivers"]
+
+
+def test_g18_the_ladder_only_climbs_and_other_anchors_are_as_before():
+    level = {"GO": 0, "CAUTION": 1, "NO_NEW_ENTRY": 2}
+    ladder = [(BLOG,), (BLOG, WIRE), (BLOG, WIRE, WIRE2), (BLOG, WIRE, WIRE2, PAPER)]
+    got = [level[ng.evaluate(_clusters(_gulf(*r), QUIET), [], {}, QUIET)["verdict"]] for r in ladder]
+    assert got == sorted(got) == [1, 1, 2, 2]
+    # a denial-led or social-only Gulf story (grade 5 / 6) still raises nothing
+    social = _gulf(("https://x.com/a", "Missile attack near Hormuz", "x.com"))
+    assert ng.evaluate(_clusters(social, QUIET), [], {}, QUIET)["verdict"] == "GO"
+    # outside the Gulf nothing changes: one wire on a market anchor that is not a Gulf one is still GO
+    far = ng.parse_gdelt(gdelt_articles([("https://www.reuters.com/t1", "China fires missiles near Taiwan in major escalation",
+                                          "20261030T100000Z", "reuters.com")]), "MACRO", "geo")
+    assert ng.evaluate(_clusters(far, QUIET), [], {}, QUIET)["verdict"] == "GO"
+
+
+def _c(i, scope, sev, grade, memory=False):
+    return {"id": i, "scope": scope, "severity": sev, "cluster_grade": grade, "memory": memory}
+
+
+def test_g18_pick_new_puts_names_first_and_counts_what_waits():
+    items = [_c("m1", "MACRO", "H", 1), _c("m2", "MACRO", "H", 2), _c("m3", "MACRO", "M", 1),
+             _c("n1", "AAA.US", "L", 3), _c("n2", "BBB.US", "M", 3), _c("old", "MACRO", "H", 1),
+             _c("mem", "AAA.US", "H", 1, memory=True)]
+    kept, waiting = ng.pick_new(items, ["old"], 3)
+    assert [i["id"] for i in kept] == ["n2", "n1", "m1"]             # names first, then severity and grade
+    assert waiting == {"left": 2, "left_names": 0}
+    kept, waiting = ng.pick_new(items, [], 1)
+    assert [i["id"] for i in kept] == ["n2"] and waiting == {"left": 5, "left_names": 1}
+    kept, waiting = ng.pick_new(items, [], 50)
+    assert [i["id"] for i in kept] == ["n2", "n1", "m1", "old", "m2", "m3"] and waiting == {"left": 0, "left_names": 0}
+
+
+def test_g18_a_capped_run_records_the_name_and_says_what_waits(armed, monkeypatch):
+    """With the cap at 1 the one row recorded is the name's (it used to be the most severe market-wide item);
+    the digest says how many wait; the verdict is the one of an uncapped run."""
+    (rc0, rep0), sh0 = _run(http=FakeHTTP(en_rss=GNEWS_EN_RSS))
+    kinds = [r[3] == "MACRO" for r in sh0.tabs[ng.ITEMS_TAB][1:]]
+    assert any(kinds) and not all(kinds)                             # the run holds both kinds
+    monkeypatch.setenv("TFB_NEWS_GATE_MAX_ITEMS", "1")
+    (rc, rep), sh = _run(http=FakeHTTP(en_rss=GNEWS_EN_RSS))
+    rows = sh.tabs[ng.ITEMS_TAB][1:]
+    assert rc == 0 and len(rows) == 1 and rows[0][3] != "MACRO"
+    assert rep["counts"]["new"] == 1 and rep["counts"]["left"] >= 1
+    assert "new 1 (%d more wait for a later run, %d about names)" % (rep["counts"]["left"], rep["counts"]["left_names"]) \
+        in ng.render_digest(rep)
+    assert rep["gate"]["verdict"] == rep0["gate"]["verdict"] and "more wait" not in ng.render_digest(rep0)
+
+
+class BusySheets(FakeSheets):
+    """Refuses the first `busy` reads of _News_Items with `code` (the workbook's per-minute read quota)."""
+
+    def __init__(self, tabs, busy, code=429):
+        super().__init__(tabs)
+        self.busy, self.code, self.refused = busy, code, 0
+
+    def get(self, url, timeout=None):
+        if self._tab_cells(url)[0] == ng.ITEMS_TAB and self.refused < self.busy:
+            self.refused += 1
+            return Resp(self.code, text="quota")
+        return super().get(url, timeout=timeout)
+
+
+def _busy_run(sh, busy, code=429):
+    waits = []
+    busy_sh = BusySheets(sh.tabs, busy, code)
+    rc, rep = ng.run(http=FakeHTTP(), sheets=busy_sh, sid=FakeSheets.SID, now=NOW + dt.timedelta(hours=2), write=False,
+                     sources=NEW_ONLY, scope=ng.read_scope(busy_sh, FakeSheets.SID, 15), sleep=waits.append,
+                     run_id="r2", mode="observe")
+    return rc, rep, waits, busy_sh
+
+
+def test_g18_a_busy_workbook_is_asked_again_for_the_memory(armed):
+    """3 of the last 15 live runs lost their memory to HTTP 429. One refusal, then two: the situation recorded two
+    hours earlier is carried after a wait; three refusals, or another error, and the digest says so."""
+    (_rc, rep), sh = _run(http=FakeHTTP(feeds=GULF_FEEDS), sources=NEW_ONLY)
+    assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    assert ng.MEMORY_RETRY_S == (0.0, 20.0, 40.0)
+    rc, rep1, waits, s1 = _busy_run(sh, 1)
+    assert rc == 0 and [w for w in waits if w in (20.0, 40.0)] == [20.0] and s1.refused == 1
+    assert rep1["counts"]["carried"] == 3 and rep1["gate"]["verdict"] == "NO_NEW_ENTRY" and "memory_error" not in rep1
+    assert "Memory not read" not in ng.render_digest(rep1)
+    rc, rep2, waits, _s = _busy_run(sh, 2)
+    assert [w for w in waits if w in (20.0, 40.0)] == [20.0, 40.0] and rep2["counts"]["carried"] == 3
+    rc, rep3, waits, s3 = _busy_run(sh, 3)
+    assert rc == 0 and s3.refused == 3 and rep3["counts"]["carried"] == 0 and "HTTP 429" in rep3["memory_error"]
+    assert rep3["gate"]["verdict"] != "NO_NEW_ENTRY"                 # what a lost memory costs
+    assert "Memory not read (RuntimeError: read _News_Items: HTTP 429): this verdict rests on" in ng.render_digest(rep3)
+    rc, rep4, waits, s4 = _busy_run(sh, 1, code=500)
+    assert s4.refused == 1 and not [w for w in waits if w in (20.0, 40.0)] and "HTTP 500" in rep4["memory_error"]

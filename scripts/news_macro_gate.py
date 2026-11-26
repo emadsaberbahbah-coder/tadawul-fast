@@ -2,8 +2,38 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.8.1 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.9.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.9.0 (2026-11-26) -- [REVIEW-26NOV] FOUR CORRECTIONS FROM THE OWNER'S REVIEW REQUEST OF THE DAY'S WORK
+WHY (owner, 26 Nov 2026 16:30 Riyadh: "Please review and try to correct and improve all"):
+  (1) RULE GAP. A Gulf high-severity story raised CAUTION when unconfirmed (grade 3-4) and NO_NEW_ENTRY when
+      graded 1 from three domains - but nothing when it was confirmed by one or two domains (grade 1-2): a
+      blog alone gave CAUTION, the blog plus Reuters gave GO, an official source alone gave GO. More
+      confirmation must never lower the verdict. Archive replay (v_news_items / v_news_gate, the 67 recorded
+      runs since 19 Nov): 13 runs held such a cluster; every one was NO_NEW_ENTRY already on other
+      clusters, so no recorded verdict changes - the gap opens on a quiet day, which the archive has not had.
+  (2) NAMES STARVED BY THE ROW CAP. A run records at most TFB_NEWS_GATE_MAX_ITEMS (200) new rows, most severe
+      first; 29 of the 67 runs filled the cap, and a medium or low item about a name waited behind every
+      market-wide item of the same severity. Archive since 19 Nov: a market-wide item was recorded a median
+      2 h after publication, an item about a name 7-17 h after (41 of 102 more than a day after). The
+      Exit Plan and Holding Read pages read names from _News_Items, so they saw that news late.
+  (3) BLS REFUSED. bls.gov answered HTTP 403 in every run; its terms reserve the right to block robots that
+      give no contact for their owner.
+  (4) THE MEMORY WAS LOST TO A BUSY WORKBOOK. In 3 of the last 15 runs (2 of the 4 chained runs of 26 Nov)
+      the read of _News_Items was refused with HTTP 429 - the workbook's per-minute read quota, right after
+      the hourly Exit Plan - and the run went on with no memory: "carried from earlier runs 0" instead of
+      about 1,300 items, so a situation confirmed over the day rested on that one run's collection. Only the
+      log said so.
+WHAT: (1) evaluate(): a Gulf-anchored high-severity story graded 1-2 that does not reach the three domains
+  is CAUTION, with the driver "macro (few sources)". (2) pick_new(): within the cap the items about names
+  come first, then severity and grade as before; the digest says how many classified items wait for a later
+  run and how many of them are about names. No item is dropped - a waiting item is recorded by a later run
+  while its source still lists it. (3) feeds(): bls.gov is asked with the declared contact
+  (TFB_SEC_USER_AGENT) like sec.gov, and not at all without it. (4) run(): a memory read refused with HTTP
+  429 is asked again after 20 s and after 40 s more (the quota is per minute); any other failure is not
+  retried; and when the memory could not be read the digest says so in a line of its own.
+ROLLBACK: revert this file to v1.8.1.
+
 v1.8.1 (2026-11-26) -- [PUBLIC-LOG] THE PUBLIC RUN LOG NO LONGER NAMES THE HOLDINGS
 WHY (the owner's standing rule: "Repo logs are public: no amounts, quantities, account numbers or holdings'
   symbols in run logs"): since v1.0.0 the log printed the scope (holdings first) and the digest listed the
@@ -362,7 +392,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -391,6 +421,11 @@ ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + N
 # v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
 # once its time budget is spent, so one throttled provider cannot hold the job
 # to its 20-minute limit (dry run 40595558188 sat in collection > 10 min).
+# v1.9.0: official sites that ask a robot to name a contact for its owner (sec.gov's fair-access rule; the
+# bls.gov terms reserve the right to block robots that give none)
+CONTACT_DOMAINS = frozenset(["sec.gov", "bls.gov"])
+# v1.9.0: waits before each try of the memory read (the first is immediate; a refusal with HTTP 429 gets the next)
+MEMORY_RETRY_S = (0.0, 20.0, 40.0)
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
@@ -1442,8 +1477,9 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
     CAUTION - a FOMC decision or a high-impact US release within the next
       30 h or the last 2 h; S&P <= -1.5%, VIX >= 25 or VIX +15% on the day;
       any market-anchored high-severity macro story graded 1-2 from >= 3
-      domains, or Gulf-anchored graded 3-4; a confirmed (grade <= 2)
-      sanctions / credit-stress story on a market anchor.
+      domains, or Gulf-anchored graded 1-4 (v1.9.0: confirmed by one or two
+      domains counts too - more confirmation never lowers the verdict); a
+      confirmed (grade <= 2) sanctions / credit-stress story on a market anchor.
     Clusters are situations (event type + anchor within the window), not
     single stories: several incidents around one Gulf anchor in 24 h are one
     situation by design (see the #859 review thread).
@@ -1510,8 +1546,9 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
                 bump(2, "macro: " + tag)
             elif anchor in MARKET_ANCHORS and grade <= 2 and len(doms) >= 3:
                 bump(1, "macro: " + tag)
-            elif anchor in GULF_ANCHORS and grade in (3, 4):
-                bump(1, "macro (unconfirmed): " + tag)
+            elif anchor in GULF_ANCHORS and grade <= 4:
+                # v1.9.0 [REVIEW-26NOV]: grade 1-2 from one or two domains used to raise nothing
+                bump(1, ("macro (unconfirmed): " if grade >= 3 else "macro (few sources): ") + tag)
         elif c["event_type"] in ("trade_sanctions", "credit_stress") and anchor in MARKET_ANCHORS \
                 and grade <= 2 and len(doms) >= 2:
             bump(1, "macro: " + tag)
@@ -1869,14 +1906,14 @@ class Collector:
     def feeds(self, group: str, sec_user_agent: str = "") -> List[Dict[str, Any]]:
         """The feeds of one group in FEEDS, each on its own: a feed that fails is named and the next one is
         read (they are different publishers, so there is no circuit breaker - only the group's time budget).
-        sec.gov is asked with the declared EDGAR contact and not at all without it."""
+        sec.gov and (v1.9.0) bls.gov are asked with the declared contact and not at all without it."""
         out: List[Dict[str, Any]] = []
         guard = _Guard(self, group)
         for fid, grp, url, domain, lang, hours in FEEDS:
             if grp != group or not guard.allow():
                 continue
             headers = None
-            if domain == "sec.gov":
+            if domain in CONTACT_DOMAINS:
                 if not sec_user_agent:
                     self._fail_part(group, fid, "TFB_SEC_USER_AGENT not set")
                     continue
@@ -2305,6 +2342,19 @@ def classify_all(items: List[Dict[str, Any]], clf: Classifier, now: _dt.datetime
     return out
 
 
+def pick_new(classified: Sequence[Dict[str, Any]], existing: Iterable[str], max_items: int
+             ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """PURE, v1.9.0: the classified items to record this run - not carried from memory, not recorded before;
+    the items about names first, then the most severe and best graded; at most max_items. Also how many
+    wait for a later run, and how many of those are about names."""
+    done = {str(x) for x in existing}
+    fresh = [i for i in classified if not i.get("memory") and i["id"] not in done]
+    fresh.sort(key=lambda i: (0 if i.get("scope") != "MACRO" else 1,
+                              _SEV_RANK.get(i.get("severity") or "L", 3), i.get("cluster_grade") or 9))
+    kept, left = fresh[:max_items], fresh[max_items:]
+    return kept, {"left": len(left), "left_names": len([i for i in left if i.get("scope") != "MACRO"])}
+
+
 def item_row(it: Dict[str, Any], run_id: str) -> List[Any]:
     rd = "denial" if it.get("denial") else ("rumour" if it.get("rumor") else "")
     return [it["id"], fmt_riyadh(it["first_seen"]), fmt_utc(it.get("published")), it["scope"],
@@ -2429,8 +2479,10 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
         lines.append(f"{hidden} cluster(s) about names kept out of the public log (the _News_Items tab has them).")
     lines.append("")
     c = rep["counts"]
-    lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}, "
-                 f"carried from earlier runs {c.get('carried', 0)}"
+    lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}"
+                 + (f" ({c['left']} more wait for a later run, {c.get('left_names', 0)} about names)"
+                    if c.get("left") else "")
+                 + f", carried from earlier runs {c.get('carried', 0)}"
                  + (lambda li: (f", not about the issuer {li['unlinked']} of {li['checked']} "
                                 f"({'dropped' if li['mode'] == 'on' else 'kept, observe'})")
                     if li and li.get("mode") != "off" else "")(rep.get("issuer_link")) + ". "
@@ -2448,6 +2500,10 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
                          + (f"{d.get('outside', 0)} / {d.get('undated', 0)} / {d.get('repeated', 0)}"
                             if src in NEW_SOURCES else "-")
                          + f" | {d.get('failed', 0) if src in NEW_SOURCES else '-'} |")
+    if rep.get("memory_error"):                 # v1.9.0: said in the digest, not only in the log
+        lines.append("")
+        lines.append(f"Memory not read ({rep['memory_error']}): this verdict rests on this run's own collection, "
+                     "without the items recorded by earlier runs.")
     if (rep.get("llm") or {}).get("line"):      # v1.8.0 [LLM-SHADOW]
         lines.append("")
         lines.append(rep["llm"]["line"])
@@ -2559,11 +2615,18 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     memory_error = ""
     if sheets is not None and sid:
         t0 = col.clock()
-        try:
-            memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
-                                 sources, symbols)
-        except Exception as exc:  # memory is a help, never a reason to fail
-            memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+        for wait in MEMORY_RETRY_S:      # v1.9.0: a busy workbook (HTTP 429, a per-minute quota) is asked again
+            if wait:
+                sleep(wait)
+            try:
+                memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
+                                     sources, symbols)
+                memory_error = ""
+                break
+            except Exception as exc:  # memory is a help, never a reason to fail
+                memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                if "HTTP 429" not in str(exc):
+                    break
         _out(f"[news_gate v{__version__}] memory: {len(memory)} items within 24 h / 72 h in "
              f"{col.clock() - t0:.0f}s" + (f" | {memory_error}" if memory_error else ""))
 
@@ -2606,11 +2669,10 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
             max_items = _int_env("TFB_NEWS_GATE_MAX_ITEMS", 200, 1, 2000)
             ensure_tab(sheets, sid, ITEMS_TAB, ITEMS_HEADER)
             existing = {str(r[0]) for r in (read_values(sheets, sid, ITEMS_TAB, "A2:A") or []) if r}
-            fresh = [i for i in classified if not i.get("memory") and i["id"] not in existing]
-            fresh.sort(key=lambda i: (_SEV_RANK.get(i.get("severity") or "L", 3), i.get("cluster_grade") or 9))
-            fresh = fresh[:max_items]
+            fresh, waiting = pick_new(classified, existing, max_items)      # v1.9.0: names first
             append_rows(sheets, sid, ITEMS_TAB, [item_row(i, run_id) for i in fresh])
             rep["counts"]["new"] = len(fresh)
+            rep["counts"].update(waiting)
             if econ:
                 ensure_tab(sheets, sid, ECON_TAB, ECON_HEADER)
                 rows = read_values(sheets, sid, ECON_TAB, "A2:M") or []
