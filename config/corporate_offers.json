@@ -1,0 +1,20 @@
+{
+ "schema": "tfb.corporate-offers.v1",
+ "about": "Cash offers standing on listed shares (core/corporate_offers.py). Merging a change to this file is the confirmation. The file lists public offers, never holdings: the Exit Plan and the Today Action Plan apply an entry only to a share they find in the book, from the day it was announced to its last day. sale = manual: the owner sells by hand, so no stop order is asked for, the stop of record is frozen and the target is the offer price; sale = rule: the price rule stays in force. When an offer completes, is extended, raised or withdrawn, change its entry here (a passed last day shows on the page as 'record its outcome').",
+ "offers": [
+  {
+   "symbol": "DDI.US",
+   "kind": "cash_tender",
+   "price": 16.25,
+   "currency": "USD",
+   "announced": "2026-11-09",
+   "expires": "2026-12-10",
+   "expires_note": "17:00 New York, which is 01:00 Riyadh on 11 Dec",
+   "bidder": "DoubleU Games",
+   "conditions": "a minimum number of shares tendered and a majority of the shares the bidder does not already hold",
+   "sale": "manual",
+   "source": "config/corporate_actions_confirmed.json not_price_actions (announced 2026-11-09, USD 16.25 per ADS); the last day and the conditions are the ones read from the offer notice on 26 Nov 2026",
+   "notes": "owner, 26 Nov 2026 01:15 Riyadh: the sale is a manual decision, waiting for the best price before the last day"
+  }
+ ]
+}
