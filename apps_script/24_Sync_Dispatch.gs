@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.1  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
+// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.2.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
 //
 // Purpose
 // -------
@@ -7,6 +7,33 @@
 // THE MINUTE instead of whenever GitHub gets round to a schedule event.
 //
 // -----------------------------------------------------------------------------
+// v1.2.0 (2026-11-26) - A FAULT AT GITHUB IS TRIED AGAIN
+// WHY (_Run_Log, 25 Nov 2026 18:47:58 Riyadh, tfbDispatchShadowScorer): the
+//   scorer's dispatch got HTTP 500 from GitHub, was sent once, and no run
+//   started. With a min gap of 1,200 minutes there is no second trigger that
+//   day: the evidence day of 25 Nov was recorded only because the workflow was
+//   dispatched by hand at 23:18Z. One answer from GitHub decided a whole day.
+// WHAT: every dispatch (daily_sync, shadow_board, shadow_scorer) goes through
+//   tfbSdSendDispatch_ and carries one more input, dispatch_id - a name made
+//   for that one dispatch ('gas-<lane>-<time>-<random>'). The three workflows
+//   print it in their run name (run-name, same change). On a transport error,
+//   HTTP 5xx or 429 the sender waits (RETRY_WAITS_MS: 5 s, then 20 s), reads
+//   the workflow's runs list, and sends again ONLY when no run carries THIS
+//   dispatch's id - a fault can still have started the run, and a second full
+//   sync is not wanted. Three sends at most; after the last one the runs list
+//   is read once more. A run found by its id counts as accepted
+//   ('OK:run_started', LAST_OK set). Any other run - a manual preview, a
+//   health_only sync, a dry run started in the same minute - never does
+//   (Codex P2 on #1087: a run is ours by its id, not by its time). A 4xx is
+//   ours and is never sent again, with one exception: a workflow that does
+//   not take dispatch_id yet answers 422 'Unexpected inputs'; the dispatch is
+//   then sent once without it, as 1.1.1 did, and the row says so. The log row
+//   gives the tries and their codes (details.attempts) only when there was
+//   more than one; details.dispatch_id is always there.
+//   Guards, schedule, the other inputs, probe and status line are unchanged.
+// ROLLBACK: Project History -> 1.1.1 (the workflows take a dispatch with or
+//   without the id).
+//
 // v1.1.1 (2026-11-04) - THE DISPATCHED SYNC CARRIES MY_PORTFOLIO
 // WHY (owner installed the dispatch triggers on 4 Nov 01:05 Riyadh; Actions
 //   run 41766747380 + _Status + _Run_Log, read-only): the first dispatched
@@ -128,7 +155,7 @@
 //   and drop the schedule block entirely.
 // ES5 only (file is loaded by the classic runtime path); no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_SYNC_DISPATCH_VERSION = '1.1.1';
+var TFB_SYNC_DISPATCH_VERSION = '1.2.0';
 
 var TFB_SYNC_DISPATCH_ = Object.freeze({
   PROP_TOKEN: 'TFB_GH_DISPATCH_TOKEN',
@@ -161,7 +188,9 @@ var TFB_SYNC_DISPATCH_ = Object.freeze({
   HOLD_KEY: 'backend sync hold until',
   STATUS_PAGE: 'Global_Markets',
   STATUS_FEED_KEY: 'TFB Feed Global_Markets',
-  BODY_MAX: 200
+  BODY_MAX: 200,
+  RETRY_WAITS_MS: [5000, 20000],          // v1.2.0: the waits before the second and the third send
+  DISPATCH_ID_INPUT: 'dispatch_id'        // v1.2.0: the input the workflows print in their run name
 });
 
 // ---------------------------------------------------------------------------
@@ -261,10 +290,11 @@ function tfbSdDecide_(inp) {
   return { dispatch: true, reason: i.force ? 'forced' : 'ok' };
 }
 
-function tfbSdBuildDispatchRequest_(repo, workflow, ref, token) {
+function tfbSdBuildDispatchRequest_(repo, workflow, ref, token, dispatchId) {
   var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
     '/actions/workflows/' + encodeURIComponent(workflow) + '/dispatches';
   var payload = { ref: ref, inputs: { run_mode: TFB_SYNC_DISPATCH_.RUN_MODE, include_portfolio: 'true' } };   // v1.1.1: the scheduled run's page set
+  if (tfbSdTrim_(dispatchId) !== '') { payload.inputs[TFB_SYNC_DISPATCH_.DISPATCH_ID_INPUT] = tfbSdTrim_(dispatchId); }   // v1.2.0
   var options = {
     method: 'post',
     contentType: 'application/json',
@@ -292,6 +322,61 @@ function tfbSdBuildProbeRequest_(repo, workflow, token) {
     muteHttpExceptions: true
   };
   return { url: url, options: options };
+}
+
+// v1.2.0: the newest workflow_dispatch runs of a workflow - to see whether a
+// send that answered with a fault started a run all the same.
+function tfbSdBuildRunsRequest_(repo, workflow, token) {
+  var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
+    '/actions/workflows/' + encodeURIComponent(workflow) + '/runs?event=workflow_dispatch&per_page=10';
+  var options = {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': TFB_SYNC_DISPATCH_.API_VERSION
+    },
+    muteHttpExceptions: true
+  };
+  return { url: url, options: options };
+}
+
+// v1.2.0 (pure): a transport error (-1) and GitHub's own faults (5xx, 429) are
+// worth another try; any other answer is final.
+function tfbSdRetryable_(code) {
+  return code === -1 || code === 429 || (code >= 500 && code <= 599);
+}
+
+// v1.2.0 (pure): a name for one dispatch - 'gas-<lane>-<ms, base 36>-<random>'.
+// Letters, digits and '-' only, so it reads the same in a run name.
+function tfbSdNewDispatchId_(lane, nowMs, rnd) {
+  var tag = String(lane || 'sync').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  var r = Math.floor((rnd === undefined || rnd === null ? Math.random() : rnd) * 1679616);   // 36^4
+  var tail = ('0000' + r.toString(36)).slice(-4);
+  return 'gas-' + (tag === '' ? 'sync' : tag) + '-' + Math.floor(nowMs).toString(36) + '-' + tail;
+}
+
+// v1.2.0 (pure; Codex P2 on #1087): does this runs-list body hold the run of
+// THIS dispatch - a workflow_dispatch run whose name carries the dispatch id?
+// A run is ours by its id, never by its time. Unreadable or no id -> false.
+function tfbSdRunHasId_(runsBody, dispatchId) {
+  var id = tfbSdTrim_(dispatchId);
+  if (id === '') { return false; }
+  var j = null;
+  try { j = JSON.parse(runsBody); } catch (err) { return false; }
+  var runs = j && j.workflow_runs;
+  if (!runs || !runs.length) { return false; }
+  for (var i = 0; i < runs.length; i++) {
+    var r = runs[i] || {};
+    if (String(r.event || '') !== 'workflow_dispatch') { continue; }
+    if (String(r.display_title || '').indexOf(id) !== -1 || String(r.name || '').indexOf(id) !== -1) { return true; }
+  }
+  return false;
+}
+
+// v1.2.0 (pure): the answer of a workflow that does not take dispatch_id yet.
+function tfbSdIdRefused_(code, body) {
+  return code === 422 && /unexpected inputs/i.test(String(body || ''));
 }
 
 // Scrub the token (and its bearer form) out of any outgoing string.
@@ -430,6 +515,73 @@ function tfbSdLog_(level, action, status, message, endpoint, httpCode, durationM
 // Core: dispatch
 // ---------------------------------------------------------------------------
 
+function tfbSdSleep_(ms) {
+  try { Utilities.sleep(ms); } catch (err) { /* noop */ }
+}
+
+// v1.2.0: is the run of THIS dispatch in the workflow's runs list?
+// Any failure of the reading -> false (the send is then tried again).
+function tfbSdRunStarted_(repo, workflow, token, dispatchId) {
+  var req = tfbSdBuildRunsRequest_(repo, workflow, token);
+  try {
+    var resp = UrlFetchApp.fetch(req.url, req.options);
+    if (resp.getResponseCode() !== 200) { return false; }
+    return tfbSdRunHasId_(resp.getContentText() || '', dispatchId);
+  } catch (err) {
+    return false;
+  }
+}
+
+function tfbSdPostOnce_(req, out) {
+  try {
+    var resp = UrlFetchApp.fetch(req.url, req.options);
+    out.code = resp.getResponseCode();
+    out.body = tfbSdClip_(resp.getContentText() || '');
+  } catch (err) {
+    out.code = -1;
+    out.body = tfbSdClip_(String(err && err.message ? err.message : err));
+  }
+  out.attempts.push(out.code);
+}
+
+// v1.2.0: send the dispatch (req carries dispatchId; reqPlain is the same
+// dispatch without it). A final answer returns at once. After a fault: wait,
+// read the runs list, and send again only when no run carries this dispatch's
+// id - RETRY_WAITS_MS.length more sends at most; after the last send the runs
+// list is read once more. A workflow that refuses the id (422 'Unexpected
+// inputs') gets the plain dispatch once, as 1.1.1 sent it: with no id there
+// is nothing to tell its run by, so that send is not tried again.
+// Returns {code, body, attempts: [codes], adopted, plain}.
+function tfbSdSendDispatch_(req, reqPlain, repo, workflow, token, dispatchId) {
+  var waits = TFB_SYNC_DISPATCH_.RETRY_WAITS_MS;
+  var out = { code: 0, body: '', attempts: [], adopted: false, plain: false };
+  for (var i = 0; i <= waits.length; i++) {
+    tfbSdPostOnce_(req, out);
+    if (i === 0 && tfbSdIdRefused_(out.code, out.body)) {
+      out.plain = true;
+      tfbSdPostOnce_(reqPlain, out);
+      return out;
+    }
+    if (!tfbSdRetryable_(out.code)) { return out; }
+    tfbSdSleep_(i < waits.length ? waits[i] : waits[0]);
+    if (tfbSdRunStarted_(repo, workflow, token, dispatchId)) {
+      out.adopted = true;
+      return out;
+    }
+  }
+  return out;
+}
+
+// v1.2.0 (pure): what the row adds when the id was refused.
+function tfbSdPlainText_(sent) {
+  return sent && sent.plain ? ' (sent without dispatch_id: the workflow on this ref does not take it yet)' : '';
+}
+
+// v1.2.0 (pure): ' after 3 tries (500, -1, 204)' - '' for a single try.
+function tfbSdTriesText_(attempts) {
+  return attempts && attempts.length > 1 ? ' after ' + attempts.length + ' tries (' + attempts.join(', ') + ')' : '';
+}
+
 function tfbSdDispatch_(force) {
   var C = TFB_SYNC_DISPATCH_;
   var t0 = tfbSdNowMs_();
@@ -456,27 +608,30 @@ function tfbSdDispatch_(force) {
     tfbSdLog_(level, action, status, 'dispatch ' + status.toLowerCase() + ': ' + verdict.reason, '', '', tfbSdNowMs_() - t0, ctx, cfg.token);
     return status + ':' + verdict.reason;
   }
-  var req = tfbSdBuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token);
-  var code = 0;
-  var body = '';
-  try {
-    var resp = UrlFetchApp.fetch(req.url, req.options);
-    code = resp.getResponseCode();
-    body = tfbSdClip_(resp.getContentText() || '');
-  } catch (err) {
-    code = -1;
-    body = tfbSdClip_(String(err && err.message ? err.message : err));
-  }
+  var did = tfbSdNewDispatchId_('sync', tfbSdNowMs_());                     // v1.2.0: this dispatch's own name
+  var req = tfbSdBuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, did);
+  var reqPlain = tfbSdBuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token);
+  var sent = tfbSdSendDispatch_(req, reqPlain, cfg.repo, cfg.workflow, cfg.token, did);   // v1.2.0: a fault is tried again
+  var code = sent.code;
+  var body = sent.body;
+  var tries = tfbSdTriesText_(sent.attempts) + tfbSdPlainText_(sent);
+  ctx.dispatch_id = did;
+  if (sent.attempts.length > 1) { ctx.attempts = sent.attempts; }
   var dur = tfbSdNowMs_() - t0;
   if (code === 204) {
     try { tfbSdProps_().setProperty(C.PROP_LAST_OK_MS, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
     ctx.http = 204;
-    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE, req.url, 204, dur, ctx, cfg.token);
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE + tries, req.url, 204, dur, ctx, cfg.token);
     return 'OK:204';
   }
   ctx.http = code;
   ctx.body = body;
-  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body, req.url, code, dur, ctx, cfg.token);
+  if (sent.adopted) {
+    try { tfbSdProps_().setProperty(C.PROP_LAST_OK_MS, String(tfbSdNowMs_())); } catch (e2) { /* noop */ }
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch answered HTTP ' + code + ' but its run started (found by its dispatch id in the runs list); not sent again' + tries + ' ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE, req.url, code, dur, ctx, cfg.token);
+    return 'OK:run_started';
+  }
+  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body + tries, req.url, code, dur, ctx, cfg.token);
   return 'FAILED:' + code;
 }
 
@@ -656,6 +811,30 @@ function tfbSyncDispatchSelfTest() {
   ok(tfbSdRedact_('Bearer tok_ABCDEFG failed tok_ABCDEFG', 'tok_ABCDEFG') === 'Bearer [redacted] failed [redacted]', 'redact');
   ok(tfbSdRedact_('x', '') === 'x' && tfbSdRedact_(null, 'tok_ABCDEFG') === '', 'redact edge');
   ok(tfbSdClip_('abcdefghij', 4) === 'abcd...', 'clip');
+  // T6 (v1.2.0) which answers are tried again, and the runs-list reading
+  ok(tfbSdRetryable_(500) && tfbSdRetryable_(502) && tfbSdRetryable_(599) && tfbSdRetryable_(429) && tfbSdRetryable_(-1), 'retryable faults');
+  ok(!tfbSdRetryable_(204) && !tfbSdRetryable_(401) && !tfbSdRetryable_(404) && !tfbSdRetryable_(422) && !tfbSdRetryable_(0), 'final answers');
+  var did = tfbSdNewDispatchId_('shadow_scorer', Date.parse('2026-11-25T15:47:58Z'), 0.5);
+  ok(/^gas-shadow-scorer-[0-9a-z]+-[0-9a-z]{4}$/.test(did), 'dispatch id shape');
+  ok(tfbSdNewDispatchId_('shadow_scorer', 1, 0.1) !== tfbSdNewDispatchId_('shadow_scorer', 1, 0.2) && tfbSdNewDispatchId_('', 1, 0) === 'gas-sync-1-0000', 'dispatch id varies; empty lane');
+  var runs = JSON.stringify({ workflow_runs: [
+    { event: 'workflow_dispatch', display_title: 'TFB Shadow Scorer (S-1 Gate) [gas-shadow-scorer-other-0000]' },
+    { event: 'workflow_dispatch', display_title: 'TFB Shadow Scorer (S-1 Gate)' },
+    { event: 'schedule', display_title: 'x [' + did + ']' }] });
+  ok(tfbSdRunHasId_(runs, did) === false, 'another dispatch, a manual run and a scheduled run are not this dispatch');
+  ok(tfbSdRunHasId_(JSON.stringify({ workflow_runs: [{ event: 'workflow_dispatch', display_title: 'S [' + did + ']' }] }), did) === true, 'the run that carries the id');
+  ok(tfbSdRunHasId_(JSON.stringify({ workflow_runs: [{ event: 'workflow_dispatch', name: 'S [' + did + ']' }] }), did) === true, 'the id in the run name');
+  ok(tfbSdRunHasId_(runs, '') === false && tfbSdRunHasId_('not json', did) === false && tfbSdRunHasId_('{}', did) === false, 'no id; unreadable runs list');
+  ok(tfbSdIdRefused_(422, '{"message":"Unexpected inputs provided: [\"dispatch_id\"]"}') && !tfbSdIdRefused_(422, 'Workflow does not have workflow_dispatch') && !tfbSdIdRefused_(500, 'Unexpected inputs'), 'id refused');
+  var rr = tfbSdBuildRunsRequest_('o/r', 'shadow_scorer.yml', 'tok_ABCDEFG');
+  ok(rr.url === 'https://api.github.com/repos/o/r/actions/workflows/shadow_scorer.yml/runs?event=workflow_dispatch&per_page=10' && rr.options.method === 'get', 'runs request');
+  var rqi = JSON.parse(tfbSdBuildDispatchRequest_('o/r', 'daily_sync.yml', 'main', 'tok_ABCDEFG', did).options.payload);
+  ok(rqi.inputs.dispatch_id === did && rqi.inputs.run_mode === 'full_sync' && rqi.inputs.include_portfolio === 'true', 'dispatch payload carries the id');
+  ok(pl.inputs.dispatch_id === undefined, 'the plain dispatch carries no id');
+  var s1i = JSON.parse(tfbS1BuildDispatchRequest_('o/r', 'shadow_board.yml', 'main', 'tok_ABCDEFG', { dry_run: 'false' }, did).options.payload);
+  ok(s1i.inputs.dispatch_id === did && s1i.inputs.dry_run === 'false', 'lane payload carries the id');
+  ok(tfbSdTriesText_([204]) === '' && tfbSdTriesText_([500, 204]) === ' after 2 tries (500, 204)', 'tries text');
+  ok(TFB_SYNC_DISPATCH_.RETRY_WAITS_MS.join(',') === '5000,20000', 'three sends at most');
   var verdict = fails.length === 0 ? 'sync dispatch core: ok' : 'sync dispatch core: FAIL ' + fails.length + ' [' + fails.join('; ') + ']';
   verdict += ' | ' + tfbS1DispatchSelfTest_();          // v1.1.0 lane battery
   try { Logger.log('[SYNC-DISPATCH v' + TFB_SYNC_DISPATCH_VERSION + '] selftest -> ' + verdict); } catch (err) { /* noop */ }
@@ -776,12 +955,13 @@ function tfbS1DecideLane_(inp) {
 }
 
 // Lane request: same headers/shape as the v1.0.0 builder, lane-specific inputs.
-function tfbS1BuildDispatchRequest_(repo, workflow, ref, token, inputs) {
+function tfbS1BuildDispatchRequest_(repo, workflow, ref, token, inputs, dispatchId) {
   var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
     '/actions/workflows/' + encodeURIComponent(workflow) + '/dispatches';
   var inp = {};
   var src = inputs || {};
   for (var k in src) { if (src.hasOwnProperty(k)) { inp[k] = String(src[k]); } }
+  if (tfbSdTrim_(dispatchId) !== '') { inp[TFB_SYNC_DISPATCH_.DISPATCH_ID_INPUT] = tfbSdTrim_(dispatchId); }   // v1.2.0
   var payload = { ref: ref, inputs: inp };
   var options = {
     method: 'post',
@@ -867,27 +1047,30 @@ function tfbS1Dispatch_(laneKey, force) {
     tfbSdLog_(level, action, status, 'dispatch ' + status.toLowerCase() + ': ' + verdict.reason, '', '', tfbSdNowMs_() - t0, ctx, cfg.token, cfg.workflow);
     return status + ':' + verdict.reason;
   }
-  var req = tfbS1BuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, cfg.inputs);
-  var code = 0;
-  var body = '';
-  try {
-    var resp = UrlFetchApp.fetch(req.url, req.options);
-    code = resp.getResponseCode();
-    body = tfbSdClip_(resp.getContentText() || '');
-  } catch (err) {
-    code = -1;
-    body = tfbSdClip_(String(err && err.message ? err.message : err));
-  }
+  var did = tfbSdNewDispatchId_(cfg.lane, tfbSdNowMs_());                  // v1.2.0: this dispatch's own name
+  var req = tfbS1BuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, cfg.inputs, did);
+  var reqPlain = tfbS1BuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, cfg.inputs);
+  var sent = tfbSdSendDispatch_(req, reqPlain, cfg.repo, cfg.workflow, cfg.token, did);   // v1.2.0: a fault is tried again
+  var code = sent.code;
+  var body = sent.body;
+  var tries = tfbSdTriesText_(sent.attempts) + tfbSdPlainText_(sent);
+  ctx.dispatch_id = did;
+  if (sent.attempts.length > 1) { ctx.attempts = sent.attempts; }
   var dur = tfbSdNowMs_() - t0;
   if (code === 204) {
     try { tfbSdProps_().setProperty(L.propLastOkMs, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
     ctx.http = 204;
-    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(cfg.inputs), req.url, 204, dur, ctx, cfg.token, cfg.workflow);
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(cfg.inputs) + tries, req.url, 204, dur, ctx, cfg.token, cfg.workflow);
     return 'OK:204';
   }
   ctx.http = code;
   ctx.body = body;
-  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body, req.url, code, dur, ctx, cfg.token, cfg.workflow);
+  if (sent.adopted) {
+    try { tfbSdProps_().setProperty(L.propLastOkMs, String(tfbSdNowMs_())); } catch (e2) { /* noop */ }
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch answered HTTP ' + code + ' but its run started (found by its dispatch id in the runs list); not sent again' + tries + ' ref=' + cfg.ref, req.url, code, dur, ctx, cfg.token, cfg.workflow);
+    return 'OK:run_started';
+  }
+  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body + tries, req.url, code, dur, ctx, cfg.token, cfg.workflow);
   return 'FAILED:' + code;
 }
 

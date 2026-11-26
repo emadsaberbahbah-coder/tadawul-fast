@@ -1,5 +1,12 @@
 name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
+# VERSION 1.0.3 (2026-11-26) -- A DISPATCH CAN CARRY ITS OWN NAME
+# WHY (_Run_Log, 25 Nov 18:47 Riyadh): this workflow's dispatch got HTTP 500,
+# was sent once, and no run started; the evidence day was saved by hand.
+# 24_Sync_Dispatch 1.2.0 tries again, and first looks for ITS run by the id it
+# sent. WHAT: input dispatch_id (optional) and run-name; a run started without
+# the id keeps GitHub's own name. No step reads the input.
+#
 # VERSION 1.0.2 (2026-11-10) -- P-186 BASE POLICY ARMED (lastscored)
 #
 # VERSION 1.0.1 (2026-10-13) -- RUNNER IMAGE PINNED TO ubuntu-24.04
@@ -12,6 +19,8 @@ name: "📊 TFB Shadow Scorer (S-1 Gate)"
 # Challenger scoring and the S-1 acceptance gate. Runs AFTER the shadow board
 # so it scores the board the challenger actually published that day.
 # Append-only: Shadow_History refuses duplicate dates by design.
+
+run-name: ${{ inputs.dispatch_id && format('{0} [{1}]', github.workflow, inputs.dispatch_id) || '' }}
 
 on:
   schedule:
@@ -31,6 +40,11 @@ on:
       rollback_drill_passed:
         description: "true = record today's rollback drill (criterion 6)"
         default: "false"
+      dispatch_id:
+        description: "Dispatcher's own id for this run (24_Sync_Dispatch 1.2.0); printed in the run name, read by no step"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
