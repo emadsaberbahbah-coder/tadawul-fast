@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.1.1  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
+// TADAWUL FAST BRIDGE - DAILY SYNC DISPATCHER v1.2.0  [P-170 DISPATCH-FROM-GAS + P-170b S-1 LANE]
 //
 // Purpose
 // -------
@@ -7,6 +7,25 @@
 // THE MINUTE instead of whenever GitHub gets round to a schedule event.
 //
 // -----------------------------------------------------------------------------
+// v1.2.0 (2026-11-26) - A FAULT AT GITHUB IS TRIED AGAIN
+// WHY (_Run_Log, 25 Nov 2026 18:47:58 Riyadh, tfbDispatchShadowScorer): the
+//   scorer's dispatch got HTTP 500 from GitHub, was sent once, and no run
+//   started. With a min gap of 1,200 minutes there is no second trigger that
+//   day: the evidence day of 25 Nov was recorded only because the workflow was
+//   dispatched by hand at 23:18Z. One answer from GitHub decided a whole day.
+// WHAT: every dispatch (daily_sync, shadow_board, shadow_scorer) goes through
+//   tfbSdSendDispatch_. On a transport error, HTTP 5xx or 429 it waits
+//   (RETRY_WAITS_MS: 5 s, then 20 s), reads the workflow's runs list, and
+//   sends again ONLY when no workflow_dispatch run has started since the
+//   first try - a fault can still have started the run, and a second full
+//   sync is not wanted. Three sends at most; after the last one the runs list
+//   is read once more. A run found there counts as accepted ('OK:run_started',
+//   LAST_OK set). A 4xx is ours and is never sent again. The log row says how
+//   many tries were made and their codes (details.attempts) - only when there
+//   was more than one, so a clean first try writes the row it always wrote.
+//   Guards, schedule, payloads, probe and status line are unchanged.
+// ROLLBACK: Project History -> 1.1.1.
+//
 // v1.1.1 (2026-11-04) - THE DISPATCHED SYNC CARRIES MY_PORTFOLIO
 // WHY (owner installed the dispatch triggers on 4 Nov 01:05 Riyadh; Actions
 //   run 41766747380 + _Status + _Run_Log, read-only): the first dispatched
@@ -128,7 +147,7 @@
 //   and drop the schedule block entirely.
 // ES5 only (file is loaded by the classic runtime path); no let/const/arrow.
 // -----------------------------------------------------------------------------
-var TFB_SYNC_DISPATCH_VERSION = '1.1.1';
+var TFB_SYNC_DISPATCH_VERSION = '1.2.0';
 
 var TFB_SYNC_DISPATCH_ = Object.freeze({
   PROP_TOKEN: 'TFB_GH_DISPATCH_TOKEN',
@@ -161,7 +180,9 @@ var TFB_SYNC_DISPATCH_ = Object.freeze({
   HOLD_KEY: 'backend sync hold until',
   STATUS_PAGE: 'Global_Markets',
   STATUS_FEED_KEY: 'TFB Feed Global_Markets',
-  BODY_MAX: 200
+  BODY_MAX: 200,
+  RETRY_WAITS_MS: [5000, 20000],          // v1.2.0: the waits before the second and the third send
+  RUN_CLOCK_TOLERANCE_MS: 10000           // v1.2.0: GitHub's clock against this script's
 });
 
 // ---------------------------------------------------------------------------
@@ -292,6 +313,44 @@ function tfbSdBuildProbeRequest_(repo, workflow, token) {
     muteHttpExceptions: true
   };
   return { url: url, options: options };
+}
+
+// v1.2.0: the newest workflow_dispatch runs of a workflow - to see whether a
+// send that answered with a fault started a run all the same.
+function tfbSdBuildRunsRequest_(repo, workflow, token) {
+  var url = TFB_SYNC_DISPATCH_.API_BASE + '/repos/' + repo +
+    '/actions/workflows/' + encodeURIComponent(workflow) + '/runs?event=workflow_dispatch&per_page=5';
+  var options = {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': TFB_SYNC_DISPATCH_.API_VERSION
+    },
+    muteHttpExceptions: true
+  };
+  return { url: url, options: options };
+}
+
+// v1.2.0 (pure): a transport error (-1) and GitHub's own faults (5xx, 429) are
+// worth another try; any other answer is final.
+function tfbSdRetryable_(code) {
+  return code === -1 || code === 429 || (code >= 500 && code <= 599);
+}
+
+// v1.2.0 (pure): does this runs-list body hold a workflow_dispatch run created
+// at or after sinceMs (less the clock tolerance)? Unreadable -> false.
+function tfbSdRunStartedSince_(runsBody, sinceMs, toleranceMs) {
+  var j = null;
+  try { j = JSON.parse(runsBody); } catch (err) { return false; }
+  var runs = j && j.workflow_runs;
+  if (!runs || !runs.length) { return false; }
+  for (var i = 0; i < runs.length; i++) {
+    var r = runs[i] || {};
+    var ms = tfbSdParseIsoMs_(r.created_at);
+    if (ms > 0 && ms >= sinceMs - toleranceMs && String(r.event || '') === 'workflow_dispatch') { return true; }
+  }
+  return false;
 }
 
 // Scrub the token (and its bearer form) out of any outgoing string.
@@ -430,6 +489,57 @@ function tfbSdLog_(level, action, status, message, endpoint, httpCode, durationM
 // Core: dispatch
 // ---------------------------------------------------------------------------
 
+function tfbSdSleep_(ms) {
+  try { Utilities.sleep(ms); } catch (err) { /* noop */ }
+}
+
+// v1.2.0: has a workflow_dispatch run of this workflow started since sinceMs?
+// Any failure of the reading -> false (the send is then tried again).
+function tfbSdRunStarted_(repo, workflow, token, sinceMs) {
+  var req = tfbSdBuildRunsRequest_(repo, workflow, token);
+  try {
+    var resp = UrlFetchApp.fetch(req.url, req.options);
+    if (resp.getResponseCode() !== 200) { return false; }
+    return tfbSdRunStartedSince_(resp.getContentText() || '', sinceMs, TFB_SYNC_DISPATCH_.RUN_CLOCK_TOLERANCE_MS);
+  } catch (err) {
+    return false;
+  }
+}
+
+// v1.2.0: send the dispatch. A final answer (204, or anything that is not a
+// fault) returns at once. After a fault: wait, read the runs list, and send
+// again only when no run has started - RETRY_WAITS_MS.length more sends at
+// most; after the last send the runs list is read once more.
+// Returns {code, body, attempts: [codes], adopted: a run was found after a fault}.
+function tfbSdSendDispatch_(req, repo, workflow, token) {
+  var waits = TFB_SYNC_DISPATCH_.RETRY_WAITS_MS;
+  var since = tfbSdNowMs_();
+  var out = { code: 0, body: '', attempts: [], adopted: false };
+  for (var i = 0; i <= waits.length; i++) {
+    try {
+      var resp = UrlFetchApp.fetch(req.url, req.options);
+      out.code = resp.getResponseCode();
+      out.body = tfbSdClip_(resp.getContentText() || '');
+    } catch (err) {
+      out.code = -1;
+      out.body = tfbSdClip_(String(err && err.message ? err.message : err));
+    }
+    out.attempts.push(out.code);
+    if (!tfbSdRetryable_(out.code)) { return out; }
+    tfbSdSleep_(i < waits.length ? waits[i] : waits[0]);
+    if (tfbSdRunStarted_(repo, workflow, token, since)) {
+      out.adopted = true;
+      return out;
+    }
+  }
+  return out;
+}
+
+// v1.2.0 (pure): ' after 3 tries (500, -1, 204)' - '' for a single try.
+function tfbSdTriesText_(attempts) {
+  return attempts && attempts.length > 1 ? ' after ' + attempts.length + ' tries (' + attempts.join(', ') + ')' : '';
+}
+
 function tfbSdDispatch_(force) {
   var C = TFB_SYNC_DISPATCH_;
   var t0 = tfbSdNowMs_();
@@ -457,26 +567,26 @@ function tfbSdDispatch_(force) {
     return status + ':' + verdict.reason;
   }
   var req = tfbSdBuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token);
-  var code = 0;
-  var body = '';
-  try {
-    var resp = UrlFetchApp.fetch(req.url, req.options);
-    code = resp.getResponseCode();
-    body = tfbSdClip_(resp.getContentText() || '');
-  } catch (err) {
-    code = -1;
-    body = tfbSdClip_(String(err && err.message ? err.message : err));
-  }
+  var sent = tfbSdSendDispatch_(req, cfg.repo, cfg.workflow, cfg.token);   // v1.2.0: a fault is tried again
+  var code = sent.code;
+  var body = sent.body;
+  var tries = tfbSdTriesText_(sent.attempts);
+  if (sent.attempts.length > 1) { ctx.attempts = sent.attempts; }
   var dur = tfbSdNowMs_() - t0;
   if (code === 204) {
     try { tfbSdProps_().setProperty(C.PROP_LAST_OK_MS, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
     ctx.http = 204;
-    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE, req.url, 204, dur, ctx, cfg.token);
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE + tries, req.url, 204, dur, ctx, cfg.token);
     return 'OK:204';
   }
   ctx.http = code;
   ctx.body = body;
-  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body, req.url, code, dur, ctx, cfg.token);
+  if (sent.adopted) {
+    try { tfbSdProps_().setProperty(C.PROP_LAST_OK_MS, String(tfbSdNowMs_())); } catch (e2) { /* noop */ }
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch answered HTTP ' + code + ' but the run started (seen in the runs list); not sent again' + tries + ' ref=' + cfg.ref + ' run_mode=' + C.RUN_MODE, req.url, code, dur, ctx, cfg.token);
+    return 'OK:run_started';
+  }
+  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body + tries, req.url, code, dur, ctx, cfg.token);
   return 'FAILED:' + code;
 }
 
@@ -656,6 +766,20 @@ function tfbSyncDispatchSelfTest() {
   ok(tfbSdRedact_('Bearer tok_ABCDEFG failed tok_ABCDEFG', 'tok_ABCDEFG') === 'Bearer [redacted] failed [redacted]', 'redact');
   ok(tfbSdRedact_('x', '') === 'x' && tfbSdRedact_(null, 'tok_ABCDEFG') === '', 'redact edge');
   ok(tfbSdClip_('abcdefghij', 4) === 'abcd...', 'clip');
+  // T6 (v1.2.0) which answers are tried again, and the runs-list reading
+  ok(tfbSdRetryable_(500) && tfbSdRetryable_(502) && tfbSdRetryable_(599) && tfbSdRetryable_(429) && tfbSdRetryable_(-1), 'retryable faults');
+  ok(!tfbSdRetryable_(204) && !tfbSdRetryable_(401) && !tfbSdRetryable_(404) && !tfbSdRetryable_(422) && !tfbSdRetryable_(0), 'final answers');
+  var runs = JSON.stringify({ workflow_runs: [{ event: 'workflow_dispatch', created_at: '2026-11-25T15:48:05Z' }, { event: 'schedule', created_at: '2026-11-25T15:49:00Z' }] });
+  var at = Date.parse('2026-11-25T15:47:58Z');
+  ok(tfbSdRunStartedSince_(runs, at, 10000) === true, 'run started after the send');
+  ok(tfbSdRunStartedSince_(runs, at + 60000, 10000) === false, 'an older run is not this send');
+  ok(tfbSdRunStartedSince_(runs, at + 15000, 10000) === true && tfbSdRunStartedSince_(runs, at + 17001, 10000) === false, 'clock tolerance');
+  ok(tfbSdRunStartedSince_('{"workflow_runs":[{"event":"schedule","created_at":"2026-11-25T15:48:05Z"}]}', at, 10000) === false, 'a scheduled run is not a dispatch');
+  ok(tfbSdRunStartedSince_('not json', at, 10000) === false && tfbSdRunStartedSince_('{}', at, 10000) === false, 'unreadable runs list');
+  var rr = tfbSdBuildRunsRequest_('o/r', 'shadow_scorer.yml', 'tok_ABCDEFG');
+  ok(rr.url === 'https://api.github.com/repos/o/r/actions/workflows/shadow_scorer.yml/runs?event=workflow_dispatch&per_page=5' && rr.options.method === 'get', 'runs request');
+  ok(tfbSdTriesText_([204]) === '' && tfbSdTriesText_([500, 204]) === ' after 2 tries (500, 204)', 'tries text');
+  ok(TFB_SYNC_DISPATCH_.RETRY_WAITS_MS.join(',') === '5000,20000', 'three sends at most');
   var verdict = fails.length === 0 ? 'sync dispatch core: ok' : 'sync dispatch core: FAIL ' + fails.length + ' [' + fails.join('; ') + ']';
   verdict += ' | ' + tfbS1DispatchSelfTest_();          // v1.1.0 lane battery
   try { Logger.log('[SYNC-DISPATCH v' + TFB_SYNC_DISPATCH_VERSION + '] selftest -> ' + verdict); } catch (err) { /* noop */ }
@@ -868,26 +992,26 @@ function tfbS1Dispatch_(laneKey, force) {
     return status + ':' + verdict.reason;
   }
   var req = tfbS1BuildDispatchRequest_(cfg.repo, cfg.workflow, cfg.ref, cfg.token, cfg.inputs);
-  var code = 0;
-  var body = '';
-  try {
-    var resp = UrlFetchApp.fetch(req.url, req.options);
-    code = resp.getResponseCode();
-    body = tfbSdClip_(resp.getContentText() || '');
-  } catch (err) {
-    code = -1;
-    body = tfbSdClip_(String(err && err.message ? err.message : err));
-  }
+  var sent = tfbSdSendDispatch_(req, cfg.repo, cfg.workflow, cfg.token);   // v1.2.0: a fault is tried again
+  var code = sent.code;
+  var body = sent.body;
+  var tries = tfbSdTriesText_(sent.attempts);
+  if (sent.attempts.length > 1) { ctx.attempts = sent.attempts; }
   var dur = tfbSdNowMs_() - t0;
   if (code === 204) {
     try { tfbSdProps_().setProperty(L.propLastOkMs, String(tfbSdNowMs_())); } catch (e1) { /* noop */ }
     ctx.http = 204;
-    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(cfg.inputs), req.url, 204, dur, ctx, cfg.token, cfg.workflow);
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch accepted (HTTP 204) ref=' + cfg.ref + ' inputs=' + JSON.stringify(cfg.inputs) + tries, req.url, 204, dur, ctx, cfg.token, cfg.workflow);
     return 'OK:204';
   }
   ctx.http = code;
   ctx.body = body;
-  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body, req.url, code, dur, ctx, cfg.token, cfg.workflow);
+  if (sent.adopted) {
+    try { tfbSdProps_().setProperty(L.propLastOkMs, String(tfbSdNowMs_())); } catch (e2) { /* noop */ }
+    tfbSdLog_('INFO', action, 'OK', 'workflow_dispatch answered HTTP ' + code + ' but the run started (seen in the runs list); not sent again' + tries + ' ref=' + cfg.ref, req.url, code, dur, ctx, cfg.token, cfg.workflow);
+    return 'OK:run_started';
+  }
+  tfbSdLog_('ERROR', action, 'FAILED', 'workflow_dispatch rejected HTTP ' + code + ' ' + body + tries, req.url, code, dur, ctx, cfg.token, cfg.workflow);
   return 'FAILED:' + code;
 }
 
