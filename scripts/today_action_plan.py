@@ -4,7 +4,30 @@ scripts/today_action_plan.py
 ================================================================================
 TFB Today Action Plan - one page that says what to do today, and why
 --------------------------------------------------------------------------------
-v1.8.2 (2026-11-23)
+v1.9.0 (2026-11-26)
+  1.9.0: A HOLDING UNDER A CASH OFFER WHOSE SALE IS MANUAL IS NOT ASKED FOR A STOP (owner, 26 Nov 2026 01:07 Riyadh,
+         in Arabic: the stop on the tender holding was removed on purpose - "the fear that the price falls in the
+         wave and a sell order is executed while a purchase offer stands at a fixed price, so we lose for no reason";
+         01:15: "the sale there will mostly be a manual decision, waiting for the best price before the final
+         offer"). Read on the 00:42 run of that night: step 1 of the page, the FINAL DECISION and both portfolio
+         pages said "No stop order is working at IBKR for <SYM>: place one at <stop> for all <n> shares" - the
+         opposite of the owner's decision. 1.8.0 knew the offer only while Holding_Read read PINNED BY AN OFFER,
+         which lasts as long as the news of the day carries it.
+         Now the page also reads config/corporate_offers.json (core/corporate_offers.py 1.0.0, the registry the
+         Exit Plan 1.7.0 reads). For a holding with a standing offer there whose sale is "manual":
+           - no step asks to place, add to, raise or check a stop on it, and it is left out of the "confirm each
+             holding's stop in IBKR" step;
+           - a REVIEW from the Exit Plan (the price doubts the offer, reaches it, or the last days) is one step:
+             "Review <SYM> today: the cash offer on it (<price> until <day>) needs a decision ...";
+           - a stop order that IS working on it is one step that says so (a sell order on tendered shares can open
+             a short position) - nothing is asked to be cancelled;
+           - its FINAL DECISION reads "Hold; cash offer <price> until <day>: the sale is the owner's manual
+             decision - no stop order is asked for.", its order status "no stop at IBKR - by the owner's decision
+             (cash offer, manual sale)" and its note in section B "cash offer: manual sale, no stop asked for".
+         Every holding with a standing offer in the registry (manual or not) carries the 1.8.0 tender caution on
+         its sell-side steps, whatever Holding_Read says that day. A holding with no entry in the registry reads
+         as 1.8.2. The registry is read by the live run only (no workbook given), as the IBKR capture is.
+         TFB_TAP_OFFERS = on (default) | off (= 1.8.2).
   1.8.2: THE RUN LOG NAMES NO HOLDING (owner, 23 Nov 2026 08:42 Riyadh: "review the full project and check specially
          the workflows and if there is any failing or other issue please update and try to improve"; his standing
          rule: "Repo logs are public: no amounts, quantities, account numbers or holdings' symbols in run logs").
@@ -284,7 +307,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.8.2"
+__version__ = "1.9.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -536,6 +559,32 @@ OFFER_READ = "PINNED BY AN OFFER"
 def sold_on() -> bool:
     """1.8.0: a holding the broker sold today reads SOLD AT IBKR (off = the 1.7.1 'absent from the capture' check)."""
     return _env("TFB_TAP_SOLD_AT_BROKER", "on").lower() not in ("off", "0", "false", "no")
+
+
+def offers_on() -> bool:
+    """1.9.0: the offers registry (config/corporate_offers.json) is read (off = 1.8.2)."""
+    return _env("TFB_TAP_OFFERS", "on").lower() not in ("off", "0", "false", "no")
+
+
+def offer_book(offers: Sequence[Dict[str, Any]], symbols: Sequence[str], today: _dt.date) -> Dict[str, Dict[str, Any]]:
+    """1.9.0: {SYMBOL: its standing offer} for the holdings that have one in the registry on `today`."""
+    from core import corporate_offers as co  # noqa: PLC0415 - stdlib only
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym in symbols:
+        o = co.standing(offers, sym, today)
+        if o:
+            out[text(sym).upper()] = o
+    return out
+
+
+def offer_manual(h: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """1.9.0: the holding's standing offer when its sale is the owner's manual decision, else None."""
+    o = h.get("offer_info")
+    return o if o and o.get("sale") == "manual" else None
+
+
+def offer_until(o: Dict[str, Any]) -> str:
+    return "%s until %s" % (fmt(o["price"]), o["expires"].isoformat())
 
 
 def read_offers(values: Sequence[Sequence[Any]]) -> List[str]:
@@ -913,6 +962,13 @@ def _holding_decision(h: Dict[str, Any]) -> Tuple[str, str]:
                         "the sale in the ledger from the broker's confirmation.")
     if h.get("review_reason") and act != "NO RULE":
         return "HOLD", "Hold. Verify at IBKR before any change: %s." % h["review_reason"]
+    om = offer_manual(h)                                            # 1.9.0
+    if om and act in ("REVIEW", "CHECK"):
+        return "HOLD", ("Hold; review today: the cash offer (%s) needs a decision - sell in the market, tender at the "
+                        "broker, or keep the shares. No stop order is asked for." % offer_until(om))
+    if om and act in ("HOLD", "RAISE STOP"):
+        return "HOLD", ("Hold; cash offer %s: the sale is the owner's manual decision - no stop order is asked for."
+                        % offer_until(om))
     if act == "SELL":
         return "SELL", "Sell all %s." % shares
     if act == "TAKE PROFIT":
@@ -976,6 +1032,8 @@ def _holding_order(h: Dict[str, Any], tol_pct: float) -> str:
     state = stop_state(h, tol_pct)
     if not state:
         return "broker orders not read" if h.get("broker_cover") is None else ""
+    if state == "none" and offer_manual(h):                         # 1.9.0
+        return "no stop at IBKR - by the owner's decision (cash offer, manual sale)"
     if state == "none":
         return "NO STOP WORKING at IBKR"
     cover, qty, bs = h.get("broker_cover") or 0, h.get("qty") or 0, h.get("broker_stop")
@@ -1296,11 +1354,25 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
             step(2, "Raise the stop on %s to %s for all %s." % (sym, fmt(stop), shares),
                  "was %s · broker stop %s%s" % (fmt(h.get("was")) or "-", fmt(bs) or (
                      ("none" if cover is not None else "not read") if broker_known else "orders not read"), at_ib))
+    elif act in ("REVIEW", "CHECK") and offer_manual(h):            # 1.9.0: the offer's own terms ask for it
+        step(3, "Review %s today: the cash offer on it (%s) needs a decision - sell in the market, tender at the "
+                "broker, or keep the shares. The Exit Plan's note says why today." % (sym, offer_until(offer_manual(h))),
+             "last %s · cash offer %s" % (fmt(h.get("last")), offer_until(offer_manual(h))))
     elif act in ("REVIEW", "CHECK"):
         step(3, "Review %s today: the exit rule could not decide on its own." % sym,
              "last %s · stop %s" % (fmt(h.get("last")), fmt(stop)))
     state = stop_state(h, tol_pct)                  # 1.3.0: "" unless the IBKR capture gave the orders
-    if act in ("HOLD", "REVIEW", "CHECK") and stop and state:
+    om = offer_manual(h)                            # 1.9.0: no stop is asked for while the offer stands
+    if om and act != "SELL":
+        if state in ("partial", "unpriced", "low", "ok") and act in ("HOLD", "REVIEW", "CHECK", "RAISE STOP"):
+            step(2.6, "A stop order is working at IBKR on %s (%s on %s of %s shares), and its sale is set to manual "
+                      "under the cash offer (%s): if its shares were tendered, a sell order on them can open a short "
+                      "position. Nothing is asked for; keep it only if it is meant." % (
+                          sym, fmt(bs) if bs is not None else "price not read", fmt(h.get("broker_cover"), 0),
+                          fmt(qty, 0), offer_until(om)),
+                 "broker stop %s · cash offer %s" % (fmt(bs) or "price not read", offer_until(om)))
+        steps[:] = [st for st in steps if not st["do"].startswith("Raise the stop")]
+    elif act in ("HOLD", "REVIEW", "CHECK") and stop and state:
         if state == "none" and h.get("offer"):                     # 1.8.0: a tendered share is not sold twice
             step(2.4, "No stop order is working at IBKR for %s, which is under a cash tender offer: if its shares were "
                       "tendered, place no sell order on them (selling tendered shares can open a short position); if "
@@ -1333,7 +1405,7 @@ def holding_steps(h: Dict[str, Any], tol_pct: float, broker_known: bool = True) 
                 sym, fmt(bs), fmt(stop), shares), "plan stop %s · broker stop %s" % (fmt(stop), fmt(bs)))
     if h.get("offer"):                                              # 1.8.0: every sell-side step of a tendered name
         for st in steps:
-            if "tender offer" not in st["do"]:
+            if "tender offer" not in st["do"] and "cash offer" not in st["levels"]:   # 1.9.0: the offer steps say it
                 st["do"] += (" %s is under a cash tender offer: if its shares were tendered, place no sell order on them "
                              "(selling tendered shares can open a short position)." % sym)
                 st["levels"] += " · tender offer"
@@ -1463,10 +1535,12 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
     exit_reason = action_source_reason("Exit_Plan", ages, k) or custody_reason
     steps: List[Dict[str, Any]] = []
     offers = set(x.get("offers") or ())                             # 1.8.0
+    book = x.get("offer_book") or {}                                # 1.9.0
     for h in holdings:
         h.pop("review_reason", None)
         h.pop("sold_at_broker", None)
-        h["offer"] = h["symbol"] in offers
+        h["offer_info"] = book.get(h["symbol"])                    # 1.9.0: the registry's standing offer
+        h["offer"] = h["symbol"] in offers or bool(h["offer_info"])
         if exit_reason:
             h["review_reason"] = exit_reason
         elif h.get("at_broker") is False and h.get("closed_at_broker") and sold_on():
@@ -1478,7 +1552,8 @@ def build(holdings: List[Dict[str, Any]], plan: Dict[str, Any], evidence: Dict[s
         steps += holding_steps(h, k["stop_tol"], not broker_note)
     # a SELL row is leaving in full: no stop to confirm on it (Codex P2, #967)
     unread = [h["symbol"] for h in holdings
-              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL") and not h.get("review_reason")]
+              if h.get("stop") and h.get("broker_stop") is None and h["action"] not in ("NO RULE", "SELL") and not h.get("review_reason")
+              and not offer_manual(h)]                              # 1.9.0: no stop is asked for on it
     if broker_note and unread:
         steps.append({"urgency": 2.6, "symbol": "ALL", "source": "Exit_Plan",
                       "do": "Confirm in IBKR that each holding's stop matches the plan's stop in section B (%s)."
@@ -1883,6 +1958,8 @@ def page_layout(d: Dict[str, Any], stamp: str, day: str, k: Dict[str, float]) ->
         state = stop_state(h, k["stop_tol"])
         note = "" if h["action"] == "NO RULE" else ("sold at IBKR today - record it in the ledger" if h.get("sold_at_broker")
                                                     else None) or (h.get("review_reason") or (
+            "cash offer: manual sale, no stop asked for"
+            if offer_manual(h) and (state == "none" or (not state and bs is None)) else None) or (
             {"none": "no stop at IBKR", "partial": "stop covers %s of %s shares" % (fmt(h.get("broker_cover"), 0), fmt(h.get("qty"), 0)),
              "unpriced": "stop price not read", "low": "broker stop below the plan", "ok": "stop in place"}[state] if state else (
                 "not at IBKR" if h.get("at_broker") is False and h.get("stop") else (
@@ -2169,9 +2246,11 @@ def hide_tabs(book: Any, names: Sequence[str]) -> List[str]:
 
 def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
              sleep: Optional[Callable[[float], None]] = None, capture: Optional[Dict[str, Any]] = None,
-             bq_session: Any = None) -> int:
+             bq_session: Any = None, offers: Optional[Sequence[Dict[str, Any]]] = None) -> int:
     """`capture` (1.3.0): a parsed IBKR capture (scripts.ibkr_capture.parse). Left out, the live run reads the newest
-    one from Drive; a run on an injected workbook reads none."""
+    one from Drive; a run on an injected workbook reads none.
+    `offers` (1.9.0): the parsed offers registry (core.corporate_offers.parse). Left out, the live run reads
+    config/corporate_offers.json; a run on an injected workbook reads none."""
     now = now or _dt.datetime.now(UTC)
     own_book = book is None
     if not enabled():
@@ -2242,6 +2321,11 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             extra.update(hold_align=True, pf=read_pf_main(more.get(PFD_TAB) or []),
                          pf2=read_pf_v2(more.get(PF2_TAB) or []))
     holdings, broker_note = read_holdings(pages["Exit_Plan"]), broker_unknown(pages["Exit_Plan"])
+    if extra is not None and offers_on():                           # 1.9.0: the offers registry
+        if offers is None and own_book:
+            from core import corporate_offers as _co  # noqa: PLC0415 - stdlib only
+            offers = _co.load()
+        extra["offer_book"] = offer_book(offers or [], [h["symbol"] for h in holdings], local.date())
     if aligned:                                                     # 1.3.0: the broker's own cash and orders
         if capture is None and own_book:
             from scripts import ibkr_capture  # noqa: PLC0415

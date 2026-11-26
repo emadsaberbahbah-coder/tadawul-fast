@@ -1364,6 +1364,7 @@ jobs:
             tests/test_ibkr_capture.py \
             tests/test_ibkr_history.py \
             tests/test_exit_plan.py \
+            tests/test_exit_plan_offers.py \
             tests/test_holding_read.py \
             tests/test_consistency_check.py \
             tests/test_cash_cells.py \

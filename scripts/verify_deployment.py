@@ -270,6 +270,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-11-22 (manifest pin only): 1.0.0 -> 1.0.1 (state() warms the read and
     # reports it; the browser User-Agent of yahoo_chart_provider).
     ("core.market_condition", "__version__", "1.0.1", "market condition"),
+    # 2026-11-26 (new module, pinned on arrival): the cash offers standing on listed shares
+    # (config/corporate_offers.json), read by the Exit Plan and the Today Action Plan (stdlib only).
+    ("core.corporate_offers", "__version__", "1.0.0", "corporate offers"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -472,13 +475,17 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("daily_plan", "1.10.3", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
-    ("exit_plan", "1.6.3", "exit plan"),   # 2026-11-22: 1.6.1 the run log names no holding; 11-23: 1.6.2 write quota, 1.6.3 open
+    # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
+    # terms, config/corporate_offers.json; [STOP-JUDGMENT] a fall named with its market or on its own, observe only).
+    ("exit_plan", "1.7.0", "exit plan"),
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.2", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
     ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
-    ("today_action_plan", "1.8.2", "today action plan"),   # 2026-11-23: 1.8.2 the run log names no stock
+    # 2026-11-26 (pin only): 1.8.2 -> 1.9.0 (a holding under a standing cash offer whose sale is manual is not asked
+    # for a stop: config/corporate_offers.json; TFB_TAP_OFFERS on).
+    ("today_action_plan", "1.9.0", "today action plan"),
     ("plan_archive", "1.1.1", "plan archive"),
     ("ibkr_capture", "1.2.0", "ibkr capture"),
     # 2026-11-21 (new script, pinned on arrival): _IBKR_NAV_History, _IBKR_Fills and _IBKR_Trades from the daily
