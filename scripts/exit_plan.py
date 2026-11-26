@@ -2,7 +2,19 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.7.0 (2026-11-26) - first written 2026-11-11 (1.0.0)
+VERSION 1.7.1 (2026-11-26) - first written 2026-11-11 (1.0.0)
+1.7.1 (26 Nov 2026): THE NEWS ROWS ARE READ FROM THE BOTTOM OF THE TAB (found while adding news sources; owner,
+    26 Nov 12:42 Riyadh, in Arabic: review what else needs changing so the news reaches the decision). The run read
+    _News_Items as "A1:M12000" - the FIRST 12,000 rows - while the news gate appends at the bottom. The tab passed
+    12,000 rows on 21 Nov 2026 at about 06:00 Riyadh and held 19,526 on 26 Nov, so no headline recorded after
+    21 Nov reached this page: 7,527 rows, 65 of them about a name, among them a negative item of severity M on a
+    holding (an 8-K of 24 Nov, tier A) that the rule "negative news tightens the trail" never saw. Nothing failed
+    and nothing said so: the page went on showing the news it could see.
+    read_newest() reads the columns the rule needs (NEWS_COLS) from the NEWEST NEWS_ROWS (20,000) rows: the header
+    row, the length of column A, then one batch of column tails - about the same number of cells as before. The
+    run log states which rows were read (numbers only). The Holding Read (1.0.3) reads its items the same way. No
+    rule, page layout, ledger column or ENV changes; a holding with a negative item of the last TFB_EXIT_NEWS_DAYS
+    days now shows it again, and its trail tightens as the rule always said.
 1.7.0 (26 Nov 2026): A HOLDING UNDER A CASH OFFER, AND WHY A PRICE FELL (owner, 26 Nov 01:07 Riyadh, in Arabic, the
     day after a stop filled in the first seconds of a session that closed higher: "is this fall temporary or lasting
     ... is it better to adjust the stop points or keep them ... that is why the stop on the tender holding was
@@ -273,7 +285,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1359,6 +1371,41 @@ def live_quote(symbol: str, opener: Optional[Callable[..., Any]] = None) -> Opti
     return px, _dt.datetime.fromtimestamp(ts, UTC)
 
 
+# 1.7.1: _News_Items is append-only (the news gate adds up to 200 rows a run at the bottom); the newest rows are
+# the ones a page needs. 20,000 rows are about a month at the rate of November 2026 (650 a day) and eleven days
+# at the gate's ceiling (200 rows x 9 runs a day).
+NEWS_ROWS = 20000
+NEWS_COLS = ("Published (UTC)", "Scope", "Event Type", "Direction", "Severity", "Cluster Grade", "Headline")
+
+
+def read_newest(book, tab: str, names: Sequence[str], rows: int = NEWS_ROWS
+                ) -> Tuple[List[List[Any]], Optional[Tuple[int, int]]]:
+    """1.7.1: (the named columns of the NEWEST `rows` rows of an append-only tab under their header, (first,
+    last) sheet row read). The header is row 1 and column A is filled on every row, as the news gate writes it. A
+    range fixed from the top ("A1:M12000") stops seeing new rows the day the tab outgrows it, without an error.
+    A missing tab, or one without any of the names, reads as [] / None."""
+    try:
+        ws = book.worksheet(tab)
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ == "WorksheetNotFound":
+            return [], None
+        raise
+    head = ws.get("A1:P1")                                 # the width the pages always read (16 columns)
+    header = [text(c) for c in (head[0] if head else [])]
+    have = [n for n in names if n in header]
+    if not have:
+        return [], None
+    last = len(ws.batch_get(["A1:A"])[0])                 # column A = the row's id: its length is the last row
+    if last < 2:
+        return [list(have)], None
+    first = max(2, last - int(rows) + 1)
+    letters = [_col(header.index(n) + 1) for n in have]
+    cols = ws.batch_get(["%s%d:%s" % (c, first, c) for c in letters])
+    height = max((len(c) for c in cols), default=0)
+    grid = [list(have)] + [[(c[i][0] if i < len(c) and c[i] else "") for c in cols] for i in range(height)]
+    return grid, (first, first + height - 1) if height else None
+
+
 def read_columns(book, tab: str, names: Sequence[str]) -> List[List[Any]]:
     """Only the named columns of a page (one header read, one batch read)."""
     ws = book.worksheet(tab)
@@ -1419,7 +1466,8 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             cal = read_calendar(_read(book, "Calendar_Events", "A1:J4000"), _read(book, "Dividend_Events", "A1:J4000"),
                                 today)
             taxes = read_dividend_tax(_read(book, "_Dividend_Log", "A1:J3000")) if k["div_net"] else {}   # 1.4.0
-            news = read_news(_read(book, "_News_Items", "A1:M12000"), now, k["news_days"])
+            news_grid, news_span = read_newest(book, "_News_Items", NEWS_COLS)        # 1.7.1: the newest rows
+            news = read_news(news_grid, now, k["news_days"])
             stops, broker_note = read_broker_stops(_read(book, "_IBKR_Account", "A1:B40"),
                                                    _read(book, "_IBKR_Orders", "A1:H200"), now)
             picks = read_plan_picks(_read(book, "_Daily_Plan", "A1:AB2001"), today)
@@ -1434,6 +1482,9 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             _out("read failed (%s) - attempt %d of %d, retrying in %d s" % (type(e).__name__, attempt,
                                                                           READ_ATTEMPTS, wait))
             _SLEEP(wait)
+    if news_span:                                                 # 1.7.1: row numbers only - no name, no headline
+        _out("news: rows %d-%d of _News_Items read (the newest %d)" % (news_span[0], news_span[1],
+                                                                      news_span[1] - news_span[0] + 1))
     if capture is None and own_book:                              # 1.3.2: the broker's own working stops
         from scripts import ibkr_capture  # noqa: PLC0415
         capture = ibkr_capture.latest(now, out=_out)

@@ -443,7 +443,7 @@ def test_j4_workflow_manifest_and_ci():
     assert step["env"]["TFB_EXIT_OFFERS"] == "${{ vars.TFB_EXIT_OFFERS || 'on' }}"
     assert step["env"]["TFB_EXIT_STOP_JUDGMENT"] == "${{ vars.TFB_EXIT_STOP_JUDGMENT || 'observe' }}"
     manifest = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in manifest and ep.__version__ == "1.7.0"
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in manifest and ep.__version__ == "1.7.1"
     assert '("core.corporate_offers", "__version__", "%s", "corporate offers")' % co.__version__ in manifest
     assert co.__version__ == "1.0.0"
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

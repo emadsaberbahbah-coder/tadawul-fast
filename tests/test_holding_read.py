@@ -542,8 +542,35 @@ def test_h10_workflow_manifest_ci():
         assert env[name] == "${{ vars.%s || '%s' }}" % (name, default), name
     assert wf["permissions"] == {"contents": "read"} and wf["concurrency"]["cancel-in-progress"] is False
     vd = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.2"
+    assert '("holding_read", "%s", "holding read")' % hr.__version__ in vd and hr.__version__ == "1.0.3"
     ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
     assert any("tests/test_holding_read.py" in s.get("run", "") for s in ci["jobs"]["lean-unit"]["steps"])
     k = hr.knobs()
     assert (k["min_n"], k["edge_pts"], k["z"], k["pin_pct"], k["vol_win"], k["range"]) == (30, 5.0, 1.64, 0.6, 60, "5y")
+
+
+# ----------------------------------------------------------------------------- H12 (1.0.3: the newest news rows)
+def test_h12_an_item_recorded_after_row_12000_is_still_named(monkeypatch, capsys):
+    """21 Nov 2026: _News_Items passed 12,000 rows and "A1:P12000" stopped seeing what the news gate appends."""
+    from tests.test_exit_plan import RangeSheet, _old_rows  # noqa: PLC0415
+    long_tab = [ITEMS[0]] + _old_rows(12500) + BBB_NEWS[1:]
+    book = Book({"_News_Items": RangeSheet(long_tab)})
+    assert hr.read_items(hr._read(book, "_News_Items", "A1:P12000")) == {}         # what 1.0.2 could see
+    grid, span = hr.read_newest(book, "_News_Items", hr.ITEM_COLS)
+    assert span == (2, 12502) and grid[0] == list(hr.ITEM_COLS)
+    assert hr.read_items(grid) == hr.read_items(BBB_NEWS) != {}
+    assert hr.read_items(hr.read_newest(Book({"_News_Items": Sheet(ITEMS)}), "_News_Items", hr.ITEM_COLS)[0]) \
+        == hr.read_items(ITEMS)                                                    # every field the page uses
+    monkeypatch.setenv("TFB_HOLDING_READ", "on")
+    monkeypatch.setenv("TFB_HREAD_LOG_DETAIL", "off")
+    CALLS.clear()
+    short, long_ = wbook(), wbook()
+    long_.tabs["_News_Items"] = RangeSheet(long_tab)
+    assert hr.run(False, book=short, now=NOW, opener=opener) == 0
+    capsys.readouterr()
+    assert hr.run(False, book=long_, now=NOW, opener=opener) == 0
+    out = capsys.readouterr().out
+    assert "news: rows 2-12502 of _News_Items read (the newest 12501)" in out and "BBB" not in out and "Beta" not in out
+    assert long_.tabs["Holding_Read"].values[4:] == short.tabs["Holding_Read"].values[4:]
+    row = next(r for r in long_.tabs["Holding_Read"].values if r and r[0] == "BBB.US")
+    assert row[6] == "COMPANY NEWS" and row[7].startswith("Beta cuts its outlook (wire.com")

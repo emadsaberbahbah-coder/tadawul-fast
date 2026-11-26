@@ -2,7 +2,13 @@
 """
 scripts/holding_read.py - TFB Holding Read
 ==========================================
-VERSION 1.0.2 (2026-11-23) - first written 2026-11-18 (1.0.0)
+VERSION 1.0.3 (2026-11-26) - first written 2026-11-18 (1.0.0)
+1.0.3 (26 Nov 2026): THE NEWS ITEMS ARE READ FROM THE BOTTOM OF THE TAB. The run read _News_Items as "A1:P12000",
+    the first 12,000 rows, while the news gate appends at the bottom: the tab passed 12,000 rows on 21 Nov 2026 and
+    held 19,526 on 26 Nov, so a holding's item recorded after 21 Nov (27 rows on four holdings by 26 Nov) could not
+    be named as the reason for its move. The items now come through scripts/exit_plan.read_newest (exit_plan 1.7.1):
+    the columns read_items() uses, from the newest 20,000 rows. The run log states the rows read (numbers only).
+    The page, the ledger and every rule are unchanged.
 1.0.2 (23 Nov 2026): OPENING THE WORKBOOK WAITS OUT THE QUOTA TOO. The Daily Plan run
     45123566985 (23 Nov 06:3x UTC) ended "cannot open workbook: APIError" at its first call: opening the book reads its
     metadata, which counts against the same per-minute Sheets quota, and it was the one read never retried. It now goes
@@ -86,10 +92,12 @@ from scripts.daily_plan import (  # noqa: E402
 )
 from scripts.exit_plan import (  # noqa: E402
     NO_STOP_CLASSES, YAHOO_HOSTS, YAHOO_UA, _parse_ts, news_is_noise, parse_chart, read_columns, read_lots,
-    split_open_session, yahoo_symbol,
+    read_newest, split_open_session, yahoo_symbol,
 )
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
+# 1.0.3: the columns read_items() uses, read from the newest rows of the append-only tab
+ITEM_COLS = ("Published (UTC)", "Scope", "Event Type", "Direction", "Severity", "Domain", "Cluster Grade", "Headline")
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
 PAGE_TAB = "Holding_Read"
@@ -661,7 +669,8 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                 if type(e).__name__ != "WorksheetNotFound":
                     raise
                 info_map = {}
-            items = read_items(_read(book, "_News_Items", "A1:P12000"))
+            item_grid, item_span = read_newest(book, "_News_Items", ITEM_COLS)       # 1.0.3: the newest rows
+            items = read_items(item_grid)
             gate = read_gate(_read(book, "_News_Gate", "A1:L4000"))
             cal = read_calendar(_read(book, "Calendar_Events", "A1:J4000"), _read(book, "Dividend_Events", "A1:J4000"),
                                 today)
@@ -676,6 +685,9 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
             _out("read failed (%s) - attempt %d of %d, retrying in %d s" % (type(e).__name__, attempt,
                                                                           READ_ATTEMPTS, wait))
             _SLEEP(wait)
+    if item_span:                                                 # 1.0.3: row numbers only
+        _out("news: rows %d-%d of _News_Items read (the newest %d)" % (item_span[0], item_span[1],
+                                                                      item_span[1] - item_span[0] + 1))
     cache: Dict[str, List[Tuple[Any, ...]]] = {}
     now_ts = now.timestamp()
 
