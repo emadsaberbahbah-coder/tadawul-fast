@@ -15,9 +15,10 @@
  *          WHAT THIS FILE DOES: rwTick (ONE time trigger every 5 minutes, installed by tfbInstallRiskWatchTrigger)
  *          works on New York weekdays from 75 minutes before the open to 10 minutes after the close and returns at
  *          once at any other time. Each run reads the holdings and their levels from the Exit Plan's own page
- *          (Exit_Plan: quantity, entry, stop, target, ATR, the stop working at the broker) and ledger (_Exit_Plan:
- *          first-target flag, offer judgment), reads one Yahoo chart per US holding and one for the S&P 500 fund
- *          (5-minute bars with the pre-market), and e-mails the owner once per holding, rule and day:
+ *          (Exit_Plan: quantity, entry, stop, target, ATR, the stop working at the broker, and in its Why whether the
+ *          holding is kept under a cash offer) and ledger (_Exit_Plan: first-target flag, the offer judgment as a
+ *          second witness), reads one Yahoo chart per US holding and one for the S&P 500 fund (5-minute bars with the
+ *          pre-market), and e-mails the owner once per holding, rule and day:
  *            BEFORE THE OPEN  OPEN_RISK   the stop working at the broker is within max(2.5 %, 1 ATR) of the last close -
  *                                         inside one ordinary day's range, so the first seconds of the open can reach
  *                                         it; with the pre-market trade when there is one
@@ -32,8 +33,14 @@
  *            A CASH OFFER     OFFER_AWAY  a holding kept under an offer (judgment offer:manual) trades 8 % or more under
  *                                         the offer price, or falls 3 % on the day
  *                             OFFER_AT    it trades within 0.5 % of the offer price
- *            ITS OWN HEALTH   PRICES      three runs in a row without a price
- *                             LEVELS      the Exit Plan page is missing, unreadable or older than 5 days
+ *            ITS OWN HEALTH   PRICES      three runs in a row without the market's price
+ *                             NO_PRICE    three runs in a row without ONE holding's price while the market's reads
+ *                                         (that holding is not watched until it reads; the alert names it)
+ *                             LEVELS      the Exit Plan page is missing, unreadable, read in part (fewer rows than
+ *                                         its own HOLDINGS count) or older than 5 days
+ *          A CASH OFFER IS READ FROM THE PAGE ITSELF (the Why the Exit Plan writes beside the stop), so a missing or
+ *          empty ledger never turns an offer holding into a stop-watched one; without the ledger the watch only
+ *          cannot tell a first target from a later one, and says "the target of record".
  *          A TRADING DAY: in the session it is proven by data - the S&P 500 fund must have traded within 10 minutes and
  *          a share's own price must be at most 20 minutes old, so on a holiday or after an early close nothing is fresh
  *          and nothing is sent. Before the open there is no trade to prove it, so the day is a trading day unless it is
@@ -82,7 +89,8 @@ var RW_ = {
   PRE_MIN: 75,            // the watch starts this long before the open
   GRACE_MIN: 10,          // and ends this long after the close
   LEDGER_TAIL: 400,       // ledger rows read from the bottom
-  STATUS_ROWS: 40,
+  PAGE_MAX_ROWS: 2000,    // the whole page is read; the HOLDINGS count on it is checked against the rows read
+  STATUS_ROWS: 40,        // the least the status block clears; a longer book gets a longer block
   STATUS_COLS: 11
 };
 
@@ -93,6 +101,9 @@ var RW_HOLIDAYS_ = ['2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '202
   '2027-09-06', '2027-11-25', '2027-12-24'];
 
 /* The limits of the rules. TFB_RISK_WATCH_CFG may replace any of them with a positive number. */
+/* The Exit Plan's own words for a holding kept under a cash offer (scripts/exit_plan.py offer_action; a test holds them). */
+var RW_OFFER_RE_ = /the sale is the owner's manual decision/i;
+
 var RW_LIMITS_ = {
   near_pct: 1.0,            // NEAR: within this much above the stop
   open_pct: 2.5,            // OPEN_RISK: the stop within this much of the last close ...
@@ -106,7 +117,7 @@ var RW_LIMITS_ = {
   fresh_min: 20,            // a share's price is at most this old
   market_fresh_min: 10,     // the fund's price is at most this old in the session
   page_max_days: 5,         // LEVELS: the Exit Plan page is at most this old
-  fail_runs: 3,             // PRICES: this many runs in a row without a price
+  fail_runs: 3,             // PRICES / NO_PRICE: this many runs in a row without a price
   mail_cap: 12              // e-mails a day
 };
 
@@ -231,11 +242,13 @@ function rwParseChartCore_(body) {
 }
 
 /* The Exit_Plan page (values) and the _Exit_Plan ledger (values, header first) -> the holdings to watch.
- * { ok, asOf ('yyyy-MM-dd HH:mm' Riyadh or ''), brokerKnown, count, list: [{ symbol, shares, entry, lastClose, atrPct,
- *   stop, target, action, brokerStop, tp1, offer }], why }
+ * { ok, asOf ('yyyy-MM-dd HH:mm' Riyadh or ''), brokerKnown, count, partial, ledgerRead, list: [{ symbol, shares, entry,
+ *   lastClose, atrPct, stop, target, action, brokerStop, tp1, tp1Known, offer }], why }
+ * offer comes from the page's own Why (the row that carries the stop), with the ledger's judgment as a second witness:
+ * a missing ledger never makes an offer holding an ordinary one. partial: fewer rows than the page's HOLDINGS count.
  * dayOf(cell) turns a ledger date cell (a Date or text) into 'yyyy-MM-dd'. */
 function rwHoldingsCore_(page, ledger, dayOf) {
-  var out = { ok: false, asOf: '', brokerKnown: false, count: 0, list: [], why: '' };
+  var out = { ok: false, asOf: '', brokerKnown: false, count: 0, partial: false, ledgerRead: false, list: [], why: '' };
   page = page || [];
   var r, c, top = -1, n = null, m;
   for (r = 0; r < page.length; r++) {
@@ -248,21 +261,26 @@ function rwHoldingsCore_(page, ledger, dayOf) {
   if (top < 0 || top + 1 >= page.length) { out.why = RW_.TAB_PAGE + ' has no HOLDINGS table'; return out; }
   var col = {}, hdr = page[top + 1] || [];
   for (c = 0; c < hdr.length; c++) col[rwTrim_(hdr[c])] = c;
-  if (!col.hasOwnProperty('Symbol') || !col.hasOwnProperty('Stop') || !col.hasOwnProperty('Target')) {
+  if (!col.hasOwnProperty('Symbol') || !col.hasOwnProperty('Stop') || !col.hasOwnProperty('Target') || !col.hasOwnProperty('Why')) {
     out.why = RW_.TAB_PAGE + ' HOLDINGS header not recognised'; return out;
   }
   var get = function (row, name) { return col.hasOwnProperty(name) ? row[col[name]] : ''; };
-  var flags = rwLedgerFlagsCore_(ledger, dayOf);
+  var flags = rwLedgerFlagsCore_(ledger, dayOf), any;
+  for (any in flags) if (flags.hasOwnProperty(any)) { out.ledgerRead = true; break; }
   for (r = top + 2; r < page.length; r++) {
     var row = page[r] || [], sym = rwTrim_(get(row, 'Symbol')).toUpperCase();
     if (!sym) break;
-    var last = rwNum_(get(row, 'Last close')), atrPct = rwNum_(get(row, 'ATR %')), f = flags[sym] || {};
+    var last = rwNum_(get(row, 'Last close')), atrPct = rwNum_(get(row, 'ATR %')), known = flags.hasOwnProperty(sym), f = known ? flags[sym] : {};
     out.list.push({ symbol: sym, shares: rwNum_(get(row, 'Qty')), entry: rwNum_(get(row, 'Entry')), lastClose: last,
                     atrPct: atrPct, stop: rwNum_(get(row, 'Stop')), target: rwNum_(get(row, 'Target')),
                     action: rwTrim_(get(row, 'Action')), brokerStop: out.brokerKnown ? rwNum_(get(row, 'Broker stop')) : null,
-                    tp1: f.tp1 === true, offer: f.offer === true });
+                    tp1: f.tp1 === true, tp1Known: known, offer: f.offer === true || RW_OFFER_RE_.test(rwTrim_(get(row, 'Why'))) });
   }
   out.ok = true; out.count = n === null ? out.list.length : n;
+  if (out.list.length !== out.count) {
+    out.partial = true;
+    out.why = RW_.TAB_PAGE + ' says ' + out.count + ' holding(s); ' + out.list.length + ' row(s) were read';
+  }
   return out;
 }
 
@@ -386,8 +404,10 @@ function rwEvaluateCore_(h, q, mkt, phase, lim, nowMs, hm) {
     out.push(rwAlert_('TARGET', sym, 2, tag + ' target reached',
       sym + ': ' + rwF_(px) + ' now - ' + (h.tp1
         ? 'the target of record ' + rwF_(h.target) + ' (the next +1R step) is reached.'
-        : 'the first target ' + rwF_(h.target) + ' (+1R) is reached. The plan\'s rule: sell half, and the stop rises to at least the entry' +
-          (h.entry !== null ? ' ' + rwF_(h.entry) : '') + '.') + ' The Exit Plan confirms it on the close.' + dayTxt));
+        : (h.tp1Known === false
+          ? 'the target of record ' + rwF_(h.target) + ' is reached (the ledger was not read: a first target or a later one, see the Exit Plan).'
+          : 'the first target ' + rwF_(h.target) + ' (+1R) is reached. The plan\'s rule: sell half, and the stop rises to at least the entry' +
+            (h.entry !== null ? ' ' + rwF_(h.entry) : '') + '.')) + ' The Exit Plan confirms it on the close.' + dayTxt));
   }
   if (chg !== null && chg <= -lim.drop_pct) {
     var step = Math.floor(-chg / lim.drop_pct) * lim.drop_pct;
@@ -409,15 +429,32 @@ function rwMarketAlertCore_(mkt, lim, near) {
     (list.length ? ' Holdings nearest to their stops: ' + list.join(', ') + '.' : ''));
 }
 
-/* The state of one New York day: { day, sent: { key: ms }, tried: { key: 1 }, mails, fail }. A new day starts clean;
- * fail (runs in a row without a price) carries over. tried = alerts whose e-mail failed: logged once, sent when it works. */
+/* The state of one New York day: { day, sent: { key: ms }, tried: { key: 1 }, mails, fail, miss: { SYMBOL: runs } }.
+ * A new day starts clean; fail (runs in a row without the market's price) and miss (the same, per holding) carry over.
+ * tried = alerts whose e-mail failed: logged once, sent when it works. */
 function rwStateCore_(raw, day) {
   var st = null;
   try { st = JSON.parse(rwTrim_(raw) || 'null'); } catch (e) { st = null; }
   var fail = st && typeof st.fail === 'number' && st.fail > 0 ? st.fail : 0;
-  if (!st || st.day !== day || typeof st.sent !== 'object' || st.sent === null) return { day: day, sent: {}, tried: {}, mails: 0, fail: fail };
+  var miss = st && typeof st.miss === 'object' && st.miss !== null ? st.miss : {};
+  if (!st || st.day !== day || typeof st.sent !== 'object' || st.sent === null) return { day: day, sent: {}, tried: {}, mails: 0, fail: fail, miss: miss };
   return { day: day, sent: st.sent, tried: typeof st.tried === 'object' && st.tried !== null ? st.tried : {},
-           mails: typeof st.mails === 'number' && st.mails > 0 ? st.mails : 0, fail: fail };
+           mails: typeof st.mails === 'number' && st.mails > 0 ? st.mails : 0, fail: fail, miss: miss };
+}
+
+/* Runs in a row without ONE holding's price. Counted only while the market's own price reads and the day is a trading
+ * day (when the market's price fails too, PRICES says so for all of them); a holding that left the book is dropped.
+ * miss: { SYMBOL: runs }, symbols: the watched holdings, quotes: { SYMBOL: parsed }. Returns the new map. */
+function rwMissCore_(miss, symbols, quotes, marketOk, tradingDay) {
+  var out = {}, i;
+  miss = miss || {};
+  for (i = 0; i < (symbols || []).length; i++) {
+    var sym = symbols[i], before = typeof miss[sym] === 'number' && miss[sym] > 0 ? miss[sym] : 0, q = quotes ? quotes[sym] : null;
+    if (q && q.ok) continue;                                    // it reads: the count ends
+    if (!marketOk || !tradingDay) { if (before) out[sym] = before; continue; }
+    out[sym] = before + 1;
+  }
+  return out;
 }
 
 /* The alerts not yet sent today. A NEAR after a CROSSED of the same holding is not news. */
@@ -466,8 +503,8 @@ function rwRecipient_(p) {
 function rwReadLevels_() {
   var ss = SpreadsheetApp.getActive(), page = [], ledger = [];
   var sp = ss.getSheetByName(RW_.TAB_PAGE);
-  if (!sp || sp.getLastRow() < 2) return { ok: false, asOf: '', brokerKnown: false, count: 0, list: [], why: RW_.TAB_PAGE + ' tab missing or empty' };
-  page = sp.getRange(1, 1, Math.min(sp.getLastRow(), 60), Math.min(Math.max(sp.getLastColumn(), 1), 16)).getValues();
+  if (!sp || sp.getLastRow() < 2) return { ok: false, asOf: '', brokerKnown: false, count: 0, partial: false, ledgerRead: false, list: [], why: RW_.TAB_PAGE + ' tab missing or empty' };
+  page = sp.getRange(1, 1, Math.min(sp.getLastRow(), RW_.PAGE_MAX_ROWS), Math.min(Math.max(sp.getLastColumn(), 1), 16)).getValues();
   var sl = ss.getSheetByName(RW_.TAB_LEDGER);
   if (sl && sl.getLastRow() >= 2) {
     var lastRow = sl.getLastRow(), width = Math.min(Math.max(sl.getLastColumn(), 1), 19);
@@ -519,13 +556,13 @@ function rwWriteStatus_(head, rows) {
                 [],
                 ['Symbol', 'Price', 'Price time (Riyadh)', 'Today %', 'Stop used', 'Stop is', 'Above the stop %', 'Target', 'To the target %', 'State', 'Alerts today']]
       .concat(rows);
-    var block = [];
-    for (var r = 0; r < RW_.STATUS_ROWS; r++) {
+    var block = [], height = Math.min(Math.max(RW_.STATUS_ROWS, grid.length, sh.getLastRow()), RW_.PAGE_MAX_ROWS + 5);
+    for (var r = 0; r < height; r++) {
       var src = grid[r] || [], line = [];
       for (var c = 0; c < RW_.STATUS_COLS; c++) line.push(src[c] === undefined || src[c] === null ? '' : src[c]);
       block.push(line);
     }
-    sh.getRange(1, 1, RW_.STATUS_ROWS, RW_.STATUS_COLS).setValues(block);
+    sh.getRange(1, 1, height, RW_.STATUS_COLS).setValues(block);
   } catch (e) { /* the alert never depends on its tab */ }
 }
 
@@ -555,7 +592,7 @@ function rwRunLocked_(p, mode, phase, clock, nowMs, force) {
   var st = rwStateCore_(p.getProperty(RW_.PROP_STATE), clock.day);
   var stamp = Utilities.formatDate(new Date(nowMs), RW_.TZ_RIYADH, 'yyyy-MM-dd HH:mm');
   var lv;
-  try { lv = rwReadLevels_(); } catch (eS) { lv = { ok: false, asOf: '', brokerKnown: false, count: 0, list: [], why: 'workbook not read: ' + String(eS && eS.message || eS).slice(0, 80) }; }
+  try { lv = rwReadLevels_(); } catch (eS) { lv = { ok: false, asOf: '', brokerKnown: false, count: 0, partial: false, ledgerRead: false, list: [], why: 'workbook not read: ' + String(eS && eS.message || eS).slice(0, 80) }; }
   var alerts = [], health = [];
   // LEVELS: the page is missing, unreadable or old
   var pageAge = null;
@@ -567,6 +604,10 @@ function rwRunLocked_(p, mode, phase, clock, nowMs, force) {
   else if (pageAge === null || pageAge > lim.page_max_days) {
     health.push(rwAlert_('LEVELS', 'HEALTH', 1, 'the Exit Plan levels are old', 'Risk watch: the ' + RW_.TAB_PAGE + ' page was last written ' +
       (lv.asOf ? lv.asOf + ' Riyadh (' + rwF_(pageAge, 0) + ' days ago)' : 'at an unknown time') + '. The stops and targets it watches are old.'));
+  }
+  if (lv.ok && lv.partial) {
+    health.push(rwAlert_('LEVELS_PART', 'HEALTH', 1, 'the Exit Plan page was read in part', 'Risk watch: ' + lv.why +
+      '. The holdings not read are not watched.'));
   }
   var watched = [], i;
   for (i = 0; i < lv.list.length; i++) if (rwWatched_(lv.list[i].symbol)) watched.push(lv.list[i]);
@@ -582,6 +623,16 @@ function rwRunLocked_(p, mode, phase, clock, nowMs, force) {
   var holiday = rwHolidayCore_(clock.day, p.getProperty(RW_.PROP_HOLIDAYS));
   var openMs = Math.floor(nowMs / 60000) * 60000 + (RW_.OPEN_MIN - clock.minutes) * 60000;      // today's open, by this clock
   var mkt = rwMarketCore_(mq.ok ? mq : null, phase, nowMs, lim, holiday, openMs), rows = [], near = [];
+  // NO_PRICE: runs in a row without ONE holding's price while the market's reads - that holding is not watched
+  st.miss = rwMissCore_(st.miss, watched.map(function (h) { return h.symbol; }), quotes, mq.ok, mkt.tradingDay);
+  for (i = 0; i < watched.length; i++) {
+    var ms = watched[i].symbol, runs = st.miss[ms] || 0;
+    if (runs < lim.fail_runs || phase === 'idle') continue;
+    health.push(rwAlert_('NO_PRICE', ms, 1, rwShort_(ms) + ' price not readable', ms + ': its price could not be read for ' + runs +
+      ' runs in a row (last answer: ' + rwTrim_((quotes[ms] || {}).why || 'none') + ') while the ' + RW_.MARKET_NAME + '\'s price reads. ' +
+      (phase === 'pre' ? 'A pre-market trade under its stop cannot be seen; the rule on the stop\'s distance from the last close still runs.'
+        : 'No price rule runs for this holding until it reads: check it at the broker.')));
+  }
   for (i = 0; i < lv.list.length; i++) {
     var h = lv.list[i], q = quotes[h.symbol], mine = [];
     if (!rwWatched_(h.symbol)) {
@@ -636,7 +687,7 @@ function rwRunLocked_(p, mode, phase, clock, nowMs, force) {
   var head = 'Read ' + stamp + ' Riyadh - mode ' + mode + ' - ' +
     (phase === 'pre' ? 'before the open' : (phase === 'session' ? 'session' : 'outside market hours (manual run)')) + ' - market: ' +
     (mkt.tradingDay ? 'trading' + (mkt.chgPct === null ? '' : ', ' + RW_.MARKET_NAME + ' ' + rwPct_(mkt.chgPct)) : 'not trading (' + (mkt.why || 'closed') + ')') +
-    ' - levels: Exit Plan of ' + (lv.asOf || 'n/a') + ' - e-mails today ' + st.mails + ' of ' + lim.mail_cap + ' - ' + note;
+    ' - levels: Exit Plan of ' + (lv.asOf || 'n/a') + (lv.ok && !lv.ledgerRead ? ' (ledger not read)' : '') + ' - e-mails today ' + st.mails + ' of ' + lim.mail_cap + ' - ' + note;
   rwWriteStatus_(head, rows);
   try { p.setProperty(RW_.PROP_STATE, JSON.stringify(st)); } catch (eP) { /* the next run reads the old state and may repeat an alert */ }
   return (force && phase === 'idle' ? 'manual' : phase) + ': ' + note;
@@ -736,6 +787,15 @@ function tfbRiskWatchSelfTest() {
   ok(rwEvaluateCore_(iboc, s, sm, 'session', lim, open + 660000, hm)[0].code === 'CROSSED', 'crossed');
   ok(rwEvaluateCore_(iboc, s, sm, 'session', lim, open + 40 * 60000, hm).length === 0, 'an old price fires nothing');
   ok(rwEvaluateCore_(iboc, s, { ok: true, tradingDay: false, chgPct: null }, 'session', lim, open + 660000, hm).length === 0, 'a closed market fires nothing');
+  var pg = [['As of 2026-11-25 08:35 Riyadh - broker orders read 2026-11-25 08:05'], ['HOLDINGS (1)'],
+            ['Symbol', 'Last close', 'ATR %', 'Stop', 'Target', 'Action', 'Why', 'Broker stop'],
+            ['DDI.US', '15.50', '0.6', '15.22', '16.25', 'HOLD', 'cash offer 16.25 a share; the sale is the owner\'s manual decision: no stop order is asked for', 'unknown']];
+  var hv = rwHoldingsCore_(pg, [], null);
+  ok(hv.ok && hv.list.length === 1 && hv.list[0].offer === true && hv.partial === false && hv.ledgerRead === false, 'an offer is read from the page, without the ledger');
+  pg[1][0] = 'HOLDINGS (2)';
+  ok(rwHoldingsCore_(pg, [], null).partial === true, 'a page read in part');
+  var mm = rwMissCore_({ 'A.US': 2 }, ['A.US', 'B.US'], { 'B.US': { ok: true } }, true, true);
+  ok(mm['A.US'] === 3 && mm['B.US'] === undefined && rwMissCore_({ 'A.US': 2 }, ['A.US'], {}, false, true)['A.US'] === 2, 'runs without one holding\'s price');
   var st = rwStateCore_('', '2026-11-25');
   var due = rwDueCore_(st, [rwAlert_('NEAR', 'A.US', 2, 't', 'l'), rwAlert_('CROSSED', 'A.US', 1, 't', 'l')]);
   ok(due.length === 2 && due[0].code === 'CROSSED', 'due, most severe first');

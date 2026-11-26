@@ -22,6 +22,10 @@
  *   W13 observe; a failed e-mail is tried again; the daily cap; no recipient; the lock
  *   W14 owner functions; summer time
  *   W15 mutants: each guard removed is caught
+ *   W16 a holding whose price does not read while the market's does is named, once (Codex P2 on #1088)
+ *   W17 a book longer than a screen is read whole; a page read in part says so (Codex P2 on #1088)
+ *   W18 a cash offer is read from the page itself: a missing ledger never makes it a stop-watched holding (Codex P2
+ *       on #1088)
  * The last line is 'PASS k/k' (exit 1 on any failure).
  */
 'use strict';
@@ -55,13 +59,17 @@ const OPEN25 = Z(25, 14, 30), PRE25 = Z(25, 9, 0);                   // 09:30 an
 
 /* the Exit_Plan page as scripts/exit_plan.py page_rows writes it (tests/test_rw_v100_risk_watch.py pins the layout) */
 const PAGE_HDR = ['Symbol', 'Name', 'Qty', 'Entry', 'Last close', 'Live', 'P/L %', 'Highest close', 'ATR %', 'Gain at high (R)', 'Stop', 'Was', 'Target', 'Action', 'Why', 'Broker stop'];
+/* the Why the Exit Plan writes for a holding kept under a cash offer (scripts/exit_plan.py offer_action) */
+const OFFER_WHY = "cash offer 16.25 a share (cash tender by Bidder Co, conditional), open until 2026-12-10 - 15 days left, and the broker's cut-off comes earlier; " +
+  "the last close is 4.6% under it; the sale is the owner's manual decision: no stop order is asked for; the stop of record 15.22 is frozen while the offer " +
+  "stands and the target is the offer price; the market-turn rule does not apply (the price follows the offer, not the market)";
 function page(holdings, opts) {
   opts = opts || {};
   const rows = [['EXIT PLAN - stop and target per holding, reviewed after every close'],
     ['As of ' + (opts.asOf || '2026-11-25 08:35') + ' Riyadh · daily bars to 2026-11-24 · ' + (opts.broker || 'broker orders from the IBKR capture of 2026-11-25 08:05 Riyadh')],
-    ['Rule: initial stop 3xATR ...'], ['Today: HOLD ' + holdings.length], [], ['HOLDINGS (' + holdings.length + ')'], opts.hdr || PAGE_HDR];
+    ['Rule: initial stop 3xATR ...'], ['Today: HOLD ' + holdings.length], [], ['HOLDINGS (' + (opts.count === undefined ? holdings.length : opts.count) + ')'], opts.hdr || PAGE_HDR];
   holdings.forEach(h => rows.push([h.symbol, h.name || '', String(h.qty || 10), (h.entry || h.close).toFixed(2), h.close.toFixed(2), '—', '+0.0', h.close.toFixed(2),
-    (h.atrPct === undefined ? 2.0 : h.atrPct).toFixed(1), '+0.0', h.stop.toFixed(2), '—', h.target.toFixed(2), h.action || 'HOLD', 'why', h.broker === undefined ? 'unknown' : h.broker.toFixed(2)]));
+    (h.atrPct === undefined ? 2.0 : h.atrPct).toFixed(1), '+0.0', h.stop.toFixed(2), '—', h.target.toFixed(2), h.action || 'HOLD', h.why !== undefined ? h.why : (h.judgment === 'offer:manual' ? OFFER_WHY : 'why'), h.broker === undefined ? 'unknown' : h.broker.toFixed(2)]));
   rows.push([], ["TODAY'S PLAN PICKS - per-stock levels (0)"], ['Symbol', 'Entry']);
   return rows.map(r => { const o = r.slice(); while (o.length < 16) o.push(''); return o; });
 }
@@ -139,6 +147,13 @@ const ON = { TFB_RISK_WATCH: 'on' };
 const IBOC = { symbol: 'IBOC.US', close: 63.77, atrPct: 1.9, stop: 62.67, target: 74.81, broker: 62.67 };
 const GLPI = { symbol: 'GLPI.US', entry: 38.50, close: 39.01, atrPct: 1.6, stop: 35.74, target: 42.02, broker: 35.74 };
 const DDI = { symbol: 'DDI.US', close: 15.50, atrPct: 0.6, stop: 15.22, target: 16.25, judgment: 'offer:manual' };
+const LONG = []; for (let i = 0; i < 70; i++) LONG.push({ symbol: 'H' + (i < 10 ? '0' : '') + i + '.US', close: 100, atrPct: 2.0, stop: 90, target: 120, broker: 90 });
+function longCharts(ms) {
+  const c = { SPY: spyLive(ms) };
+  LONG.forEach(h => { c[h.symbol.replace('.US', '')] = live(ms, 100.5, 100); });
+  c.H69 = live(ms, 90.5, 91);                                           // the last row of the page is near its stop
+  return c;
+}
 function book(holdings, opts) { return { Exit_Plan: page(holdings, opts), _Exit_Plan: ledger(holdings, opts && opts.ledgerDay) }; }
 const spyPre = (at) => chart({ price: 590.0, at: YESTERDAY, prev: 588.0, pre: [[at - 600000, 590.5, 1000], [at - 120000, 590.8, 2000]] });
 const spyLive = (at, px) => chart({ price: px === undefined ? 590.0 : px, at: at - 20000, prev: 590.0 });
@@ -531,6 +546,108 @@ test('W15 mutants: each guard removed is caught', () => {
   const e = mutate("    if (!force) return 'off';", "");
   const we = world({}, book([IBOC])); we.charts = { SPY: spyLive(ms), IBOC: live(ms, 63.20, 63.77) };
   ok(tick(we, ms, { src: e }).ret !== 'off', 'mutant e not caught');
+  // (f) the offer read from the page: with the ledger as the only witness, a missing ledger makes DDI a stop-watched holding
+  const f = mutate("offer: f.offer === true || RW_OFFER_RE_.test(rwTrim_(get(row, 'Why'))) });", "offer: f.offer === true });");
+  const wf = world(ON, { Exit_Plan: page([DDI]) }); wf.charts = { SPY: spyLive(ms), DDI: live(ms, 14.90, 15.50) };
+  ok(/under the offer/.test(tick(wf, ms).mails[0].subject));
+  const wf2 = world(ON, { Exit_Plan: page([DDI]) }); wf2.charts = wf.charts;
+  ok(/DDI at or below its stop/.test(tick(wf2, ms, { src: f }).mails[0].subject), 'mutant f not caught');
+  // (g) the whole page: capped at 60 rows, a 70-holding book loses its tail
+  const g = mutate("Math.min(sp.getLastRow(), RW_.PAGE_MAX_ROWS)", "Math.min(sp.getLastRow(), 60)");
+  const wg = world(ON, book(LONG)); wg.charts = longCharts(ms);
+  ok(tick(wg, ms, { src: g }).fetches.filter(x => x.host === 'query1.finance.yahoo.com').length < 71, 'mutant g not caught');
+  // (h) the count per holding: restarted every run, it never reaches the limit
+  const h = mutate("    out[sym] = before + 1;", "    out[sym] = 1;");
+  const wh = world(ON, book([IBOC]));
+  let mailsH = 0;
+  for (let k = 0; k < 4; k++) { wh.charts = { SPY: spyLive(ms + k * 300000) }; mailsH += tick(wh, ms + k * 300000, { src: h }).mails.length; }
+  eq(mailsH, 0, 'mutant h not caught');
+});
+
+// ------------------------------------------------------------------ W16 one holding without a price
+test('W16 a holding whose price does not read while the market reads is named, once', () => {
+  const ms = OPEN25 + 600000, step = 300000;
+  const w = world(ON, book([IBOC, GLPI]));
+  const at = (k) => { const m = ms + k * step; w.charts = { SPY: spyLive(m), GLPI: live(m, 39.2, 39.01) }; return tick(w, m); };   // no IBOC chart: 404 on both hosts
+  eq(at(0).mails.length, 0); eq(state(w).miss['IBOC.US'], 1); eq(state(w).fail, 0);
+  eq(at(1).mails.length, 0);
+  const t3 = at(2);
+  eq(t3.mails.length, 1); eq(t3.mails[0].subject, 'TFB risk watch: IBOC price not readable');
+  ok(/^- IBOC\.US: its price could not be read for 3 runs in a row \(last answer: HTTP 404\) while the S&P 500 fund's price reads\. No price rule runs for this holding until it reads: check it at the broker\./.test(t3.mails[0].body), t3.mails[0].body);
+  eq(logRows(w)[0].slice(3, 5).join('|'), 'NO_PRICE|IBOC.US');
+  eq(at(3).mails.length, 0); eq(state(w).miss['IBOC.US'], 4); ok(state(w).miss['GLPI.US'] === undefined);
+  // it reads again: the count ends, and the rules run on it
+  const m5 = ms + 4 * step; w.charts = { SPY: spyLive(m5), GLPI: live(m5, 39.2, 39.01), IBOC: live(m5, 63.20, 63.77) };
+  const t5 = tick(w, m5); eq(t5.mails.length, 1); ok(/IBOC 0\.8% above its stop/.test(t5.mails[0].subject), t5.mails[0].subject); ok(state(w).miss['IBOC.US'] === undefined);
+  // when the market's own price fails too, PRICES speaks for all: no line per holding, the count stands, a holding that left is dropped
+  const x = world(ON, book([IBOC]));
+  x.props.TFB_RISK_WATCH_STATE = JSON.stringify({ day: '2026-11-25', sent: {}, tried: {}, mails: 0, fail: 0, miss: { 'IBOC.US': 2, 'GONE.US': 7 } });
+  x.http = { 'query1.finance.yahoo.com': 429, 'query2.finance.yahoo.com': 429 };
+  eq(tick(x, ms).mails.length, 0); eq(state(x).miss['IBOC.US'], 2); ok(state(x).miss['GONE.US'] === undefined, 'a holding that left the book is dropped');
+  // a closed day in session hours: the fund is not fresh, so nothing is counted
+  const c = world(ON, book([IBOC])); c.charts = { SPY: closed(590) };
+  for (let k = 0; k < 4; k++) eq(tick(c, Z(26, 15, 0) + k * step).mails.length, 0);
+  ok(state(c).miss['IBOC.US'] === undefined);
+  // before the open it is said too, with what still works
+  const y = world(ON, book([GLPI])), pre = Z(25, 13, 20);
+  for (let k = 0; k < 2; k++) { y.charts = { SPY: spyPre(pre + k * step) }; eq(tick(y, pre + k * step).mails.length, 0); }
+  y.charts = { SPY: spyPre(pre + 2 * step) };
+  const ty = tick(y, pre + 2 * step);
+  eq(ty.mails.length, 1); eq(ty.mails[0].subject, 'TFB risk watch: GLPI price not readable');
+  ok(/A pre-market trade under its stop cannot be seen; the rule on the stop's distance from the last close still runs\./.test(ty.mails[0].body), ty.mails[0].body);
+  // the pure count
+  const e = env(SRC, world(), ms);
+  eq(JSON.stringify(e.rwMissCore_({ 'A.US': 2, 'B.US': 1, 'GONE.US': 9 }, ['A.US', 'B.US', 'C.US'], { 'A.US': { ok: false }, 'B.US': { ok: true } }, true, true)), '{"A.US":3,"C.US":1}');
+  eq(JSON.stringify(e.rwMissCore_({ 'A.US': 2 }, ['A.US', 'C.US'], {}, false, true)), '{"A.US":2}');
+  eq(JSON.stringify(e.rwMissCore_({ 'A.US': 2 }, ['A.US'], {}, true, false)), '{"A.US":2}');
+  eq(JSON.stringify(e.rwStateCore_(JSON.stringify({ day: '2026-11-24', sent: { x: 1 }, fail: 2, miss: { 'A.US': 3 } }), '2026-11-25')), '{"day":"2026-11-25","sent":{},"tried":{},"mails":0,"fail":2,"miss":{"A.US":3}}');
+});
+
+// ------------------------------------------------------------------ W17 a long book; a page read in part
+test('W17 a book longer than a screen is read whole; a page read in part says so', () => {
+  const ms = OPEN25 + 600000;
+  const w = world(ON, book(LONG)); w.charts = longCharts(ms);
+  const t = tick(w, ms);
+  eq(t.fetches.filter(f => f.host === 'query1.finance.yahoo.com').length, 71); eq(t.fetches.length, 71);
+  eq(t.mails.length, 1); eq(t.mails[0].subject, 'TFB risk watch: H69 0.6% above its stop');
+  eq(statusRows(w).length, 70); eq(statusOf(w, 'H69.US')[9], 'NEAR'); eq(statusOf(w, 'H00.US')[9], 'watched');
+  // a shorter book afterwards leaves no old row behind
+  w.sheets.Exit_Plan = page([IBOC]); w.sheets._Exit_Plan = ledger([IBOC]); w.charts = { SPY: spyLive(ms + 300000), IBOC: live(ms + 300000, 64.5, 63.77) };
+  tick(w, ms + 300000); eq(statusRows(w).length, 1); eq(statusRows(w)[0][0], 'IBOC.US');
+  // the page's own count is the check: fewer rows than it says is said once, and the rows read are still watched
+  const x = world(ON, { Exit_Plan: page([IBOC, GLPI], { count: 3 }), _Exit_Plan: ledger([IBOC, GLPI]) });
+  x.charts = { SPY: spyLive(ms), IBOC: live(ms, 63.20, 63.77), GLPI: live(ms, 39.2, 39.01) };
+  const tx = tick(x, ms);
+  eq(tx.mails.length, 1); eq(tx.mails[0].subject, 'TFB risk watch: the Exit Plan page was read in part; IBOC 0.8% above its stop');
+  ok(/^- Risk watch: Exit_Plan says 3 holding\(s\); 2 row\(s\) were read\. The holdings not read are not watched\./m.test(tx.mails[0].body), tx.mails[0].body);
+  x.charts = { SPY: spyLive(ms + 300000), IBOC: live(ms + 300000, 63.20, 63.77), GLPI: live(ms + 300000, 39.2, 39.01) };
+  eq(tick(x, ms + 300000).mails.length, 0);
+});
+
+// ------------------------------------------------------------------ W18 the offer is read from the page
+test('W18 a cash offer is read from the page itself: a missing ledger never makes it a stop-watched holding', () => {
+  const ms = OPEN25 + 600000;
+  const run = (sheets) => { const w = world(ON, sheets); w.charts = { SPY: spyLive(ms), DDI: live(ms, 14.90, 15.50), GLPI: live(ms, 42.10, 41.50) }; return { w, t: tick(w, ms) }; };
+  // no ledger tab, an empty one, one without the holding: 14.90 is under the frozen stop 15.22 and no stop line is written
+  [{ Exit_Plan: page([DDI]) }, { Exit_Plan: page([DDI]), _Exit_Plan: [] }, { Exit_Plan: page([DDI]), _Exit_Plan: ledger([GLPI]) }].forEach((sheets, i) => {
+    const r = run(sheets);
+    eq(r.t.mails.length, 1, 'case ' + i); eq(r.t.mails[0].subject, 'TFB risk watch: DDI 8.3% under the offer', 'case ' + i);
+    ok(!/at or below its stop|Exit Plan stop|stop working/.test(r.t.mails[0].subject + r.t.mails[0].body), 'case ' + i);
+    eq(statusOf(r.w, 'DDI.US')[5], 'none: cash offer, manual sale');
+  });
+  // the ledger alone still says it (a page whose Why does not)
+  eq(run({ Exit_Plan: page([Object.assign({}, DDI, { why: 'why' })]), _Exit_Plan: ledger([DDI]) }).t.mails[0].subject, 'TFB risk watch: DDI 8.3% under the offer');
+  // neither says it: an ordinary holding, by its Exit Plan stop
+  ok(/DDI at or below its stop/.test(run({ Exit_Plan: page([Object.assign({}, DDI, { why: 'why', judgment: '' })]), _Exit_Plan: ledger([Object.assign({}, DDI, { judgment: '' })]) }).t.mails[0].subject));
+  // an ordinary holding without a ledger keeps its rules; its target line does not guess first or next
+  const r3 = run({ Exit_Plan: page([GLPI]) });
+  eq(r3.t.mails[0].subject, 'TFB risk watch: GLPI target reached');
+  ok(/42\.10 now - the target of record 42\.02 is reached \(the ledger was not read: a first target or a later one, see the Exit Plan\)\. The Exit Plan confirms it on the close\./.test(r3.t.mails[0].body), r3.t.mails[0].body);
+  ok(/levels: Exit Plan of 2026-11-25 08:35 \(ledger not read\) - /.test(r3.w.sheets.Risk_Watch[1][0]), r3.w.sheets.Risk_Watch[1][0]);
+  ok(!/ledger not read/.test(run(book([GLPI])).w.sheets.Risk_Watch[1][0]));
+  // a page without its Why column cannot say what is under an offer: nothing is guessed, LEVELS says so
+  const r4 = run({ Exit_Plan: page([DDI], { hdr: PAGE_HDR.filter(c => c !== 'Why') }), _Exit_Plan: ledger([DDI]) });
+  eq(r4.t.mails.length, 1); ok(/Exit_Plan HOLDINGS header not recognised/.test(r4.t.mails[0].body));
 });
 
 console.log((failed === 0 ? 'PASS ' : 'FAIL ') + passed + '/' + (passed + failed));

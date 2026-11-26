@@ -34,8 +34,9 @@ What the system did before these opens:
 | | `MARKET` | the S&P 500 fund is down 2 % or more, again at 3 %, 4 % … |
 | A cash offer | `OFFER_AWAY` | a holding kept under an offer trades 8 % or more under the offer price, or falls 3 % on the day (the Exit Plan's own offer limits) |
 | | `OFFER_AT` | it trades within 0.5 % of the offer price |
-| Its own health | `PRICES` | three runs in a row without a price |
-| | `LEVELS` | the Exit Plan page is missing, unreadable or older than 5 days |
+| Its own health | `PRICES` | three runs in a row without the market's price |
+| | `NO_PRICE` | three runs in a row without **one holding's** price while the market's reads: that holding is not watched until it reads, and the e-mail names it |
+| | `LEVELS` | the Exit Plan page is missing, unreadable, read in part (fewer rows than its own HOLDINGS count) or older than 5 days |
 
 **On the two mornings above** it would have sent `OPEN_RISK` at about 16:15 Riyadh, 75 minutes before each open (the harness runs the IBOC morning with its real figures).
 
@@ -47,8 +48,11 @@ What the system did before these opens:
 ### What it reads, and how that is held
 | It reads | Written by | Pinned by |
 |---|---|---|
-| `Exit_Plan` page: Qty, Entry, Last close, ATR %, Stop, Target, Action, Broker stop; the "As of" time; the broker note | `scripts/exit_plan.py` `page_rows` | a test builds the page with the real `page_rows` and reads it with the watch's own reader |
-| `_Exit_Plan` ledger, newest day: TP1 Reached, Judgment (`offer:manual`) | `scripts/exit_plan.py` | the same test, with `LEDGER_HEADERS` |
+| `Exit_Plan` page, every row: Qty, Entry, Last close, ATR %, Stop, Target, Action, Why, Broker stop; the "As of" time; the broker note; the HOLDINGS count | `scripts/exit_plan.py` `page_rows` | a test builds the page with the real `page_rows` and reads it with the watch's own reader (also a 71-holding page) |
+| **Whether a holding is kept under a cash offer**: the page's own Why ("the sale is the owner's manual decision"), written beside the stop | `scripts/exit_plan.py` `offer_action` | a test writes the Why with the real `offer_action` and reads the offer with no ledger at all |
+| `_Exit_Plan` ledger, newest day: TP1 Reached; Judgment (`offer:manual`) as a second witness | `scripts/exit_plan.py` | the same test, with `LEDGER_HEADERS` |
+
+Without the ledger the watch loses one thing only: it cannot tell a first target from a later one, says "the target of record", and the `Risk_Watch` tab's first line says "ledger not read".
 | Yahoo v8 chart, 5-minute bars with the pre-market | — | parser held to `scripts/pre_open_check.py` `parse_prepost` (only this morning's bars) and to the provider's previous-close order |
 
 ### What it writes
@@ -78,9 +82,16 @@ At most 12 e-mails a day; the twelfth says so, and later alerts go to the tab an
 ## Tests
 | File | What it pins |
 |---|---|
-| `tests/test_rw_v100_risk_watch.js` (16 groups) | the real `.gs` in a vm with a real time-zone clock: the gate; idle hours and weekends read nothing; **the IBOC morning of 25 Nov with its real figures** — one e-mail, once; a pre-market trade at or below the stop; a holiday (calendar before the open, data in the session); the rule working with Yahoo down; near then crossed, once each, a new day clean; first and next target; a sharp fall and its steps; the market's fall; a holding under an offer; an old price fires nothing; a listing outside the US; health (prices, second host, levels, an all-cash book); observe; a failed e-mail tried again and logged once; the daily cap; recipient order; the lock; owner functions; summer time; five mutants, each caught |
-| `tests/test_rw_v100_risk_watch.py` (6) | runs the harness under pytest; the page built by the real `page_rows` read by the watch (four broker notes, thousands separators, an all-cash book); tab names, columns, Yahoo symbol, hosts and offer limits equal to the Exit Plan's; the holiday list holds the repository's own; no new Google service |
+| `tests/test_rw_v100_risk_watch.js` (19 groups) | the real `.gs` in a vm with a real time-zone clock: the gate; idle hours and weekends read nothing; **the IBOC morning of 25 Nov with its real figures** — one e-mail, once; a pre-market trade at or below the stop; a holiday (calendar before the open, data in the session); the rule working with Yahoo down; near then crossed, once each, a new day clean; first and next target; a sharp fall and its steps; the market's fall; a holding under an offer; an old price fires nothing; a listing outside the US; health (prices, second host, levels, an all-cash book); observe; a failed e-mail tried again and logged once; the daily cap; recipient order; the lock; owner functions; summer time; one holding without a price named once; a 70-holding book read whole and a page read in part; an offer read from the page with no ledger; eight mutants, each caught |
+| `tests/test_rw_v100_risk_watch.py` (8) | runs the harness under pytest; the page built by the real `page_rows` read by the watch (four broker notes, thousands separators, an all-cash book); the offer Why written by the real `offer_action`; a 71-holding page against its own count; tab names, columns, Yahoo symbol, hosts and offer limits equal to the Exit Plan's; the holiday list holds the repository's own; no new Google service |
 | `tfbRiskWatchSelfTest` (in the file) | the pure rules, runnable from the Apps Script editor |
+
+## Review (Codex on #1088, three P2 — all taken)
+| Finding | Was | Now |
+|---|---|---|
+| One holding's price fails while the market's reads | the failure count followed the market's price only, so that holding went unwatched with no word | a count per holding (`miss`, kept in the state); at three runs `NO_PRICE` names it, once a day; counted only while the market's price reads on a trading day; a holding that leaves the book is dropped |
+| The page read stopped at 60 rows | a book of more than 53 holdings lost its tail silently | the whole page is read, and the rows read are held against the page's own `HOLDINGS (n)`: a shortfall is `LEVELS` "read in part"; the status tab grows with the book |
+| The offer flag came from the ledger alone | a missing or empty ledger made a cash-offer holding a stop-watched one | the offer is read from the page's own Why (the row that carries the stop), the ledger is a second witness; a page without its Why column is `LEVELS` "header not recognised" and nothing is guessed |
 
 ## After merge — owner (or Claude in the connected browser, on the owner's word)
 1. Apps Script → new file `32_Risk_Watch` → paste `apps_script/32_Risk_Watch.gs`.

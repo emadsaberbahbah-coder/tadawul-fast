@@ -49,7 +49,7 @@ def test_rw_v100_risk_watch_native_harness():
         pytest.skip("node is not installed")
     result = subprocess.run([node, str(HARNESS)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.rstrip().endswith("PASS 16/16"), result.stdout[-2000:]
+    assert result.stdout.rstrip().endswith("PASS 19/19"), result.stdout[-2000:]
 
 
 def _result(symbol, shares, entry, last, stop, target, atr_pct, broker, action="HOLD"):
@@ -92,6 +92,53 @@ def test_the_watch_reads_the_page_the_exit_plan_writes():
                                   "summary": "Today: no holdings"}, xp.knobs())
     got = _node(LOAD + "console.log(JSON.stringify(ctx.rwHoldingsCore_(inp.page, inp.ledger, null)));", {"page": empty, "ledger": []})
     assert got["ok"] is True and got["count"] == 0 and got["list"] == []
+
+
+def test_a_cash_offer_is_read_from_the_exit_plans_own_words_without_the_ledger():
+    """Codex P2 on #1088: with the ledger missing, a holding kept under a cash offer must not become a stop-watched one.
+    The Why is written by the Exit Plan's own offer_action; the watch reads the offer from it, with no ledger at all."""
+    import datetime as dt
+
+    from core import corporate_offers as co
+
+    offer = co.parse({"schema": co.SCHEMA, "offers": [{
+        "symbol": "DDI.US", "kind": "cash_tender", "price": 16.25, "announced": "2026-11-10", "expires": "2026-12-10",
+        "bidder": "Bidder Co", "conditions": "a minimum", "sale": "manual"}]})[0]
+    held = _result("DDI.US", 10, 14.0, 15.5, 15.22, 16.25, 0.6, None)
+    held["why"] = []
+    xp.offer_action(held, offer, [], xp.knobs(), dt.date(2026, 11, 25))
+    assert held["offer_held"] is True and "the sale is the owner's manual decision" in held["why"][-1]
+    plain = _result("IBOC.US", 10, 66.0, 63.77, 62.67, 74.81, 1.9, 62.67)
+    info = {"headline": "As of 2026-11-25 08:35 Riyadh · daily bars to 2026-11-24 · broker orders read 2026-11-25 08:05", "summary": "s"}
+    page = xp.page_rows([held, plain], [], info, xp.knobs())
+    for ledger in ([], [list(xp.LEDGER_HEADERS)], None):
+        got = _node(LOAD + "console.log(JSON.stringify(ctx.rwHoldingsCore_(inp.page, inp.ledger, null)));", {"page": page, "ledger": ledger})
+        by = {h["symbol"]: h for h in got["list"]}
+        assert got["ok"] is True and got["partial"] is False and got["ledgerRead"] is False
+        assert by["DDI.US"]["offer"] is True and by["DDI.US"]["target"] == 16.25 and by["DDI.US"]["tp1Known"] is False
+        assert by["IBOC.US"]["offer"] is False and by["IBOC.US"]["stop"] == 62.67
+    # the words the watch looks for are the Exit Plan's, in its source
+    rx = re.search(r"var RW_OFFER_RE_ = /(.+?)/i;", SOURCE.read_text(encoding="utf-8")).group(1)
+    assert rx == "the sale is the owner's manual decision" and rx in Path(xp.__file__).read_text(encoding="utf-8")
+
+
+def test_a_long_page_is_read_whole_and_checked_against_its_own_count():
+    """Codex P2 on #1088: page_rows has no limit on holdings, so the watch reads every row and holds the rows read
+    against the page's own HOLDINGS count."""
+    results = [_result("H%02d.US" % i, 10, 100.0, 100.0, 90.0, 120.0, 2.0, 90.0) for i in range(70)]
+    # one holding without daily bars: listed on the page with blank levels, and counted
+    results.append({"ok": False, "symbol": "NOBARS.US", "name": "n", "shares": 10, "entry": 5.0, "action": "REVIEW", "why": ["no daily price history"]})
+    info = {"headline": "As of 2026-11-25 08:35 Riyadh · daily bars to 2026-11-24 · broker orders read 2026-11-25 08:05", "summary": "s"}
+    page = xp.page_rows(results, [], info, xp.knobs())
+    got = _node(LOAD + "console.log(JSON.stringify(ctx.rwHoldingsCore_(inp.page, [], null)));", {"page": page})
+    assert got["ok"] is True and got["count"] == 71 and len(got["list"]) == 71 and got["partial"] is False
+    blank = [h for h in got["list"] if h["symbol"] == "NOBARS.US"][0]
+    assert blank["stop"] is None and blank["target"] is None and blank["lastClose"] is None
+    cut = _node(LOAD + "console.log(JSON.stringify(ctx.rwHoldingsCore_(inp.page, [], null)));", {"page": page[:60]})
+    assert cut["ok"] is True and cut["partial"] is True and cut["count"] == 71 and len(cut["list"]) == 53
+    assert cut["why"] == "Exit_Plan says 71 holding(s); 53 row(s) were read"
+    src = SOURCE.read_text(encoding="utf-8")
+    assert "Math.min(sp.getLastRow(), RW_.PAGE_MAX_ROWS)" in src and "PAGE_MAX_ROWS: 2000" in src
 
 
 def test_the_watch_names_what_the_exit_plan_names():
