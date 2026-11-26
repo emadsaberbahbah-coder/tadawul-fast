@@ -62,8 +62,19 @@ A missing tab still reads as empty; a connection or quota fault is still raised 
 | `scripts/verify_deployment.py` | pins |
 | `tests/test_exit_plan.py`, `tests/test_holding_read.py`, `tests/test_exit_plan_offers.py` | X24, H12, pins |
 
-## Not in this change
-Other tabs are read with fixed ranges too (`_News_Gate` 4,000 — 137 rows today; `_Daily_Plan` 2,001; `_Cash_Snapshot` 2,000; `_Dividend_Log` 3,000; calendar tabs 4,000). Each is to be checked against its live length and its writer's own cap in the next morning build.
+## The other fixed ranges (checked 26 Nov 13:35 Riyadh, live workbook)
+| Tab | Rows now | Range read | State |
+|---|---|---|---|
+| `_News_Items` | 19,927 | 12,000 | **outgrown — this change** |
+| `_News_Gate` | 140 | 4,000 | far (about 5 rows a day) |
+| `_Cash_Snapshot` | 98 | 2,000 | far |
+| `_Dividend_Log` | 19 | 3,000 | far |
+| `Calendar_Events` / `Dividend_Events` | 144 / 3 | 4,000 | far |
+| `_IBKR_Orders` | 7 | 200 | far |
+| `_Portfolio_CostBasis` | 12 | 400–600 | far |
+| `_Daily_Plan`, `_Exit_Plan`, `_Holding_Read` | 255 / – / – | 2,001–3,001 | capped by their own writers (the newest rows are kept) |
+
+`_News_Items` is the only tab written without a cap by one script and read with a fixed range by another.
 
 ## Owner
 Merge when content. Nothing to set.
