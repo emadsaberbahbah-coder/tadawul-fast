@@ -2465,3 +2465,46 @@ def test_g18_a_capped_run_records_the_name_and_says_what_waits(armed, monkeypatc
     assert "new 1 (%d more wait for a later run, %d about names)" % (rep["counts"]["left"], rep["counts"]["left_names"]) \
         in ng.render_digest(rep)
     assert rep["gate"]["verdict"] == rep0["gate"]["verdict"] and "more wait" not in ng.render_digest(rep0)
+
+
+class BusySheets(FakeSheets):
+    """Refuses the first `busy` reads of _News_Items with `code` (the workbook's per-minute read quota)."""
+
+    def __init__(self, tabs, busy, code=429):
+        super().__init__(tabs)
+        self.busy, self.code, self.refused = busy, code, 0
+
+    def get(self, url, timeout=None):
+        if self._tab_cells(url)[0] == ng.ITEMS_TAB and self.refused < self.busy:
+            self.refused += 1
+            return Resp(self.code, text="quota")
+        return super().get(url, timeout=timeout)
+
+
+def _busy_run(sh, busy, code=429):
+    waits = []
+    busy_sh = BusySheets(sh.tabs, busy, code)
+    rc, rep = ng.run(http=FakeHTTP(), sheets=busy_sh, sid=FakeSheets.SID, now=NOW + dt.timedelta(hours=2), write=False,
+                     sources=NEW_ONLY, scope=ng.read_scope(busy_sh, FakeSheets.SID, 15), sleep=waits.append,
+                     run_id="r2", mode="observe")
+    return rc, rep, waits, busy_sh
+
+
+def test_g18_a_busy_workbook_is_asked_again_for_the_memory(armed):
+    """3 of the last 15 live runs lost their memory to HTTP 429. One refusal, then two: the situation recorded two
+    hours earlier is carried after a wait; three refusals, or another error, and the digest says so."""
+    (_rc, rep), sh = _run(http=FakeHTTP(feeds=GULF_FEEDS), sources=NEW_ONLY)
+    assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    assert ng.MEMORY_RETRY_S == (0.0, 20.0, 40.0)
+    rc, rep1, waits, s1 = _busy_run(sh, 1)
+    assert rc == 0 and [w for w in waits if w in (20.0, 40.0)] == [20.0] and s1.refused == 1
+    assert rep1["counts"]["carried"] == 3 and rep1["gate"]["verdict"] == "NO_NEW_ENTRY" and "memory_error" not in rep1
+    assert "Memory not read" not in ng.render_digest(rep1)
+    rc, rep2, waits, _s = _busy_run(sh, 2)
+    assert [w for w in waits if w in (20.0, 40.0)] == [20.0, 40.0] and rep2["counts"]["carried"] == 3
+    rc, rep3, waits, s3 = _busy_run(sh, 3)
+    assert rc == 0 and s3.refused == 3 and rep3["counts"]["carried"] == 0 and "HTTP 429" in rep3["memory_error"]
+    assert rep3["gate"]["verdict"] != "NO_NEW_ENTRY"                 # what a lost memory costs
+    assert "Memory not read (RuntimeError: read _News_Items: HTTP 429): this verdict rests on" in ng.render_digest(rep3)
+    rc, rep4, waits, s4 = _busy_run(sh, 1, code=500)
+    assert s4.refused == 1 and not [w for w in waits if w in (20.0, 40.0)] and "HTTP 500" in rep4["memory_error"]

@@ -4,7 +4,7 @@
 ================================================================================
 TFB News & Macro Gate - v1.9.0 (observe-only; program register A7 / news layer)
 ================================================================================
-v1.9.0 (2026-11-26) -- [REVIEW-26NOV] THREE CORRECTIONS FROM THE OWNER'S REVIEW REQUEST OF THE DAY'S WORK
+v1.9.0 (2026-11-26) -- [REVIEW-26NOV] FOUR CORRECTIONS FROM THE OWNER'S REVIEW REQUEST OF THE DAY'S WORK
 WHY (owner, 26 Nov 2026 16:30 Riyadh: "Please review and try to correct and improve all"):
   (1) RULE GAP. A Gulf high-severity story raised CAUTION when unconfirmed (grade 3-4) and NO_NEW_ENTRY when
       graded 1 from three domains - but nothing when it was confirmed by one or two domains (grade 1-2): a
@@ -19,12 +19,19 @@ WHY (owner, 26 Nov 2026 16:30 Riyadh: "Please review and try to correct and impr
       Exit Plan and Holding Read pages read names from _News_Items, so they saw that news late.
   (3) BLS REFUSED. bls.gov answered HTTP 403 in every run; its terms reserve the right to block robots that
       give no contact for their owner.
+  (4) THE MEMORY WAS LOST TO A BUSY WORKBOOK. In 3 of the last 15 runs (2 of the 4 chained runs of 26 Nov)
+      the read of _News_Items was refused with HTTP 429 - the workbook's per-minute read quota, right after
+      the hourly Exit Plan - and the run went on with no memory: "carried from earlier runs 0" instead of
+      about 1,300 items, so a situation confirmed over the day rested on that one run's collection. Only the
+      log said so.
 WHAT: (1) evaluate(): a Gulf-anchored high-severity story graded 1-2 that does not reach the three domains
   is CAUTION, with the driver "macro (few sources)". (2) pick_new(): within the cap the items about names
   come first, then severity and grade as before; the digest says how many classified items wait for a later
   run and how many of them are about names. No item is dropped - a waiting item is recorded by a later run
   while its source still lists it. (3) feeds(): bls.gov is asked with the declared contact
-  (TFB_SEC_USER_AGENT) like sec.gov, and not at all without it.
+  (TFB_SEC_USER_AGENT) like sec.gov, and not at all without it. (4) run(): a memory read refused with HTTP
+  429 is asked again after 20 s and after 40 s more (the quota is per minute); any other failure is not
+  retried; and when the memory could not be read the digest says so in a line of its own.
 ROLLBACK: revert this file to v1.8.1.
 
 v1.8.1 (2026-11-26) -- [PUBLIC-LOG] THE PUBLIC RUN LOG NO LONGER NAMES THE HOLDINGS
@@ -417,6 +424,8 @@ ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + N
 # v1.9.0: official sites that ask a robot to name a contact for its owner (sec.gov's fair-access rule; the
 # bls.gov terms reserve the right to block robots that give none)
 CONTACT_DOMAINS = frozenset(["sec.gov", "bls.gov"])
+# v1.9.0: waits before each try of the memory read (the first is immediate; a refusal with HTTP 429 gets the next)
+MEMORY_RETRY_S = (0.0, 20.0, 40.0)
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
@@ -2491,6 +2500,10 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
                          + (f"{d.get('outside', 0)} / {d.get('undated', 0)} / {d.get('repeated', 0)}"
                             if src in NEW_SOURCES else "-")
                          + f" | {d.get('failed', 0) if src in NEW_SOURCES else '-'} |")
+    if rep.get("memory_error"):                 # v1.9.0: said in the digest, not only in the log
+        lines.append("")
+        lines.append(f"Memory not read ({rep['memory_error']}): this verdict rests on this run's own collection, "
+                     "without the items recorded by earlier runs.")
     if (rep.get("llm") or {}).get("line"):      # v1.8.0 [LLM-SHADOW]
         lines.append("")
         lines.append(rep["llm"]["line"])
@@ -2602,11 +2615,18 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     memory_error = ""
     if sheets is not None and sid:
         t0 = col.clock()
-        try:
-            memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
-                                 sources, symbols)
-        except Exception as exc:  # memory is a help, never a reason to fail
-            memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+        for wait in MEMORY_RETRY_S:      # v1.9.0: a busy workbook (HTTP 429, a per-minute quota) is asked again
+            if wait:
+                sleep(wait)
+            try:
+                memory = read_memory(sheets, sid, now, _int_env("TFB_NEWS_GATE_MEMORY_ROWS", 2500, 0, 20000),
+                                     sources, symbols)
+                memory_error = ""
+                break
+            except Exception as exc:  # memory is a help, never a reason to fail
+                memory_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                if "HTTP 429" not in str(exc):
+                    break
         _out(f"[news_gate v{__version__}] memory: {len(memory)} items within 24 h / 72 h in "
              f"{col.clock() - t0:.0f}s" + (f" | {memory_error}" if memory_error else ""))
 
