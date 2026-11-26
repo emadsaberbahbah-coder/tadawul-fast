@@ -994,8 +994,8 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.6.3"                                                 # 2026-11-23: 1.6.3
-    assert '("exit_plan", "1.6.3", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.7.0"                                                 # 2026-11-26: 1.7.0
+    assert '("exit_plan", "1.7.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])
@@ -1068,7 +1068,7 @@ def test_x19_run_observe_on_off(monkeypatch):
     b = wbook()
     assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a), market=CRASH) == 0
     led = b.tabs["_Exit_Plan"].values
-    assert led[0] == ep.LEDGER_HEADERS and led[0][-1] == "Market" and len(led[0]) == 18
+    assert led[0] == ep.LEDGER_HEADERS and led[0][17:] == ["Market", "Judgment"] and len(led[0]) == 19   # 1.7.0
     assert led[1][2] == "DDI.US" and led[1][13] == "TAKE PROFIT" and led[1][17] == "us:crash_day:2026-11-10"
     page = _page(b)
     assert "market not calm (observe): the US market on a crash day as of 2026-11-10" in page

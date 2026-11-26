@@ -1888,7 +1888,7 @@ def test_t17_the_whole_run_writes_the_two_columns_and_the_knob_is_mapped(monkeyp
         assert tap.day_order_on() is want, value
     raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
     assert "TFB_TAP_DAY_ORDER: ${{ vars.TFB_TAP_DAY_ORDER || 'on' }}" in raw
-    assert tap.__version__ == "1.8.2"
+    assert tap.__version__ == "1.9.0"
 
 
 def test_t17_the_page_and_the_tab_of_a_run_the_morning_after(capsys):
@@ -2035,6 +2035,102 @@ def test_t19_a_holding_under_a_tender_offer_gets_no_blind_stop_instruction():
     assert not any("tender" in x[2] for x in cards(b3.tabs["Today_Action_Plan"].values))
     h = {"symbol": "X.US", "qty": 10.0, "stop": 9.0, "action": "SELL", "why": "", "offer": True}
     assert tap.holding_steps(h, 1.0)[0]["do"].endswith("(selling tendered shares can open a short position).")
+
+
+def _offer_reg(**over):
+    from core import corporate_offers as co
+    raw = {"symbol": "DDI.US", "kind": "cash_tender", "price": 16.25, "announced": "2026-11-09",
+           "expires": "2026-12-10", "sale": "manual", "bidder": "DoubleU Games"}
+    raw.update(over)
+    return co.parse({"schema": co.SCHEMA, "offers": [raw]})
+
+
+def _section_b(page, sym):
+    return [r for r in page if r and r[0] == sym and "Hold" not in str(r[1])][-1]
+
+
+def test_t20_a_holding_under_a_manual_sale_offer_is_not_asked_for_a_stop(monkeypatch):
+    """26 Nov: the owner removed the stop on the tender holding on purpose and sells it by hand; the page said
+    'No stop order is working at IBKR for DDI.US: place one at 15.22 for all 240 shares' (Holding_Read no longer read
+    PINNED BY AN OFFER, so the 1.8.0 caution was gone too)."""
+    held = _hold_exit()
+    i = [n for n, r in enumerate(held) if r and r[0] == "DDI.US"][0]
+    held[i][13], held[i][15] = "HOLD", ""
+    book = _final_book(Exit_Plan=Sheet(held))
+    assert tap.run_once(False, book=book, now=NOW, capture=_closed_capture(), offers=_offer_reg()) == 0
+    page = book.tabs["Today_Action_Plan"].values
+    assert [x for x in cards(page) if x[1] == "DDI.US"] == []                       # no step: nothing to place
+    f = _final(book)[1]["DDI.US"]
+    assert f["Decision"] == "HOLD" and f["Do today"].startswith(
+        "Hold; cash offer 16.25 until 2026-12-10: the sale is the owner's manual decision - no stop order is asked for.")
+    assert "place" not in f["Do today"] and "stop at" not in f["Do today"]
+    assert f["Order status"] == "no stop at IBKR - by the owner's decision (cash offer, manual sale)"
+    assert f["Control status"] == "OK"
+    assert "cash offer: manual sale, no stop asked for" in [str(c) for r in page if r and r[0] == "DDI.US" for c in r]
+    assert not any("place one at" in str(c) for r in page for c in r if "DDI" in str(c))
+    # the others are untouched: the holding the broker sold today still reads as in 1.8.0
+    assert _final(book)[1]["IBOC.US"]["Decision"] == "SELL"
+    # a REVIEW from the Exit Plan (the offer's own terms) is one step, with no stop instruction
+    held[i][13] = "REVIEW"
+    b2 = _final_book(Exit_Plan=Sheet(held))
+    assert tap.run_once(False, book=b2, now=NOW, capture=_closed_capture(), offers=_offer_reg()) == 0
+    c2 = [x for x in cards(b2.tabs["Today_Action_Plan"].values) if x[1] == "DDI.US"]
+    assert len(c2) == 1 and c2[0][2] == (
+        "Review DDI.US today: the cash offer on it (16.25 until 2026-12-10) needs a decision - sell in the market, "
+        "tender at the broker, or keep the shares. The Exit Plan's note says why today.")
+    assert c2[0][4] == "last 15.72 · cash offer 16.25 until 2026-12-10"
+    assert _final(b2)[1]["DDI.US"]["Decision"] == "HOLD" and _final(b2)[1]["DDI.US"]["Do today"].startswith(c2[0][2])
+    # an old RAISE STOP row (the Exit Plan not yet on 1.7.0) asks for nothing either
+    b3 = _final_book()
+    assert tap.run_once(False, book=b3, now=NOW, capture=_closed_capture(), offers=_offer_reg()) == 0
+    assert [x for x in cards(b3.tabs["Today_Action_Plan"].values) if x[1] == "DDI.US"] == []
+    assert _final(b3)[1]["DDI.US"]["Do today"].startswith("Hold; cash offer 16.25 until 2026-12-10")
+    # a stop that IS working on it is named, and nothing is asked to be cancelled
+    b4 = _final_book(Exit_Plan=Sheet(held[:i] + [held[i][:13] + ["HOLD"] + held[i][14:]] + held[i + 1:]))
+    assert tap.run_once(False, book=b4, now=NOW, capture=_closed_capture(ddi_stop=True), offers=_offer_reg()) == 0
+    c4 = [x for x in cards(b4.tabs["Today_Action_Plan"].values) if x[1] == "DDI.US"]
+    assert len(c4) == 1 and c4[0][2] == (
+        "A stop order is working at IBKR on DDI.US (14.80 on 240 of 240 shares), and its sale is set to manual under "
+        "the cash offer (16.25 until 2026-12-10): if its shares were tendered, a sell order on them can open a short "
+        "position. Nothing is asked for; keep it only if it is meant.")
+    assert _final(b4)[1]["DDI.US"]["Order status"] == "stop 14.80 working on 240 share(s)"
+    # sale = rule: the registry gives the 1.8.0 tender caution whatever Holding_Read says, and the stop is asked for
+    b5 = _final_book(Exit_Plan=Sheet(held[:i] + [held[i][:13] + ["HOLD"] + held[i][14:]] + held[i + 1:]))
+    assert tap.run_once(False, book=b5, now=NOW, capture=_closed_capture(), offers=_offer_reg(sale="rule")) == 0
+    c5 = [x for x in cards(b5.tabs["Today_Action_Plan"].values) if x[1] == "DDI.US"]
+    assert len(c5) == 1 and c5[0][2].startswith(
+        "No stop order is working at IBKR for DDI.US, which is under a cash tender offer: if its shares were tendered")
+    # outside the offer's days, off, or with no registry given on a caller's workbook: 1.8.2
+    for kw, env in (({"offers": _offer_reg(expires="2026-11-11")}, None), ({"offers": _offer_reg()}, "off"), ({}, None)):
+        if env:
+            monkeypatch.setenv("TFB_TAP_OFFERS", env)
+        b6 = _final_book(Exit_Plan=Sheet(held[:i] + [held[i][:13] + ["HOLD"] + held[i][14:]] + held[i + 1:]))
+        assert tap.run_once(False, book=b6, now=NOW, capture=_closed_capture(), **kw) == 0
+        assert any(x[2] == "No stop order is working at IBKR for DDI.US: place one at 14.80 for all 240 shares."
+                   for x in cards(b6.tabs["Today_Action_Plan"].values)), (kw, env)
+        monkeypatch.delenv("TFB_TAP_OFFERS", raising=False)
+    for value, want in (("on", True), ("", True), ("0", False), ("off", False)):
+        monkeypatch.setenv("TFB_TAP_OFFERS", value)
+        assert tap.offers_on() is want, value
+    # pure pieces
+    o = _offer_reg()[0]
+    assert tap.offer_book(_offer_reg(), ["ddi.us", "GLPI.US"], dt.date(2026, 11, 26)) == {"DDI.US": o}
+    assert tap.offer_book(_offer_reg(), ["DDI.US"], dt.date(2026, 12, 11)) == {}
+    assert tap.offer_manual({"offer_info": o}) is o and tap.offer_manual({"offer_info": _offer_reg(sale="rule")[0]}) is None
+    assert tap.offer_manual({}) is None and tap.offer_until(o) == "16.25 until 2026-12-10"
+    sell = {"symbol": "DDI.US", "qty": 240.0, "stop": 14.8, "action": "SELL", "why": "", "offer": True, "offer_info": o}
+    assert tap.holding_steps(sell, 1.0)[0]["do"].startswith("Sell all 240 shares of DDI.US.")       # an old SELL row
+    assert tap.holding_steps(sell, 1.0)[0]["do"].endswith("(selling tendered shares can open a short position).")
+    raw = (ROOT / ".github/workflows/today_action_plan.yml").read_text(encoding="utf-8")
+    assert "TFB_TAP_OFFERS: ${{ vars.TFB_TAP_OFFERS || 'on' }}" in raw
+    assert tap.__version__ == "1.9.0"
+
+
+def test_t20_the_live_run_reads_the_registry_and_a_callers_book_does_not(monkeypatch):
+    from core import corporate_offers as co
+    monkeypatch.setattr(co, "load", lambda path=None: (_ for _ in ()).throw(AssertionError("registry read")))
+    book = _final_book()
+    assert tap.run_once(False, book=book, now=NOW, capture=_closed_capture()) == 0   # a caller's book: none read
 
 
 def test_v181_passing_server_fault_is_waited_out(capsys):

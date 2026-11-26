@@ -78,6 +78,7 @@ _MODULE_FILES = {
     "core.providers.calendar_provider": "core/providers/calendar_provider.py",
     "core.data_engine_v2": "core/data_engine_v2.py",
     "core.market_condition": "core/market_condition.py",          # 2026-11-21: NEW 1.0.0
+    "core.corporate_offers": "core/corporate_offers.py",          # 2026-11-26: NEW 1.0.0
 }
 
 # the SCRIPTS manifest checks SCRIPT_VERSION, falling back to __version__
