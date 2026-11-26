@@ -2,8 +2,24 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.10.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.11.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.11.0 (2026-11-26) -- [CENTRAL-BANKS] THREE MORE OFFICIAL FEEDS: BANK OF ENGLAND, BANK OF JAPAN, SWISS NATIONAL BANK
+WHY (owner, 26 Nov 2026 18:54 Riyadh, in Arabic: do the world market, the funds, commodities and currencies need
+  the same care as the Saudi sources; 19:13: "if it is ready, build it now"): the official group read the Fed,
+  the ECB and US agencies and no other central bank. Each feed below was opened on 26 Nov 2026 and held dated
+  items of the last two days; each bank publishes it for feed readers and allows personal, non-commercial use.
+WHAT: FEEDS gains, in the official_rss group (72 h window, tier A):
+       boe   https://www.bankofengland.co.uk/rss/news          RSS 2.0, 50 items
+       boj   https://www.boj.or.jp/en/rss/whatsnew.xml          RSS 2.0, 46 items
+       snb   https://www.snb.ch/public/rss/en/pressrel          RSS 2.0, 20 items, the date in dc:date (read since 1.5.0)
+  Left out on purpose: the People's Bank of China (its terms for automated reading were not found), HKEX
+  (its terms forbid reading by a program without written permission), SAMA, OPEC and the IEA (no official feed).
+  domain_of() knows the Japanese second levels "or.jp" and "go.jp": a link to www.boj.or.jp was read as the
+  domain "or.jp", an unknown source (tier F), wherever Google News or GDELT carried a Bank of Japan page.
+  A feed that refuses the runner is named in the run's failure note, as every feed is.
+ROLLBACK: revert this file to v1.10.0.
+
 v1.10.0 (2026-11-26) -- [ORIGINS] A HEADLINE COPIED BY SEVERAL SITES IS ONE CONFIRMATION, NOT SEVERAL
 WHY (owner, 26 Nov 2026 19:10 Riyadh, in Arabic: what matters is how an item is let through, used, classified,
   "and the measure of whether the item is repeated on other sites"; 19:13: "if it is ready, build it now"):
@@ -412,7 +428,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -487,6 +503,13 @@ FEEDS: Tuple[Tuple[str, str, str, str, str, float], ...] = (
      "eia.gov", "en", NAME_WINDOW_H),
     ("whitehouse_actions", "official_rss", "https://www.whitehouse.gov/presidential-actions/feed/",
      "whitehouse.gov", "en", NAME_WINDOW_H),
+    # v1.11.0 [CENTRAL-BANKS]
+    ("boe", "official_rss", "https://www.bankofengland.co.uk/rss/news",
+     "bankofengland.co.uk", "en", NAME_WINDOW_H),
+    ("boj", "official_rss", "https://www.boj.or.jp/en/rss/whatsnew.xml",
+     "boj.or.jp", "en", NAME_WINDOW_H),
+    ("snb", "official_rss", "https://www.snb.ch/public/rss/en/pressrel",
+     "snb.ch", "en", NAME_WINDOW_H),
     ("asharq_business", "gulf_rss", "https://www.asharqbusiness.com/rss.xml",
      "asharqbusiness.com", "ar", MACRO_WINDOW_H),
     ("arabnews", "gulf_rss", "https://www.arabnews.com/rss.xml",
@@ -536,6 +559,7 @@ SOURCE_TIERS: Dict[str, str] = {
     "sec.gov": "A", "federalreserve.gov": "A", "saudiexchange.sa": "A",
     "tadawul.com.sa": "A", "cma.org.sa": "A", "sama.gov.sa": "A", "spa.gov.sa": "A",
     "opec.org": "A", "eia.gov": "A", "bls.gov": "A", "bea.gov": "A",
+    "bankofengland.co.uk": "A", "boj.or.jp": "A", "snb.ch": "A",      # v1.11.0
     "treasury.gov": "A", "ecb.europa.eu": "A", "imf.org": "A", "whitehouse.gov": "A",
     "globenewswire.com": "A", "prnewswire.com": "A", "businesswire.com": "A",
     "accessnewswire.com": "A", "newsfilecorp.com": "A",
@@ -567,7 +591,8 @@ SOURCE_TIERS: Dict[str, str] = {
 }
 _TIER_RANK = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
 _TWO_LEVEL_SUFFIXES = ("com.sa", "gov.sa", "org.sa", "net.sa", "edu.sa", "co.uk",
-                       "org.uk", "com.au", "co.jp", "com.hk", "com.eg", "co.za")
+                       "org.uk", "com.au", "co.jp", "com.hk", "com.eg", "co.za",
+                       "or.jp", "go.jp")      # v1.11.0: boj.or.jp was read as "or.jp" (an unknown source)
 
 # Anchors whose escalation can move this book (Gulf / oil / Fed / China).
 MARKET_ANCHORS = frozenset([

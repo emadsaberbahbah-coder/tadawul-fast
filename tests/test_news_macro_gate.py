@@ -908,9 +908,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.10.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.10.0 [ORIGINS]
+    assert ng.__version__ == "1.11.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.11.0 [CENTRAL-BANKS]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.10.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.11.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1661,9 +1661,9 @@ RDF = """<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-r
 
 def test_g14_the_registry_is_whole():
     ids = [f[0] for f in ng.FEEDS]
-    assert len(ids) == len(set(ids)) == 17
+    assert len(ids) == len(set(ids)) == 20                        # v1.11.0: + boe, boj, snb
     assert {f[1] for f in ng.FEEDS} == set(ng.FEED_GROUPS)
-    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 6, 4]
+    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 9, 4]
     for fid, group, url, domain, lang, hours in ng.FEEDS:
         assert url.startswith("https://") and lang in ("en", "ar") and hours in (24.0, 72.0)
         assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
@@ -1969,7 +1969,7 @@ def test_g14_sec_is_asked_with_the_declared_contact_or_not_at_all(armed):
     http2 = FakeHTTP()
     col2 = ng.Collector(http2, _sleep, NOW)
     col2.feeds("official_rss", "")
-    assert not [u for u in http2.calls if "sec.gov" in u or "bls.gov" in u] and len(http2.calls) == 4
+    assert not [u for u in http2.calls if "sec.gov" in u or "bls.gov" in u] and len(http2.calls) == 7
     assert col2.failed == {"official_rss": "sec_press: TFB_SEC_USER_AGENT not set; bls: TFB_SEC_USER_AGENT not set"}
 
 
@@ -2594,3 +2594,51 @@ def test_g19_the_tabs_keep_every_copy(armed):
     assert rc == 0 and len(sh.tabs[ng.ITEMS_TAB][1:]) == 3
     assert rep["gate"]["verdict"] != "NO_NEW_ENTRY"                         # GULF_FEEDS, three wordings, is NO_NEW_ENTRY
     assert any("3 sources (1 independent)" in d for d in rep["gate"]["drivers"])
+
+
+# ----------------------------------------------------------------------------- G20 (v1.11.0 [CENTRAL-BANKS])
+SNB_FEED = ('<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>'
+            '<title>SNB press releases</title><dc:date>2026-11-26T13:41:59Z</dc:date>'
+            '<item><title>2026-11-24 - Swiss National Bank raises policy rate by 0.25 percentage points</title>'
+            '<link>https://www.snb.ch/en/publications/communication/press-releases/2026/pre_20261124_2</link>'
+            '<dc:date>%s</dc:date></item>'
+            '<item><title>2026-09-01 - An older release</title><link>https://www.snb.ch/en/old</link>'
+            '<dc:date>2026-09-01T08:00:00Z</dc:date></item></channel></rss>')
+
+
+def test_g20_the_three_central_bank_feeds():
+    by_id = {f[0]: f for f in ng.FEEDS}
+    assert [(by_id[k][1], by_id[k][3], by_id[k][5], ng.tier_of(by_id[k][3])) for k in ("boe", "boj", "snb")] == [
+        ("official_rss", "bankofengland.co.uk", 72.0, "A"), ("official_rss", "boj.or.jp", 72.0, "A"),
+        ("official_rss", "snb.ch", 72.0, "A")]
+    # the three date forms the banks write: RFC 822 ending "Z", RFC 822 with +0900, ISO 8601 in dc:date
+    assert ng._feed_time("Wed, 25 Nov 2026 10:00:00 Z") == dt.datetime(2026, 11, 25, 10, 0, tzinfo=UTC)
+    assert ng._feed_time("Thu, 26 Nov 2026 10:00:00 +0900") == dt.datetime(2026, 11, 26, 1, 0, tzinfo=UTC)
+    assert ng._feed_time("2026-11-24T08:00:00Z") == dt.datetime(2026, 11, 24, 8, 0, tzinfo=UTC)
+    # a Bank of Japan page met through a search is the bank's, not the unknown domain "or.jp"
+    assert ng.domain_of("https://www.boj.or.jp/en/mopo/k1.pdf") == "boj.or.jp" and ng.tier_of("boj.or.jp") == "A"
+    assert ng.domain_of("https://www.mof.go.jp/x") == "mof.go.jp" and ng.domain_of("https://www3.nhk.or.jp/n") == "nhk.or.jp"
+    got = ng.parse_feed((SNB_FEED % "2026-11-24T08:00:00Z").encode("utf-8"), "MACRO", "snb", "official_rss", "en", "snb.ch")
+    assert [(i["published"], i["domain"], i["tier"] if "tier" in i else ng.tier_of(i["domain"])) for i in got] == [
+        (dt.datetime(2026, 11, 24, 8, 0, tzinfo=UTC), "snb.ch", "A"), (dt.datetime(2026, 9, 1, 8, 0, tzinfo=UTC), "snb.ch", "A")]
+
+
+def test_g20_a_central_bank_release_is_collected_dated_and_official(armed):
+    fresh = _hours_ago(5)
+    iso = (NOW - dt.timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    feeds = {"snb": SNB_FEED % iso,
+             "boe": _feed(("Bank Rate maintained at 4% - November 2026", "https://www.bankofengland.co.uk/n1", fresh)),
+             "boj": _feed(("Statement on Monetary Policy", "https://www.boj.or.jp/en/mopo/k1.pdf", None))}
+    http = FakeHTTP(feeds=feeds)
+    col = ng.Collector(http, _sleep, NOW)
+    got = col.feeds("official_rss", "TFB research test@example.com")
+    assert sorted((i["domain"], i["title"][:24]) for i in got) == [("bankofengland.co.uk", "Bank Rate maintained at "),
+                                                                   ("snb.ch", "2026-11-24 - Swiss Natio")]
+    assert col.detail["official_rss"]["outside"] == 1 and col.detail["official_rss"]["undated"] == 1   # old SNB, undated BoJ
+    assert col.failed == {} and all("User-Agent" not in c["headers"] for c in http.seen
+                                    if "snb.ch" in c["url"] or "boj.or.jp" in c["url"] or "bankofengland" in c["url"])
+    # a bank that refuses the runner is named and the others are still read
+    http2 = FakeHTTP(feeds=dict(feeds, boe=Resp(403, text="no")))
+    col2 = ng.Collector(http2, _sleep, NOW)
+    assert [i["domain"] for i in col2.feeds("official_rss", "TFB research test@example.com")] == ["snb.ch"]
+    assert col2.failed == {"official_rss": "boe: HTTP 403"}
