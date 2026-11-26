@@ -38,6 +38,10 @@ Pinned here:
   G8 main(): --write without a spreadsheet id -> 2; evidence JSON +
      markdown; job summary appended; env symbols join the scope
   G9 ASCII-only module, version pin in verify_deployment, workflow shape
+  G15 (v1.6.0 [FINNHUB]) market and company news from the Finnhub key the
+     project already holds: header-borne key never in a message; publisher
+     read from the URL or from 'source'; US names only; a refusal is named;
+     without the key the source is skipped and named
   G14 (v1.5.0 [SOURCES]) five more sources: the feed reader (RSS 2.0, RSS 1.0,
      Atom; bytes with a byte-order mark; a reply that is not a feed raises and
      is named under Sources Failed - the Fed feed read 0 items in 134 runs
@@ -72,6 +76,7 @@ UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 10, 28, 12, 47, tzinfo=UTC)          # 15:47 Riyadh, FOMC day
 QUIET = dt.datetime(2026, 10, 30, 12, 47, tzinfo=UTC)
 KEY = "secret-eodhd-key-123"
+FKEY = "secret-finnhub-key-456"
 AR = {
     "drone_hormuz": "\u0647\u062c\u0648\u0645 \u0628\u0637\u0627\u0626\u0631\u0629 \u0645\u0633\u064a\u0631\u0629 \u0639\u0644\u0649 \u0646\u0627\u0642\u0644\u0629 \u0641\u064a \u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632",
     "aramco_profit_up": "\u0623\u0631\u0627\u0645\u0643\u0648 \u062a\u0639\u0644\u0646 \u0627\u0631\u062a\u0641\u0627\u0639 \u0635\u0627\u0641\u064a \u0627\u0644\u0631\u0628\u062d \u0644\u0644\u0631\u0628\u0639 \u0627\u0644\u062b\u0627\u0644\u062b",
@@ -190,6 +195,10 @@ class FakeHTTP:
         self.seen: List[Dict[str, Any]] = []
 
     def _new_source(self, url, params):
+        if url.startswith(ng.FINNHUB_API):           # v1.6.0: replies keyed 'finnhub:news' / 'finnhub:<TICKER>'
+            key = "finnhub:" + (params.get("symbol") or "news")
+            body = self.feeds.get(key, [])
+            return body if isinstance(body, Resp) else Resp(200, body)
         if url == ng.BING_NEWS_RSS:
             key = next((k for k in self.feeds if k.startswith("bing:") and k[5:] in params.get("q", "")), "bing")
         elif url == ng.YAHOO_RSS:
@@ -348,6 +357,7 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("TFB_NEWS_GATE", "observe")
     monkeypatch.setenv("TFB_SEC_USER_AGENT", "TFB research test@example.com")
     monkeypatch.setenv("EODHD_API_KEY", KEY)
+    monkeypatch.setenv("FINNHUB_API_KEY", FKEY)
     monkeypatch.setenv("DEFAULT_SPREADSHEET_ID", FakeSheets.SID)
     monkeypatch.setenv("TFB_NEWS_GATE_GDELT_SPACING_S", "0")
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
@@ -840,7 +850,7 @@ def test_g7_failures_are_named_and_key_scrubbed(armed):
         assert src in rep["sources_failed"]
         assert KEY not in rep["sources_failed"][src]
     dead = {"sec.gov": 500, "gdeltproject": 500, "news.google": 500, "federalreserve": 500, "eodhd.com": 500,
-            "bing.com": 500, "yahoo.com": 500}
+            "bing.com": 500, "yahoo.com": 500, "finnhub.io": 500}
     dead.update({urlparse(f[2]).hostname: 500 for f in ng.FEEDS})       # v1.5.0: the new sources too
     (rc, rep), _ = _run(http=FakeHTTP(fail=dead))
     assert rc == 1 and rep["sources_ok"] == {}
@@ -867,7 +877,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.5.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.6.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -892,9 +902,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.5.0"   # 2026-11-21: v1.4.1 [FOMC-2027]; 2026-11-26: v1.5.0 [SOURCES]
+    assert ng.__version__ == "1.6.0"   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.5.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.6.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1648,12 +1658,12 @@ def test_g14_the_registry_is_whole():
         assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
         assert ng.domain_of("https://" + domain + "/x") == domain or domain == "ecb.europa.eu", fid
     assert {ng.tier_of(f[3]) for f in ng.FEEDS if f[1] == "official_rss"} == {"A"}
-    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 11
+    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 12
     assert set(ng.NEW_SOURCES) <= set(ng.SOURCE_BUDGET_S) and set(ng.FEED_GROUPS) < set(ng.NEW_SOURCES)
-    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss"}
+    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub"}
     assert ng.selected_sources("") == list(ng.ALL_SOURCES)
     assert ng.selected_sources(",".join(OLD_SIX)) == OLD_SIX          # the rollback named in the header
-    assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 360   # the job has 20 minutes
+    assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 400   # the job has 20 minutes
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
     assert "blank = all: " + ",".join(ng.ALL_SOURCES) in wf
 
@@ -2041,7 +2051,7 @@ def test_g14_the_new_sources_alone_confirm_a_gulf_situation_and_carry_it(armed):
                                                          ("press_rss", "wsj.com", "B")]
     assert [r[13] for r in rows if r[8] == "bing_news"] == ["https://www.reuters.com/world/a1"]
     gate = sh.tabs[ng.GATE_TAB][1]
-    assert gate[8] == "bing_news=1, gulf_rss=1, market=2, press_rss=1" and gate[9] == "" and gate[11] == "1.5.0"
+    assert gate[8] == "bing_news=1, gulf_rss=1, market=2, press_rss=1" and gate[9] == "" and gate[11] == ng.__version__
     # two hours later the feeds have moved on: the recorded rows still hold the situation ...
     later = NOW + dt.timedelta(hours=2)
     (rc2, rep2), _ = _run(http=FakeHTTP(), sheets=sh, now=later, sources=NEW_ONLY, write=False)
@@ -2088,7 +2098,7 @@ def test_g14_with_every_new_feed_empty_the_run_equals_the_six_source_run(armed):
     ga, gb = sh_a.tabs[ng.GATE_TAB][1], sh_b.tabs[ng.GATE_TAB][1]
     assert ga[:8] == gb[:8] and ga[9:] == gb[9:]                  # only the Sources OK cell differs
     assert set(gb[8].split(", ")) == set(ga[8].split(", ")) | {"bing_news=0", "gulf_rss=0", "official_rss=0",
-                                                            "press_rss=0", "yahoo_rss=0"}
+                                                            "press_rss=0", "yahoo_rss=0", "finnhub=0"}
     assert b["sources_detail"]["bing_news"] == {"asked": 10, "read": 0, "outside": 0, "undated": 0}
     assert "sources_detail" in a and a["sources_detail"] == {} and set(a["source_ages"]) <= set(OLD_SIX)
     assert a["sources_failed"] == b["sources_failed"]
@@ -2111,3 +2121,91 @@ def test_g14_the_digest_and_the_evidence_carry_one_line_per_source(armed, monkey
     assert data["sources_detail"]["bing_news"]["asked"] == 10 and data["source_ages"]["gulf_rss"]["newest_min"] == 60
     row = ng.gate_row(dict(rep, sources_failed={"press_rss": "x" * 420, "gulf_rss": "y" * 420, "bing_news": "z" * 420}))
     assert len(row[9]) == 1000                                     # the failed-sources cell holds 1000 characters
+
+
+# ----------------------------------------------------------------------------- G15 (v1.6.0 [FINNHUB])
+def _fh(headline, url, hours_ago, source="Reuters", related=""):
+    return {"category": "company", "datetime": int((NOW - dt.timedelta(hours=hours_ago)).timestamp()),
+            "headline": headline, "id": abs(hash(headline)) % 10 ** 9, "image": "", "related": related,
+            "source": source, "summary": "", "url": url}
+
+
+def test_g15_parse_finnhub():
+    rows = [_fh("Iran fires missiles at tanker in Strait of Hormuz", "https://www.reuters.com/world/x", 2),
+            _fh("Primis Financial cuts outlook", "https://finnhub.io/api/news?id=abc", 5, source="SeekingAlpha"),
+            _fh("Unknown wire item", "https://finnhub.io/api/news?id=def", 5, source="SomeBlog"),
+            _fh("", "https://www.reuters.com/empty", 1),
+            dict(_fh("No time", "https://www.cnbc.com/t", 1), datetime=0), "junk"]
+    got = ng.parse_finnhub(rows, "MACRO", "market news finnhub")
+    assert [(i["domain"], i["source"]) for i in got] == [("reuters.com", "finnhub"), ("seekingalpha.com", "finnhub"),
+                                                         ("finnhub.io", "finnhub"), ("cnbc.com", "finnhub")]
+    assert got[0]["published"] == NOW - dt.timedelta(hours=2) and got[3]["published"] is None
+    assert ng.tier_of("finnhub.io") == "D" and ng.parse_finnhub([], "MACRO", "x") == []
+    for bad, why in (({"error": "Invalid API key."}, "Invalid API key"), ("text", "not a news list"), (None, "not a news list")):
+        with pytest.raises(ValueError) as err:
+            ng.parse_finnhub(bad, "MACRO", "x")
+        assert why in str(err.value)
+    assert [ng.finnhub_symbol(x) for x in ("supn.us", "BRK-B.US", "5023.SR", "VOD.L", ".US", "")] == \
+        ["SUPN", "BRK.B", "", "", "", ""]
+
+
+def test_g15_the_key_travels_in_a_header_and_never_in_a_message(armed):
+    http = FakeHTTP(feeds={"finnhub:news": [_fh("Iran fires missiles at tanker in Strait of Hormuz",
+                                                  "https://www.reuters.com/world/x", 2),
+                                              _fh("Old story", "https://www.reuters.com/old", 30)],
+                           "finnhub:FRST": [_fh("Primis Financial (NASDAQ:FRST) shares fall after earnings miss",
+                                                "https://www.benzinga.com/p1", 40, source="Benzinga")]})
+    scope = ng.read_scope(workbook(), FakeSheets.SID, 15)
+    col = ng.Collector(http, _sleep, NOW)
+    got = col.finnhub([s["symbol"] for s in scope], FKEY)
+    asked = [c for c in http.seen if c["url"].startswith(ng.FINNHUB_API)]
+    assert [c["url"].rsplit("/", 1)[1] for c in asked] == ["news", "company-news", "company-news"]   # 5023.SR not asked
+    assert [c["params"].get("symbol") for c in asked[1:]] == ["FRST", "BADCO"]
+    assert asked[1]["params"]["from"] == "2026-10-25" and asked[1]["params"]["to"] == "2026-10-28"
+    assert all(c["headers"] == {"X-Finnhub-Token": FKEY} and FKEY not in str(c["params"]) and
+               c["timeout"] == ng.FEED_TIMEOUT_S for c in asked)
+    assert [(i["scope"], i["domain"]) for i in got] == [("MACRO", "reuters.com"), ("FRST.US", "benzinga.com")]
+    assert col.ok == {"finnhub": 2} and col.failed == {}
+    assert col.detail["finnhub"] == {"asked": 3, "read": 3, "outside": 1, "undated": 0}
+
+    class Leaky(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.startswith(ng.FINNHUB_API):
+                raise ConnectionError("refused for token " + (headers or {}).get("X-Finnhub-Token", ""))
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    col = ng.Collector(Leaky(), _sleep, NOW)
+    assert col.finnhub(["FRST.US", "BADCO.US", "ZZZ.US"], FKEY) == []
+    note = col.failed["finnhub"]
+    assert FKEY not in note and "***" in note and "circuit open after 2 consecutive failures" in note
+
+
+def test_g15_a_refusal_is_named_and_no_key_skips_the_source(armed, monkeypatch):
+    http = FakeHTTP(feeds={"finnhub:news": Resp(200, {"error": "You don't have access to this resource."}),
+                           "finnhub:FRST": Resp(429, text="limit")})
+    col = ng.Collector(http, _sleep, NOW)
+    assert col.finnhub(["FRST.US"], FKEY) == []
+    assert col.failed["finnhub"].startswith("market news finnhub: not a news list: You don't have access")
+    assert "name FRST.US finnhub: HTTP 429" in col.failed["finnhub"]
+    assert len([u for u in http.calls if u.startswith(ng.FINNHUB_API)]) == 2      # asked once each: no retry
+    monkeypatch.delenv("FINNHUB_API_KEY")
+    http2 = FakeHTTP()
+    (rc, rep), _ = _run(http=http2, write=False, sources=["finnhub", "market"])
+    assert rc == 0 and rep["sources_failed"] == {"finnhub": "FINNHUB_API_KEY not set"}
+    assert not [u for u in http2.calls if u.startswith(ng.FINNHUB_API)]
+
+
+def test_g15_finnhub_joins_the_gate_like_the_other_new_sources(armed):
+    """A Reuters story carried by Google and by Finnhub is one member; a name item is judged by the issuer rule."""
+    feeds = {"finnhub:news": [_fh("Iran fires missiles at tanker in Strait of Hormuz", "https://www.reuters.com/x", 3),
+                              _fh("Missile strike on tanker near Hormuz lifts oil", "https://www.ft.com/f1", 2)],
+             "finnhub:FRST": [_fh("5 bank stocks to watch as rates fall", "https://www.zacks.com/l", 3, source="Zacks")]}
+    (rc, rep), sh = _run(http=FakeHTTP(fail={"gdeltproject": 429}, en_rss=GNEWS_EN_RSS, feeds=feeds), write=True)
+    assert rc == 0 and rep["sources_ok"]["finnhub"] == 3
+    assert rep["sources_detail"]["finnhub"]["repeated"] == 1                      # the Reuters copy Google carries
+    assert rep["issuer_link"]["unlinked"] >= 1                                     # the list article is not about FRST
+    rows = [r for r in sh.tabs[ng.ITEMS_TAB][1:] if r[8] == "finnhub"]
+    assert [(r[9], r[10]) for r in rows] == [("ft.com", "B")]
+    assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
+    wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
+    assert "FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}" in wf
