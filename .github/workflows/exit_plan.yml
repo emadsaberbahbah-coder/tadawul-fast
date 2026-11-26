@@ -1,7 +1,13 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.6.0 (2026-11-21)
+# VERSION 1.7.0 (2026-11-26)
+#
+# 1.7.0: a holding under a standing cash offer is read on the offer's own terms
+# (exit_plan 1.7.0; config/corporate_offers.json; TFB_EXIT_OFFERS on, off = the
+# 1.6.3 reading), and each holding's fall is named with its market or on its
+# own (TFB_EXIT_STOP_JUDGMENT observe - a note and a ledger column, the action
+# does not change; off = no note).
 #
 # 1.6.0: a holding whose market is not calm is flagged for sale (exit_plan
 # 1.6.0; TFB_EXIT_MARKET_TURN observe by default - a note, the action does not
@@ -140,6 +146,8 @@ jobs:
           TFB_EXIT_MARKET_TURN: ${{ vars.TFB_EXIT_MARKET_TURN || 'observe' }}
           TFB_EXIT_MARKET_TURN_LABELS: ${{ vars.TFB_EXIT_MARKET_TURN_LABELS || 'weak,stress,drawdown,crash_day' }}
           TFB_EXIT_IBKR_MAX_AGE_H: ${{ vars.TFB_EXIT_IBKR_MAX_AGE_H || '30' }}
+          TFB_EXIT_OFFERS: ${{ vars.TFB_EXIT_OFFERS || 'on' }}
+          TFB_EXIT_STOP_JUDGMENT: ${{ vars.TFB_EXIT_STOP_JUDGMENT || 'observe' }}
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           EVENT_NAME: ${{ github.event_name }}
