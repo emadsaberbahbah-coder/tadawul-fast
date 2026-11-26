@@ -2,8 +2,24 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.7.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.8.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.8.0 (2026-11-26) -- [LLM-SHADOW] A LANGUAGE MODEL READS THE SAME HEADLINES BESIDE THE WORD LISTS
+WHY (owner, 26 Nov 2026 15:28 and 15:34: can another AI he subscribes to help the news reading - "let us
+  start with this too"): the word lists classified 56% of the headlines collected since 19 Nov and cannot read
+  a sentence (v1.4.0 left "Iran attacks US bases ... despite diplomatic efforts" unread as fighting).
+WHAT: after the verdict is computed and recorded, llm_shadow() hands the run's fresh headlines to
+  scripts/news_llm_reader.py 1.0.0 (Gemini API) and appends its labels beside the rule's own reading to a new
+  tab, _News_LLM (15 columns; the reader's header). The reader sees headlines and their kind only - no symbol.
+  IT CONTROLS NOTHING: it runs after evaluate() and after the gate's own rows are written; its labels go to
+  their own tab and are read by nothing; any failure in it is caught, named in the digest and leaves the
+  verdict, the exit code and the three gate tabs exactly as they were (pinned by a test).
+  Gate TFB_NEWS_LLM = on (default) | off; without GEMINI_API_KEY nothing is asked. A dry run asks and records
+  nothing in the workbook.
+NOT IN THIS VERSION: no verdict rule, taxonomy or existing tab changes. The BigQuery copy of _News_LLM and the
+  view that scores the two readings against what followed come once the tab holds rows.
+ROLLBACK: TFB_NEWS_LLM=off (repository Variable), or revert this file to v1.7.0.
+
 v1.7.0 (2026-11-26) -- [MARKETAUX] COMPANY NEWS FROM MARKETAUX FOR THE FIRST NAMES OF THE SCOPE
 WHY (owner, 26 Nov 2026 15:21: the repository secret MARKETAUX_API_KEY added after the review of five news
   services he sent): of the five, Marketaux alone serves its free plan without delay (100 requests a day,
@@ -331,7 +347,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -2352,6 +2368,9 @@ def render_digest(rep: Dict[str, Any]) -> str:
                          + (f"{d.get('outside', 0)} / {d.get('undated', 0)} / {d.get('repeated', 0)}"
                             if src in NEW_SOURCES else "-")
                          + f" | {d.get('failed', 0) if src in NEW_SOURCES else '-'} |")
+    if (rep.get("llm") or {}).get("line"):      # v1.8.0 [LLM-SHADOW]
+        lines.append("")
+        lines.append(rep["llm"]["line"])
     lines.append("")
     lines.append("Not a licensed financial adviser; the owner decides and executes every trade.")
     return "\n".join(lines) + "\n"
@@ -2360,7 +2379,8 @@ def render_digest(rep: Dict[str, Any]) -> str:
 def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         sources: Sequence[str], scope: List[Dict[str, str]], sleep: Callable[[float], None],
         run_id: str, mode: str, tax: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
-    clf = Classifier(tax or load_taxonomy())
+    tax = tax or load_taxonomy()
+    clf = Classifier(tax)
     col = Collector(http, sleep, now)
     raw: List[Dict[str, Any]] = []
     econ: List[Dict[str, Any]] = []
@@ -2513,7 +2533,49 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         except Exception as exc:
             rep["write_error"] = str(exc)[:300]
             rc = 1
+    # v1.8.0 [LLM-SHADOW]: after the verdict and the gate's own rows; nothing below can change either
+    rep["llm"] = llm_shadow(http=http, sheets=sheets, sid=sid, items=fresh_items, tax=tax, now=now, run_id=run_id,
+                            write=bool(write and rep["wrote"]), sleep=sleep, clock=col.clock)
+    if rep["llm"].get("line"):
+        _out(f"[news_gate v{__version__}] " + rep["llm"]["line"])
     return rc, rep
+
+
+def llm_shadow(*, http: Any, sheets: Any, sid: str, items: Sequence[Dict[str, Any]], tax: Dict[str, Any],
+               now: _dt.datetime, run_id: str, write: bool, sleep: Callable[[float], None],
+               clock: Callable[[], float]) -> Dict[str, Any]:
+    """v1.8.0 [LLM-SHADOW]: the report of the shadow reader (scripts/news_llm_reader.py). Every fault is caught
+    here: the reader labels headlines for later scoring and must never fail, slow past its own budget or
+    change the run that called it."""
+    if _env("TFB_NEWS_LLM", "on").strip().lower() in ("off", "0", "false", "no"):
+        return {"mode": "off"}
+    key = _env("GEMINI_API_KEY")
+    try:
+        try:
+            from scripts import news_llm_reader as llm  # noqa: PLC0415
+        except ImportError:  # run as a file from scripts/
+            import news_llm_reader as llm  # type: ignore  # noqa: PLC0415
+        if not key:
+            rep: Dict[str, Any] = {"mode": "no key"}
+        else:
+            seen: List[str] = []
+            if sheets is not None and sid:
+                ids = read_values(sheets, sid, llm.TAB, "A2:A") or []
+                seen = [str(r[0]) for r in ids[-8000:] if r]
+            rows, rep = llm.read(post=getattr(http, "post", None), key=key, model=_env("TFB_NEWS_LLM_MODEL"),
+                                 items=items, taxonomy=tax, now=now, seen=seen, run_id=run_id, sleep=sleep,
+                                 clock=clock, max_items=_int_env("TFB_NEWS_LLM_MAX_ITEMS", 120, 0, 400))
+            rep["wrote"] = False
+            if write and rows and sheets is not None and sid:
+                ensure_tab(sheets, sid, llm.TAB, llm.HEADER)
+                append_rows(sheets, sid, llm.TAB, rows)
+                rep["wrote"] = True
+        rep["line"] = llm.digest_line(rep)
+        return rep
+    except Exception as exc:  # noqa: BLE001
+        why = _scrub(f"{type(exc).__name__}: {exc}", key)[:120]
+        return {"mode": "failed", "error": why,
+                "line": f"LLM shadow reader: failed ({why}); the gate is not affected."}
 
 
 def _json_default(o: Any) -> Any:

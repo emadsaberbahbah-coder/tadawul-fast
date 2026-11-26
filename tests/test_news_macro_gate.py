@@ -882,7 +882,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.7.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.8.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -907,9 +907,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.7.0"   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]
+    assert ng.__version__ == "1.8.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.8.0 [LLM-SHADOW]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.7.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.8.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
