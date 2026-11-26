@@ -1,5 +1,7 @@
 # Hypothesis H-29 — "Entry Score separates winners" (registered 2026-09-01; first evidence same day; NOT yet a gate change)
 
+> **Status, 26 Nov 2026 — DESCRIPTIVE, not evidence.** Every number below was produced by `tfb_backtest` v1.0.0 / v1.1.0: a random 5-fold CV and quintiles pooled over all rows. The external audit of 25 Nov 2026 found that this leaks time (cohorts of the same day, and overlapping horizon windows, sat on both sides of a fold; the cut points were made of later rows too). The "out of sample" window here is a later slice of the same log scored the same way — not a purged walk-forward. Read the tables as a description of the log on 31 Aug 2026. H-29a / H-29b stay proposals: neither may be armed on these numbers. A fresh run of `tfb_backtest` v1.3.0 (walk-forward gain, quintiles per formation date) is the test. No figure below was changed.
+
 | Field | Value |
 |---|---|
 | ID | H-29 |
