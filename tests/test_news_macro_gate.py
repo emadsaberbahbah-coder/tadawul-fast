@@ -77,6 +77,7 @@ NOW = dt.datetime(2026, 10, 28, 12, 47, tzinfo=UTC)          # 15:47 Riyadh, FOM
 QUIET = dt.datetime(2026, 10, 30, 12, 47, tzinfo=UTC)
 KEY = "secret-eodhd-key-123"
 FKEY = "secret-finnhub-key-456"
+MKEY = "secret-marketaux-key-789"
 AR = {
     "drone_hormuz": "\u0647\u062c\u0648\u0645 \u0628\u0637\u0627\u0626\u0631\u0629 \u0645\u0633\u064a\u0631\u0629 \u0639\u0644\u0649 \u0646\u0627\u0642\u0644\u0629 \u0641\u064a \u0645\u0636\u064a\u0642 \u0647\u0631\u0645\u0632",
     "aramco_profit_up": "\u0623\u0631\u0627\u0645\u0643\u0648 \u062a\u0639\u0644\u0646 \u0627\u0631\u062a\u0641\u0627\u0639 \u0635\u0627\u0641\u064a \u0627\u0644\u0631\u0628\u062d \u0644\u0644\u0631\u0628\u0639 \u0627\u0644\u062b\u0627\u0644\u062b",
@@ -195,6 +196,9 @@ class FakeHTTP:
         self.seen: List[Dict[str, Any]] = []
 
     def _new_source(self, url, params):
+        if url == ng.MARKETAUX_API:                  # v1.7.0: replies keyed 'marketaux:<code>'
+            body = self.feeds.get("marketaux:" + params.get("symbols", ""), {"meta": {}, "data": []})
+            return body if isinstance(body, Resp) else Resp(200, body)
         if url.startswith(ng.FINNHUB_API):           # v1.6.0: replies keyed 'finnhub:news' / 'finnhub:<TICKER>'
             key = "finnhub:" + (params.get("symbol") or "news")
             body = self.feeds.get(key, [])
@@ -358,6 +362,7 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("TFB_SEC_USER_AGENT", "TFB research test@example.com")
     monkeypatch.setenv("EODHD_API_KEY", KEY)
     monkeypatch.setenv("FINNHUB_API_KEY", FKEY)
+    monkeypatch.setenv("MARKETAUX_API_KEY", MKEY)
     monkeypatch.setenv("DEFAULT_SPREADSHEET_ID", FakeSheets.SID)
     monkeypatch.setenv("TFB_NEWS_GATE_GDELT_SPACING_S", "0")
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
@@ -850,7 +855,7 @@ def test_g7_failures_are_named_and_key_scrubbed(armed):
         assert src in rep["sources_failed"]
         assert KEY not in rep["sources_failed"][src]
     dead = {"sec.gov": 500, "gdeltproject": 500, "news.google": 500, "federalreserve": 500, "eodhd.com": 500,
-            "bing.com": 500, "yahoo.com": 500, "finnhub.io": 500}
+            "bing.com": 500, "yahoo.com": 500, "finnhub.io": 500, "marketaux.com": 500}
     dead.update({urlparse(f[2]).hostname: 500 for f in ng.FEEDS})       # v1.5.0: the new sources too
     (rc, rep), _ = _run(http=FakeHTTP(fail=dead))
     assert rc == 1 and rep["sources_ok"] == {}
@@ -877,7 +882,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.6.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.7.0")
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -902,9 +907,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.6.0"   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]
+    assert ng.__version__ == "1.7.0"   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.6.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.7.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1658,12 +1663,12 @@ def test_g14_the_registry_is_whole():
         assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
         assert ng.domain_of("https://" + domain + "/x") == domain or domain == "ecb.europa.eu", fid
     assert {ng.tier_of(f[3]) for f in ng.FEEDS if f[1] == "official_rss"} == {"A"}
-    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 12
+    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 13
     assert set(ng.NEW_SOURCES) <= set(ng.SOURCE_BUDGET_S) and set(ng.FEED_GROUPS) < set(ng.NEW_SOURCES)
-    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub"}
+    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub", "marketaux"}
     assert ng.selected_sources("") == list(ng.ALL_SOURCES)
     assert ng.selected_sources(",".join(OLD_SIX)) == OLD_SIX          # the rollback named in the header
-    assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 400   # the job has 20 minutes
+    assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 450   # the job has 20 minutes
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
     assert "blank = all: " + ",".join(ng.ALL_SOURCES) in wf
 
@@ -2098,7 +2103,7 @@ def test_g14_with_every_new_feed_empty_the_run_equals_the_six_source_run(armed):
     ga, gb = sh_a.tabs[ng.GATE_TAB][1], sh_b.tabs[ng.GATE_TAB][1]
     assert ga[:8] == gb[:8] and ga[9:] == gb[9:]                  # only the Sources OK cell differs
     assert set(gb[8].split(", ")) == set(ga[8].split(", ")) | {"bing_news=0", "gulf_rss=0", "official_rss=0",
-                                                            "press_rss=0", "yahoo_rss=0", "finnhub=0"}
+                                                            "press_rss=0", "yahoo_rss=0", "finnhub=0", "marketaux=0"}
     assert b["sources_detail"]["bing_news"] == {"asked": 10, "read": 0, "outside": 0, "undated": 0}
     assert "sources_detail" in a and a["sources_detail"] == {} and set(a["source_ages"]) <= set(OLD_SIX)
     assert a["sources_failed"] == b["sources_failed"]
@@ -2209,3 +2214,81 @@ def test_g15_finnhub_joins_the_gate_like_the_other_new_sources(armed):
     assert rep["gate"]["verdict"] == "NO_NEW_ENTRY"
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
     assert "FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}" in wf
+
+
+# ----------------------------------------------------------------------------- G16 (v1.7.0 [MARKETAUX])
+def _mx(*rows):
+    return {"meta": {"found": len(rows), "returned": len(rows), "limit": 3, "page": 1},
+            "data": [{"uuid": "u%d" % n, "title": t, "url": u, "source": src, "language": "en",
+                      "published_at": (NOW - dt.timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
+                      "entities": [{"symbol": "FRST", "sentiment_score": -0.6}]} for n, (t, u, src, h) in enumerate(rows)]}
+
+
+def test_g16_parse_marketaux():
+    got = ng.parse_marketaux(_mx(("Primis Financial shares fall after earnings miss", "https://www.benzinga.com/a", "benzinga.com", 5),
+                                 ("No link story", "", "reuters.com", 1), ("", "https://x.com/e", "x.com", 1)), "FRST.US", "lbl")
+    assert [(i["domain"], i["source"], i["scope"]) for i in got] == [("benzinga.com", "marketaux", "FRST.US"),
+                                                                    ("reuters.com", "marketaux", "FRST.US")]
+    assert got[0]["published"] == NOW - dt.timedelta(hours=5)
+    assert ng.parse_marketaux({"meta": {}, "data": []}, "X.US", "l") == []
+    for bad, why in (({"error": {"code": "usage_limit_reached", "message": "m"}}, "refused: usage_limit_reached"),
+                     ({"meta": {}}, "not a news reply"), ([], "not a news reply"), (None, "not a news reply")):
+        with pytest.raises(ValueError) as err:
+            ng.parse_marketaux(bad, "X.US", "l")
+        assert why in str(err.value)
+
+
+def test_g16_bounded_requests_and_the_key_never_in_a_message(armed):
+    http = FakeHTTP(feeds={"marketaux:FRST": _mx(("Primis Financial (NASDAQ:FRST) shares fall after earnings miss",
+                                                  "https://www.benzinga.com/a", "benzinga.com", 5),
+                                                 ("Primis Financial old item", "https://www.benzinga.com/o", "benzinga.com", 90))})
+    col = ng.Collector(http, _sleep, NOW)
+    syms = ["FRST.US", "5023.SR", "VOD.L", "BADCO.US"] + ["N%d.US" % n for n in range(20)]
+    got = col.marketaux(syms, MKEY, 3)
+    asked = [c for c in http.seen if c["url"] == ng.MARKETAUX_API]
+    assert [c["params"]["symbols"] for c in asked] == ["FRST", "5023.SR", "BADCO"]      # the first three it lists
+    assert all(c["params"]["api_token"] == MKEY and c["params"]["filter_entities"] == "true"
+               and c["params"]["published_after"] == "2026-10-25T12:47:00" and c["timeout"] == ng.FEED_TIMEOUT_S for c in asked)
+    assert [i["url"] for i in got] == ["https://www.benzinga.com/a"] and col.ok == {"marketaux": 1}
+    assert col.detail["marketaux"] == {"asked": 3, "read": 2, "outside": 1, "undated": 0}
+    assert ng.Collector(FakeHTTP(), _sleep, NOW).marketaux(syms, MKEY, 0) == []
+
+    class Leaky(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url == ng.MARKETAUX_API:
+                raise ConnectionError("refused api_token=%s" % (params or {}).get("api_token"))
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    leaky = Leaky()
+    col = ng.Collector(leaky, _sleep, NOW)
+    assert col.marketaux(syms, MKEY, 8) == [] and len(leaky.calls) == 0     # raised before the call is recorded
+    assert col.detail["marketaux"] == {"failed": 2}                           # asked once each: no retry
+    assert MKEY not in col.failed["marketaux"] and "***" in col.failed["marketaux"]
+    assert "circuit open after 2 consecutive failures; 6 queries skipped" in col.failed["marketaux"]
+    limit = FakeHTTP(feeds={"marketaux:FRST": Resp(402, text="limit"), "marketaux:BADCO": Resp(402, text="limit")})
+    col = ng.Collector(limit, _sleep, NOW)
+    col.marketaux(["FRST.US", "BADCO.US", "ZZZ.US"], MKEY, 8)
+    assert col.failed["marketaux"].startswith("FRST.US: HTTP 402; BADCO.US: HTTP 402") and len(limit.calls) == 2
+    busy = FakeHTTP(feeds={"marketaux:FRST": Resp(429, text="slow down")})
+    ng.Collector(busy, _sleep, NOW).marketaux(["FRST.US"], MKEY, 8)
+    assert len(busy.calls) == 1                                               # a 429 is not retried within the run
+
+
+def test_g16_marketaux_in_the_run_and_without_a_key(armed, monkeypatch):
+    feeds = {"marketaux:FRST": _mx(("Primis Financial (NASDAQ:FRST) shares fall after earnings miss", "https://www.wsj.com/a", "wsj.com", 5),
+                                   ("5 bank stocks to watch as rates fall", "https://www.zacks.com/l", "zacks.com", 3))}
+    (rc, rep), sh = _run(http=FakeHTTP(feeds=feeds), sources=["marketaux", "market"])
+    assert rc == 0 and rep["sources_ok"]["marketaux"] == 2 and rep["issuer_link"]["unlinked"] == 1
+    rows = [r for r in sh.tabs[ng.ITEMS_TAB][1:] if r[8] == "marketaux"]
+    assert [(r[3], r[9], r[10]) for r in rows] == [("FRST.US", "wsj.com", "B")]
+    assert rep["gate"]["names"]["FRST.US"][0]["level"] == "WATCH"          # a confirmed negative item, as for any source
+    monkeypatch.setenv("TFB_NEWS_GATE_MARKETAUX_MAX", "1")
+    http = FakeHTTP()
+    _run(http=http, sources=["marketaux"], write=False)
+    assert len([u for u in http.calls if u == ng.MARKETAUX_API]) == 1
+    monkeypatch.delenv("MARKETAUX_API_KEY")
+    http = FakeHTTP()
+    (rc, rep), _ = _run(http=http, sources=["marketaux", "market"], write=False)
+    assert rep["sources_failed"] == {"marketaux": "MARKETAUX_API_KEY not set"} and ng.MARKETAUX_API not in http.calls
+    wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
+    assert "MARKETAUX_API_KEY: ${{ secrets.MARKETAUX_API_KEY }}" in wf
