@@ -16,6 +16,7 @@ Archive, 19–26 Nov (`v_news_items`, 10,121 items):
 `scripts/news_macro_gate.py` 1.9.0 → **1.10.0**.
 
 - **`origins()`**: members whose headline is the same are one origin. "The same" means equal after a trailing site name (` - Reuters`, ` | BBC News`) is removed and the text is normalised. The copy from the best tier speaks for the origin.
+- **Only a site's name is taken off the end.** A tail is removed when it names the item's own domain (`BBC News` on bbc.com, `The Wall Street Journal` on wsj.com) or a known publisher (`Reuters`, `AP`, `Financial Times`). Any other short closing clause, such as ` - exports collapse`, stays part of the headline. *(Codex P2, fixed: the first version removed every short tail, so two wires whose headlines differed only in such a clause merged into one.)*
 - **A short headline is never merged.** Under 25 characters, two sites can write the same words on their own ("Oil prices rise").
 - **`information_grade()`** grades the origins. The domain counts in `evaluate()`'s rules (three domains, two domains) count the origins' domains.
 - **A copy never raises anything.** A site that only says it quotes a wire is not given the wire's tier. It merges with the wire's own item when that item is in the cluster, and stays its own source when it is not.
@@ -38,8 +39,9 @@ BigQuery, the 67 recorded runs since 19 Nov. Every market-anchored cluster (120 
 Those days were confirmed many times over, so removing copies still left enough. The rule matters on a thin day, when one reprinted story is all there is. The archive has not had such a day, so this change is a guard, not a correction of a past verdict.
 
 ## Tests
-- `tests/test_news_macro_gate.py`: 320 pass. New G19:
+- `tests/test_news_macro_gate.py`: 321 pass. New G19:
   - the headline key: site tail removed, short headlines not compared, a long tail kept as headline;
+  - which tails are site names: 14 cases, and Codex's two-wire example still reads CAUTION;
   - `origins()` keeps the best copy, in order, and merges nothing else;
   - a copy never raises the grade: wire plus two copies, two papers with one story, a syndication network, a blog quoting a wire, a denial reprinted three times;
   - the table above, and the market-anchor rule (one story on two wires' sites no longer counts as two);
@@ -47,7 +49,8 @@ Those days were confirmed many times over, so removing copies still left enough.
 - Five older tests used one headline on three domains to stand for three confirmations. Their fixtures now give each wire its own wording; what they assert is unchanged.
 - The two hashes that pin `evaluate()` are updated on purpose, with the reason beside them.
 - `tests/test_news_llm_reader.py`: 22 pass. Both files also pass with `GITHUB_ACTIONS=true`.
-- Seven hand mutants each fail a test: grade without origins, rule counts without origins, first copy kept instead of best, no minimum length, site tail not removed, the "independent" note removed, copies not merged.
+- The replay above removed every short tail, so it merged at least as much as the final rule does. Its result (no verdict changes) holds for the final rule.
+- Ten hand mutants each fail a test (the last three: every tail removed, no tail removed, two-letter domains matched by initials). The first seven: grade without origins, rule counts without origins, first copy kept instead of best, no minimum length, site tail not removed, the "independent" note removed, copies not merged.
 
 ## Limits
 - Two reports of one event in different words are still two origins. That is intended: it is how independent confirmation looks.

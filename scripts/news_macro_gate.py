@@ -29,7 +29,8 @@ WHY (owner, 26 Nov 2026 19:10 Riyadh, in Arabic: what matters is how an item is 
   (v_news_items): 639 headlines appeared word for word on two or more domains (1,838 of 10,121 items).
 WHAT: origins() - members whose headline is the same once a trailing site name is removed (25 characters or
   more after normalising, so a short common headline is not merged) are ONE origin, and the copy from the
-  best tier speaks for it. information_grade() grades the origins, and the domain counts of evaluate()'s
+  best tier speaks for it. A tail is a site name only when it names the item's own domain or a known
+  publisher (is_site_tail); any other short closing clause stays part of the headline. information_grade() grades the origins, and the domain counts of evaluate()'s
   rules count the origins' domains. A copy never raises anything: a site that only says it quotes a wire is
   not given the wire's tier - it merges with the wire's own item when that item is in the cluster, and stays
   its own source when it is not. The driver line says "N sources (M independent)" when the two differ. The
@@ -1411,14 +1412,44 @@ def parse_market(payload: Any) -> Dict[str, Dict[str, Any]]:
 # clustering + grading
 # ----------------------------------------------------------------------------- #
 # v1.10.0 [ORIGINS]: a trailing " - Site" / " | Site" on a headline, and the least a headline must hold to be compared
-_SITE_TAIL = re.compile(r"\s+[-|\u2013\u2014]\s+[^-|\u2013\u2014]{2,40}$")
+_SITE_TAIL = re.compile(r"\s+[-|\u2013\u2014]\s+([^-|\u2013\u2014]{2,40})$")
 ORIGIN_MIN_CHARS = 25
+
+
+def _site_names() -> frozenset:
+    """The names a headline's tail may carry as attribution: the first label of every graded domain, the
+    publisher names Finnhub uses, and the two agencies known by their initials."""
+    names = {d.split(".")[0] for d in SOURCE_TIERS} | {"".join(normalize_text(k).split()) for k in FINNHUB_SOURCE_DOMAINS}
+    return frozenset(n for n in names | {"ap", "afp", "associatedpress"} if len(n) >= 2)
+
+
+_SITE_NAMES = _site_names()
+
+
+def is_site_tail(tail: str, domain: str = "") -> bool:
+    """PURE: is this trailing " - ..." part of a headline a site's name? Yes when it names the item's own
+    domain ("BBC News" on bbc.com), or is or begins with a known publisher's name ("Reuters", "CNBC TV18").
+    Any other short clause ("- exports collapse") is part of the headline (Codex P2 on #1097)."""
+    words = normalize_text(tail).split()
+    if words[:1] == ["the"]:
+        words = words[1:]
+    squashed = "".join(words)
+    if not squashed or len(words) > 4:
+        return False
+    label = str(domain or "").lower().split(".")[0]
+    if len(label) >= 3 and (label in squashed or "".join(w[0] for w in words) == label):
+        return True
+    return squashed in _SITE_NAMES or words[0] in _SITE_NAMES or "".join(words[:2]) in _SITE_NAMES
 
 
 def origin_key(member: Dict[str, Any]) -> str:
     """PURE: the headline without a trailing site name, normalised; "" when it is too short to tell a copy
-    from a coincidence (or absent)."""
-    t = normalize_text(_SITE_TAIL.sub("", str(member.get("title") or ""))).strip()
+    from a coincidence (or absent). The tail is removed only when is_site_tail() says it is a site's name."""
+    title = str(member.get("title") or "")
+    m = _SITE_TAIL.search(title)
+    if m and is_site_tail(m.group(1), str(member.get("domain") or "")):
+        title = title[:m.start()]
+    t = normalize_text(title).strip()
     return t if len(t) >= ORIGIN_MIN_CHARS else ""
 
 
