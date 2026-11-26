@@ -2,8 +2,52 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.4.1 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.5.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.5.0 (2026-11-26) -- [SOURCES] FIVE MORE SOURCES; A FEED THAT CANNOT BE READ IS NAMED, NOT COUNTED AS ZERO
+WHY (owner, 26 Nov 2026 12:42: add three to five news sources and make the gate stronger and faster): the
+  archive of the gate's 137 runs (27 Oct - 26 Nov) shows it standing on one source. Google News carried
+  about 1,030 of the items of an average run; GDELT was refused (HTTP 429) in every run and returned nothing
+  in 67; the Fed feed answered in 134 runs and gave 0 items in all 134 - also in the 7 runs of 12 - 15 Nov,
+  days after the Fed's press release of 12 Nov - and no run named a fault. parse_rss() returned [] for any
+  reply it could not parse, so a blocked or mis-decoded feed looked the same as a quiet one. (One way this
+  happens: requests decodes a text/xml reply that names no charset as ISO-8859-1; a UTF-8 byte-order mark
+  then reaches the XML parser as three stray characters and the whole feed is refused.)
+WHAT: (1) five keyless sources, each optional and fail-open like the six before them:
+       bing_news    Bing News RSS, newest first: the seven English macro searches + each scope name (a
+                    second aggregator, so the gate is not blind when Google throttles the runner)
+       yahoo_rss    Yahoo Finance headline feed per scope name (US ticker, or the .SR code)
+       press_rss    publishers' own feeds: MarketWatch, WSJ Markets, CNBC, BBC Business, NYT Business,
+                    Investing.com, Seeking Alpha
+       official_rss primary sources: SEC press releases, BEA, BLS, ECB, EIA, White House presidential actions
+       gulf_rss     Asharq Business (Arabic), Arab News, The National (business), Al Jazeera
+     FEEDS is the registry (feed id, group, URL, publisher domain, language, window in hours). A feed item
+     takes its publisher's tier from SOURCE_TIERS as every headline does. An item with no readable date, or
+     outside its window (24 h market-wide, 72 h for a name or an official release), is left out: evaluate()
+     reads an undated headline as published now. A feed is asked once per run (12 s at most, no retry).
+  (2) parse_feed() reads RSS 2.0, RSS 1.0 and Atom from the reply's bytes (byte-order mark and leading blank
+     lines removed) and raises on a reply that is not a feed. google_news and fed_rss use it, so such a reply
+     is listed under Sources Failed with its first characters (for Google News the next search is still
+     asked: the reply does not count toward the two-failure breaker). parse_rss() keeps its old contract ([]).
+  (3) fold_new_sources(): a headline from a new source is left out when an older source, or an earlier new
+     one, already carries the same headline from the same publisher in the same scope - one story from one
+     publisher stays one member of its cluster. No item of the six older sources is ever left out by it.
+  (4) the issuer-link rule (v1.1.0) also judges bing_news and yahoo_rss name items; the new news sources are
+     carried in the run-to-run memory like gdelt and google_news (official feeds are re-read whole).
+  (5) the digest and the evidence file gain one line per source: items kept, left out (outside the window,
+     undated, repeated) and the age in minutes of its newest and median item at the run.
+THIS CAN CHANGE A VERDICT OR A NAME FLAG. Up: more publishers reach the three-domain rules sooner, and an
+  official release grades its cluster 1. Down, in two corners that exist today: a denial from a new source can
+  make a cluster "denied", and a Gulf story that one or two publishers confirm (grade 1-2, fewer than three
+  domains) raises nothing while the same story unconfirmed (grade 3-4) raises CAUTION - a gap in evaluate()
+  since v1.0.0, left as it is here. The gate still controls nothing (observe-only); the Version column of
+  _News_Gate marks the runs, so the score can be read before and after.
+NOT IN THIS VERSION: the verdict rules, the taxonomy, the 200-row limit per run and GDELT's throttling are
+  unchanged. No tab or header changes. The feeds were checked through a web fetch on 26 Nov; which of them
+  answer the GitHub runner is known only from the first run - a feed that refuses is named in Sources Failed.
+ROLLBACK: TFB_NEWS_GATE_SOURCES=edgar,gdelt,google_news,fed_rss,econ,market (repository Variable) turns the
+  five off; or revert this file to v1.4.1.
+
 v1.4.1 (2026-11-21) -- [FOMC-2027] THE FED'S REVISED 2027 SCHEDULE
 WHY: the Fed revised its tentative 2027 calendar on 12 Nov 2026 (federalreserve.gov, press release of that
 day): the 26-27 Oct 2027 meeting is for strategy and announces no decision, and the 7-8 Dec meeting moved to
@@ -244,6 +288,7 @@ import argparse
 import base64
 import datetime as _dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -252,9 +297,9 @@ import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -270,14 +315,66 @@ EDGAR_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 EDGAR_SUBMISSIONS = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 EODHD_ECON = "https://eodhd.com/api/economic-events"
 EODHD_RT = "https://eodhd.com/api/real-time/{code}"
+BING_NEWS_RSS = "https://www.bing.com/news/search"                    # v1.5.0 [SOURCES]
+YAHOO_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline"        # v1.5.0 [SOURCES]
 
-ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market")
+# v1.5.0 [SOURCES]: five keyless sources beside the six of v1.0.0. FEED_GROUPS are read from FEEDS below.
+NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss")
+FEED_GROUPS = ("press_rss", "official_rss", "gulf_rss")
+ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + NEW_SOURCES
 # v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
 # once its time budget is spent, so one throttled provider cannot hold the job
 # to its 20-minute limit (dry run 40595558188 sat in collection > 10 min).
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
-                   "fed_rss": 45.0, "econ": 60.0, "market": 45.0}
+                   "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
+                   "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
+                   "official_rss": 75.0, "gulf_rss": 45.0}
 BREAKER_FAILURES = 2
+# v1.5.0 [SOURCES]: a feed is asked once per run and never held longer than this; a reply larger than
+# MAX_FEED_BYTES is not parsed. Windows: what evaluate() can still use (24 h market-wide, 72 h for a name).
+FEED_TIMEOUT_S = 12.0
+MAX_FEED_BYTES = 4_000_000
+MACRO_WINDOW_H = 24.0
+NAME_WINDOW_H = 72.0
+# (feed id, source group, URL, publisher domain - it sets the tier -, language, window in hours).
+# Checked 26 Nov 2026. The Fed's own feed stays the source fed_rss.
+FEEDS: Tuple[Tuple[str, str, str, str, str, float], ...] = (
+    ("marketwatch", "press_rss", "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+     "marketwatch.com", "en", MACRO_WINDOW_H),
+    ("wsj_markets", "press_rss", "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+     "wsj.com", "en", MACRO_WINDOW_H),
+    ("cnbc", "press_rss", "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+     "cnbc.com", "en", MACRO_WINDOW_H),
+    ("bbc_business", "press_rss", "https://feeds.bbci.co.uk/news/business/rss.xml",
+     "bbc.com", "en", MACRO_WINDOW_H),
+    ("nyt_business", "press_rss", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+     "nytimes.com", "en", MACRO_WINDOW_H),
+    ("investing", "press_rss", "https://www.investing.com/rss/news.rss",
+     "investing.com", "en", MACRO_WINDOW_H),
+    ("seekingalpha", "press_rss", "https://seekingalpha.com/market_currents.xml",
+     "seekingalpha.com", "en", MACRO_WINDOW_H),
+    ("sec_press", "official_rss", "https://www.sec.gov/news/pressreleases.rss",
+     "sec.gov", "en", NAME_WINDOW_H),
+    ("bea", "official_rss", "https://apps.bea.gov/rss/rss.xml",
+     "bea.gov", "en", NAME_WINDOW_H),
+    ("bls", "official_rss", "https://www.bls.gov/feed/bls_latest.rss",
+     "bls.gov", "en", NAME_WINDOW_H),
+    ("ecb", "official_rss", "https://www.ecb.europa.eu/rss/press.html",
+     "ecb.europa.eu", "en", NAME_WINDOW_H),
+    ("eia", "official_rss", "https://www.eia.gov/rss/press_rss.xml",
+     "eia.gov", "en", NAME_WINDOW_H),
+    ("whitehouse_actions", "official_rss", "https://www.whitehouse.gov/presidential-actions/feed/",
+     "whitehouse.gov", "en", NAME_WINDOW_H),
+    ("asharq_business", "gulf_rss", "https://www.asharqbusiness.com/rss.xml",
+     "asharqbusiness.com", "ar", MACRO_WINDOW_H),
+    ("arabnews", "gulf_rss", "https://www.arabnews.com/rss.xml",
+     "arabnews.com", "en", MACRO_WINDOW_H),
+    ("thenational", "gulf_rss",
+     "https://www.thenationalnews.com/arc/outboundfeeds/rss/category/business/?outputType=xml",
+     "thenationalnews.com", "en", MACRO_WINDOW_H),
+    ("aljazeera", "gulf_rss", "https://www.aljazeera.com/xml/rss/all.xml",
+     "aljazeera.com", "en", MACRO_WINDOW_H),
+)
 
 GATE_TAB = "_News_Gate"
 ITEMS_TAB = "_News_Items"
@@ -293,7 +390,9 @@ ECON_HEADER = ["Key", "Date (UTC)", "Country", "Event", "Comparison", "Period", 
 # v1.0.2: headlines from earlier runs stay in the clusters while they can still
 # move the verdict (evaluate(): 24 h for macro, 72 h for a name).
 MEMORY_HOURS = {"MACRO": 24.0, "NAME": 72.0}
-MEMORY_SOURCES = ("gdelt", "google_news")
+# v1.5.0 [SOURCES]: the new news sources are carried too; official feeds keep days of items and are re-read.
+MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss")
+ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss")
 _LEVEL_ORDER = {"BLOCK": 0, "WATCH": 1, "INFO": 2}
 
 VERDICTS = ("GO", "CAUTION", "NO_NEW_ENTRY")
@@ -326,6 +425,7 @@ SOURCE_TIERS: Dict[str, str] = {
     "fortune.com": "C", "forbes.com": "C", "businessinsider.com": "C", "cnbcarabia.com": "C",
     # D
     "yahoo.com": "D", "msn.com": "D", "seekingalpha.com": "D", "fool.com": "D",
+    "bing.com": "D",   # v1.5.0: a Bing News link whose publisher could not be read
     "zacks.com": "D", "tipranks.com": "D", "marketbeat.com": "D", "news.google.com": "D",
     "insidermonkey.com": "D", "simplywall.st": "D", "stocktitan.net": "D",
     "gurufocus.com": "D", "finviz.com": "D", "investorsobserver.com": "D",
@@ -702,26 +802,241 @@ def _rfc822(s: str) -> Optional[_dt.datetime]:
         return None
 
 
-def parse_rss(xml_text: str, scope: str, label: str, source: str, lang: str) -> List[Dict[str, Any]]:
+# v1.5.0 [SOURCES]: one reader for RSS 2.0, RSS 1.0 (RDF) and Atom.
+_FEED_NS = ("http://www.w3.org/2005/Atom", "http://purl.org/rss/1.0/", "http://purl.org/dc/elements/1.1/")
+_ENTITY_REF = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+
+
+def _local(tag: Any) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _feed_ns(tag: Any) -> str:
+    return tag[1:].split("}", 1)[0] if isinstance(tag, str) and tag.startswith("{") else ""
+
+
+def _feed_child(el: Any, names: Sequence[str]) -> Any:
+    """The first direct child with one of `names`: the plain tag first, then that name in a feed namespace
+    (so <media:title> never stands in for <title>)."""
+    for name in names:
+        for ch in el:
+            if ch.tag == name:
+                return ch
+    for name in names:
+        for ch in el:
+            if _local(ch.tag) == name and _feed_ns(ch.tag) in _FEED_NS:
+                return ch
+    return None
+
+
+def _feed_link(el: Any) -> str:
+    spare = ""
+    for ch in el:
+        if _local(ch.tag) != "link" or (ch.tag != "link" and _feed_ns(ch.tag) not in _FEED_NS):
+            continue
+        href = (ch.get("href") or "").strip()
+        if href:                                          # Atom: <link rel="alternate" href="..."/>
+            if (ch.get("rel") or "alternate") == "alternate":
+                return href
+            spare = spare or href
+        elif (ch.text or "").strip():
+            return ch.text.strip()
+    return spare
+
+
+def _feed_time(text: Any) -> Optional[_dt.datetime]:
+    """RFC 822 (RSS), ISO 8601 (Atom, dc:date) or 'YYYY-MM-DD HH:MM:SS'; a time with no zone is read as UTC."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return None
+    got = _rfc822(raw)
+    if got is not None:
+        return got
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
+        d = _dt.datetime.fromisoformat(raw[:-1] + "+00:00" if raw[-1] in "Zz" else raw)
+    except ValueError:
+        return None
+    return d.astimezone(UTC) if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+def _feed_root(payload: Any) -> Any:
+    """The root of a feed reply, read from bytes when the reply has them (the parser then honours the
+    feed's own encoding). Raises ValueError for a reply that is not a feed: an empty feed is a feed, a
+    block page is not."""
+    if isinstance(payload, (bytes, bytearray)):
+        data: Any = bytes(payload)
+        if data.startswith(b"\xef\xbb\xbf"):
+            data = data[3:]
+        data = data.lstrip()
+        head = data[:60].decode("ascii", "replace")
+        entity = b"<!ENTITY" in data
+    else:
+        data = str(payload or "")
+        for mark in ("\ufeff", "\u00ef\u00bb\u00bf"):      # a byte-order mark, read as UTF-8 or as Latin-1
+            if data.startswith(mark):
+                data = data[len(mark):]
+        data = data.lstrip()
+        head = data[:60]
+        entity = "<!ENTITY" in data
+    head = " ".join(head.encode("ascii", "replace").decode("ascii").split())
+    if not data:
+        raise ValueError("empty reply")
+    if len(data) > MAX_FEED_BYTES:
+        raise ValueError(f"reply of {len(data)} characters is over the limit")
+    if entity:
+        raise ValueError("reply declares XML entities")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ValueError(f"not a feed ({str(exc)[:40]}): {head}")
+    kind = _local(root.tag).lower()
+    if kind not in ("rss", "feed", "rdf"):
+        raise ValueError(f"not a feed (root <{kind[:20]}>)")
+    return root
+
+
+def parse_feed(payload: Any, scope: str, label: str, source: str, lang: str,
+               domain: str = "") -> List[Dict[str, Any]]:
+    """v1.5.0 [SOURCES]: the items of an RSS / Atom reply (text or bytes). `domain` names the publisher of a
+    publisher's own feed; without it the item's <source url> or its link decides, as before. Raises
+    ValueError when the reply is not a feed - parse_rss() below keeps the older, silent contract."""
+    root = _feed_root(payload)
     out = []
-    for it in root.iter("item"):
-        title = " ".join((it.findtext("title") or "").split())
-        link = (it.findtext("link") or "").strip()
+    for it in root.iter():
+        if it.tag not in ("item", "entry") and not (_local(it.tag) in ("item", "entry")
+                                                    and _feed_ns(it.tag) in _FEED_NS):
+            continue
+        t = _feed_child(it, ("title",))
+        # a feed that escapes twice leaves '&amp;' in the text; only whole references (ending ';') are undone
+        title = " ".join(_ENTITY_REF.sub(lambda m: html.unescape(m.group(0)),
+                                         (t.text or "") if t is not None else "").split())
+        link = _feed_link(it)
         if not title:
             continue
-        src = it.find("source")
+        src = _feed_child(it, ("source",))
         src_url = (src.get("url") if src is not None else "") or ""
         src_name = (src.text or "").strip() if src is not None and src.text else ""
         if src_name and title.endswith(" - " + src_name):
             title = title[: -(len(src_name) + 3)].strip()
-        dom = domain_of(src_url) if src_url else domain_of(link)
+        dom = domain or (domain_of(src_url) if src_url else domain_of(link))
+        when = _feed_child(it, ("pubDate", "published", "updated", "date"))
         out.append({"source": source, "query": label, "scope": scope, "title": title,
-                    "url": link, "domain": dom, "published": _rfc822(it.findtext("pubDate") or ""),
+                    "url": link, "domain": dom, "published": _feed_time(when.text if when is not None else ""),
                     "lang": lang})
+    return out
+
+
+def parse_rss(xml_text: str, scope: str, label: str, source: str, lang: str) -> List[Dict[str, Any]]:
+    """The lenient reader of v1.0.0, kept for its contract: [] for a reply that is not a feed. The
+    collectors call parse_feed(), which says so."""
+    try:
+        return parse_feed(xml_text, scope, label, source, lang)
+    except ValueError:
+        return []
+
+
+def _feed_payload(resp: Any) -> Any:
+    raw = getattr(resp, "content", None)
+    return raw if isinstance(raw, (bytes, bytearray)) and raw else getattr(resp, "text", "")
+
+
+def bing_target(link: str) -> str:
+    """v1.5.0 [SOURCES] PURE: the publisher's address inside a Bing News click link
+    ('.../news/apiclick.aspx?...&url=<address>&...'); any other link is returned as it is."""
+    try:
+        p = urlparse(link)
+        host = (p.hostname or "").lower()
+        if host == "bing.com" or host.endswith(".bing.com"):
+            target = (parse_qs(p.query).get("url") or [""])[0].strip()
+            if target.lower().startswith(("http://", "https://")):
+                return target
+    except ValueError:
+        pass
+    return link
+
+
+def yahoo_symbol(symbol: str) -> str:
+    """v1.5.0 [SOURCES] PURE: the code Yahoo Finance lists a scope symbol under ('' = not asked)."""
+    s = str(symbol or "").strip().upper()
+    if s.endswith(".US") and len(s) > 3:
+        return s[:-3].replace(".", "-")
+    return s if s.endswith(".SR") and len(s) > 3 else ""
+
+
+def within_window(items: Sequence[Dict[str, Any]], now: _dt.datetime, hours: float
+                  ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """v1.5.0 [SOURCES] PURE: (items published inside the last `hours`, how many were left out). An undated
+    item is left out - evaluate() reads a missing date as 'now', so an old undated headline would count as
+    fresh - and so is one dated more than an hour ahead of the run."""
+    kept: List[Dict[str, Any]] = []
+    left = {"outside": 0, "undated": 0}
+    floor, ceiling = now - _dt.timedelta(hours=hours), now + _dt.timedelta(hours=1)
+    for it in items:
+        published = it.get("published")
+        if published is None:
+            left["undated"] += 1
+        elif published < floor or published > ceiling:
+            left["outside"] += 1
+        else:
+            kept.append(it)
+    return kept, left
+
+
+def fold_new_sources(items: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """v1.5.0 [SOURCES] PURE: (items kept, {source: copies left out}). One story from one publisher is one
+    member of its cluster: an item of a NEW source is left out when an item of an older source carries the
+    same headline from the same publisher in the same scope, or when another item of a new source claimed
+    it first (a row recorded by an earlier run before a fresh copy; otherwise the order of collection).
+    The same item met again (same Item ID) is not a copy. Items of the six older sources are never left
+    out here, and an item with no publisher or no headline is not compared."""
+    def key(it: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        dom = str(it.get("domain") or "").lower()
+        title = normalize_text(it.get("title") or "").strip()
+        return (str(it.get("scope") or ""), dom, title) if dom and title else None
+
+    def iid(it: Dict[str, Any]) -> str:
+        return it.get("id") or item_id(it.get("url", ""), it.get("title", ""), it.get("source", ""),
+                                       it.get("scope", ""))
+
+    older = set()
+    claimed: Dict[Tuple[str, str, str], str] = {}
+    for it in items:
+        k = key(it)
+        if k is None:
+            continue
+        if it.get("source") not in NEW_SOURCES:
+            older.add(k)
+        elif it.get("memory"):
+            claimed.setdefault(k, iid(it))
+    kept: List[Dict[str, Any]] = []
+    left: Dict[str, int] = {}
+    for it in items:
+        src = it.get("source")
+        k = key(it) if src in NEW_SOURCES else None
+        if k is not None:
+            mine = iid(it)
+            if k in older or claimed.setdefault(k, mine) != mine:
+                left[src] = left.get(src, 0) + 1
+                continue
+        kept.append(it)
+    return kept, left
+
+
+def source_ages(items: Sequence[Dict[str, Any]], now: _dt.datetime) -> Dict[str, Dict[str, int]]:
+    """v1.5.0 [SOURCES] PURE: per news source, the age in minutes at this run of its newest and its median
+    dated item (rows carried from memory and EDGAR filings are not counted)."""
+    ages: Dict[str, List[float]] = {}
+    for it in items:
+        if it.get("memory") or it.get("source") == "edgar" or not it.get("published"):
+            continue
+        ages.setdefault(str(it.get("source") or ""), []).append(
+            max(0.0, (now - it["published"]).total_seconds() / 60.0))
+    out: Dict[str, Dict[str, int]] = {}
+    for src, xs in ages.items():
+        xs.sort()
+        half = len(xs) // 2
+        median = xs[half] if len(xs) % 2 else (xs[half - 1] + xs[half]) / 2.0
+        out[src] = {"n": len(xs), "newest_min": int(round(xs[0])), "median_min": int(round(median))}
     return out
 
 
@@ -1099,21 +1414,24 @@ class Collector:
         self.timeout = _float_env("TFB_NEWS_GATE_TIMEOUT_S", 20.0, 5.0, 60.0)
         self.ok: Dict[str, int] = {}
         self.failed: Dict[str, str] = {}
+        self.detail: Dict[str, Dict[str, int]] = {}      # v1.5.0 [SOURCES]: what each new source read and left out
 
     def _get(self, src: str, url: str, *, params: Optional[Dict[str, Any]] = None,
-             headers: Optional[Dict[str, str]] = None, retry_wait: float = 8.0) -> Any:
-        for attempt in (1, 2):
+             headers: Optional[Dict[str, str]] = None, retry_wait: float = 8.0,
+             attempts: int = 2, timeout: Optional[float] = None) -> Any:
+        last = max(1, attempts)
+        for attempt in range(1, last + 1):
             try:
-                resp = self.http.get(url, params=params, headers=headers or {}, timeout=self.timeout)
+                resp = self.http.get(url, params=params, headers=headers or {}, timeout=timeout or self.timeout)
             except Exception as exc:  # network error
-                if attempt == 2:
+                if attempt == last:
                     raise RuntimeError(f"{type(exc).__name__}: {exc}")
                 self.sleep(retry_wait)
                 continue
             code = getattr(resp, "status_code", 0)
             if code == 200:
                 return resp
-            if code in (429, 500, 502, 503, 504) and attempt == 1:
+            if code in (429, 500, 502, 503, 504) and attempt < last:
                 self.sleep(retry_wait)
                 continue
             raise RuntimeError(f"HTTP {code}")
@@ -1124,6 +1442,29 @@ class Collector:
 
     def _fail(self, src: str, why: str) -> None:
         self.failed.setdefault(src, why[:160])
+
+    def _fail_part(self, src: str, part: str, why: str) -> None:
+        """v1.5.0 [SOURCES]: every feed or search of a new source that failed is named, not only the first."""
+        prev = self.failed.get(src, "")
+        self.failed[src] = (((prev + "; ") if prev else "") + f"{part}: {why}"[:72])[:420]
+        self._tally(src, failed=1)
+
+    def _tally(self, src: str, **counts: int) -> None:
+        row = self.detail.setdefault(src, {})
+        for k, v in counts.items():
+            row[k] = row.get(k, 0) + int(v)
+
+    def _read_feed(self, src: str, url: str, *, scope: str, label: str, lang: str, hours: float,
+                   domain: str = "", params: Optional[Dict[str, Any]] = None,
+                   headers: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+        """v1.5.0 [SOURCES]: one feed, asked once (the next run asks again). Raises on a transport fault and
+        on a reply that is not a feed; returns the items inside the window."""
+        resp = self._get(src, url, params=params, headers=headers, attempts=1,
+                         timeout=min(self.timeout, FEED_TIMEOUT_S))
+        got = parse_feed(_feed_payload(resp), scope, label, src, lang, domain)
+        kept, left = within_window(got, self.now, hours)
+        self._tally(src, asked=1, read=len(got), outside=left["outside"], undated=left["undated"])
+        return kept
 
     # -- GDELT ------------------------------------------------------------------
     def gdelt(self, queries: Sequence[Tuple[str, str, str]], spacing: float,
@@ -1172,7 +1513,15 @@ class Collector:
                 lang, {"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
             try:
                 resp = self._get("google_news", GNEWS_RSS, params=params)
-                got = parse_rss(resp.text, scope, label, "google_news", lang[:2])
+                try:
+                    got = parse_feed(_feed_payload(resp), scope, label, "google_news", lang[:2])
+                except ValueError as exc:
+                    # v1.5.0: a reply that is not a feed is named, not counted as zero items. The service
+                    # answered, so - as with GDELT's plain-text replies - the breaker does not advance and
+                    # the next search is still asked: this is the gate's main source.
+                    self._fail("google_news", f"{label}: {exc}")
+                    guard.success()
+                    continue
                 out.extend(got)
                 self._note("google_news", len(got))
                 guard.success()
@@ -1186,7 +1535,8 @@ class Collector:
     def fed_rss(self) -> List[Dict[str, Any]]:
         try:
             resp = self._get("fed_rss", FED_RSS)
-            got = [i for i in parse_rss(resp.text, "MACRO", "fed press", "fed_rss", "en")
+            # v1.5.0: read from the reply's bytes; a reply that is not a feed is named under Sources Failed
+            got = [i for i in parse_feed(_feed_payload(resp), "MACRO", "fed press", "fed_rss", "en")
                    if not i.get("published") or i["published"] >= self.now - _dt.timedelta(days=3)]
             for i in got:
                 i["domain"] = "federalreserve.gov"
@@ -1195,6 +1545,85 @@ class Collector:
         except Exception as exc:
             self._fail("fed_rss", str(exc))
             return []
+
+    # -- v1.5.0 [SOURCES] ---------------------------------------------------------
+    def bing_news(self, queries: Sequence[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
+        """Bing News RSS, newest first. Each item is filed under its publisher (the address inside Bing's
+        click link), so it is tiered and counted like the same story from any other source."""
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "bing_news")
+        for i, (scope, label, q) in enumerate(queries):
+            if not guard.allow():
+                continue
+            if i:
+                self.sleep(1.0)
+            try:
+                got = self._read_feed("bing_news", BING_NEWS_RSS, scope=scope, label=label, lang="en",
+                                      hours=MACRO_WINDOW_H if scope == "MACRO" else NAME_WINDOW_H,
+                                      params={"q": q, "format": "rss", "qft": 'sortbydate="1"'})
+                for it in got:
+                    it["url"] = bing_target(it.get("url") or "")
+                    it["domain"] = domain_of(it["url"])
+                out.extend(got)
+                self._note("bing_news", len(got))
+                guard.success()
+            except Exception as exc:
+                self._fail_part("bing_news", label, str(exc))
+                guard.failure()
+        guard.close()
+        return out
+
+    def yahoo_rss(self, symbols: Sequence[str]) -> List[Dict[str, Any]]:
+        """Yahoo Finance headline feed, one request per scope name Yahoo lists (US ticker or .SR code)."""
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "yahoo_rss")
+        asked = 0
+        for sym in symbols:
+            code = yahoo_symbol(sym)
+            if not code or not guard.allow():
+                continue
+            if asked:
+                self.sleep(0.5)
+            asked += 1
+            try:
+                got = self._read_feed("yahoo_rss", YAHOO_RSS, scope=sym, label=f"name {sym} yahoo", lang="en",
+                                      hours=NAME_WINDOW_H, params={"s": code, "region": "US", "lang": "en-US"})
+                out.extend(got)
+                self._note("yahoo_rss", len(got))
+                guard.success()
+            except Exception as exc:
+                self._fail_part("yahoo_rss", sym, str(exc))
+                guard.failure()
+        guard.close()
+        return out
+
+    def feeds(self, group: str, sec_user_agent: str = "") -> List[Dict[str, Any]]:
+        """The feeds of one group in FEEDS, each on its own: a feed that fails is named and the next one is
+        read (they are different publishers, so there is no circuit breaker - only the group's time budget).
+        sec.gov is asked with the declared EDGAR contact and not at all without it."""
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, group)
+        for fid, grp, url, domain, lang, hours in FEEDS:
+            if grp != group or not guard.allow():
+                continue
+            headers = None
+            if domain == "sec.gov":
+                if not sec_user_agent:
+                    self._fail_part(group, fid, "TFB_SEC_USER_AGENT not set")
+                    continue
+                headers = {"User-Agent": sec_user_agent, "Accept-Encoding": "gzip, deflate"}
+            try:
+                got = self._read_feed(group, url, scope="MACRO", label=fid, lang=lang, hours=hours,
+                                      domain=domain, headers=headers)
+                out.extend(got)
+                self._note(group, len(got))
+            except Exception as exc:
+                self._fail_part(group, fid, str(exc))
+        if guard.skipped:      # the feeds already named stay named (the guard's own note keeps 110 characters)
+            prev = self.failed.get(group, "")
+            self.failed[group] = (((prev + "; ") if prev else "")
+                                  + f"time budget {guard.budget:.0f}s spent: {guard.skipped} feeds not asked")[:420]
+        return out
 
     # -- EDGAR ------------------------------------------------------------------
     def edgar(self, symbols: Sequence[str], user_agent: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
@@ -1370,14 +1799,15 @@ def _issuer_link_mode() -> str:
 
 def apply_issuer_link(items: List[Dict[str, Any]], names: Dict[str, str], mode: str
                       ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """v1.1.0 [ISSUER-LINK]: (kept items, report). Only GDELT / Google-News items about a name are judged."""
+    """v1.1.0 [ISSUER-LINK]: (kept items, report). Only the name items of the search and per-name sources
+    (ISSUER_LINK_SOURCES: GDELT, Google News and, from v1.5.0, Bing News and Yahoo) are judged."""
     info: Dict[str, Any] = {"mode": mode, "checked": 0, "unlinked": 0, "examples": []}
     if mode == "off":
         return items, info
     kept = []
     for it in items:
         scope = str(it.get("scope") or "")
-        if scope and scope != "MACRO" and it.get("source") in ("gdelt", "google_news"):
+        if scope and scope != "MACRO" and it.get("source") in ISSUER_LINK_SOURCES:
             verdict = issuer_linked(it.get("title", ""), scope, names.get(scope, ""))
             if verdict is not None:
                 info["checked"] += 1
@@ -1413,6 +1843,20 @@ def build_queries(scope: Sequence[Dict[str, str]]) -> Tuple[List[Tuple[str, str,
             gdelt.append((s["symbol"], f"name {s['symbol']}", nq))
             gnews.append((s["symbol"], f"name {s['symbol']} en", f"{nq} when:3d", "en"))
     return gdelt, gnews
+
+
+def build_bing_queries(scope: Sequence[Dict[str, str]]) -> List[Tuple[str, str, str]]:
+    """v1.5.0 [SOURCES]: Google News' English macro searches without its 'when:' operator (Bing has none:
+    the feed is asked newest first and the window is applied to the dates), then every scope name."""
+    out = []
+    for label, q in GNEWS_EN_QUERIES:
+        out.append(("MACRO", (label[:-3] if label.endswith(" en") else label) + " bing",
+                    re.sub(r"\s+when:\d+[dh]\s*$", "", q)))
+    for s in scope:
+        nq = _name_query(s.get("name") or "")
+        if nq:
+            out.append((s["symbol"], f"name {s['symbol']} bing", nq))
+    return out
 
 
 # ----------------------------------------------------------------------------- #
@@ -1614,10 +2058,11 @@ def _parse_stamp(text: Any, tz: _dt.timezone) -> Optional[_dt.datetime]:
 def read_memory(sheets: Any, sid: str, now: _dt.datetime, max_rows: int,
                 sources: Sequence[str] = MEMORY_SOURCES,
                 symbols: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
-    """v1.0.2: GDELT / Google-News headlines recorded by earlier runs that can
+    """v1.0.2: headlines of the news sources (MEMORY_SOURCES; v1.5.0 adds the new
+    ones) recorded by earlier runs that can
     still move the verdict (published within 24 h for macro, 72 h for a
-    name), read from the newest max_rows rows of _News_Items. EDGAR and the
-    Fed feed are re-read whole every run, so their rows are not carried, and
+    name), read from the newest max_rows rows of _News_Items. EDGAR, the Fed
+    feed and the official feeds are re-read whole every run, so their rows are not carried, and
     a source left out of the run's selection is not carried either. With
     symbols given, a name's rows are carried only for names in that scope."""
     allowed = {src for src in sources if src in MEMORY_SOURCES}
@@ -1678,7 +2123,8 @@ def gate_row(rep: Dict[str, Any]) -> List[Any]:
             f"{c['new']}/{c['classified']}/{c['collected']}"
             + (f" +{c['carried']} carried" if c.get("carried") else ""),
             ", ".join(f"{k}={v}" for k, v in sorted(rep["sources_ok"].items())),
-            "; ".join(f"{k}: {v}" for k, v in sorted(rep["sources_failed"].items()))[:500],
+            # v1.5.0: 1000 characters (was 500), so the feeds a new source could not read stay named
+            "; ".join(f"{k}: {v}" for k, v in sorted(rep["sources_failed"].items()))[:1000],
             rep["mode"], __version__]
 
 
@@ -1710,6 +2156,18 @@ def render_digest(rep: Dict[str, Any]) -> str:
                     if li and li.get("mode") != "off" else "")(rep.get("issuer_link")) + ". "
                  f"Sources OK: {', '.join(f'{k}={v}' for k, v in sorted(rep['sources_ok'].items())) or 'none'}. "
                  f"Failed: {'; '.join(f'{k}: {v}' for k, v in sorted(rep['sources_failed'].items())) or 'none'}.")
+    detail, ages = rep.get("sources_detail") or {}, rep.get("source_ages") or {}
+    if detail or ages:      # v1.5.0 [SOURCES]
+        lines.append("")
+        lines.append("| Source | Dated items kept | Newest (min old) | Median (min old) | Left out: outside window / "
+                     "undated / repeated | Requests failed |")
+        lines.append("|---|---|---|---|---|---|")
+        for src in sorted(set(detail) | set(ages)):
+            d, a = detail.get(src, {}), ages.get(src, {})
+            lines.append(f"| {src} | {a.get('n', 0)} | {a.get('newest_min', '-')} | {a.get('median_min', '-')} | "
+                         + (f"{d.get('outside', 0)} / {d.get('undated', 0)} / {d.get('repeated', 0)}"
+                            if src in NEW_SOURCES else "-")
+                         + f" | {d.get('failed', 0) if src in NEW_SOURCES else '-'} |")
     lines.append("")
     lines.append("Not a licensed financial adviser; the owner decides and executes every trade.")
     return "\n".join(lines) + "\n"
@@ -1756,6 +2214,23 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         got = col.fed_rss()
         raw.extend(got)
         stage("fed_rss", len(got), t0)
+    # v1.5.0 [SOURCES]
+    if "bing_news" in sources:
+        t0 = col.clock()
+        got = col.bing_news(build_bing_queries(scope))
+        raw.extend(got)
+        stage("bing_news", len(got), t0)
+    if "yahoo_rss" in sources:
+        t0 = col.clock()
+        got = col.yahoo_rss(symbols)
+        raw.extend(got)
+        stage("yahoo_rss", len(got), t0)
+    for group in FEED_GROUPS:
+        if group in sources:
+            t0 = col.clock()
+            got = col.feeds(group, _env("TFB_SEC_USER_AGENT"))
+            raw.extend(got)
+            stage(group, len(got), t0)
     key = _env("EODHD_API_KEY")
     if "econ" in sources:
         t0 = col.clock()
@@ -1784,7 +2259,14 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         _out(f"[news_gate v{__version__}] issuer link ({link_mode}): {link_info['unlinked']} of "
              f"{link_info['checked']} name items not about the issuer"
              + (" dropped" if link_mode == "on" else " (kept, observe)"))
-    items = classify_all(linked, clf, now)
+    # v1.5.0 [SOURCES]: one story from one publisher is one member, whichever sources carried it
+    folded, repeated = fold_new_sources(linked)
+    for src, n in repeated.items():
+        col._tally(src, repeated=n)
+    if repeated:
+        _out(f"[news_gate v{__version__}] repeated by a new source and left out: "
+             + ", ".join(f"{k} {v}" for k, v in sorted(repeated.items())))
+    items = classify_all(folded, clf, now)
     fresh_items = [i for i in items if not i.get("memory")]
     classified = [i for i in items if i.get("event_type") and i["event_type"] != "law_firm_noise"]
     carried = [i for i in classified if i.get("memory")]
@@ -1798,6 +2280,8 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
                    "new": 0, "carried": len(carried)},
         "econ": econ,
         "issuer_link": link_info,
+        "sources_detail": {k: dict(v) for k, v in sorted(col.detail.items())},      # v1.5.0 [SOURCES]
+        "source_ages": source_ages(fresh_items, now),
     }
     if memory_error:
         rep["memory_error"] = memory_error
