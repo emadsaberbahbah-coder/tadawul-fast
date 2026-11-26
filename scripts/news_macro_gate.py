@@ -2,8 +2,24 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.6.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.7.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.7.0 (2026-11-26) -- [MARKETAUX] COMPANY NEWS FROM MARKETAUX FOR THE FIRST NAMES OF THE SCOPE
+WHY (owner, 26 Nov 2026 15:21: the repository secret MARKETAUX_API_KEY added after the review of five news
+  services he sent): of the five, Marketaux alone serves its free plan without delay (100 requests a day,
+  3 articles a request, 80+ markets, articles matched to the entity - a company - they are about). Its terms
+  grant personal, non-commercial use, which is this project's use.
+WHAT: source `marketaux` (in NEW_SOURCES: folded, carried, issuer-linked): /v1/news/all once per name for the
+  first TFB_NEWS_GATE_MARKETAUX_MAX (default 8, 0-30) scope names it can ask - the scope lists holdings first -
+  with filter_entities, English, published in the last 72 h. 8 requests x 9 runs a day stay under the plan's 100;
+  past it the service answers HTTP 402 and the source is named and stopped for the run. Marketaux takes the
+  key only as the api_token parameter, so - as for EODHD - it is scrubbed from every message. An item is
+  filed under the publisher of its URL (else its 'source' domain).
+  Without MARKETAUX_API_KEY the source is skipped and named. Its sentiment scores are not read: the gate
+  classifies every headline itself.
+NOT IN THIS VERSION: verdict rules, taxonomy, tabs and headers are unchanged; observe-only as before.
+ROLLBACK: leave marketaux out of TFB_NEWS_GATE_SOURCES, or revert this file to v1.6.0.
+
 v1.6.0 (2026-11-26) -- [FINNHUB] THE FINNHUB KEY THE PROJECT ALREADY HOLDS NOW READS NEWS
 WHY (owner, 26 Nov 2026 14:49: "I think it already exists but may be unused"): FINNHUB_API_KEY is set on
   Render, where core/providers/finnhub_provider.py uses it as the last price fallback (quotes only). No
@@ -315,7 +331,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -334,9 +350,11 @@ EODHD_RT = "https://eodhd.com/api/real-time/{code}"
 BING_NEWS_RSS = "https://www.bing.com/news/search"                    # v1.5.0 [SOURCES]
 YAHOO_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline"        # v1.5.0 [SOURCES]
 FINNHUB_API = "https://finnhub.io/api/v1"                                # v1.6.0 [FINNHUB]
+MARKETAUX_API = "https://api.marketaux.com/v1/news/all"                  # v1.7.0 [MARKETAUX]
 
 # v1.5.0 [SOURCES]: five keyless sources beside the six of v1.0.0. FEED_GROUPS are read from FEEDS below.
-NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss", "finnhub")   # v1.6.0: finnhub
+NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss", "finnhub",   # v1.6.0: finnhub
+               "marketaux")                                                                   # v1.7.0
 FEED_GROUPS = ("press_rss", "official_rss", "gulf_rss")
 ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + NEW_SOURCES
 # v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
@@ -345,7 +363,8 @@ ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + N
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
-                   "official_rss": 75.0, "gulf_rss": 45.0, "finnhub": 45.0}
+                   "official_rss": 75.0, "gulf_rss": 45.0, "finnhub": 45.0,
+                   "marketaux": 30.0}
 BREAKER_FAILURES = 2
 # v1.5.0 [SOURCES]: a feed is asked once per run and never held longer than this; a reply larger than
 # MAX_FEED_BYTES is not parsed. Windows: what evaluate() can still use (24 h market-wide, 72 h for a name).
@@ -408,8 +427,8 @@ ECON_HEADER = ["Key", "Date (UTC)", "Country", "Event", "Comparison", "Period", 
 # move the verdict (evaluate(): 24 h for macro, 72 h for a name).
 MEMORY_HOURS = {"MACRO": 24.0, "NAME": 72.0}
 # v1.5.0 [SOURCES]: the new news sources are carried too; official feeds keep days of items and are re-read.
-MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub")
-ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "finnhub")
+MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub", "marketaux")
+ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "finnhub", "marketaux")
 # v1.6.0 [FINNHUB]: the publisher of a Finnhub item whose URL is Finnhub's own redirect, read from its 'source'
 FINNHUB_SOURCE_DOMAINS: Dict[str, str] = {
     "reuters": "reuters.com", "bloomberg": "bloomberg.com", "cnbc": "cnbc.com", "marketwatch": "marketwatch.com",
@@ -1014,6 +1033,32 @@ def parse_finnhub(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
             dom = FINNHUB_SOURCE_DOMAINS.get(name, "finnhub.io")
         out.append({"source": "finnhub", "query": label, "scope": scope, "title": title, "url": url,
                     "domain": dom, "published": published, "lang": "en"})
+    return out
+
+
+def parse_marketaux(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
+    """v1.7.0 [MARKETAUX] PURE: items of a /v1/news/all reply ({"meta": .., "data": [..]}). Raises ValueError for
+    an error reply or any other shape, so a refusal is named rather than counted as zero."""
+    if not isinstance(payload, dict):
+        raise ValueError("not a news reply")
+    if payload.get("error"):
+        err = payload["error"]
+        raise ValueError("refused: %s" % str(err.get("code") if isinstance(err, dict) else err)[:60])
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise ValueError("not a news reply")
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = " ".join(str(row.get("title") or "").split())
+        url = str(row.get("url") or "").strip()
+        if not title:
+            continue
+        dom = domain_of(url) or domain_of("https://" + str(row.get("source") or "").strip().lower())
+        out.append({"source": "marketaux", "query": label, "scope": scope, "title": title, "url": url,
+                    "domain": dom, "published": _feed_time(row.get("published_at")),
+                    "lang": str(row.get("language") or "en")[:2]})
     return out
 
 
@@ -1700,6 +1745,42 @@ class Collector:
         guard.close()
         return out
 
+    def marketaux(self, symbols: Sequence[str], key: str, max_names: int) -> List[Dict[str, Any]]:
+        """v1.7.0 [MARKETAUX]: company news for the first `max_names` scope names it lists (holdings come first
+        in the scope). The free plan gives 100 requests a day, so the count per run is bounded."""
+        if not key:
+            self._fail("marketaux", "MARKETAUX_API_KEY not set")
+            return []
+        after = (self.now - _dt.timedelta(hours=NAME_WINDOW_H)).strftime("%Y-%m-%dT%H:%M:%S")
+        asks = [(sym, yahoo_symbol(sym)) for sym in symbols]
+        asks = [(sym, code) for sym, code in asks if code][:max(0, int(max_names))]
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "marketaux")
+        for i, (sym, code) in enumerate(asks):
+            if not guard.allow():
+                continue
+            if i:
+                self.sleep(0.5)
+            try:
+                resp = self._get("marketaux", MARKETAUX_API, attempts=1, timeout=min(self.timeout, FEED_TIMEOUT_S),
+                                 params={"api_token": key, "symbols": code, "filter_entities": "true",
+                                         "language": "en", "published_after": after})
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    raise ValueError("reply is not JSON")
+                got = parse_marketaux(payload, sym, f"name {sym} marketaux")
+                kept, left = within_window(got, self.now, NAME_WINDOW_H)
+                self._tally("marketaux", asked=1, read=len(got), outside=left["outside"], undated=left["undated"])
+                out.extend(kept)
+                self._note("marketaux", len(kept))
+                guard.success()
+            except Exception as exc:
+                self._fail_part("marketaux", sym, _scrub(str(exc), key))
+                guard.failure()
+        guard.close()
+        return out
+
     def feeds(self, group: str, sec_user_agent: str = "") -> List[Dict[str, Any]]:
         """The feeds of one group in FEEDS, each on its own: a feed that fails is named and the next one is
         read (they are different publishers, so there is no circuit breaker - only the group's time budget).
@@ -2328,6 +2409,11 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         got = col.finnhub(symbols, _env("FINNHUB_API_KEY"))
         raw.extend(got)
         stage("finnhub", len(got), t0)
+    if "marketaux" in sources:                                     # v1.7.0 [MARKETAUX]
+        t0 = col.clock()
+        got = col.marketaux(symbols, _env("MARKETAUX_API_KEY"), _int_env("TFB_NEWS_GATE_MARKETAUX_MAX", 8, 0, 30))
+        raw.extend(got)
+        stage("marketaux", len(got), t0)
     if "yahoo_rss" in sources:
         t0 = col.clock()
         got = col.yahoo_rss(symbols)

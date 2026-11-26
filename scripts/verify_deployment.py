@@ -467,7 +467,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("markets_board", "1.2.0", "markets board"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
-    ("news_macro_gate", "1.6.0", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]
+    ("news_macro_gate", "1.7.0", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]
     # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
     # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete
