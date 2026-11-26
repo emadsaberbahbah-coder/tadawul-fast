@@ -1,6 +1,9 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.6 (2026-11-26) -- THE PUBLIC LOG KEEPS THE HOLDINGS OUT (news_macro_gate 1.8.1 [PUBLIC-LOG])
+#       The run step passes the Variable TFB_NEWS_GATE_LOG_DETAIL (on | off | auto, default auto: off on
+#       Actions). This repository is public: its logs, step summaries and artifacts name no holding.
 # VERSION 1.1.5 (2026-11-26) -- THE SHADOW READER'S KEY AND SWITCH (news_macro_gate 1.8.0 [LLM-SHADOW])
 #       The run step passes secrets.GEMINI_API_KEY and the Variables TFB_NEWS_LLM (on | off, default on)
 #       and TFB_NEWS_LLM_MODEL. The reader labels headlines in its own tab and controls nothing.
@@ -164,6 +167,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # 1.1.5: news_macro_gate 1.8.0 [LLM-SHADOW]
           TFB_NEWS_LLM: ${{ vars.TFB_NEWS_LLM || 'on' }}
           TFB_NEWS_LLM_MODEL: ${{ vars.TFB_NEWS_LLM_MODEL || '' }}
+          TFB_NEWS_GATE_LOG_DETAIL: ${{ vars.TFB_NEWS_GATE_LOG_DETAIL || 'auto' }}   # 1.1.6: news_macro_gate 1.8.1 [PUBLIC-LOG]
           TFB_SEC_USER_AGENT: ${{ secrets.TFB_SEC_USER_AGENT || vars.TFB_SEC_USER_AGENT }}
           TFB_NEWS_GATE: ${{ vars.TFB_NEWS_GATE || 'observe' }}
           TFB_NEWS_GATE_SOURCES: ${{ github.event.inputs.sources || vars.TFB_NEWS_GATE_SOURCES || '' }}

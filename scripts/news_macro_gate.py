@@ -2,8 +2,23 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.8.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.8.1 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.8.1 (2026-11-26) -- [PUBLIC-LOG] THE PUBLIC RUN LOG NO LONGER NAMES THE HOLDINGS
+WHY (the owner's standing rule: "Repo logs are public: no amounts, quantities, account numbers or holdings'
+  symbols in run logs"): since v1.0.0 the log printed the scope (holdings first) and the digest listed the
+  flagged names and every name cluster with its headline; failure notes since v1.5.0 name the symbol asked.
+  The repository is public, so its Actions logs, step summaries and artifacts are too.
+WHAT: log_detail() - TFB_NEWS_GATE_LOG_DETAIL = on | off | auto (default auto: off on GitHub Actions, on
+  elsewhere), the rule exit_plan 1.6.1 uses. When off: the scope line gives the count only; the digest (log,
+  step summary, evidence .md) keeps the verdict, the drivers, the market-wide clusters, the counts and the
+  source health, and gives the flagged names and the name clusters as counts; the evidence .json is the same
+  public cut (the issuer-link examples, which are name headlines, as counts); and every line printed passes
+  mask_public(), which replaces each scope symbol, its letter ticker and its company name with "[name]" (a failure
+  note "<symbol>: HTTP 401" reads "[name]: HTTP 401"). The workbook tabs keep every detail - nothing written
+  there changes.
+ROLLBACK: TFB_NEWS_GATE_LOG_DETAIL=on (repository Variable), or revert this file to v1.8.0.
+
 v1.8.0 (2026-11-26) -- [LLM-SHADOW] A LANGUAGE MODEL READS THE SAME HEADLINES BESIDE THE WORD LISTS
 WHY (owner, 26 Nov 2026 15:28 and 15:34: can another AI he subscribes to help the news reading - "let us
   start with this too"): the word lists classified 56% of the headlines collected since 19 Nov and cannot read
@@ -347,7 +362,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -564,9 +579,63 @@ _SEV_RANK = {"H": 0, "M": 1, "L": 2}
 # ----------------------------------------------------------------------------- #
 # small helpers
 # ----------------------------------------------------------------------------- #
+# v1.8.1 [PUBLIC-LOG]: the scope's symbols, tickers and names to keep out of a public log (empty: print as is)
+_PUBLIC_MASK: List[str] = []
+
+
 def _out(msg: str) -> None:
+    if _PUBLIC_MASK:
+        msg = mask_public(msg, _PUBLIC_MASK)
     sys.stdout.write(msg + "\n")
     sys.stdout.flush()
+
+
+def log_detail() -> bool:
+    """v1.8.1: may the run log name the scope's symbols? TFB_NEWS_GATE_LOG_DETAIL = on | off | auto (default:
+    not on GitHub Actions, whose logs are public for this repository) - exit_plan 1.6.1's rule."""
+    v = (os.environ.get("TFB_NEWS_GATE_LOG_DETAIL") or "auto").strip().lower()
+    if v in ("on", "1", "true", "yes"):
+        return True
+    if v in ("off", "0", "false", "no"):
+        return False
+    return (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true"
+
+
+def mask_tokens(scope: Sequence[Dict[str, str]]) -> List[str]:
+    """PURE: what a public log must not show - each scope symbol, its ticker (the part before the dot, two
+    characters or more, letters - a numeric Saudi code alone would mask counts and ages, and its full symbol
+    is masked) and its company name (four characters or more), longest first."""
+    out = set()
+    for s in scope:
+        sym = str(s.get("symbol") or "").strip()
+        if sym:
+            out.add(sym)
+            root = sym.split(".")[0]
+            if len(root) >= 2 and not root.isdigit():
+                out.add(root)
+        name = str(s.get("name") or "").strip()
+        if len(name) >= 4:
+            out.add(name)
+    return sorted(out, key=lambda t: (-len(t), t))
+
+
+def _mask_values(obj: Any, tokens: Sequence[str]) -> Any:
+    """PURE: obj with every string value masked; numbers, booleans and keys stay as they are."""
+    if isinstance(obj, str):
+        return mask_public(obj, tokens)
+    if isinstance(obj, dict):
+        return {k: _mask_values(v, tokens) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_mask_values(v, tokens) for v in obj]
+    return obj
+
+
+def mask_public(text: str, tokens: Sequence[str]) -> str:
+    """PURE: text with every token replaced by "[name]", whole words only (a ticker inside a longer word stays)."""
+    if not tokens or not text:
+        return text
+    pat = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(t) for t in tokens) + r")(?![A-Za-z0-9])")
+    return pat.sub("[name]", text)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -2328,7 +2397,9 @@ def gate_row(rep: Dict[str, Any]) -> List[Any]:
             rep["mode"], __version__]
 
 
-def render_digest(rep: Dict[str, Any]) -> str:
+def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
+    """The run's digest. public (v1.8.1): the flagged names and the name clusters as counts, every scope
+    symbol, ticker and name masked - for the public log, step summary and evidence."""
     g = rep["gate"]
     lines = [f"## News & macro gate v{__version__} - {fmt_riyadh(rep['now'])} Riyadh",
              "", f"**Verdict: {g['verdict']}** (observe-only; mode {rep['mode']}, "
@@ -2338,15 +2409,24 @@ def render_digest(rep: Dict[str, Any]) -> str:
         lines.append("**Easing:** " + "; ".join(g["positives"]))
     flagged = _flags(g)
     lines.append("")
-    lines.append("**Names:** " + ("; ".join(f"{s} {f['level']} - {f['why']}" for s, f in flagged)
-                                   if flagged else "no flags"))
+    if public and flagged:
+        lines.append(f"**Names:** {len(flagged)} flag(s) on {len({s for s, _ in flagged})} name(s) - kept out "
+                     "of the public log (the _News_Gate tab has them)")
+    else:
+        lines.append("**Names:** " + ("; ".join(f"{s} {f['level']} - {f['why']}" for s, f in flagged)
+                                       if flagged else "no flags"))
     lines.append("")
     lines.append("| Cluster | Scope | Grade | Tier | Sources | Headline |")
     lines.append("|---|---|---|---|---|---|")
-    for c in rep["clusters"][:15]:
+    shown = [c for c in rep["clusters"] if not public or c.get("scope") == "MACRO"]
+    for c in shown[:15]:
         lines.append(f"| {c['event_type']}{'/' + c['anchor'] if c['anchor'] else ''} | {c['scope']} | "
                      f"{c['grade']} | {c['tier']} | {len(c['domains'])} | "
                      f"{c['headline'][:110].replace('|', '/')} |")
+    hidden = len(rep["clusters"]) - len(shown)
+    if public and hidden:
+        lines.append("")
+        lines.append(f"{hidden} cluster(s) about names kept out of the public log (the _News_Items tab has them).")
     lines.append("")
     c = rep["counts"]
     lines.append(f"Items: collected {c['collected']}, classified {c['classified']}, new {c['new']}, "
@@ -2373,7 +2453,26 @@ def render_digest(rep: Dict[str, Any]) -> str:
         lines.append(rep["llm"]["line"])
     lines.append("")
     lines.append("Not a licensed financial adviser; the owner decides and executes every trade.")
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    return mask_public(text, mask_tokens(rep.get("scope") or [])) if public else text
+
+
+def public_report(rep: Dict[str, Any]) -> Dict[str, Any]:
+    """v1.8.1: the evidence .json for a public artifact - the scope and the flagged names as counts, the
+    market-wide clusters only, and every scope symbol, ticker and name masked in what is left."""
+    g = rep["gate"]
+    pub = {k: v for k, v in rep.items() if k not in ("scope", "gate", "clusters")}
+    pub["scope"] = {"names": len(rep.get("scope") or []), "detail": "kept out of the public log"}
+    pub["gate"] = {k: v for k, v in g.items() if k != "names"}
+    pub["gate"]["names_flagged"] = len(_flags(g))
+    pub["clusters"] = [c for c in rep["clusters"] if c.get("scope") == "MACRO"]
+    pub["clusters_about_names"] = len(rep["clusters"]) - len(pub["clusters"])
+    if isinstance(rep.get("issuer_link"), dict):      # its examples are name headlines: counts only
+        pub["issuer_link"] = {k: v for k, v in rep["issuer_link"].items() if k != "examples"}
+    # the string values only, after a round trip that turns times into text (Codex P2 on #1095: masking the
+    # serialised JSON could turn a number into "[name]" and break it)
+    plain = json.loads(json.dumps(pub, default=_json_default, ensure_ascii=True))
+    return _mask_values(plain, mask_tokens(rep.get("scope") or []))
 
 
 def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
@@ -2393,7 +2492,8 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         _out(f"[news_gate v{__version__}] {src}: {n} items in {col.clock() - t0:.0f}s"
              + (f" | {why[:160]}" if why else ""))
 
-    _out(f"[news_gate v{__version__}] scope {len(scope)}: " + ", ".join(symbols)[:300])
+    _out(f"[news_gate v{__version__}] scope {len(scope)}: "
+         + (", ".join(symbols)[:300] if not _PUBLIC_MASK else "(names kept out of the public log)"))
     if "edgar" in sources:
         t0 = col.clock()
         got, sec_names = col.edgar(symbols, _env("TFB_SEC_USER_AGENT"))
@@ -2584,21 +2684,29 @@ def _json_default(o: Any) -> Any:
     return str(o)
 
 
-def write_evidence(rep: Dict[str, Any], directory: str) -> None:
+def write_evidence(rep: Dict[str, Any], directory: str, public: bool = False) -> None:
     if not directory:
         return
     os.makedirs(directory, exist_ok=True)
-    slim = dict(rep)
+    slim = public_report(rep) if public else dict(rep)
     slim["clusters"] = [{k: v for k, v in c.items() if k != "members"} | {"size": len(c["members"])}
-                        for c in rep["clusters"]]
+                        for c in slim["clusters"]]
     with open(os.path.join(directory, "news_gate.json"), "w", encoding="utf-8") as fh:
         json.dump(slim, fh, default=_json_default, ensure_ascii=True, indent=1)
     with open(os.path.join(directory, "news_gate.md"), "w", encoding="utf-8") as fh:
-        fh.write(render_digest(rep))
+        fh.write(render_digest(rep, public=public))
 
 
 def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any = None,
          now: Optional[_dt.datetime] = None, sleep: Optional[Callable[[float], None]] = None) -> int:
+    try:
+        return _main(argv, http=http, sheets=sheets, now=now, sleep=sleep)
+    finally:
+        _PUBLIC_MASK[:] = []      # v1.8.1: the mask belongs to one run
+
+
+def _main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any = None,
+          now: Optional[_dt.datetime] = None, sleep: Optional[Callable[[float], None]] = None) -> int:
     ap = argparse.ArgumentParser(description="TFB news & macro gate (observe-only)")
     mode_g = ap.add_mutually_exclusive_group()
     mode_g.add_argument("--write", action="store_true", help="append to the workbook tabs")
@@ -2606,6 +2714,7 @@ def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any 
     ap.add_argument("--now", default="", help="ISO time for replays (UTC if no offset)")
     args = ap.parse_args(argv)
     mode = gate_mode()
+    _PUBLIC_MASK[:] = []          # v1.8.1: set once the scope is known; nothing before it names a holding
     if mode == "off":
         _out(f"[news_gate v{__version__}] TFB_NEWS_GATE is off - nothing collected, nothing written.")
         return 0
@@ -2646,13 +2755,16 @@ def main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any 
     for s in parse_symbols_env(_env("TFB_NEWS_GATE_SYMBOLS")):
         if s["symbol"] not in {x["symbol"] for x in scope}:
             scope.append(s)
+    public = not log_detail()
+    if public:
+        _PUBLIC_MASK[:] = mask_tokens(scope) or ["\x00"]     # "\x00" never occurs: masking stays on
     sources = selected_sources(_env("TFB_NEWS_GATE_SOURCES"))
     run_id = _env("GITHUB_RUN_ID") or now.strftime("local-%Y%m%dT%H%M%S")
     rc, rep = run(http=http, sheets=sheets, sid=sid, now=now, write=bool(args.write),
                   sources=sources, scope=scope, sleep=sleep or time.sleep, run_id=run_id, mode=mode)
-    digest = render_digest(rep)
+    digest = render_digest(rep, public=public)
     _out(digest)
-    write_evidence(rep, _env("TFB_NEWS_GATE_EVIDENCE_DIR"))
+    write_evidence(rep, _env("TFB_NEWS_GATE_EVIDENCE_DIR"), public=public)
     summary = _env("GITHUB_STEP_SUMMARY")
     if summary:
         try:
