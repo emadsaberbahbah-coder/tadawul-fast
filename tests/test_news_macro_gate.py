@@ -908,9 +908,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.9.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.9.0 [REVIEW-26NOV]
+    assert ng.__version__ == "1.10.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.10.0 [ORIGINS]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.9.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.10.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1055,7 +1055,7 @@ def test_g10_new_types_never_move_the_verdict():
     # an older subject named beside a new one still counts: a recession story with an election word is CAUTION
     mixed = ng.parse_gdelt(gdelt_articles([
         ("https://www.reuters.com/m1", "China faces recession as election uncertainty grows", "20261030T100000Z", "reuters.com"),
-        ("https://apnews.com/m2", "China faces recession as election uncertainty grows", "20261030T101000Z", "apnews.com"),
+        ("https://apnews.com/m2", "China heads for recession as election uncertainty grows", "20261030T101000Z", "apnews.com"),
     ]), "MACRO", "politics")
     cm = _clusters(mixed, QUIET)
     assert [(c["event_type"], c["anchor"]) for c in cm] == [("credit_stress", "china")]
@@ -1075,9 +1075,10 @@ def test_g10_new_types_never_move_the_verdict():
 TRADE_LISTS = ("trade_truce", "trade_relief", "trade_hedge")
 # evaluate() without its easing block: the rules that RAISE a verdict. Byte-identical from v1.1.0 to v1.8.1
 # (68bed4f2...); v1.9.0 [REVIEW-26NOV] changed one of them on purpose - a Gulf high-severity story confirmed by
-# one or two domains is CAUTION (test_g18) - and nothing else.
-RAISE_RULES_SHA = "fd4d76d91f16448e7d742d2b2c2785aeb439343f33c9de231c1cabe6e070b63b"
-EVALUATE_SHA = "412d30f348522ca1bbfde95df7d918bd0cc47878a1d749eefc8d50e4735bd354"      # evaluate() of v1.4.0 [TRUCE-READ]
+# one or two domains is CAUTION (test_g18) - and nothing else. v1.10.0 [ORIGINS] changed how the domains of a
+# rule are counted (a headline copied by several sites is one origin, test_g19); the thresholds are the same.
+RAISE_RULES_SHA = "854068c653086ccf4b6ab00e5fbfc023a80e9a86847f3f10d2eb0a8711a706f3"
+EVALUATE_SHA = "e51d566b601e68449a6e4b398aaef799f3bd3a5d809f9d9e57b9b8d32a12cf26"      # evaluate() of v1.4.0 [TRUCE-READ]
 
 # (headline, reading before v1.3.0, reading now, direction now). World headlines of 5 - 18 Nov 2026 (GDELT) and the
 # gate's own archive; the last block is written to probe the guards.
@@ -1298,7 +1299,9 @@ def _wires(scope, *titles):
     rows = []
     for n, title in enumerate(titles):
         for k, (base, dom) in enumerate(doms):
-            rows.append((base + "t%d%d" % (n, k), title, "20261030T10%02d00Z" % (n * 3 + k), dom))
+            # v1.10.0 [ORIGINS]: each wire words it its own way - the same headline on three sites is one origin
+            own = title if k == 0 else "%s, edition %d" % (title, k + 1)
+            rows.append((base + "t%d%d" % (n, k), own, "20261030T10%02d00Z" % (n * 3 + k), dom))
     return ng.parse_gdelt(gdelt_articles(rows), scope, "trade china")
 
 
@@ -1785,8 +1788,9 @@ def test_g14_within_window_leaves_out_undated_and_old():
     old = {"source": "press_rss", "scope": "MACRO", "title": HORMUZ_REUTERS, "url": "https://www.wsj.com/o",
            "domain": "wsj.com", "published": None}
     clf = ng.Classifier(ng.load_taxonomy())
-    undated = ng.classify_all([dict(old, url="https://www.wsj.com/o%d" % n, domain=d) for n, d in
-                               enumerate(("wsj.com", "reuters.com", "apnews.com"))], clf, QUIET)
+    undated = ng.classify_all([dict(old, url="https://www.wsj.com/o%d" % n, domain=d, title=t) for n, (d, t) in
+                               enumerate((("wsj.com", HORMUZ_REUTERS), ("reuters.com", "Missile strike on tanker near Hormuz"),
+                                          ("apnews.com", "Tanker hit by missile in Strait of Hormuz")))], clf, QUIET)
     assert ng.evaluate(ng.cluster_items(undated), [], {}, QUIET)["verdict"] == "NO_NEW_ENTRY"
 
 
@@ -2508,3 +2512,85 @@ def test_g18_a_busy_workbook_is_asked_again_for_the_memory(armed):
     assert "Memory not read (RuntimeError: read _News_Items: HTTP 429): this verdict rests on" in ng.render_digest(rep3)
     rc, rep4, waits, s4 = _busy_run(sh, 1, code=500)
     assert s4.refused == 1 and not [w for w in waits if w in (20.0, 40.0)] and "HTTP 500" in rep4["memory_error"]
+
+
+# ----------------------------------------------------------------------------- G19 (v1.10.0 [ORIGINS])
+def _mt(domain, title, tier=None, **flags):
+    return dict(_m(domain, tier, **flags), title=title)
+
+
+STORY = "Jensen Huang reinstatement at Nvidia sparks huge Wall Street rally"
+
+
+def test_g19_origin_key():
+    assert ng.origin_key({"title": STORY + " - Reuters"}) == ng.origin_key({"title": STORY}) == ng.origin_key(
+        {"title": STORY.upper() + " | Big News Network"}) != ""
+    assert ng.origin_key({"title": "Tanker hit by missile near Hormuz – BBC News"}) == "tanker hit by missile near hormuz"
+    assert ng.origin_key({"title": "Oil prices rise"}) == "" and ng.origin_key({}) == ""       # too short to compare
+    assert ng.origin_key({"title": "Fed holds rates - but signals two cuts next year, officials say"}) \
+        == "fed holds rates but signals two cuts next year officials say"                       # a long tail is the headline
+    assert ng.ORIGIN_MIN_CHARS == 25
+
+
+def test_g19_origins_keep_the_best_copy_and_merge_nothing_else():
+    net = [_mt("bostonstar.com", STORY), _mt("iraqsun.com", STORY), _mt("reuters.com", STORY + " - Reuters"),
+           _mt("cnbc.com", "Nvidia shares jump as Huang returns as chief executive"), _mt("x.com", "Oil prices rise"),
+           _mt("y.com", "Oil prices rise"), _m("sec.gov")]
+    got = ng.origins(net)
+    assert [m["domain"] for m in got] == ["reuters.com", "cnbc.com", "x.com", "y.com", "sec.gov"]
+    assert ng.origins([]) == [] and ng.origins(got) == got
+
+
+def test_g19_a_copy_never_raises_the_grade():
+    wire = _mt("reuters.com", STORY)
+    copies = [_mt("investing.com", STORY), _mt("cnbc.com", STORY + " - CNBC")]
+    assert ng.information_grade([wire]) == 2
+    assert ng.information_grade([wire] + copies) == 2                       # was 1: three domains with a wire
+    two_papers = [_mt("cnbc.com", STORY), _mt("bbc.com", STORY)]
+    assert ng.information_grade(two_papers) == 3                            # was 2: one story on two sites
+    assert ng.information_grade([_mt("cnbc.com", STORY), _mt("bbc.com", "Wall Street rallies after Nvidia brings Huang back")]) == 2
+    network = [_mt(d, STORY) for d in ("africaleader.com", "bostonstar.com", "iraqsun.com", "nigeriasun.com")]
+    assert ng.information_grade(network) == 3
+    # a site that says it quotes a wire is not given the wire's tier; with the wire's own item it is one origin
+    quoted = _mt("someblog.io", STORY + " - Reuters")
+    assert ng.information_grade([quoted]) == 3 and ng.information_grade([quoted, wire]) == 2
+    # three wires, each in its own words, are still three
+    own_words = [wire, _mt("apnews.com", "Wall Street surges after Nvidia reinstates Jensen Huang"),
+                 _mt("bbc.com", "Nvidia brings back Huang and markets soar")]
+    assert ng.information_grade(own_words) == 1 and ng.information_grade(own_words + copies) == 1
+    # a denial reprinted three times is one denial against one report
+    report, denial = _mt("reuters.com", STORY), _mt("bbc.com", "Nvidia denies report of Huang reinstatement plan", denial=True)
+    assert ng.information_grade([report, denial]) == 5
+    assert ng.information_grade([report, _mt("cnbc.com", "Nvidia board confirms Huang returns as chief executive"),
+                                 denial, dict(denial, domain="a.com"), dict(denial, domain="b.com")]) == 2   # was 5
+
+
+def test_g19_a_gulf_story_reprinted_is_not_three_confirmations():
+    one = "Iran fires missiles at tanker in Strait of Hormuz"
+    reprinted = _gulf(("https://www.reuters.com/r1", one, "reuters.com"), ("https://www.investing.com/r2", one, "investing.com"),
+                      ("https://www.cnbc.com/r3", one + " - CNBC", "cnbc.com"))
+    g = ng.evaluate(_clusters(reprinted, QUIET), [], {}, QUIET)
+    assert g["verdict"] == "CAUTION"                                        # was NO_NEW_ENTRY: grade 1 from "3 domains"
+    assert g["drivers"][0].startswith("macro (few sources): war_escalation/hormuz grade 2, 3 sources (1 independent): ")
+    three = _gulf(WIRE, WIRE2, PAPER)                                       # three sites, three wordings: as before
+    g3 = ng.evaluate(_clusters(three, QUIET), [], {}, QUIET)
+    assert g3["verdict"] == "NO_NEW_ENTRY" and g3["drivers"][0].startswith("macro: war_escalation/hormuz grade 1, 3 sources: ")
+    both = ng.evaluate(_clusters(_gulf(WIRE, WIRE2, PAPER, ("https://x.io/c", WIRE[1], "x.io")), QUIET), [], {}, QUIET)
+    assert both["verdict"] == "NO_NEW_ENTRY" and "4 sources (3 independent)" in both["drivers"][0]
+    # the market-anchor rule counts origins too: a confirmed story needs two of them
+    china = "China faces recession as election uncertainty grows"
+    copied = ng.parse_gdelt(gdelt_articles([("https://www.reuters.com/m1", china, "20261030T100000Z", "reuters.com"),
+                                            ("https://apnews.com/m2", china, "20261030T101000Z", "apnews.com")]), "MACRO", "p")
+    assert ng.evaluate(_clusters(copied, QUIET), [], {}, QUIET)["verdict"] == "GO"            # was CAUTION
+
+
+def test_g19_the_tabs_keep_every_copy(armed):
+    """The count changes what a cluster is worth, not what is recorded: all three copies are rows of _News_Items."""
+    one = "Iran fires missiles at tanker in Strait of Hormuz"
+    feeds = {"bing:Hormuz": _feed((one, _bing("https://www.reuters.com/world/a1"), _hours_ago(3))),
+             "wsj_markets": _feed((one, "https://www.wsj.com/w2", _hours_ago(2))),
+             "arabnews": _feed((one, "https://www.arabnews.com/n1", _hours_ago(1)))}
+    (rc, rep), sh = _run(http=FakeHTTP(feeds=feeds), sources=NEW_ONLY)
+    assert rc == 0 and len(sh.tabs[ng.ITEMS_TAB][1:]) == 3
+    assert rep["gate"]["verdict"] != "NO_NEW_ENTRY"                         # GULF_FEEDS, three wordings, is NO_NEW_ENTRY
+    assert any("3 sources (1 independent)" in d for d in rep["gate"]["drivers"])

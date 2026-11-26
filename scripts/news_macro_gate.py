@@ -2,8 +2,28 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.9.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.10.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.10.0 (2026-11-26) -- [ORIGINS] A HEADLINE COPIED BY SEVERAL SITES IS ONE CONFIRMATION, NOT SEVERAL
+WHY (owner, 26 Nov 2026 19:10 Riyadh, in Arabic: what matters is how an item is let through, used, classified,
+  "and the measure of whether the item is repeated on other sites"; 19:13: "if it is ready, build it now"):
+  the information grade and the "three domains" rules counted DOMAINS. One agency story reprinted under the
+  same headline by a network of sites counted as that many confirmations - the archive of 24-26 Nov holds one
+  headline on 15 sites of one syndication network, every one of them an unknown source. Archive 19-26 Nov
+  (v_news_items): 639 headlines appeared word for word on two or more domains (1,838 of 10,121 items).
+WHAT: origins() - members whose headline is the same once a trailing site name is removed (25 characters or
+  more after normalising, so a short common headline is not merged) are ONE origin, and the copy from the
+  best tier speaks for it. information_grade() grades the origins, and the domain counts of evaluate()'s
+  rules count the origins' domains. A copy never raises anything: a site that only says it quotes a wire is
+  not given the wire's tier - it merges with the wire's own item when that item is in the cluster, and stays
+  its own source when it is not. The driver line says "N sources (M independent)" when the two differ. The
+  rows recorded in the tabs do not change, and nothing is dropped from them.
+  Archive replay (the 67 recorded runs since 19 Nov, every market-anchored cluster re-graded both ways over
+  each run's own 24 hours): in all 67 runs some cluster loses domains once copies count once; no cluster's
+  grade or level changes and no recorded verdict changes - the days were confirmed many times over. The
+  rule matters on a thin day, when one reprinted story is all there is.
+ROLLBACK: revert this file to v1.9.0.
+
 v1.9.0 (2026-11-26) -- [REVIEW-26NOV] FOUR CORRECTIONS FROM THE OWNER'S REVIEW REQUEST OF THE DAY'S WORK
 WHY (owner, 26 Nov 2026 16:30 Riyadh: "Please review and try to correct and improve all"):
   (1) RULE GAP. A Gulf high-severity story raised CAUTION when unconfirmed (grade 3-4) and NO_NEW_ENTRY when
@@ -392,7 +412,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -1365,8 +1385,40 @@ def parse_market(payload: Any) -> Dict[str, Dict[str, Any]]:
 # ----------------------------------------------------------------------------- #
 # clustering + grading
 # ----------------------------------------------------------------------------- #
+# v1.10.0 [ORIGINS]: a trailing " - Site" / " | Site" on a headline, and the least a headline must hold to be compared
+_SITE_TAIL = re.compile(r"\s+[-|\u2013\u2014]\s+[^-|\u2013\u2014]{2,40}$")
+ORIGIN_MIN_CHARS = 25
+
+
+def origin_key(member: Dict[str, Any]) -> str:
+    """PURE: the headline without a trailing site name, normalised; "" when it is too short to tell a copy
+    from a coincidence (or absent)."""
+    t = normalize_text(_SITE_TAIL.sub("", str(member.get("title") or ""))).strip()
+    return t if len(t) >= ORIGIN_MIN_CHARS else ""
+
+
+def origins(members: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """PURE, v1.10.0: one member per origin, in first-seen order. Members with the same origin_key are one
+    story reprinted; the copy from the best tier speaks for it (the first seen among equals). A member with
+    no comparable headline is its own origin."""
+    out: List[Dict[str, Any]] = []
+    at: Dict[str, int] = {}
+    for m in members:
+        k = origin_key(m)
+        if not k:
+            out.append(m)
+        elif k not in at:
+            at[k] = len(out)
+            out.append(m)
+        elif _TIER_RANK.get(m.get("tier", "F"), 9) < _TIER_RANK.get(out[at[k]].get("tier", "F"), 9):
+            out[at[k]] = m
+    return out
+
+
 def information_grade(members: Sequence[Dict[str, Any]]) -> int:
-    """Admiralty-style: 1 confirmed .. 6 social only."""
+    """Admiralty-style: 1 confirmed .. 6 social only. v1.10.0: graded on the origins - a headline reprinted
+    by several sites is one member."""
+    members = origins(members)
     denials = [m for m in members if m.get("denial")]
     if denials:
         # A denial weighs against the story only when denials are at least
@@ -1521,10 +1573,12 @@ def evaluate(clusters: Sequence[Dict[str, Any]], econ: Sequence[Dict[str, Any]],
         recent = [m for m in c["members"] if (m.get("published") or now) >= since]
         if not recent:
             continue
-        doms = {m.get("domain") for m in recent if m.get("domain")}
+        sites = {m.get("domain") for m in recent if m.get("domain")}
+        doms = {m.get("domain") for m in origins(recent) if m.get("domain")}     # v1.10.0: copies count once
         grade = information_grade(recent)
         anchor = c["anchor"]
-        tag = f"{c['event_type']}/{anchor} grade {grade}, {len(doms)} sources: {c['headline'][:90]}"
+        tag = (f"{c['event_type']}/{anchor} grade {grade}, {len(sites)} sources"
+               + (f" ({len(doms)} independent)" if len(doms) != len(sites) else "") + f": {c['headline'][:90]}")
         if c["event_type"] == "de_escalation":
             # v1.4.0 [TRUCE-READ]: a ceasefire reported as breaking (a member read as falling) is not easing.
             # The line lists the cluster for its other members only: they must outnumber the falling ones and
