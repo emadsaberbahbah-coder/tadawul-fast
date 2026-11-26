@@ -390,7 +390,7 @@ PENDING = {
     "v_news_llm": "a06c1b6fb679009ac58732b23bc2b247d6988290b26f8283879d811be9c68eca",
     "v_news_llm_days": "9f3e0f319ca88094eccca7cf02a97a42e5a6db6241a00da86a50b0490b0cc859",
     "v_news_llm_eval": "b31dbef2f26273328d81d6da15f82b0c6f111cfa6a5d517c21492cd51bbccd67",
-    "v_news_llm_duel": "21e1f6dca30845d276e340e13ff2e7a4746d1c5da806baa3567f08964dedb673",
+    "v_news_llm_duel": "92b377b8bc3beebb12d86ec0820e25c61d03cfead4751b3ef3b22838da430cc0",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -4394,12 +4394,13 @@ def case_v68():
                  "WHERE p.rules_class IS NOT NULL AND p.model_class IS NOT NULL",
                  "WHEN t.duel = 'opposite' AND t.matured_5d < 20 THEN 'THIN'",
                  "WHEN t.duel = 'opposite' AND t.model_right_pct >= 60 THEN 'MODEL AHEAD (forward test)'",
-                 "WHEN t.duel = 'opposite' AND t.model_right_pct <= 40 THEN 'RULES AHEAD (forward test)'",
+                 "WHEN t.duel = 'opposite' AND t.rules_right_pct >= 60 THEN 'RULES AHEAD (forward test)'",
                  "WHEN t.duel = 'model only' AND t.model_calls < 30 THEN 'THIN'",
                  "WHEN t.duel = 'model only' AND t.model_right_pct >= 55 THEN 'MODEL ADDS (forward test)'",
                  "WHEN t.rules_calls < 30 THEN 'THIN'",
                  "WHEN t.rules_right_pct >= 55 THEN 'RULES ADD (forward test)'"):
         assert frag in du, frag
+    assert "model_right_pct <= 40" not in du        # Codex P2 on #1094: a flat day is right for neither reader
     for code in (typed, days, ev, du):
         assert "FOLLOWING" not in code and "CURRENT_" not in code                 # nothing read from a clock
     assert days.count("LEAD(") == 4                                              # the only look forward: the targets

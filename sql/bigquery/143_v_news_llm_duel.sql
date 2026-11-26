@@ -9,7 +9,9 @@
 -- READING (never "proven"; a call is a positive or negative class with a matured 5-session move):
 --   'agree'       'BOTH'
 --   'opposite'    'THIN' under 20 matured days, else 'MODEL AHEAD (forward test)' when the model was right on at
---                 least 60 % of them, 'RULES AHEAD (forward test)' at 40 % or less, else 'LEVEL'
+--                 least 60 % of them, 'RULES AHEAD (forward test)' when the word lists were, else 'LEVEL'. Each
+--                 reader is judged on its own share: a day with no move at all is right for neither, so a low
+--                 share for one is not a high share for the other
 --   'model only'  'THIN' under 30 model calls, else 'MODEL ADDS (forward test)' at 55 % right or more,
 --                 'MODEL NOISE' at 45 % or less, else 'UNCLEAR'
 --   'rules only'  the same for the word lists: 'RULES ADD (forward test)' / 'RULES NOISE' / 'UNCLEAR' / 'THIN'
@@ -64,7 +66,7 @@ SELECT t.*,
          WHEN t.duel = 'agree' THEN 'BOTH'
          WHEN t.duel = 'opposite' AND t.matured_5d < 20 THEN 'THIN'
          WHEN t.duel = 'opposite' AND t.model_right_pct >= 60 THEN 'MODEL AHEAD (forward test)'
-         WHEN t.duel = 'opposite' AND t.model_right_pct <= 40 THEN 'RULES AHEAD (forward test)'
+         WHEN t.duel = 'opposite' AND t.rules_right_pct >= 60 THEN 'RULES AHEAD (forward test)'
          WHEN t.duel = 'opposite' THEN 'LEVEL'
          WHEN t.duel = 'model only' AND t.model_calls < 30 THEN 'THIN'
          WHEN t.duel = 'model only' AND t.model_right_pct >= 55 THEN 'MODEL ADDS (forward test)'

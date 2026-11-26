@@ -27,7 +27,7 @@ First live read (dry run on main after the merge, 13:01 UTC): 107 of 120 headlin
 **Readings (fixed today; never "proven"):**
 - **eval:** `NOT MEASURABLE (one side)`, then `BIASED (one side > 90 %)`, then `THIN` (the smaller side has fewer than 30 matured 5-session days), then `NO EDGE` (corr ≤ 0.05, or positive not above negative), else `CANDIDATE (forward test)`. THIN is checked before any edge call: on a few weeks of days, a "no edge" call is as noisy as an edge.
 - **duel:**
-  - `opposite`: THIN under 20 days; `MODEL AHEAD` when the model is right on ≥ 60 %; `RULES AHEAD` at ≤ 40 %; else `LEVEL`.
+  - `opposite`: THIN under 20 days; `MODEL AHEAD` when the model is right on ≥ 60 %; `RULES AHEAD` when the word lists are right on ≥ 60 %; else `LEVEL`. Each reader is judged on its own share, because a day with no move is right for neither (Codex P2, fixed).
   - `model only` / `rules only`: THIN under 30 calls; `ADDS` when right on ≥ 55 %; `NOISE` at ≤ 45 %; else `UNCLEAR`.
 
 ## Verified
