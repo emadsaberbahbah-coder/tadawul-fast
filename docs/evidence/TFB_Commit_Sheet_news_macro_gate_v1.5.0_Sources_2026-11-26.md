@@ -38,7 +38,7 @@ Limits each new request keeps:
 - sec.gov is asked with the declared EDGAR contact (`TFB_SEC_USER_AGENT`) and not at all without it. Every other feed is asked as `TFB-news-gate/1.5.0`; nothing pretends to be a browser.
 
 ### 2. A reply that is not a feed is a named failure
-`parse_feed()` reads RSS 2.0, RSS 1.0 and Atom **from the reply's bytes**, removes a byte-order mark and leading blank lines, and raises when the reply is not a feed. `google_news` and `fed_rss` now use it. A block page or a mis-decoded reply appears under **Sources Failed** with its first characters; for Google News it also counts toward the two-failure breaker.
+`parse_feed()` reads RSS 2.0, RSS 1.0 and Atom **from the reply's bytes**, removes a byte-order mark and leading blank lines, and raises when the reply is not a feed. `google_news` and `fed_rss` now use it. A block page or a mis-decoded reply appears under **Sources Failed** with its first characters. For Google News — the gate's main source — the next search is still asked, as for GDELT's plain-text replies: an unreadable reply is named but does not count toward the two-failure breaker.
 
 One way the silent zero happens, reproduced in the tests: `requests` decodes a `text/xml` reply that names no charset as ISO-8859-1; a UTF-8 byte-order mark then reaches the XML parser as three stray characters and the whole feed is refused. Whether that is the Fed feed's fault on the runner is **not yet known** — the first run after the merge either reads the feed or names the reason.
 

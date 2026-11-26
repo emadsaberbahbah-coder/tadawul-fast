@@ -2002,9 +2002,20 @@ def test_g14_the_fed_feed_is_read_from_bytes_and_a_block_page_is_named(armed):
     (rc, rep), _ = _run(http=http, write=False, sources=["fed_rss", "google_news", "market"])
     assert rc == 0 and rep["sources_ok"] == {"market": 2}
     assert rep["sources_failed"]["fed_rss"] == "not a feed (root <html>)"
-    assert rep["sources_failed"]["google_news"].startswith("saudi market ar: not a feed (root <html>)")
-    assert "circuit open after 2 consecutive failures" in rep["sources_failed"]["google_news"]
-    assert len([u for u in http.calls if u == ng.GNEWS_RSS]) == 2  # a block page now opens the breaker
+    assert rep["sources_failed"]["google_news"] == "saudi market ar: not a feed (root <html>)"
+    # the main source is not cut short by a reply it could not read: every search is still asked (as for GDELT)
+    assert len([u for u in http.calls if u == ng.GNEWS_RSS]) == 16 == len(ng.build_queries(rep["scope"])[1])
+
+    class HalfBlocked(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            out = super().get(url, params=params, headers=headers, timeout=timeout)
+            if url == ng.GNEWS_RSS and (params or {}).get("hl") == "ar":
+                out.text = "<html><body>Before you continue</body></html>"
+            return out
+
+    (rc, half), _ = _run(http=HalfBlocked(en_rss=GNEWS_EN_RSS), write=False, sources=["google_news", "market"])
+    assert half["sources_ok"]["google_news"] == 3 and "not a feed" in half["sources_failed"]["google_news"]
+    assert half["gate"]["verdict"] == "NO_NEW_ENTRY"               # the English wires still confirm the situation
 
 
 GULF_FEEDS = {

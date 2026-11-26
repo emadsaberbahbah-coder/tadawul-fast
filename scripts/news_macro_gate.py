@@ -27,7 +27,8 @@ WHAT: (1) five keyless sources, each optional and fail-open like the six before 
      reads an undated headline as published now. A feed is asked once per run (12 s at most, no retry).
   (2) parse_feed() reads RSS 2.0, RSS 1.0 and Atom from the reply's bytes (byte-order mark and leading blank
      lines removed) and raises on a reply that is not a feed. google_news and fed_rss use it, so such a reply
-     is listed under Sources Failed with its first characters. parse_rss() keeps its old contract ([]).
+     is listed under Sources Failed with its first characters (for Google News the next search is still
+     asked: the reply does not count toward the two-failure breaker). parse_rss() keeps its old contract ([]).
   (3) fold_new_sources(): a headline from a new source is left out when an older source, or an earlier new
      one, already carries the same headline from the same publisher in the same scope - one story from one
      publisher stays one member of its cluster. No item of the six older sources is ever left out by it.
@@ -1512,8 +1513,15 @@ class Collector:
                 lang, {"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
             try:
                 resp = self._get("google_news", GNEWS_RSS, params=params)
-                # v1.5.0: a reply that is not a feed is a failure with a name, not zero items
-                got = parse_feed(_feed_payload(resp), scope, label, "google_news", lang[:2])
+                try:
+                    got = parse_feed(_feed_payload(resp), scope, label, "google_news", lang[:2])
+                except ValueError as exc:
+                    # v1.5.0: a reply that is not a feed is named, not counted as zero items. The service
+                    # answered, so - as with GDELT's plain-text replies - the breaker does not advance and
+                    # the next search is still asked: this is the gate's main source.
+                    self._fail("google_news", f"{label}: {exc}")
+                    guard.success()
+                    continue
                 out.extend(got)
                 self._note("google_news", len(got))
                 guard.success()
