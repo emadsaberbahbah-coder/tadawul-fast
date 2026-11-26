@@ -332,11 +332,11 @@ def test_a8_news_llm_tab():
     from scripts import news_llm_reader as llm
     assert arc.__version__ == "1.2.0" and arc.TABS[-1] == ("_News_LLM", 1) == (llm.TAB, 1)
     assert arc.table_name(llm.TAB) == "news_llm" and "news_llm" in bv.ARCHIVE_TABLES
-    row = ["n1", "2026-11-26 16:42:10", "2026-11-26 13:20", "GLPI.US", "Declares a dividend", "dividend", 1, "L",
+    row = ["n1", "2026-11-26 16:42:10", "2026-11-26 13:20", "ACME.US", "Declares a dividend", "dividend", 1, "L",
            "dividend", 1, "L", 80, "same", "gemini-3.5-flash-lite", "run-1"]
     assert len(row) == len(llm.HEADER) == 15 <= arc.MAX_COLS
     rows, n = arc.build_rows(llm.TAB, [llm.HEADER, row], 1, "2026-11-26", "x", "r")
     assert n == {"rows": 2, "cells": 30, "truncated": 0}
     assert rows[1]["cells"][6] == "1" and rows[1]["cells"][11] == "80"
     rec = json.loads(rows[1]["record_json"])
-    assert rec["LLM Event"] == "dividend" and rec["Agree"] == "same" and rec["Scope"] == "GLPI.US"
+    assert rec["LLM Event"] == "dividend" and rec["Agree"] == "same" and rec["Scope"] == "ACME.US"
