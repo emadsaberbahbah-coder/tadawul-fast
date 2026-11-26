@@ -131,6 +131,9 @@ def test_non_rank_metrics_preserve_pre_repair_golden_values():
         ],
         "raw_brier_as_probability": 0.0833, "cv_brier_group_calibrated": 0.3137,
         "win_spread_pp": 100.0, "spread_z": 2.32, "cv_gain_vs_base": -0.0915, "verdict": "NONE",
+        # v1.2.0: undated rows cannot be walked forward; the verdict basis is reported.
+        "wf_brier": None, "wf_base_brier": None, "wf_gain_vs_base": None, "wf_scored": 0, "wf_folds": 0,
+        "wf_status": "insufficient_dated_rows", "cv_mode": "wf",
     }
 
 
@@ -144,7 +147,7 @@ def test_actual_cli_serializes_null_and_prints_undefined_without_live_io(tmp_pat
     report = tmp_path / "report.json"
     assert backtest.main(["--export-dir", str(tmp_path), "--signal", "Signal", "--json", str(report)]) == 0
     payload = json.loads(report.read_text(encoding="utf-8"), parse_constant=lambda token: pytest.fail(token))
-    assert payload["version"] == "1.1.1"
+    assert payload["version"] == "1.2.0"
     assert payload["results"][0]["spearman_vs_roi"] is None
     assert payload["results"][0]["spearman_status"] == "constant_signal"
     assert "Spearman vs ROI undefined (constant_signal)" in capsys.readouterr().out

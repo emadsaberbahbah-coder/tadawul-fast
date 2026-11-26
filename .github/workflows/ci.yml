@@ -1326,6 +1326,8 @@ jobs:
             tests/test_markets_board.py \
             tests/test_market_condition.py \
             tests/test_tfb_backtest_rank_evidence.py \
+            tests/test_tfb_backtest_walk_forward.py \
+            tests/test_pit_legacy_repair_runner.py \
             tests/test_ci_required_verdict.py \
             tests/test_secret_redaction.py \
             tests/test_task_error_redaction.py \
