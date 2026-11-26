@@ -137,6 +137,23 @@ def _reply_text(payload: Any) -> str:
     return text
 
 
+def _whole(value: Any) -> int:
+    """A whole number as the model wrote it (3, 3.0, "3", "-1"); anything else raises ValueError. int() alone
+    would cut 1.9 to 1 and -0.9 to 0, filing an answer under a headline or a direction the model never gave
+    (Codex P2, PR 1093)."""
+    if isinstance(value, bool):
+        raise ValueError("not a whole number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")) or not value.is_integer():
+            raise ValueError("not a whole number")
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]{1,6}", value.strip()):
+        return int(value.strip())
+    raise ValueError("not a whole number")
+
+
 def parse_reply(payload: Any, batch: Sequence[Dict[str, Any]], macro: Sequence[str], company: Sequence[str]
                 ) -> Tuple[Dict[int, Dict[str, Any]], int]:
     """PURE: ({position in batch: label}, entries dropped). A label is kept only when every field is one of the
@@ -157,13 +174,13 @@ def parse_reply(payload: Any, batch: Sequence[Dict[str, Any]], macro: Sequence[s
     dropped = 0
     for row in data:
         try:
-            i = int(row["i"])
+            i = _whole(row["i"])
             it = batch[i - 1] if 1 <= i <= len(batch) else None
             event = str(row["event"]).strip().lower()
-            direction = int(row["dir"])
+            direction = _whole(row["dir"])
             sev = str(row["sev"]).strip().upper()
             conf = int(round(float(row["conf"])))
-        except (KeyError, TypeError, ValueError, IndexError):
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
             dropped += 1
             continue
         allowed = macro if it is not None and kind_of(it.get("scope")) == "MACRO" else company

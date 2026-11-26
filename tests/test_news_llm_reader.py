@@ -109,6 +109,14 @@ def test_l2_only_fixed_values_are_kept():
         {"event": "none"}, "junk", None]), batch, MACRO, COMPANY)
     assert labels == {1: {"event": "war_escalation", "dir": -1, "sev": "H", "conf": 90},
                       2: {"event": "earnings", "dir": 1, "sev": "M", "conf": 55}} and dropped == 10
+    # Codex P2 (PR 1093): a fraction is not cut down to a headline number or a direction
+    frac = [{"i": 1.9, "event": "none", "dir": 0, "sev": "L", "conf": 5}, {"i": 2, "event": "none", "dir": -0.9, "sev": "L", "conf": 5},
+            {"i": True, "event": "none", "dir": 0, "sev": "L", "conf": 5}, {"i": "3x", "event": "none", "dir": 0, "sev": "L", "conf": 5},
+            {"i": 4, "event": "none", "dir": float("nan"), "sev": "L", "conf": 5}, {"i": 1e400, "event": "none", "dir": 0, "sev": "L", "conf": 5},
+            {"i": 5.0, "event": "none", "dir": "-1", "sev": "L", "conf": 5}, {"i": "6", "event": "none", "dir": 1.0, "sev": "L", "conf": 5}]
+    labels, dropped = llm.parse_reply(_reply(frac), batch, MACRO, COMPANY)
+    assert labels == {5: {"event": "none", "dir": -1, "sev": "L", "conf": 5}, 6: {"event": "none", "dir": 1, "sev": "L", "conf": 5}}
+    assert dropped == 6
     fenced = {"candidates": [{"content": {"parts": [{"text": "```json\n[{\"i\":1,\"event\":\"none\",\"dir\":0,\"sev\":\"L\",\"conf\":5}]\n```"}]}}]}
     assert llm.parse_reply(fenced, batch, MACRO, COMPANY)[0] == {1: {"event": "none", "dir": 0, "sev": "L", "conf": 5}}
     wrapped = _reply({"labels": [{"i": 2, "event": "none", "dir": 0, "sev": "L", "conf": 5}]})
