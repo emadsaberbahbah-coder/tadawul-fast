@@ -7,7 +7,7 @@ VERSION 1.7.1 (2026-11-26) - first written 2026-11-11 (1.0.0)
     26 Nov 12:42 Riyadh, in Arabic: review what else needs changing so the news reaches the decision). The run read
     _News_Items as "A1:M12000" - the FIRST 12,000 rows - while the news gate appends at the bottom. The tab passed
     12,000 rows on 20 Nov 2026 at 22:42 Riyadh (19:42 UTC) and held 19,526 on 26 Nov, so no headline recorded after
-    21 Nov reached this page: 7,527 rows, 65 of them about a name, among them a negative item of severity M on a
+    that hour reached this page: 7,527 rows, 65 of them about a name, among them a negative item of severity M on a
     holding (an 8-K of 24 Nov, tier A) that the rule "negative news tightens the trail" never saw. Nothing failed
     and nothing said so: the page went on showing the news it could see.
     read_newest() reads the columns the rule needs (NEWS_COLS) from the NEWEST NEWS_ROWS (20,000) rows: the header
