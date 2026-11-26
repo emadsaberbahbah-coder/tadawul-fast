@@ -1,5 +1,7 @@
 # Hypothesis H-28 — "Stated Forecast Reliability predicts cohort outcomes" (registered 2026-09-01, backtested same day)
 
+> **Status, 26 Nov 2026 — DESCRIPTIVE.** The numbers below were produced on 1 Sep 2026 with a random 5-fold CV, which the external audit of 25 Nov 2026 found to leak time. A leak flatters a signal, so a rejection made with it stands on firmer ground than an acceptance would; still, read the tables as a description of the log on 31 Aug 2026, not as an out-of-sample result. `tfb_backtest` v1.3.0 (purged walk-forward, quintiles per formation date) is the instrument for any re-test. No figure below was changed.
+
 ## Registration (Hypothesis_Registry row, paste-ready)
 | Field | Value |
 |---|---|

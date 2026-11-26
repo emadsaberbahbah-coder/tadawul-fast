@@ -380,6 +380,11 @@ PENDING = {
     "v_trial_value_screen": "9b66d56d4f89c567d79e1688037198fb5a7a259f08014613364c1cdbdf8de94e",
     "v_cash_entry_events": "2914c7b31eab17989411bae88c32d2f37b3addf2f2b0d02c222c97fc9ec36fab",
     "v_cash_entry_trial": "04bee31d70cc0f981c19240ae3ff0b330e14a24ee9fd8c0bd8d1230b1fb1a1f6",
+    # apply_bq_views 1.31.0 (26 Nov 2026): the forward signal ledger, the gate record and their check against the
+    # outcome engine (research only)
+    "v_forward_signals": "c94ff5dd391aca769481b5c72a2d815fb78dec410d0ce76299cda49960c47237",
+    "v_forward_signal_gates": "f7072173c7a5c2b114c95b696c94ffcf743fec6533ba12a967d3e03be894839a",
+    "v_forward_signal_recon": "a9a1af5acb318e9e39f7f7e1846350cf9bc3daf32a19101a0f715f1514dd700b",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -417,9 +422,10 @@ EXPECTED_ORDER = [
     "v_symbol_news_class_now", "v_news_now_eval", "v_news_now_learning",
     "v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
     "v_cash_entry_events", "v_cash_entry_trial",
+    "v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 76)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 79)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -989,7 +995,8 @@ def case_v18():
         "v_news_trend_daily": {"symbol_bars_daily"},          # v1.25.0: each followed name's sessions around its news
         "v_shock_drop_events": {"symbol_bars_daily"},        # v1.26.0: the largest US names' falls and what followed
         "v_news_now_eval": {"symbol_bars_daily"},              # v1.28.0: the hourly reading's next sessions
-        "v_stop_cause_events": {"symbol_bars_daily"}}, used   # v1.30.0: the falls of the followed US and Saudi shares
+        "v_stop_cause_events": {"symbol_bars_daily"},         # v1.30.0: the falls of the followed US and Saudi shares
+        "v_forward_signals": {"symbol_bars_daily"}}, used     # v1.31.0: the base bar's close, for the entry-price test
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
@@ -3149,12 +3156,12 @@ def case_v44():
 
 
 def case_v45():
-    """apply_bq_views 1.18.0 (kept in 1.30.0): a file number may have three digits, and the files are applied in number
+    """apply_bq_views 1.18.0 (kept in 1.31.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.30.0"
+    assert bv.__version__ == "1.31.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-38:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-41:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
@@ -3170,8 +3177,10 @@ def case_v45():
                            "130_v_news_now_learning.sql",
                            "131_v_stop_cause_events.sql", "132_v_stop_cause_learning.sql",
                            "133_v_value_screen.sql", "134_v_trial_value_screen.sql",
-                           "135_v_cash_entry_events.sql", "136_v_cash_entry_trial.sql"]
-    assert files[:-37] == sorted(files[:-37])                                       # the two-digit order is unchanged
+                           "135_v_cash_entry_events.sql", "136_v_cash_entry_trial.sql",
+                           "137_v_forward_signals.sql", "138_v_forward_signal_gates.sql",
+                           "139_v_forward_signal_recon.sql"]
+    assert files[:-40] == sorted(files[:-40])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3451,7 +3460,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 29
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 32
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3744,7 +3753,7 @@ def case_v58():
     assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
     objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
     names = [o.name for o in bv.load_objects()]
-    assert names[-22:-17] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+    assert names[-25:-20] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
                             "v_driver_learning"]
     for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
                  "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
@@ -3824,7 +3833,7 @@ def case_v61():
     no look-ahead (the state and the volatility of the last close BEFORE the call), a within-day lift for the stock
     rule and a between-days lift for the market rules, read only at 20 call days and 40 forward calls."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-17:-15] == ["v_projection_context", "v_projection_scorecard"]
+    assert names[-20:-18] == ["v_projection_context", "v_projection_scorecard"]
     _, pc = _driver_view("v_projection_context", 120, {"v_universe_latest", "v_options_reading", "v_market_drivers"},
                          "1.24.0")
     for frag in ("COALESCE(o.iv30, u.volatility_30d_pct) AS vol",
@@ -3873,7 +3882,7 @@ def case_v62():
     was read; the outcome starts at the close AFTER the reaction window (no look-ahead); every t is overlap-adjusted;
     only sessions from 24 Nov 2026 are evidence; today's reading sits beside TFB's own view."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-15:-12] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
+    assert names[-18:-15] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
     _, nd = _driver_view("v_news_trend_daily", 122,
                          {"market_series_daily", "v_symbol_news_class", "v_news_items", "symbol_bars_daily"}, "1.25.0")
     _, nl = _driver_view("v_news_trend_learning", 123, {"v_news_trend_daily"}, "1.25.0")
@@ -3931,7 +3940,7 @@ def case_v63():
     the shock-drop shadow rule on the 100 largest US equities with bars, two ways of entering fixed before reading,
     the outcome from the signal close only, the history read as in-sample (survivorship), forward from 24 Nov 2026."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-12:-9] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
+    assert names[-15:-12] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
     _, cc = _driver_view("v_confidence_calibration", 125, {"v_performance_log", "market_series_daily"}, "1.26.0")
     _, se = _driver_view("v_shock_drop_events", 126, {"v_universe", "market_series_daily", "symbol_bars_daily"},
                          "1.26.0")
@@ -3994,7 +4003,7 @@ def case_v64():
     assert bv.NOW_TABLES <= bv.SOURCE_TABLES and not (bv.NOW_TABLES & bv.DEEP_TABLES)
     assert nn.SCHEMA_NEWS is asd.SCHEMA_NEWS                                  # the same columns as the nightly feed
     objs = {o.name: o for o in bv.load_objects()}
-    assert [o.name for o in bv.load_objects()][-9] == "v_symbol_news_class_now"
+    assert [o.name for o in bv.load_objects()][-12] == "v_symbol_news_class_now"
     _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "snap_universe_latest"}, "1.29.0")
     night = bv._code(objs["v_symbol_news_class"].template)
     desc = re.compile(r'OPTIONS \(description = "[^"]*"\)')
@@ -4016,7 +4025,7 @@ def case_v65():
     v_news_trend_learning does, with the reading fixed before any outcome was seen."""
     import news_now as nn
     names = [o.name for o in bv.load_objects()]
-    assert names[-8:-6] == ["v_news_now_eval", "v_news_now_learning"]
+    assert names[-11:-9] == ["v_news_now_eval", "v_news_now_learning"]
     _, ev = _driver_view("v_news_now_eval", 129, {"news_now_log", "symbol_bars_daily", "market_series_daily"}, "1.28.0")
     _, le = _driver_view("v_news_now_learning", 130, {"v_news_now_eval"}, "1.28.0")
     log_cols = {f["name"] for f in nn.SCHEMA_LOG}
@@ -4052,14 +4061,125 @@ def case_v65():
     assert ev.count("LEAD(") == 4 and "r.price" not in ev                     # the only look forward: SPY's targets
 
 
+def case_v67():
+    """v_forward_signals, v_forward_signal_gates, v_forward_signal_recon (1.31.0): the forward signal ledger - every
+    signal against the benchmark of its own market net of a stated cost, the names the gates kept out beside the
+    names they let in, and the ledger's counts held to the outcome engine's."""
+    names = [o.name for o in bv.load_objects()]
+    assert names[-3:] == ["v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon"]
+    objs, fs = _driver_view("v_forward_signals", 137,
+                            {"v_outcome_engine", "symbol_bars_daily", "v_universe", "market_series_daily"}, "1.31.0")
+    _, fg = _driver_view("v_forward_signal_gates", 138, {"v_forward_signals"}, "1.31.0")
+    _, fr = _driver_view("v_forward_signal_recon", 139, {"v_outcome_engine", "v_forward_signals"}, "1.31.0")
+    eng = bv._code(objs["v_outcome_engine"].template)
+    for frag in (# one row per Key: the engine's cohort row when it has one, else the Key's first record - in the
+                 # engine's own order
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY record_key ORDER BY in_engine_cohort DESC, recorded_at, sheet_row, record_id) = 1",
+                 "LEFT JOIN base b ON b.symbol = e.bars_symbol AND b.date = e.base_bar_date",
+                 "LEFT JOIN uni u ON u.symbol = e.symbol AND u.snapshot_date = e.recorded_date",
+                 # the gate, and the reason only when the page shows the record's own tier
+                 "WHEN e.entry_tier = 'INVESTABLE' THEN 'admitted'",
+                 "WHEN e.entry_tier IN ('WATCHLIST', 'BLOCKED') THEN 'kept out'",
+                 "WHEN e.entry_tier IN ('WATCHLIST', 'BLOCKED') AND u.tier = e.entry_tier AND u.reason_class IS NOT NULL THEN u.reason_class",
+                 "WHEN e.entry_tier IN ('WATCHLIST', 'BLOCKED') THEN '(reason not archived)'",
+                 r"NULLIF(TRIM(REGEXP_EXTRACT(IFNULL(CAST(block_reason AS STRING), ''), r'^[^:(\x{2014}]*')), '') AS reason_class",
+                 # the benchmark of the record's own market: total return but for the Saudi index, which has none
+                 "CASE symbol WHEN 'SPY' THEN 'US' WHEN '^TASI.SR' THEN 'Tadawul' ELSE 'Other' END AS market_group,",
+                 "IF(symbol = '^TASI.SR', close, COALESCE(adj_close, close)) AS px,",
+                 "WHERE symbol IN ('SPY', '^TASI.SR', 'ACWI') AND close > 0",
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, date ORDER BY captured_at DESC) = 1",
+                 "WHEN '^TASI.SR' THEN 'Tadawul All Share (^TASI.SR), price only - no dividends'",
+                 # anchored on the last session that had CLOSED when the record was made, to the target bar's date
+                 "IF(symbol = '^TASI.SR', TIMESTAMP(DATETIME(date, TIME '15:00:00'), 'Asia/Riyadh'),",
+                 "TIMESTAMP(DATETIME(date, TIME '16:00:00'), 'America/New_York')) AS closes_at",
+                 "LEFT JOIN bench b0 ON b0.market_group = s.market_group AND b0.closes_at <= s.recorded_at",
+                 "AND (b0.next_closes_at IS NULL OR b0.next_closes_at > s.recorded_at)",
+                 "LEFT JOIN bench b1 ON b1.market_group = s.market_group AND b1.date <= s.target_bar_date",
+                 "AND (b1.next_date IS NULL OR b1.next_date > s.target_bar_date)",
+                 # the return, the cost, the beat (long side) and the stance's own reading
+                 "IF(s.outcome_state = 'scored_from_bar', ROUND((SAFE_DIVIDE(s.target_close_adj, s.entry_price) - 1) * 100, 4), NULL) AS stock_roi,",
+                 "IF(s.outcome_state = 'scored_from_bar', 100 * (SAFE_DIVIDE(b1.px, b0.px) - 1), NULL) AS bench_roi",
+                 "IF(stock_roi IS NOT NULL AND bench_roi IS NOT NULL, 0.5, NULL) AS cost_pp,",
+                 "ROUND(stock_roi - bench_roi - 0.5, 4) AS active_net_pp,",
+                 "stock_roi - bench_roi - 0.5 > 0 AS beat_benchmark,",
+                 "WHEN entry_stance = 'bullish' THEN stock_roi - bench_roi - 0.5 > 0",
+                 "WHEN entry_stance = 'bearish' THEN stock_roi - bench_roi < 0",
+                 # every row keeps a status
+                 "WHEN engine_scored AND bench_roi IS NOT NULL THEN 'scored'",
+                 "WHEN engine_scored THEN 'scored, no benchmark close'",
+                 "WHEN outcome_state = 'scored_from_bar' AND entry_stance IN ('bullish', 'bearish') THEN 'not scored: the price did not move'",
+                 "WHEN outcome_state = 'scored_from_bar' THEN 'tracked: no direction given'",
+                 "WHEN outcome_state = 'target_not_due' THEN 'open: target not due'",
+                 "WHEN outcome_state = 'awaiting_bar' THEN 'open: awaiting the bar'",
+                 "ELSE CONCAT('not scorable: ', outcome_state)",
+                 "CASE WHEN recorded_date < DATE '2026-11-26' THEN 'history, tally fixed before reading it' "
+                 "ELSE 'forward from 2026-11-26' END AS period"):
+        assert frag in fs, frag
+    assert "b0.date <= s.recorded_date" not in fs          # never a close of the recording day that came after the record
+    assert " WHERE " not in fs.split("\ns AS (")[1]         # no record is dropped after the one-row-per-Key pick
+    # the benchmark's closing times are the engine's own venue table
+    assert "('SR', 'Tadawul', 'Asia/Riyadh', 900)," in eng and "('US', 'US', 'America/New_York', 960)," in eng
+    assert (900, 960) == (15 * 60, 16 * 60)
+    # outcome_state is the engine's engine_state without the stance line: the same tests, in the same order
+    def whens(code, start, end):
+        block = code.split(start)[1].split(end)[0]
+        return [ln.strip() for ln in block.splitlines() if ln.strip().startswith(("WHEN", "ELSE"))]
+    mine = whens(fs.split("AS market_group,")[2], "CASE", "END AS outcome_state")
+    theirs = whens(eng.split("AS close_3m,")[1], "CASE", "END AS engine_state")
+    assert [w for w in theirs if "entry_stance" in w] == [
+        "WHEN r.entry_stance NOT IN ('bullish', 'bearish') OR r.entry_stance IS NULL THEN 'unscorable_stance'"]
+    said = [w.replace("r.", "e.").replace("a.base.close", "b.close").replace("a.tb.date", "e.target_bar_date")
+             .replace("sl.symbol IS NULL", "e.last_bar_date IS NULL").replace("sl.last_bar_date", "e.last_bar_date")
+            for w in theirs if "entry_stance" not in w]
+    assert mine == said and len(mine) == 7, (mine, said)
+    # the cost is v_hold_vs_switch's: 0.10 commission + 0.15 spread a side, both ways
+    hs = bv._code(objs["v_hold_vs_switch"].template)
+    assert "SELECT 0.10 AS commission_side_pp, 0.15 AS spread_side_pp" in hs and abs(2 * (0.10 + 0.15) - 0.5) < 1e-12
+    # the SQL carries no bare word the applier refuses (the stance column is call_right)
+    assert not bv._FORBIDDEN.search(fs) and "AS call_right," in fs
+    for frag in ("UNNEST(IF(s.gate = 'kept out', [s.block_reason_class, '(all reasons)'], [s.block_reason_class])) AS r",
+                 "WHERE s.gate IN ('admitted', 'kept out')",
+                 "COUNTIF(active_net_pp IS NOT NULL) AS with_outcome,",
+                 "COUNTIF(active_net_pp > 0) AS winners,",
+                 "COUNTIF(active_net_pp <= 0) AS losers,",
+                 "IF(gate = 'kept out', winners, NULL) AS blocked_winners,",
+                 "IF(gate = 'admitted', losers, NULL) AS admitted_losers,",
+                 # a date's signals averaged first; neighbouring dates share most of their window
+                 "SELECT period, market_group, horizon, gate, block_reason_class, recorded_date, AVG(active_net_pp) AS m",
+                 "/ SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj",
+                 "WHEN period != 'forward from 2026-11-26' THEN 'in-sample, not evidence'",
+                 "WHEN with_outcome < 30 OR days < 8 THEN 'collecting'",
+                 "WHEN gate = 'kept out' AND t_adj <= -2 THEN 'works: the names kept out trailed their benchmark'",
+                 "WHEN gate = 'kept out' AND t_adj >= 2 THEN 'fails: the names kept out beat their benchmark'",
+                 "WHEN gate = 'admitted' AND t_adj >= 2 THEN 'works: the admitted names beat their benchmark'",
+                 "WHEN gate = 'admitted' AND t_adj <= -2 THEN 'fails: the admitted names trailed their benchmark'",
+                 "ELSE 'no clear edge'"):
+        assert frag in fg, frag
+    assert "LEAD(" not in fg and "FOLLOWING" not in fg
+    for frag in ("SELECT COUNT(*) AS engine_rows, COUNT(DISTINCT record_key) AS engine_keys, COUNTIF(in_engine_cohort) AS engine_cohort",
+                 "COUNTIF(STARTS_WITH(status, 'scored')) AS ledger_scored,",
+                 "COUNTIF(entry_stance IN ('bullish', 'bearish') AND outcome_state != engine_state) AS state_differences,",
+                 "COUNTIF(engine_roi_pp IS NOT NULL AND ABS(IFNULL(stock_roi_pp, 1e9) - engine_roi_pp) > 0.0001) AS return_differences",
+                 "IF(led.ledger_rows = eng.engine_keys AND led.ledger_keys = eng.engine_keys AND led.ledger_scored = eng.engine_cohort",
+                 "AND led.state_differences = 0 AND led.return_differences = 0, 'reconciled', 'DIFFERENCE') AS verdict"):
+        assert frag in fr, frag
+    # every status the ledger writes is one the check or the gate record reads by name
+    status_case = fs.split("END AS call_right,")[1].split("END AS status")[0]
+    statuses = set(re.findall(r"THEN '([^']*)'", status_case))
+    assert statuses == {"scored", "scored, no benchmark close", "tracked: no direction given",
+                        "not scored: the price did not move", "open: target not due", "open: awaiting the bar"}
+    for word in ("'scored'", "'scored, no benchmark close'", "'tracked: no direction given'"):
+        assert word in fr, word
+
+
 def case_v66():
     """v_stop_cause_events / _learning, v_value_screen, v_trial_value_screen, v_cash_entry_events / _trial (1.30.0):
     three shadow records of the 26 Nov 2026 review - why a share fell and what holding did, the value screen beside
     the engine's labels, cash entered after a not-calm reading. Each rule is fixed on 26 Nov 2026, every earlier row
     is in-sample, and the outcome is the only look forward."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-6:] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
-                          "v_cash_entry_events", "v_cash_entry_trial"]
+    assert names[-9:-3] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
+                            "v_cash_entry_events", "v_cash_entry_trial"]
     _, se = _driver_view("v_stop_cause_events", 131, {"market_series_daily", "symbol_bars_daily"}, "1.30.0")
     _, sl = _driver_view("v_stop_cause_learning", 132, {"v_stop_cause_events"}, "1.30.0")
     _, vs = _driver_view("v_value_screen", 133, {"v_universe"}, "1.30.0")
@@ -4215,7 +4335,7 @@ CASES = [case_v1, case_v2, case_v3, case_v4, case_v5, case_v6, case_v7, case_v8,
          case_v28, case_v29, case_v30, case_v31, case_v32, case_v33, case_v34, case_v35, case_v36, case_v37, case_v38,
          case_v39, case_v40, case_v41, case_v42, case_v43, case_v44, case_v45, case_v46, case_v47,
          case_v48, case_v49, case_v50, case_v51, case_v52, case_v53, case_v54, case_v55, case_v56, case_v57,
-         case_v58, case_v59, case_v60, case_v61, case_v62, case_v63, case_v64, case_v65, case_v66]
+         case_v58, case_v59, case_v60, case_v61, case_v62, case_v63, case_v64, case_v65, case_v66, case_v67]
 
 
 def test_v1(): case_v1()
@@ -4284,6 +4404,7 @@ def test_v63(): case_v63()
 def test_v64(): case_v64()
 def test_v65(): case_v65()
 def test_v66(): case_v66()
+def test_v67(): case_v67()
 
 
 if __name__ == "__main__":

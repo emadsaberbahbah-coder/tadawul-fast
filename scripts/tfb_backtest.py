@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tfb_backtest.py — v1.2.0 (2026-11-25)
+tfb_backtest.py — v1.3.0 (2026-11-26)
 ================================================================================
+WHY v1.3.0 (week plan of 23 Nov, package 4): two things v1.2.0 left. (1) A numeric
+signal was cut into quintiles of ALL rows pooled. A score whose level moves with
+the market then puts whole weeks in one quintile, and the table reads the market,
+not the choice between names; and a pooled cut point is made of later rows too.
+Quintiles are now cut per formation date: a row's quintile is its rank among the
+rows recorded the same day (five or more values that day; fewer -> the row is left
+out and counted), so no value of another day can enter it. Rollback: --quintiles
+pooled (or TFB_BACKTEST_QUINTILES=pooled) restores the v1.2.0 cuts. (2) Every
+number but the walk-forward block is a description of rows already seen. Each
+result now says so: "evidence" lists its keys as descriptive or out_of_sample,
+"verdict_basis" says what the verdict stands on, the console tags each line, and
+the JSON carries the same legend. The walk-forward also reports the smallest gap
+between a fold's last training entry and its first test day (wf_min_gap_days): a
+training row is usable only once its own horizon has passed (purge), plus
+--embargo-days. Functions added: 2 (date_quintiles, _quintile_mode).
+
 WHY v1.2.0 (external audit of 25 Nov, P1 "validation"): the CV Brier that decides
 SEPARATES shuffled rows at random into five folds. Cohorts recorded on the same
 day, and overlapping 1W/2W/1M windows, then sat on both sides of a fold, and the
@@ -27,8 +43,9 @@ separate winners), by either AI, on the same export, with the same numbers.
 WHAT IT DOES
   - loads Performance_Log (browser TSV export, xlsx, or --live), keeps matured
     cohorts with a WIN/LOSS outcome, DEDUPLICATED by Key (the v6.35.0 rule);
-  - for each --signal column: numeric -> bands (custom edges or quintiles),
-    categorical -> groups; per group n, win %, mean/median realized ROI %;
+  - for each --signal column: numeric -> bands (custom edges, or quintiles cut
+    per formation date - v1.3.0), categorical -> groups; per group n, win %,
+    mean/median realized ROI % (all descriptive);
   - predictive power: Brier of the raw value as a probability (numeric 0-100
     only) vs naive 0.5 vs constant base rate; 5-fold cross-validated Brier of a
     group-calibrated probability (shrinkage k=20) vs the base rate;
@@ -36,7 +53,8 @@ WHAT IT DOES
     correlation of average tie ranks; undefined rank IC is JSON null with an
     explicit status (fewer than three pairs or a constant input); win-rate spread
     (max-min group win %, groups with n >= min_n);
-  - verdict per signal: SEPARATES (CV Brier beats base rate by >= 0.002 AND
+  - verdict per signal: SEPARATES (the purged walk-forward Brier beats the
+    training base rate by >= 0.002 - the only out-of-sample number - AND
     spread >= 5 pp with n >= min_n in both extremes) / WEAK / NONE.
 
 USAGE
@@ -48,6 +66,7 @@ Options: --edges "50,70,85" (numeric bands) --min-n 100 --json out.json --horizo
          --filter "Origin Tab=Top_10_Investments" (repeatable, exact match)   [v1.1.0]
          --since 2026-08-01 / --until 2026-08-31  (Date Recorded window)       [v1.1.0]
          --cv wf|legacy (default wf) --embargo-days 1                         [v1.2.0]
+         --quintiles date|pooled (default date)                               [v1.3.0]
 READ-ONLY. No writes, ever.
 """
 from __future__ import annotations
@@ -64,7 +83,7 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_SIGNALS = ["Entry Forecast Reliability", "Entry Score", "Confidence", "Entry Investability",
                    "Entry Recommendation", "Entry Risk Bucket", "Horizon", "Origin Tab"]
 
@@ -285,11 +304,14 @@ def wf_brier(ys: List[float], entry: List[Optional[_dt.date]], known: List[Optio
     (block start - embargo_days); ``labeler_for(train_idx)`` returns the group
     labeller fitted on those rows only. The baseline is the training win rate,
     scored on the same test rows. A fold with fewer than ``min_train`` training
-    rows is skipped. Returns brier, base_brier, gain, scored, folds, status."""
+    rows is skipped. Returns brier, base_brier, gain, scored, folds, status, and
+    (v1.3.0) wf_min_gap_days - the smallest distance, over the folds, between the
+    last training entry day and the first test day - beside wf_embargo_days."""
     usable = sorted((i for i in range(len(ys)) if entry[i] is not None and known[i] is not None),
                     key=lambda i: (entry[i], i))
     out: Dict[str, Any] = {"wf_brier": None, "wf_base_brier": None, "wf_gain_vs_base": None,
-                           "wf_scored": 0, "wf_folds": 0, "wf_status": "insufficient_dated_rows"}
+                           "wf_scored": 0, "wf_folds": 0, "wf_status": "insufficient_dated_rows",
+                           "wf_min_gap_days": None, "wf_embargo_days": max(0, int(embargo_days))}
     days = sorted({entry[i] for i in usable})
     if len(usable) < 2 * min_train or len(days) < k + 1:
         return out
@@ -305,6 +327,7 @@ def wf_brier(ys: List[float], entry: List[Optional[_dt.date]], known: List[Optio
     blocks = [b for b in blocks if b]
     model, base = [], []
     folds = 0
+    gaps: List[int] = []
     for test in blocks[1:]:
         start = min(entry[i] for i in test)
         cutoff = start - _dt.timedelta(days=max(0, int(embargo_days)))
@@ -312,6 +335,7 @@ def wf_brier(ys: List[float], entry: List[Optional[_dt.date]], known: List[Optio
         if len(train) < min_train:
             continue
         folds += 1
+        gaps.append((start - max(entry[i] for i in train)).days)   # v1.3.0: the purge, as measured
         label = labeler_for(train)
         rate = sum(ys[i] for i in train) / len(train)
         agg: Dict[Any, List[float]] = {}
@@ -328,8 +352,57 @@ def wf_brier(ys: List[float], entry: List[Optional[_dt.date]], known: List[Optio
         return out
     mb, bb = brier(model), brier(base)
     out.update({"wf_brier": round(mb, 4), "wf_base_brier": round(bb, 4), "wf_gain_vs_base": round(bb - mb, 4),
-                "wf_scored": len(model), "wf_folds": folds, "wf_status": "ok"})
+                "wf_scored": len(model), "wf_folds": folds, "wf_status": "ok", "wf_min_gap_days": min(gaps)})
     return out
+
+
+QUINTILE_MIN_NAMES = 5
+
+
+def date_quintiles(xs: List[float], days: List[Optional[_dt.date]],
+                   min_names: int = QUINTILE_MIN_NAMES) -> List[Optional[int]]:
+    """v1.3.0: the quintile (1..5) of each value among the values of its own formation day.
+
+    Equal values share the quintile of their average rank, so the order of the rows never matters. A row
+    with no day, or on a day with fewer than ``min_names`` values, gets None. Nothing from another day is
+    read, so a later row can never move an earlier row's quintile."""
+    by_day: Dict[_dt.date, List[int]] = {}
+    for i, d in enumerate(days):
+        if d is not None:
+            by_day.setdefault(d, []).append(i)
+    out: List[Optional[int]] = [None] * len(xs)
+    for idx in by_day.values():
+        n = len(idx)
+        if n < max(1, int(min_names)):
+            continue
+        order = sorted(idx, key=lambda i: xs[i])
+        j = 0
+        while j < n:
+            k = j
+            while k + 1 < n and xs[order[k + 1]] == xs[order[j]]:
+                k += 1
+            q = min(5, 1 + int(5 * ((j + k) / 2.0 + 0.5) / n))
+            for t in range(j, k + 1):
+                out[order[t]] = q
+            j = k + 1
+    return out
+
+
+def _quintile_mode(explicit: str = "") -> str:
+    """v1.3.0: date (default) or pooled; --quintiles wins over TFB_BACKTEST_QUINTILES."""
+    raw = (explicit or os.getenv("TFB_BACKTEST_QUINTILES") or "date").strip().lower()
+    return "pooled" if raw == "pooled" else "date"
+
+
+# v1.3.0: what each number is. Only the walk-forward block is scored on rows the model had not seen.
+DESCRIPTIVE_KEYS = ("base_win_pct", "base_brier", "groups", "raw_brier_as_probability", "spearman_vs_roi",
+                    "win_spread_pp", "spread_z", "cv_brier_group_calibrated", "cv_gain_vs_base")
+OUT_OF_SAMPLE_KEYS = ("wf_brier", "wf_base_brier", "wf_gain_vs_base")
+OUTPUT_LEGEND = {
+    "descriptive": "computed on rows already seen: says what happened, not what will - never evidence on its own "
+                   "(the legacy random K-fold belongs here: it leaks time)",
+    "out_of_sample": "purged walk-forward: each block scored by a model fitted only on outcomes known before it",
+}
 
 
 def _cv_mode(explicit: str = "") -> str:
@@ -339,7 +412,7 @@ def _cv_mode(explicit: str = "") -> str:
 
 
 def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[List[float]] = None,
-                    min_n: int = 100, cv: str = "", embargo_days: int = 1) -> Dict[str, Any]:
+                    min_n: int = 100, cv: str = "", embargo_days: int = 1, quintiles: str = "") -> Dict[str, Any]:
     """Summarize one signal on the supplied decided, finite-return cohort.
 
     Numeric rank IC is a descriptive pooled association, not an out-of-sample
@@ -347,27 +420,49 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
     ``spearman_status`` is ``defined``; otherwise it is None (JSON null) with
     status ``insufficient_samples``, ``constant_signal``, ``constant_roi``, or
     ``constant_signal_and_roi``. Finite numeric scores retain their paired ROI.
+
+    v1.3.0: a numeric signal without ``edges`` is cut into quintiles per formation
+    date (``bands`` = ``date_quintiles``; rows on a day with fewer than five values
+    are left out and counted in ``rows_without_date_quintile``). When no day has
+    five values the pooled cut is used and ``bands`` says ``pooled_quintiles
+    (no formation day with 5 values)``. ``evidence`` names every key as
+    descriptive or out_of_sample; ``verdict_basis`` says what the verdict used.
     """
     vals = [r.get(signal) for r in cohorts]
     nums = [_f(v) for v in vals]
     numeric = sum(1 for x in nums if x is not None) >= 0.9 * max(1, len(vals))
     ys = [1.0 if _s(r.get("Outcome")) == "WIN" else 0.0 for r in cohorts]
     rois = [_f(r.get("Realized ROI %")) or 0.0 for r in cohorts]
+    entry_all, known_all = label_days(cohorts)
+    bands, dropped = "categories", 0
     if numeric:
         keep = [i for i, x in enumerate(nums) if x is not None]
         xs = [nums[i] for i in keep]
-        if edges is None:  # quintiles
+        dq: List[Optional[int]] = []
+        if edges is None and _quintile_mode(quintiles) == "date":
+            # v1.3.0: the quintile of a row among the rows of its own formation day
+            dq = date_quintiles(xs, [entry_all[i] for i in keep])
+        if edges is None and any(q is not None for q in dq):
+            bands = "date_quintiles"
+            dropped = sum(1 for q in dq if q is None)
+            groups = ["Q%d" % q for q in dq if q is not None]
+            keep = [i for i, q in zip(keep, dq) if q is not None]
+        elif edges is None:  # pooled quintiles (the v1.2.0 cut): asked for, or no day has five values
+            bands = "pooled_quintiles" if _quintile_mode(quintiles) == "pooled" else \
+                "pooled_quintiles (no formation day with %d values)" % QUINTILE_MIN_NAMES
             qs = sorted(xs)
             cuts = [qs[int(len(qs) * q)] for q in (0.2, 0.4, 0.6, 0.8)]
             label = lambda x: "Q%d" % (1 + sum(1 for c in cuts if x >= c))
+            groups = [label(nums[i]) for i in keep]
         else:
+            bands = "edges"
             e = sorted(edges)
             def label(x):
                 for j, c in enumerate(e):
                     if x < c:
                         return f"<{c:g}" if j == 0 else f"{e[j-1]:g}-{c:g}"
                 return f">={e[-1]:g}"
-        groups = [label(nums[i]) for i in keep]
+            groups = [label(nums[i]) for i in keep]
     else:
         keep = [i for i, v in enumerate(vals) if _s(v)]
         groups = [_s(vals[i]) for i in keep]
@@ -418,11 +513,11 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
     res["spread_z"] = round(z, 2)
     gain = base_brier - res["cv_brier_group_calibrated"]
     res["cv_gain_vs_base"] = round(gain, 4)
-    # v1.2.0: purged walk-forward on the same cohort; quintile cuts refitted per fold.
-    entry_all, known_all = label_days(cohorts)
+    # v1.2.0: purged walk-forward on the same cohort; pooled quintile cuts refitted per fold.
+    # v1.3.0: a date quintile needs no fitting - it reads its own day only.
     entry = [entry_all[i] for i in keep]
     known = [known_all[i] for i in keep]
-    if numeric and edges is None:
+    if numeric and edges is None and bands != "date_quintiles":
         xk = [nums[i] for i in keep]
 
         def labeler_for(train: List[int]):
@@ -443,25 +538,41 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
         strong_gain = res["wf_status"] == "ok" and res["wf_gain_vs_base"] >= 0.002
     strong_spread = z >= 3.0 and spread >= 5.0
     res["verdict"] = "SEPARATES" if (strong_gain and strong_spread) else ("WEAK" if (strong_gain or strong_spread) else "NONE")
+    # v1.3.0: what each number is, and what the verdict stands on
+    res["bands"] = bands
+    if bands == "date_quintiles":
+        res["rows_without_date_quintile"] = dropped
+    res["verdict_basis"] = ("legacy random K-fold gain and win spread - both descriptive" if res["cv_mode"] == "legacy"
+                            else "walk-forward gain (out-of-sample) and win spread (descriptive)")
+    res["evidence"] = {"descriptive": [k for k in DESCRIPTIVE_KEYS if k in res],
+                       "out_of_sample": [k for k in OUT_OF_SAMPLE_KEYS if k in res]}
     return res
 
 
 def render(results: List[Dict[str, Any]], title: str) -> str:
-    lines = [f"TFB BACKTEST v{VERSION} — {title}"]
+    lines = [f"TFB BACKTEST v{VERSION} — {title}",
+             "  [descriptive] = rows already seen, never evidence on its own | [out-of-sample] = purged walk-forward"]
     for r in results:
         lines.append(f"\n[{r['verdict']:9s}] {r['signal']} ({r['type']}, n={r['n']}, base win {r['base_win_pct']}%, base Brier {r['base_brier']})")
         if "raw_brier_as_probability" in r:
-            lines.append(f"    raw value as probability: Brier {r['raw_brier_as_probability']}")
+            lines.append(f"    [descriptive] raw value as probability: Brier {r['raw_brier_as_probability']}")
         if "spearman_vs_roi" in r:
             ic_text = str(r["spearman_vs_roi"]) if r["spearman_vs_roi"] is not None else f"undefined ({r['spearman_status']})"
-            lines.append(f"    Spearman vs ROI {ic_text}")
+            lines.append(f"    [descriptive] Spearman vs ROI {ic_text}")
         if r.get("wf_status") == "ok":
             wf_txt = (f"Walk-forward Brier {r['wf_brier']} vs base {r['wf_base_brier']} "
-                      f"(gain {r['wf_gain_vs_base']:+.4f}, {r['wf_scored']} rows, {r['wf_folds']} folds)")
+                      f"(gain {r['wf_gain_vs_base']:+.4f}, {r['wf_scored']} rows, {r['wf_folds']} folds, "
+                      f"smallest train-to-test gap {r.get('wf_min_gap_days')} d)")
         else:
             wf_txt = f"Walk-forward Brier undefined ({r.get('wf_status', 'n/a')})"
-        lines.append(f"    {wf_txt} | win spread {r['win_spread_pp']} pp (z={r['spread_z']}) | verdict basis: {r.get('cv_mode', 'wf')}")
-        lines.append(f"    legacy random K-fold Brier {r['cv_brier_group_calibrated']} (gain {r['cv_gain_vs_base']:+.4f}; leaks time, diagnostic only)")
+        lines.append(f"    [out-of-sample] {wf_txt}")
+        lines.append(f"    [descriptive] win spread {r['win_spread_pp']} pp (z={r['spread_z']}) | verdict basis: "
+                     f"{r.get('verdict_basis', r.get('cv_mode', 'wf'))}")
+        lines.append(f"    [descriptive] legacy random K-fold Brier {r['cv_brier_group_calibrated']} (gain {r['cv_gain_vs_base']:+.4f}; leaks time, diagnostic only)")
+        band_txt = r.get("bands", "")
+        if band_txt == "date_quintiles":
+            band_txt = "quintiles per formation date; %d row(s) on thin or undated days left out" % r.get("rows_without_date_quintile", 0)
+        lines.append(f"    [descriptive] groups: {band_txt}")
         lines.append(f"    {'group':14s}{'n':>6s}{'win%':>7s}{'meanROI%':>10s}{'medROI%':>9s}")
         for t in r["groups"][:12]:
             lines.append(f"    {t['group'][:14]:14s}{t['n']:6d}{t['win_pct']:7.1f}{t['mean_roi_pct']:10.2f}{t['median_roi_pct']:9.2f}")
@@ -514,9 +625,29 @@ def _selftest() -> int:
     lk_wf, lk_legacy = evaluate_signal(leak, "Day"), evaluate_signal(leak, "Day", cv="legacy")
     assert lk_legacy["cv_gain_vs_base"] >= 0.02 and lk_legacy["verdict"] == "WEAK", lk_legacy["verdict"]
     assert lk_wf["wf_status"] == "ok" and lk_wf["wf_gain_vs_base"] < 0.002 and lk_wf["verdict"] == "NONE", lk_wf["verdict"]
+    # v1.3.0: a quintile is cut inside its own formation day. A score whose LEVEL follows the market (high on the
+    # good days, low on the bad ones) and says nothing about which name does better that day fills the pooled
+    # quintiles with whole days: a spread that is the market's, not the choice's. Cut per day it shows none.
+    rng = random.Random(11)
+    lvl = []
+    for i in range(3000):
+        day = d0 + _dt.timedelta(days=i // 50)
+        up = (i // 50) % 2 == 0
+        lvl.append({"Key": f"V{i}", "Status": "matured", "Outcome": "WIN" if rng.random() < (0.8 if up else 0.3) else "LOSS",
+                    "Realized ROI %": "1", "Horizon": "1W", "Level": str(round((70 if up else 30) + rng.uniform(-10, 10), 2)),
+                    "Date Recorded (Riyadh)": day.isoformat() + " 09:00:00"})
+    lv_date, lv_pool = evaluate_signal(lvl, "Level"), evaluate_signal(lvl, "Level", quintiles="pooled")
+    assert lv_pool["bands"] == "pooled_quintiles" and lv_pool["win_spread_pp"] >= 30 and lv_pool["verdict"] != "NONE", lv_pool
+    assert lv_date["bands"] == "date_quintiles" and lv_date["win_spread_pp"] < 8 and lv_date["verdict"] == "NONE", lv_date
+    assert noise["bands"] == "date_quintiles" and good["bands"] == "edges" and cat["bands"] == "categories"
+    assert good["wf_min_gap_days"] >= 7 + AVAILABILITY_PAD_DAYS + 1, good["wf_min_gap_days"]   # horizon + pad + embargo
+    assert good["evidence"]["out_of_sample"] == ["wf_brier", "wf_base_brier", "wf_gain_vs_base"]
+    assert "groups" in good["evidence"]["descriptive"] and "cv_gain_vs_base" in good["evidence"]["descriptive"]
     print(render([good, noise, cat], "selftest"))
-    print("selftest: PASS 6/6 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
-          "filter/since/until; walk-forward >= 4 folds; an entry-day label gains under the legacy K-fold, not walk-forward)")
+    print("selftest: PASS 9/9 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
+          "filter/since/until; walk-forward >= 4 folds; an entry-day label gains under the legacy K-fold, not walk-forward; "
+          "a market-level score separates only under pooled quintiles, not per formation date; the train-to-test gap "
+          "covers the horizon; every output is named descriptive or out-of-sample)")
     return 0
 
 
@@ -536,6 +667,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--min-n", type=int, default=100)
     ap.add_argument("--cv", default="", choices=["", "wf", "legacy"], help="verdict basis (v1.2.0; default wf)")
     ap.add_argument("--embargo-days", type=int, default=1, help="walk-forward embargo after a known outcome (v1.2.0)")
+    ap.add_argument("--quintiles", default="", choices=["", "date", "pooled"],
+                    help="numeric bands without --edges: per formation date (default) or pooled (v1.3.0)")
     ap.add_argument("--json", default="")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
@@ -570,7 +703,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     signals = a.signal or (DEFAULT_SIGNALS if a.all_signals else ["Entry Forecast Reliability"])
     edges = [float(x) for x in a.edges.split(",") if x.strip()] or None
     results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n,
-                               cv=a.cv, embargo_days=a.embargo_days) for sg in signals if sg in hdr]
+                               cv=a.cv, embargo_days=a.embargo_days, quintiles=a.quintiles)
+               for sg in signals if sg in hdr]
     missing = [sg for sg in signals if sg not in hdr]
     scope = (f" | horizons {','.join(hz)}" if hz else "") + (f" | filter {flt}" if flt else "") + \
             (f" | since {a.since}" if a.since else "") + (f" | until {a.until}" if a.until else "")
@@ -580,7 +714,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
         with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump({"version": VERSION, "title": title, "n": len(coh), "results": results, "missing": missing}, fh, indent=2, ensure_ascii=False)
+            json.dump({"version": VERSION, "title": title, "n": len(coh), "output_legend": OUTPUT_LEGEND,
+                       "results": results, "missing": missing}, fh, indent=2, ensure_ascii=False)
     return 0
 
 

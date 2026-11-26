@@ -388,7 +388,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (manifest pin only): 1.29.0 -> 1.30.0 (v_stop_cause_events / _learning, v_value_screen,
     # v_trial_value_screen, v_cash_entry_events / _trial - the stop judgment, the value screen and the cash entry,
     # each recorded and scored, observe only).
-    ("apply_bq_views", "1.30.0", "bigquery looker views"),
+    # 2026-11-26 (manifest pin only): 1.30.0 -> 1.31.0 (v_forward_signals, v_forward_signal_gates,
+    # v_forward_signal_recon - every signal against the benchmark of its own market net of cost, the blocked winners
+    # and the admitted losers per block reason, and the ledger's counts held to v_outcome_engine; research only).
+    ("apply_bq_views", "1.31.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -453,7 +456,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # counts shown without a sign).
     # 2026-11-26 (pin only): 1.0.1 -> 1.1.0 (three records join the registry: the stop judgment, the value screen
     # and the cash entry; 21 are read).
-    ("learning_watch", "1.1.0", "learning watch"),
+    # 2026-11-26 (pin only): 1.1.0 -> 1.2.0 (the gate record joins the registry: v_forward_signal_gates; 22 are read).
+    ("learning_watch", "1.2.0", "learning watch"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),

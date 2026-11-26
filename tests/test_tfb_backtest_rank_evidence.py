@@ -134,6 +134,12 @@ def test_non_rank_metrics_preserve_pre_repair_golden_values():
         # v1.2.0: undated rows cannot be walked forward; the verdict basis is reported.
         "wf_brier": None, "wf_base_brier": None, "wf_gain_vs_base": None, "wf_scored": 0, "wf_folds": 0,
         "wf_status": "insufficient_dated_rows", "cv_mode": "wf",
+        # v1.3.0: the gap and the embargo are reported; every output is named descriptive or out-of-sample.
+        "wf_min_gap_days": None, "wf_embargo_days": 1, "bands": "edges",
+        "verdict_basis": "walk-forward gain (out-of-sample) and win spread (descriptive)",
+        "evidence": {"descriptive": ["base_win_pct", "base_brier", "groups", "raw_brier_as_probability",
+                                     "spearman_vs_roi", "win_spread_pp", "spread_z", "cv_brier_group_calibrated", "cv_gain_vs_base"],
+                     "out_of_sample": ["wf_brier", "wf_base_brier", "wf_gain_vs_base"]},
     }
 
 
@@ -147,7 +153,8 @@ def test_actual_cli_serializes_null_and_prints_undefined_without_live_io(tmp_pat
     report = tmp_path / "report.json"
     assert backtest.main(["--export-dir", str(tmp_path), "--signal", "Signal", "--json", str(report)]) == 0
     payload = json.loads(report.read_text(encoding="utf-8"), parse_constant=lambda token: pytest.fail(token))
-    assert payload["version"] == "1.2.0"
+    assert payload["version"] == "1.3.0"
+    assert set(payload["output_legend"]) == {"descriptive", "out_of_sample"}
     assert payload["results"][0]["spearman_vs_roi"] is None
     assert payload["results"][0]["spearman_status"] == "constant_signal"
     assert "Spearman vs ROI undefined (constant_signal)" in capsys.readouterr().out

@@ -2,8 +2,24 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.30.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.31.0 (program register C8, Phase 2)
 ================================================================================
+v1.31.0 (26 Nov 2026, the forward signal ledger). WHY (week plan of 23 Nov
+2026, package 4; owner, 23 Nov 2026: "go and Start build and daily in the
+moring start to build the remaing"): a rise is not a win when the market rose
+more, and a gate is judged by what it kept out as well as by what it let in.
+Three new views, research only: v_forward_signals (137) - one row per signal
+and horizon from v_outcome_engine, with its gate and block reason, the
+benchmark of its own market over the same dates (SPY total return, ^TASI.SR
+price only, ACWI otherwise; anchored on the last session closed when the
+record was made), the return above it net of 0.50 points of cost, benchmark
+beat and status - HOLD records included, with the long-side outcome the
+engine does not give them; v_forward_signal_gates (138) - per period, market,
+horizon, gate and block reason, the blocked winners and the admitted losers,
+with a reading fixed on 26 Nov 2026 (earlier rows in-sample);
+v_forward_signal_recon (139) - the ledger's counts against the engine's, with
+a verdict. No file of 1.30.0 changes.
+
 v1.30.0 (26 Nov 2026, the stop judgment, the value screen and the cash
 entry). WHY (owner, 26 Nov 2026, Riyadh, in Arabic - 01:07: is the fall
 temporary or lasting, adjust the stops or keep them, "the system must have
@@ -637,7 +653,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.30.0"
+__version__ = "1.31.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
