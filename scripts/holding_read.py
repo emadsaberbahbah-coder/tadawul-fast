@@ -4,8 +4,8 @@ scripts/holding_read.py - TFB Holding Read
 ==========================================
 VERSION 1.0.3 (2026-11-26) - first written 2026-11-18 (1.0.0)
 1.0.3 (26 Nov 2026): THE NEWS ITEMS ARE READ FROM THE BOTTOM OF THE TAB. The run read _News_Items as "A1:P12000",
-    the first 12,000 rows, while the news gate appends at the bottom: the tab passed 12,000 rows on 21 Nov 2026 and
-    held 19,526 on 26 Nov, so a holding's item recorded after 21 Nov (27 rows on four holdings by 26 Nov) could not
+    the first 12,000 rows, while the news gate appends at the bottom: the tab passed 12,000 rows on 20 Nov 2026 (22:42 Riyadh) and
+    held 19,526 on 26 Nov, so a holding's item recorded after that (27 rows on four holdings by 26 Nov) could not
     be named as the reason for its move. The items now come through scripts/exit_plan.read_newest (exit_plan 1.7.1):
     the columns read_items() uses, from the newest 20,000 rows. The run log states the rows read (numbers only).
     The page, the ledger and every rule are unchanged.

@@ -551,7 +551,7 @@ def test_h10_workflow_manifest_ci():
 
 # ----------------------------------------------------------------------------- H12 (1.0.3: the newest news rows)
 def test_h12_an_item_recorded_after_row_12000_is_still_named(monkeypatch, capsys):
-    """21 Nov 2026: _News_Items passed 12,000 rows and "A1:P12000" stopped seeing what the news gate appends."""
+    """20 Nov 2026, 22:42 Riyadh: _News_Items passed 12,000 rows and "A1:P12000" stopped seeing what the news gate appends."""
     from tests.test_exit_plan import RangeSheet, _old_rows  # noqa: PLC0415
     long_tab = [ITEMS[0]] + _old_rows(12500) + BBB_NEWS[1:]
     book = Book({"_News_Items": RangeSheet(long_tab)})

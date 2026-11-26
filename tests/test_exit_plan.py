@@ -1217,7 +1217,7 @@ FRESH_NEG = ["n1", "", "2026-11-10 12:00", "DDI.US", "auditor_change", -1, "M", 
 
 
 def test_x24_the_newest_news_rows_are_read():
-    """21 Nov 2026: _News_Items passed 12,000 rows; by 26 Nov 7,527 newer rows were outside "A1:M12000"."""
+    """20 Nov 2026, 22:42 Riyadh: _News_Items passed 12,000 rows; by 26 Nov 7,527 newer rows were outside "A1:M12000"."""
     book = Book({"_News_Items": RangeSheet([NEWS_HDR] + _old_rows(12500) + [FRESH_NEG])})
     assert len(ep._read(book, "_News_Items", "A1:M12000")) == 12000                # what 1.7.0 asked for ...
     assert ep.read_news(ep._read(book, "_News_Items", "A1:M12000"), NOW, 3) == {}  # ... and what it could not see

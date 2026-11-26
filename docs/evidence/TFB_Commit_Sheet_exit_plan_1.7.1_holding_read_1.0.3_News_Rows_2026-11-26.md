@@ -10,7 +10,7 @@ Both pages read the news gate's `_News_Items` tab as a range fixed from the top:
 | Exit Plan | `A1:M12000` | the rule "a negative item (severity H or M) of the last 3 days tightens the trail", and the line "latest negative item" |
 | Holding Read | `A1:P12000` | naming a company item as the reason for a holding's move |
 
-The news gate **appends at the bottom**, up to 200 rows a run. The tab passed 12,000 rows on **21 Nov 2026 at 06:02 Riyadh**. From then on neither page could see a new headline. Nothing failed and nothing said so.
+The news gate **appends at the bottom**, up to 200 rows a run. The tab passed 12,000 rows on **20 Nov 2026 at 22:42 Riyadh** (19:42 UTC). From then on neither page could see a new headline. Nothing failed and nothing said so.
 
 On 26 Nov (`v_news_items`, snapshot of that day):
 
@@ -46,7 +46,7 @@ A missing tab still reads as empty; a connection or quota fault is still raised 
 ## What changes on the pages after the merge
 - A holding with a negative item (H or M, not a law-firm notice, cluster grade 1–3) of the last 3 days shows it again: `trail tightened to 2xATR: negative news (…)` and `latest negative item: …`.
 - The **stop number** moves only where the trail is already in force (the holding has reached +1R); otherwise the line appears and the stop stays.
-- The Holding Read can again name an item recorded after 21 Nov as the reason for a move.
+- The Holding Read can again name an item recorded after 20 Nov as the reason for a move.
 - For the one item above: the holding has not reached +1R, so its stop number is not expected to move; the two lines appear until the window ends.
 
 ## Tests
