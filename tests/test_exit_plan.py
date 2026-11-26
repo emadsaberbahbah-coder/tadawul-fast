@@ -994,8 +994,8 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.7.0"                                                 # 2026-11-26: 1.7.0
-    assert '("exit_plan", "1.7.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.7.1"                                                 # 2026-11-26: 1.7.0, 1.7.1
+    assert '("exit_plan", "1.7.1", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])
@@ -1185,3 +1185,94 @@ def test_x20_detail_elsewhere_and_by_choice(monkeypatch, capsys):
     assert "DDI.US    TAKE PROFIT" in out and "PICK TEN.US" in out
     wf = (ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8")
     assert "TFB_EXIT_LOG_DETAIL" not in wf, "the workflow keeps the default: no detail on Actions"
+
+
+# ----------------------------------------------------------------------------- X24 (1.7.1: the newest news rows)
+class RangeSheet(Sheet):
+    """A worksheet that returns only the A1 range it is asked for, as the Sheets API does. The plain Sheet above
+    returns every row whatever the range - which is how "A1:M12000" passed every test while, on the live tab, it had
+    stopped seeing the rows the news gate appends."""
+
+    def get(self, rng):
+        m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d*)$", rng)
+        c0, r0, c1 = _colnum(m.group(1)) - 1, int(m.group(2)) - 1, _colnum(m.group(3))
+        r1 = int(m.group(4)) if m.group(4) else len(self.values)
+        out = [list(row[c0:c1]) for row in self.values[r0:r1]]
+        while out and not any(str(x) != "" for x in out[-1]):
+            out.pop()
+        return out
+
+
+NEWS_HDR = ["Item ID", "First Seen (Riyadh)", "Published (UTC)", "Scope", "Event Type", "Direction", "Severity",
+            "Rumour/Denial", "Source", "Domain", "Tier", "Cluster Grade", "Headline", "URL", "Cluster", "Run ID"]
+
+
+def _old_rows(n):
+    return [["o%d" % i, "", "2026-10-28 09:00", "MACRO", "war_escalation", -1, "H", "", "google_news", "reuters.com",
+             "B", 1, "older market-wide headline %d" % i, "u", "c", "r"] for i in range(n)]
+
+
+FRESH_NEG = ["n1", "", "2026-11-10 12:00", "DDI.US", "auditor_change", -1, "M", "", "edgar", "sec.gov", "A", 1,
+             "8-K 4.01 auditor change", "u", "c", "r"]
+
+
+def test_x24_the_newest_news_rows_are_read():
+    """20 Nov 2026, 22:42 Riyadh: _News_Items passed 12,000 rows; by 26 Nov 7,527 newer rows were outside "A1:M12000"."""
+    book = Book({"_News_Items": RangeSheet([NEWS_HDR] + _old_rows(12500) + [FRESH_NEG])})
+    assert len(ep._read(book, "_News_Items", "A1:M12000")) == 12000                # what 1.7.0 asked for ...
+    assert ep.read_news(ep._read(book, "_News_Items", "A1:M12000"), NOW, 3) == {}  # ... and what it could not see
+    grid, span = ep.read_newest(book, "_News_Items", ep.NEWS_COLS)
+    assert span == (2, 12502) and grid[0] == list(ep.NEWS_COLS) and len(grid) == 12502
+    assert ep.read_news(grid, NOW, 3) == {"DDI.US": {"n": 1, "headline": "8-K 4.01 auditor change", "ignored": 0,
+                                                     "at": dt.datetime(2026, 11, 10, 12, 0, tzinfo=UTC)}}
+    # a tab longer than the budget: the rows left out are the OLDEST
+    grid, span = ep.read_newest(book, "_News_Items", ep.NEWS_COLS, rows=100)
+    assert span == (12403, 12502) and len(grid) == 101 and grid[-1][1] == "DDI.US" and grid[1][1] == "MACRO"
+    assert ep.read_news(grid, NOW, 3)["DDI.US"]["n"] == 1
+    assert ep.NEWS_ROWS == 20000
+    # the same answer as a whole read while the tab is short
+    short = [NEWS_HDR, FRESH_NEG, ["n2", "", "2026-11-10 13:00", "GLPI.US", "earnings", -1, "H", "", "google_news", "w.com",
+                                   "B", 2, "GLPI cuts guidance", "u", "c", "r"]]
+    for kind in (Sheet, RangeSheet):
+        grid, span = ep.read_newest(Book({"_News_Items": kind(short)}), "_News_Items", ep.NEWS_COLS)
+        assert span == (2, 3) and ep.read_news(grid, NOW, 3) == ep.read_news(short, NOW, 3) != {}
+    # a blank cell inside a column tail does not shift the rows under it
+    gaps = [NEWS_HDR, ["a", "", "2026-11-10 12:00", "DDI.US", "earnings", -1, "M", "", "s", "d", "B", "", "", "u"],
+            ["b", "", "2026-11-10 13:00", "GLPI.US", "earnings", -1, "H", "", "s", "d", "B", 2, "GLPI cuts guidance", "u"]]
+    grid, _span = ep.read_newest(Book({"_News_Items": RangeSheet(gaps)}), "_News_Items", ep.NEWS_COLS)
+    got = ep.read_news(grid, NOW, 3)
+    assert got["GLPI.US"]["headline"] == "GLPI cuts guidance" and got["DDI.US"]["headline"] == ""
+    # nothing to read
+    assert ep.read_newest(Book({}), "_News_Items", ep.NEWS_COLS) == ([], None)                       # no tab
+    assert ep.read_newest(Book({"_News_Items": RangeSheet([])}), "_News_Items", ep.NEWS_COLS) == ([], None)
+    assert ep.read_newest(Book({"_News_Items": RangeSheet([["A", "B"]])}), "_News_Items", ep.NEWS_COLS) == ([], None)
+    assert ep.read_newest(Book({"_News_Items": RangeSheet([NEWS_HDR])}), "_News_Items", ep.NEWS_COLS) \
+        == ([list(ep.NEWS_COLS)], None)
+
+    class Down(Book):
+        def worksheet(self, name):
+            raise ConnectionError("down")
+    with pytest.raises(ConnectionError):                       # a fault is not an empty tab: the run retries it
+        ep.read_newest(Down({}), "_News_Items", ep.NEWS_COLS)
+
+
+def test_x24_the_page_carries_a_negative_item_recorded_after_row_12000(monkeypatch, capsys):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.setenv("TFB_EXIT_PLAN", "on")
+    monkeypatch.setenv("TFB_EXIT_LOG_DETAIL", "off")
+    quiet = wbook()
+    assert ep.run(False, False, book=quiet, now=NOW, opener=opener) == 0
+    capsys.readouterr()
+    b = wbook()
+    b.tabs["_News_Items"] = RangeSheet([NEWS_HDR] + _old_rows(12500) + [FRESH_NEG])
+    assert ep.run(False, False, book=b, now=NOW, opener=opener) == 0
+    out = capsys.readouterr().out
+    assert "news: rows 2-12502 of _News_Items read (the newest 12501)" in out
+    assert "DDI" not in out and "auditor" not in out           # the public log names no holding and no headline
+
+    def why(book):
+        return next(" | ".join(str(c) for c in r) for r in book.tabs["Exit_Plan"].values if r and r[0] == "DDI.US")
+    assert "negative news (1 item in 3 days)" in why(b) and "latest negative item: 8-K 4.01 auditor change" in why(b)
+    assert "negative news" not in why(quiet) and "latest negative item" not in why(quiet)
+    led = {r[2]: r for r in b.tabs["_Exit_Plan"].values[1:]}
+    assert "negative news (1 item in 3 days)" in str(led["DDI.US"])

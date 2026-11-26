@@ -486,10 +486,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
     # terms, config/corporate_offers.json; [STOP-JUDGMENT] a fall named with its market or on its own, observe only).
-    ("exit_plan", "1.7.0", "exit plan"),
+    ("exit_plan", "1.7.1", "exit plan"),   # 2026-11-26: 1.7.1 the news rows are read from the bottom of the tab
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
-    ("holding_read", "1.0.2", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
+    ("holding_read", "1.0.3", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
     ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
     # 2026-11-26 (pin only): 1.8.2 -> 1.9.0 (a holding under a standing cash offer whose sale is manual is not asked
