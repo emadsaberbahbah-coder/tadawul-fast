@@ -248,11 +248,11 @@ def test_lt13_tags_avoid_the_reliability_words(monkeypatch):
 def test_lt14_version_manifest_why(monkeypatch):
     from core import data_engine_v2 as de
     from core import scoring
-    assert de.__version__ == "5.164.0" and scoring.__version__ == "5.11.5"
+    assert de.__version__ == "5.165.0" and scoring.__version__ == "5.11.5"
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("core.data_engine_v2", "__version__", "5.164.0",' in vd
+    assert '("core.data_engine_v2", "__version__", "5.165.0",' in vd
     assert "(\"core.scoring\", \"__version__\", '5.11.5'," in vd
     src = (_REPO / "core" / "data_engine_v2.py").read_text(encoding="utf-8")
     assert src.count("WHY v5.163.0 - TRUTH IN LABELS AND UNITS") == 1
-    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.164.0" in src
+    assert "Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.165.0" in src
     assert "WHY v5.11.5" in (_REPO / "core" / "scoring.py").read_text(encoding="utf-8")
