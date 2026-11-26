@@ -388,7 +388,8 @@ PENDING = {
     # apply_bq_views 1.32.0 (26 Nov 2026): the news read twice - the word lists and the language model, each scored
     # against the next sessions, and the days they part (research only)
     "v_news_llm": "a06c1b6fb679009ac58732b23bc2b247d6988290b26f8283879d811be9c68eca",
-    "v_news_llm_days": "9f3e0f319ca88094eccca7cf02a97a42e5a6db6241a00da86a50b0490b0cc859",
+    # apply_bq_views 1.33.0 (27 Nov 2026): v_news_llm_days enters after the model's reading (audit D1)
+    "v_news_llm_days": "2ff795f3b0c42d85eb25b6597e12cf009d2a88cf29de6238ca9c684433dad867",
     "v_news_llm_eval": "b31dbef2f26273328d81d6da15f82b0c6f111cfa6a5d517c21492cd51bbccd67",
     "v_news_llm_duel": "92b377b8bc3beebb12d86ec0820e25c61d03cfead4751b3ef3b22838da430cc0",
 }
@@ -3166,7 +3167,7 @@ def case_v44():
 def case_v45():
     """apply_bq_views 1.18.0 (kept in 1.32.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.32.0"
+    assert bv.__version__ == "1.33.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
     assert files[-45:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
@@ -4367,9 +4368,13 @@ def case_v68():
                  "SELECT kind, symbol, d, COUNT(*) AS headlines, SUM(rule_dir) AS rules_x, SUM(llm_dir) AS model_x",
                  "CROSS JOIN UNNEST([STRUCT('rules' AS reader, mv.rules_x AS x), STRUCT('model' AS reader, mv.model_x AS x)]) AS r",
                  "CASE WHEN r.x >= 1 THEN 'positive' WHEN r.x <= -1 THEN 'negative' ELSE 'neutral' END AS class,",
-                 # entry: the first close AFTER the news day, within 6 calendar days - a name's and SPY's alike
-                 "JOIN bars AS b ON b.symbol = y.symbol AND b.date > y.d AND b.date <= DATE_ADD(y.d, INTERVAL 6 DAY)",
-                 "JOIN spy AS s ON s.date > y.d AND s.date <= DATE_ADD(y.d, INTERVAL 6 DAY)",
+                 # entry: the first close AFTER the news day and after the day's last reading (1.33.0, audit D1),
+                 # within 6 calendar days - a name's and SPY's alike
+                 "MAX(read_at) AS last_read_at,",
+                 "IFNULL(GREATEST(d, DATE(MAX(read_at), 'America/New_York')), d) AS after_d",
+                 "JOIN bars AS b ON b.symbol = y.symbol AND b.date > y.after_d AND b.date <= DATE_ADD(y.after_d, INTERVAL 6 DAY)",
+                 "JOIN spy AS s ON s.date > y.after_d AND s.date <= DATE_ADD(y.after_d, INTERVAL 6 DAY)",
+                 "mv.last_read_at, mv.entry_date,",
                  # a name against the same-day US names, MACRO the S&P 500 fund itself
                  "IF(y.kind = 'MACRO', m.e.r1, n.e.r1 - p.p1) AS move_1d_pp,",
                  "IF(y.kind = 'MACRO', m.e.r5, n.e.r5 - p.p5) AS move_5d_pp",
@@ -4404,6 +4409,8 @@ def case_v68():
     for code in (typed, days, ev, du):
         assert "FOLLOWING" not in code and "CURRENT_" not in code                 # nothing read from a clock
     assert days.count("LEAD(") == 4                                              # the only look forward: the targets
+    assert "b.date > y.d " not in days and "s.date > y.d " not in days          # 1.33.0: never the news day alone
+    assert "entry after the reading: views 1.33.0" in objs["v_news_llm_days"].template
     for o in ("v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel"):
         assert "never an order" in objs[o].template and "26 Nov 2026 15:34 Riyadh" in objs[o].template, o
 
