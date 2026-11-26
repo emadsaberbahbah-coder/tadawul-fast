@@ -290,7 +290,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("compare_broker_observation", "1.0.0", "offline research observation comparison; no funding certificate"),
     ('tfb_capture_evidence', '1.0.0', 'private offline custodian capture'),
     ('repair_pit_legacy_rows', '1.0.0', 'bounded operator PIT repair'),
-    ('tfb_export_audit', '1.2.1', 'offline export audit'),
+    ('tfb_export_audit', '1.2.2', 'offline export audit'),   # 2026-11-25: a tighter sector cap is a WARN
     ('calibration_report', '1.0.1', 'offline calibration evidence'),
     ('audit_workbook', '1.2.1', 'read-only workbook audit'),
     ('flag_registry', '1.0.0', 'static flag inventory'),
