@@ -447,6 +447,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-24 (pin only): 1.0.0 -> 1.1.0 (TFB's view read from the fresh snap_universe_latest, else the view).
     # 2026-11-24 (pin only): 1.1.0 -> 1.1.1 (no EODHD news call for .SR names: no feed, not a failure).
     ("news_now", "1.1.1", "news now"),
+    # 2026-11-26 (new script, pinned on arrival): the shadow reader the news gate 1.8.0 calls after its verdict -
+    # a language model labels the same headlines beside the word lists (observe only; _News_LLM tab).
+    ("news_llm_reader", "1.0.0", "news llm reader"),
     # 2026-11-24 (new script, pinned on arrival): the heavy views computed once after each collector into snap_*
     # tables; readers take a snapshot younger than 30 hours, else the view.
     ("bq_snapshots", "1.0.0", "bigquery snapshots"),
@@ -467,7 +470,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("markets_board", "1.2.0", "markets board"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
-    ("news_macro_gate", "1.7.0", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]
+    ("news_macro_gate", "1.8.0", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]; v1.8.0 [LLM-SHADOW]
     # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
     # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete

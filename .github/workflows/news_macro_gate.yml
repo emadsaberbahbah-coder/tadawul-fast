@@ -1,6 +1,9 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.5 (2026-11-26) -- THE SHADOW READER'S KEY AND SWITCH (news_macro_gate 1.8.0 [LLM-SHADOW])
+#       The run step passes secrets.GEMINI_API_KEY and the Variables TFB_NEWS_LLM (on | off, default on)
+#       and TFB_NEWS_LLM_MODEL. The reader labels headlines in its own tab and controls nothing.
 # VERSION 1.1.4 (2026-11-26) -- THE MARKETAUX KEY REACHES THE GATE (news_macro_gate 1.7.0 [MARKETAUX])
 #       The run step passes secrets.MARKETAUX_API_KEY (added by the owner 26 Nov). Nothing else changes.
 # VERSION 1.1.3 (2026-11-26) -- THE FINNHUB KEY REACHES THE GATE (news_macro_gate 1.6.0 [FINNHUB])
@@ -158,6 +161,9 @@ jobs:
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}   # 1.1.3: news_macro_gate 1.6.0 [FINNHUB]
           MARKETAUX_API_KEY: ${{ secrets.MARKETAUX_API_KEY }}   # 1.1.4: news_macro_gate 1.7.0 [MARKETAUX]
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # 1.1.5: news_macro_gate 1.8.0 [LLM-SHADOW]
+          TFB_NEWS_LLM: ${{ vars.TFB_NEWS_LLM || 'on' }}
+          TFB_NEWS_LLM_MODEL: ${{ vars.TFB_NEWS_LLM_MODEL || '' }}
           TFB_SEC_USER_AGENT: ${{ secrets.TFB_SEC_USER_AGENT || vars.TFB_SEC_USER_AGENT }}
           TFB_NEWS_GATE: ${{ vars.TFB_NEWS_GATE || 'observe' }}
           TFB_NEWS_GATE_SOURCES: ${{ github.event.inputs.sources || vars.TFB_NEWS_GATE_SOURCES || '' }}
