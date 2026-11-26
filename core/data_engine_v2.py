@@ -2,8 +2,26 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.164.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.165.0
 ================================================================================
+
+WHY v5.165.0 - A HOLD ROW NO LONGER SAYS "SCALE IN"
+(TFB_HOLD_PROSE_POST_GATE = on (default) | off; off -> byte-identical to v5.164.0)
+- EVIDENCE (owner's external audit of 25 Nov 2026, P1 analysis): My_Portfolio
+  rows GLPI, AX and IBOC read HOLD / WATCH while their reason and sizing hint
+  still said "Scale in / accumulate ... supports a gradual position" and
+  "Scale in gradually / partial position". Root cause: scoring wrote the
+  ACCUMULATE prose, the gate and the v5.102.0 coherence pass demoted the row
+  to HOLD, and _reconcile_recommendation_family only rewrote the reason's
+  PREFIX ("HOLD:") while v5.77.23 left every hint "flexible" on HOLD.
+- CHANGE: the final (post-gate) recommendation now owns the prose. On HOLD,
+  (1) a hint that carries add-capital language and no hold/trim language is
+  replaced by the HOLD hint ("Maintain or trim"); (2) a reason whose text
+  after the prefix opens with add-capital language becomes
+  "HOLD: no new capital now; pre-gate view: <the original text>", so the
+  pre-gate rationale stays visible and is labelled as such. Idempotent (the
+  rewritten text no longer opens with add language); no column, no score,
+  verdict, rank or final_action change. Presentation only.
 
 WHY v5.164.0 - THE LEVERAGE LABEL LEAVES LENDERS OUT
 (TFB_LABEL_TRUTH as in v5.163.0; off -> byte-identical to v5.163.0)
@@ -4666,7 +4684,7 @@ from core.financial_units import (
 #   TFB_MARKET_GATE / TFB_SELECTION_GATE default off = byte-identical.
 #   Tests: tests/test_de_market_and_selection_gate.py,
 #   tests/test_market_condition.py.
-__version__ = "5.164.0"
+__version__ = "5.165.0"
 
 from core.sheet_presentation import present_instrument_row
 from core.eps_basis import FIELDS as _EPS_FIELDS, KEY as _EPS_BASIS_KEY, copy_basis as _copy_eps_basis
@@ -6424,6 +6442,31 @@ _PSH_ADD_TOKENS: Tuple[str, ...] = (
 )
 
 
+# v5.165.0: add-capital openings of a scoring reason (the ACCUMULATE / BUY prose).
+_REASON_ADD_OPENINGS: Tuple[str, ...] = (
+    "scale in", "accumulate", "add gradually", "add to", "build", "initiate",
+)
+_HOLD_REASON_LEAD = "no new capital now; pre-gate view: "
+
+
+def _hold_prose_post_gate_enabled() -> bool:
+    """v5.165.0: TFB_HOLD_PROSE_POST_GATE (default ON). off/0/false/no restores v5.164.0."""
+    raw = (os.getenv("TFB_HOLD_PROSE_POST_GATE") or "").strip().lower()
+    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _hold_reason_post_gate(reason: str) -> str:
+    """v5.165.0: 'HOLD: Scale in / accumulate - ...' -> 'HOLD: no new capital now;
+    pre-gate view: Scale in / accumulate - ...'. Any other reason is returned as is."""
+    head, sep, tail = _safe_str(reason).partition(":")
+    if not sep or _canonical_recommendation(head.strip()) != "HOLD":
+        return reason
+    body = tail.strip()
+    if not body.lower().startswith(_REASON_ADD_OPENINGS):
+        return reason
+    return f"{head.strip()}: {_HOLD_REASON_LEAD}{body}"
+
+
 def _position_hint_contradicts_reco(hint: str, final_reco: str) -> bool:
     """v5.77.23 (Fix H): True if a (non-blank) position_size_hint's capital-action
     direction contradicts the final recommendation. An ADD reco (BUY family)
@@ -6441,6 +6484,9 @@ def _position_hint_contradicts_reco(hint: str, final_reco: str) -> bool:
         return has_non_add and not has_add
     if direction == "TRIM":
         return any(tok in h for tok in _PSH_ADD_TOKENS)
+    if direction == "HOLD" and _hold_prose_post_gate_enabled():
+        # v5.165.0: a HOLD row must not carry add-capital sizing ("Scale in gradually / partial position").
+        return any(tok in h for tok in _PSH_ADD_TOKENS) and not any(tok in h for tok in _PSH_NON_ADD_TOKENS)
     return False
 
 
@@ -7574,6 +7620,12 @@ def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
         head_canon = _canonical_recommendation(head.strip())
         if head_canon and head_canon != final:
             row["recommendation_reason"] = final + ":" + tail
+    # v5.165.0: the post-gate HOLD owns the prose; the pre-gate add-capital text is kept, labelled.
+    if final == "HOLD" and _hold_prose_post_gate_enabled():
+        cur = _safe_str(row.get("recommendation_reason"))
+        new = _hold_reason_post_gate(cur)
+        if new != cur:
+            row["recommendation_reason"] = new
     # v5.77.21 (Fix E): keep position_size_hint consistent without clobbering
     # richer scoring text. Refresh only a blank hint or a generic fallback hint
     # that no longer matches the final recommendation.
