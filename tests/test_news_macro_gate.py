@@ -365,6 +365,7 @@ def armed(monkeypatch, tmp_path):
     monkeypatch.setenv("MARKETAUX_API_KEY", MKEY)
     monkeypatch.setenv("DEFAULT_SPREADSHEET_ID", FakeSheets.SID)
     monkeypatch.setenv("TFB_NEWS_GATE_GDELT_SPACING_S", "0")
+    monkeypatch.setenv("TFB_NEWS_GATE_LOG_DETAIL", "on")     # v1.8.1: the same log on CI as locally
     for k in ("TFB_NEWS_GATE_SOURCES", "TFB_NEWS_GATE_SYMBOLS", "GITHUB_STEP_SUMMARY",
               "TFB_NEWS_GATE_EVIDENCE_DIR", "GITHUB_RUN_ID", "TFB_NEWS_GATE_MAX_NAMES",
               "GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"):
@@ -882,7 +883,7 @@ def test_g8_main_paths(armed, monkeypatch, capsys):
     assert data["gate"]["verdict"] == "CAUTION"
     assert {s["symbol"] for s in data["scope"]} >= {"ACME.US", "2222.SR", "FRST.US"}
     assert "Verdict: CAUTION" in summary.read_text()
-    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v1.8.0")
+    assert (ev_dir / "news_gate.md").read_text().startswith("## News & macro gate v" + ng.__version__)
 
 
 def test_g8_write_without_credentials_fails_loudly(armed, capsys):
@@ -907,9 +908,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.8.0"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.8.0 [LLM-SHADOW]
+    assert ng.__version__ == "1.8.1"   # 2026-11-26: v1.5.0 [SOURCES] .. v1.8.1 [PUBLIC-LOG]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.8.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.8.1", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -2292,3 +2293,73 @@ def test_g16_marketaux_in_the_run_and_without_a_key(armed, monkeypatch):
     assert rep["sources_failed"] == {"marketaux": "MARKETAUX_API_KEY not set"} and ng.MARKETAUX_API not in http.calls
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
     assert "MARKETAUX_API_KEY: ${{ secrets.MARKETAUX_API_KEY }}" in wf
+
+
+# ----------------------------------------------------------------------------- G17
+SECRETS_OF_THE_SCOPE = ("FRST.US", "FRST", "Primis Financial Corp.", "5023.SR", "Arabian Centres Sukuk 5023",
+                        "BADCO.US", "BADCO", "Bad Co Inc", "ACME.US", "Acme Corp")
+
+
+@pytest.mark.parametrize("value,actions,public", [("auto", "true", True), ("auto", "", False), ("off", "", True),
+                                                  ("on", "true", False), ("junk", "true", True)])
+def test_g17_log_detail(monkeypatch, value, actions, public):
+    monkeypatch.setenv("TFB_NEWS_GATE_LOG_DETAIL", value)
+    monkeypatch.setenv("GITHUB_ACTIONS", actions)
+    assert ng.log_detail() is (not public)
+
+
+def test_g17_mask_public():
+    scope = [{"symbol": "AX.US", "name": "Axos Financial, Inc."}, {"symbol": "5023.SR", "name": ""},
+             {"symbol": "X", "name": "Co"}]
+    toks = ng.mask_tokens(scope)
+    assert toks[0] == "Axos Financial, Inc." and {"AX.US", "AX", "5023.SR", "5023", "X"} <= set(toks)
+    assert "Co" not in toks                                         # a name under four characters is not masked
+    assert ng.mask_public("name AX.US finnhub: HTTP 429; AX up; MAX and TAXES stay; Axos Financial, Inc. said",
+                          toks) == "name [name] finnhub: HTTP 429; [name] up; MAX and TAXES stay; [name] said"
+    assert ng.mask_public("5023.SR and 50230", toks) == "[name] and 50230"
+    assert ng.mask_public("anything", []) == "anything" and ng.mask_public("", toks) == ""
+
+
+def test_g17_the_public_log_names_no_holding_and_the_tabs_keep_everything(armed, monkeypatch, capsys):
+    """v1.8.1 [PUBLIC-LOG]: on GitHub Actions (auto) the log, the step summary and both evidence files name no
+    scope symbol, ticker or company; the verdict and every row written to the workbook are the same as with the
+    detail on; a failure note keeps its reason with the name masked; the mask ends with the run."""
+    monkeypatch.setenv("TFB_NEWS_GATE_SYMBOLS", "ACME.US:Acme Corp")
+    feeds = {"finnhub:FRST": Resp(429, text="limit")}
+
+    def one(tag):
+        ev, summary = armed / ("ev-" + tag), armed / ("summary-" + tag + ".md")
+        monkeypatch.setenv("TFB_NEWS_GATE_EVIDENCE_DIR", str(ev))
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        sh = workbook()
+        rc = ng.main(["--write"], http=FakeHTTP(en_rss=GNEWS_EN_RSS, feeds=feeds), sheets=sh, now=NOW, sleep=_sleep)
+        out = capsys.readouterr().out
+        texts = [out, summary.read_text(), (ev / "news_gate.md").read_text(), (ev / "news_gate.json").read_text()]
+        return rc, sh, texts
+
+    rc_on, sh_on, texts_on = one("on")
+    assert rc_on == 0 and "FRST.US" in texts_on[0] and "Primis Financial Corp." in texts_on[3]   # detail on: named
+    assert "name FRST.US finnhub: HTTP 429" in texts_on[0]
+    monkeypatch.setenv("TFB_NEWS_GATE_LOG_DETAIL", "auto")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc, sh, texts = one("public")
+    assert rc == rc_on == 0
+    for text in texts:
+        for secret in SECRETS_OF_THE_SCOPE:
+            assert secret not in text, secret
+    out, summary, md, raw = texts
+    assert "scope 4: (names kept out of the public log)" in out
+    assert "name [name] finnhub: HTTP 429" in out                          # the reason stays, the name goes
+    assert "kept out of the public log (the _News_Gate tab has them)" in md
+    assert md == summary and md in out
+    data = json.loads(raw)
+    assert data["scope"] == {"names": 4, "detail": "kept out of the public log"}
+    assert "names" not in data["gate"] and data["gate"]["names_flagged"] >= 1
+    assert all(c["scope"] == "MACRO" for c in data["clusters"]) and data["clusters_about_names"] >= 1
+    assert "examples" not in data["issuer_link"]
+    named = [c["headline"][:60] for c in json.loads(texts_on[3])["clusters"] if c["scope"] != "MACRO"]
+    assert named and not [h for h in named if h in md or h in out]        # no name headline, masked or not
+    assert data["gate"]["verdict"] == json.loads(texts_on[3])["gate"]["verdict"]
+    assert sh.tabs == sh_on.tabs                                            # the workbook keeps every detail
+    assert any("FRST.US" in str(r) for r in sh.tabs[ng.ITEMS_TAB][1:])
+    assert ng._PUBLIC_MASK == []                                            # the mask belongs to one run
