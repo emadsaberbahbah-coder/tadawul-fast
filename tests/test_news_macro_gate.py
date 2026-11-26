@@ -2524,12 +2524,30 @@ STORY = "Jensen Huang reinstatement at Nvidia sparks huge Wall Street rally"
 
 def test_g19_origin_key():
     assert ng.origin_key({"title": STORY + " - Reuters"}) == ng.origin_key({"title": STORY}) == ng.origin_key(
-        {"title": STORY.upper() + " | Big News Network"}) != ""
+        {"title": STORY.upper() + " | BBC News"}) != ""
     assert ng.origin_key({"title": "Tanker hit by missile near Hormuz – BBC News"}) == "tanker hit by missile near hormuz"
     assert ng.origin_key({"title": "Oil prices rise"}) == "" and ng.origin_key({}) == ""       # too short to compare
     assert ng.origin_key({"title": "Fed holds rates - but signals two cuts next year, officials say"}) \
         == "fed holds rates but signals two cuts next year officials say"                       # a long tail is the headline
     assert ng.ORIGIN_MIN_CHARS == 25
+
+
+def test_g19_only_a_site_name_is_taken_off_the_headline():
+    """Codex P2 on #1097: two wires whose headlines differ only in a short closing clause are two reports."""
+    for tail, domain, site in ((" - Reuters", "someblog.io", True), (" | BBC News", "bbc.com", True), (" - CNBC TV18", "x.io", True),
+                               (" - The Wall Street Journal", "wsj.com", True), (" - WSJ", "wsj.com", True),
+                               (" \u2013 Financial Times", "ft.com", True), (" - AP", "kbtx.com", True),
+                               (" - Boston Star", "bostonstar.com", True), (" - Big News Network", "bostonstar.com", False),
+                               (" - exports collapse", "reuters.com", False), (" - banks cut lending", "apnews.com", False),
+                               (" - report", "reuters.com", False), (" - Fed officials say", "cnbc.com", False), (" - Fed tightens", "ft.com", False)):
+        assert ng.is_site_tail(ng._SITE_TAIL.search("x" + tail).group(1), domain) is site, (tail, domain)
+    base = "China faces recession as election uncertainty grows"
+    a, b = _mt("reuters.com", base + " - exports collapse"), _mt("apnews.com", base + " - banks cut lending")
+    assert ng.origin_key(a) != ng.origin_key(b) and len(ng.origins([a, b])) == 2
+    two = ng.parse_gdelt(gdelt_articles([("https://www.reuters.com/m1", a["title"], "20261030T100000Z", "reuters.com"),
+                                         ("https://apnews.com/m2", b["title"], "20261030T101000Z", "apnews.com")]), "MACRO", "p")
+    assert ng.evaluate(_clusters(two, QUIET), [], {}, QUIET)["verdict"] == "CAUTION"          # two reports, as before
+    assert ng.origin_key(_mt("reuters.com", base + " - Reuters")) == ng.origin_key(_mt("x.io", base)) != ""
 
 
 def test_g19_origins_keep_the_best_copy_and_merge_nothing_else():
