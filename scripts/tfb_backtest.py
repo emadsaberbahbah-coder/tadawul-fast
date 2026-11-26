@@ -9,7 +9,11 @@ the market then puts whole weeks in one quintile, and the table reads the market
 not the choice between names; and a pooled cut point is made of later rows too.
 Quintiles are now cut per formation date: a row's quintile is its rank among the
 rows recorded the same day (five or more values that day; fewer -> the row is left
-out and counted), so no value of another day can enter it. Rollback: --quintiles
+out and counted), so no value of another day can enter it. The day's rows are
+ALL the records made that day (formation_records: one per Key, the same horizon,
+filter and date scope, no test of status or outcome) - not only the ones that
+later matured as WIN or LOSS: who else was on the list is known at formation,
+which of them matured is not (Codex P2 on #1086). Rollback: --quintiles
 pooled (or TFB_BACKTEST_QUINTILES=pooled) restores the v1.2.0 cuts. (2) Every
 number but the walk-forward block is a description of rows already seen. Each
 result now says so: "evidence" lists its keys as descriptive or out_of_sample,
@@ -17,7 +21,8 @@ result now says so: "evidence" lists its keys as descriptive or out_of_sample,
 the JSON carries the same legend. The walk-forward also reports the smallest gap
 between a fold's last training entry and its first test day (wf_min_gap_days): a
 training row is usable only once its own horizon has passed (purge), plus
---embargo-days. Functions added: 2 (date_quintiles, _quintile_mode).
+--embargo-days. Functions added: 3 (formation_records, date_quintiles,
+_quintile_mode).
 
 WHY v1.2.0 (external audit of 25 Nov, P1 "validation"): the CV Brier that decides
 SEPARATES shuffled rows at random into five folds. Cohorts recorded on the same
@@ -174,6 +179,31 @@ def decided_cohorts(records: List[Dict[str, str]], horizons: Optional[List[str]]
         if until and d and d > until:
             continue
         if _f(r.get("Realized ROI %")) is None:
+            continue
+        out.append(r)
+    return out
+
+
+def formation_records(records: List[Dict[str, str]], horizons: Optional[List[str]] = None,
+                      filters: Optional[Dict[str, str]] = None, since: str = "", until: str = "") -> List[Dict[str, str]]:
+    """v1.3.0 (Codex P2 on #1086): every record as it stood when it was made - one per Key (first
+    occurrence), in the same horizon, column and Date Recorded scope as decided_cohorts, with NO test of
+    status, outcome or realised return. It is the cross-section a date quintile is cut from: who else was
+    recorded that day is known at formation; which of them later matured, won, lost or broke even is not."""
+    seen, out = set(), []
+    for r in records:
+        k = _s(r.get("Key"))
+        if k in seen:
+            continue
+        seen.add(k)
+        if horizons and _s(r.get("Horizon")) not in horizons:
+            continue
+        if filters and any(_s(r.get(k2)) != v for k2, v in filters.items()):
+            continue
+        d = _s(r.get("Date Recorded (Riyadh)"))[:10]
+        if since and d and d < since:
+            continue
+        if until and d and d > until:
             continue
         out.append(r)
     return out
@@ -412,7 +442,8 @@ def _cv_mode(explicit: str = "") -> str:
 
 
 def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[List[float]] = None,
-                    min_n: int = 100, cv: str = "", embargo_days: int = 1, quintiles: str = "") -> Dict[str, Any]:
+                    min_n: int = 100, cv: str = "", embargo_days: int = 1, quintiles: str = "",
+                    formation: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """Summarize one signal on the supplied decided, finite-return cohort.
 
     Numeric rank IC is a descriptive pooled association, not an out-of-sample
@@ -423,10 +454,15 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
 
     v1.3.0: a numeric signal without ``edges`` is cut into quintiles per formation
     date (``bands`` = ``date_quintiles``; rows on a day with fewer than five values
-    are left out and counted in ``rows_without_date_quintile``). When no day has
-    five values the pooled cut is used and ``bands`` says ``pooled_quintiles
-    (no formation day with 5 values)``. ``evidence`` names every key as
-    descriptive or out_of_sample; ``verdict_basis`` says what the verdict used.
+    are left out and counted in ``rows_without_date_quintile``). ``formation``
+    is the day's whole cross-section (formation_records: every record made, decided
+    or not); a cohort takes the quintile its Key holds there, so a same-day record
+    maturing later cannot move it (``quintile_universe`` = ``formation records``).
+    Without ``formation`` the cohorts themselves are the cross-section
+    (``decided rows only``) - right only when every record of the day is decided.
+    When no day has five values the pooled cut is used and ``bands`` says
+    ``pooled_quintiles (no formation day with 5 values)``. ``evidence`` names every
+    key as descriptive or out_of_sample; ``verdict_basis`` says what the verdict used.
     """
     vals = [r.get(signal) for r in cohorts]
     nums = [_f(v) for v in vals]
@@ -435,13 +471,24 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
     rois = [_f(r.get("Realized ROI %")) or 0.0 for r in cohorts]
     entry_all, known_all = label_days(cohorts)
     bands, dropped = "categories", 0
+    universe, universe_n = "decided rows only", 0
     if numeric:
         keep = [i for i, x in enumerate(nums) if x is not None]
         xs = [nums[i] for i in keep]
         dq: List[Optional[int]] = []
-        if edges is None and _quintile_mode(quintiles) == "date":
-            # v1.3.0: the quintile of a row among the rows of its own formation day
+        if edges is None and _quintile_mode(quintiles) == "date" and formation is not None:
+            # v1.3.0 (Codex P2 on #1086): the quintile of a row among ALL the records made the same day,
+            # whatever became of them; a cohort takes the quintile its Key holds in that cross-section
+            f_rows = [(r, _f(r.get(signal))) for r in formation]
+            f_rows = [(r, x) for r, x in f_rows if x is not None]
+            f_q = date_quintiles([x for _, x in f_rows], [_day(r.get("Date Recorded (Riyadh)")) for r, _ in f_rows])
+            by_key = {_s(r.get("Key")): q for (r, _), q in zip(f_rows, f_q)}
+            dq = [by_key.get(_s(cohorts[i].get("Key"))) for i in keep]
+            universe, universe_n = "formation records", len(f_rows)
+        elif edges is None and _quintile_mode(quintiles) == "date":
+            # no formation set given: the cohorts are their own cross-section
             dq = date_quintiles(xs, [entry_all[i] for i in keep])
+            universe_n = len(xs)
         if edges is None and any(q is not None for q in dq):
             bands = "date_quintiles"
             dropped = sum(1 for q in dq if q is None)
@@ -542,6 +589,8 @@ def evaluate_signal(cohorts: List[Dict[str, str]], signal: str, edges: Optional[
     res["bands"] = bands
     if bands == "date_quintiles":
         res["rows_without_date_quintile"] = dropped
+        res["quintile_universe"] = universe
+        res["formation_rows"] = universe_n
     res["verdict_basis"] = ("legacy random K-fold gain and win spread - both descriptive" if res["cv_mode"] == "legacy"
                             else "walk-forward gain (out-of-sample) and win spread (descriptive)")
     res["evidence"] = {"descriptive": [k for k in DESCRIPTIVE_KEYS if k in res],
@@ -571,7 +620,9 @@ def render(results: List[Dict[str, Any]], title: str) -> str:
         lines.append(f"    [descriptive] legacy random K-fold Brier {r['cv_brier_group_calibrated']} (gain {r['cv_gain_vs_base']:+.4f}; leaks time, diagnostic only)")
         band_txt = r.get("bands", "")
         if band_txt == "date_quintiles":
-            band_txt = "quintiles per formation date; %d row(s) on thin or undated days left out" % r.get("rows_without_date_quintile", 0)
+            band_txt = ("quintiles per formation date, cut among %d %s; %d row(s) on thin or undated days left out"
+                        % (r.get("formation_rows", 0), r.get("quintile_universe", "decided rows only"),
+                           r.get("rows_without_date_quintile", 0)))
         lines.append(f"    [descriptive] groups: {band_txt}")
         lines.append(f"    {'group':14s}{'n':>6s}{'win%':>7s}{'meanROI%':>10s}{'medROI%':>9s}")
         for t in r["groups"][:12]:
@@ -640,14 +691,32 @@ def _selftest() -> int:
     assert lv_pool["bands"] == "pooled_quintiles" and lv_pool["win_spread_pp"] >= 30 and lv_pool["verdict"] != "NONE", lv_pool
     assert lv_date["bands"] == "date_quintiles" and lv_date["win_spread_pp"] < 8 and lv_date["verdict"] == "NONE", lv_date
     assert noise["bands"] == "date_quintiles" and good["bands"] == "edges" and cat["bands"] == "categories"
+    # Codex P2 on #1086: a day's quintiles are cut among every record made that day, not only the ones decided so
+    # far. Ten records a day, scores 1..10; only the five lowest have matured, and of those only score 5 wins.
+    # Among all ten, score 5 is the middle (Q3); among the decided five it would be the top (Q5).
+    half = []
+    for d in range(40):
+        day = (d0 + _dt.timedelta(days=d)).isoformat()
+        for v in range(1, 11):
+            done = v <= 5
+            half.append({"Key": f"H{d}-{v}", "Status": "matured" if done else "open",
+                         "Outcome": ("WIN" if v == 5 else "LOSS") if done else "", "Realized ROI %": "1" if done else "",
+                         "Horizon": "1W", "Score": str(v), "Date Recorded (Riyadh)": day + " 09:00:00"})
+    hc, hf = decided_cohorts(half), formation_records(half)
+    assert len(hc) == 200 and len(hf) == 400
+    top = lambda res: [g["group"] for g in res["groups"] if g["win_pct"] == 100.0]
+    with_f, without_f = evaluate_signal(hc, "Score", formation=hf), evaluate_signal(hc, "Score")
+    assert top(with_f) == ["Q3"] and with_f["quintile_universe"] == "formation records" and with_f["formation_rows"] == 400
+    assert top(without_f) == ["Q5"] and without_f["quintile_universe"] == "decided rows only"
     assert good["wf_min_gap_days"] >= 7 + AVAILABILITY_PAD_DAYS + 1, good["wf_min_gap_days"]   # horizon + pad + embargo
     assert good["evidence"]["out_of_sample"] == ["wf_brier", "wf_base_brier", "wf_gain_vs_base"]
     assert "groups" in good["evidence"]["descriptive"] and "cv_gain_vs_base" in good["evidence"]["descriptive"]
     print(render([good, noise, cat], "selftest"))
-    print("selftest: PASS 9/9 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
+    print("selftest: PASS 10/10 (informative numeric SEPARATES, noise NONE, categorical SEPARATES; duplicate key dropped; "
           "filter/since/until; walk-forward >= 4 folds; an entry-day label gains under the legacy K-fold, not walk-forward; "
-          "a market-level score separates only under pooled quintiles, not per formation date; the train-to-test gap "
-          "covers the horizon; every output is named descriptive or out-of-sample)")
+          "a market-level score separates only under pooled quintiles, not per formation date; a day's quintiles are cut "
+          "among every record made that day, decided or not; the train-to-test gap covers the horizon; every output is "
+          "named descriptive or out-of-sample)")
     return 0
 
 
@@ -700,21 +769,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             k, v = item.split("=", 1)
             flt[k.strip()] = v.strip()
     coh = decided_cohorts(recs, hz, flt or None, a.since.strip(), a.until.strip())
+    # v1.3.0: the day's whole cross-section, decided or not - what a date quintile is cut from
+    formed = formation_records(recs, hz, flt or None, a.since.strip(), a.until.strip())
     signals = a.signal or (DEFAULT_SIGNALS if a.all_signals else ["Entry Forecast Reliability"])
     edges = [float(x) for x in a.edges.split(",") if x.strip()] or None
     results = [evaluate_signal(coh, sg, edges=edges if sg == signals[0] and edges else None, min_n=a.min_n,
-                               cv=a.cv, embargo_days=a.embargo_days, quintiles=a.quintiles)
+                               cv=a.cv, embargo_days=a.embargo_days, quintiles=a.quintiles, formation=formed)
                for sg in signals if sg in hdr]
     missing = [sg for sg in signals if sg not in hdr]
     scope = (f" | horizons {','.join(hz)}" if hz else "") + (f" | filter {flt}" if flt else "") + \
             (f" | since {a.since}" if a.since else "") + (f" | until {a.until}" if a.until else "")
-    print(render(results, f"{title} | decided cohorts n={len(coh)}{scope}"))
+    print(render(results, f"{title} | decided cohorts n={len(coh)} of {len(formed)} formation records{scope}"))
     if missing:
         print("signals not in header:", ", ".join(missing))
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
         with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump({"version": VERSION, "title": title, "n": len(coh), "output_legend": OUTPUT_LEGEND,
+            json.dump({"version": VERSION, "title": title, "n": len(coh), "formation_records": len(formed),
+                       "output_legend": OUTPUT_LEGEND,
                        "results": results, "missing": missing}, fh, indent=2, ensure_ascii=False)
     return 0
 

@@ -201,6 +201,89 @@ def test_quintile_mode_flag_wins_over_env_and_thin_days_fall_back(monkeypatch):
     assert res["bands"] == "date_quintiles" and res["rows_without_date_quintile"] == 3 and res["n"] == 100
 
 
+def _half_matured_day(n_decided):
+    # one formation day, ten records with scores 1..10: the lowest n_decided have matured, the rest are still open;
+    # of the decided ones only score 5 wins - so the group that shows a win is the quintile score 5 was put in
+    rows = []
+    for v in range(1, 11):
+        done = v <= n_decided
+        rows.append({"Record ID": str(v), "Key": f"K{v}", "Status": "matured" if done else "open",
+                     "Outcome": ("WIN" if v == 5 else "LOSS") if done else "", "Realized ROI %": "1" if done else "",
+                     "Horizon": "1W", "Sig": str(v), "Date Recorded (Riyadh)": D0.isoformat() + " 09:00:00"})
+    return rows
+
+
+def _winning_quintile(result):
+    return [g["group"] for g in result["groups"] if g["win_pct"] > 0]
+
+
+def test_a_same_day_record_maturing_later_cannot_move_a_quintile():
+    """Codex P2 on #1086: the day's cross-section is every record made that day, not only the ones decided so far."""
+    early, late = _half_matured_day(5), _half_matured_day(10)
+    for rows in (early, late):
+        res = backtest.evaluate_signal(backtest.decided_cohorts(rows), "Sig", min_n=1,
+                                       formation=backtest.formation_records(rows))
+        # score 5 is the middle of the ten records of its day, whether five or ten of them have matured
+        assert _winning_quintile(res) == ["Q3"]
+        assert res["quintile_universe"] == "formation records" and res["formation_rows"] == 10
+    assert backtest.evaluate_signal(backtest.decided_cohorts(early), "Sig", min_n=1,
+                                    formation=backtest.formation_records(early))["n"] == 5
+    # the planted selection: cut among the decided rows only, the same record is the top quintile while five have
+    # matured and the middle one once all ten have - its label would be made of who matured
+    assert _winning_quintile(backtest.evaluate_signal(backtest.decided_cohorts(early), "Sig", min_n=1)) == ["Q5"]
+    assert _winning_quintile(backtest.evaluate_signal(backtest.decided_cohorts(late), "Sig", min_n=1)) == ["Q3"]
+    assert backtest.evaluate_signal(backtest.decided_cohorts(early), "Sig", min_n=1)["quintile_universe"] == "decided rows only"
+
+
+def test_formation_records_keep_every_record_once_in_the_same_scope():
+    rows = _half_matured_day(5)
+    rows.append(dict(rows[0], Sig="99"))                                           # a later duplicate of K1
+    rows.append(dict(rows[1], Key="B1", Outcome="BREAKEVEN"))                      # breakeven: no cohort, still formed
+    rows.append(dict(rows[2], Key="M1", Horizon="1M"))
+    rows.append(dict(rows[3], Key="L1", **{"Date Recorded (Riyadh)": "2026-08-15 09:00:00"}))
+    formed = backtest.formation_records(rows)
+    assert [r["Key"] for r in formed] == ["K%d" % v for v in range(1, 11)] + ["B1", "M1", "L1"]
+    assert formed[0]["Sig"] == "1"                                                  # the first occurrence of a Key
+    assert {r["Key"] for r in backtest.decided_cohorts(rows)} == {"K1", "K2", "K3", "K4", "K5", "M1", "L1"}
+    assert [r["Key"] for r in backtest.formation_records(rows, horizons=["1M"])] == ["M1"]
+    assert [r["Key"] for r in backtest.formation_records(rows, since="2026-08-01")] == ["L1"]
+    assert len(backtest.formation_records(rows, until="2026-07-31")) == 12
+    assert [r["Key"] for r in backtest.formation_records(rows, filters={"Outcome": "BREAKEVEN"})] == ["B1"]
+    # a cohort whose Key is not in the cross-section gets no quintile and is counted
+    res = backtest.evaluate_signal(backtest.decided_cohorts(rows), "Sig", min_n=1,
+                                   formation=backtest.formation_records(rows, horizons=["1W"]))
+    # M1 is outside the 1W cross-section; L1 stands alone on its day (fewer than five records): neither has a quintile
+    assert res["rows_without_date_quintile"] == 2 and res["n"] == 5
+    # thin formation days fall back to the pooled cut, and say so
+    thin = backtest.evaluate_signal(backtest.decided_cohorts(rows), "Sig", min_n=1, formation=rows[:4])
+    assert thin["bands"] == "pooled_quintiles (no formation day with 5 values)" and "quintile_universe" not in thin
+
+
+def test_cli_cuts_quintiles_among_all_formation_records(tmp_path, capsys):
+    import csv
+    import json
+    rows = []
+    for d in range(3):
+        for r in _half_matured_day(5):
+            rows.append(dict(r, Key="%s-%d" % (r["Key"], d), **{"Record ID": "%s-%d" % (r["Record ID"], d),
+                        "Date Recorded (Riyadh)": (D0 + dt.timedelta(days=d)).isoformat() + " 09:00:00"}))
+    path = tmp_path / "synthetic_Performance_Log.tsv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+    report = tmp_path / "report.json"
+    assert backtest.main(["--export-dir", str(tmp_path), "--signal", "Sig", "--min-n", "1", "--json", str(report)]) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    res = payload["results"][0]
+    assert payload["n"] == 15 and payload["formation_records"] == 30
+    assert res["bands"] == "date_quintiles" and res["quintile_universe"] == "formation records" and res["formation_rows"] == 30
+    assert _winning_quintile(res) == ["Q3"]
+    out = capsys.readouterr().out
+    assert "decided cohorts n=15 of 30 formation records" in out
+    assert "quintiles per formation date, cut among 30 formation records; 0 row(s)" in out
+
+
 def test_gap_between_training_and_test_covers_the_horizon():
     rng = random.Random(5)
     for horizon, days in (("1W", 7), ("1M", 30)):
@@ -225,7 +308,8 @@ def test_every_output_is_named_descriptive_or_out_of_sample(tmp_path, capsys):
                                                    "cv_brier_group_calibrated", "cv_gain_vs_base"}
     # every number of the result is in one list or the other, or is a count / a status / a label
     plain = {"signal", "type", "n", "spearman_status", "wf_scored", "wf_folds", "wf_status", "wf_min_gap_days",
-             "wf_embargo_days", "cv_mode", "verdict", "bands", "rows_without_date_quintile", "verdict_basis", "evidence"}
+             "wf_embargo_days", "cv_mode", "verdict", "bands", "rows_without_date_quintile", "quintile_universe",
+             "formation_rows", "verdict_basis", "evidence"}
     assert set(res) == plain | set(res["evidence"]["descriptive"]) | set(res["evidence"]["out_of_sample"])
     assert res["verdict_basis"] == "walk-forward gain (out-of-sample) and win spread (descriptive)"
     assert backtest.evaluate_signal(rows, "Sig", cv="legacy")["verdict_basis"] == \
