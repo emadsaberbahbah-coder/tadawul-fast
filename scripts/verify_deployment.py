@@ -472,6 +472,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (pin only): 1.1.0 -> 1.2.0 (the gate record joins the registry: v_forward_signal_gates; 22 are read).
     # 2026-11-27 (pin only): 1.2.0 -> 1.2.1 (the sector record is read with its t_adj, views 1.35.0).
     ("learning_watch", "1.2.1", "learning watch"),
+    # 2026-11-27 (new script, pinned on arrival): the workbook grid trim - every tab's allocated grid against its
+    # used extent, and (four gates, by hand) the trailing empty rows and columns deleted. Report by default.
+    ("trim_workbook_grid", "1.0.0", "workbook grid trim"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
