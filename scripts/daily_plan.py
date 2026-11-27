@@ -230,7 +230,7 @@ merit list this plan picks from, has IC -0.01 (t -0.09; on the names with an ana
 analyst target upside - the distance from the price to the source page's Target Price, the evidence rule's own
 number - has IC 0.30 (t 2.59, 42 days, 0.31 and 0.30 in the two halves), the best record in the system. Its
 forward evidence was fixed before any forward day: v_trial_c2 (calls from 20 Nov in the top half of their day by
-the upside), v_trial_shadow_v2 (from 19 Nov) and the upside's IC in v_signal_edge on the days after 19 Nov.
+the upside) and the upside's IC in v_signal_edge on the days after 19 Nov.
 TFB_PLAN_RANKER = engine (default: the merit list's order, unchanged) | observe | upside.
   - upside: the eligible candidates priced in TFB_PLAN_RANKER_CCY (USD) that carry an analyst upside are ordered
     by it, highest first; every other candidate follows in the engine's order. The kept-pick rule, the two-level
