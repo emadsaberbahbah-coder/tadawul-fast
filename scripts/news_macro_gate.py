@@ -2,8 +2,15 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.13.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.13.1 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.13.1 (2026-11-27) -- [FEEDS-PRUNE] THE TWO GULF FEEDS THE RUNNER CANNOT READ ARE TAKEN OUT
+WHY: the first run of 1.13.0 on main (dry run 45968251004, 27 Nov 08:4x UTC) read Argaam's two Arabic feeds
+  (gulf_rss rose from 83-85 to 92 items, newest 0 min old), so the gate has an Arabic Saudi feed again; Asharq
+  Business refused it (HTTP 403) as in every run since 26 Nov, and Mubasher's TDWL address answered an HTML page,
+  not a feed. As 1.13.0 said, a feed that refuses or is not a feed is taken out.
+WHAT: FEEDS loses asharq_business and mubasher_tdwl; their publishers keep their tiers (a copy carried by Google
+  News is graded as before). No verdict rule, tab or column changes.
 v1.13.0 (2026-11-27) -- [SOURCES-REVIEW] YAHOO OFF BY DEFAULT, ARABIC SAUDI SEARCHES, EODHD COMPANY NEWS
 WHY (news-sources review the owner set for 27 Nov; owner, 26 Nov 2026 19:13 Riyadh, in Arabic: "if it is ready,
   build it now"). Measured on the runs of 26-27 Nov: yahoo_rss gave 0 headlines inside the window in every run
@@ -484,7 +491,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.13.0"
+__version__ = "1.13.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -573,8 +580,6 @@ FEEDS: Tuple[Tuple[str, str, str, str, str, float], ...] = (
      "boj.or.jp", "en", NAME_WINDOW_H),
     ("snb", "official_rss", "https://www.snb.ch/public/rss/en/pressrel",
      "snb.ch", "en", NAME_WINDOW_H),
-    ("asharq_business", "gulf_rss", "https://www.asharqbusiness.com/rss.xml",
-     "asharqbusiness.com", "ar", MACRO_WINDOW_H),
     ("arabnews", "gulf_rss", "https://www.arabnews.com/rss.xml",
      "arabnews.com", "en", MACRO_WINDOW_H),
     ("thenational", "gulf_rss",
@@ -589,8 +594,6 @@ FEEDS: Tuple[Tuple[str, str, str, str, str, float], ...] = (
      "argaam.com", "ar", MACRO_WINDOW_H),
     ("argaam_pulse", "gulf_rss", "https://www.argaam.com/ar/rss/ho-market-pulse?sectionid=70",
      "argaam.com", "ar", MACRO_WINDOW_H),
-    ("mubasher_tdwl", "gulf_rss", "https://feeds.mubasher.info/ar/TDWL/news",
-     "mubasher.info", "ar", MACRO_WINDOW_H),
 )
 
 GATE_TAB = "_News_Gate"

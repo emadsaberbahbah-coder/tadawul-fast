@@ -915,9 +915,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.13.0"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1, v1.13.0
+    assert ng.__version__ == "1.13.1"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1, v1.13.0, v1.13.1
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.13.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.13.1", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1672,9 +1672,9 @@ RDF = """<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-r
 
 def test_g14_the_registry_is_whole():
     ids = [f[0] for f in ng.FEEDS]
-    assert len(ids) == len(set(ids)) == 23                        # v1.11.0: + boe, boj, snb; v1.13.0: + 3 Arabic
+    assert len(ids) == len(set(ids)) == 21          # v1.11.0: + boe, boj, snb; v1.13.0: + 3 Arabic; v1.13.1: - 2
     assert {f[1] for f in ng.FEEDS} == set(ng.FEED_GROUPS)
-    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 9, 7]
+    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 9, 5]
     for fid, group, url, domain, lang, hours in ng.FEEDS:
         assert url.startswith("https://") and lang in ("en", "ar") and hours in (24.0, 72.0)
         assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
@@ -1963,9 +1963,9 @@ def test_g14_every_feed_of_a_group_failing_is_named_feed_by_feed(armed):
     col = ng.Collector(http, _sleep, NOW)
     assert col.feeds("gulf_rss") == [] and col.ok == {}
     note = col.failed["gulf_rss"]
-    assert [p.split(":")[0] for p in note.split("; ")] == ["asharq_business", "arabnews", "thenational", "aljazeera",
-                                                           "argaam_main", "argaam_pulse", "mubasher_tdwl"]
-    assert len(http.calls) == 7 and len(note) <= 420
+    assert [p.split(":")[0] for p in note.split("; ")] == ["arabnews", "thenational", "aljazeera", "argaam_main",
+                                                           "argaam_pulse"]            # v1.13.1: Asharq and Mubasher out
+    assert len(http.calls) == 5 and len(note) <= 420
 
 
 def test_g14_sec_is_asked_with_the_declared_contact_or_not_at_all(armed):
@@ -2873,10 +2873,11 @@ def test_g23_a_story_from_one_publisher_counts_once_across_finnhub_and_eodhd():
 
 def test_g23_the_arabic_saudi_feeds_and_the_sama_search_are_on_trial():
     ar = {f[0]: f for f in ng.FEEDS if f[1] == "gulf_rss" and f[4] == "ar"}
-    assert set(ar) == {"asharq_business", "argaam_main", "argaam_pulse", "mubasher_tdwl"}
+    assert set(ar) == {"argaam_main", "argaam_pulse"}            # v1.13.1: the runner read both on 27 Nov
+    assert not any(f[0] in ("asharq_business", "mubasher_tdwl") for f in ng.FEEDS)       # refused / not a feed
     assert ar["argaam_main"][2] == "https://www.argaam.com/ar/rss/ho-main-news?sectionid=1523"
     assert ar["argaam_pulse"][2] == "https://www.argaam.com/ar/rss/ho-market-pulse?sectionid=70"
     assert "1543" not in " ".join(f[2] for f in ng.FEEDS)                      # the companies feed is dead since 2022
-    assert {ng.tier_of(f[3]) for f in ar.values()} == {"B", "C"}
+    assert {ng.tier_of(f[3]) for f in ar.values()} == {"B"} and ng.tier_of("asharqbusiness.com") == "B"
     gq, nq = ng.build_queries([])
     assert ("MACRO", "sama site", "site:sama.gov.sa when:3d", "en-sa") in nq and ng.tier_of("sama.gov.sa") == "A"
