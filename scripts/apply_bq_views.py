@@ -2,8 +2,26 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.35.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.36.0 (program register C8, Phase 2)
 ================================================================================
+v1.36.0 (27 Nov 2026, the bar archive check). WHY (full project review of
+27 Nov 2026, plan item 'Split and bad-print check on the nightly bars';
+owner, 27 Nov 2026 16:30 Riyadh: "ok let's start do your recommdadtions and
+optimzation phase"): every return in the research views is a ratio of two
+archived closes, and no view listed the bars that sit on another price
+basis or the splits recorded without adjustment. Two new views, research
+only: v_bar_jumps (148) - every session whose close is 1.5 times the
+previous archived close or more, or two thirds of it or less, paired with
+the next jump that undid it (product of the two ratios 0.8 to 1.25, at most
+60 days apart): 'spike' (back within 3 bars), 'detour' (back later), 'step'
+(nothing undid it) or 'too new' (fewer than 3 later bars);
+v_bar_jump_symbols (149) - one row per symbol with a fixed reading: two
+price bases, bad bar, large step (3 times or more), too new, steps under 3
+times; is_new marks a jump within 7 days of the archive's newest bar. On
+the archive of 27 Nov: 107 jumps on 29 symbols - 3 symbols on two price
+bases, 5 with a bad bar, 6 with a large step, 15 with steps under 3 times.
+No existing view changes; nothing reads the new ones yet.
+
 v1.35.0 (27 Nov 2026, a reading needs its test). WHY (full project review
 of 27 Nov 2026, approved by the owner at 14:06 Riyadh: "ok approved and start
 doing the need"): the Learning Watch page listed 15 PROVEN rows, all from
@@ -719,7 +737,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.35.0"
+__version__ = "1.36.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
