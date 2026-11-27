@@ -11,9 +11,9 @@ holds - two years of daily prices - and judged per market, net of cost, on
 dates it never saw. Four new views, research only: v_challenger_v0_features
 (144) - per share and session, 12-1 and 6-1 month momentum over 63-session
 volatility, the 63-session return and the 126-session downside volatility,
-from that close and earlier ones only; v_challenger_v0_ranks (145) - every
-5th session of each market, each input ranked inside its market and sector
-(at least 20 peers, else the market, else neutral), and the next 21 sessions
+from that close and earlier ones only; v_challenger_v0_ranks (145) - the
+first session of each ISO week of each market, each input ranked inside its
+market and sector (at least 20 peers, else the market, else neutral), and the next 21 sessions
 from the NEXT close against the market's benchmark; v_challenger_v0_walkforward
 (146) - each market's weights learned from earlier dates whose results had
 all closed (purged), the score, a shadow action and a shadow size per name;

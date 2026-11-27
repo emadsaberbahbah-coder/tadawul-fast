@@ -15,7 +15,7 @@
 -- OVER DATES: dates, names (mean per date), ic_mean, ic_t_adj, q5_net_mean_pp, q5_t_adj, q5_beat_pct (dates on
 -- which quintile 5 beat the benchmark net of cost), spread_mean_pp, spread_net_mean_pp, spread_t_adj. Each t is
 -- the mean over its standard error across dates, divided by SQRT(21 / 5): a result runs 21 sessions and the dates
--- are 5 sessions apart, so neighbouring dates share most of their window.
+-- are a week (about 5 sessions) apart, so neighbouring dates share most of their window.
 -- PERIOD: 'history (backtest)' for formation dates before 27 Nov 2026, 'forward from 2026-11-27' after.
 -- THE READING (fixed on 27 Nov 2026, before the first read): 'THIN' under 26 dates; 'REVERSED' at ic_t_adj <= -2;
 -- 'CANDIDATE (forward test)' at ic_t_adj >= 2 with q5_net_mean_pp > 0 and spread_t_adj >= 2; else 'NO EDGE'. A

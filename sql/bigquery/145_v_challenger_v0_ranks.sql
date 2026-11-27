@@ -4,7 +4,10 @@
 -- WHY (week plan of 23 Nov 2026, package 5): see v_challenger_v0_features. This view adds the ranks and the result;
 -- v_challenger_v0_walkforward learns the weights, v_challenger_v0_scorecard reads the record.
 -- FORMATION DATES: a market's sessions are the dates on which at least 20 of its names have a close; a formation
--- date is every 5th session from the 253rd on (the first with a 12-month history).
+-- date is the FIRST such session of each ISO week on which at least 20 of its names have a 12-month history. Tied
+-- to the calendar, not to a count of sessions, so the nightly reload of symbol_bars_daily (a rolling 760-day
+-- window) only drops the oldest dates and never moves the others (Codex P2 on #1101); and a date is final once its
+-- session has closed, so a shadow book recorded on it does not move later in the week.
 -- THE RANK of each input on a formation date: its percentile among the names of the same market and sector that
 -- have it, when there are at least 20 of them; else among the names of the market that have it, when at least 20;
 -- else none. dev_* = percentile - 0.5, and 0 (neutral) for a missing input or rank. score_eq = 50 + 100 x the mean
@@ -21,19 +24,22 @@
 -- (Added after the first read on 27 Nov 2026; the reading rules of the scorecard were not changed.)
 -- Research only: no decision, gate or count reads this view. (views 1.34.0)
 CREATE OR REPLACE VIEW `{{DS}}.v_challenger_v0_ranks`
-OPTIONS (description = "TFB shadow challenger v0 ranks (views 1.34.0): on every 5th session of each market, each input ranked inside its market and sector (at least 20 peers, else the market, else neutral), the equal-weight score, and the next 21 sessions from the next close against the market's benchmark. Research view, never an order.")
+OPTIONS (description = "TFB shadow challenger v0 ranks (views 1.34.0): on the first session of each ISO week of each market, each input ranked inside its market and sector (at least 20 peers, else the market, else neutral), the equal-weight score, and the next 21 sessions from the next close against the market's benchmark. Research view, never an order.")
 AS
 WITH f AS (
   SELECT * FROM `{{DS}}.v_challenger_v0_features`
 ),
 cal AS (
-  SELECT market, date, ROW_NUMBER() OVER (PARTITION BY market ORDER BY date) AS idx
+  SELECT market, date, COUNT(mom12_vs) AS n_m12
   FROM f
   GROUP BY market, date
   HAVING COUNT(*) >= 20
 ),
 form AS (
-  SELECT market, date AS d FROM cal WHERE idx > 252 AND MOD(idx, 5) = 0
+  SELECT market, MIN(date) AS d
+  FROM cal
+  WHERE n_m12 >= 20
+  GROUP BY market, DATE_TRUNC(date, ISOWEEK)
 ),
 lab AS (
   SELECT symbol, date,

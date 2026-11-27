@@ -395,7 +395,7 @@ PENDING = {
     # apply_bq_views 1.34.0 (27 Nov 2026): the shadow challenger v0 - price inputs ranked per market and sector,
     # weights learned walk-forward, a shadow action and size per name, and its scorecard (research only)
     "v_challenger_v0_features": "33a6db6c984f8578fbe3c6ba19dbdccdc82d816d5ecf3fd1ea601cbfdf0ef9b8",
-    "v_challenger_v0_ranks": "18f6e3216286c0a2ed1756f7f65886d732259ffc8723a278e972deaf64945237",
+    "v_challenger_v0_ranks": "2f98c250c05913f033a71290cdb8dfb25eafaf27788f48eb92b21a6a94fb852c",
     "v_challenger_v0_walkforward": "0e39890fc235a201810a8d0d1fcc929e5e9aaef68bbabbe00905098555cc6281",
     "v_challenger_v0_scorecard": "c0ee2aa57cf9680afa5a26c100f8fc8928684b5cba4ec7d3b76841ea161a4982",
 }
@@ -4452,8 +4452,11 @@ def case_v69():
                  "WHERE REGEXP_CONTAINS(s.symbol, r'\\.[A-Z]+$') AND TRIM(IFNULL(s.sector, '')) != ''"):
         assert frag in fe, frag
     assert "LEAD(" not in fe and fe.count("ROWS BETWEEN") == 2
-    for frag in (# every 5th session from the 253rd; at least 20 peers, else the market, else neutral
-                 "SELECT market, date AS d FROM cal WHERE idx > 252 AND MOD(idx, 5) = 0",
+    for frag in (# the first session of each ISO week with a 12-month history (Codex P2 on #1101: tied to the
+                 # calendar, so the rolling bar window never moves a date); at least 20 peers, else the market, else 0
+                 "SELECT market, MIN(date) AS d",
+                 "WHERE n_m12 >= 20",
+                 "GROUP BY market, DATE_TRUNC(date, ISOWEEK)",
                  "HAVING COUNT(*) >= 20",
                  "CASE WHEN r.ps_m12 IS NOT NULL AND r.ns_m12 >= 20 THEN r.ps_m12 - 0.5",
                  "WHEN r.pm_m12 IS NOT NULL AND r.nm_m12 >= 20 THEN r.pm_m12 - 0.5 ELSE 0 END AS dev_m12,",
@@ -4468,6 +4471,7 @@ def case_v69():
                  "LEAST(GREATEST(e.excess_pp, PERCENTILE_CONT(e.excess_pp, 0.01) OVER (PARTITION BY e.market, e.d)),"):
         assert frag in rk, frag
     assert rk.count("LEAD(") == 4 and rk.count("PERCENT_RANK()") == 9
+    assert "ROW_NUMBER()" not in rk and "MOD(" not in rk                     # no count of sessions anchors a date
     for frag in (# weights from earlier dates whose LAST result closed before the date (purged); warm-up 12 dates
                  "MAX(exit_date) AS exit_max,",
                  "LEFT JOIN ic AS i ON i.market = f.market AND i.exit_max < f.d",
