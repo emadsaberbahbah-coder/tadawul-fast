@@ -2,8 +2,27 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.12.1 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.13.0 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.13.0 (2026-11-27) -- [SOURCES-REVIEW] YAHOO OFF BY DEFAULT, ARABIC SAUDI SEARCHES, EODHD COMPANY NEWS
+WHY (news-sources review the owner set for 27 Nov; owner, 26 Nov 2026 19:13 Riyadh, in Arabic: "if it is ready,
+  build it now"). Measured on the runs of 26-27 Nov: yahoo_rss gave 0 headlines inside the window in every run
+  (222 of 224 outside on 26 Nov, 221 of 221 on 27 Nov 09:42); Asharq Business refused the runner (HTTP 403) in
+  every run, which left the gate with no Arabic feed at all (the Al Jazeera feed is the English one); a Saudi name
+  was searched on Google News in English only; and news_now already reads EODHD's company news every hour while
+  the gate did not.
+WHAT: (1) DEFAULT_SOURCES = ALL_SOURCES without yahoo_rss (OFF_BY_DEFAULT): a blank TFB_NEWS_GATE_SOURCES reads
+  every source but Yahoo, and naming yahoo_rss still reads it. (2) Arabic Google News searches on the Saudi
+  sites (Argaam, Mubasher, Al Eqtisadiah, Al Arabiya): one MACRO search for the Saudi market (in place of the
+  refused Asharq feed), and one per Saudi scope name by its Tadawul code (SAUDI_SITES); the issuer link keeps a
+  name item only when the headline gives the code in brackets ('(2222)'), as before for any ticker. Whether
+  they return dated, relevant items is read on the first runs on main; the Asharq feed stays until then.
+  (3) eodhd_news: EODHD's company news (/api/news, the call news_now makes) for every scope name but the Saudi
+  ones, 72-hour window, folded with the other sources by (scope, publisher, headline) and checked by the issuer
+  link. EODHD's sentiment fields are NOT read: v_company_news_eval (20 Nov) found the provider's polarity
+  positive on 455 of 464 days. (4) Three Arabic feeds on trial in gulf_rss (Argaam's main news and market
+  pulse, Mubasher's TDWL news) and a Google News search of sama.gov.sa (SAMA has no feed). No verdict rule, tab
+  or column changes.
 v1.12.1 (2026-11-27) -- [ISSUER-UNCHECKED] A NAME ITEM WHOSE ISSUER COULD NOT BE CHECKED IS COUNTED AND SAID
 WHY: outside engineering audit the owner uploaded on 26 Nov 2026, finding A2; owner, 26 Nov 2026 19:13 Riyadh, in
   Arabic: "if it is ready, build it now". issuer_linked() returns None (cannot judge) for a symbol of the scope with
@@ -465,7 +484,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.12.1"
+__version__ = "1.13.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -488,9 +507,16 @@ MARKETAUX_API = "https://api.marketaux.com/v1/news/all"                  # v1.7.
 
 # v1.5.0 [SOURCES]: five keyless sources beside the six of v1.0.0. FEED_GROUPS are read from FEEDS below.
 NEW_SOURCES = ("bing_news", "yahoo_rss", "press_rss", "official_rss", "gulf_rss", "finnhub",   # v1.6.0: finnhub
-               "marketaux")                                                                   # v1.7.0
+               "marketaux", "eodhd_news")                                                     # v1.7.0, v1.13.0
 FEED_GROUPS = ("press_rss", "official_rss", "gulf_rss")
 ALL_SOURCES = ("edgar", "gdelt", "google_news", "fed_rss", "econ", "market") + NEW_SOURCES
+# v1.13.0: read only when named in TFB_NEWS_GATE_SOURCES (Yahoo: 0 headlines inside the window on 26-27 Nov)
+OFF_BY_DEFAULT = ("yahoo_rss",)
+DEFAULT_SOURCES = tuple(s for s in ALL_SOURCES if s not in OFF_BY_DEFAULT)
+EODHD_NEWS = "https://eodhd.com/api/news"                                # v1.13.0 [SOURCES-REVIEW]
+EODHD_NEWS_LIMIT = 20
+# v1.13.0: the Saudi financial sites an Arabic Google News search is held to (site: operators)
+SAUDI_SITES = ("argaam.com", "mubasher.info", "aleqt.com", "alarabiya.net")
 # v1.0.1: a source stops after 2 consecutive failed queries (circuit open) or
 # once its time budget is spent, so one throttled provider cannot hold the job
 # to its 20-minute limit (dry run 40595558188 sat in collection > 10 min).
@@ -503,7 +529,7 @@ SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
                    "official_rss": 75.0, "gulf_rss": 45.0, "finnhub": 45.0,
-                   "marketaux": 30.0}
+                   "marketaux": 30.0, "eodhd_news": 30.0}
 BREAKER_FAILURES = 2
 # v1.5.0 [SOURCES]: a feed is asked once per run and never held longer than this; a reply larger than
 # MAX_FEED_BYTES is not parsed. Windows: what evaluate() can still use (24 h market-wide, 72 h for a name).
@@ -556,6 +582,15 @@ FEEDS: Tuple[Tuple[str, str, str, str, str, float], ...] = (
      "thenationalnews.com", "en", MACRO_WINDOW_H),
     ("aljazeera", "gulf_rss", "https://www.aljazeera.com/xml/rss/all.xml",
      "aljazeera.com", "en", MACRO_WINDOW_H),
+    # v1.13.0 [SOURCES-REVIEW]: Arabic Saudi feeds, on trial - the first runs on main show whether the runner
+    # may read them (Argaam's main news and market pulse were live on 26 Nov; Mubasher's TDWL feed answered a
+    # page, not a feed, to a cloud reader). A feed that refuses or is not a feed is named and taken out.
+    ("argaam_main", "gulf_rss", "https://www.argaam.com/ar/rss/ho-main-news?sectionid=1523",
+     "argaam.com", "ar", MACRO_WINDOW_H),
+    ("argaam_pulse", "gulf_rss", "https://www.argaam.com/ar/rss/ho-market-pulse?sectionid=70",
+     "argaam.com", "ar", MACRO_WINDOW_H),
+    ("mubasher_tdwl", "gulf_rss", "https://feeds.mubasher.info/ar/TDWL/news",
+     "mubasher.info", "ar", MACRO_WINDOW_H),
 )
 
 GATE_TAB = "_News_Gate"
@@ -573,8 +608,9 @@ ECON_HEADER = ["Key", "Date (UTC)", "Country", "Event", "Comparison", "Period", 
 # move the verdict (evaluate(): 24 h for macro, 72 h for a name).
 MEMORY_HOURS = {"MACRO": 24.0, "NAME": 72.0}
 # v1.5.0 [SOURCES]: the new news sources are carried too; official feeds keep days of items and are re-read.
-MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub", "marketaux")
-ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "finnhub", "marketaux")
+MEMORY_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub", "marketaux",
+                  "eodhd_news")                                                          # v1.13.0
+ISSUER_LINK_SOURCES = ("gdelt", "google_news", "bing_news", "yahoo_rss", "finnhub", "marketaux", "eodhd_news")
 # v1.6.0 [FINNHUB]: the publisher of a Finnhub item whose URL is Finnhub's own redirect, read from its 'source'
 FINNHUB_SOURCE_DOMAINS: Dict[str, str] = {
     "reuters": "reuters.com", "bloomberg": "bloomberg.com", "cnbc": "cnbc.com", "marketwatch": "marketwatch.com",
@@ -619,6 +655,7 @@ SOURCE_TIERS: Dict[str, str] = {
     "yahoo.com": "D", "msn.com": "D", "seekingalpha.com": "D", "fool.com": "D",
     "bing.com": "D",   # v1.5.0: a Bing News link whose publisher could not be read
     "finnhub.io": "D",  # v1.6.0: a Finnhub item whose publisher could not be read
+    "eodhd.com": "D",   # v1.13.0: an EODHD item whose publisher could not be read
     "zacks.com": "D", "tipranks.com": "D", "marketbeat.com": "D", "news.google.com": "D",
     "insidermonkey.com": "D", "simplywall.st": "D", "stocktitan.net": "D",
     "gurufocus.com": "D", "finviz.com": "D", "investorsobserver.com": "D",
@@ -779,8 +816,9 @@ def _float_env(name: str, default: float, lo: float, hi: float) -> float:
 
 
 def selected_sources(spec: str) -> List[str]:
+    """v1.13.0: blank = DEFAULT_SOURCES (every source but OFF_BY_DEFAULT); a list names the sources to read."""
     if not spec.strip():
-        return list(ALL_SOURCES)
+        return list(DEFAULT_SOURCES)
     want = [s.strip().lower() for s in spec.split(",") if s.strip()]
     return [s for s in ALL_SOURCES if s in want]
 
@@ -1233,6 +1271,44 @@ def parse_finnhub(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
             dom = FINNHUB_SOURCE_DOMAINS.get(name, "finnhub.io")
         out.append({"source": "finnhub", "query": label, "scope": scope, "title": title, "url": url,
                     "domain": dom, "published": published, "lang": "en"})
+    return out
+
+
+def tadawul_code(symbol: str) -> str:
+    """v1.13.0 [SOURCES-REVIEW] PURE: the four-digit Tadawul code of a '.SR' symbol ('' for any other)."""
+    s = str(symbol or "").strip().upper()
+    return s[:-3] if s.endswith(".SR") and s[:-3].isdigit() else ""
+
+
+def eodhd_news_symbol(symbol: str) -> str:
+    """v1.13.0 [SOURCES-REVIEW] PURE: the code EODHD's news takes for a scope symbol ('' = not asked: the Saudi
+    names, which EODHD's company news does not cover - news_now reads holdings and the Top 10 the same way)."""
+    s = str(symbol or "").strip().upper()
+    if not s or s == "MACRO" or s.endswith(".SR") or "." not in s:
+        return ""
+    return s
+
+
+def parse_eodhd_news(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
+    """v1.13.0 [SOURCES-REVIEW] PURE: items of an EODHD /api/news reply (a JSON list). The sentiment fields are
+    never read. Raises ValueError when the reply is not that list, so a refusal is named rather than counted as
+    zero."""
+    if isinstance(payload, dict):
+        raise ValueError("not a news list: %s" % str(payload.get("message") or payload.get("error")
+                                                     or list(payload)[:3])[:60])
+    if not isinstance(payload, list):
+        raise ValueError("not a news list")
+    out = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        title = " ".join(str(row.get("title") or "").split())
+        url = str(row.get("link") or "").strip()
+        if not title:
+            continue
+        out.append({"source": "eodhd_news", "query": label, "scope": scope, "title": title, "url": url,
+                    "domain": domain_of(url) or "eodhd.com", "published": _feed_time(row.get("date")),
+                    "lang": "en"})
     return out
 
 
@@ -2070,6 +2146,42 @@ class Collector:
         guard.close()
         return out
 
+    def eodhd_news(self, symbols: Sequence[str], key: str) -> List[Dict[str, Any]]:
+        """v1.13.0 [SOURCES-REVIEW]: EODHD's company news for every scope name but the Saudi ones (the call
+        news_now makes every hour). The key is a query parameter, so every message is scrubbed of it."""
+        if not key:
+            self._fail("eodhd_news", "EODHD_API_KEY not set")
+            return []
+        frm = (self.now - _dt.timedelta(hours=NAME_WINDOW_H)).strftime("%Y-%m-%d")
+        asks = [(sym, eodhd_news_symbol(sym)) for sym in symbols]
+        asks = [(sym, code) for sym, code in asks if code]
+        out: List[Dict[str, Any]] = []
+        guard = _Guard(self, "eodhd_news")
+        for i, (sym, code) in enumerate(asks):
+            if not guard.allow():
+                continue
+            if i:
+                self.sleep(0.3)
+            try:
+                resp = self._get("eodhd_news", EODHD_NEWS, attempts=1, timeout=min(self.timeout, FEED_TIMEOUT_S),
+                                 params={"s": code, "from": frm, "limit": EODHD_NEWS_LIMIT, "offset": 0,
+                                         "api_token": key, "fmt": "json"})
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    raise ValueError("reply is not JSON")
+                got = parse_eodhd_news(payload, sym, f"name {sym} eodhd")
+                kept, left = within_window(got, self.now, NAME_WINDOW_H)
+                self._tally("eodhd_news", asked=1, read=len(got), outside=left["outside"], undated=left["undated"])
+                out.extend(kept)
+                self._note("eodhd_news", len(kept))
+                guard.success()
+            except Exception as exc:
+                self._fail_part("eodhd_news", sym, _scrub(str(exc), key))
+                guard.failure()
+        guard.close()
+        return out
+
     def feeds(self, group: str, sec_user_agent: str = "") -> List[Dict[str, Any]]:
         """The feeds of one group in FEEDS, each on its own: a feed that fails is named and the next one is
         read (they are different publishers, so there is no circuit breaker - only the group's time budget).
@@ -2308,11 +2420,24 @@ def _name_query(name: str) -> str:
     return f'"{cleaned}"' if cleaned else ""
 
 
+def saudi_sites_query(terms: str, when: str) -> str:
+    """v1.13.0 [SOURCES-REVIEW] PURE: an Arabic Google News search held to SAUDI_SITES."""
+    return f"{terms} ({' OR '.join('site:' + d for d in SAUDI_SITES)}) when:{when}"
+
+
 def build_queries(scope: Sequence[Dict[str, str]]) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str, str]]]:
     gdelt = [("MACRO", label, q) for label, q in GDELT_MACRO_QUERIES]
     gnews = [("MACRO", label, q, "ar") for label, q in GNEWS_AR_QUERIES]
+    # v1.13.0: the Saudi market from the Saudi financial sites, in Arabic (the Asharq feed refuses the runner)
+    gnews.append(("MACRO", "saudi sites ar", saudi_sites_query(
+        "\u062a\u062f\u0627\u0648\u0644 OR \u062a\u0627\u0633\u064a OR \u0627\u0644\u0633\u0648\u0642 \u0627\u0644\u0633\u0639\u0648\u062f\u064a\u0629", "1d"), "ar"))
     gnews += [("MACRO", label, q, "en") for label, q in GNEWS_EN_QUERIES]
+    # v1.13.0: SAMA has no feed; its own site through Google News (kept only if it gives dated items)
+    gnews.append(("MACRO", "sama site", "site:sama.gov.sa when:3d", "en-sa"))
     for s in scope:
+        code = tadawul_code(s.get("symbol") or "")
+        if code:                                   # v1.13.0: a Saudi name in Arabic, by its code, on the Saudi sites
+            gnews.append((s["symbol"], f"name {s['symbol']} ar", saudi_sites_query(f'"{code}"', "3d"), "ar"))
         name = s.get("name") or ""
         nq = _name_query(name)
         if not nq:
@@ -2785,6 +2910,11 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         got = col.marketaux(symbols, _env("MARKETAUX_API_KEY"), _int_env("TFB_NEWS_GATE_MARKETAUX_MAX", 8, 0, 30))
         raw.extend(got)
         stage("marketaux", len(got), t0)
+    if "eodhd_news" in sources:                                    # v1.13.0 [SOURCES-REVIEW]
+        t0 = col.clock()
+        got = col.eodhd_news(symbols, _env("EODHD_API_KEY"))
+        raw.extend(got)
+        stage("eodhd_news", len(got), t0)
     if "yahoo_rss" in sources:
         t0 = col.clock()
         got = col.yahoo_rss(symbols)
