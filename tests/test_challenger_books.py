@@ -81,15 +81,15 @@ class Query:
 
 
 class BQ:
-    def __init__(self, fail_market=None):
-        self.ensured, self.loads, self.fail_market = [], [], fail_market
+    def __init__(self, fail_market=None, fail_day=None):
+        self.ensured, self.loads, self.fail_market, self.fail_day = [], [], fail_market, fail_day
 
     def ensure(self, session, project, dataset, table, spec=None):
         self.ensured.append((table, spec))
         return False
 
     def load(self, session, project, dataset, location, table, day, rows, run_id, schema=None, disposition=None):
-        if self.fail_market and rows and rows[0]["market"] == self.fail_market:
+        if (self.fail_market and rows and rows[0]["market"] == self.fail_market) or day == self.fail_day:
             raise RuntimeError("load failed for " + rows[0]["symbol"])
         self.loads.append({"table": table, "day": day, "rows": rows, "run_id": run_id, "schema": schema,
                            "disposition": disposition})
@@ -240,6 +240,42 @@ def test_thin_is_under_ninety_percent_of_the_last_frozen_book_of_the_same_market
     assert plan_of([book("US", nxt, SYMBOLS[:8])], sess, later)[("US", nxt)]["action"] == "FREEZE"
     first = plan_of([book("US", MON, SYMBOLS[:2])], US_SESS)[("US", MON)]   # the first book has no reference
     assert first["action"] == "FREEZE"
+
+
+NXT = MON + dt.timedelta(7)
+CATCH_UP = sessions("US", MON, MON + dt.timedelta(1), NXT, NXT + dt.timedelta(1))       # one later session of NXT
+CATCH_UP_NOW = dt.datetime(2026, 12, 9, 7, 0, tzinfo=UTC)
+
+
+def test_a_run_catching_up_judges_the_second_book_against_the_first():
+    """Codex P2 on #1109: the reference of the thin rule includes a book frozen earlier in the same pass."""
+    books = [book("US", MON, SYMBOLS[:10]), book("US", NXT, SYMBOLS[:8])]
+    e = plan_of(books, CATCH_UP)
+    assert e[("US", MON)]["action"] == "FREEZE"
+    assert e[("US", NXT)]["action"] == "HOLD" and "the book of 2026-11-30 had 10" in e[("US", NXT)]["why"]
+    e = plan_of(books, CATCH_UP + sessions("US", NXT + dt.timedelta(2)))
+    assert [e[k]["action"] for k in (("US", MON), ("US", NXT))] == ["FREEZE", "FREEZE"]
+    assert e[("US", NXT)]["why"].endswith("frozen as it is")
+    e = plan_of([book("US", MON, SYMBOLS[:10], n=11), book("US", NXT, SYMBOLS[:8])], CATCH_UP)
+    assert [e[k]["action"] for k in (("US", MON), ("US", NXT))] == ["SKIP", "FREEZE"]   # a book not frozen is no reference
+
+
+def test_a_write_run_catching_up_holds_the_thin_second_book(capsys):
+    q = Query(books=book("US", MON, SYMBOLS[:10]) + book("US", NXT, SYMBOLS[:8]), sess=CATCH_UP)
+    rc, bq = run(q, now=CATCH_UP_NOW)
+    assert rc == 0 and [x["day"] for x in bq.loads] == ["2026-11-30"]
+    out = capsys.readouterr().out
+    assert "US    2026-12-07  HOLD" in out and "the book of 2026-11-30 had 10" in out
+    rc, bq = run(Query(books=book("US", MON, SYMBOLS[:10]) + book("US", NXT, SYMBOLS[:8]), sess=CATCH_UP), dry=True,
+                 now=CATCH_UP_NOW)
+    assert rc == 0 and bq.loads == [] and "dry run: 1 book(s) would be frozen" in capsys.readouterr().out
+
+
+def test_only_a_book_that_was_written_is_a_reference(capsys):
+    q = Query(books=book("US", MON, SYMBOLS[:10]) + book("US", NXT, SYMBOLS[:8]), sess=CATCH_UP)
+    rc, bq = run(q, now=CATCH_UP_NOW, bq=BQ(fail_day="2026-11-30"))
+    assert rc == 1 and [x["day"] for x in bq.loads] == ["2026-12-07"]          # judged with no reference: frozen
+    assert "ERROR: US 2026-11-30 was not frozen (RuntimeError)" in capsys.readouterr().out
 
 
 def test_rows_and_their_types():

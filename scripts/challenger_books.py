@@ -16,6 +16,8 @@ v1.0.0 (2026-11-27)
        FORWARD_START and within the last LOOKBACK_DAYS) that challenger_books does not hold yet, and freezes
        each (market, d) that is final - the archive holds a later session of that market. Rows are appended
        into the partition of d; a frozen book is never rewritten or deleted by this script.
+  ORDER: oldest first; each book is judged against the books frozen before it, this run's own included (a run
+       catching up on two weeks judges the second against the first; Codex P2 on #1109).
   NOT FROZEN (each says why in the log):
        short  - fewer rows came back than the book's own size (the reader's one page of PAGE_LIMIT rows);
        thin   - under THIN_SHARE of the names of the market's last frozen book while only one later session is
@@ -194,34 +196,45 @@ def _week(d: _dt.date) -> Tuple[int, int]:
     return d.isocalendar()[:2]
 
 
+def judge(m: str, d: _dt.date, rows: List[Dict[str, Any]], sessions: Dict[str, List[_dt.date]],
+          frozen: Dict[Tuple[str, _dt.date], int]) -> Dict[str, Any]:
+    """One book: FREEZE, HOLD (thin, try again) or SKIP, with the reason, against the books frozen so far."""
+    want = max((_int(r.get("book_n")) for r in rows), default=0)
+    later = sum(1 for s in sessions.get(m, []) if s > d)
+    e = {"market": m, "d": d, "rows": rows, "names": len(rows), "book_n": want, "later": later, "why": ""}
+    same_week = sorted(fd for (fm, fd) in frozen if fm == m and fd != d and _week(fd) == _week(d))
+    prev = max(((fd, n) for (fm, fd), n in frozen.items() if fm == m and fd < d), default=None)
+    if (m, d) in frozen:
+        e["action"], e["why"] = "SKIP", "frozen already (%d rows)" % frozen[(m, d)]
+    elif d < FORWARD_START:
+        e["action"], e["why"] = "SKIP", "before the forward start"
+    elif later < 1:
+        e["action"], e["why"] = "SKIP", "not final yet (no later session of %s archived)" % m
+    elif len(rows) != want or not rows:
+        e["action"], e["why"] = "SKIP", "short (%d of %d rows came back)" % (len(rows), want)
+    elif same_week:
+        e["action"], e["why"] = "SKIP", "a book of this week is frozen already (d %s)" % same_week[0].isoformat()
+    elif prev is not None and len(rows) < THIN_SHARE * prev[1] and later < 2:
+        e["action"], e["why"] = "HOLD", ("thin (%d names; the book of %s had %d) - held until a second later "
+                                         "session is archived" % (len(rows), prev[0].isoformat(), prev[1]))
+    else:
+        e["action"] = "FREEZE"
+        if prev is not None and len(rows) < THIN_SHARE * prev[1]:
+            e["why"] = "thin (%d names; the book of %s had %d), frozen as it is" % (
+                len(rows), prev[0].isoformat(), prev[1])
+    return e
+
+
 def plan(books: Dict[Tuple[str, _dt.date], List[Dict[str, Any]]], sessions: Dict[str, List[_dt.date]],
          frozen: Dict[Tuple[str, _dt.date], int]) -> List[Dict[str, Any]]:
-    """One entry per (market, d): FREEZE, HOLD (thin, try again) or SKIP, with the reason."""
-    out = []
+    """One entry per (market, d), oldest first, each judged against the books frozen before it - those frozen
+    earlier and those this pass freezes ahead of it (Codex P2 on #1109: a run catching up on two weeks judges the
+    second against the first)."""
+    held, out = dict(frozen), []
     for (m, d), rows in sorted(books.items()):
-        want = max((_int(r.get("book_n")) for r in rows), default=0)
-        later = sum(1 for s in sessions.get(m, []) if s > d)
-        e = {"market": m, "d": d, "rows": rows, "names": len(rows), "book_n": want, "later": later, "why": ""}
-        same_week = sorted(fd for (fm, fd) in frozen if fm == m and fd != d and _week(fd) == _week(d))
-        prev = max(((fd, n) for (fm, fd), n in frozen.items() if fm == m and fd < d), default=None)
-        if (m, d) in frozen:
-            e["action"], e["why"] = "SKIP", "frozen already (%d rows)" % frozen[(m, d)]
-        elif d < FORWARD_START:
-            e["action"], e["why"] = "SKIP", "before the forward start"
-        elif later < 1:
-            e["action"], e["why"] = "SKIP", "not final yet (no later session of %s archived)" % m
-        elif len(rows) != want or not rows:
-            e["action"], e["why"] = "SKIP", "short (%d of %d rows came back)" % (len(rows), want)
-        elif same_week:
-            e["action"], e["why"] = "SKIP", "a book of this week is frozen already (d %s)" % same_week[0].isoformat()
-        elif prev is not None and len(rows) < THIN_SHARE * prev[1] and later < 2:
-            e["action"], e["why"] = "HOLD", ("thin (%d names; the book of %s had %d) - held until a second later "
-                                             "session is archived" % (len(rows), prev[0].isoformat(), prev[1]))
-        else:
-            e["action"] = "FREEZE"
-            if prev is not None and len(rows) < THIN_SHARE * prev[1]:
-                e["why"] = "thin (%d names; the book of %s had %d), frozen as it is" % (
-                    len(rows), prev[0].isoformat(), prev[1])
+        e = judge(m, d, rows, sessions, held)
+        if e["action"] == "FREEZE":
+            held[(m, d)] = e["names"]
         out.append(e)
     return out
 
@@ -313,36 +326,41 @@ def run_once(dry_run: bool, session=None, now: Optional[_dt.datetime] = None, qu
     _out("%d book(s) frozen so far; %d row(s) of books not frozen yet came back%s"
          % (len(frozen), len(rows), " - the reader's page limit: the books past it wait for the next run"
             if len(rows) >= PAGE_LIMIT else ""))
-    entries = plan(books_by_key(rows), sess, frozen)
-    if not entries:
+    books = books_by_key(rows)
+    if not books:
         _out("no book to freeze (the first forward book forms on the first session of the week after %s)"
              % FORWARD_START.isoformat())
         return 0
-    for e in entries:
+    rc, todo, version, sha, sha_read = 0, 0, _views_version(), None, False
+    for key in sorted(books):                        # oldest first: each book is judged against those frozen
+        e = judge(key[0], key[1], books[key], sess, frozen)       # before it, this run's own included
         _out(summary(e))
-    todo = [e for e in entries if e["action"] == "FREEZE"]
-    if dry_run:
-        _out("dry run: %d book(s) would be frozen, nothing written" % len(todo))
-        return 0
-    if not todo:
-        _out("nothing to freeze")
-        return 0
-    try:
-        sha = views_sha(query(session, project, location, sql_views(ds)))
-    except Exception as e:  # noqa: BLE001 - the book is worth more than the hash: frozen without it
-        _out("views_sha not read (%s); the books are frozen without it" % type(e).__name__)
-        sha = None
-    rc, version = 0, _views_version()
-    for e in todo:
-        body = book_rows(e, now, run_id, version, sha)
+        if e["action"] != "FREEZE":
+            continue
+        todo += 1
+        if dry_run:
+            frozen[key] = e["names"]                 # as a write run would see it
+            continue
+        if not sha_read:
+            sha_read = True
+            try:
+                sha = views_sha(query(session, project, location, sql_views(ds)))
+            except Exception as ex:  # noqa: BLE001 - the book is worth more than the hash: frozen without it
+                _out("views_sha not read (%s); the books are frozen without it" % type(ex).__name__)
         try:
-            n = load(session, project, dataset, location, TABLE, e["d"].isoformat(), body, run_id,
-                     schema=SCHEMA, disposition="WRITE_APPEND")
+            n = load(session, project, dataset, location, TABLE, e["d"].isoformat(),
+                     book_rows(e, now, run_id, version, sha), run_id, schema=SCHEMA, disposition="WRITE_APPEND")
+            frozen[key] = e["names"]                 # only a book that was written is a reference
             _out("froze %s %s: %d row(s) into %s$%s" % (e["market"], e["d"].isoformat(), n, TABLE,
                                                         e["d"].isoformat().replace("-", "")))
         except Exception as ex:  # noqa: BLE001 - one market never stops the others; the run is marked failed
             _out("ERROR: %s %s was not frozen (%s)" % (e["market"], e["d"].isoformat(), type(ex).__name__))
             rc = 1
+    if dry_run:
+        _out("dry run: %d book(s) would be frozen, nothing written" % todo)
+        return 0
+    if not todo:
+        _out("nothing to freeze")
     return rc
 
 
