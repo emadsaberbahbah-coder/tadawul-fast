@@ -1,0 +1,89 @@
+# =============================================================================
+# 📒 Challenger Books - each forward book of the shadow challenger, frozen once
+# -----------------------------------------------------------------------------
+# VERSION 1.0.0 (2026-11-27)
+#
+# WHY: full project review of 27 Nov 2026 (owner, 16:30 Riyadh: "ok let's
+# start do your recommdadtions and optimzation phase"). The walk-forward view
+# recomputes every weekly book from an archive that is reloaded whole every
+# night, so a book read later can differ from the book that was formed. A
+# forward test is judged on the books as they were formed; the first forward
+# book forms on Mon 30 Nov 2026.
+#
+# WHEN: after every run of the BigQuery Symbol Deep Data workflow (the bars
+# it reloads are what makes a book final), whatever its result - a run that
+# kept yesterday's table leaves nothing new to freeze. No cron: GitHub's
+# schedule starts this repository's runs hours late. A manual dispatch is a
+# dry run unless write=true.
+#
+# READS: the walk-forward view, the archived sessions and the frozen keys
+# (SELECT only). WRITES: BigQuery challenger_books (append-only, one
+# partition per formation date). Nothing reads it yet; nothing changes a
+# recommendation, a gate or an order. Logs: counts per market, no symbol.
+# Rollback: repository Variable TFB_CHALLENGER_BOOKS=off.
+# =============================================================================
+name: 📒 Challenger Books
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('{0} (dispatch, write={1})', github.workflow, inputs.write) || github.workflow }}
+
+on:
+  workflow_run:
+    workflows: ["🔬 BigQuery Symbol Deep Data"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Freeze the final books into BigQuery (unticked = dry run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  freeze:
+    name: 📒 Freeze the final forward books
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: tfb-challenger-books
+      cancel-in-progress: false
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: python -m pip install --quiet "google-auth==2.49.2" "requests==2.33.1"
+
+      - name: 📒 Freeze the books
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BQ_PROJECT: ${{ vars.TFB_BQ_PROJECT || 'project-2e3530e6-2311-4aa3-b36' }}
+          TFB_BQ_DATASET: ${{ vars.TFB_BQ_DATASET || 'tfb_archive' }}
+          TFB_BQ_LOCATION: ${{ vars.TFB_BQ_LOCATION || 'US' }}
+          TFB_CHALLENGER_BOOKS: ${{ vars.TFB_CHALLENGER_BOOKS || 'on' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IN_WRITE: ${{ inputs.write }}
+        run: |
+          ARGS=()
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$IN_WRITE" != "true" ]]; then
+            ARGS+=(--dry-run)
+            echo "Dry-run mode - reading the books, writing nothing (tick write=true to write)."
+          fi
+          python scripts/challenger_books.py "${ARGS[@]}"
