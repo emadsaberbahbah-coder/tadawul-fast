@@ -1,6 +1,7 @@
 # =============================================================================
 # News & Macro Gate - observe-only verdict before each market session
 # =============================================================================
+# VERSION 1.1.8 (2026-11-27) -- news_macro_gate 1.13.0: yahoo_rss off by default, eodhd_news added (the sources input names them)
 # VERSION 1.1.7 (2026-11-27) -- EXTRA SYMBOLS FROM A SECRET (news_macro_gate 1.12.0, audit E1)
 #       TFB_NEWS_GATE_SYMBOLS is read from secrets.TFB_NEWS_GATE_SYMBOLS (masked in the log) instead of a
 #       repository Variable (printed in the step's env block). The dispatch input stays, marked public.
@@ -86,7 +87,7 @@ on:
         default: false
         type: boolean
       sources:
-        description: "Comma list of sources (blank = all: edgar,gdelt,google_news,fed_rss,econ,market,bing_news,yahoo_rss,press_rss,official_rss,gulf_rss,finnhub,marketaux)"
+        description: "Comma list of sources (blank = default: edgar,gdelt,google_news,fed_rss,econ,market,bing_news,press_rss,official_rss,gulf_rss,finnhub,marketaux,eodhd_news; also: yahoo_rss)"
         required: false
         default: ""
         type: string

@@ -57,8 +57,10 @@ Run: python tests/test_news_macro_gate.py   or   pytest -q <this file>
 from __future__ import annotations
 
 import datetime as dt
+import ast
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -196,6 +198,9 @@ class FakeHTTP:
         self.seen: List[Dict[str, Any]] = []
 
     def _new_source(self, url, params):
+        if url == ng.EODHD_NEWS:                     # v1.13.0: replies keyed 'eodhd_news:<code>'
+            body = self.feeds.get("eodhd_news:" + params.get("s", ""), [])
+            return body if isinstance(body, Resp) else Resp(200, body)
         if url == ng.MARKETAUX_API:                  # v1.7.0: replies keyed 'marketaux:<code>'
             body = self.feeds.get("marketaux:" + params.get("symbols", ""), {"meta": {}, "data": []})
             return body if isinstance(body, Resp) else Resp(200, body)
@@ -781,7 +786,7 @@ def test_g7_english_wires_confirm_without_gdelt(armed):
     assert [q[1] for q in en if q[0] == "MACRO"] == ["geopolitics en", "oil en", "rates en", "markets en",
                                                      "trade china en", "ai tech en", "politics en"]
     assert {q[0] for q in en if q[0] != "MACRO"} == {"FRST.US", "BADCO.US"}
-    assert [q[0] for q in nq if q[3] == "en-sa"] == ["5023.SR"]
+    assert [q[0] for q in nq if q[3] == "en-sa"] == ["MACRO", "5023.SR"]          # v1.13.0: + the SAMA site
 
 
 def test_g7_article_keeps_macro_and_company_scope():
@@ -901,17 +906,18 @@ def test_g8_bad_now(armed):
 
 
 def test_g8_selected_sources():
-    assert ng.selected_sources("") == list(ng.ALL_SOURCES)
+    assert ng.selected_sources("") == list(ng.DEFAULT_SOURCES)                     # v1.13.0: Yahoo off by default
     assert ng.selected_sources("GDELT, econ ,nope") == ["gdelt", "econ"]
+    assert ng.selected_sources("yahoo_rss") == ["yahoo_rss"]                        # still read when named
 
 
 # ----------------------------------------------------------------------------- G9
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.12.1"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1
+    assert ng.__version__ == "1.13.0"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1, v1.13.0
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.12.1", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.13.0", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1504,7 +1510,8 @@ def test_g10_topic_searches():
     gq, nq = ng.build_queries(scope)
     assert [q[0] for q in gq[:8]] == ["MACRO"] * 8 and all(q[0] != "MACRO" for q in gq[8:])     # topics before names
     macro_n = [i for i, q in enumerate(nq) if q[0] == "MACRO"]
-    assert macro_n == list(range(13))                                                          # 6 ar + 7 en, then names
+    assert macro_n == list(range(15))          # 6 ar + the Saudi sites (v1.13.0) + 7 en + the SAMA site, then names
+    assert nq[6][:2] == ("MACRO", "saudi sites ar") and nq[6][3] == "ar" and "site:argaam.com OR " in nq[6][2]
 
 
 if __name__ == "__main__":
@@ -1665,22 +1672,23 @@ RDF = """<?xml version="1.0"?><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-r
 
 def test_g14_the_registry_is_whole():
     ids = [f[0] for f in ng.FEEDS]
-    assert len(ids) == len(set(ids)) == 20                        # v1.11.0: + boe, boj, snb
+    assert len(ids) == len(set(ids)) == 23                        # v1.11.0: + boe, boj, snb; v1.13.0: + 3 Arabic
     assert {f[1] for f in ng.FEEDS} == set(ng.FEED_GROUPS)
-    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 9, 4]
+    assert [len([f for f in ng.FEEDS if f[1] == g]) for g in ng.FEED_GROUPS] == [7, 9, 7]
     for fid, group, url, domain, lang, hours in ng.FEEDS:
         assert url.startswith("https://") and lang in ("en", "ar") and hours in (24.0, 72.0)
         assert ng.tier_of(domain) != "F", fid                      # a publisher the tiers know
         assert ng.domain_of("https://" + domain + "/x") == domain or domain == "ecb.europa.eu", fid
     assert {ng.tier_of(f[3]) for f in ng.FEEDS if f[1] == "official_rss"} == {"A"}
-    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 13
+    assert ng.ALL_SOURCES == tuple(OLD_SIX) + ng.NEW_SOURCES and len(ng.ALL_SOURCES) == 14   # v1.13.0: eodhd_news
     assert set(ng.NEW_SOURCES) <= set(ng.SOURCE_BUDGET_S) and set(ng.FEED_GROUPS) < set(ng.NEW_SOURCES)
-    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub", "marketaux"}
-    assert ng.selected_sources("") == list(ng.ALL_SOURCES)
+    assert set(ng.MEMORY_SOURCES) == {"gdelt", "google_news", "bing_news", "yahoo_rss", "press_rss", "gulf_rss", "finnhub",
+                                      "marketaux", "eodhd_news"}
+    assert ng.selected_sources("") == list(ng.DEFAULT_SOURCES) == [x for x in ng.ALL_SOURCES if x != "yahoo_rss"]
     assert ng.selected_sources(",".join(OLD_SIX)) == OLD_SIX          # the rollback named in the header
     assert sum(ng.SOURCE_BUDGET_S[x] for x in ng.NEW_SOURCES) <= 450   # the job has 20 minutes
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
-    assert "blank = all: " + ",".join(ng.ALL_SOURCES) in wf
+    assert "blank = default: " + ",".join(ng.DEFAULT_SOURCES) + "; also: yahoo_rss" in wf      # v1.13.0
 
 
 def test_g14_the_reader_takes_rss_atom_and_rdf():
@@ -1955,8 +1963,9 @@ def test_g14_every_feed_of_a_group_failing_is_named_feed_by_feed(armed):
     col = ng.Collector(http, _sleep, NOW)
     assert col.feeds("gulf_rss") == [] and col.ok == {}
     note = col.failed["gulf_rss"]
-    assert [p.split(":")[0] for p in note.split("; ")] == ["asharq_business", "arabnews", "thenational", "aljazeera"]
-    assert len(http.calls) == 4 and len(note) <= 420
+    assert [p.split(":")[0] for p in note.split("; ")] == ["asharq_business", "arabnews", "thenational", "aljazeera",
+                                                           "argaam_main", "argaam_pulse", "mubasher_tdwl"]
+    assert len(http.calls) == 7 and len(note) <= 420
 
 
 def test_g14_sec_is_asked_with_the_declared_contact_or_not_at_all(armed):
@@ -2035,7 +2044,8 @@ def test_g14_the_fed_feed_is_read_from_bytes_and_a_block_page_is_named(armed):
     assert rep["sources_failed"]["fed_rss"] == "not a feed (root <html>)"
     assert rep["sources_failed"]["google_news"] == "saudi market ar: not a feed (root <html>)"
     # the main source is not cut short by a reply it could not read: every search is still asked (as for GDELT)
-    assert len([u for u in http.calls if u == ng.GNEWS_RSS]) == 16 == len(ng.build_queries(rep["scope"])[1])
+    # v1.13.0: 19 = 16 + the Arabic search on the Saudi sites + the SAMA site + one Arabic search for the Saudi name
+    assert len([u for u in http.calls if u == ng.GNEWS_RSS]) == 19 == len(ng.build_queries(rep["scope"])[1])
 
     class HalfBlocked(FakeHTTP):
         def get(self, url, params=None, headers=None, timeout=None):
@@ -2120,7 +2130,8 @@ def test_g14_with_every_new_feed_empty_the_run_equals_the_six_source_run(armed):
     ga, gb = sh_a.tabs[ng.GATE_TAB][1], sh_b.tabs[ng.GATE_TAB][1]
     assert ga[:8] == gb[:8] and ga[9:] == gb[9:]                  # only the Sources OK cell differs
     assert set(gb[8].split(", ")) == set(ga[8].split(", ")) | {"bing_news=0", "gulf_rss=0", "official_rss=0",
-                                                            "press_rss=0", "yahoo_rss=0", "finnhub=0", "marketaux=0"}
+                                                            "press_rss=0", "yahoo_rss=0", "finnhub=0", "marketaux=0",
+                                                            "eodhd_news=0"}                     # v1.13.0
     assert b["sources_detail"]["bing_news"] == {"asked": 10, "read": 0, "outside": 0, "undated": 0}
     assert "sources_detail" in a and a["sources_detail"] == {} and set(a["source_ages"]) <= set(OLD_SIX)
     assert a["sources_failed"] == b["sources_failed"]
@@ -2775,3 +2786,97 @@ def test_g22_a2_the_log_and_the_digest_say_it_without_a_symbol(armed, capsys):
     assert "issuer not checked" not in ng.render_digest(dict(rep, issuer_link=dict(li, unchecked=0)))
     pub = ng.public_report(rep2)
     assert pub["issuer_link"]["unchecked"] == 3 and "examples" not in pub["issuer_link"]
+
+
+# ----------------------------------------------------------------------------- G23 (v1.13.0 [SOURCES-REVIEW])
+def test_g23_yahoo_is_off_by_default_and_still_read_when_named():
+    assert ng.OFF_BY_DEFAULT == ("yahoo_rss",) and "yahoo_rss" in ng.ALL_SOURCES
+    assert "yahoo_rss" not in ng.selected_sources("") and "eodhd_news" in ng.selected_sources("")
+    assert ng.selected_sources("yahoo_rss, google_news") == ["google_news", "yahoo_rss"]
+
+
+def test_g23_arabic_searches_on_the_saudi_sites():
+    assert ng.tadawul_code("5023.SR") == "5023" and ng.tadawul_code("SUKUK.SR") == "" and ng.tadawul_code("AX.US") == ""
+    q = ng.saudi_sites_query('"5023"', "3d")
+    assert q == '"5023" (site:argaam.com OR site:mubasher.info OR site:aleqt.com OR site:alarabiya.net) when:3d'
+    scope = [{"symbol": "5023.SR", "name": "Arabian Centres Sukuk 5023"}, {"symbol": "FRST.US", "name": "Primis Financial Corp"},
+             {"symbol": "2222.SR", "name": ""}]
+    gq, nq = ng.build_queries(scope)
+    ar = [x for x in nq if x[3] == "ar" and x[0] != "MACRO"]
+    assert ar == [("5023.SR", "name 5023.SR ar", ng.saudi_sites_query('"5023"', "3d"), "ar"),
+                  ("2222.SR", "name 2222.SR ar", ng.saudi_sites_query('"2222"', "3d"), "ar")]   # no name needed
+    assert ("5023.SR", "name 5023.SR", '"Arabian Centres Sukuk 5023" when:3d', "en-sa") in nq   # the English one stays
+    assert not any(x[0] == "2222.SR" and x[3] == "en-sa" for x in nq)
+    assert sum(1 for x in nq if x[0] == "MACRO" and x[1] == "saudi sites ar") == 1
+    # the issuer link keeps an Arabic headline only when it gives the code in brackets
+    yes = "أرامكو (2222) تعلن نتائج الربع"
+    no = "أرامكو تعلن نتائج الربع"
+    assert ng.issuer_linked(yes, "2222.SR", "Saudi Arabian Oil Co") is True
+    assert ng.issuer_linked(no, "2222.SR", "Saudi Arabian Oil Co") is False
+
+
+def test_g23_eodhd_company_news_is_parsed_without_its_sentiment():
+    hour = (NOW - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    rows = [{"date": hour, "title": "Primis Financial  beats estimates", "link": "https://www.reuters.com/a1",
+             "symbols": ["FRST.US"], "sentiment": {"polarity": 0.9, "neg": 0, "neu": 0.1, "pos": 0.9}},
+            {"date": hour, "title": "No link here", "link": ""}, {"date": hour, "title": ""}, "junk"]
+    got = ng.parse_eodhd_news(rows, "FRST.US", "name FRST.US eodhd")
+    assert [g["title"] for g in got] == ["Primis Financial beats estimates", "No link here"]
+    assert got[0]["domain"] == "reuters.com" and got[1]["domain"] == "eodhd.com" and got[0]["published"] == NOW - dt.timedelta(hours=1)
+    assert all(set(g) == {"source", "query", "scope", "title", "url", "domain", "published", "lang"} for g in got)
+    for bad in ({"message": "Wrong API token"}, "x"):
+        with pytest.raises(ValueError):
+            ng.parse_eodhd_news(bad, "FRST.US", "x")
+    assert ng.eodhd_news_symbol("FRST.US") == "FRST.US" and ng.eodhd_news_symbol("0700.HK") == "0700.HK"
+    # Codex P2 on #1104: the suffixes EODHD names differently, as news_now asks them (archive_symbol_deep)
+    assert ng.eodhd_news_symbol("BARC.L") == "BARC.LSE" and ng.eodhd_news_symbol("SAP.DE") == "SAP.XETRA"
+    assert ng.eodhd_news_symbol("BHP.AX") == "BHP.AU" and ng.eodhd_news_symbol("RELIANCE.NS") == "RELIANCE.NSE"
+    src = (_REPO / "scripts" / "archive_symbol_deep.py").read_text(encoding="utf-8")
+    table = ast.literal_eval(re.search(r"^EODHD_SUFFIX = (\{[^}]*\})", src, re.M).group(1))
+    assert ng.EODHD_NEWS_SUFFIX == table                                       # one table, two copies held equal
+    assert ng.eodhd_news_symbol("5023.SR") == ng.eodhd_news_symbol("MACRO") == ng.eodhd_news_symbol("FRST") == ""
+    assert ng.tier_of("eodhd.com") == "D"
+
+
+def test_g23_the_run_reads_eodhd_news_for_the_names_but_the_saudi_ones(armed):
+    hour = (NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    old = (NOW - dt.timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    feeds = {"eodhd_news:FRST.US": [{"date": hour, "title": "Primis Financial cuts guidance after quarterly loss",
+                                     "link": "https://www.reuters.com/p1"},
+                                    {"date": old, "title": "Primis Financial old story", "link": "https://www.reuters.com/p0"},
+                                    {"title": "Primis Financial undated", "link": "https://www.reuters.com/p2"}]}
+    http = FakeHTTP(feeds=feeds)
+    (rc, rep), _ = _run(http=http, write=False, sources=["eodhd_news", "market"])
+    assert rc == 0 and rep["sources_ok"]["eodhd_news"] == 1
+    det = rep["sources_detail"]["eodhd_news"]
+    assert det["read"] == 3 and det["outside"] == 1 and det["undated"] == 1
+    assert det["asked"] == len([s for s in rep["scope"] if ng.eodhd_news_symbol(s["symbol"])])
+    assert not any(s["symbol"].endswith(".SR") for s in rep["scope"] if ng.eodhd_news_symbol(s["symbol"]))
+    titles = [m["title"] for c in rep["clusters"] for m in c["members"]]
+    assert "Primis Financial cuts guidance after quarterly loss" in titles and "Primis Financial old story" not in titles
+    class Leaky(FakeHTTP):
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url == ng.EODHD_NEWS:
+                raise RuntimeError("token=%s" % (params or {}).get("api_token"))      # inside the 72-character note
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+    (rc2, rep2), _ = _run(http=Leaky(), write=False, sources=["eodhd_news", "market"])
+    assert rc2 == 0 and "FRST.US" in rep2["sources_failed"]["eodhd_news"] and KEY not in json.dumps(rep2["sources_failed"])
+
+
+def test_g23_a_story_from_one_publisher_counts_once_across_finnhub_and_eodhd():
+    a = {"source": "finnhub", "scope": "FRST.US", "title": "Primis Financial misses estimates", "domain": "reuters.com",
+         "url": "https://www.reuters.com/p1"}
+    b = dict(a, source="eodhd_news", url="https://www.reuters.com/p1?utm=x")
+    kept, left = ng.fold_new_sources([a, b])
+    assert kept == [a] and left == {"eodhd_news": 1}
+
+
+def test_g23_the_arabic_saudi_feeds_and_the_sama_search_are_on_trial():
+    ar = {f[0]: f for f in ng.FEEDS if f[1] == "gulf_rss" and f[4] == "ar"}
+    assert set(ar) == {"asharq_business", "argaam_main", "argaam_pulse", "mubasher_tdwl"}
+    assert ar["argaam_main"][2] == "https://www.argaam.com/ar/rss/ho-main-news?sectionid=1523"
+    assert ar["argaam_pulse"][2] == "https://www.argaam.com/ar/rss/ho-market-pulse?sectionid=70"
+    assert "1543" not in " ".join(f[2] for f in ng.FEEDS)                      # the companies feed is dead since 2022
+    assert {ng.tier_of(f[3]) for f in ar.values()} == {"B", "C"}
+    gq, nq = ng.build_queries([])
+    assert ("MACRO", "sama site", "site:sama.gov.sa when:3d", "en-sa") in nq and ng.tier_of("sama.gov.sa") == "A"
