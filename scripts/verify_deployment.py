@@ -396,7 +396,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (pin only): 1.31.0 -> 1.32.0 (the news read twice: v_news_llm,
     # v_news_llm_days, v_news_llm_eval, v_news_llm_duel; research only).
     # 2026-11-27 (pin only): 1.32.0 -> 1.33.0 (v_news_llm_days enters after the model's reading, audit D1).
-    ("apply_bq_views", "1.33.0", "bigquery looker views"),
+    # 2026-11-27 (pin only): 1.33.0 -> 1.34.0 (the shadow challenger v0: v_challenger_v0_features, _ranks,
+    # _walkforward, _scorecard; research only; check_objects refuses a challenger view that could look ahead).
+    ("apply_bq_views", "1.34.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).

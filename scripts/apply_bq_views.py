@@ -2,8 +2,28 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.33.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.34.0 (program register C8, Phase 2)
 ================================================================================
+v1.34.0 (27 Nov 2026, the shadow challenger v0). WHY (week plan of 23 Nov
+2026, package 5; owner, 23 Nov 2026: "go and Start build"): the 23 Nov deep
+audit asks for a challenger to the live score, built only from data TFB
+holds - two years of daily prices - and judged per market, net of cost, on
+dates it never saw. Four new views, research only: v_challenger_v0_features
+(144) - per share and session, 12-1 and 6-1 month momentum over 63-session
+volatility, the 63-session return and the 126-session downside volatility,
+from that close and earlier ones only; v_challenger_v0_ranks (145) - every
+5th session of each market, each input ranked inside its market and sector
+(at least 20 peers, else the market, else neutral), and the next 21 sessions
+from the NEXT close against the market's benchmark; v_challenger_v0_walkforward
+(146) - each market's weights learned from earlier dates whose results had
+all closed (purged), the score, a shadow action and a shadow size per name;
+v_challenger_v0_scorecard (147) - rank correlation, top fifth against the
+benchmark net of cost and top minus bottom fifth, with overlap-adjusted t
+and a reading fixed before the first read. check_objects() now refuses a
+challenger view that could look ahead (lookahead_problems): an input view
+with a forward window, a result taken from any CTE but the label one, an
+entry at the formation close, or weights trained on a result still running.
+
 v1.33.0 (27 Nov 2026, the reading before the entry). WHY (outside
 engineering audit the owner uploaded on 26 Nov 2026, finding D1; owner, 26
 Nov 2026 19:13 Riyadh, in Arabic: "if it is ready, build it now"):
@@ -680,7 +700,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"
@@ -806,6 +826,69 @@ def load_objects(sql_dir: Path = SQL_DIR) -> List[SqlObject]:
     return objs
 
 
+# v1.34.0: the shadow challenger's views may look forward only for the result, and only from its label CTE.
+CHALLENGER_PREFIX = "v_challenger_"
+# the columns that carry the result (from the label CTE on): never an input, a rank or a score
+LABEL_TOKENS = re.compile(r"\b(entry_date|entry_p|exit_date|exit_p|fwd_pp|bench_pp|excess_pp|excess_w_pp|label_pr)\b")
+
+
+def cte_bodies(code: str) -> Dict[str, str]:
+    """PURE: {cte name: its body} for the CTEs of a view whose CTE names start a line ('name AS ('), and '' for
+    the final SELECT after the last one (comments already removed)."""
+    out: Dict[str, str] = {}
+    end = 0
+    for m in re.finditer(r"(?m)^(?:WITH )?([a-z][a-z0-9_]*) AS \(\s*$", code):
+        if m.start() < end:
+            continue
+        depth, i = 1, m.end()
+        while i < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[i], 0)
+            i += 1
+        out[m.group(1)] = code[m.end():i - 1]
+        end = i
+    out[""] = code[end:]
+    return out
+
+
+def lookahead_problems(objs: Sequence[SqlObject]) -> List[str]:
+    """PURE, v1.34.0: the shadow challenger views (v_challenger_*) must not look ahead. Rules: no FOLLOWING frame
+    and no clock (CURRENT_...) in any of them; LEAD only in v_challenger_v0_ranks' label CTE 'lab', which must buy
+    at the NEXT close (LEAD(p, 1)); no result column in the inputs view, nor in the CTEs that rank (f, cal, form,
+    ranked), nor in a dev_* or score_eq expression; and the walk-forward weights train only on dates whose LAST
+    result closed before the date they are used on (i.exit_max < f.d)."""
+    problems: List[str] = []
+    for o in objs:
+        if not o.name.startswith(CHALLENGER_PREFIX):
+            continue
+        code, label = _code(o.template), o.path.name
+        if "FOLLOWING" in code or "CURRENT_" in code:
+            problems.append(f"{label}: a forward window frame or a clock in a challenger view")
+        ctes = cte_bodies(code)
+        leads = [n for n, b in ctes.items() if "LEAD(" in b]
+        if o.name == "v_challenger_v0_ranks":
+            if leads != ["lab"]:
+                problems.append(f"{label}: LEAD outside the label CTE 'lab': {leads}")
+            if "LEAD(p, 1) OVER w AS entry_p" not in ctes.get("lab", "") or "LEAD(date, 1) OVER w AS entry_date" not in ctes.get("lab", ""):
+                problems.append(f"{label}: the result must be bought at the next close (LEAD(p, 1))")
+            for n in ("f", "cal", "form", "ranked"):
+                if LABEL_TOKENS.search(ctes.get(n, "")):
+                    problems.append(f"{label}: a result column in the ranking CTE '{n}'")
+            exprs = re.findall(r"CASE\s+WHEN.*?END AS dev_[a-z0-9]+", ctes.get("devs", ""), re.S)
+            exprs += re.findall(r"50 \+ 100 \*[^\n]*AS score_eq", ctes.get("ex", ""))
+            if len(exprs) != 5 or any(LABEL_TOKENS.search(e) for e in exprs):
+                problems.append(f"{label}: a dev_* or score_eq expression reads a result (or is missing)")
+        elif leads:
+            problems.append(f"{label}: LEAD in a challenger view other than the label CTE of v_challenger_v0_ranks")
+        if o.name == "v_challenger_v0_features" and LABEL_TOKENS.search(code):
+            problems.append(f"{label}: a result column in the inputs view")
+        if o.name == "v_challenger_v0_walkforward":
+            if "LEFT JOIN ic AS i ON i.market = f.market AND i.exit_max < f.d" not in ctes.get("learned", "") \
+                    or "MAX(exit_date) AS exit_max" not in ctes.get("ic", ""):
+                problems.append(f"{label}: the weights must train only on dates whose last result closed before "
+                                "the date (i.exit_max < f.d)")
+    return problems
+
+
 def check_objects(objs: Sequence[SqlObject]) -> List[str]:
     """Static checks; [] when every file is safe to apply in this order."""
     problems: List[str] = []
@@ -844,6 +927,7 @@ def check_objects(objs: Sequence[SqlObject]) -> List[str]:
             if ref not in SOURCE_TABLES and ref not in defined:
                 problems.append(f"{label}: references {ref} before it is defined")
         defined[o.name] = label
+    problems.extend(lookahead_problems(objs))        # v1.34.0
     return problems
 
 
