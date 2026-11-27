@@ -311,7 +311,7 @@ INSTALLED = {
     "v_missed_winners": "5d696fe1c1517c8e0134fffd2fa0d6fe14f5e3d9eb7dc46bba728700cdf43faf",
     # apply_bq_views 1.12.0 (19 Nov 2026): one sector per symbol, outcomes by sector, and trial C-2
     "v_symbol_sector": "f5018131ba52c2884030e246d759214473ba3ad30c5263288e9ff27575cbde64",
-    "v_outcome_sector": "2a160aee50920fd78e1a89fcdac055d14abd30eb893523fbadbdc6f06f7fd04e",
+    # (v_outcome_sector moves to PENDING: body replaced in 1.35.0, was 2a160aee5092)
     "v_trial_c2": "a1af0a9b476971b078d159c9bfe1c19169bb9936295eecc0dbd6fd80e29056db",
     # apply_bq_views 1.11.0 (18 Nov 2026): the shadow score and its forward trial
     # (pending body replaced: v_signal_edge_daily ccf6ea331773, 1.7.0)
@@ -383,7 +383,7 @@ PENDING = {
     # apply_bq_views 1.31.0 (26 Nov 2026): the forward signal ledger, the gate record and their check against the
     # outcome engine (research only)
     "v_forward_signals": "c94ff5dd391aca769481b5c72a2d815fb78dec410d0ce76299cda49960c47237",
-    "v_forward_signal_gates": "f7072173c7a5c2b114c95b696c94ffcf743fec6533ba12a967d3e03be894839a",
+    # (v_forward_signal_gates moves to PENDING: its horizon map replaced in 1.35.0, was f7072173c7a5)
     "v_forward_signal_recon": "a9a1af5acb318e9e39f7f7e1846350cf9bc3daf32a19101a0f715f1514dd700b",
     # apply_bq_views 1.32.0 (26 Nov 2026): the news read twice - the word lists and the language model, each scored
     # against the next sessions, and the days they part (research only)
@@ -398,6 +398,10 @@ PENDING = {
     "v_challenger_v0_ranks": "2f98c250c05913f033a71290cdb8dfb25eafaf27788f48eb92b21a6a94fb852c",
     "v_challenger_v0_walkforward": "0e39890fc235a201810a8d0d1fcc929e5e9aaef68bbabbe00905098555cc6281",
     "v_challenger_v0_scorecard": "c0ee2aa57cf9680afa5a26c100f8fc8928684b5cba4ec7d3b76841ea161a4982",
+    # apply_bq_views 1.35.0 (27 Nov 2026): v_outcome_sector reads 'beats' / 'loses' only with t_adj of 2 or more
+    # ... and each horizon is divided by its own days in both views that carry the adjusted t (review of PR 1106)
+    "v_outcome_sector": "f4be51391e6db23778c7edaf8a2d3050a2dcffd816912d231b163da2930ea593",
+    "v_forward_signal_gates": "40e03bcfd820b90c0d6189de2bbc648a6332abb949fe5ee69a3ffee6e481b135",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -2314,14 +2318,30 @@ def _c2_reading(period, days, calls, horizon_days, dm, dsd):
     return "C-2 ahead but not yet clear (t under 2): keep collecting", t
 
 
-def _sector_reading(calls, edge, ahead):
+def _sector_reading(calls, edge, ahead, t_adj=None):
+    """v_outcome_sector's reading (1.35.0: 'beats' / 'loses' also need t_adj of 2 or more; no t, no reading)."""
     if calls < 100:
         return "too few calls"
-    if edge >= 0.5 and ahead >= 0.55:
+    if edge >= 0.5 and ahead >= 0.55 and t_adj is not None and t_adj >= 2:
         return "beats its market"
-    if edge <= -0.5 and ahead <= 0.45:
+    if edge <= -0.5 and ahead <= 0.45 and t_adj is not None and t_adj <= -2:
         return "loses to its market"
     return "no clear edge"
+
+
+def _sector_t(day_means, horizon):
+    """t_adj as the view computes it: the mean of the per-date means over its standard error, over SQRT(days)."""
+    n = len(day_means)
+    if n < 2:
+        return None
+    m = sum(day_means) / n
+    sd = (sum((x - m) ** 2 for x in day_means) / (n - 1)) ** 0.5
+    if sd == 0:
+        return None
+    days = {"1W": 7, "2W": 14, "1M": 30, "3M": 91, "6M": 182, "12M": 365, "1Y": 365}.get(horizon)
+    if days is None:
+        return None                                              # a horizon outside the list has no t
+    return round(m / (sd / n ** 0.5) / days ** 0.5, 2)
 
 
 def case_v35():
@@ -2346,15 +2366,42 @@ def case_v35():
     for frag in ("UPPER(IFNULL(e.entry_recommendation, '')) IN ('BUY', 'STRONG BUY', 'ACCUMULATE')",
                  "LEFT JOIN `{{DS}}.v_symbol_sector` AS s ON s.symbol = UPPER(TRIM(e.symbol))",
                  "IFNULL(s.sector, '(no sector)') AS sector",
-                 "WHEN calls < 100 THEN 'too few calls'",
-                 "WHEN m_edge >= 0.5 AND ahead >= 0.55 THEN 'beats its market'",
-                 "WHEN m_edge <= -0.5 AND ahead <= 0.45 THEN 'loses to its market'"):
+                 "WHEN a.calls < 100 THEN 'too few calls'",
+                 # 1.35.0: a reading needs its test - t over recording dates, overlap-adjusted, 2 or more either way
+                 "WHEN a.m_edge >= 0.5 AND a.ahead >= 0.55 AND tt.t_adj >= 2 THEN 'beats its market'",
+                 "WHEN a.m_edge <= -0.5 AND a.ahead <= 0.45 AND tt.t_adj <= -2 THEN 'loses to its market'",
+                 "SELECT market_group, sector, horizon, recorded_date, AVG(edge) AS m",
+                 "ROUND(SAFE_DIVIDE(AVG(m), SAFE_DIVIDE(STDDEV(m), SQRT(COUNT(*))))",
+                 # review of PR 1106: every horizon divided by its own days; one outside the list has no t
+                 "/ SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91",
+                 "WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj",
+                 "JOIN tt USING (market_group, sector, horizon)"):
         assert frag in code, frag
+    assert "THEN 'beats its market'" in code and code.count("tt.t_adj") == 3   # the column and both readings
+    assert code.index("tt.t_adj,") < code.index("END AS reading")             # reading stays the last column
     # the 19 Nov read: US financials at one month, 147 calls, -1.56 points, 46.3% ahead
-    assert _sector_reading(147, -1.56, 0.463) == "no clear edge"
-    assert _sector_reading(416, 0.91, 0.611) == "beats its market"
-    assert _sector_reading(99, 9.0, 0.9) == "too few calls"
-    assert _sector_reading(100, -0.5, 0.45) == "loses to its market"
+    assert _sector_reading(147, -1.56, 0.463, -3.0) == "no clear edge"
+    assert _sector_reading(416, 0.91, 0.611, 2.0) == "beats its market"
+    assert _sector_reading(99, 9.0, 0.9, 9.0) == "too few calls"
+    assert _sector_reading(100, -0.5, 0.45, -2.0) == "loses to its market"
+    # 1.35.0 - the read of 27 Nov 2026: 15 cells read 'beats'; 13 of them had t between 0.22 and 1.87
+    assert _sector_reading(106, 8.41, 0.60, 1.87) == "no clear edge"            # the largest edge on the page
+    assert _sector_reading(155, 0.86, 0.56, 0.34) == "no clear edge"
+    assert _sector_reading(111, 1.77, 0.60, 2.46) == "beats its market"         # one of the two that keep it
+    assert _sector_reading(416, 0.91, 0.611) == "no clear edge"                 # no t (one date, or no spread): no reading
+    assert _sector_reading(416, 0.91, 0.611, -2.5) == "no clear edge"           # the sign must agree with the edge
+    assert _sector_reading(100, -0.5, 0.45, 2.5) == "no clear edge"
+    assert _sector_reading(100, -0.5, 0.45, -1.99) == "no clear edge"
+    # t over recording dates: 40 dates of +1.0 / +3.0 alternating - mean 2, a weekly horizon divides by SQRT(7)
+    days = [1.0, 3.0] * 20
+    assert _sector_t(days, "1W") == round(2.0 / (1.0127393670836666 / 40 ** 0.5) / 7 ** 0.5, 2) == 4.72
+    assert _sector_t(days, "1M") == 2.28 and _sector_t(days, "3M") == 1.31       # the longer the hold, the less each date adds
+    assert _sector_t([2.0], "1W") is None and _sector_t([2.0, 2.0, 2.0], "1W") is None
+    # review of PR 1106: a 6M or 1Y cohort divided by 91 days would read 1.31 here; by its own days 0.93 and 0.65
+    assert _sector_t(days, "6M") == 0.93 and _sector_t(days, "1Y") == _sector_t(days, "12M") == 0.65
+    assert _sector_t(days, "2Y") is None and _sector_reading(416, 0.91, 0.611, _sector_t(days, "2Y")) == "no clear edge"
+    for sql in ("86_v_outcome_sector.sql", "138_v_forward_signal_gates.sql"):
+        assert "ELSE 91" not in (ROOT / "sql" / "bigquery" / sql).read_text(encoding="utf-8"), sql
     # v_trial_c2: the fixed rule
     c = objs["v_trial_c2"]
     assert c.path.name == "87_v_trial_c2.sql" and c.kind == "VIEW"
@@ -3175,7 +3222,7 @@ def case_v44():
 def case_v45():
     """apply_bq_views 1.18.0 (kept in 1.32.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.34.0"
+    assert bv.__version__ == "1.35.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
     assert files[-49:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
@@ -4166,7 +4213,8 @@ def case_v67():
                  "IF(gate = 'admitted', losers, NULL) AS admitted_losers,",
                  # a date's signals averaged first; neighbouring dates share most of their window
                  "SELECT period, market_group, horizon, gate, block_reason_class, recorded_date, AVG(active_net_pp) AS m",
-                 "/ SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj",
+                 "/ SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91",
+                 "WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj",
                  "WHEN period != 'forward from 2026-11-26' THEN 'in-sample, not evidence'",
                  "WHEN with_outcome < 30 OR days < 8 THEN 'collecting'",
                  "WHEN gate = 'kept out' AND t_adj <= -2 THEN 'works: the names kept out trailed their benchmark'",

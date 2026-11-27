@@ -105,6 +105,17 @@ def test_every_registry_column_exists_in_its_view_file():
         for col in list(keys) + [reading, n, effect] + ([t] if t else []) + re.findall(r"^(\w+) =", where):
             assert re.search(r"\b%s\b" % col, src), (view, col)
     assert len(lw.REGISTRY) == 22 and len({e[0] for e in lw.REGISTRY}) == 22          # v1.2.0: the gate record
+    # v1.2.1: a record whose words can read PROVEN or AGAINST is read with a t, or is a pair reading, or is in-sample
+    by = {e[0]: e for e in lw.REGISTRY}
+    assert by["v_outcome_sector"][6] == "t_adj"
+    sector = list(SQL_DIR.glob("*_v_outcome_sector.sql"))[0].read_text(encoding="utf-8")
+    assert "AND tt.t_adj >= 2 THEN 'beats its market'" in sector and "AND tt.t_adj <= -2 THEN 'loses to its market'" in sector
+    no_t = sorted(e[0] for e in lw.REGISTRY if e[6] is None)
+    assert no_t == ["v_company_news_eval", "v_confidence_calibration", "v_market_driver_learning", "v_news_signal_eval"]
+    for view in no_t:                       # none of them can put a row under PROVEN
+        src = list(SQL_DIR.glob("*_%s.sql" % view))[0].read_text(encoding="utf-8")
+        words = re.findall(r"(?:THEN|ELSE) '([^']+)'", src)
+        assert view in lw.IN_SAMPLE_VIEWS or not [w for w in words if lw.classify(w) == "PROVEN"], (view, words)
     assert [e[0] for e in lw.REGISTRY[-4:]] == ["v_stop_cause_learning", "v_trial_value_screen", "v_cash_entry_trial",
                                                 "v_forward_signal_gates"]
     # Codex P1 on #1074: a record that defines every row as in-sample is never read as evidence
@@ -268,7 +279,7 @@ def test_dry_run_and_switch(monkeypatch):
 
 def test_source_and_workflow():
     src = Path(lw.__file__).read_text(encoding="utf-8")
-    assert src.isascii() and lw.__version__ == "1.2.0" and "v1.2.0 (2026-11-26)" in src and "v1.1.0 (2026-11-26)" in src
+    assert src.isascii() and lw.__version__ == "1.2.1" and "v1.2.1 (2026-11-27)" in src and "v1.2.0 (2026-11-26)" in src
     wf = yaml.safe_load(Path(".github/workflows/learning_watch.yml").read_text(encoding="utf-8"))
     on = wf[True] if True in wf else wf["on"]
     assert on["workflow_run"]["workflows"] == ["🎯 Exit Plan"] and "schedule" not in on

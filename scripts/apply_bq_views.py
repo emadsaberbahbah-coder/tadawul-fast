@@ -2,8 +2,27 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.34.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.35.0 (program register C8, Phase 2)
 ================================================================================
+v1.35.0 (27 Nov 2026, a reading needs its test). WHY (full project review
+of 27 Nov 2026, approved by the owner at 14:06 Riyadh: "ok approved and start
+doing the need"): the Learning Watch page listed 15 PROVEN rows, all from
+v_outcome_sector (86) - 'beats its market' at an average edge of +0.5 points
+with 55% of calls ahead, on calls that overlap (a name is counted once per
+day) and with no test. The view now carries t_adj - the mean over distinct
+recording dates over its standard error, divided by SQRT of the horizon in
+days, as v_forward_signal_gates does - and 'beats its market' / 'loses to
+its market' also need t_adj of 2 or more either way. On the data of 27 Nov:
+2 of the 15 cells keep the reading (t 2.11 and 2.46), 13 read 'no clear
+edge' (t 0.22 to 1.87). One new column (t_adj, before reading). Research
+only. Review of PR 1106: the divisor was 91 days for every horizon past 1M,
+which would overstate the t of a 6M or 1Y cohort (by about 1.4 and 2). Each
+horizon is now divided by its own days (7 / 14 / 30 / 91 / 182 / 365) in both
+views that carry the adjusted t - v_outcome_sector (86) and
+v_forward_signal_gates (138) - and a horizon outside that list has no t and
+so no claim. The archive holds only 1W, 2W, 1M and 3M today, so no number on
+either view moves.
+
 v1.34.0 (27 Nov 2026, the shadow challenger v0). WHY (week plan of 23 Nov
 2026, package 5; owner, 23 Nov 2026: "go and Start build"): the 23 Nov deep
 audit asks for a challenger to the live score, built only from data TFB
@@ -700,7 +719,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.34.0"
+__version__ = "1.35.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

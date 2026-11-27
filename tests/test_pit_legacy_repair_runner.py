@@ -99,6 +99,6 @@ def test_workflow_is_dispatch_only_scans_by_default_and_backs_up_before_apply():
 def test_sector_cap_tighter_is_warn_looser_is_fail(t10, pf, status):
     pytest.importorskip("openpyxl")             # the export audit imports it at module level (lean CI has none)
     from scripts import tfb_export_audit as ea
-    assert ea.SCRIPT_VERSION == "1.2.2"
+    assert ea.SCRIPT_VERSION == "1.2.3"      # 1.2.3 (27 Nov): receipts and the dispatcher clock; this rule is unchanged
     got, examples = ea.sector_cap_status(t10, pf, 3, 40.0)
     assert got == status and len(examples) == (t10 not in (None, 3)) + (pf not in (None, 40))

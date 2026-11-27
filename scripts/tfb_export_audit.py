@@ -105,6 +105,24 @@ filed a FAIL for a cap that is stricter than policy. sector_caps_vs_policy now
 FAILs only when a panel cap is LOOSER than policy (a breached risk ceiling)
 and WARNs when it is tighter (an unversioned policy difference to record).
 Counts and the --sector-cap default are unchanged.
+
+WHY (v1.2.3, 2026-11-27): a RED that is partly the audit's own stale defaults
+----------------------------------------------------
+Full project review of 27 Nov (owner's export of 13:17 Riyadh): 3 of the 12
+FAILs were the audit's defaults, not the workbook. (1) Row counts were held
+to a universe typed in on 3 Oct (Global_Markets 6609, Mutual_Funds 2474); the
+pages held 6602 and 2422, exactly what the sync had written. With no --expect
+for a page, the expectation is now the sync's own receipt: the Rows cell of
+the page's SUCCESS row in _Status (a page shorter than its receipt was cut
+after the write). --expect Page=N still wins; with neither, no expectation.
+(2) Lateness was measured against the cron '17 4,12,20', which daily_sync.yml
+dropped on 10 Nov when the Apps Script dispatcher became the clock - every run
+read about 7 hours late. When _Run_Log holds the dispatcher's own accepted
+dispatches (tfbDispatchDailySync, status OK), lateness is the time from each
+dispatch to the first row of the run it started; a dispatch with no run within
+12 hours is a FAIL of its own. An export with no dispatch row is judged
+against --cron as before. Nothing else changes: the selftest digest and the
+default payload of the synthetic export are byte-identical.
 """
 from __future__ import annotations
 
@@ -121,7 +139,7 @@ import re
 import sys
 import tempfile
 
-SCRIPT_VERSION = "1.2.2"
+SCRIPT_VERSION = "1.2.3"
 
 try:
     import openpyxl
@@ -131,6 +149,8 @@ except ImportError:  # pragma: no cover
     sys.exit(2)
 
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
+# The universe of 3 Oct 2026. v1.2.3: no longer a default (it goes stale with every retired symbol); kept as the
+# worked example for --expect. With no --expect the expectation is the sync's own receipt in _Status.
 DEFAULT_EXPECT = {"Market_Leaders": 255, "Global_Markets": 6609,
                   "Commodities_FX": 453, "Mutual_Funds": 2474}
 MAIN_WIDTH = 115
@@ -358,7 +378,22 @@ def check_structure(book, now_utc):
     return out
 
 
-def check_market_pages(book, expect, asof_date, dq_floor, rel_floor, margin_receipts=False):
+def status_row_receipts(book):
+    """v1.2.3 PURE: {page: rows} from _Status - the Rows cell of each market page's own SUCCESS row, i.e. what the
+    sync says it wrote. A row with another status, or a Rows cell that is not a whole number, gives no receipt."""
+    out = {}
+    for r in (book.rows("_Status") or [])[1:]:
+        page = _s(r[0]) if r else ""
+        if page not in MARKET_PAGES or len(r) < 7 or _s(r[2]).upper() != "SUCCESS":
+            continue
+        n = _num(r[6])
+        if n is None or isinstance(r[6], bool) or n < 0 or n != int(n):
+            continue
+        out[page] = int(n)
+    return out
+
+
+def check_market_pages(book, expect, asof_date, dq_floor, rel_floor, margin_receipts=False, receipts=None):
     out, metrics, allsyms = [], {}, collections.Counter()
     invest_total = invest_pass = 0
     for page in MARKET_PAGES:
@@ -370,9 +405,13 @@ def check_market_pages(book, expect, asof_date, dq_floor, rel_floor, margin_rece
         hdr_width = len([h for h in book.rows(page)[0] if h not in (None, "")])
         m = {"rows": len(body), "header_width": hdr_width, "width": width}
         exp = expect.get(page)
+        by_receipt = exp is None and page in (receipts or {})      # v1.2.3: no --expect -> the sync's own receipt
+        if by_receipt:
+            exp = receipts[page]
         out.append(F("a", "DATA", f"{page}.rows",
                      "PASS" if exp is None or len(body) == exp else "FAIL", len(body),
-                     f"expected {exp}" if exp is not None else "no expectation set"))
+                     (f"expected {exp} (the sync's own receipt in _Status)" if by_receipt else f"expected {exp}")
+                     if exp is not None else "no expectation set"))
         out.append(F("a", "DATA", f"{page}.schema_width",
                      "PASS" if hdr_width == MAIN_WIDTH else "FAIL", hdr_width,
                      f"contract {MAIN_WIDTH} columns"))
@@ -1282,6 +1321,45 @@ def check_model(book, tz_offset):
 # --------------------------------------------------------------------------- #
 # Gate (e): _Run_Log guard health
 # --------------------------------------------------------------------------- #
+DISPATCH_ACTIONS = ("tfbDispatchDailySync", "tfbDispatchDailySyncNow")   # 24_Sync_Dispatch.gs: the sync's clock
+DISPATCH_NO_RUN_H = 12        # an accepted dispatch with no run within this many hours never started one
+DISPATCH_PENDING_MIN = 60     # a dispatch younger than this may simply not have started yet
+
+
+def dispatch_lateness(dispatches, run_starts, now_utc):
+    """v1.2.3 PURE: (finding, worst minutes). For each accepted dispatch, the minutes to the first row of the run that
+    followed it (a run may start up to 2 minutes 'before' its dispatch row: the row is written after GitHub
+    answers). PASS at 15 minutes or less, WARN to 60, FAIL beyond - the same bands as the cron check. A dispatch
+    older than DISPATCH_PENDING_MIN with no run within DISPATCH_NO_RUN_H hours is a FAIL of its own."""
+    starts = sorted(run_starts)
+    late, lost, worst = [], [], 0
+    for d in sorted(dispatches):
+        nxt = [st for st in starts
+               if d - dt.timedelta(minutes=2) <= st <= d + dt.timedelta(hours=DISPATCH_NO_RUN_H)]
+        if not nxt:
+            if (now_utc - d).total_seconds() > DISPATCH_PENDING_MIN * 60:
+                lost.append(f"dispatch {d:%m-%d %H:%M}Z: no run started")
+            continue
+        mins = max(0, int((nxt[0] - d).total_seconds() // 60))
+        worst = max(worst, mins)
+        late.append(f"dispatch {d:%m-%d %H:%M}Z started {nxt[0]:%H:%M}Z, +{mins // 60}h{mins % 60:02d}m")
+    status = "FAIL" if (lost or worst > 60) else ("WARN" if worst > 15 else "PASS")
+    detail = (f"worst start delay after the dispatcher's own accepted dispatch over {len(late)} dispatches "
+              f"(the dispatcher is the clock; first _Run_Log row of each run)"
+              + (f"; {len(lost)} dispatch(es) started no run" if lost else "") + "; P-170")
+    return F("e", "PIPELINE", "schedule_lateness", status, worst, detail, (lost + late)[-6:]), worst
+
+
+def _dashboard_scope(book, out):
+    """The in-workbook validator's scope check, the last finding of gate (e) on either lateness path."""
+    da = book.rows("Dashboard_Audit") or []
+    capped = [f"{_s(r[0])} {_num(r[3]):g}" for r in da if _s(r[1]) == "scope.coverage" and _s(r[2]) == "WARN"]
+    if da:
+        out.append(F("e", "PIPELINE", "dashboard_audit_scope_capped", "PASS" if not capped else "WARN", len(capped),
+                     "in-workbook validator samples a capped row count (P-190)", capped))
+    return out
+
+
 def _cron_slots(cron):
     m = re.match(r"^\s*(\d{1,2})\s+([\d,]+)\s*$", cron)
     if not m:
@@ -1300,6 +1378,7 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     rows402 = 0
     refusals = 0
     sync_rows = []   # (ts, run id or None) for run_dashboard_sync rows in the window
+    dispatches = []  # v1.2.3: the dispatcher's own accepted daily_sync dispatches in the window (UTC)
     for r in rows[1:]:
         ts = _parse_dt(r[0], tz_offset)
         if ts is None:
@@ -1328,6 +1407,8 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
         if action == "run_dashboard_sync" and ts >= since:
             rid = (re.search(r"run=(\d+)", msg) or re.search(r'"run_id":\s*"?(\d+)', details) or [None, None])[1]
             sync_rows.append((ts, rid))
+        if action in DISPATCH_ACTIONS and ts >= since and len(r) > 4 and _s(r[4]).upper() == "OK":
+            dispatches.append(ts)
     # A run = a cluster of sync rows with no gap > 90 min; the first row of a run rarely carries the run id.
     run_first = {}
     cluster, cid = [], None
@@ -1365,6 +1446,12 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     out.append(F("e", "PIPELINE", "eodhd_http_402_rows", "PASS" if rows402 == 0 else "FAIL", rows402,
                  f"rows that hit HTTP 402 in the last {since_days} days"))
     # Schedule lateness
+    if dispatches:               # v1.2.3: the dispatcher is the clock (daily_sync.yml 1.0.13 has no cron)
+        f, worst = dispatch_lateness(dispatches, list(run_first.values()), now_utc)
+        metrics["schedule_worst_lateness_min"] = worst
+        metrics["schedule_basis"] = "dispatcher"
+        out.append(f)
+        return _dashboard_scope(book, out), metrics
     try:
         minute, hours = _cron_slots(cron)
     except ValueError as e:
@@ -1390,12 +1477,7 @@ def check_runlog(book, tz_offset, since_days, eodhd_target, cron, now_utc, asof_
     out.append(F("e", "PIPELINE", "schedule_lateness", "PASS" if worst <= 15 else ("WARN" if worst <= 60 else "FAIL"),
                  worst, f"worst start delay vs cron '{cron}' over {len(late)} runs (first _Run_Log row of each run); P-170",
                  late[-6:]))
-    da = book.rows("Dashboard_Audit") or []
-    capped = [f"{_s(r[0])} {_num(r[3]):g}" for r in da if _s(r[1]) == "scope.coverage" and _s(r[2]) == "WARN"]
-    if da:
-        out.append(F("e", "PIPELINE", "dashboard_audit_scope_capped", "PASS" if not capped else "WARN", len(capped),
-                     "in-workbook validator samples a capped row count (P-190)", capped))
-    return out, metrics
+    return _dashboard_scope(book, out), metrics
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,7 +1518,7 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
                    manifest=None, now_utc=None, cash_max_age_hours=24.0,
                    margin_receipts=False, eodhd_fail_pct=0):
     """Run every gate on one export. Returns a JSON-serialisable result dict."""
-    expect = dict(DEFAULT_EXPECT if expect is None else expect)
+    expect = dict(expect or {})              # v1.2.3: no typed-in default; see status_row_receipts
     if not math.isfinite(eodhd_fail_pct) or not 0 <= eodhd_fail_pct <= 100:
         raise ValueError("eodhd_fail_pct must be between 0 and 100")
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
@@ -1452,7 +1534,7 @@ def audit_workbook(path, expect=None, asof=None, dq=80.0, rel=70.0, sector_cap=(
         asof = max(dates) if dates else now_utc.strftime("%Y-%m-%d")
     findings, metrics = [], {"asof": asof}
     findings += check_structure(book, now_utc)
-    f, m = check_market_pages(book, expect, asof, dq, rel, margin_receipts)
+    f, m = check_market_pages(book, expect, asof, dq, rel, margin_receipts, status_row_receipts(book))
     findings += f
     metrics["pages"] = m
     findings += check_crypto_identity(book)
@@ -1893,8 +1975,9 @@ def parse_args(argv=None):
     ap.add_argument("export", nargs="?", help="path to the .xlsx export of the workbook")
     ap.add_argument("--json", help="write the full result JSON here")
     ap.add_argument("--md", help="write the Markdown report here")
-    ap.add_argument("--expect", default=",".join(f"{k}={v}" for k, v in DEFAULT_EXPECT.items()),
-                    help="expected row counts, Page=N,...")
+    ap.add_argument("--expect", default="",
+                    help="expected row counts, Page=N,... (default: each page's own receipt in _Status; example: "
+                         + ",".join(f"{k}={v}" for k, v in DEFAULT_EXPECT.items()) + ")")
     ap.add_argument("--asof", help="as-of date YYYY-MM-DD (default: most common Last Updated date)")
     ap.add_argument("--dq", type=float, default=80.0, help="cockpit Data Quality floor")
     ap.add_argument("--rel", type=float, default=70.0, help="cockpit reliability floor")

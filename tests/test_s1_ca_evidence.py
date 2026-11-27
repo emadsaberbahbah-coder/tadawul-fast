@@ -117,4 +117,4 @@ def test_a_confirmed_action_and_a_readable_log_are_judged_as_before(monkeypatch)
     assert ss.ca_is_clean(Book({"_Corporate_Actions": reg, "Performance_Log": [LOG_HDR, DONE_ROW]})) is True    # repaired
     assert ss.ca_is_clean(Book({"_Corporate_Actions": reg, "Performance_Log": [LOG_HDR]})) is True              # nothing to repair
     assert ss.ca_is_clean(Book({"_Corporate_Actions": reg, "Performance_Log": [LOG_HDR + ["Extra"], DONE_ROW + [""]]})) is True
-    assert ss.SCRIPT_VERSION == "1.9.7"
+    assert ss.SCRIPT_VERSION == "1.9.8"

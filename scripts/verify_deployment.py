@@ -290,7 +290,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("compare_broker_observation", "1.0.0", "offline research observation comparison; no funding certificate"),
     ('tfb_capture_evidence', '1.0.0', 'private offline custodian capture'),
     ('repair_pit_legacy_rows', '1.0.0', 'bounded operator PIT repair'),
-    ('tfb_export_audit', '1.2.2', 'offline export audit'),   # 2026-11-25: a tighter sector cap is a WARN
+    # 2026-11-27 (pin only): 1.2.2 -> 1.2.3 (row counts held to the sync's receipt; lateness to the dispatcher).
+    ('tfb_export_audit', '1.2.3', 'offline export audit'),
     ('calibration_report', '1.0.1', 'offline calibration evidence'),
     ('audit_workbook', '1.2.1', 'read-only workbook audit'),
     ('flag_registry', '1.0.0', 'static flag inventory'),
@@ -319,7 +320,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # default strict; workflow-scoped, never on Render).
     ("await_cockpit_receipts", "1.4.0", "after-sync release dispatch (read-only wait)"),
     ("run_weekly_brief", "1.0.3", "weekly brief"),
-    ("run_shadow_scorer", "1.9.7", "shadow scorer"),
+    # 2026-11-27 (pin only): 1.9.7 -> 1.9.8 ([S1-SIGNIFICANCE], observe: a PASS says whether its net alpha could be chance).
+    ("run_shadow_scorer", "1.9.8", "shadow scorer"),
     # 2026-10-21 (daily; manifest pin only, SCRIPT_VERSION unchanged as in the
     # 2026-10-21 note above): 6.45.0 -> 6.47.0 (TRACK_HIST_TARGET_CLOSE, default off).
     # 2026-10-22: merged onto main's 6.46.0 pin (#816), so 6.46.0 -> 6.47.0.
@@ -398,7 +400,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (pin only): 1.32.0 -> 1.33.0 (v_news_llm_days enters after the model's reading, audit D1).
     # 2026-11-27 (pin only): 1.33.0 -> 1.34.0 (the shadow challenger v0: v_challenger_v0_features, _ranks,
     # _walkforward, _scorecard; research only; check_objects refuses a challenger view that could look ahead).
-    ("apply_bq_views", "1.34.0", "bigquery looker views"),
+    # 2026-11-27 (pin only): 1.34.0 -> 1.35.0 (v_outcome_sector: 'beats' / 'loses' need t_adj of 2 or more).
+    ("apply_bq_views", "1.35.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -467,7 +470,11 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (pin only): 1.0.1 -> 1.1.0 (three records join the registry: the stop judgment, the value screen
     # and the cash entry; 21 are read).
     # 2026-11-26 (pin only): 1.1.0 -> 1.2.0 (the gate record joins the registry: v_forward_signal_gates; 22 are read).
-    ("learning_watch", "1.2.0", "learning watch"),
+    # 2026-11-27 (pin only): 1.2.0 -> 1.2.1 (the sector record is read with its t_adj, views 1.35.0).
+    ("learning_watch", "1.2.1", "learning watch"),
+    # 2026-11-27 (new script, pinned on arrival): the workbook grid trim - every tab's allocated grid against its
+    # used extent, and (four gates, by hand) the trailing empty rows and columns deleted. Report by default.
+    ("trim_workbook_grid", "1.0.0", "workbook grid trim"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),

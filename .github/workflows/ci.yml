@@ -2,8 +2,19 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.104 (2026-11-25) -- AUDIT OF 25 NOV: QUOTA CLIENT + CA WITNESS
+# VERSION 1.1.105 (2026-11-27) -- FULL REVIEW OF 27 NOV: HONEST WORDS, PART 1
 #
+# v1.1.105: run tests/test_s1_significance.py (run_shadow_scorer 1.9.8: the
+# S-1 gate says whether its net alpha could be chance; observe only) right
+# after tests/test_s1_ca_evidence.py, and tests/test_export_audit_v123.py
+# (tfb_export_audit 1.2.3: row counts held to the sync's own receipt, lateness
+# to the dispatcher's own dispatches) right after tests/test_export_audit_v120.py.
+# Also tests/test_trim_workbook_grid.py (trim_workbook_grid 1.0.0: the empty
+# grid Google counts against the 20,000,000-cell limit, reported tab by tab
+# and trimmed only by hand behind four gates) right after
+# tests/test_export_audit_v123.py.
+# All three are also collected by the whole-suite job. Nothing is removed.
+# v1.1.104 (2026-11-25, audit of 25 Nov: quota client + CA witness).
 # v1.1.104: run tests/test_sheets_quota_client.py (scripts/sheets_backoff.py
 # 1.0.0 and run_calendar_sync 1.3.1: every request of the 15 page jobs that
 # open the workbook through _open_book waits out a Sheets 429) right after
@@ -1412,6 +1423,7 @@ jobs:
             tests/test_sync_publication_clock.py \
             tests/test_shadow_scorer_regret_read_failure.py \
             tests/test_s1_ca_evidence.py \
+            tests/test_s1_significance.py \
             tests/test_repair_corporate_actions_seed.py \
             tests/test_repair_corporate_actions_witness.py \
             tests/test_opportunity_builder.py \
@@ -1736,6 +1748,8 @@ jobs:
             tests/test_de_label_truth.py \
             tests/test_de_hold_prose_post_gate.py \
             tests/test_export_audit_v120.py \
+            tests/test_export_audit_v123.py \
+            tests/test_trim_workbook_grid.py \
             tests/test_calibration_report.py \
             tests/test_eq_roi_unit_sentry.py \
             tests/test_pf_dd_fee_guards.py \

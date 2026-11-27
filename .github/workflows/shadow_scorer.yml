@@ -1,5 +1,10 @@
 name: "📊 TFB Shadow Scorer (S-1 Gate)"
 
+# VERSION 1.0.4 (2026-11-27) -- THE GATE SAYS WHETHER ITS ALPHA COULD BE CHANCE
+# WHY (full project review, 27 Nov): S1_Gate read PASS on 37 scored days with
+# no test of chance. run_shadow_scorer 1.9.8 adds the reading (observe only).
+# WHAT: one env line, TFB_S1_SIGNIFICANCE (default observe; off = scorer 1.9.7).
+#
 # VERSION 1.0.3 (2026-11-26) -- A DISPATCH CAN CARRY ITS OWN NAME
 # WHY (_Run_Log, 25 Nov 18:47 Riyadh): this workflow's dispatch got HTTP 500,
 # was sent once, and no run started; the evidence day was saved by hand.
@@ -97,6 +102,12 @@ jobs:
       # A last-scored base older than this many calendar days makes the run
       # fall back to legacy pairing (recovery path; scorer 1.9.5).
       TFB_S1_BASE_MAX_AGE_D: ${{ vars.TFB_S1_BASE_MAX_AGE_D || '7' }}
+      # 1.0.4 (2026-11-27): scorer 1.9.8 [S1-SIGNIFICANCE], observe only. The
+      # gate says whether its net alpha could be chance (t over the paired
+      # scored days); a PASS that is not evidence says so on its 'why' line.
+      # Criteria, statuses and verdict are untouched.
+      # Rollback: set the repository variable TFB_S1_SIGNIFICANCE=off.
+      TFB_S1_SIGNIFICANCE: ${{ vars.TFB_S1_SIGNIFICANCE || 'observe' }}
       # IR-082 (external audit P0-7, adjudicated 2026-08-23): the scorer's
       # v1.3.0 EODHD rescue reads exactly these two names and was
       # structurally unreachable because neither was mapped. This mapping is

@@ -1,0 +1,122 @@
+# =============================================================================
+# ✂️ Workbook Grid Trim — .github/workflows/grid_trim.yml
+# =============================================================================
+# VERSION 1.0.0 (2026-11-27)
+# WHY (full project review of 27 Nov 2026, approved by the owner at 14:06
+# Riyadh): Google counts every tab's rows x columns, used or not, against a
+# 20,000,000-cell limit. The workbook stood at 9,736,507 (48.7%) and about
+# half of that grid is empty: tabs left at the default 1,000 x 26, log tabs
+# with unused columns. scripts/trim_workbook_grid.py 1.0.0 reports every tab
+# (grid, exact used extent, target, cells freed) and, when armed, deletes
+# trailing EMPTY rows and columns only. See the tool header for its rules.
+#
+# MANUAL DISPATCH ONLY. Two steps:
+#   1) apply=false (the default): read the plan in the log. Nothing is written.
+#   2) After a workbook backup: apply=true, have_backup=yes, confirm=TRIM.
+# The tool refuses to apply unless every gate is present, re-reads each trim
+# region before deleting it (it must be empty), and never deletes a tab.
+#
+# CONCURRENCY IS PRIVATE, ON PURPOSE (the lesson recorded in
+# track_performance.yml, 2026-10-06): a concurrency group keeps ONE pending
+# run, and a newly queued run cancels the one already waiting - so a trim
+# queued in the production-write group could evict a waiting Daily Sync.
+# Instead, an armed trim first reads the Actions API and REFUSES (fail-closed)
+# while a Daily Sync, a page-refresh recovery or a grid-capacity repair is
+# queued or running, or when that state cannot be read. The report (apply=false)
+# only reads, so it needs no such check.
+# =============================================================================
+name: ✂️ Workbook Grid Trim
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Trim the grid (false = report only, nothing written)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      have_backup:
+        description: "A full workbook backup exists (required to trim)"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+      confirm:
+        description: "Type TRIM to arm the trim"
+        type: string
+        default: ""
+      exclude:
+        description: "Tabs to leave alone, comma separated (optional)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read   # the in-flight check before an armed trim
+
+concurrency:
+  group: tfb-grid-trim
+  cancel-in-progress: false
+
+jobs:
+  grid-trim:
+    name: ✂️ Report / trim the empty grid
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth
+
+      - name: Refuse to trim while a production write is in flight
+        if: ${{ inputs.apply == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Fail CLOSED: a trim that cannot prove no production writer is in
+          # flight does not run. Nothing is lost by running it again later.
+          BUSY=0
+          for WF in daily_sync.yml page_refresh_recovery.yml grid_capacity_repair.yml; do
+            N="$(curl -sS --max-time 25 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/runs?per_page=20" \
+              | jq -r '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting" or .status=="pending" or .status=="requested")] | length' 2>/dev/null || echo "ERR")"
+            if [[ ! "$N" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not read the state of ${WF}; the trim is refused (fail-closed). Run it again."
+              exit 1
+            fi
+            echo "${WF}: ${N} run(s) queued or in progress"
+            BUSY=$((BUSY + N))
+          done
+          if [[ "$BUSY" -gt 0 ]]; then
+            echo "::error::${BUSY} production write run(s) queued or in progress - the trim is refused. Run it again when they have finished."
+            exit 1
+          fi
+          echo "No production write in flight."
+
+      - name: Report or trim
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          TFB_GRID_TRIM_APPLY: ${{ inputs.apply == 'true' && '1' || '0' }}
+          IN_APPLY: ${{ inputs.apply }}
+          IN_BACKUP: ${{ inputs.have_backup }}
+          IN_CONFIRM: ${{ inputs.confirm }}
+          IN_EXCLUDE: ${{ inputs.exclude }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "$IN_APPLY" = "true" ]; then ARGS+=(--apply); fi
+          if [ "$IN_BACKUP" = "yes" ]; then ARGS+=(--i-have-backup); fi
+          if [ -n "$IN_CONFIRM" ]; then ARGS+=(--confirm "$IN_CONFIRM"); fi
+          if [ -n "$IN_EXCLUDE" ]; then ARGS+=(--exclude "$IN_EXCLUDE"); fi
+          python scripts/trim_workbook_grid.py "${ARGS[@]}"
