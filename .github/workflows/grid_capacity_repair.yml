@@ -16,6 +16,19 @@
 #
 # Concurrency joins the PRODUCTION-WRITE group used by daily_sync so this can
 # never run while a sync leg is writing.
+#
+# 2026-11-28 -- A REPORT NO LONGER JOINS THE PRODUCTION-WRITE QUEUE
+# WHY: a GitHub concurrency group keeps one pending run, and a newly queued
+# run cancels the one already waiting. On 27 Nov at 11:07 UTC a REPORT of
+# this workflow (apply=false, run 45987841282) joined the group while a
+# Daily Sync dispatch waited its turn (run 45980484268, queued 10:15 UTC
+# behind the 10:14 sync); the waiting sync was cancelled before it started,
+# and the Sync Outcome Audit of that run went red (no page artifact). That
+# sync was a duplicate, so no page was missed - the next one could be real.
+# WHAT: a report (apply=false) writes nothing and runs in its own group,
+# tfb-grid-capacity-report-<ref>. An armed repair (apply=true) keeps the
+# production-write group, exactly as before.
+# Rollback: restore the single group line below.
 # =============================================================================
 name: 🧰 Grid Capacity Repair (P0-1)
 
@@ -45,7 +58,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tadawul-production-write-${{ github.ref }}
+  group: ${{ inputs.apply == 'true' && format('tadawul-production-write-{0}', github.ref) || format('tfb-grid-capacity-report-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
