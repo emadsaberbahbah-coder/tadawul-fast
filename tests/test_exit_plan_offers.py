@@ -423,12 +423,12 @@ def test_j2_the_live_run_reads_each_market_once(monkeypatch):
 
 # ----------------------------------------------------------------------------- J3
 def test_j3_the_ledger_shapes():
-    assert ep.LEDGER_HEADERS[-2:] == ["Market", "Judgment"] and len(ep.LEDGER_HEADERS) == 19
+    assert ep.LEDGER_HEADERS[-3:] == ["Market", "Judgment", "Stop Without News"] and len(ep.LEDGER_HEADERS) == 20
     assert ep.LEDGER_HEADERS_V16 == ep.LEDGER_HEADERS[:18] and ep.LEDGER_HEADERS_V15 == ep.LEDGER_HEADERS[:17]
     line = ["2026-11-10", "x", "AAA.US", "lot", 100, 10, 104, 104, 3, 9, 95.0, 109, "no", "HOLD", "", "2026-11-09", 1]
     v15 = ep.parse_ledger([ep.LEDGER_HEADERS_V15, line])
     v16 = ep.parse_ledger([ep.LEDGER_HEADERS_V16, line + ["us:calm:2026-11-09"]])
-    v17 = ep.parse_ledger([ep.LEDGER_HEADERS, line + ["us:calm:2026-11-09", "alone:stands:-9.0:-0.5"]])
+    v17 = ep.parse_ledger([ep.LEDGER_HEADERS_V17, line + ["us:calm:2026-11-09", "alone:stands:-9.0:-0.5"]])
     assert v15[0]["Market"] == "" and v15[0]["Judgment"] == "" and v15[0]["Stop"] == 95.0
     assert v16[0]["Market"] == "us:calm:2026-11-09" and v16[0]["Judgment"] == ""
     assert v17[0]["Judgment"] == "alone:stands:-9.0:-0.5"
@@ -443,7 +443,7 @@ def test_j4_workflow_manifest_and_ci():
     assert step["env"]["TFB_EXIT_OFFERS"] == "${{ vars.TFB_EXIT_OFFERS || 'on' }}"
     assert step["env"]["TFB_EXIT_STOP_JUDGMENT"] == "${{ vars.TFB_EXIT_STOP_JUDGMENT || 'observe' }}"
     manifest = (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
-    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in manifest and ep.__version__ == "1.7.1"
+    assert '("exit_plan", "%s", "exit plan")' % ep.__version__ in manifest and ep.__version__ == "1.8.0"
     assert '("core.corporate_offers", "__version__", "%s", "corporate offers")' % co.__version__ in manifest
     assert co.__version__ == "1.0.0"
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
