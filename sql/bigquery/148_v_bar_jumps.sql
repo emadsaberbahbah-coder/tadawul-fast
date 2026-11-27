@@ -20,7 +20,9 @@
 --              'too new'  alone, with fewer than 3 later bars: not yet known
 -- READ IT AS: a 'spike' or a 'detour' is a bad bar or two price bases in one series, and a return measured from
 -- or to one of its bars is wrong. A 'step' of 3 times or more in one session is rarely a real move.
--- COLUMNS: symbol, date, prev_date, gap_days, prev_close, close, ratio, direction (up / down), volume, source,
+-- COLUMNS: symbol, date, prev_date, gap_days, prev_close, close, ratio (rounded, to read), factor (the larger of
+-- close / previous close and its inverse, NOT rounded - v_bar_jump_symbols tests it against 3, and a rounded ratio
+-- of 0.333 would turn a factor of 2.9994 into 3.003: review of PR 1107), direction (up / down), volume, source,
 -- leg, bars_away, back_date (on the 'out' leg), bars_after (bars archived after this one), kind.
 -- This view looks at later bars on purpose: it checks the archive, it is not a signal.
 -- Research only: no decision, gate or count reads this view.
@@ -85,6 +87,7 @@ SELECT
   ROUND(prev_close, 4) AS prev_close,
   ROUND(close, 4) AS close,
   ROUND(ratio, 3) AS ratio,
+  GREATEST(SAFE_DIVIDE(close, prev_close), SAFE_DIVIDE(prev_close, close)) AS factor,
   IF(ratio > 1, 'up', 'down') AS direction,
   volume,
   source,

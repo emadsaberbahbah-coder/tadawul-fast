@@ -16,6 +16,7 @@ One row per jump in `symbol_bars_daily`.
 - **Leg:** `out` and `back` for such a pair (a chain alternates), `alone` for a jump nothing undid. `bars_away` is the bars between the two.
 - **Kind:** `spike` (back within 3 bars), `detour` (back later), `step` (alone, 3 or more later bars), `too new` (alone, fewer).
 - It looks at later bars on purpose: it checks the archive, it is not a signal. No clock is read.
+- **Review of this PR (automated review, P2), accepted:** the symbol view tested a factor rebuilt from the ratio after rounding it to three decimals, so a step of 2.9994 times (ratio shown as 0.333) read 'large step'. `v_bar_jumps` now carries `factor`, the larger of close / previous close and its inverse, not rounded, and the symbol view reads that. On the archive of 27 Nov no symbol changes its reading.
 
 ### New `sql/bigquery/149_v_bar_jump_symbols.sql`
 One row per symbol with a fixed reading, in this order: `two price bases` (a detour), `bad bar` (a spike), `large step` (a step of 3 times or more: a split or reverse split recorded without adjustment is likely), `too new`, `steps under 3 times` (a real move is possible; price alone cannot tell). `is_new` marks a last jump within 7 days of the archive's newest bar.
@@ -38,8 +39,8 @@ Docstring entry and version. No existing view changes. `scripts/verify_deploymen
 
 ## Tests
 - `tests/test_bq_views.py` `case_v70` (70 cases pass): both files' fragments, both body hashes, the order and kinds lists, the file list, version 1.36.0, no clock in either body, `LEAD` only over the chain of jumps.
-- **The rule was run in BigQuery itself.** Twelve short series (two price bases, one bad bar, an unadjusted reverse split, too new, a chain of three, a way back after 65 days, an overshoot, a close of 0, back on the third against the fourth bar, the exact thresholds, a flat series) were given to both view bodies in place of the archive table. All 22 jump rows and 11 symbol rows came back equal to the Python mirror in the test, column for column. The series and the expected rows are pinned in the test.
-- The edges, each deciding a case: exactly 1.5 times and exactly two thirds are jumps, a hair inside is not; products of 0.8 and 1.25 pair, 0.79 and 1.26 do not; 60 days pair, 61 do not; 3 bars is a spike, 4 a detour; 3 later bars is a step, fewer is too new.
+- **The rule was run in BigQuery itself.** Twelve short series (two price bases, one bad bar, an unadjusted reverse split, too new, a chain of three, a way back after 65 days, an overshoot, a close of 0, back on the third against the fourth bar, the exact thresholds, a flat series) were given to both view bodies in place of the archive table. All 22 jump rows and 11 symbol rows came back equal to the Python mirror in the test, column for column. After the review fix, the two series it adds (2.9994 times and exactly 3 times, the same rounded ratio) and six of the others were run again on the changed bodies: equal again. The series and the expected rows are pinned in the test.
+- The edges, each deciding a case: exactly 1.5 times and exactly two thirds are jumps, a hair inside is not; a factor of exactly 3 is a large step and 2.9994 is not; products of 0.8 and 1.25 pair, 0.79 and 1.26 do not; 60 days pair, 61 do not; 3 bars is a spike, 4 a detour; 3 later bars is a step, fewer is too new.
 - Any change to either body changes its pinned hash.
 - Related tests (the 60 test files that name the views tool, the bar archive or the deployment manifest): 1,650 pass, 35 skipped. The changed test file also passes with `GITHUB_ACTIONS=true`.
 

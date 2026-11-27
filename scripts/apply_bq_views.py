@@ -20,7 +20,9 @@ price bases, bad bar, large step (3 times or more), too new, steps under 3
 times; is_new marks a jump within 7 days of the archive's newest bar. On
 the archive of 27 Nov: 107 jumps on 29 symbols - 3 symbols on two price
 bases, 5 with a bad bar, 6 with a large step, 15 with steps under 3 times.
-No existing view changes; nothing reads the new ones yet.
+No existing view changes; nothing reads the new ones yet. Review of PR
+1107: v_bar_jumps carries 'factor' (not rounded) and the symbol view tests
+that against 3, so a step of 2.9994 times is not read as a large step.
 
 v1.35.0 (27 Nov 2026, a reading needs its test). WHY (full project review
 of 27 Nov 2026, approved by the owner at 14:06 Riyadh: "ok approved and start

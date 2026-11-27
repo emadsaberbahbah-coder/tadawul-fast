@@ -11,7 +11,8 @@
 --   'steps under 3 times' steps only, each under 3 times: a real move is possible (price alone cannot tell)
 -- COLUMNS: symbol, market_group (Tadawul for .SR, US for .US or no suffix, else Other markets), jumps, spikes,
 -- detours (pairs, counted once), steps, too_new, bars_on_another_level (bars inside the spikes and detours),
--- largest_factor (the largest one-session factor, up or down), largest_step_factor, first_jump, last_jump,
+-- largest_factor (the largest one-session factor, up or down), largest_step_factor (both rounded to read; the
+-- reading tests the factor before rounding), first_jump, last_jump,
 -- is_new (the last jump is within 7 days of the archive's newest bar), reading.
 -- Research only: no decision, gate or count reads this view.
 CREATE OR REPLACE VIEW `{{DS}}.v_bar_jump_symbols`
@@ -26,8 +27,8 @@ WITH a AS (
     COUNTIF(kind = 'step') AS steps,
     COUNTIF(kind = 'too new') AS too_new,
     SUM(IF(leg = 'out', bars_away, 0)) AS bars_on_another_level,
-    MAX(GREATEST(ratio, SAFE_DIVIDE(1, ratio))) AS f_max,
-    MAX(IF(kind = 'step', GREATEST(ratio, SAFE_DIVIDE(1, ratio)), NULL)) AS f_step,
+    MAX(factor) AS f_max,
+    MAX(IF(kind = 'step', factor, NULL)) AS f_step,
     MIN(date) AS first_jump,
     MAX(date) AS last_jump
   FROM `{{DS}}.v_bar_jumps`

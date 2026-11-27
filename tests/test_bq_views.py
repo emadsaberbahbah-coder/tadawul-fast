@@ -404,8 +404,8 @@ PENDING = {
     "v_forward_signal_gates": "40e03bcfd820b90c0d6189de2bbc648a6332abb949fe5ee69a3ffee6e481b135",
     # apply_bq_views 1.36.0 (27 Nov 2026): the bar archive check - jumps of 1.5 times or more in the archived closes,
     # the jump that undid each, and a fixed reading per symbol (research only)
-    "v_bar_jumps": "f6bbd54ca55272765bd24772405fe1742bee915c24bfe6e597d25aa782d1e25f",
-    "v_bar_jump_symbols": "c8cb711469d017ad64f7f9d8a757725f09634ced782d1d2be404f974f332256a",
+    "v_bar_jumps": "061b569c64d3993653678f03cd3fc55daf502c2abb215f9e9371a2f39417c804",
+    "v_bar_jump_symbols": "a28abd397adb0792f8fd076f3e8f6018cc1038f0f3fe890a86e88cf6c122a522",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -4621,6 +4621,9 @@ BAR_SERIES = {
     # exactly 1.5 times and exactly two thirds are jumps; 224.985 / 150 is a hair under 1.5 and is not
     "EDGE": _days([100, 150, 150, 150, 150, 149.99 * 1.5, 224.985, 224.985, 224.985, 149.99, 149.99, 149.99, 149.99]),
     "FLAT": _days([10, 11, 12, 13, 12, 11, 10]),
+    # review of PR 1107: a factor of 2.9994 reads 0.333 when rounded, whose inverse is 3.003 - it is under 3
+    "NEAR3": _days([100, 33.34, 33.34, 33.34, 33.34]),
+    "AT3": _days([30, 10, 10, 10, 10]),                                      # exactly 3 times, downwards
 }
 BAR_JUMPS_EXPECTED = [
     # symbol, date, ratio, leg, bars_away, back_date, bars_after, kind
@@ -4647,6 +4650,10 @@ BAR_JUMPS_EXPECTED = [
     ("THREE", "2026-01-04", 2.952, "alone", None, None, 4, "step"),
     ("ZERO", "2026-01-03", 3.0, "alone", None, None, 3, "step"),
 ]
+BAR_JUMPS_EXPECTED = sorted(BAR_JUMPS_EXPECTED + [
+    ("NEAR3", "2026-01-02", 0.333, "alone", None, None, 3, "step"),
+    ("AT3", "2026-01-02", 0.333, "alone", None, None, 3, "step"),           # the same rounded ratio as NEAR3
+])
 BAR_SYMBOLS_EXPECTED = {
     # symbol: jumps, spikes, detours, steps, too_new, bars_on_another_level, largest_factor, largest_step_factor,
     #         is_new, reading
@@ -4661,11 +4668,14 @@ BAR_SYMBOLS_EXPECTED = {
     "STEP": (1, 0, 0, 1, 0, 0, 37.61, 37.61, False, "large step"),
     "THREE": (3, 1, 0, 1, 0, 1, 3.0, 2.95, False, "bad bar"),
     "ZERO": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "large step"),
+    "NEAR3": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "steps under 3 times"),     # 2.9994 shows as 3.0 and is under 3
+    "AT3": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "large step"),
 }
 
 
-def _bar_jumps(series):
-    """The rule of v_bar_jumps in Python: one tuple per jump, as BAR_JUMPS_EXPECTED lists them."""
+def _bar_jump_rows(series):
+    """The rule of v_bar_jumps in Python: one tuple per jump as BAR_JUMPS_EXPECTED lists them, plus the factor
+    before rounding as its last item."""
     out = []
     for sym, rows in sorted(series.items()):
         bars = sorted((d, c) for d, c in rows if c is not None and c > 0)
@@ -4674,7 +4684,7 @@ def _bar_jumps(series):
         for i in range(1, n):
             (_, pc), (d, c) = bars[i - 1], bars[i]
             if c >= 1.5 * pc or c * 1.5 <= pc:
-                jumps.append({"date": d, "ratio": c / pc, "bar_n": i + 1})
+                jumps.append({"date": d, "ratio": c / pc, "factor": max(c / pc, pc / c), "bar_n": i + 1})
         chains = []
         for q, j in enumerate(jumps):
             p = jumps[q - 1] if q else None
@@ -4693,17 +4703,23 @@ def _bar_jumps(series):
                 after = n - j["bar_n"]
                 kind = ("too new" if after < 3 else "step") if leg == "alone" else ("spike" if away <= 3 else "detour")
                 out.append((sym, j["date"].isoformat(), round(j["ratio"], 3), leg, away,
-                            ch[k]["date"].isoformat() if leg == "out" else None, after, kind))
+                            ch[k]["date"].isoformat() if leg == "out" else None, after, kind, j["factor"]))
     return out
 
 
+def _bar_jumps(series):
+    """The rows of _bar_jump_rows as the view shows them (the ratio rounded, the factor left out)."""
+    return [r[:8] for r in _bar_jump_rows(series)]
+
+
 def _bar_jump_symbols(jumps, newest):
-    """The rule of v_bar_jump_symbols in Python, from the rows of _bar_jumps and the archive's newest bar."""
+    """The rule of v_bar_jump_symbols in Python, from the rows of _bar_jump_rows and the archive's newest bar. The
+    reading tests the factor BEFORE rounding."""
     out = {}
     for sym in sorted({j[0] for j in jumps}):
         js = [j for j in jumps if j[0] == sym]
-        f = [max(j[2], 1 / j[2]) for j in js]
-        fs = [max(j[2], 1 / j[2]) for j in js if j[7] == "step"]
+        f = [j[8] for j in js]
+        fs = [j[8] for j in js if j[7] == "step"]
         spikes = sum(1 for j in js if j[7] == "spike" and j[3] == "out")
         detours = sum(1 for j in js if j[7] == "detour" and j[3] == "out")
         steps = sum(1 for j in js if j[7] == "step")
@@ -4737,6 +4753,8 @@ def case_v70():
                  "CASE WHEN MOD(chain_n, 2) = 0 THEN 'back' WHEN chain_n < chain_len THEN 'out' ELSE 'alone' END AS leg,",
                  "CASE WHEN MOD(chain_n, 2) = 0 THEN bar_n - chain_prev_bar WHEN chain_n < chain_len THEN chain_next_bar - bar_n END AS bars_away",
                  "IF(leg = 'out', chain_next_date, NULL) AS back_date,",
+                 # the factor is not rounded: the symbol view tests it against 3
+                 "GREATEST(SAFE_DIVIDE(close, prev_close), SAFE_DIVIDE(prev_close, close)) AS factor,",
                  "WHEN leg = 'alone' AND bars - bar_n < 3 THEN 'too new'",
                  "WHEN leg = 'alone' THEN 'step'",
                  "WHEN bars_away <= 3 THEN 'spike'",
@@ -4745,7 +4763,8 @@ def case_v70():
     for frag in ("COUNTIF(kind = 'spike' AND leg = 'out') AS spikes,",
                  "COUNTIF(kind = 'detour' AND leg = 'out') AS detours,",
                  "SUM(IF(leg = 'out', bars_away, 0)) AS bars_on_another_level,",
-                 "MAX(IF(kind = 'step', GREATEST(ratio, SAFE_DIVIDE(1, ratio)), NULL)) AS f_step,",
+                 "MAX(factor) AS f_max,",
+                 "MAX(IF(kind = 'step', factor, NULL)) AS f_step,",
                  "SELECT MAX(date) AS d FROM `{{DS}}.symbol_bars_daily`",
                  "DATE_DIFF(n.d, a.last_jump, DAY) <= 7 AS is_new,",
                  "WHEN a.detours >= 1 THEN 'two price bases'",
@@ -4760,7 +4779,13 @@ def case_v70():
     got = _bar_jumps(BAR_SERIES)
     assert got == BAR_JUMPS_EXPECTED
     newest = max(d for rows in BAR_SERIES.values() for d, _ in rows)
-    assert _bar_jump_symbols(got, newest) == BAR_SYMBOLS_EXPECTED
+    rows = _bar_jump_rows(BAR_SERIES)
+    assert _bar_jump_symbols(rows, newest) == BAR_SYMBOLS_EXPECTED
+    # review of PR 1107: the two series show the same rounded ratio and read differently, because the factor is not
+    # rounded before it is tested against 3
+    near, at = [r for r in rows if r[0] == "NEAR3"][0], [r for r in rows if r[0] == "AT3"][0]
+    assert near[2] == at[2] == 0.333 and round(near[8], 4) == 2.9994 and at[8] == 3.0
+    assert "GREATEST(ratio, SAFE_DIVIDE(1, ratio))" not in bs and "ROUND(" not in bs.split("FROM `{{DS}}.v_bar_jumps`")[0]
     assert "FLAT" not in {j[0] for j in got}                         # no jump, no row
     # each threshold of the rule decides a case above
     assert [j[7] for j in got if j[0] in ("B3", "B4")] == ["spike", "spike", "detour", "detour"]       # 3 bars / 4 bars
