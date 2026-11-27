@@ -402,7 +402,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # _walkforward, _scorecard; research only; check_objects refuses a challenger view that could look ahead).
     # 2026-11-27 (pin only): 1.34.0 -> 1.35.0 (v_outcome_sector: 'beats' / 'loses' need t_adj of 2 or more).
     # 2026-11-27 (pin only): 1.35.0 -> 1.36.0 (the bar archive check: v_bar_jumps, v_bar_jump_symbols; research only).
-    ("apply_bq_views", "1.36.0", "bigquery looker views"),
+    # 2026-11-27 (pin only): 1.36.0 -> 1.37.0 (v_bars_clean; the challenger's inputs and results inside one price basis).
+    ("apply_bq_views", "1.37.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
