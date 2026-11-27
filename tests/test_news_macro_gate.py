@@ -57,8 +57,10 @@ Run: python tests/test_news_macro_gate.py   or   pytest -q <this file>
 from __future__ import annotations
 
 import datetime as dt
+import ast
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -2826,6 +2828,12 @@ def test_g23_eodhd_company_news_is_parsed_without_its_sentiment():
         with pytest.raises(ValueError):
             ng.parse_eodhd_news(bad, "FRST.US", "x")
     assert ng.eodhd_news_symbol("FRST.US") == "FRST.US" and ng.eodhd_news_symbol("0700.HK") == "0700.HK"
+    # Codex P2 on #1104: the suffixes EODHD names differently, as news_now asks them (archive_symbol_deep)
+    assert ng.eodhd_news_symbol("BARC.L") == "BARC.LSE" and ng.eodhd_news_symbol("SAP.DE") == "SAP.XETRA"
+    assert ng.eodhd_news_symbol("BHP.AX") == "BHP.AU" and ng.eodhd_news_symbol("RELIANCE.NS") == "RELIANCE.NSE"
+    src = (_REPO / "scripts" / "archive_symbol_deep.py").read_text(encoding="utf-8")
+    table = ast.literal_eval(re.search(r"^EODHD_SUFFIX = (\{[^}]*\})", src, re.M).group(1))
+    assert ng.EODHD_NEWS_SUFFIX == table                                       # one table, two copies held equal
     assert ng.eodhd_news_symbol("5023.SR") == ng.eodhd_news_symbol("MACRO") == ng.eodhd_news_symbol("FRST") == ""
     assert ng.tier_of("eodhd.com") == "D"
 

@@ -25,6 +25,7 @@ This is the news-sources review the owner set for 27 Nov. What the runs of 26–
    - 72-hour window; folded with the other sources by (scope, publisher, headline); checked by the issuer link.
    - **EODHD's sentiment is not read.** `v_company_news_eval` found it positive on 455 of 464 days.
    - The key is scrubbed from every failure note.
+   - EODHD's own exchange codes are asked (BARC.L → BARC.LSE, SAP.DE → SAP.XETRA), the table news_now uses; a test holds the two copies equal (Codex P2 on #1104).
 4. **On trial in `gulf_rss`:**
    - Argaam's main news (`sectionid=1523`) and market pulse (`sectionid=70`), live on 26 Nov;
    - Mubasher's TDWL news, which answered a page, not a feed, to a cloud reader;

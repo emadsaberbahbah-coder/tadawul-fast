@@ -1280,13 +1280,22 @@ def tadawul_code(symbol: str) -> str:
     return s[:-3] if s.endswith(".SR") and s[:-3].isdigit() else ""
 
 
+# Codex P2 on #1104: the Yahoo-style suffixes EODHD names differently - the table of
+# archive_symbol_deep.EODHD_SUFFIX, the one news_now asks with (tests/test_news_macro_gate.py G23 holds them equal;
+# that module is not imported here: it pulls in the archive's readers)
+EODHD_NEWS_SUFFIX = {"NS": "NSE", "BO": "BSE", "DE": "XETRA", "AX": "AU", "KS": "KO",
+                     "L": "LSE", "XETR": "XETRA", "ETR": "XETRA", "TASE": "TA"}
+
+
 def eodhd_news_symbol(symbol: str) -> str:
     """v1.13.0 [SOURCES-REVIEW] PURE: the code EODHD's news takes for a scope symbol ('' = not asked: the Saudi
-    names, which EODHD's company news does not cover - news_now reads holdings and the Top 10 the same way)."""
+    names, which EODHD's company news does not cover - news_now reads holdings and the Top 10 the same way).
+    The Yahoo-style suffixes EODHD names differently are translated (BARC.L -> BARC.LSE, SAP.DE -> SAP.XETRA)."""
     s = str(symbol or "").strip().upper()
     if not s or s == "MACRO" or s.endswith(".SR") or "." not in s:
         return ""
-    return s
+    base, suf = s.rsplit(".", 1)
+    return f"{base}.{EODHD_NEWS_SUFFIX.get(suf, suf)}"
 
 
 def parse_eodhd_news(payload: Any, scope: str, label: str) -> List[Dict[str, Any]]:
