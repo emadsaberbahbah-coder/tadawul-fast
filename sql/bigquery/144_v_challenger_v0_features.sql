@@ -9,7 +9,10 @@
 -- flatters any long side (the rank correlation is less affected).
 -- THE MARKET: US ('.US'), SA (Tadawul, '.SR'), JP ('.T'), HK ('.HK'), OTHER (every other suffix, pooled - each
 -- below 25 names on its own).
--- THE PRICE: adj_close (dividends and splits folded in), else close; one row per symbol and date.
+-- THE PRICE: adj_close (dividends and splits folded in), else close; one row per symbol and date. From views 1.37.0
+-- the bars come from v_bars_clean (the archive without its one-to-three-bar spikes) and every window below runs
+-- inside one price basis of the symbol: an input whose window would span a detour or an unexplained jump of 3
+-- times or more is left empty (the full project review of 27 Nov 2026 found such jumps on 27 of the names here).
 -- THE INPUTS at session t (all from closes up to t):
 --   lr           the log return of the session
 --   vol63        the annualised standard deviation of the last 63 log returns (at least 60 present)
@@ -19,13 +22,13 @@
 --                the market does, so the market's own return need not be taken off
 --   low_down126  minus the root mean square of the negative log returns of the last 126 sessions (at least 120
 --                present): a calmer downside ranks higher
--- Research only: no decision, gate or count reads this view. (views 1.34.0)
+-- Research only: no decision, gate or count reads this view. (views 1.34.0; clean bars from views 1.37.0)
 CREATE OR REPLACE VIEW `{{DS}}.v_challenger_v0_features`
 OPTIONS (description = "TFB shadow challenger v0 inputs (views 1.34.0): per followed share and session, from that close and earlier ones only - 12-1 and 6-1 month momentum over 63-session volatility, the 63-session return and the 126-session downside volatility, with market and GICS sector. Research view, never an order.")
 AS
 WITH px AS (
-  SELECT symbol, date, ANY_VALUE(COALESCE(adj_close, close)) AS p
-  FROM `{{DS}}.symbol_bars_daily`
+  SELECT symbol, date, ANY_VALUE(COALESCE(adj_close, close)) AS p, MAX(basis) AS basis
+  FROM `{{DS}}.v_bars_clean`
   WHERE close > 0 AND REGEXP_CONTAINS(symbol, r'\.[A-Z]+$')
   GROUP BY symbol, date
 ),
@@ -37,24 +40,24 @@ names AS (
   WHERE REGEXP_CONTAINS(s.symbol, r'\.[A-Z]+$') AND TRIM(IFNULL(s.sector, '')) != ''
 ),
 lagged AS (
-  SELECT n.market, n.sector, x.symbol, x.date, x.p,
+  SELECT n.market, n.sector, x.symbol, x.date, x.basis, x.p,
          LN(x.p / LAG(x.p) OVER w) AS lr,
          LAG(x.p, 21) OVER w AS p21, LAG(x.p, 63) OVER w AS p63,
          LAG(x.p, 126) OVER w AS p126, LAG(x.p, 252) OVER w AS p252
   FROM px AS x
   JOIN names AS n USING (symbol)
-  WINDOW w AS (PARTITION BY x.symbol ORDER BY x.date)
+  WINDOW w AS (PARTITION BY x.symbol, x.basis ORDER BY x.date)
 ),
 rolled AS (
   SELECT l.*,
          STDDEV_SAMP(l.lr) OVER w63 * SQRT(252) AS vol63, COUNT(l.lr) OVER w63 AS n63,
          SQRT(AVG(POW(LEAST(l.lr, 0), 2)) OVER w126) AS down126, COUNT(l.lr) OVER w126 AS n126
   FROM lagged AS l
-  WINDOW w63 AS (PARTITION BY l.symbol ORDER BY l.date ROWS BETWEEN 62 PRECEDING AND CURRENT ROW),
-         w126 AS (PARTITION BY l.symbol ORDER BY l.date ROWS BETWEEN 125 PRECEDING AND CURRENT ROW)
+  WINDOW w63 AS (PARTITION BY l.symbol, l.basis ORDER BY l.date ROWS BETWEEN 62 PRECEDING AND CURRENT ROW),
+         w126 AS (PARTITION BY l.symbol, l.basis ORDER BY l.date ROWS BETWEEN 125 PRECEDING AND CURRENT ROW)
 )
 SELECT
-  market, sector, symbol, date, p, lr,
+  market, sector, symbol, date, basis, p, lr,
   IF(n63 >= 60 AND vol63 > 0, vol63, NULL) AS vol63,
   IF(n63 >= 60 AND vol63 > 0 AND p252 > 0, SAFE_DIVIDE(p21 / p252 - 1, vol63), NULL) AS mom12_vs,
   IF(n63 >= 60 AND vol63 > 0 AND p126 > 0, SAFE_DIVIDE(p21 / p126 - 1, vol63), NULL) AS mom6_vs,
