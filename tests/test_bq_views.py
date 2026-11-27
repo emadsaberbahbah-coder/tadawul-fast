@@ -383,7 +383,7 @@ PENDING = {
     # apply_bq_views 1.31.0 (26 Nov 2026): the forward signal ledger, the gate record and their check against the
     # outcome engine (research only)
     "v_forward_signals": "c94ff5dd391aca769481b5c72a2d815fb78dec410d0ce76299cda49960c47237",
-    "v_forward_signal_gates": "f7072173c7a5c2b114c95b696c94ffcf743fec6533ba12a967d3e03be894839a",
+    # (v_forward_signal_gates moves to PENDING: its horizon map replaced in 1.35.0, was f7072173c7a5)
     "v_forward_signal_recon": "a9a1af5acb318e9e39f7f7e1846350cf9bc3daf32a19101a0f715f1514dd700b",
     # apply_bq_views 1.32.0 (26 Nov 2026): the news read twice - the word lists and the language model, each scored
     # against the next sessions, and the days they part (research only)
@@ -399,7 +399,9 @@ PENDING = {
     "v_challenger_v0_walkforward": "0e39890fc235a201810a8d0d1fcc929e5e9aaef68bbabbe00905098555cc6281",
     "v_challenger_v0_scorecard": "c0ee2aa57cf9680afa5a26c100f8fc8928684b5cba4ec7d3b76841ea161a4982",
     # apply_bq_views 1.35.0 (27 Nov 2026): v_outcome_sector reads 'beats' / 'loses' only with t_adj of 2 or more
-    "v_outcome_sector": "c1378f901b5cda91d1721d5f198897b77bdbdf116e6c4d0a144f91797529e17a",
+    # ... and each horizon is divided by its own days in both views that carry the adjusted t (review of PR 1106)
+    "v_outcome_sector": "f4be51391e6db23778c7edaf8a2d3050a2dcffd816912d231b163da2930ea593",
+    "v_forward_signal_gates": "40e03bcfd820b90c0d6189de2bbc648a6332abb949fe5ee69a3ffee6e481b135",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -2336,7 +2338,10 @@ def _sector_t(day_means, horizon):
     sd = (sum((x - m) ** 2 for x in day_means) / (n - 1)) ** 0.5
     if sd == 0:
         return None
-    return round(m / (sd / n ** 0.5) / {"1W": 7, "2W": 14, "1M": 30}.get(horizon, 91) ** 0.5, 2)
+    days = {"1W": 7, "2W": 14, "1M": 30, "3M": 91, "6M": 182, "12M": 365, "1Y": 365}.get(horizon)
+    if days is None:
+        return None                                              # a horizon outside the list has no t
+    return round(m / (sd / n ** 0.5) / days ** 0.5, 2)
 
 
 def case_v35():
@@ -2367,7 +2372,9 @@ def case_v35():
                  "WHEN a.m_edge <= -0.5 AND a.ahead <= 0.45 AND tt.t_adj <= -2 THEN 'loses to its market'",
                  "SELECT market_group, sector, horizon, recorded_date, AVG(edge) AS m",
                  "ROUND(SAFE_DIVIDE(AVG(m), SAFE_DIVIDE(STDDEV(m), SQRT(COUNT(*))))",
-                 "/ SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj",
+                 # review of PR 1106: every horizon divided by its own days; one outside the list has no t
+                 "/ SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91",
+                 "WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj",
                  "JOIN tt USING (market_group, sector, horizon)"):
         assert frag in code, frag
     assert "THEN 'beats its market'" in code and code.count("tt.t_adj") == 3   # the column and both readings
@@ -2390,6 +2397,11 @@ def case_v35():
     assert _sector_t(days, "1W") == round(2.0 / (1.0127393670836666 / 40 ** 0.5) / 7 ** 0.5, 2) == 4.72
     assert _sector_t(days, "1M") == 2.28 and _sector_t(days, "3M") == 1.31       # the longer the hold, the less each date adds
     assert _sector_t([2.0], "1W") is None and _sector_t([2.0, 2.0, 2.0], "1W") is None
+    # review of PR 1106: a 6M or 1Y cohort divided by 91 days would read 1.31 here; by its own days 0.93 and 0.65
+    assert _sector_t(days, "6M") == 0.93 and _sector_t(days, "1Y") == _sector_t(days, "12M") == 0.65
+    assert _sector_t(days, "2Y") is None and _sector_reading(416, 0.91, 0.611, _sector_t(days, "2Y")) == "no clear edge"
+    for sql in ("86_v_outcome_sector.sql", "138_v_forward_signal_gates.sql"):
+        assert "ELSE 91" not in (ROOT / "sql" / "bigquery" / sql).read_text(encoding="utf-8"), sql
     # v_trial_c2: the fixed rule
     c = objs["v_trial_c2"]
     assert c.path.name == "87_v_trial_c2.sql" and c.kind == "VIEW"
@@ -4201,7 +4213,8 @@ def case_v67():
                  "IF(gate = 'admitted', losers, NULL) AS admitted_losers,",
                  # a date's signals averaged first; neighbouring dates share most of their window
                  "SELECT period, market_group, horizon, gate, block_reason_class, recorded_date, AVG(active_net_pp) AS m",
-                 "/ SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj",
+                 "/ SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91",
+                 "WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj",
                  "WHEN period != 'forward from 2026-11-26' THEN 'in-sample, not evidence'",
                  "WHEN with_outcome < 30 OR days < 8 THEN 'collecting'",
                  "WHEN gate = 'kept out' AND t_adj <= -2 THEN 'works: the names kept out trailed their benchmark'",

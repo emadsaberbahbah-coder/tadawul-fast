@@ -17,9 +17,12 @@
 -- same 100-call floor as the calls-against-the-market panel.
 -- t_adj (views 1.35.0, full review of 27 Nov 2026): the mean over distinct
 -- recording dates - a date's calls averaged first - over its standard error,
--- divided by SQRT of the horizon in days (7 / 14 / 30 / 91), as
--- v_forward_signal_gates does: neighbouring dates share most of their
--- holding window, and a name recorded on many days is one bet, not many.
+-- divided by SQRT of the horizon in days (7 / 14 / 30 / 91, and 182 / 365
+-- for a 6M or a 12M / 1Y call), as v_forward_signal_gates does: neighbouring
+-- dates share most of their holding window, and a name recorded on many days
+-- is one bet, not many. A horizon outside that list has no t, and so no
+-- 'beats' or 'loses' reading (review of PR 1106: a longer hold divided by 91
+-- would have its t overstated).
 -- WHY: without it 15 cells read 'beats its market' on the Learning Watch page
 -- as PROVEN, on overlapping calls and with no test at all.
 -- COLUMNS: market_group (US / Tadawul / Other markets / ALL), sector
@@ -79,7 +82,8 @@ tt AS (
     sector,
     horizon,
     ROUND(SAFE_DIVIDE(AVG(m), SAFE_DIVIDE(STDDEV(m), SQRT(COUNT(*))))
-          / SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj
+          / SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91
+                              WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj
   FROM dd
   GROUP BY market_group, sector, horizon
 )

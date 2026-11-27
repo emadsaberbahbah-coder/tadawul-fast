@@ -10,8 +10,9 @@
 -- recording dates with an outcome), winners (active_net_pp > 0), losers (the rest), winner_pct, blocked_winners
 -- (winners of a 'kept out' row), admitted_losers (losers of the 'admitted' row), mean_stock_pp, mean_bench_pp,
 -- mean_active_net_pp and t_adj (the mean over distinct recording dates - a date's signals averaged first - over
--- its standard error, divided by SQRT of the horizon in days, 7 / 14 / 30 / 91: neighbouring dates share most of
--- their window).
+-- its standard error, divided by SQRT of the horizon in days, 7 / 14 / 30 / 91 and 182 / 365 for a 6M or a
+-- 12M / 1Y signal: neighbouring dates share most of their window; a horizon outside that list has no t, and so
+-- no 'works' or 'fails' reading - views 1.35.0).
 -- THE READING (fixed on 26 Nov 2026): 'in-sample, not evidence' for every row but 'forward from 2026-11-26'; for the
 -- forward rows 'collecting' under 30 outcomes or 8 dates; then, for a 'kept out' row, 'works: the names kept out
 -- trailed their benchmark' at t_adj <= -2 and 'fails: the names kept out beat their benchmark' at t_adj >= 2; for
@@ -54,7 +55,8 @@ a AS (
 j AS (
   SELECT a.*, IFNULL(d.days, 0) AS days,
     ROUND(SAFE_DIVIDE(d.e_mean, SAFE_DIVIDE(d.e_sd, SQRT(d.days)))
-          / SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj
+          / SQRT(CASE a.horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 WHEN '3M' THEN 91
+                                WHEN '6M' THEN 182 WHEN '12M' THEN 365 WHEN '1Y' THEN 365 END), 2) AS t_adj
   FROM a LEFT JOIN d USING (period, market_group, horizon, gate, block_reason_class)
 )
 SELECT

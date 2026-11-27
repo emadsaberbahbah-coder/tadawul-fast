@@ -23,6 +23,7 @@ The full project review of 27 Nov (owner's approval at 14:06 Riyadh: "ok approve
 ### `sql/bigquery/86_v_outcome_sector.sql` (views 1.34.0 → **1.35.0**) and `scripts/learning_watch.py` 1.2.0 → **1.2.1**
 - The view gains `t_adj`: the mean over distinct recording dates (a date's calls averaged first) over its standard error, divided by SQRT of the horizon in days (7 / 14 / 30 / 91), as `v_forward_signal_gates` does. 'beats its market' and 'loses to its market' now also need `t_adj` of 2 or more either way. One new column, before `reading`.
 - Learning Watch reads the new column (shown under t).
+- **Review of this PR (automated review, P2), accepted:** the divisor was 91 days for every horizon past 1M, which would overstate the t of a 6M or 1Y cohort by about 1.4 and 2. Each horizon is now divided by its own days (7 / 14 / 30 / 91 / 182 / 365) in both views that carry the adjusted t, `86_v_outcome_sector.sql` and `138_v_forward_signal_gates.sql`; a horizon outside that list has no t and so no 'beats', 'loses', 'works' or 'fails' reading. The archive holds only 1W, 2W, 1M and 3M today: the new gates body returns the installed view's rows exactly, and the sector view still reads 2 'beats its market', 30 'no clear edge', 164 'too few calls'.
 - **On the data of 27 Nov:** 2 of the 15 cells keep 'beats its market' (Other markets, Financials, 1W t 2.46 and 2W t 2.11); 13 read 'no clear edge' (t 0.22 to 1.87).
 
 ### `scripts/tfb_export_audit.py` 1.2.2 → **1.2.3**

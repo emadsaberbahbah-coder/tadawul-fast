@@ -15,7 +15,13 @@ days, as v_forward_signal_gates does - and 'beats its market' / 'loses to
 its market' also need t_adj of 2 or more either way. On the data of 27 Nov:
 2 of the 15 cells keep the reading (t 2.11 and 2.46), 13 read 'no clear
 edge' (t 0.22 to 1.87). One new column (t_adj, before reading). Research
-only; no other file changes.
+only. Review of PR 1106: the divisor was 91 days for every horizon past 1M,
+which would overstate the t of a 6M or 1Y cohort (by about 1.4 and 2). Each
+horizon is now divided by its own days (7 / 14 / 30 / 91 / 182 / 365) in both
+views that carry the adjusted t - v_outcome_sector (86) and
+v_forward_signal_gates (138) - and a horizon outside that list has no t and
+so no claim. The archive holds only 1W, 2W, 1M and 3M today, so no number on
+either view moves.
 
 v1.34.0 (27 Nov 2026, the shadow challenger v0). WHY (week plan of 23 Nov
 2026, package 5; owner, 23 Nov 2026: "go and Start build"): the 23 Nov deep
