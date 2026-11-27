@@ -394,8 +394,10 @@ PENDING = {
     "v_news_llm_duel": "92b377b8bc3beebb12d86ec0820e25c61d03cfead4751b3ef3b22838da430cc0",
     # apply_bq_views 1.34.0 (27 Nov 2026): the shadow challenger v0 - price inputs ranked per market and sector,
     # weights learned walk-forward, a shadow action and size per name, and its scorecard (research only)
-    "v_challenger_v0_features": "33a6db6c984f8578fbe3c6ba19dbdccdc82d816d5ecf3fd1ea601cbfdf0ef9b8",
-    "v_challenger_v0_ranks": "2f98c250c05913f033a71290cdb8dfb25eafaf27788f48eb92b21a6a94fb852c",
+    # (1.37.0: the features read v_bars_clean and the ranks measure the result inside one price basis;
+    #  were 33a6db6c984f and 2f98c250c059)
+    "v_challenger_v0_features": "def69759414e36f8515b2f101b6ce5dfaa04cfad2c0b8b342c77bb9427d325e0",
+    "v_challenger_v0_ranks": "df28a4b262e60095f71ba722ecafa9c0f7c18209a0c3aad101081aae1d4b6cd8",
     "v_challenger_v0_walkforward": "0e39890fc235a201810a8d0d1fcc929e5e9aaef68bbabbe00905098555cc6281",
     "v_challenger_v0_scorecard": "c0ee2aa57cf9680afa5a26c100f8fc8928684b5cba4ec7d3b76841ea161a4982",
     # apply_bq_views 1.35.0 (27 Nov 2026): v_outcome_sector reads 'beats' / 'loses' only with t_adj of 2 or more
@@ -406,6 +408,8 @@ PENDING = {
     # the jump that undid each, and a fixed reading per symbol (research only)
     "v_bar_jumps": "061b569c64d3993653678f03cd3fc55daf502c2abb215f9e9371a2f39417c804",
     "v_bar_jump_symbols": "a28abd397adb0792f8fd076f3e8f6018cc1038f0f3fe890a86e88cf6c122a522",
+    # apply_bq_views 1.37.0 (27 Nov 2026): the bar archive less its spikes, with a price basis per bar, for the return maths
+    "v_bars_clean": "48090d1c66997868cb71969337460bf2a1a052b0f7f8a53e6debd9405e4e2c6a",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -413,6 +417,8 @@ EXPECTED_ORDER = [
     "v_top10_board", "v_portfolio_decision", "v_my_portfolio", "v_top10_status",
     "v_run_log", "v_archive_health",
     "v_market_daily", "f_market_window", "f_market_summary",
+    # views 1.37.0: the bar archive check moves ahead of every view that computes a return, with the clean bars
+    "v_bar_jumps", "v_bar_jump_symbols", "v_bars_clean",
     "v_universe", "v_universe_latest", "f_universe_return",
     "v_news_items", "v_econ_events", "v_news_gate", "v_calendar_events", "v_fx_sar", "f_symbol_pick",
     "v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
@@ -446,10 +452,9 @@ EXPECTED_ORDER = [
     "v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon",
     "v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel",
     "v_challenger_v0_features", "v_challenger_v0_ranks", "v_challenger_v0_walkforward", "v_challenger_v0_scorecard",
-    "v_bar_jumps", "v_bar_jump_symbols",
 ]
-EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 2
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 89)
+EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 5
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 87)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -1022,9 +1027,10 @@ def case_v18():
         "v_stop_cause_events": {"symbol_bars_daily"},         # v1.30.0: the falls of the followed US and Saudi shares
         "v_forward_signals": {"symbol_bars_daily"},           # v1.31.0: the base bar's close, for the entry-price test
         "v_news_llm_days": {"symbol_bars_daily"},              # v1.32.0: each name's next sessions after its news day
-        "v_challenger_v0_features": {"symbol_bars_daily"},    # v1.34.0: the challenger's price inputs
+        # v1.34.0: the challenger's price inputs - from v1.37.0 through v_bars_clean, so it reads no deep table itself
         "v_bar_jumps": {"symbol_bars_daily"},                  # v1.36.0: the archive's own closes, checked for jumps
-        "v_bar_jump_symbols": {"symbol_bars_daily"}}, used     # v1.36.0: the archive's newest bar, for 'is_new'
+        "v_bar_jump_symbols": {"symbol_bars_daily"},           # v1.36.0: the archive's newest bar, for 'is_new'
+        "v_bars_clean": {"symbol_bars_daily"}}, used           # v1.37.0: the archive less its spikes, with a basis
     assert {"symbol", "date", "close", "volume", "source"} <= cols["symbol_bars_daily"]            # what v_bar_jumps reads
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
@@ -3230,10 +3236,10 @@ def case_v44():
 def case_v45():
     """apply_bq_views 1.18.0 (kept in 1.32.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.36.0"
+    assert bv.__version__ == "1.37.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-51:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-49:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
@@ -3254,9 +3260,8 @@ def case_v45():
                            "139_v_forward_signal_recon.sql", "140_v_news_llm.sql", "141_v_news_llm_days.sql",
                            "142_v_news_llm_eval.sql", "143_v_news_llm_duel.sql",
                            "144_v_challenger_v0_features.sql", "145_v_challenger_v0_ranks.sql",
-                           "146_v_challenger_v0_walkforward.sql", "147_v_challenger_v0_scorecard.sql",
-                           "148_v_bar_jumps.sql", "149_v_bar_jump_symbols.sql"]
-    assert files[:-50] == sorted(files[:-50])                                       # the two-digit order is unchanged
+                           "146_v_challenger_v0_walkforward.sql", "147_v_challenger_v0_scorecard.sql"]
+    assert files[:-48] == sorted(files[:-48])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3536,7 +3541,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 42
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 40
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3829,7 +3834,7 @@ def case_v58():
     assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
     objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
     names = [o.name for o in bv.load_objects()]
-    assert names[-35:-30] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+    assert names[-33:-28] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
                             "v_driver_learning"]
     for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
                  "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
@@ -3909,7 +3914,7 @@ def case_v61():
     no look-ahead (the state and the volatility of the last close BEFORE the call), a within-day lift for the stock
     rule and a between-days lift for the market rules, read only at 20 call days and 40 forward calls."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-30:-28] == ["v_projection_context", "v_projection_scorecard"]
+    assert names[-28:-26] == ["v_projection_context", "v_projection_scorecard"]
     _, pc = _driver_view("v_projection_context", 120, {"v_universe_latest", "v_options_reading", "v_market_drivers"},
                          "1.24.0")
     for frag in ("COALESCE(o.iv30, u.volatility_30d_pct) AS vol",
@@ -3958,7 +3963,7 @@ def case_v62():
     was read; the outcome starts at the close AFTER the reaction window (no look-ahead); every t is overlap-adjusted;
     only sessions from 24 Nov 2026 are evidence; today's reading sits beside TFB's own view."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-28:-25] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
+    assert names[-26:-23] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
     _, nd = _driver_view("v_news_trend_daily", 122,
                          {"market_series_daily", "v_symbol_news_class", "v_news_items", "symbol_bars_daily"}, "1.25.0")
     _, nl = _driver_view("v_news_trend_learning", 123, {"v_news_trend_daily"}, "1.25.0")
@@ -4016,7 +4021,7 @@ def case_v63():
     the shock-drop shadow rule on the 100 largest US equities with bars, two ways of entering fixed before reading,
     the outcome from the signal close only, the history read as in-sample (survivorship), forward from 24 Nov 2026."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-25:-22] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
+    assert names[-23:-20] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
     _, cc = _driver_view("v_confidence_calibration", 125, {"v_performance_log", "market_series_daily"}, "1.26.0")
     _, se = _driver_view("v_shock_drop_events", 126, {"v_universe", "market_series_daily", "symbol_bars_daily"},
                          "1.26.0")
@@ -4079,7 +4084,7 @@ def case_v64():
     assert bv.NOW_TABLES <= bv.SOURCE_TABLES and not (bv.NOW_TABLES & bv.DEEP_TABLES)
     assert nn.SCHEMA_NEWS is asd.SCHEMA_NEWS                                  # the same columns as the nightly feed
     objs = {o.name: o for o in bv.load_objects()}
-    assert [o.name for o in bv.load_objects()][-22] == "v_symbol_news_class_now"
+    assert [o.name for o in bv.load_objects()][-20] == "v_symbol_news_class_now"
     _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "snap_universe_latest"}, "1.29.0")
     night = bv._code(objs["v_symbol_news_class"].template)
     desc = re.compile(r'OPTIONS \(description = "[^"]*"\)')
@@ -4101,7 +4106,7 @@ def case_v65():
     v_news_trend_learning does, with the reading fixed before any outcome was seen."""
     import news_now as nn
     names = [o.name for o in bv.load_objects()]
-    assert names[-21:-19] == ["v_news_now_eval", "v_news_now_learning"]
+    assert names[-19:-17] == ["v_news_now_eval", "v_news_now_learning"]
     _, ev = _driver_view("v_news_now_eval", 129, {"news_now_log", "symbol_bars_daily", "market_series_daily"}, "1.28.0")
     _, le = _driver_view("v_news_now_learning", 130, {"v_news_now_eval"}, "1.28.0")
     log_cols = {f["name"] for f in nn.SCHEMA_LOG}
@@ -4142,7 +4147,7 @@ def case_v67():
     signal against the benchmark of its own market net of a stated cost, the names the gates kept out beside the
     names they let in, and the ledger's counts held to the outcome engine's."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-13:-10] == ["v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon"]
+    assert names[-11:-8] == ["v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon"]
     objs, fs = _driver_view("v_forward_signals", 137,
                             {"v_outcome_engine", "symbol_bars_daily", "v_universe", "market_series_daily"}, "1.31.0")
     _, fg = _driver_view("v_forward_signal_gates", 138, {"v_forward_signals"}, "1.31.0")
@@ -4255,7 +4260,7 @@ def case_v66():
     the engine's labels, cash entered after a not-calm reading. Each rule is fixed on 26 Nov 2026, every earlier row
     is in-sample, and the outcome is the only look forward."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-19:-13] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
+    assert names[-17:-11] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
                             "v_cash_entry_events", "v_cash_entry_trial"]
     _, se = _driver_view("v_stop_cause_events", 131, {"market_series_daily", "symbol_bars_daily"}, "1.30.0")
     _, sl = _driver_view("v_stop_cause_learning", 132, {"v_stop_cause_events"}, "1.30.0")
@@ -4413,7 +4418,7 @@ def case_v68():
     import archive_to_bigquery as arc
     import news_llm_reader as llm
     names = [o.name for o in bv.load_objects()]
-    assert names[-10:-6] == ["v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel"]
+    assert names[-8:-4] == ["v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel"]
     # the source: the reader's tab, copied nightly by archive 1.2.0 with header row 1
     assert arc.TABS[-1] == ("_News_LLM", 1) and arc.table_name("_News_LLM") == "news_llm" == llm.TAB.strip("_").lower()
     assert "news_llm" in bv.ARCHIVE_TABLES and "news_llm" in bv.SOURCE_TABLES
@@ -4491,8 +4496,8 @@ def case_v69():
     names = [o.name for o in objs]
     chain = ["v_challenger_v0_features", "v_challenger_v0_ranks", "v_challenger_v0_walkforward",
              "v_challenger_v0_scorecard"]
-    assert names[-6:-2] == chain
-    by, fe = _driver_view("v_challenger_v0_features", 144, {"symbol_bars_daily", "v_symbol_sector"}, "1.34.0")
+    assert names[-4:] == chain
+    by, fe = _driver_view("v_challenger_v0_features", 144, {"v_bars_clean", "v_symbol_sector"}, "1.34.0")
     _, rk = _driver_view("v_challenger_v0_ranks", 145, {"v_challenger_v0_features", "market_series_daily"}, "1.34.0")
     _, wf = _driver_view("v_challenger_v0_walkforward", 146, {"v_challenger_v0_ranks"}, "1.34.0")
     _, sc = _driver_view("v_challenger_v0_scorecard", 147, {"v_challenger_v0_walkforward"}, "1.34.0")
@@ -4500,8 +4505,11 @@ def case_v69():
     for frag in (# the inputs: closes up to the session only
                  "LAG(x.p, 21) OVER w AS p21, LAG(x.p, 63) OVER w AS p63,",
                  "LAG(x.p, 126) OVER w AS p126, LAG(x.p, 252) OVER w AS p252",
-                 "WINDOW w63 AS (PARTITION BY l.symbol ORDER BY l.date ROWS BETWEEN 62 PRECEDING AND CURRENT ROW),",
-                 "w126 AS (PARTITION BY l.symbol ORDER BY l.date ROWS BETWEEN 125 PRECEDING AND CURRENT ROW)",
+                 # views 1.37.0: every window runs inside one price basis of the symbol (v_bars_clean)
+                 "WINDOW w AS (PARTITION BY x.symbol, x.basis ORDER BY x.date)",
+                 "WINDOW w63 AS (PARTITION BY l.symbol, l.basis ORDER BY l.date ROWS BETWEEN 62 PRECEDING AND CURRENT ROW),",
+                 "w126 AS (PARTITION BY l.symbol, l.basis ORDER BY l.date ROWS BETWEEN 125 PRECEDING AND CURRENT ROW)",
+                 "FROM `{{DS}}.v_bars_clean`",
                  "IF(n63 >= 60 AND vol63 > 0 AND p252 > 0, SAFE_DIVIDE(p21 / p252 - 1, vol63), NULL) AS mom12_vs,",
                  "IF(n63 >= 60 AND vol63 > 0 AND p126 > 0, SAFE_DIVIDE(p21 / p126 - 1, vol63), NULL) AS mom6_vs,",
                  "IF(n126 >= 120, -down126, NULL) AS low_down126",
@@ -4521,6 +4529,8 @@ def case_v69():
                  # the result: bought at the NEXT close, sold 21 sessions later, against the market's benchmark
                  "LEAD(date, 1) OVER w AS entry_date, LEAD(p, 1) OVER w AS entry_p,",
                  "LEAD(date, 22) OVER w AS exit_date, LEAD(p, 22) OVER w AS exit_p",
+                 # views 1.37.0: the result is measured inside one price basis; one that spans a break is left empty
+                 "WINDOW w AS (PARTITION BY symbol, basis ORDER BY date)",
                  "IF(DATE_DIFF(l.exit_date, f.date, DAY) <= 45, (l.exit_p / l.entry_p - 1) * 100, NULL) AS fwd_pp",
                  "CASE f.market WHEN 'US' THEN 'SPY' WHEN 'SA' THEN '^TASI.SR' WHEN 'JP' THEN '^N225' WHEN 'HK' THEN '^HSI'",
                  "ANY_VALUE(IF(symbol IN ('SPY', 'ACWI'), COALESCE(adj_close, close), close)) AS bp",
@@ -4624,6 +4634,8 @@ BAR_SERIES = {
     # review of PR 1107: a factor of 2.9994 reads 0.333 when rounded, whose inverse is 3.003 - it is under 3
     "NEAR3": _days([100, 33.34, 33.34, 33.34, 33.34]),
     "AT3": _days([30, 10, 10, 10, 10]),                                      # exactly 3 times, downwards
+    # views 1.37.0: too new to tell and 3 times - v_bars_clean starts a new basis on it (run in BigQuery on 27 Nov)
+    "NEW3": _days([10, 10, 10, 30, 31]),
 }
 BAR_JUMPS_EXPECTED = [
     # symbol, date, ratio, leg, bars_away, back_date, bars_after, kind
@@ -4653,6 +4665,7 @@ BAR_JUMPS_EXPECTED = [
 BAR_JUMPS_EXPECTED = sorted(BAR_JUMPS_EXPECTED + [
     ("NEAR3", "2026-01-02", 0.333, "alone", None, None, 3, "step"),
     ("AT3", "2026-01-02", 0.333, "alone", None, None, 3, "step"),           # the same rounded ratio as NEAR3
+    ("NEW3", "2026-01-04", 3.0, "alone", None, None, 1, "too new"),
 ])
 BAR_SYMBOLS_EXPECTED = {
     # symbol: jumps, spikes, detours, steps, too_new, bars_on_another_level, largest_factor, largest_step_factor,
@@ -4670,6 +4683,7 @@ BAR_SYMBOLS_EXPECTED = {
     "ZERO": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "large step"),
     "NEAR3": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "steps under 3 times"),     # 2.9994 shows as 3.0 and is under 3
     "AT3": (1, 0, 0, 1, 0, 0, 3.0, 3.0, False, "large step"),
+    "NEW3": (1, 0, 0, 0, 1, 0, 3.0, None, False, "too new"),
 }
 
 
@@ -4738,9 +4752,10 @@ def case_v70():
     pairs with it (spike within 3 bars, detour after more); a jump nothing undid is a step, or too new. The symbol
     view reads each series: two price bases, bad bar, large step, too new, steps under 3 times."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-2:] == ["v_bar_jumps", "v_bar_jump_symbols"]
-    objs, bj = _driver_view("v_bar_jumps", 148, {"symbol_bars_daily"}, "1.36.0")
-    _, bs = _driver_view("v_bar_jump_symbols", 149, {"v_bar_jumps", "symbol_bars_daily"}, "1.36.0")
+    at = names.index("f_market_summary") + 1                        # 1.37.0: ahead of every view that computes a return
+    assert names[at:at + 3] == ["v_bar_jumps", "v_bar_jump_symbols", "v_bars_clean"]
+    objs, bj = _driver_view("v_bar_jumps", 43, {"symbol_bars_daily"}, "1.36.0")
+    _, bs = _driver_view("v_bar_jump_symbols", 44, {"v_bar_jumps", "symbol_bars_daily"}, "1.36.0")
     assert bv.check_objects(bv.load_objects()) == []
     for frag in (# the jump, on the archive's own previous bar; a close of 0 or less is no bar
                  "FROM `{{DS}}.symbol_bars_daily`\n  WHERE close > 0",
@@ -4798,6 +4813,95 @@ def case_v70():
     legs = {s: [j[3] for j in _bar_jumps({s: rows})] for s, rows in edge.items()}
     assert legs == {"P80": ["out", "back"], "P125": ["out", "back"], "P79": ["alone", "alone"], "P126": ["alone", "alone"],
                     "D60": ["out", "back"], "D61": ["alone", "alone"]}
+
+# ----------------------------------------------------------------------------- v71: clean bars for the return maths
+# What the body of 45_v_bars_clean.sql returned in BigQuery on 27 Nov 2026 for BAR_SERIES (with 43_v_bar_jumps.sql
+# in place of the installed view): bars kept, the dates removed, and the basis of each kept bar in date order.
+BARS_CLEAN_EXPECTED = {
+    "AT3": (5, [], "01111"),                       # exactly 3 times and nothing undid it: a new basis
+    "B3": (6, ["01-03", "01-04", "01-05"], "000000"),   # a spike of three bars: removed
+    "B4": (10, [], "0011112222"),                  # a detour: a new basis at each end, nothing removed
+    "DET": (16, ["01-13"], "0011111112222222"),    # a detour, then a one-bar spike
+    "DRIFT": (10, [], "0000000000"),               # two steps under 3 times: kept whole
+    "EDGE": (13, [], "0111111112222"),             # a detour of exactly 1.5 and two thirds
+    "FAR": (14, [], "00000000000000"),
+    "FLAT": (7, [], "0000000"),
+    "NEAR3": (5, [], "00000"),                     # 2.9994 times: under 3, kept whole
+    "NEW": (5, [], "00000"),                       # too new and under 3 times
+    "SPK": (6, ["01-03"], "000000"),
+    "STEP": (7, [], "0011111"),                    # 37.6 times: a new basis
+    "THREE": (7, ["01-02"], "0000000"),            # a spike, then a step of 2.95 (kept)
+    "ZERO": (5, [], "01111"),                      # 3 times across a close of 0 (no bar)
+    "NEW3": (5, [], "00011"),                      # too new, 3 times: a new basis at once
+}
+
+
+def _bars_clean(series):
+    """The rule of v_bars_clean in Python: {symbol: (kept, removed MM-DD dates, basis string)} from the rows of
+    _bar_jump_rows - a spike's bars removed, a new basis at every detour jump and every jump of 3 times or more that
+    nothing undid."""
+    rows = _bar_jump_rows(series)
+    out = {}
+    for sym, bars in sorted(series.items()):
+        js = [r for r in rows if r[0] == sym]
+        spikes = [(dt.date.fromisoformat(r[1]), dt.date.fromisoformat(r[5])) for r in js if r[7] == "spike" and r[3] == "out"]
+        breaks = {dt.date.fromisoformat(r[1]) for r in js if r[7] == "detour" or (r[3] == "alone" and r[8] >= 3)}
+        kept, removed = [], []
+        for d, c in sorted(bars):
+            if c is None or c <= 0:
+                continue
+            if any(d0 <= d < d1 for d0, d1 in spikes):
+                removed.append(d.strftime("%m-%d"))
+                continue
+            kept.append(sum(1 for k in breaks if k <= d))
+        out[sym] = (len(kept), removed, "".join(str(b) for b in kept))
+    return out
+
+
+def case_v71():
+    """v_bars_clean (1.37.0): the archive less the bars of its one-to-three-bar spikes, with a price basis that starts
+    anew at every detour jump and every jump of 3 times or more that nothing undid; the shadow challenger reads it,
+    runs every input window inside one basis and measures every result inside one basis."""
+    objs = bv.load_objects()
+    names = [o.name for o in objs]
+    assert names.index("v_bar_jumps") < names.index("v_bar_jump_symbols") < names.index("v_bars_clean") \
+        < names.index("v_outcome_engine") < names.index("v_challenger_v0_features")
+    by, cl = _driver_view("v_bars_clean", 45, {"v_bar_jumps", "symbol_bars_daily"}, "1.37.0")
+    for frag in ("SELECT symbol, date, back_date, leg, kind, factor\n  FROM `{{DS}}.v_bar_jumps`",
+                 # removed: the bars of a spike, from its 'out' jump up to the bar before its 'back' jump
+                 "WHERE kind = 'spike' AND leg = 'out'",
+                 "LEFT JOIN spike_bars AS s ON s.symbol = x.symbol AND x.date >= s.d0 AND x.date < s.d1",
+                 "WHERE x.close > 0 AND s.symbol IS NULL",
+                 # a new basis: every detour jump, and every jump of 3 times or more that nothing undid
+                 "WHERE kind = 'detour' OR (leg = 'alone' AND factor >= 3)",
+                 "LEFT JOIN breaks AS k ON k.symbol = d.symbol AND k.date <= d.date",
+                 "SELECT d.symbol, d.date, COUNT(k.date) AS basis",
+                 "SELECT b.*, s.basis"):
+        assert frag in cl, frag
+    assert "CURRENT_" not in cl and "LEAD(" not in cl and "ratio" not in cl    # the unrounded factor decides (PR 1107)
+    tpl = by["v_bars_clean"].template
+    assert "it removes recording errors, it never reads a" in tpl and "read it from views 1.37.0" in tpl
+    # the challenger: inputs and results inside one basis, from the clean bars only
+    fe = bv._code(by["v_challenger_v0_features"].template)
+    rk = bv._code(by["v_challenger_v0_ranks"].template)
+    assert "symbol_bars_daily" not in fe and "FROM `{{DS}}.v_bars_clean`" in fe
+    assert fe.count("PARTITION BY x.symbol, x.basis ORDER BY x.date") == 1 and fe.count(", l.basis ORDER BY l.date ROWS") == 2
+    assert "PARTITION BY l.symbol ORDER BY" not in fe and "PARTITION BY x.symbol ORDER BY" not in fe
+    assert "  market, sector, symbol, date, basis, p, lr," in fe
+    assert "WINDOW w AS (PARTITION BY symbol, basis ORDER BY date)" in rk and "PARTITION BY symbol ORDER BY date" not in rk
+    assert bv.lookahead_problems(objs) == [] and bv.check_objects(objs) == []
+    # the outcome engine and the forward ledger still read the raw archive (the next step, not this one)
+    for name in ("v_outcome_engine", "v_forward_signals"):
+        assert "symbol_bars_daily" in bv._code(by[name].template) and "v_bars_clean" not in bv._code(by[name].template)
+    # the rule, on the series the SQL itself was run on
+    assert _bars_clean(BAR_SERIES) == BARS_CLEAN_EXPECTED
+    # each part of the rule decides a case above
+    got = BARS_CLEAN_EXPECTED
+    assert got["SPK"][1] == ["01-03"] and got["B3"][1] == ["01-03", "01-04", "01-05"] and got["B4"][1] == []  # 3 bars / 4
+    assert got["AT3"][2] == "01111" and got["NEAR3"][2] == "00000"                                         # 3 / 2.9994
+    assert got["DRIFT"][2] == "0" * 10 and got["THREE"][2] == "0" * 7                                      # under 3: whole
+    assert got["B4"][2] == "0011112222"                                                    # both ends of a detour
+    assert got["NEW3"][2] == "00011" and got["NEW"][2] == "00000"                       # too new: 3 times / 2 times
 
 
 def test_v1(): case_v1()
@@ -4870,6 +4974,7 @@ def test_v67(): case_v67()
 def test_v68(): case_v68()
 def test_v69(): case_v69()
 def test_v70(): case_v70()
+def test_v71(): case_v71()
 
 
 if __name__ == "__main__":

@@ -2,8 +2,26 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.36.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.37.0 (program register C8, Phase 2)
 ================================================================================
+v1.37.0 (27 Nov 2026, clean bars for the return maths). WHY (the same plan
+item as 1.36.0, whose exit test reads "the challenger re-read"): v_bar_jumps
+found the jumps; nothing kept them out of a return. 27 of the 29 symbols are
+in the shadow challenger's books, and a result that spans one of them
+averaged 302 points of excess in the US and 98 in Saudi (7 and 6 for the
+rest). The challenger's first forward book forms on Mon 30 Nov 2026, so the
+fix lands before it. WHAT: v_bar_jumps (43) and v_bar_jump_symbols (44)
+move from 148 and 149 to the front of the return views (bodies unchanged),
+and v_bars_clean (45) is new: symbol_bars_daily less the bars of the
+one-to-three-bar spikes (8 bars on 7 symbols on 27 Nov), with a price basis
+per bar that starts anew at every detour jump and every unexplained jump of
+3 times or more (23 breaks on 10 symbols). v_challenger_v0_features (144)
+reads it and runs every window inside one basis; v_challenger_v0_ranks (145)
+measures the result inside one basis, so a result that spans a break is
+left empty. Model, ranks, weights and reading rules are unchanged. Re-read
+on 27 Nov: HK, JP and OTHER identical (HK still 'CANDIDATE (forward test)');
+SA and US move in the third decimal and keep 'NO EDGE'.
+
 v1.36.0 (27 Nov 2026, the bar archive check). WHY (full project review of
 27 Nov 2026, plan item 'Split and bad-print check on the nightly bars';
 owner, 27 Nov 2026 16:30 Riyadh: "ok let's start do your recommdadtions and
@@ -739,7 +757,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.36.0"
+__version__ = "1.37.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

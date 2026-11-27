@@ -22,7 +22,9 @@
 -- percentile of the market's results on that date, for the means of v_challenger_v0_scorecard: a few US names
 -- carry unadjusted reverse splits (a price x 100 in one session) whose results otherwise swamp any quintile mean.
 -- (Added after the first read on 27 Nov 2026; the reading rules of the scorecard were not changed.)
--- Research only: no decision, gate or count reads this view. (views 1.34.0)
+-- From views 1.37.0 the result is measured inside one price basis of the name (v_bars_clean): a result whose 22
+-- sessions would span a detour or an unexplained jump of 3 times or more is left empty, like one beyond 45 days.
+-- Research only: no decision, gate or count reads this view. (views 1.34.0; one price basis from views 1.37.0)
 CREATE OR REPLACE VIEW `{{DS}}.v_challenger_v0_ranks`
 OPTIONS (description = "TFB shadow challenger v0 ranks (views 1.34.0): on the first session of each ISO week of each market, each input ranked inside its market and sector (at least 20 peers, else the market, else neutral), the equal-weight score, and the next 21 sessions from the next close against the market's benchmark. Research view, never an order.")
 AS
@@ -46,7 +48,7 @@ lab AS (
          LEAD(date, 1) OVER w AS entry_date, LEAD(p, 1) OVER w AS entry_p,
          LEAD(date, 22) OVER w AS exit_date, LEAD(p, 22) OVER w AS exit_p
   FROM f
-  WINDOW w AS (PARTITION BY symbol ORDER BY date)
+  WINDOW w AS (PARTITION BY symbol, basis ORDER BY date)
 ),
 bench_raw AS (
   SELECT symbol AS bench_symbol, date, ANY_VALUE(IF(symbol IN ('SPY', 'ACWI'), COALESCE(adj_close, close), close)) AS bp
