@@ -2,7 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.105 (2026-11-27) -- FULL REVIEW OF 27 NOV: HONEST WORDS, PART 1
+# VERSION 1.1.106 (2026-11-27) -- THE CHALLENGER'S FORWARD BOOKS, FROZEN
+#
+# v1.1.106: run tests/test_challenger_books.py (scripts/challenger_books.py
+# 1.0.0 and .github/workflows/challenger_books.yml: each forward book of the
+# shadow challenger frozen once into BigQuery, the day it is final; research
+# only) right after tests/test_bq_snapshots.py. It is also collected by the
+# whole-suite job. Nothing is removed and no existing entry moves.
+#
+# (1.1.105, 2026-11-27: FULL REVIEW OF 27 NOV: HONEST WORDS, PART 1)
 #
 # v1.1.105: run tests/test_s1_significance.py (run_shadow_scorer 1.9.8: the
 # S-1 gate says whether its net alpha could be chance; observe only) right
@@ -1332,6 +1340,7 @@ jobs:
             tests/test_news_now.py \
             tests/test_learning_watch.py \
             tests/test_bq_snapshots.py \
+            tests/test_challenger_books.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \

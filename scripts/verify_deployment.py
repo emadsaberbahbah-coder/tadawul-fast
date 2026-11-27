@@ -477,6 +477,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (new script, pinned on arrival): the workbook grid trim - every tab's allocated grid against its
     # used extent, and (four gates, by hand) the trailing empty rows and columns deleted. Report by default.
     ("trim_workbook_grid", "1.0.0", "workbook grid trim"),
+    # 2026-11-27 (new script, pinned on arrival): each forward book of the shadow challenger frozen once into
+    # BigQuery challenger_books, the day it is final (append-only; research only, nothing reads it yet).
+    ("challenger_books", "1.0.0", "challenger books"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
