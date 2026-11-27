@@ -187,6 +187,10 @@ jobs:
           TFB_PLAN_REGIME_BLOCK: ${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
           TFB_PLAN_REGIME_CCY: ${{ vars.TFB_PLAN_REGIME_CCY || 'USD' }}
           TFB_PLAN_SECTOR_HELD_MAX: ${{ vars.TFB_PLAN_SECTOR_HELD_MAX || '3' }}
+          # 1.11.0 [RANKER]: observe labels each candidate with its analyst upside and the picks that order
+          # would make; upside orders the US candidates by it (the owner's switch). Rollback: engine.
+          TFB_PLAN_RANKER: ${{ vars.TFB_PLAN_RANKER || 'observe' }}
+          TFB_PLAN_RANKER_CCY: ${{ vars.TFB_PLAN_RANKER_CCY || 'USD' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |

@@ -223,6 +223,27 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE (owner, 28 Nov 2026 01:30 Riyadh: "Try to make
+full review and engine restructured looking for better results"). Measured that night (v_signal_edge, signal days
+to 26 Oct, US, 1 month, about 24-32 names a day, overlap-adjusted t): the engine's overall score, which orders the
+merit list this plan picks from, has IC -0.01 (t -0.09; on the names with an analyst target -0.19, t -1.13); the
+analyst target upside - the distance from the price to the source page's Target Price, the evidence rule's own
+number - has IC 0.30 (t 2.59, 42 days, 0.31 and 0.30 in the two halves), the best record in the system. Its
+forward evidence was fixed before any forward day: v_trial_c2 (calls from 20 Nov in the top half of their day by
+the upside), v_trial_shadow_v2 (from 19 Nov) and the upside's IC in v_signal_edge on the days after 19 Nov.
+TFB_PLAN_RANKER = engine (default: the merit list's order, unchanged) | observe | upside.
+  - upside: the eligible candidates priced in TFB_PLAN_RANKER_CCY (USD) that carry an analyst upside are ordered
+    by it, highest first; every other candidate follows in the engine's order. The kept-pick rule, the two-level
+    entry rule, the sector caps and the cash checks are unchanged. A pick says "ranked by analyst upside +x%
+    (engine rank n)" and a waiting name "next in line (upside order n; engine rank m)".
+  - observe: the order is the engine's; each candidate is labelled "[observe] analyst upside +x% - upside order
+    n of m" (or why it has none), and the names the upside order would pick under the day's sector cap read
+    "[observe] the upside ranker would pick this (before the cash and held-sector checks)".
+  - The run log gives counts only: how many candidates carry an upside and how many of the day's picks the upside
+    order would keep (the repository's logs are public).
+The workflow arms observe; upside is the owner's switch once the forward test reads in its favour.
+Rollback: repository variable TFB_PLAN_RANKER=engine.
+
 1.10.3 (23 Nov 2026): OPENING THE WORKBOOK WAITS OUT THE QUOTA TOO. The Daily Plan run
 45123566985 (23 Nov 06:3x UTC) ended "cannot open workbook: APIError" at its first call: opening the book reads its
 metadata, which counts against the same per-minute Sheets quota, and it was the one read never retried. It now goes
@@ -279,7 +300,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.10.3"
+__version__ = "1.11.0"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -377,6 +398,15 @@ def roi_cap_mode() -> str:
     return v if v in ("on", "observe", "off") else "on"
 
 
+RANKERS = ("engine", "observe", "upside")                                        # 1.11.0 [RANKER]
+
+
+def ranker_mode() -> str:
+    """1.11.0 [RANKER]: engine (default) | observe | upside; any other word is engine."""
+    v = _env("TFB_PLAN_RANKER", "engine").lower()
+    return v if v in RANKERS else "engine"
+
+
 def regime_mode() -> str:
     """1.10.0: off (default) | observe | enforce."""
     v = _env("TFB_PLAN_REGIME", "off").lower()
@@ -462,6 +492,9 @@ def knobs() -> Dict[str, Any]:
         "regime_block": [x for x in (p.strip().lower() for p in _env(
             "TFB_PLAN_REGIME_BLOCK", "weak,stress,drawdown,crash_day").split(",")) if x in REGIME_LABELS and x != "calm"],
         "regime_ccy": [c.strip().upper() for c in _env("TFB_PLAN_REGIME_CCY", "USD").split(",") if c.strip()],
+        "ranker": ranker_mode(),                                                  # 1.11.0 [RANKER]
+        "ranker_ccy": [c.strip().upper() for c in _env("TFB_PLAN_RANKER_CCY", "USD").split(",") if c.strip()]
+        or ["USD"],
         "sector_held_max": int(_env_num("TFB_PLAN_SECTOR_HELD_MAX", 0, 0, 20)),   # 1.10.0: 0 = off
         "roi_cap_pct": _env_num("TFB_PLAN_ROI_CAP_PCT", 34, 20, 100),
     }
@@ -723,6 +756,38 @@ def evidence_rule(symbol: str, src: Dict[str, Any], risk_max: float, upside_min:
     return "FAIL", "evidence rule FAIL (%s; needs %s)" % (facts, " and ".join(need))
 
 
+def analyst_upside(src: Dict[str, Any]) -> Optional[float]:
+    """1.11.0 [RANKER] PURE: the analyst target's distance above the price in percent, from the source page (the
+    evidence rule's number and v_signal_edge's target_upside); None without a positive price and target."""
+    price, target = num(src.get("price")), num(src.get("target"))
+    if price is None or target is None or price <= 0 or target <= 0:
+        return None
+    return round((target / price - 1.0) * 100.0, 4)
+
+
+def upside_order(cands: Sequence[Dict[str, Any]], ccy: Sequence[str]) -> List[Dict[str, Any]]:
+    """1.11.0 [RANKER] PURE: the candidates priced in `ccy` that carry an upside, highest first (ties by the engine's
+    rank), then every other candidate in the engine's order."""
+    ranked = [c for c in cands if c.get("ccy") in ccy and c.get("upside") is not None]
+    rest = [c for c in cands if not (c.get("ccy") in ccy and c.get("upside") is not None)]
+    return sorted(ranked, key=lambda c: (-c["upside"], c["rank"])) + sorted(rest, key=lambda c: c["rank"])
+
+
+def would_pick(order: Sequence[Dict[str, Any]], n: int, max_per_sector: int) -> List[Dict[str, Any]]:
+    """1.11.0 [RANKER] PURE: the first n of `order` under the day's sector cap alone (no cash or held-sector check)."""
+    out: List[Dict[str, Any]] = []
+    per: Dict[str, int] = {}
+    for c in order:
+        if len(out) >= n:
+            break
+        sec = sector_key(c.get("sector") or "") or "?"
+        if per.get(sec, 0) >= max(1, max_per_sector):
+            continue
+        per[sec] = per.get(sec, 0) + 1
+        out.append(c)
+    return out
+
+
 def _days_until(date_cell: Any, days_cell: Any, today: Optional[_dt.date]) -> Optional[float]:
     """1.0.1: days from `today` to the date in `date_cell` when it parses; else the stored day count."""
     d = parse_date(date_cell)
@@ -840,7 +905,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     pipeline: List[Dict[str, Any]] = []
     for q in qualified:
         src = sources.get(q["symbol"]) or {}
-        c = dict(q, price=src.get("price"), ccy=src.get("ccy") or "", labels=[], waiting="")
+        c = dict(q, price=src.get("price"), ccy=src.get("ccy") or "", labels=[], waiting="",
+                 upside=analyst_upside(src))                                       # 1.11.0 [RANKER]
         if not c["sector"]:
             c["sector"] = src.get("sector") or ""
         ev = cal.get(q["symbol"]) or {}
@@ -914,7 +980,26 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
                 fmt(c["score"], 1), fmt(s_in, 0), fmt(s_out, 0))
             pipeline.append(c)
         cands = [c for c in cands if not low(c)]
-    cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
+    rmode, rccy = k.get("ranker", "engine"), k.get("ranker_ccy") or ["USD"]       # 1.11.0 [RANKER]
+    order = upside_order(cands, rccy) if rmode != "engine" else []
+    upos = {id(c): i + 1 for i, c in enumerate(order)}
+    if rmode == "upside":
+        cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, upos[id(c)]))
+    else:
+        cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
+    alt = would_pick(order, k["picks"], max_per_sector) if rmode == "observe" else []
+    if rmode == "observe":
+        for c in cands:
+            if c.get("ccy") not in rccy:
+                c["labels"].append("[observe] no upside order (priced in %s)" % (c.get("ccy") or "?"))
+            elif c.get("upside") is None:
+                c["labels"].append("[observe] no analyst upside (no target price on its source page)")
+            else:
+                c["labels"].append("[observe] analyst upside %+.0f%% - upside order %d of %d" % (
+                    c["upside"], upos[id(c)], len(order)))
+            if any(a is c for a in alt):
+                c["labels"].append("[observe] the upside ranker would pick this (before the cash and held-sector "
+                                   "checks)")
     picks: List[Dict[str, Any]] = []
     per_sector: Dict[str, int] = {}
     held_max = int(k.get("sector_held_max", 0) or 0)                              # 1.10.0 [SECTOR-HELD]
@@ -928,7 +1013,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         shown = c["sector"] or "?"
         sec = sector_key(c["sector"]) or "?"                                        # 1.10.1: counted under GICS
         if len(picks) >= k["picks"]:
-            c["waiting"] = "next in line (rank %d)" % c["rank"]
+            c["waiting"] = ("next in line (upside order %d; engine rank %d)" % (upos[id(c)], c["rank"])
+                            if rmode == "upside" else "next in line (rank %d)" % c["rank"])
             pipeline.append(c)
         elif per_sector.get(sec, 0) >= max(1, max_per_sector):
             c["waiting"] = "sector cap (%s already has %d)" % (shown, per_sector[sec])
@@ -938,6 +1024,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
                 shown, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
             pipeline.append(c)
         else:
+            if rmode == "upside" and c.get("ccy") in rccy and c.get("upside") is not None:
+                c["labels"].append("ranked by analyst upside %+.0f%% (engine rank %d)" % (c["upside"], c["rank"]))
             if kept(c):
                 c["labels"].append("kept from the previous plan")
             elif low(c):
@@ -980,8 +1068,11 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
                   "tp2": round(entry * (1 + roi), 4) if roi > 0 else None,
                   "risk_sar": round(qty * (entry - stop) * fx, 2)})
     pipeline.sort(key=lambda c: c["rank"])
+    ranker = {"mode": rmode, "candidates": len(cands),
+              "with_upside": sum(1 for c in cands if c.get("ccy") in rccy and c.get("upside") is not None),
+              "alt": [c["symbol"] for c in alt]}
     return {"picks": picks, "pipeline": pipeline, "nav": nav, "cash": cash_sar, "deployable": deployable,
-            "per_pick": alloc}
+            "per_pick": alloc, "ranker": ranker}
 
 
 def pick_status(row: Dict[str, Any], price: Optional[float], held: Dict[str, _dt.date], plan_date: _dt.date,
@@ -1327,6 +1418,15 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                     k["regime"] = regime_rule(reg, k["regime_mode"], k["regime_block"], k["regime_ccy"])
                     _out(k["regime"]["note"] + (" - %s" % k["regime_mode"] if k["regime"]["blocks"] else ""))
                 plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
+                rk = plan.get("ranker") or {}
+                if rk.get("mode", "engine") != "engine":                 # 1.11.0 [RANKER]: counts only
+                    line = "ranker %s: %d of %d candidate(s) carry an analyst upside" % (
+                        rk["mode"], rk["with_upside"], rk["candidates"])
+                    if rk["mode"] == "observe":
+                        same = len(set(rk["alt"]) & {c["symbol"] for c in plan["picks"]})
+                        line += "; the upside order would pick %d name(s), %d of them among today's %d pick(s)" % (
+                            len(rk["alt"]), same, len(plan["picks"]))
+                    _out(line)
                 if text((k.get("regime") or {}).get("note")).startswith("market regime not read"):
                     for c in plan["picks"]:                # 1.10.0: a rule that could not be applied is said
                         c["labels"].append(k["regime"]["note"])

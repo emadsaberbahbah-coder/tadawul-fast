@@ -511,7 +511,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # dispatch for a BigQuery collector whose cron slot GitHub missed or
     # delivered past its grace (TFB_COLLECTOR_CATCHUP, workflow default observe).
     ("collector_catchup", "1.0.0", "collector catch-up"),
-    ("daily_plan", "1.10.3", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too
+    ("daily_plan", "1.11.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER)
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
