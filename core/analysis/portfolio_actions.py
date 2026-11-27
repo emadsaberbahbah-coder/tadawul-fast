@@ -1075,7 +1075,23 @@ logger = logging.getLogger("core.analysis.portfolio_actions")
 #   _action_row, the KPI blocks of the research view and of the main payload.
 #   Removed: 0. Tests: tests/test_pf_total_return.py. Rollback:
 #   TFB_PF_TOTAL_RETURN=off, or revert.
-PORTFOLIO_ACTIONS_VERSION = "1.20.0"
+#
+# v1.20.1 (2026-11-27) - [FX-STATIC-MINOR] DISCLOSURE ONLY
+# WHY: meta fx.static_fallback_used listed a currency only when its row's
+#   fx_source was exactly "static". A minor-unit holding (GBp, GBX, ZAc, ILA)
+#   priced from the built-in table carries "static/100"
+#   (opportunity_builder _resolve_fx + /100), so its SAR value used an
+#   assumed rate that the payload did not disclose.
+# WHAT: _static_fx_source() (pure) also counts "static/100". No number,
+#   verdict, row or gate changes; only that meta list can gain a currency.
+# Tests: tests/test_pf_fx_static_minor.py. Rollback: revert.
+PORTFOLIO_ACTIONS_VERSION = "1.20.1"
+
+
+def _static_fx_source(source):
+    """v1.20.1: True when an FX source is the built-in table ("static"), the
+    minor-unit form of it ("static/100") included."""
+    return isinstance(source, str) and source.split("/", 1)[0] == "static"
 
 # v1.16.0 (2026-10-13) - [P0-6 RESEARCH VIEW] RULE VERDICTS AND DISPLAY
 # LEVELS ON UNRECONCILED HOLDINGS, NEVER AN EXECUTABLE ACTION
@@ -5405,7 +5421,7 @@ def _build_verified(rows, ctl, fx_rates, upstream_meta, post_earnings=None):
             "fx": {"provided": sorted(fx_rates.keys()),
                    "static_fallback_used": sorted(
                        {c.get("currency") for c in cands
-                        if c.get("fx_source") == "static"} - {None})},
+                        if _static_fx_source(c.get("fx_source"))} - {None})},
             "versions": {
                 "portfolio_actions": PORTFOLIO_ACTIONS_VERSION,
                 "opportunity_builder": getattr(
