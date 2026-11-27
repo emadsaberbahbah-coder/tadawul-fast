@@ -994,8 +994,8 @@ def test_x17b_run_stores_the_brokers_stop(monkeypatch):
     step_env = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in step_env["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_BROKER_FLOOR"] == "${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}"
-    assert ep.__version__ == "1.7.1"                                                 # 2026-11-26: 1.7.0, 1.7.1
-    assert '("exit_plan", "1.7.1", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert ep.__version__ == "1.8.0"                                         # 2026-11-26: 1.7.0, 1.7.1; 27 Nov: 1.8.0
+    assert '("exit_plan", "1.8.0", "exit plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------- X19 (1.6.0 [MARKET-TURN])
@@ -1068,7 +1068,8 @@ def test_x19_run_observe_on_off(monkeypatch):
     b = wbook()
     assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: sent.append(a), market=CRASH) == 0
     led = b.tabs["_Exit_Plan"].values
-    assert led[0] == ep.LEDGER_HEADERS and led[0][17:] == ["Market", "Judgment"] and len(led[0]) == 19   # 1.7.0
+    assert led[0] == ep.LEDGER_HEADERS and led[0][17:] == ["Market", "Judgment", "Stop Without News"]   # 1.7.0, 1.8.0
+    assert len(led[0]) == 20
     assert led[1][2] == "DDI.US" and led[1][13] == "TAKE PROFIT" and led[1][17] == "us:crash_day:2026-11-10"
     page = _page(b)
     assert "market not calm (observe): the US market on a crash day as of 2026-11-10" in page
@@ -1276,3 +1277,72 @@ def test_x24_the_page_carries_a_negative_item_recorded_after_row_12000(monkeypat
     assert "negative news" not in why(quiet) and "latest negative item" not in why(quiet)
     led = {r[2]: r for r in b.tabs["_Exit_Plan"].values[1:]}
     assert "negative news (1 item in 3 days)" in str(led["DDI.US"])
+
+
+# ----------------------------------------------------------------------------- X30 (1.8.0 [NEWS-SHADOW], audit C1)
+def test_x30_the_stop_without_the_news_is_recorded_and_read_nowhere():
+    closes = [100.0] * 30 + [104.0, 108.0, 112.0, 121.0, 120.0]
+    base = lv(mk(closes, 0.015))
+    news = lv(mk(closes, 0.015), info={"news_neg": 2})
+    # with no news the two are the same stop
+    assert base["stop_no_news"] == pytest.approx(base["stop"]) and base["news_tightened"] is False
+    # news alone: the stop of record tightens, the shadow keeps the normal trail - the base stop
+    assert news["news_tightened"] is True and news["stop"] > base["stop"]
+    assert news["stop_no_news"] == pytest.approx(base["stop"])
+    assert news["action"] == lv(mk(closes, 0.015), info={"news_neg": 2})["action"]       # the rule is unchanged
+    # news and another reason: the other reason still tightens the shadow
+    both = lv(mk(closes, 0.015), info={"news_neg": 2, "forecast_1m": 115.0, "reliability": 72})
+    fc = lv(mk(closes, 0.015), info={"forecast_1m": 115.0, "reliability": 72})
+    assert both["news_tightened"] and both["stop_no_news"] == pytest.approx(fc["stop"]) == pytest.approx(both["stop"])
+    # the shadow follows its own history, never down, and never above the stop of record
+    assert base["stop"] == pytest.approx(108.5125)
+    hi = lv(mk(closes, 0.015), prev={"Stop": 110.0, "StopNN": 109.0})
+    assert hi["stop"] == pytest.approx(110.0) and hi["stop_no_news"] == pytest.approx(109.0)
+    up = lv(mk(closes, 0.015), prev={"Stop": 110.0, "StopNN": 108.0})       # the rule's own stop is higher: it wins
+    assert up["stop_no_news"] == pytest.approx(108.5125)
+    old = lv(mk(closes, 0.015), prev={"Stop": 110.0})                       # a 1.7.x row: its own Stop stands in
+    assert old["stop_no_news"] == pytest.approx(110.0)
+    low = lv(mk(closes, 0.015), info={"news_neg": 1}, prev={"Stop": 90.0, "StopNN": 99.0})
+    assert low["stop_no_news"] <= low["stop"] + 1e-9
+
+
+def test_x30b_prior_row_and_the_ledger_carry_the_shadow():
+    h = ep.LEDGER_HEADERS
+    assert h[-1] == "Stop Without News" and len(h) == 20 and ep.LEDGER_HEADERS_V17 == h[:19]
+    line = ["2026-11-10", "x", "AAA.US", "L", 100, 10, 104, 104, 3, 9, 95.0, 109, "no", "HOLD", "", "2026-11-09", 1,
+            "us:calm:2026-11-09", ""]
+    led = ep.parse_ledger([h, line + [93.0], ["2026-11-11"] + line[1:10] + [97.0] + line[11:] + [""]])
+    assert led[0]["Stop Without News"] == 93.0 and led[1]["Stop Without News"] == ""
+    pr = ep.prior_row(led, "L", dt.date(2026, 11, 12))
+    assert pr["Stop"] == 97.0 and pr["StopNN"] == 97.0                       # a row without the shadow lends its Stop
+    only = ep.prior_row(led[:1], "L", dt.date(2026, 11, 12))
+    assert only["Stop"] == 95.0 and only["StopNN"] == 93.0 and only["StopNNNorm"] == 93.0
+    v17 = ep.parse_ledger([ep.LEDGER_HEADERS_V17, line])
+    assert v17[0]["Stop Without News"] == "" and v17[0]["Stop"] == 95.0
+
+
+def test_x30c_the_run_writes_the_shadow_and_logs_counts_only(monkeypatch, capsys):
+    monkeypatch.setattr(ep, "_SLEEP", lambda s: None)
+    monkeypatch.delenv("TFB_EXIT_LOG_DETAIL", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")                             # the public log
+    b = wbook()
+    assert ep.run(False, True, book=b, now=NOW, opener=opener, mailer=lambda *a: None) == 0
+    led = b.tabs["_Exit_Plan"].values
+    row = dict(zip(led[0], led[1]))
+    assert row["Stop Without News"] == row["Stop"]                           # no news on the fixture: the same stop
+    out = capsys.readouterr().out
+    assert "news shadow (1.8.0): 0 of 1 lot(s) tightened by negative news; 0 of them with a stop above" in out
+    assert "DDI" not in out.split("news shadow")[1].splitlines()[0]
+    page = "\n".join(" | ".join(str(c) for c in r) for r in b.tabs["Exit_Plan"].values)
+    assert "Without News" not in page                                         # read nowhere: not on the page
+
+
+def test_x30d_the_shadow_takes_the_same_broker_floor():
+    closes = [100.0] * 30 + [104.0, 108.0, 112.0, 121.0, 120.0]
+    bars = mk(closes, 0.015)
+    r = ep.exit_levels("AAA.US", 100.0, bars[29][0], bars, {"news_neg": 2, "broker_stop": 115.0}, {},
+                       K(broker_floor=True), TODAY)
+    assert r["stop"] == pytest.approx(115.0) and r["stop_no_news"] == pytest.approx(115.0) and r["news_tightened"]
+    off = ep.exit_levels("AAA.US", 100.0, bars[29][0], bars, {"news_neg": 2, "broker_stop": 115.0}, {},
+                         K(broker_floor=False), TODAY)
+    assert off["stop"] > off["stop_no_news"] == pytest.approx(108.5125)

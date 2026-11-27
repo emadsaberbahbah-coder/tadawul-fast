@@ -501,7 +501,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
     # terms, config/corporate_offers.json; [STOP-JUDGMENT] a fall named with its market or on its own, observe only).
-    ("exit_plan", "1.7.1", "exit plan"),   # 2026-11-26: 1.7.1 the news rows are read from the bottom of the tab
+    # 2026-11-26: 1.7.1 the news rows are read from the bottom of the tab
+    ("exit_plan", "1.8.0", "exit plan"),   # 2026-11-27: 1.8.0 the stop without the news, recorded (audit C1)
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.3", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
