@@ -396,7 +396,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (pin only): 1.31.0 -> 1.32.0 (the news read twice: v_news_llm,
     # v_news_llm_days, v_news_llm_eval, v_news_llm_duel; research only).
     # 2026-11-27 (pin only): 1.32.0 -> 1.33.0 (v_news_llm_days enters after the model's reading, audit D1).
-    ("apply_bq_views", "1.33.0", "bigquery looker views"),
+    # 2026-11-27 (pin only): 1.33.0 -> 1.34.0 (the shadow challenger v0: v_challenger_v0_features, _ranks,
+    # _walkforward, _scorecard; research only; check_objects refuses a challenger view that could look ahead).
+    ("apply_bq_views", "1.34.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -500,7 +502,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
     # terms, config/corporate_offers.json; [STOP-JUDGMENT] a fall named with its market or on its own, observe only).
-    ("exit_plan", "1.7.1", "exit plan"),   # 2026-11-26: 1.7.1 the news rows are read from the bottom of the tab
+    # 2026-11-26: 1.7.1 the news rows are read from the bottom of the tab
+    ("exit_plan", "1.8.0", "exit plan"),   # 2026-11-27: 1.8.0 the stop without the news, recorded (audit C1)
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.3", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open

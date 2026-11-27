@@ -2,7 +2,18 @@
 """
 scripts/exit_plan.py - TFB Exit Plan
 ====================================
-VERSION 1.7.1 (2026-11-26) - first written 2026-11-11 (1.0.0)
+VERSION 1.8.0 (2026-11-27) - first written 2026-11-11 (1.0.0)
+1.8.0 (27 Nov 2026): THE STOP WITHOUT THE NEWS, RECORDED BESIDE THE STOP [NEWS-SHADOW] (outside engineering audit the
+    owner uploaded on 26 Nov 2026, finding C1; owner, 26 Nov 2026 19:13 Riyadh, in Arabic: "if it is ready, build
+    it now"). A negative name item of severity H or M and information grade 1-3 tightens the trail to
+    TFB_EXIT_TRAIL_TIGHT_ATR x ATR. Grade 3 is a story with few or unconfirmed sources, and the rule has never been
+    measured: it may sell holdings on news that did not matter. The rule is NOT changed. Each ledger row now also
+    records "Stop Without News": the same stop, from the same entry, ATR, highest close, floors and frozen offers,
+    with the negative-news reason taken out (any other reason still tightens it). It follows its own history (the
+    highest one recorded for the lot, never down) and is read nowhere: the page, the mail, the actions and the stop
+    of record are unchanged. Once enough lots have had news, the two can be compared on what the price did next,
+    and the owner decides whether grade 3 keeps tightening. A ledger written before 1.8.0 (19 columns) is read as
+    before, its rows' own Stop standing in for the shadow. The run log gives the counts only.
 1.7.1 (26 Nov 2026): THE NEWS ROWS ARE READ FROM THE BOTTOM OF THE TAB (found while adding news sources; owner,
     26 Nov 12:42 Riyadh, in Arabic: review what else needs changing so the news reaches the decision). The run read
     _News_Items as "A1:M12000" - the FIRST 12,000 rows - while the news gate appends at the bottom. The tab passed
@@ -285,7 +296,7 @@ from scripts.daily_plan import (  # noqa: E402
     _col, _read, cell, dividend_tax, fmt, num, parse_date, read_calendar, riyadh_str, table_index, text, write_grid,
 )
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -296,7 +307,9 @@ MAX_LEDGER_ROWS = 3000
 LEDGER_HEADERS = [
     "Date", "Run At (Riyadh)", "Symbol", "Lot", "Entry", "Shares", "Last", "Highest Close", "ATR", "R",
     "Stop", "Target", "TP1 Reached", "Action", "Tighten", "Bars To", "Basis", "Market", "Judgment",
+    "Stop Without News",                              # 1.8.0 [NEWS-SHADOW]: recorded, read nowhere
 ]
+LEDGER_HEADERS_V17 = LEDGER_HEADERS[:19]             # 1.8.0: a 1.7.x ledger has no Stop Without News column
 LEDGER_HEADERS_V16 = LEDGER_HEADERS[:18]             # 1.7.0: a 1.6.x ledger has no Judgment column
 LEDGER_HEADERS_V15 = LEDGER_HEADERS[:17]             # 1.6.0: a 1.5.0 ledger has no Market column
 MARKET_TURN_LABELS_DEFAULT = "weak,stress,drawdown,crash_day"
@@ -601,6 +614,12 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     stop = init_stop
     if r_high >= 1:
         stop = max(stop, entry * (1 + k["be_pct"] / 100.0), hc - trail_k * a_now)
+    # 1.8.0 [NEWS-SHADOW]: the same stop with the negative-news reason taken out (any other reason still tightens)
+    news_reasons = [t for t in res["tighten"] if t.startswith("negative news")]
+    trail_nn = k["trail_tight"] if len(res["tighten"]) > len(news_reasons) else k["trail"]
+    stop_nn = init_stop
+    if r_high >= 1:
+        stop_nn = max(stop_nn, entry * (1 + k["be_pct"] / 100.0), hc - trail_nn * a_now)
     prev_stop = was_stop = None
     if prev:
         # a dividend paid since the last run re-adjusts the history (and the entry); the stop is rebased with it
@@ -613,6 +632,12 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
             was_stop = prev_stop
     if prev_stop is not None and prev_stop > stop:
         stop = prev_stop                                   # the stop never moves down
+    if prev:                                               # 1.8.0: the shadow follows its own history
+        nn_norm = num(prev.get("StopNNNorm"))
+        prev_nn = nn_norm * f_e if nn_norm is not None else num(prev.get("StopNN"))
+        prev_nn = prev_stop if prev_nn is None else prev_nn
+        if prev_nn is not None and prev_nn > stop_nn:
+            stop_nn = prev_nn
     bs = info.get("broker_stop")                           # 1.5.0 [BROKER-FLOOR]
     # The floor is the LOWEST working stop of the IBKR capture ("broker_stop_floor", set by run()); the workbook's
     # older broker tabs keep the highest per symbol and never set it. A direct caller's broker_stop is its floor.
@@ -620,6 +645,8 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     rule_stop, floored = stop, False
     if fl is not None and stop * 1.0025 < fl < last[4]:
         stop, floored = fl, True                           # never below the stop working at the broker
+    if fl is not None and stop_nn * 1.0025 < fl < last[4]:
+        stop_nn = fl                                       # 1.8.0: the shadow takes the same floor
     # the broker already carries the stop of record (on a re-run of the same close the ledger holds the floor, so
     # `floored` is False while the earlier stop is still the one "before this close"): never a RAISE STOP to-do
     carried = floored or (fl is not None and fl >= stop * 0.9975 and fl < last[4])
@@ -637,6 +664,7 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
         frozen = was_stop if was_stop is not None else prev_stop
         if frozen is not None:
             stop = frozen
+        stop_nn = stop                                     # 1.8.0: a frozen stop has no news to take out
         floored = carried = False
         res["tighten"] = []                              # nothing tightens a stop that is not in force
         target = offer["price"]                          # Codex P2 on #1084: the offer price itself, also above the next R step
@@ -645,7 +673,8 @@ def exit_levels(symbol: str, entry: float, entry_date: _dt.date, bars: Sequence[
     res.update({"ok": True, "basis": f_e, "atr": a_now, "atr_entry": a_e, "atr_pct": a_now / last[4] * 100.0, "r": r,
                 "dist_pct": dist_pct, "init_stop": init_stop, "hc": hc, "last": last[4], "bars_to": last[0],
                 "r_high": r_high, "stop": stop, "prev_stop": was_stop, "target": target, "tp1": tp1,
-                "trail_k": trail_k, "sessions": sessions, "pl_pct": (last[4] / entry - 1) * 100.0,
+                "trail_k": trail_k, "sessions": sessions, "stop_no_news": min(stop_nn, stop),
+                "news_tightened": bool(news_reasons) and not held, "pl_pct": (last[4] / entry - 1) * 100.0,
                 "stop_gap_pct": (1 - stop / last[4]) * 100.0, "fresh": fresh})
     if fresh:
         live_px = info.get("live")
@@ -1136,14 +1165,16 @@ def tp1_flag(r: Dict[str, Any]) -> str:
 
 
 def parse_ledger(values: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
-    """1.7.0: the 19-column ledger, a 1.6.x one (18 columns, no Judgment) or a 1.5.0 one (17, no Market): a column
-    the ledger does not have reads as ''."""
+    """1.8.0: the 20-column ledger, a 1.7.x one (19 columns, no Stop Without News), a 1.6.x one (18, no Judgment)
+    or a 1.5.0 one (17, no Market): a column the ledger does not have reads as ''."""
     rows = list(values)
     if not rows:
         return []
     head = [text(c) for c in rows[0]]
     if head[:len(LEDGER_HEADERS)] == LEDGER_HEADERS:
         names = LEDGER_HEADERS
+    elif head[:len(LEDGER_HEADERS_V17)] == LEDGER_HEADERS_V17:
+        names = LEDGER_HEADERS_V17
     elif head[:len(LEDGER_HEADERS_V16)] == LEDGER_HEADERS_V16:
         names = LEDGER_HEADERS_V16
     elif head[:len(LEDGER_HEADERS_V15)] == LEDGER_HEADERS_V15:
@@ -1191,6 +1222,12 @@ def prior_row(ledger: Sequence[Dict[str, Any]], key: str, today: _dt.date,
     stop, norm = high(rows)
     if stop is not None:
         last["Stop"], last["StopNorm"] = stop, norm
+    # 1.8.0 [NEWS-SHADOW]: the highest stop without the news; a row written before 1.8.0 lends its own Stop
+    nn = [(num(d.get("Stop Without News")) if num(d.get("Stop Without News")) is not None else num(d["Stop"]),
+           num(d.get("Basis")) or 1.0) for d in rows]
+    nn = [(a, b) for a, b in nn if a is not None]
+    if nn:
+        last["StopNN"], last["StopNNNorm"] = max(a for a, _ in nn), max(a / b for a, b in nn)
     last["Was"], last["WasNorm"] = high(older)
     if any(text(d["TP1 Reached"]).lower() == "yes" for d in rows):
         last["TP1 Reached"] = "yes"
@@ -1623,8 +1660,12 @@ def run(dry_run: bool, send: bool, book=None, now: Optional[_dt.datetime] = None
             _round(r.get("hc")), _round(r.get("atr")), _round(r.get("r")), _round(r.get("stop")),
             _round(r.get("target")), tp1_flag(r), r["action"], "; ".join(r.get("tighten") or []),
             r["bars_to"].isoformat() if r.get("bars_to") else "", _round(r.get("basis")), r.get("market", ""),
-            r.get("judgment", "")]
+            r.get("judgment", ""), _round(r.get("stop_no_news"))]
            for r in results if r.get("ok")]
+    tight = [r for r in results if r.get("ok") and r.get("news_tightened")]
+    _out("news shadow (1.8.0): %d of %d lot(s) tightened by negative news; %d of them with a stop above the stop "
+         "without the news" % (len(tight), sum(1 for r in results if r.get("ok")),
+                               sum(1 for r in tight if (r.get("stop") or 0) > (r.get("stop_no_news") or 0) * 1.0005)))
     grid = [list(LEDGER_HEADERS)] + ([[d.get(h, "") for h in LEDGER_HEADERS] for d in keep] + new)[-MAX_LEDGER_ROWS:]
     from scripts import sheets_quota  # noqa: PLC0415
 
