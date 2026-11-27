@@ -480,7 +480,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-26 (pin only): 1.9.0 -> 1.10.0 (a headline copied by several sites is one confirmation).
     # 2026-11-26 (pin only): 1.10.0 -> 1.11.0 (Bank of England, Bank of Japan, Swiss National Bank feeds).
     # 2026-11-27 (pin only): 1.11.0 -> 1.12.0 (five guards from the external audit of 26 Nov).
-    ("news_macro_gate", "1.12.0", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]; v1.8.0 [LLM-SHADOW]
+    # 2026-11-27 (pin only): 1.12.0 -> 1.12.1 (a name item whose issuer could not be checked is counted, audit A2).
+    ("news_macro_gate", "1.12.1", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]; v1.8.0 [LLM-SHADOW]
     # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
     # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete

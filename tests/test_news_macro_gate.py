@@ -909,9 +909,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.12.0"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS]
+    assert ng.__version__ == "1.12.1"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.12.0", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.12.1", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -1572,12 +1572,13 @@ def test_g8_apply_modes_and_scope():
     names = {"MBIN.US": "Merchants Bancorp"}
     kept, info = ng.apply_issuer_link(items, names, "on")
     assert [i["title"] for i in kept] == [items[1]["title"], items[2]["title"], items[3]["title"], items[4]["title"]]
-    assert info == {"mode": "on", "checked": 2, "unlinked": 1,
+    assert info == {"mode": "on", "checked": 2, "unlinked": 1, "unchecked": 1, "unnamed": 1,   # v1.12.1: XYZ.US
                     "examples": ["MBIN.US: Farmers & Merchants Bancorp stock: Q3 profit rises"]}
     kept, info = ng.apply_issuer_link(items, names, "observe")
     assert kept == items and info["unlinked"] == 1 and info["mode"] == "observe"
     kept, info = ng.apply_issuer_link(items, names, "off")
-    assert kept == items and info == {"mode": "off", "checked": 0, "unlinked": 0, "examples": []}
+    assert kept == items and info == {"mode": "off", "checked": 0, "unlinked": 0, "unchecked": 0, "unnamed": 0,
+                                      "examples": []}
 
 
 class _WrongNameHTTP(FakeHTTP):
@@ -1609,7 +1610,8 @@ def test_g8_run_drops_a_headline_about_another_company(monkeypatch, armed, mode)
     assert rep["gate"]["verdict"] == off["gate"]["verdict"]
     digest = ng.render_digest(rep)
     assert ("not about the issuer 1 of %d (%s)" % (li["checked"], "kept, observe" if mode == "observe" else "dropped")) in digest
-    assert off["issuer_link"] == {"mode": "off", "checked": 0, "unlinked": 0, "examples": []}
+    assert off["issuer_link"] == {"mode": "off", "checked": 0, "unlinked": 0, "unchecked": 0, "unnamed": 0,
+                                  "examples": []}
     assert "not about the issuer" not in ng.render_digest(off)
 
 
@@ -2746,3 +2748,30 @@ def test_g21_e1_the_workflow_takes_extra_symbols_from_a_secret():
     wf = (_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8")
     assert "secrets.TFB_NEWS_GATE_SYMBOLS" in wf and "vars.TFB_NEWS_GATE_SYMBOLS" not in wf
     assert "PUBLIC: shown in the run log, never type a holding" in wf
+
+
+# ----------------------------------------------------------------------------- G22 (v1.12.1 [ISSUER-UNCHECKED])
+def test_g22_a2_an_item_whose_issuer_cannot_be_checked_is_counted_and_kept():
+    items = [{"source": "google_news", "scope": "ZZZQ.US", "title": "Shares slide after weak quarter"},
+             {"source": "google_news", "scope": "ZZZQ.US", "title": "ZZZQ (NASDAQ:ZZZQ) misses estimates"},
+             {"source": "google_news", "scope": "FRST.US", "title": "Primis Financial misses estimates"},
+             {"source": "google_news", "scope": "FRST.US", "title": "Another bank misses estimates"},
+             {"source": "google_news", "scope": "MACRO", "title": "Oil rises"},
+             {"source": "edgar", "scope": "ZZZQ.US", "title": "8-K"}]
+    kept, info = ng.apply_issuer_link([dict(i) for i in items], {"ZZZQ.US": "", "FRST.US": "Primis Financial Corp"}, "on")
+    assert info["checked"] == 3 and info["unlinked"] == 1 and info["unchecked"] == 1 and info["unnamed"] == 1
+    assert [k["title"] for k in kept] == [i["title"] for i in items if i["title"] != "Another bank misses estimates"]
+    assert kept[0]["issuer_checked"] is False and "issuer_checked" not in kept[1]       # the ticker tied it
+    off, info_off = ng.apply_issuer_link([dict(i) for i in items], {}, "off")
+    assert len(off) == len(items) and info_off["unchecked"] == 0
+
+
+def test_g22_a2_the_log_and_the_digest_say_it_without_a_symbol(armed, capsys):
+    (rc, rep), _ = _run(http=FakeHTTP(en_rss=GNEWS_EN_RSS), write=False)
+    li = rep["issuer_link"]
+    assert {"unchecked", "unnamed"} <= set(li)
+    rep2 = dict(rep, issuer_link=dict(li, unchecked=3, unnamed=2))
+    assert "issuer not checked 3 (no company name for 2 symbol(s), kept)" in ng.render_digest(rep2)
+    assert "issuer not checked" not in ng.render_digest(dict(rep, issuer_link=dict(li, unchecked=0)))
+    pub = ng.public_report(rep2)
+    assert pub["issuer_link"]["unchecked"] == 3 and "examples" not in pub["issuer_link"]
