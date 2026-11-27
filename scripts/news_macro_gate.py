@@ -2,8 +2,18 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.12.0 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.12.1 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.12.1 (2026-11-27) -- [ISSUER-UNCHECKED] A NAME ITEM WHOSE ISSUER COULD NOT BE CHECKED IS COUNTED AND SAID
+WHY: outside engineering audit the owner uploaded on 26 Nov 2026, finding A2; owner, 26 Nov 2026 19:13 Riyadh, in
+  Arabic: "if it is ready, build it now". issuer_linked() returns None (cannot judge) for a symbol of the scope with
+  no company name and no ticker in the headline, and apply_issuer_link() then kept the item without a word: it went
+  on to the clusters, the _News_Items tab and the Exit Plan's news count as if it had been checked.
+WHAT: apply_issuer_link() counts those items ('unchecked') and the symbols behind them that have no name ('unnamed',
+  a count: the public log names no symbol), and marks each item issuer_checked = False in memory. The run log and
+  the digest say "issuer not checked N (no company name for M symbol(s), kept)". Nothing is dropped and no verdict,
+  tab, column or count rule changes: the count shows how much of the name news rests on items nobody could tie to
+  the company, and names to add to the scope.
 v1.12.0 (2026-11-27) -- [AUDIT-GUARDS] FIVE GUARDS FROM THE EXTERNAL ENGINEERING AUDIT OF 26 NOV 2026
 WHY (owner, 26 Nov 2026 23:38 Riyadh: an outside review of the whole project; its report, read and checked
   against this code on main 65c7864, findings A1, A3, A4, A6 and E1 reproduced here):
@@ -455,7 +465,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.12.0"
+__version__ = "1.12.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -2264,7 +2274,9 @@ def apply_issuer_link(items: List[Dict[str, Any]], names: Dict[str, str], mode: 
                       ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """v1.1.0 [ISSUER-LINK]: (kept items, report). Only the name items of the search and per-name sources
     (ISSUER_LINK_SOURCES: GDELT, Google News and, from v1.5.0, Bing News and Yahoo) are judged."""
-    info: Dict[str, Any] = {"mode": mode, "checked": 0, "unlinked": 0, "examples": []}
+    info: Dict[str, Any] = {"mode": mode, "checked": 0, "unlinked": 0, "unchecked": 0, "unnamed": 0,
+                            "examples": []}
+    unnamed = set()                                  # v1.12.1 (audit A2): counted, never named in the report
     if mode == "off":
         return items, info
     kept = []
@@ -2272,6 +2284,10 @@ def apply_issuer_link(items: List[Dict[str, Any]], names: Dict[str, str], mode: 
         scope = str(it.get("scope") or "")
         if scope and scope != "MACRO" and it.get("source") in ISSUER_LINK_SOURCES:
             verdict = issuer_linked(it.get("title", ""), scope, names.get(scope, ""))
+            if verdict is None:                      # v1.12.1 (audit A2): kept, but counted and marked
+                info["unchecked"] += 1
+                unnamed.add(scope)
+                it["issuer_checked"] = False
             if verdict is not None:
                 info["checked"] += 1
                 if verdict is False:
@@ -2281,6 +2297,7 @@ def apply_issuer_link(items: List[Dict[str, Any]], names: Dict[str, str], mode: 
                     if mode == "on":
                         continue
         kept.append(it)
+    info["unnamed"] = len(unnamed)
     return kept, info
 
 
@@ -2641,7 +2658,9 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
                     if c.get("left") else "")
                  + f", carried from earlier runs {c.get('carried', 0)}"
                  + (lambda li: (f", not about the issuer {li['unlinked']} of {li['checked']} "
-                                f"({'dropped' if li['mode'] == 'on' else 'kept, observe'})")
+                                f"({'dropped' if li['mode'] == 'on' else 'kept, observe'})"
+                                + (f", issuer not checked {li['unchecked']} (no company name for "
+                                   f"{li.get('unnamed', 0)} symbol(s), kept)" if li.get("unchecked") else ""))
                     if li and li.get("mode") != "off" else "")(rep.get("issuer_link")) + ". "
                  f"Sources OK: {', '.join(f'{k}={v}' for k, v in sorted(rep['sources_ok'].items())) or 'none'}. "
                  f"Failed: {'; '.join(f'{k}: {v}' for k, v in sorted(rep['sources_failed'].items())) or 'none'}.")
@@ -2811,7 +2830,9 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     if link_mode != "off":
         _out(f"[news_gate v{__version__}] issuer link ({link_mode}): {link_info['unlinked']} of "
              f"{link_info['checked']} name items not about the issuer"
-             + (" dropped" if link_mode == "on" else " (kept, observe)"))
+             + (" dropped" if link_mode == "on" else " (kept, observe)")
+             + (f"; issuer not checked {link_info['unchecked']} (no company name for {link_info['unnamed']} "
+                f"symbol(s), kept)" if link_info.get("unchecked") else ""))
     # v1.5.0 [SOURCES]: one story from one publisher is one member, whichever sources carried it
     folded, repeated = fold_new_sources(linked)
     for src, n in repeated.items():
