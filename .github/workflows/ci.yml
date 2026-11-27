@@ -2,6 +2,12 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.107 (2026-11-27) -- GBp STATIC FX DISCLOSED
+#
+# v1.1.107: run tests/test_pf_fx_static_minor.py (portfolio_actions 1.20.1:
+#   meta fx.static_fallback_used also lists a minor-unit holding priced
+#   from the built-in FX table, "static/100").
+#
 # VERSION 1.1.106 (2026-11-27) -- THE CHALLENGER'S FORWARD BOOKS, FROZEN
 #
 # v1.1.106: run tests/test_challenger_books.py (scripts/challenger_books.py
@@ -1359,6 +1365,7 @@ jobs:
             tests/test_pf_custody_tier.py \
             tests/test_pf_dd_div_basis.py \
             tests/test_pf_total_return.py \
+            tests/test_pf_fx_static_minor.py \
             tests/test_pd_v1521_div_basis.py \
             tests/test_pd_v1522_total_return.py \
             tests/test_fdc_v100_final_decision_column.py \
