@@ -4,6 +4,12 @@ scripts/learning_watch.py
 ================================================================================
 TFB Learning Watch - every learning record in BigQuery, read every day, in one place
 --------------------------------------------------------------------------------
+v1.2.1 (2026-11-27)
+  1.2.1: the sector record is read with its test (full project review of 27 Nov 2026, approved by the owner at 14:06
+         Riyadh). The page of 27 Nov listed 15 PROVEN rows, all 'beats its market' cells of v_outcome_sector, which
+         had no t: overlapping calls, a name counted once per day. Views 1.35.0 give that view t_adj and its reading
+         now needs t_adj of 2 or more either way; this job reads the new column (shown under t on the page). 2 of
+         the 15 rows keep their reading; nothing else changes. The view must be applied first (bq_views --write).
 v1.2.0 (2026-11-26)
   1.2.0: one record joins the registry (week plan of 23 Nov 2026, package 4): v_forward_signal_gates - the names the
          gates kept out and the names they let in, each against the benchmark of its own market net of cost, by
@@ -63,7 +69,7 @@ if _HERE not in sys.path:
 import archive_symbol_deep as asd  # noqa: E402 - same folder: the tested BigQuery loader
 import news_board as nb  # noqa: E402 - same folder: text helpers and the optional-view reader
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -101,8 +107,9 @@ REGISTRY: List[Tuple[str, str, Tuple[str, ...], str, str, str, Optional[str], st
      "edge_pp", "t_adj", ""),
     ("v_projection_scorecard", "Projection rules", ("period", "horizon", "arm"), "reading", "calls", "lift_pp",
      "t_stat", ""),
+    # v1.2.1 (views 1.35.0): the sector record carries t_adj, and 'beats' / 'loses' need 2 or more either way
     ("v_outcome_sector", "Calls by sector against their market", ("market_group", "sector", "horizon"), "reading",
-     "calls", "edge_pp", None, ""),
+     "calls", "edge_pp", "t_adj", ""),
     ("v_signal_edge", "Score features (rank IC)", ("market_group", "feature", "horizon"), "verdict", "days",
      "mean_ic", "t_adj", ""),
     ("v_switch_calibration", "Hold or switch calibration", ("market_group", "horizon"), "verdict", "days", "mean_ic",

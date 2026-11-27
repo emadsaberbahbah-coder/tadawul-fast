@@ -121,6 +121,13 @@ def test_s1_v2_requires_an_operator_variable_and_defaults_off():
     assert workflow["jobs"]["score"]["env"]["TFB_S1_CRITERIA_V2"] == _mapping("TFB_S1_CRITERIA_V2", "off")
 
 
+def test_s1_significance_is_observe_by_default_and_can_be_switched_off():
+    """shadow_scorer.yml 1.0.4 (2026-11-27): scorer 1.9.8 reads whether the net alpha could be chance."""
+    workflow = _workflow("shadow_scorer.yml")
+    assert workflow["jobs"]["score"]["env"]["TFB_S1_SIGNIFICANCE"] == _mapping("TFB_S1_SIGNIFICANCE", "observe")
+    assert "TFB_S1_SIGNIFICANCE" not in workflow.get("env", {})
+
+
 def test_behavior_flags_are_scoped_to_writer_lanes_and_do_not_leak_into_ci():
     names = TRACKER_DEFAULTS.keys() | SYNC_DEFAULTS.keys() | {"TFB_S1_CRITERIA_V2"}
     for workflow_name in ("track_performance.yml", "daily_sync.yml", "shadow_scorer.yml"):

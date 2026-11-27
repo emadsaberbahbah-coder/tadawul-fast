@@ -11,18 +11,25 @@
 -- engine cohort, with an excess return. A name recorded on many days counts
 -- once per day, so calls overlap; read 'names' beside 'calls'.
 -- READING, in this order: 'too few calls' under 100 calls; 'beats its market'
--- at an average edge of +0.5 points or more with at least 55% of calls ahead;
--- 'loses to its market' at -0.5 points or worse with at most 45% ahead;
--- otherwise 'no clear edge'. The same 100-call floor as the calls-against-
--- the-market panel.
+-- at an average edge of +0.5 points or more with at least 55% of calls ahead
+-- AND t_adj of 2 or more; 'loses to its market' at -0.5 points or worse with
+-- at most 45% ahead AND t_adj of -2 or less; otherwise 'no clear edge'. The
+-- same 100-call floor as the calls-against-the-market panel.
+-- t_adj (views 1.35.0, full review of 27 Nov 2026): the mean over distinct
+-- recording dates - a date's calls averaged first - over its standard error,
+-- divided by SQRT of the horizon in days (7 / 14 / 30 / 91), as
+-- v_forward_signal_gates does: neighbouring dates share most of their
+-- holding window, and a name recorded on many days is one bet, not many.
+-- WHY: without it 15 cells read 'beats its market' on the Learning Watch page
+-- as PROVEN, on overlapping calls and with no test at all.
 -- COLUMNS: market_group (US / Tadawul / Other markets / ALL), sector
 -- ('(no sector)' when v_symbol_sector has none), horizon, calls, names, days,
 -- first_day, last_day, edge_pp, right_pct, avg_forecast_pp, avg_realized_pp,
--- reading.
+-- t_adj, reading.
 -- Research view: the live system never reads BigQuery; no decision, gate,
 -- count or broker action depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_outcome_sector`
-OPTIONS (description = "TFB buy calls by market group, GICS sector and horizon against the market benchmark - calls, names, average edge, share ahead, forecast against realized, and a fixed reading (at least 100 calls)")
+OPTIONS (description = "TFB buy calls by market group, GICS sector and horizon against the market benchmark - calls, names, average edge, share ahead, forecast against realized, an overlap-adjusted t over recording dates, and a fixed reading (at least 100 calls, t of 2 or more either way)")
 AS
 WITH c AS (
   SELECT
@@ -60,24 +67,41 @@ a AS (
     AVG(realized) AS m_real
   FROM g
   GROUP BY market_group, sector, horizon
+),
+dd AS (
+  SELECT market_group, sector, horizon, recorded_date, AVG(edge) AS m
+  FROM g
+  GROUP BY market_group, sector, horizon, recorded_date
+),
+tt AS (
+  SELECT
+    market_group,
+    sector,
+    horizon,
+    ROUND(SAFE_DIVIDE(AVG(m), SAFE_DIVIDE(STDDEV(m), SQRT(COUNT(*))))
+          / SQRT(CASE horizon WHEN '1W' THEN 7 WHEN '2W' THEN 14 WHEN '1M' THEN 30 ELSE 91 END), 2) AS t_adj
+  FROM dd
+  GROUP BY market_group, sector, horizon
 )
 SELECT
-  market_group,
-  sector,
-  horizon,
-  calls,
-  names,
-  days,
-  first_day,
-  last_day,
-  ROUND(m_edge, 2) AS edge_pp,
-  ROUND(100 * ahead, 1) AS right_pct,
-  ROUND(m_fc, 2) AS avg_forecast_pp,
-  ROUND(m_real, 2) AS avg_realized_pp,
+  a.market_group,
+  a.sector,
+  a.horizon,
+  a.calls,
+  a.names,
+  a.days,
+  a.first_day,
+  a.last_day,
+  ROUND(a.m_edge, 2) AS edge_pp,
+  ROUND(100 * a.ahead, 1) AS right_pct,
+  ROUND(a.m_fc, 2) AS avg_forecast_pp,
+  ROUND(a.m_real, 2) AS avg_realized_pp,
+  tt.t_adj,
   CASE
-    WHEN calls < 100 THEN 'too few calls'
-    WHEN m_edge >= 0.5 AND ahead >= 0.55 THEN 'beats its market'
-    WHEN m_edge <= -0.5 AND ahead <= 0.45 THEN 'loses to its market'
+    WHEN a.calls < 100 THEN 'too few calls'
+    WHEN a.m_edge >= 0.5 AND a.ahead >= 0.55 AND tt.t_adj >= 2 THEN 'beats its market'
+    WHEN a.m_edge <= -0.5 AND a.ahead <= 0.45 AND tt.t_adj <= -2 THEN 'loses to its market'
     ELSE 'no clear edge'
   END AS reading
-FROM a;
+FROM a
+JOIN tt USING (market_group, sector, horizon);

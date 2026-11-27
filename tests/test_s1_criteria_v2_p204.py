@@ -17,6 +17,8 @@ fetch and the clock are the only injected parts.
   C6 enforce with a published Zero MAE column, model beating zero, a CA row and
      a positive window: 3/4/5 PASS; verdict NOT_DECIDABLE on criterion 1 only
   C7 --dry-run under observe: zero writes, token printed
+  C8 v1.9.8 [S1-SIGNIFICANCE]: the reading on the REAL 10-05 rows; REAL main() observe (the default)
+     against off differ by the token only - history, criteria, verdict and 'why' identical
 Run x3, identical digest.
 
 Pytest executes this unchanged battery in an isolated subprocess.
@@ -217,11 +219,11 @@ def main():
     assert c_off[5][0] == "PENDING" and "CA not evaluable" in c_off[5][1], c_off
     if s1b:
         sh_b = fresh_sheet(); rcb, out_b = run_at(s1b, WHEN, sh_b, SPOT, v2=None)
-        norm = lambda rows: [[str(c).replace("v1.9.1", "vX").replace("v1.9.7", "vX") for c in r] for r in rows]  # noqa: E731
+        norm = lambda rows: [[str(c).replace("v1.9.1", "vX").replace("v1.9.8", "vX") for c in r] for r in rows]  # noqa: E731
         assert rcb == 0 and norm(hist_rows(sh_b)) == norm(hist_rows(sh_off)), "history parity"
         assert norm(gate_body(sh_b)) == norm(gate_body(sh_off)), "gate parity"
         vb, vd = runlog(sh_b)[-1][5], runlog(sh_off)[-1][5]
-        assert vb.replace("v1.9.1", "vX") == vd.replace("v1.9.7", "vX"), (vb, vd)
+        assert vb.replace("v1.9.1", "vX") == vd.replace("v1.9.8", "vX"), (vb, vd)
         print("C3 PASS  dual-tree parity under mode off: history rows, S1_Gate body and verdict byte-identical (version token aside)")
     else:
         print("C3 SKIP  dual-tree parity (set S1_BASE=<v1.9.1 file>)")
@@ -237,7 +239,7 @@ def main():
     assert "0 rows (vacuous)" in c_obs[5][1] and "would NOT_EVALUABLE" in c_obs[5][1], c_obs[5]
     assert gate_body(sh_obs)[0][2] == gate_body(sh_off)[0][2], "verdict changed under observe"
     assert hist_rows(sh_obs) == hist_rows(sh_off), "observe must not touch Shadow_History"
-    tok = [l for l in out_obs.splitlines() if l.startswith("[S1-CRITERIA-V2 v1.9.7] mode=observe")]
+    tok = [l for l in out_obs.splitlines() if l.startswith("[S1-CRITERIA-V2 v1.9.8] mode=observe")]
     # today's scored day moves every index by exactly +1.00 % (all spots x1.01, zero turnover), so the
     # window return = seed_index x 1.01 / pre-boundary index - 1 for each basket
     exp = {b: (i * 1.01 / p - 1) * 100 for b, i, p in (("chal", 106.892669, 107.164026), ("bench", 101.554736, 99.04464))}
@@ -248,9 +250,9 @@ def main():
         and "zero_mae=n/a" in tok[0] and "model_mae=3.13pp" in tok[0] \
         and "ca_rows=0" in tok[0] and "set=" in tok[0], (tok, exp_alpha)
     meta_cells = " ".join(str(c) for r in gate_body(sh_obs)[:6] for c in r)
-    assert "[S1-CRITERIA-V2 v1.9.7] mode=observe" in meta_cells, "meta cell token missing"
+    assert "[S1-CRITERIA-V2 v1.9.8] mode=observe" in meta_cells, "meta cell token missing"
     rl = runlog(sh_obs)[-1]
-    assert "[S1-CRITERIA-V2 v1.9.7]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
+    assert "[S1-CRITERIA-V2 v1.9.8]" in rl[5] and json.loads(rl[9]).get("criteria_v2", {}).get("mode") == "observe", rl
     print("C4 PASS  observe: statuses/verdict unchanged, 3/4/5 annotated, token on verdict + meta + _Run_Log JSON, history untouched")
     digest_parts.append(tok[0].split(" set=")[0])
 
@@ -283,10 +285,55 @@ def main():
     # ---------------------------------------------------------------- C7 ------ #
     sh7 = fresh_sheet(); before = (copy.deepcopy(hist_rows(sh7)), copy.deepcopy(runlog(sh7)))
     rc, out7 = run_at(s1, WHEN, sh7, SPOT, v2="observe", argv=["--dry-run"])
-    assert rc == 0 and "[S1-CRITERIA-V2 v1.9.7] mode=observe" in out7, out7
+    assert rc == 0 and "[S1-CRITERIA-V2 v1.9.8] mode=observe" in out7, out7
     assert (hist_rows(sh7), runlog(sh7)) == before and s1.TAB_GATE not in sh7.tabs, "dry-run wrote"
     print("C7 PASS  --dry-run under observe: token printed, zero writes")
     digest_parts.append("dryrun-ok")
+
+    # ---------------------------------------------------------------- C8 ------ #
+    # v1.9.8 [S1-SIGNIFICANCE]: (a) the REAL read_history rows of the 2026-10-05 tab: 14 paired scored days,
+    # 44 excluded -> too few for a test; (b) the REAL main(), the variable unset (observe) against off: the same
+    # history rows, criteria and verdict; the token on stdout, the meta cell and the _Run_Log JSON; off = no token.
+    sc8, ex8 = s1.count_scored_days(history, "CHALLENGER")
+    sig8 = s1.significance(history, None, ex8)
+    assert (sc8, ex8) == (14, 44) and sig8 == {"n": 14, "mean_pp": 0.4109, "t": 0.77, "excluded": 44,
+                                               "coverage": "thin", "reading": "TOO_FEW_DAYS", "evidence": False}, sig8
+    assert s1.significance_line(sig8, "observe") == (
+        "[S1-SIGNIFICANCE v1.9.8] mode=observe n=14 mean=+0.411pp t=+0.77 excluded=44 coverage=thin "
+        "reading=TOO_FEW_DAYS evidence=no")
+    def run_sig(value, argv=None):
+        saved = os.environ.get("TFB_S1_SIGNIFICANCE")
+        try:
+            if value is None: os.environ.pop("TFB_S1_SIGNIFICANCE", None)
+            else: os.environ["TFB_S1_SIGNIFICANCE"] = value
+            sheet = fresh_sheet(); rc_, out_ = run_at(s1, WHEN, sheet, SPOT, v2=None, argv=argv)
+            return rc_, out_, sheet
+        finally:
+            if saved is None: os.environ.pop("TFB_S1_SIGNIFICANCE", None)
+            else: os.environ["TFB_S1_SIGNIFICANCE"] = saved
+    rc_o, out_o, sh_o = run_sig(None)                    # unset = observe
+    rc_x, out_x, sh_x = run_sig("off")
+    assert rc_o == 0 and rc_x == 0
+    tok = [l for l in out_o.splitlines() if l.startswith("[S1-SIGNIFICANCE v1.9.8] mode=observe")]
+    assert len(tok) == 1 and "reading=TOO_FEW_DAYS evidence=no" in tok[0], out_o
+    assert "[S1-SIGNIFICANCE" not in out_x and "[S1-SIGNIFICANCE" not in json.dumps(gate_body(sh_x)) \
+        and "[S1-SIGNIFICANCE" not in json.dumps(runlog(sh_x)), "off must be byte-quiet"
+    assert hist_rows(sh_o) == hist_rows(sh_x), "the reading must not touch Shadow_History"
+    assert crit(sh_o) == crit(sh_x), "criteria and statuses are untouched"
+    go, gx = gate_body(sh_o), gate_body(sh_x)
+    assert go[0] == gx[0] and go[1] == gx[1] and go[2] == gx[2], "verdict, why (not a PASS) and the returns row"
+    assert tok[0] in go[3][4] and tok[0] not in json.dumps(gx), "meta cell token"
+    strip = lambda rows: json.loads(json.dumps(rows).replace(" | " + tok[0], ""))   # noqa: E731
+    assert strip(go) == gx, "the gate page differs by the token only"
+    rl_o, rl_x = runlog(sh_o)[-1], runlog(sh_x)[-1]
+    assert tok[0] in rl_o[5] and rl_o[5].replace(" | " + tok[0], "") == rl_x[5], "verdict line differs by the token only"
+    d_o, d_x = json.loads(rl_o[9]), json.loads(rl_x[9])
+    assert d_o.pop("significance")["reading"] == "TOO_FEW_DAYS" and "significance" not in d_x and d_o == d_x
+    rc_d, out_d, sh_d = run_sig(None, argv=["--dry-run"])
+    assert rc_d == 0 and "[S1-SIGNIFICANCE v1.9.8] mode=observe" in out_d and s1.TAB_GATE not in sh_d.tabs
+    print("C8 PASS  significance: 14 paired days on the 10-05 tab -> TOO_FEW_DAYS; REAL main() observe vs off "
+          "differ by the token only; dry run prints it and writes nothing")
+    digest_parts.append(sig8)
 
     digest = hashlib.sha256(json.dumps(digest_parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
     print("RUN-DIGEST", digest)

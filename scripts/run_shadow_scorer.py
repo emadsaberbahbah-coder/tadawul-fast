@@ -1,6 +1,21 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.9.8 (2026-11-27) — A PASS SAYS WHETHER ITS NET ALPHA COULD BE CHANCE
+WHY (full project review of 27 Nov 2026, approved by the owner at 14:06 Riyadh: "ok approved and start doing the
+need"): S1_Gate of 26 Nov reads PASS, "all six criteria met — Tranche 1 may be authorized", on 37 scored days with
+57 excluded and a net alpha of +4.30%. Criterion 3 asks only for a net alpha of 0 or more; none of the six asks
+whether that alpha could be chance, and every page that copies the gate repeats the PASS.
+WHAT [S1-SIGNIFICANCE], observe only: the day-by-day net alpha (challenger minus benchmark, both from the stored
+Cum Index, so net of cost - the returns criterion 3 compounds) on the days BOTH baskets were scored, its mean, and
+t = mean over its standard error. Reading: TOO_FEW_DAYS under 20 paired days; SIGNIFICANT at t of 2 or more;
+else NOT_SIGNIFICANT. Coverage is 'thin' when more days were excluded than scored. The reading is evidence only
+when SIGNIFICANT with coverage ok. One token line on the verdict, the S1_Gate meta cell and _Run_Log; and on a
+PASS that is not evidence the gate's 'why' line ends with the reading in words, so every copy of the gate carries
+it. NOTHING ELSE CHANGES: the six criteria, their statuses, the verdict, Shadow_History and the ledgers are as in
+1.9.7; the gate still never auto-promotes. An enforce mode is a decision for the owner's 10-session review.
+ROLLBACK: repository Variable TFB_S1_SIGNIFICANCE=off (byte-identical to 1.9.7).
+
 VERSION 1.9.7 (2026-11-15) — A CORPORATE-ACTION CHECK THAT COULD NOT RUN IS NOT A PASS
 WHY (review of 15 Nov, "remaining gap in the CA gate"): two inputs still answered clean without a check having
 run. (1) A register holding only unconfirmed proposals (AUTO_DETECT): the repair index is built from confirmed
@@ -525,7 +540,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # parse_zero_mae, parse_model_mae, read_s1_calibration_mae, ca_register_rows,
 # evaluate_s1_v2, criteria_v2_line = 9). Removed: 0. Kill: unset the env.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "1.9.7"
+SCRIPT_VERSION = "1.9.8"
 # -----------------------------------------------------------------------------
 # v1.7.0 (2026-08-31, 10-day program Day 6) - CRITERION 6 READS THE DRILL THAT
 #          ACTUALLY RAN (the registration gap)
@@ -1297,6 +1312,124 @@ def criteria_v2_line(gate: Dict[str, Any]) -> str:
             f"model_mae={_f(v.get('model_mae_pp'), '{:.2f}pp')} "
             f"ca_rows={'n/a' if v.get('ca_rows') is None else v.get('ca_rows')} "
             f"set={v.get('set_digest') or '-'}")
+
+
+# --------------------------------------------------------------------------- #
+# v1.9.8 [S1-SIGNIFICANCE] - could the net alpha be chance? (observe only)    #
+# --------------------------------------------------------------------------- #
+S1_SIG_MIN_DAYS = 20      # fewer paired scored days cannot carry a test
+S1_SIG_T = 2.0            # the project's floor for a clear result
+
+
+def _significance_mode() -> str:
+    """v1.9.8: TFB_S1_SIGNIFICANCE observe (DEFAULT) | off. Only an explicit
+    off / 0 / false / no turns it off. Read at call time; never raises."""
+    try:
+        raw = (os.getenv("TFB_S1_SIGNIFICANCE") or "observe").strip().lower()
+        return "off" if raw in ("off", "0", "false", "no") else "observe"
+    except Exception:  # noqa: BLE001
+        return "observe"
+
+
+def net_daily_returns(history: Sequence[Dict[str, Any]], basket: str) -> Dict[str, float]:
+    """v1.9.8 PURE: {date: net return %} for the SCORED days of `basket` on or
+    after EVIDENCE_EPOCH. The return is the day's move of the stored Cum
+    Index (chain_index puts the cost drag in it), so it is exactly what
+    criterion 3 compounds. A row with a blank Daily Return (seed, excluded,
+    non-trading) carries the index and gives no return. The first row of a
+    date stands. Never raises."""
+    out: Dict[str, float] = {}
+    prev: Optional[float] = None
+    for h in history or []:
+        try:
+            if h.get("basket") != basket:
+                continue
+            idx = h.get("cum_index")
+            idx = float(idx) if idx is not None else None
+            day = str(h.get("date") or "")[:10]
+            d = _parse_iso_date(day)
+            if (h.get("daily_return") is not None and prev and idx
+                    and d is not None and d >= EVIDENCE_EPOCH and day not in out):
+                out[day] = (idx / prev - 1.0) * 100.0
+            if idx:
+                prev = idx
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def significance(history: Sequence[Dict[str, Any]],
+                 today_rows: Optional[Sequence[Dict[str, Any]]] = None,
+                 excluded_days: Optional[int] = None) -> Dict[str, Any]:
+    """v1.9.8 PURE: the test the six criteria do not make. Daily net alpha =
+    challenger minus benchmark net return on the days BOTH were scored; t =
+    mean / (sample sd / sqrt(n)). Daily returns do not overlap, so no
+    horizon adjustment applies. Never raises."""
+    rows = list(history or []) + list(today_rows or [])
+    chal = net_daily_returns(rows, CHALLENGER)
+    bench = net_daily_returns(rows, BENCHMARK)
+    diffs = [chal[d] - bench[d] for d in sorted(set(chal) & set(bench))]
+    n = len(diffs)
+    mean = (sum(diffs) / n) if n else None
+    t: Optional[float] = None
+    if n >= 2:
+        var = sum((x - mean) ** 2 for x in diffs) / (n - 1)
+        if var > 0:
+            t = mean / ((var ** 0.5) / (n ** 0.5))
+    excluded = max(0, int(excluded_days or 0))
+    if n < S1_SIG_MIN_DAYS:
+        reading = "TOO_FEW_DAYS"
+    elif t is not None and t >= S1_SIG_T:
+        reading = "SIGNIFICANT"
+    else:
+        reading = "NOT_SIGNIFICANT"
+    coverage = "thin" if excluded > n else "ok"
+    return {"n": n, "mean_pp": None if mean is None else round(mean, 4),
+            "t": None if t is None else round(t, 2), "excluded": excluded,
+            "coverage": coverage, "reading": reading,
+            "evidence": reading == "SIGNIFICANT" and coverage == "ok"}
+
+
+def significance_words(sig: Dict[str, Any]) -> str:
+    """v1.9.8 PURE: the reading in words, for the gate's 'why' line."""
+    n, t, excl = sig.get("n") or 0, sig.get("t"), sig.get("excluded") or 0
+    if sig.get("reading") == "TOO_FEW_DAYS":
+        core = f"only {n} paired scored days ({S1_SIG_MIN_DAYS} needed for a test)"
+    else:
+        core = (f"daily net alpha t={'n/a' if t is None else f'{t:+.2f}'} "
+                f"over {n} paired scored days")
+    if excl:
+        core += f", {excl} excluded"
+    if sig.get("evidence"):
+        return core + ": a clear edge on these days"
+    if sig.get("reading") == "SIGNIFICANT":
+        return core + ": more days excluded than scored, coverage too thin to rely on"
+    return core + ": not yet evidence of an edge; the six criteria do not test it"
+
+
+def apply_significance(gate: Dict[str, Any], sig: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """v1.9.8 PURE: returns a NEW gate dict. off -> deep copy, untouched.
+    observe -> criteria, statuses and verdict untouched; the reading rides
+    on the gate, and a PASS that is not evidence says so at the end of its
+    'why' line (the line every page copies). Never auto-promotes, never
+    demotes."""
+    g = copy.deepcopy(gate)
+    if mode != "observe":
+        return g
+    g["significance"] = dict(sig)
+    if g.get("verdict") == "PASS" and not sig.get("evidence"):
+        g["why"] = f"{g.get('why', '')} | significance (observe): {significance_words(sig)}"
+    return g
+
+
+def significance_line(sig: Dict[str, Any], mode: str) -> str:
+    """v1.9.8 PURE: the read-back token line for the verdict / meta / _Run_Log."""
+    def _f(x: Any, fmt: str) -> str:
+        return "n/a" if x is None else fmt.format(x)
+    return (f"[S1-SIGNIFICANCE v{SCRIPT_VERSION}] mode={mode} n={sig.get('n')} "
+            f"mean={_f(sig.get('mean_pp'), '{:+.3f}pp')} t={_f(sig.get('t'), '{:+.2f}')} "
+            f"excluded={sig.get('excluded')} coverage={sig.get('coverage')} "
+            f"reading={sig.get('reading')} evidence={'yes' if sig.get('evidence') else 'no'}")
 
 
 def evaluate_s1(days: int, violations: List[str],
@@ -2397,6 +2530,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                               _v2_model, _v2_ca_rows, _v2_cums, _v2_set)
         _v2_line = criteria_v2_line(gate)
         print(_v2_line)
+    _sig_mode = _significance_mode()               # v1.9.8 [S1-SIGNIFICANCE]
+    _sig_line = ""
+    if _sig_mode != "off":
+        _sig = significance(
+            history,
+            [{"date": str(today), "basket": _b,
+              "daily_return": (results.get(_b) or {}).get("ret"),
+              "cum_index": (results.get(_b) or {}).get("index")}
+             for _b in (CHALLENGER, BENCHMARK)],
+            excluded_days)
+        gate = apply_significance(gate, _sig, _sig_mode)
+        _sig_line = significance_line(_sig, _sig_mode)
+        print(_sig_line)
 
     verdict = (f"[S1-GATE v{SCRIPT_VERSION}] {gate['verdict']} day {days}/"
                f"{S1_WINDOW_DAYS}"
@@ -2422,6 +2568,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         verdict += f" | {_base_line}"
     if _v2_line:                                   # v1.9.2 armed only
         verdict += f" | {_v2_line}"
+    if _sig_line:                                  # v1.9.8 unless switched off
+        verdict += f" | {_sig_line}"
     if _bf_mode != "off":                          # v1.8.0 read-back
         verdict += (f" | [S1-BOARD-FRESH v{SCRIPT_VERSION}] "
                     f"asof={_bf_asof or '?'} mode={_bf_mode}"
@@ -2470,7 +2618,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          + f" | {_fresh_line}"
          + (f" | {_dk_line}" if _dk["drift"] else "")
          + (f" | {_base_line}" if _base_line else "")
-         + (f" | {_v2_line}" if _v2_line else "")],  # v1.7.3 / v1.9.0 / v1.9.1 / v1.9.2 cells
+         + (f" | {_v2_line}" if _v2_line else "")
+         + (f" | {_sig_line}" if _sig_line else "")],  # v1.7.3 / v1.9.0 / v1.9.1 / v1.9.2 / v1.9.8 cells
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -2512,6 +2661,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                       "fresh_frac_used": round(_chal_frac, 4)}
     if _v2_line:                                   # v1.9.2 armed only
         _rl_details["criteria_v2"] = gate.get("v2")
+    if _sig_line:                                  # v1.9.8 unless switched off
+        _rl_details["significance"] = gate.get("significance")
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
