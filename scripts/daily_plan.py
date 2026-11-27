@@ -983,11 +983,17 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     rmode, rccy = k.get("ranker", "engine"), k.get("ranker_ccy") or ["USD"]       # 1.11.0 [RANKER]
     order = upside_order(cands, rccy) if rmode != "engine" else []
     upos = {id(c): i + 1 for i, c in enumerate(order)}
+
+    def by_upside(c: Dict[str, Any]) -> Tuple[int, int, int]:
+        """1.11.0 [RANKER]: the upside switch's order - a kept pick first, a name under the entry level last."""
+        return (0 if kept(c) else 1, 1 if low(c) else 0, upos[id(c)])
+
     if rmode == "upside":
-        cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, upos[id(c)]))
+        cands.sort(key=by_upside)
     else:
         cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
-    alt = would_pick(order, k["picks"], max_per_sector) if rmode == "observe" else []
+    # observe previews the switch in its own order, kept and entry-level priorities included (Codex P2 on #1112)
+    alt = would_pick(sorted(cands, key=by_upside), k["picks"], max_per_sector) if rmode == "observe" else []
     if rmode == "observe":
         for c in cands:
             if c.get("ccy") not in rccy:

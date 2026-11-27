@@ -24,7 +24,7 @@ IC is the day's rank correlation with the next month's return, about 24 to 32 na
    - `observe`: the picks are the engine's. Each candidate gets a label:
      - `[observe] analyst upside +x% - upside order n of m`;
      - or, when it has none, `[observe] no analyst upside (no target price on its source page)` / `[observe] no upside order (priced in X)`.
-     - The names the upside order would pick under the day's sector cap read `[observe] the upside ranker would pick this (before the cash and held-sector checks)`.
+     - The names the upside switch would pick read `[observe] the upside ranker would pick this (before the cash and held-sector checks)`. The preview takes the switch's own order (a kept pick first, a name under the entry level last), then the day's sector cap (Codex P2 on #1112).
    - `upside`: the candidates are taken in the upside order. A name kept from the previous plan still comes first, and a low-data name still comes last. A pick reads `ranked by analyst upside +x% (engine rank n)` and a waiting name `next in line (upside order n; engine rank m)`.
    - Every gate before the order is unchanged: the regime gate, the forecast cap, the evidence rule, currency and funding, the earnings and ex-dividend windows, the entry rule, the sector caps and the cash checks.
 5. **Run log, counts only:** `ranker observe: a of b candidate(s) carry an analyst upside; the upside order would pick c name(s), d of them among today's e pick(s)`. The line is not printed in `engine`, and no symbol is printed.
@@ -40,17 +40,18 @@ The forward evidence already exists and was fixed before any forward day:
 The observe labels show the owner each morning which names the upside order would buy, beside the engine's. Switching to `upside` is the owner's decision once those readings are in (1-week reading about 17 Dec, 2-week about 31 Dec). Rollback: `TFB_PLAN_RANKER=engine`.
 
 ## Tests
-- `tests/test_daily_plan.py`: 72 pass. The seven new R tests:
+- `tests/test_daily_plan.py`: 73 pass. The eight new R tests:
   - R1: knob parsing (including `on` and blank read `engine`), the currency list, `analyst_upside` and its None cases, `upside_order` ties and the rest by rank, `would_pick` under the sector cap;
   - R2: engine is the default and adds no label;
   - R3: observe keeps the picks, quantities, entries, stops and allocations, labels every candidate, names the would-picks, and gives the `ranker` summary;
   - R4: upside reorders the fixture's picks (rank 3, upside +6 %, is replaced by rank 4, +28 %), labels the picks, and gives the waiting order;
   - R5: the kept pick still leads; a currency outside `TFB_PLAN_RANKER_CCY` is not ranked; the regime gate still holds US buys;
   - R6: the run-log line gives counts and no symbol, and is absent in `engine`;
-  - R7: the workflow arms observe, and the version and header are checked.
+  - R7: the workflow arms observe, and the version and header are checked;
+  - R8: the observe preview equals the upside switch's picks with a kept pick and with names under the entry level.
 - Changed with a reason: W1's version assertion moves to 1.11.0.
-- Related suites pass: `test_today_action_plan`, `test_markets_board`, `test_verify_manifest_pins`, `test_bq_views`. Workflow audit: errors 0, warnings 0.
-- Nineteen hand mutants: eighteen fail a test. The one that lives computes the upside order in `engine` mode too, which changes nothing anyone can see (an equivalent mutant).
+- Related suites pass: `test_today_action_plan`, `test_markets_board`, `test_verify_manifest_pins`, `test_bq_views`, and `test_trial_shadow_v2_rule`. That last guard holds that no live script names the shadow score, so the code header names `v_trial_c2` and `v_signal_edge` only. Workflow audit: errors 0, warnings 0.
+- Twenty-one hand mutants: twenty fail a test. The one that lives computes the upside order in `engine` mode too, which changes nothing anyone can see (an equivalent mutant).
 
 ## Owner
 Merge when ready; nothing to set. The workflow arms observe. Setting the repository variable `TFB_PLAN_RANKER=upside` is the live switch and stays your decision after the forward readings.

@@ -1581,6 +1581,27 @@ def test_r5_upside_keeps_the_plans_own_rules(monkeypatch):
     assert blocked["picks"] == [] and all(c["waiting"] for c in blocked["pipeline"])
 
 
+
+def test_r8_observe_previews_the_switch_in_its_own_order(monkeypatch):
+    """Codex P2 on #1112: the would-pick labels follow the upside switch's priorities, not the bare upside order."""
+    def both(**kw):
+        monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+        obs = plan(src=SRC_EV, cal=CAL_EV, **kw)
+        monkeypatch.setenv("TFB_PLAN_RANKER", "upside")
+        up = plan(src=SRC_EV, cal=CAL_EV, **kw)
+        would = [c["symbol"] for c in obs["picks"] + obs["pipeline"]
+                 if any(x.startswith("[observe] the upside ranker would pick") for x in c["labels"])]
+        return obs["ranker"]["alt"], sorted(would), _syms(up["picks"])
+
+    alt, would, up = both(prior=("ZTO.US",))                       # yesterday's pick keeps its place under upside
+    assert alt == up == ["ZTO.US", "ITRN.US", "TEN.US"] and would == sorted(up)
+    k = lambda r: K(ranker=r, stable="prefer", stable_enter=77)      # scores 79-72: ranks 4+ are under the entry level
+    monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+    obs = plan(src=SRC_EV, cal=CAL_EV, k=k("observe"))
+    upn = plan(src=SRC_EV, cal=CAL_EV, k=k("upside"))
+    assert obs["ranker"]["alt"] == _syms(upn["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]   # not +28% NMM: under 77
+
+
 def test_r6_the_run_log_gives_counts_only(monkeypatch, capsys):
     monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
     monkeypatch.setenv("TFB_PLAN_LOG_DETAIL", "off")
