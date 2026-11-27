@@ -217,7 +217,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
     # 2026-10-28 (manifest pin only): 1.17.0 -> 1.17.1 (D1b malformed
     # post-earnings entry is unknown evidence, never dropped).
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.20.0", "portfolio actions"),
+     "1.20.1", "portfolio actions"),
     ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.19.0",
      "advanced analysis route"),
     # 2026-11-25 (pin only): 4.8.4 -> 4.9.0 (opt-in response_shape=market-objects.v1; default response unchanged).

@@ -46,9 +46,9 @@ def _acts(payload):
 
 
 def test_version_and_manifest_pin():
-    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.20.0"
+    assert pa.PORTFOLIO_ACTIONS_VERSION == "1.20.1"
     manifest = open(os.path.join(_ROOT, "scripts", "verify_deployment.py"), encoding="utf-8").read()
-    assert '"1.20.0", "portfolio actions")' in manifest
+    assert '"1.20.1", "portfolio actions")' in manifest
     ci = open(os.path.join(_ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
     assert "tests/test_pf_total_return.py" in ci
 
