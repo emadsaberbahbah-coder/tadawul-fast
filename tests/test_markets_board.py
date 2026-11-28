@@ -291,11 +291,11 @@ def test_m1_days_verdict_and_the_run_on_hold():
     gap = [facts[0], dict(facts[2], day=dt.date(2026, 11, 16))]
     assert mb.hold_streak(gap) == (1, dt.date(2026, 11, 20), False)                      # a calendar gap ends the run
     head, detail = mb.verdict_lines(facts[0], days[0][1], mb.hold_streak(facts))
-    assert head == "ALL ON HOLD - cash stays cash"
+    assert head == "ALL ON HOLD (market test: calm only)"                               # 1.3.0: never the live rule
     assert detail == ("none of the 10 markets with a fund is calm (oil is a reading only); every market on hold for "
-                      "3 day(s) in a row, since Wed 18 Nov 2026")
+                      "3 day(s) in a row, since Wed 18 Nov 2026 - the live buy rule is the LIVE RULE line")
     head, detail = mb.verdict_lines(facts[3], days[3][1], mb.hold_streak(facts[3:]))
-    assert head == "2 of 10 OPEN" and detail == "open: Gold, Bonds; first: Gold - a buy would use GLD"
+    assert head == "2 of 10 OPEN (market test: calm only)" and detail == "open: Gold, Bonds; first: Gold - a buy would use GLD"
     one = [facts[0], facts[1], dict(facts[2], open=1)]
     assert mb.hold_streak(one) == (2, dt.date(2026, 11, 19), False)                   # one open market ends the run
     # oil has no fund: a calm oil price opens nothing, and the first open market is the first with a fund
@@ -304,8 +304,39 @@ def test_m1_days_verdict_and_the_run_on_hold():
                    x for x in mb.MARKETS if x not in ("oil", "sukuk"))])
     f = mb.day_facts(dt.date(2026, 11, 16), oil_day)
     assert f["open"] == 1 and f["open_names"] == ["Sukuk"] and f["first"] == "Oil"
-    assert mb.verdict_lines(f, oil_day, (0, None, False)) == ("1 of 10 OPEN",
+    assert mb.verdict_lines(f, oil_day, (0, None, False)) == ("1 of 10 OPEN (market test: calm only)",
                                                               "open: Sukuk; first: Sukuk - a buy would use SPSK")
+
+
+def test_m1b_the_live_rule_is_said_as_configured(monkeypatch):
+    """1.3.0 (owner, 28 Nov 14:24: the pages agree and do not contradict): the US line and the LIVE RULE line read the
+    Daily Plan's hold labels as configured, never the page's own calm-only test."""
+    monkeypatch.setenv("TFB_PLAN_REGIME_BLOCK", "drawdown,crash_day")
+    monkeypatch.setenv("TFB_PLAN_REGIME", "enforce")
+    rule = mb.plan_rule()
+    day = [mrow("2026-11-27", "us", 1, "stress", 0.1), mrow("2026-11-27", "eu", 2, "calm", 0.2, opened=1),
+           mrow("2026-11-27", "sa", 3, "drawdown", -0.3), mrow("2026-11-27", "jp", 4, "drawdown", -0.4),
+           mrow("2026-11-27", "cn", 5, "drawdown", -0.5), mrow("2026-11-27", "gold", 6, "weak", 0.0)]
+    assert mb.us_words("stress", rule) == ("the Daily Plan holds a new US buy on drawdown, crash_day "
+                                           "(TFB_PLAN_REGIME_BLOCK): today the US reads stress - not held")
+    assert mb.us_words("drawdown", rule).endswith("today the US reads drawdown - held")
+    assert mb.live_rule_line(day, rule) == (
+        "hold on drawdown, crash_day",
+        "the main page's market gate - new buys held today: Saudi Arabia (drawdown), Japan (drawdown), China / Hong "
+        "Kong (drawdown); allowed: United States (stress), Europe (calm) (the Daily Plan's own rule reads the US only: "
+        "the US line)")                     # gold is no stock market; the plan's rule is not said per market (#1115 P2)
+    obs = dict(rule, mode="observe")
+    assert mb.us_words("drawdown", obs).endswith("- would be held (observe)")
+    assert mb.live_rule_line(day, obs)[0] == "hold on drawdown, crash_day (observe)"
+    off = dict(rule, mode="off")
+    assert mb.us_words("stress", off).startswith("the Daily Plan's US rule is off")
+    assert mb.live_rule_line(day, off) == ("off", "the Daily Plan's market rule is off: no market is held for its "
+                                                  "condition")
+    assert mb.test_verdict("ALL ON HOLD - cash stays cash") == "ALL ON HOLD (market test: calm only)"
+    assert mb.test_verdict("1 of 10 open") == "1 of 10 open (market test: calm only)" and mb.test_verdict("") == ""
+    src = (ROOT / "scripts/markets_board.py").read_text(encoding="utf-8")
+    code = src.split('"""', 2)[2]                                                   # the code, after the docstring
+    assert "unless the US is calm" not in code and "cash stays cash" not in code      # no stale claim on the page
 
 
 # ----------------------------------------------------------------------------- M2 a market's row
@@ -390,13 +421,18 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     cells = cells_of(page)
     assert not any("None" in c or c.lower() in ("nan", "inf") for c in cells)
     assert page[0][0].startswith("MARKETS BOARD - ") and "OBSERVE ONLY" in page[0][0]
-    assert page[1][0] == ("Built 2026-11-21 11:40 Riyadh | markets_board 1.2.0 | as of Fri 20 Nov 2026 (each market's "
+    assert page[1][0] == ("Built 2026-11-21 11:40 Riyadh | markets_board 1.3.0 | as of Fri 20 Nov 2026 (each market's "
                           "latest close, 6 days at most) | BigQuery v_market_rank | only the Today Action Plan gives orders")
-    assert page[2][:3] == ["VERDICT", "ALL ON HOLD - cash stays cash",
+    assert page[2][:3] == ["VERDICT", "ALL ON HOLD (market test: calm only)",
                            "none of the 10 markets with a fund is calm (oil is a reading only); every market on hold for "
-                           "3 day(s) in a row, since Wed 18 Nov 2026"]
-    assert page[3][:2] == ["US", "crash_day"]
-    assert page[4][:3] == ["NEXT EVENT", "US core PCE prices (m/m) - Oct, Wed 25 Nov 16:30 Riyadh",     # 1.2.0
+                           "3 day(s) in a row, since Wed 18 Nov 2026 - the live buy rule is the LIVE RULE line"]
+    assert page[3][:3] == ["US", "crash_day", "the Daily Plan holds a new US buy on weak, stress, drawdown, crash_day "
+                                              "(TFB_PLAN_REGIME_BLOCK): today the US reads crash_day - held"]   # 1.3.0
+    assert page[4][:3] == ["LIVE RULE", "hold on weak, stress, drawdown, crash_day",                     # 1.3.0
+                           "the main page's market gate - new buys held today: United States (crash_day), Saudi Arabia "
+                           "(drawdown), Europe (crash_day), Japan (crash_day), China / Hong Kong (drawdown); allowed: none "
+                           "(the Daily Plan's own rule reads the US only: the US line)"]
+    assert page[5][:3] == ["NEXT EVENT", "US core PCE prices (m/m) - Oct, Wed 25 Nov 16:30 Riyadh",     # 1.2.0
                            "on its 24 earlier event(s) the US moved a median +0.12 % (middle 80 %: -0.90 .. +1.05) and "
                            "oil moved a median +0.30 % (middle 80 %: -2.20 .. +2.40) - section 7 has the next 14 days"]
     head = page.index(mb.HEAD)
@@ -408,7 +444,7 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     first = page.index(hist)
     assert [r[0] for r in page[first + 1:first + 5]] == ["Fri 20 Nov 2026", "Thu 19 Nov 2026", "Wed 18 Nov 2026",
                                                         "Tue 17 Nov 2026"]
-    assert page[first + 4][1:5] == ["2 of 10", "2 of 10 open", "Gold, Bonds", "Gold (open)"]
+    assert page[first + 4][1:5] == ["2 of 10", "2 of 10 open (market test: calm only)", "Gold, Bonds", "Gold (open)"]
     assert any(r[0] == "Measure" for r in page)
     texts = [r[0] for r in page if isinstance(r[0], str) and r[0]]
     assert any(t.startswith("BACKTEST (the same rules") for t in texts)
@@ -477,11 +513,11 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert ("EVENTS, FORWARD (from Mon 23 Nov 2026): 2 event(s) scored so far - collecting; the owner reviews them "
             "with the rest after 10 sessions.") in texts
     out = capsys.readouterr().out
-    assert ("MARKETS as of 2026-11-20: 10 of 11 market(s) read, 0 of 10 open (ALL ON HOLD - cash stays cash); labels "
+    assert ("MARKETS as of 2026-11-20: 10 of 11 market(s) read, 0 of 10 open by the market test (ALL ON HOLD); labels "
             "crash_day 3, drawdown 6, weak 1; scorecard rows: backtest 3, forward 0") in out
     assert ("READY 3 of 6 qualified (hold 2, not read 1, open 3) | switch check: 2 holding(s), 1 with a SWITCH CANDIDATE | "
             "ready scorecard rows: 7 | Final_Decisions: 3 stock(s) read") in out
-    assert "wrote the Markets_Board tab (100 row(s))" in out                   # the rows written before the blank tail
+    assert "wrote the Markets_Board tab (101 row(s))" in out                   # the rows written before the blank tail (1.3.0: + LIVE RULE)
     assert ("EVENTS ahead (14 days): 2 event(s) with a scenario | last 7 days: 1 | event scorecard lines: backtest 2, "
             "forward 1") in out
     for sym in ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "HHH", "JJJ", "ZZZ"):
@@ -629,7 +665,8 @@ def test_m7_workflow_manifest_and_read_only_scope():
     src = (ROOT / "scripts/markets_board.py").read_text(encoding="utf-8")
     for name in re.findall(r"(TFB_[A-Z_]+): \$\{\{", raw):
         assert name in src or name.startswith("TFB_BQ_"), name
-    assert src.isascii() and mb.__version__ == "1.2.0" and "v1.2.0 (2026-11-21)" in src and "v1.1.0 (2026-11-21)" in src
+    assert src.isascii() and mb.__version__ == "1.3.0" and "v1.3.0 (2026-11-28)" in src and "v1.2.0 (2026-11-21)" in src
+    assert "v1.1.0 (2026-11-21)" in src
     assert "v1.0.0 (2026-11-21)" in src
     assert ('("markets_board", "%s", "markets board")' % mb.__version__
             in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8"))

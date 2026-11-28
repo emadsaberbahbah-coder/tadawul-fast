@@ -494,7 +494,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-21 (new script, pinned on arrival): the Markets_Board tab - the condition of every market, their
     # order by trend and risk and the scorecard of the forward test, read from the market views (observe only).
     # 2026-11-21: v1.1.0 the ready list, the switch check; v1.2.0 the events ahead and their scorecard (views 1.21.0).
-    ("markets_board", "1.2.0", "markets board"),
+    # 2026-11-28 (pin only): 1.2.0 -> 1.3.0 (the US line and a LIVE RULE line say the live buy rule as configured; the
+    # verdict is named as the page's own calm-only market test).
+    ("markets_board", "1.3.0", "markets board"),
     # 2026-10-28 (A7 news layer, observe-only; pin only): the news & macro gate.
     # 2026-10-28 (same rule): 1.0.0 -> 1.0.1 (--write needs a workbook session).
     # 2026-11-26 (pin only): 1.8.0 -> 1.8.1 (the public run log names no holding).
@@ -529,7 +531,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-18 (new script, pinned on arrival): the Holding_Read page - what moved each holding last
     # session (company news, its group or the market) and the next-session read from its own history.
     ("holding_read", "1.0.3", "holding read"),   # 2026-11-23: 1.0.1 no holding in the run log; write quota; 1.0.2 open
-    ("consistency_check", "1.5.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
+    # 2026-11-28 (pin only): 1.5.0 -> 1.6.0 (C16 gate rules: the main page's market gate on Render, the Daily Plan's
+    # hold and the Exit Plan's sell note read the same market states).
+    ("consistency_check", "1.6.0", "consistency check"),   # 2026-11-21: v1.5.0 C15 reads the tabs the page uses
     ("evidence_board", "1.2.1", "evidence board"),
     # 2026-11-26 (pin only): 1.8.2 -> 1.9.0 (a holding under a standing cash offer whose sale is manual is not asked
     # for a stop: config/corporate_offers.json; TFB_TAP_OFFERS on).

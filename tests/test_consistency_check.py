@@ -204,7 +204,7 @@ def test_k4_gate_page_and_read_failure(monkeypatch, capsys):
     assert page[2] == ["Check", "Status", "Detail", "First page", "Second page", "Pages compared", "Control rule"]
     assert all(len(r) == 7 for r in page) and all(r[6] for r in page[3:])          # every check carries its rule
     assert [r[6] for r in page[3:] if r[0] == "C9 stops"] == ["The stop to place is the Exit Plan's. Another page's stop is analysis."]
-    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 16))
+    assert set(cc.CONTROLS) == set("C%d" % i for i in range(1, 17))                       # 1.6.0: C16
     assert [r[1] for r in page[3:]] == ["MISMATCH"] * 4 + ["STALE"] * 3 + ["INFO"] * 4 + ["MATCH"] * 6
     assert set(b.tabs) - set(wb()) == {"Consistency_Check"}                       # no other page is touched
     log = capsys.readouterr().out                                                 # 1.2.0: the run log is public
@@ -345,7 +345,7 @@ def test_k7_the_13_nov_differences():
     assert [r for r in got if r[0] == "C10 actions"][0][1] == "MATCH"
     # the page: its own count and place
     page = cc.page_rows(cc.run_checks(wb13(), today, cc.knobs(), now), "2026-11-13 11:50")
-    assert " · 1 over the position cap · " in page[1][0] and "consistency_check 1.5.0" in page[1][0]
+    assert " · 1 over the position cap · " in page[1][0] and "consistency_check %s" % cc.__version__ in page[1][0]
     order = [r[1] for r in page[4:]]
     assert order.index("OVER CAP") > max(i for i, s in enumerate(order) if s in ("MISMATCH", "STALE"))
     assert order.index("OVER CAP") < min(i for i, s in enumerate(order) if s in ("INFO", "MATCH"))
@@ -395,7 +395,7 @@ def test_k9_a_plan_with_no_pick_is_a_plan():
     # no row of any Kind for today: still 'not cut yet'
     c1 = by(wb(_Daily_Plan=zero[:2]), "C1 decision")[0]
     assert c1[1] == "INFO" and "no Daily Plan for 2026-11-11 yet" in c1[2]
-    assert cc.__version__ == "1.5.0"
+    assert tuple(int(x) for x in cc.__version__.split(".")) >= (1, 5, 0)
 
 
 # ----------------------------------------------------------------------------- K10 (1.4.0)
@@ -517,3 +517,79 @@ def test_k11_c15_reads_the_trade_record_stamp_and_lets_the_capture_rule_the_acco
     assert hand[1] == "STALE" and "_IBKR_NAV_History" not in hand[2]
     assert hand[2].startswith("_IBKR_Trades has no as_of (a hand-filled snapshot) - Portfolio_Decision_v2 reads")
     assert cc.RANGES["_IBKR_Trades"] == "A1:I6" and cc.log_detail(hand) == hand[2]
+
+
+# ----------------------------------------------------------------------------- K16 (1.6.0 C16 gate rules)
+def _health(hold="crash_day,drawdown", mode="enforce", nest=False):
+    gates = {"market_gate": mode, "market_gate_hold": hold, "market_gate_markets": "us,sa,eu,jp,cn"}
+    body = {"status": "ok", "engine_gates": gates}
+    return {"data": body} if nest else body
+
+
+def test_k16_the_three_gate_lists_agree_or_are_named(monkeypatch):
+    """1.6.0 (owner, 28 Nov 14:24: the pages agree and do not contradict): the main page's market gate (Render), the
+    Daily Plan's hold and the Exit Plan's sell note hold a buy on the same market states."""
+    assert cc.gate_set("Drawdown, crash_day ,calm,x") == ("crash_day", "drawdown")
+    assert cc.gate_set("") == () and cc.gate_set(None) == ()
+    env = {"TFB_PLAN_REGIME": "enforce", "TFB_PLAN_REGIME_BLOCK": "drawdown,crash_day", "TFB_EXIT_MARKET_TURN": "observe"}
+    rules = cc.gate_rules(env)
+    assert rules == {"plan_mode": "enforce", "plan": ("crash_day", "drawdown"), "sell_mode": "observe",
+                     "sell": ("crash_day", "drawdown")}                    # the sell note follows the plan when unset
+    assert cc.gate_rules({})["plan"] == ("crash_day", "drawdown", "stress", "weak")          # each rule's own default
+    assert cc.gate_rules(dict(env, TFB_EXIT_MARKET_TURN_LABELS="weak,stress,drawdown,crash_day"))["sell"] == (
+        "crash_day", "drawdown", "stress", "weak")
+    ok = cc.gate_rules_check(cc.find_engine_gates(_health()), rules)
+    assert ok[:2] == ["C16 gate rules", "MATCH"] and "crash_day, drawdown" in ok[2]
+    assert ok[3] == "main page (enforce): crash_day, drawdown"
+    # 28 Nov before the change on Render: the main page still held stress and weak
+    bad = cc.gate_rules_check(cc.find_engine_gates(_health("weak,stress,drawdown,crash_day")), rules)
+    assert bad[1] == "MISMATCH" and "main page (enforce): crash_day, drawdown, stress, weak" in bad[2]
+    assert "Daily Plan (enforce): crash_day, drawdown" in bad[2] and "TFB_MARKET_GATE_HOLD" in bad[2]
+    sell = cc.gate_rules_check(cc.find_engine_gates(_health()), dict(rules, sell=("crash_day", "drawdown", "stress")))
+    assert sell[1] == "MISMATCH" and "Exit Plan sell note (observe): crash_day, drawdown, stress" in sell[2]
+    nested = cc.find_engine_gates(_health(nest=True))
+    assert nested["market_gate_hold"] == "crash_day,drawdown" and cc.find_engine_gates({"x": 1}) == {}
+    info = cc.gate_rules_check(None, rules, "/health not read (URLError)")
+    assert info[1] == "INFO" and "not read (/health not read (URLError))" in info[2]
+    assert cc.gate_rules_check({"market_gate": "off"}, rules)[1] == "INFO"        # no hold list: not compared
+
+
+def test_k16_the_read_never_raises_and_the_run_adds_the_row(monkeypatch, capsys):
+    calls = []
+
+    def get(url, timeout):
+        calls.append((url, timeout))
+        return 200, _health()
+    assert cc.read_engine_gates("https://x.example/", get) == (_health()["engine_gates"], "")
+    assert calls == [("https://x.example/health", 20.0)]
+    assert cc.read_engine_gates("http://x.example", get) == (None, "no https TFB_BACKEND_URL")
+    assert cc.read_engine_gates("https://x.example", lambda u, t: (503, {})) == (None, "/health answered HTTP 503")
+    assert cc.read_engine_gates("https://x.example", lambda u, t: (200, {"status": "ok"})) == (
+        None, "no engine_gates in /health")
+
+    def boom(url, timeout):
+        raise OSError("down")
+    assert cc.read_engine_gates("https://x.example", boom) == (None, "/health not read (OSError)")
+    # the run: with gates given, C16 is one more row and its detail reaches the log (no account figure in it)
+    monkeypatch.setenv("TFB_PLAN_REGIME", "enforce")
+    monkeypatch.setenv("TFB_PLAN_REGIME_BLOCK", "drawdown,crash_day")
+    monkeypatch.delenv("TFB_EXIT_MARKET_TURN_LABELS", raising=False)
+    monkeypatch.setenv("TFB_CONSISTENCY", "on")
+    b = Book(wb())
+    assert cc.run(True, book=b, now=NOW, capture={"ok": False, "reason": "test"},
+                  gates=(_health()["engine_gates"], "")) == 0
+    out = capsys.readouterr().out
+    assert "C16 gate rules   MATCH    every page holds a new buy on the same states: crash_day, drawdown" in out
+    # without a URL (a run outside the workflow) there is no C16 and no network read
+    monkeypatch.delenv("TFB_BACKEND_URL", raising=False)
+    assert cc.run(True, book=Book(wb()), now=NOW, capture={"ok": False, "reason": "test"}) == 0
+    assert "C16" not in capsys.readouterr().out
+    wf = (ROOT / ".github/workflows/consistency_check.yml").read_text(encoding="utf-8")
+    for line in ("TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}",
+                 "TFB_PLAN_REGIME_BLOCK: ${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}",
+                 "TFB_EXIT_MARKET_TURN_LABELS: ${{ vars.TFB_EXIT_MARKET_TURN_LABELS || vars.TFB_PLAN_REGIME_BLOCK || "
+                 "'weak,stress,drawdown,crash_day' }}"):
+        assert line in wf, line
+    for name in ("daily_plan.yml", "exit_plan.yml"):                   # the same expressions as the rules' own workflows
+        other = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+        assert "vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day'" in other, name
