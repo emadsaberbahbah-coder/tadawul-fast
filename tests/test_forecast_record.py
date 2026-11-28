@@ -319,7 +319,8 @@ def _honest(p):
 
 def test_h3_every_judged_name_is_labelled_and_no_pick_changes(monkeypatch):
     assert dp.honest_mode() == "observe" and dp.knobs()["honest"] == "observe"
-    for word, want in (("off", "off"), ("OFF", "off"), ("observe", "observe"), ("on", "observe"), ("", "observe")):
+    for word, want in (("off", "off"), ("OFF", "off"), ("observe", "observe"), ("on", "observe"), ("", "observe"),
+                       ("enforce", "enforce"), ("ENFORCE", "enforce"), ("enforced", "observe")):
         monkeypatch.setenv("TFB_PLAN_HONEST", word)
         assert dp.honest_mode() == want, word
     base = _plan(dict(dp.knobs(), honest="off"))
@@ -449,7 +450,7 @@ def test_w1_the_record_follows_the_two_archives_and_writes_only_its_tab():
 def test_w2_the_plan_arms_observe():
     wf = _wf("daily_plan.yml")
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
-    assert env["TFB_PLAN_HONEST"] == "${{ vars.TFB_PLAN_HONEST || 'observe' }}"
+    assert env["TFB_PLAN_HONEST"] == "${{ vars.TFB_PLAN_HONEST || 'enforce' }}"       # 1.14.0: armed by the owner
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
     assert tuple(int(x) for x in dp.__version__.split(".")) >= (1, 12, 0)
     assert "1.12.0 (2026-11-28): EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED" in src
@@ -463,3 +464,71 @@ def test_w3_the_pins_and_the_ci_lane():
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "tests/test_regime_shadow.py \\\n            tests/test_forecast_record.py \\" in ci
     assert "VERSION 1.1.109 (2026-11-28) -- THE HONEST FORECAST" in ci
+
+
+# ----------------------------------------------------------------------------- R (daily_plan 1.14.0 [RECORD-RULE])
+def _k(mode, **over):
+    return dict(dp.knobs(), honest=mode, record=record(), roi_cap="off", **over)
+
+
+def _held(p):
+    return [c for c in p["pipeline"] if str(c["waiting"]).startswith("the record: ")]
+
+
+def test_r1_enforce_holds_what_the_record_says_lost_and_observe_holds_nothing():
+    obs, enf = _plan(_k("observe")), _plan(_k("enforce"))
+    held = _held(enf)
+    assert held and _held(obs) == []
+    ten = [c for c in held if c["symbol"] == "TEN.US"][0]                         # the lowest third of US promises
+    assert ten["waiting"] == "the record: US buy calls like it lost money over 1M (-1.3% on 153 calls)"
+    assert "TEN.US" in [c["symbol"] for c in obs["picks"]]                        # observe picked it
+    was = {c["symbol"]: c["waiting"] for c in obs["pipeline"]}
+    for c in held:                                                                # only a name no gate held
+        assert c["waiting"] == dp.record_hold(c["honest"]), c["symbol"]
+        assert was.get(c["symbol"], "").startswith(("", "next in line")) and not was.get(c["symbol"], "").startswith(
+            ("earnings", "currency", "no price")), c["symbol"]
+    for c in enf["picks"]:
+        assert dp.record_hold(c["honest"]) == "", c["symbol"]
+    now = {c["symbol"]: c["waiting"] for c in enf["pipeline"]}
+    for s, w in was.items():                                                      # every gate's own reason stands
+        if not w.startswith("next in line"):
+            assert now[s] == w, s
+    assert _honest(enf) == _honest(obs)                                           # the labels do not change
+    assert dp.record_hold([]) == "" and dp.record_hold([{"honest": None, "row": None}]) == ""
+    made = {"h": "1M", "market": "US", "honest": 3.26, "band": "high", "row": {"reading": "beat its index", "calls": 153}}
+    assert dp.record_hold([made]) == ""
+    whole = dict(made, honest=-4.37, band="all", market="Tadawul", row={"reading": "lost money", "calls": 204})
+    assert dp.record_hold([whole]) == "the record: all Tadawul buy calls lost money over 1M (-4.4% on 204 calls)"
+    # an earlier gate keeps its own reason: the record speaks only for a name nothing else holds
+    gated = _plan(_k("enforce", regime=dp.regime_rule(STRESS, "enforce", BLOCK, ["USD"])))
+    assert gated["picks"] == [] and all(c["ccy"] != "USD" for c in _held(gated))
+
+
+def test_r2_enforce_puts_the_highest_third_first():
+    assert [dp.band_rank([{"honest": 1.0, "band": b}]) for b in ("high", "mid", "low", "all")] == [0, 1, 2, 2]
+    assert dp.band_rank([]) == 2 and dp.band_rank([{"honest": None, "band": "high"}]) == 2
+    order = lambda p: [c["symbol"] for c in p["picks"]]                            # noqa: E731
+    obs, enf = _plan(_k("observe", earn_days=0)), _plan(_k("enforce", earn_days=0))
+    assert order(obs) == ["ITRN.US", "TEN.US", "ZTO.US"]                           # the engine's order: ranks 1, 2, 3
+    assert order(enf) == ["ITRN.US", "NMM.US", "ZTO.US"]                           # the highest third (ranks 1, 4), then the middle
+    two = _plan(_k("enforce", earn_days=0, picks=2))
+    assert order(two) == ["ITRN.US", "NMM.US"]
+    assert [c["waiting"] for c in two["pipeline"] if c["symbol"] == "ZTO.US"] == ["next in line (rank 3)"]
+    # a kept pick still comes before the record's order
+    kept = dp.decide(dp.read_qualified(board(qual=QUAL)), dp.read_sources([SRC_FP]), dp.read_calendar(CAL, []),
+                     dp.read_ledger_lots(LOTS, dt.date(2026, 11, 10), 10), 33125.0, 2,
+                     _k("enforce", earn_days=0, picks=1), prior_picks=("ZTO.US",))
+    assert order(kept) == ["ZTO.US"] and "kept from the previous plan" in kept["picks"][0]["labels"]
+
+
+def test_r3_off_and_observe_are_the_plan_of_before_and_the_log_counts_only():
+    base, obs = _plan(dict(dp.knobs(), honest="off")), _plan(_k("observe"))
+    for key in ("symbol", "qty", "entry", "stop", "alloc_sar"):
+        assert [c[key] for c in obs["picks"]] == [c[key] for c in base["picks"]], key
+    enf = _plan(_k("enforce"))
+    line = dp.honest_line(enf["picks"] + enf["pipeline"], record(), "enforce")
+    assert "; %d held by the record | record scored through 2026-11-27" % len(_held(enf)) in line
+    assert all(c["symbol"].split(".")[0] not in line for c in enf["picks"] + enf["pipeline"])
+    assert "held by the record" not in dp.honest_line(obs["picks"] + obs["pipeline"], record(), "observe")
+    no_record = _plan(dict(dp.knobs(), honest="enforce", record={}))               # no tab read: nothing held, no order
+    assert [c["symbol"] for c in no_record["picks"]] == [c["symbol"] for c in base["picks"]] and _held(no_record) == []
