@@ -405,7 +405,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (pin only): 1.36.0 -> 1.37.0 (v_bars_clean; the challenger's inputs and results inside one price basis).
     # 2026-11-28 (pin only): 1.37.0 -> 1.38.0 (the shadow regime rule: v_regime_shadow, v_regime_shadow_insample).
     # 2026-11-28 (pin only): 1.38.0 -> 1.39.0 (the forecast record: v_forecast_record, the honest forecast's source).
-    ("apply_bq_views", "1.39.0", "bigquery looker views"),
+    # 2026-11-28 (pin only): 1.39.0 -> 1.40.0 (v_forecast_record: the cuts of the thirds are constants in the view).
+    ("apply_bq_views", "1.40.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -507,7 +508,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (pin only): 1.12.0 -> 1.12.1 (a name item whose issuer could not be checked is counted, audit A2).
     # 2026-11-27 (pin only): 1.12.1 -> 1.13.0 (Yahoo off by default, Arabic Saudi searches, EODHD company news).
     # 2026-11-27 (pin only): 1.13.0 -> 1.13.1 (the two Gulf feeds the runner cannot read taken out).
-    ("news_macro_gate", "1.13.1", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]; v1.8.0 [LLM-SHADOW]
+    ("news_macro_gate", "1.13.2", "news macro gate"),   # 2026-11-26: v1.5.0 [SOURCES]; v1.6.0 [FINNHUB]; v1.7.0 [MARKETAUX]; v1.8.0 [LLM-SHADOW]
     # 2026-11-08 (new script, pinned on arrival): the Corporate_Events tab from
     # SEC EDGAR 8-K items for the cockpit's v1.27.0 corporate-event guard.
     # 2026-11-08 (review P1 x2; pin only): 1.0.0 -> 1.0.1 (any incomplete
@@ -521,7 +522,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # dispatch for a BigQuery collector whose cron slot GitHub missed or
     # delivered past its grace (TFB_COLLECTOR_CATCHUP, workflow default observe).
     ("collector_catchup", "1.0.0", "collector catch-up"),
-    ("daily_plan", "1.12.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER); 1.12.0 the honest forecast (TFB_PLAN_HONEST)
+    # 2026-11-28 (pin only): 1.12.0 -> 1.13.0 (the upside arm goes through the plan's own cash and sector checks).
+    ("daily_plan", "1.13.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER); 1.12.0 the honest forecast (TFB_PLAN_HONEST)
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own

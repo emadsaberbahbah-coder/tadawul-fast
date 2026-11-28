@@ -915,9 +915,9 @@ def test_g8_selected_sources():
 def test_g9_ascii_module_version_pin_and_workflow():
     src = (_REPO / "scripts" / "news_macro_gate.py").read_bytes()
     assert all(b < 128 for b in src)
-    assert ng.__version__ == "1.13.1"   # 2026-11-27: v1.5.0 [SOURCES] .. v1.12.0 [AUDIT-GUARDS], v1.12.1, v1.13.0, v1.13.1
+    assert ng.__version__ == "1.13.2"   # 2026-11-28: v1.5.0 [SOURCES] .. v1.13.0, v1.13.1, v1.13.2 [SCOPE-STATE]
     vd = (_REPO / "scripts" / "verify_deployment.py").read_text(encoding="utf-8")
-    assert '("news_macro_gate", "1.13.1", "news macro gate")' in vd
+    assert '("news_macro_gate", "1.13.2", "news macro gate")' in vd
     import yaml
     wf = yaml.safe_load((_REPO / ".github" / "workflows" / "news_macro_gate.yml").read_text(encoding="utf-8"))
     on = wf.get("on") or wf.get(True)
@@ -2881,3 +2881,67 @@ def test_g23_the_arabic_saudi_feeds_and_the_sama_search_are_on_trial():
     assert {ng.tier_of(f[3]) for f in ar.values()} == {"B"} and ng.tier_of("asharqbusiness.com") == "B"
     gq, nq = ng.build_queries([])
     assert ("MACRO", "sama site", "site:sama.gov.sa when:3d", "en-sa") in nq and ng.tier_of("sama.gov.sa") == "A"
+
+
+# ----------------------------------------------------------------------------- #
+# v1.13.2 [SCOPE-STATE]: a list of names that was not read is not "no flags"
+# ----------------------------------------------------------------------------- #
+class ScopeBusySheets(FakeSheets):
+    """My_Portfolio answers `code` to its first `busy` reads (the workbook's per-minute quota is HTTP 429)."""
+
+    def __init__(self, tabs, busy, code=429):
+        super().__init__(tabs)
+        self.busy, self.code, self.asked = busy, code, 0
+
+    def get(self, url, timeout=None):
+        tab, _ = self._tab_cells(url)
+        if tab == "My_Portfolio":
+            self.asked += 1
+            if self.asked <= self.busy:
+                return Resp(self.code, {})
+        return super().get(url, timeout=timeout)
+
+
+def _scope_busy_run(busy, code=429, args=("--dry-run",)):
+    sh, waits = ScopeBusySheets(workbook().tabs, busy, code), []
+    rc = ng.main(list(args), http=FakeHTTP(), sheets=sh, now=NOW, sleep=waits.append)
+    return rc, sh, waits
+
+
+def test_s1_a_busy_workbook_is_asked_again_and_the_names_are_checked(armed, capsys):
+    rc, sh, waits = _scope_busy_run(1)
+    out = capsys.readouterr().out
+    assert rc == 0 and sh.asked == 2 and 20.0 in waits and 40.0 not in waits
+    assert "NOT CHECKED" not in out and "scope_state" not in out and "scope 0:" not in out
+    assert ng.SCOPE_RETRY_S == ng.MEMORY_RETRY_S == (0.0, 20.0, 40.0)
+
+
+def test_s2_a_scope_that_was_not_read_is_said_and_never_no_flags(armed, capsys):
+    rc, sh, waits = _scope_busy_run(99, args=("--write",))
+    out = capsys.readouterr().out
+    assert rc == 0 and sh.asked == 3 and 20.0 in waits and 40.0 in waits        # three tries, then the run goes on
+    why = "NOT CHECKED - the list of names was not read (read My_Portfolio: HTTP 429)"
+    assert "**Names:** " + why in out and "**Names:** no flags" not in out
+    assert "scope read failed (read My_Portfolio: HTTP 429): the names are NOT CHECKED in this run" in out
+    assert "scope=0 scope_state=not-read" in out and "wrote=True" in out
+    row = sh.tabs["_News_Gate"][-1]
+    assert row[ng.GATE_HEADER.index("Names Flagged")] == why                    # the page says it too
+    assert row[ng.GATE_HEADER.index("Verdict")] in ("GO", "CAUTION", "NO_NEW_ENTRY")   # the macro verdict is written
+    assert row[ng.GATE_HEADER.index("Version")] == "1.13.2"
+
+
+def test_s3_another_failure_is_not_asked_again(armed, capsys):
+    rc, sh, waits = _scope_busy_run(99, code=500)
+    out = capsys.readouterr().out
+    assert rc == 0 and sh.asked == 1 and 20.0 not in waits
+    assert "NOT CHECKED - the list of names was not read (read My_Portfolio: HTTP 500)" in out
+
+
+def test_s4_a_read_scope_changes_no_word(armed, capsys):
+    assert ng.scope_words({}) == "" and ng.scope_words({"scope_state": ""}) == ""
+    assert ng.scope_words({"scope_state": "x"}) == "NOT CHECKED - the list of names was not read (x)"
+    sh = workbook()
+    assert ng.main(["--write"], http=FakeHTTP(), sheets=sh, now=NOW, sleep=_sleep) == 0
+    out = capsys.readouterr().out
+    assert "NOT CHECKED" not in out and "scope_state" not in out
+    assert not str(sh.tabs["_News_Gate"][-1][ng.GATE_HEADER.index("Names Flagged")]).startswith("NOT CHECKED")

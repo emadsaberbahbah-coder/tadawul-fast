@@ -103,12 +103,12 @@ def _view():
 
 def test_v1_the_view_installs_last_and_reads_two_sources():
     objs = bv.load_objects()
-    assert [o.name for o in objs][-1] == "v_forecast_record" and bv.__version__ == "1.39.0"
+    assert [o.name for o in objs][-1] == "v_forecast_record" and bv.__version__ == "1.40.0"
     v = _view()
     assert v.path.name == "152_v_forecast_record.sql" and v.kind == "VIEW" and bv.check_objects(objs) == []
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_forecast_record"} == {"v_outcome_engine", "market_series_daily"}
-    assert "views 1.39.0" in v.template and "research only" in v.template
+    assert "views 1.40.0" in v.template and "research only" in v.template
     assert "the live system never reads BigQuery" in v.template
 
 
@@ -117,10 +117,16 @@ def test_v2_the_population_and_the_fixed_thirds():
     assert ("engine_scored AND in_engine_cohort AND entry_investability = 'INVESTABLE' AND entry_stance = 'bullish'"
             in code)
     assert "horizon IN ('1W', '2W', '1M', '3M')" in code
-    # the thirds are cut once, on the calls scored by 27 Nov 2026: later calls never move them
-    assert "WHERE recorded_date <= DATE '2026-11-28' AND target_bar_date <= DATE '2026-11-27'" in code
-    assert "NTILE(3) OVER (PARTITION BY market, horizon ORDER BY p, symbol, recorded_date) AS third" in code
-    assert "MAX(IF(third = 1, p, NULL)) AS low_to, MAX(IF(third = 2, p, NULL)) AS mid_to" in code
+    # views 1.40.0 (audit of 28 Nov, finding 08): the cuts are constants in the view - nothing works them out again,
+    # so no late correction of an old record can move a band once the forward test has begun
+    assert "NTILE" not in code and "AS third" not in code and "fixed AS" not in code
+    assert "STRUCT('Canada' AS market, '1W' AS horizon, 0.6851 AS low_to, 0.8377 AS mid_to)" in code
+    assert "('US', '1M', 2.6724, 4.2143)" in code and "('US', '3M', 6.0638, 10.5)" in code
+    assert "('Tadawul', '1M', 4.1929, 5.4891)" in code and "('Hong Kong', '1M', 2.0639, 3.3083)" in code
+    assert "('Mexico', '1M', 3.6, CAST(NULL AS FLOAT64))" in code            # one call on 28 Nov: 'low' and 'mid' only
+    pairs = re.findall(r"\('([A-Za-z ]+)', '(1W|2W|1M|3M)', ([0-9.]+), ([0-9.]+|CAST\(NULL AS FLOAT64\))\)", code)
+    assert len(pairs) == 36 and len({p[:2] for p in pairs} | {("Canada", "1W")}) == 37
+    assert all(m.startswith("CAST") or float(lo) <= float(m) for _, _, lo, m in pairs)
     # the same band rule as daily_plan.band_of
     assert "WHEN c.p <= k.low_to THEN 'low'" in code and "WHEN k.mid_to IS NULL OR c.p <= k.mid_to THEN 'mid'" in code
     assert dp.band_of(2.67, 2.67, 4.21) == "low" and dp.band_of(2.68, 2.67, 4.21) == "mid"
@@ -445,7 +451,8 @@ def test_w2_the_plan_arms_observe():
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_HONEST"] == "${{ vars.TFB_PLAN_HONEST || 'observe' }}"
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
-    assert dp.__version__ == "1.12.0" and "1.12.0 (2026-11-28): EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED" in src
+    assert tuple(int(x) for x in dp.__version__.split(".")) >= (1, 12, 0)
+    assert "1.12.0 (2026-11-28): EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED" in src
 
 
 def test_w3_the_pins_and_the_ci_lane():
