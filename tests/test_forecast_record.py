@@ -148,6 +148,8 @@ def test_v4_the_reading_and_every_column_the_tab_copies():
     final = code[code.rindex("\nSELECT"):]
     for _, col, _ in fr.COLUMNS:
         assert re.search(r"\b%s\b" % col, final), col
+    # the cuts leave unrounded, so a reader places a promise exactly as the view did (Codex P2 on #1114)
+    assert "g.low_to AS low_to_pp, g.mid_to AS mid_to_pp" in final and "ROUND(g.low_to" not in final
 
 
 # ----------------------------------------------------------------------------- F (the tab writer)
@@ -264,6 +266,16 @@ def test_h1_the_tab_read_back():
     assert dp.read_record([]) == {} and dp.read_record([["no", "table"]]) == {}
     assert dp.market_of("aapl", rec["suffix"]) == "US" and dp.market_of("2222.SR", rec["suffix"]) == "Tadawul"
     assert dp.market_of("BBOX.L", rec["suffix"]) is None
+
+
+def test_h2b_a_promise_between_the_rounded_and_the_true_cut_reads_the_views_band():
+    rows = [dict(r, low_to_pp="2.6744", mid_to_pp="4.2133") if r["market"] == "US" and r["horizon"] == "1M" else r
+            for r in view_rows()]
+    rec = dp.read_record(tab(rows))
+    assert rec["cuts"][("US", "1M")] == (2.6744, 4.2133)                      # the tab keeps the full cut
+    on_cut = dp.honest_read("XYZ.US", {"price": 100.0, "fp1m": 102.672}, rec, "1M")
+    assert on_cut["band"] == "low" and dp.band_of(2.672, 2.6744, 4.2133) == "low"      # 2.67 would have read mid
+    assert dp.honest_read("XYZ.US", {"price": 100.0, "fp1m": 104.212}, rec, "1M")["band"] == "mid"
 
 
 def test_h2_the_honest_read_and_its_label():

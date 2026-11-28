@@ -416,7 +416,7 @@ PENDING = {
     "v_regime_shadow_insample": "25c44ff7d8d46e4f0cc1d2a4e10d9d5ccd2cd1a1bb85b5a37044eaad617aecc2",
     # apply_bq_views 1.39.0 (28 Nov 2026): the forecast record - what the scored buy calls promised and delivered, per
     # market, horizon and promise third (cut once, on the calls scored by 27 Nov 2026), against their own index
-    "v_forecast_record": "a72d7b927e58441b306c03314e6de8ab265b961555d36ff5f86ef709ac69aaf2",
+    "v_forecast_record": "142caee5b170571135476b3ce3ba0203d32a2738426893df7b5c0386c0cd9ec2",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",

@@ -14,7 +14,8 @@
 -- scaled to the window (track_performance), so only 1M and 3M carry the page's own forecast.
 -- THE THIRDS, FIXED ON 28 NOV 2026: per market and horizon, the calls recorded up to 28 Nov 2026 and scored by 27 Nov 2026
 -- are cut into thirds by their promise (target_roi_pp, NTILE(3), lowest first, ties by symbol and day). low_to_pp and
--- mid_to_pp are the highest promise of the first and second third, and they do not move as new calls are scored: a call
+-- mid_to_pp are the highest promise of the first and second third, unrounded (a reader places a promise exactly as
+-- this view does - Codex P2 on #1114), and they do not move as new calls are scored: a call
 -- is 'low' at or under low_to_pp, 'mid' at or under mid_to_pp, else 'high' (no band where the market and horizon had no
 -- such call). 'all' is the whole market and horizon.
 -- THE PERIODS: 'all' (every scored call) and 'forward' (calls recorded from 29 Nov 2026, after the thirds were fixed):
@@ -119,7 +120,7 @@ sfx AS (
 SELECT
   g.market, g.horizon, g.band, g.period,
   CASE g.band WHEN 'all' THEN 0 WHEN 'low' THEN 1 WHEN 'mid' THEN 2 ELSE 3 END AS band_order,
-  ROUND(g.low_to, 2) AS low_to_pp, ROUND(g.mid_to, 2) AS mid_to_pp,
+  g.low_to AS low_to_pp, g.mid_to AS mid_to_pp,
   ROUND(g.promise_from, 2) AS promise_from_pp, ROUND(g.promise_to, 2) AS promise_to_pp,
   g.calls, g.symbols, g.days, g.first_call, g.last_call, g.scored_through,
   ROUND(g.promised, 2) AS promised_pp, ROUND(g.delivered, 2) AS delivered_pp,
