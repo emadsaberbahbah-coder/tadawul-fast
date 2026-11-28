@@ -979,7 +979,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.10.3"
+    assert dp.__version__ == "1.11.0"                                 # 1.11.0 [RANKER] bumped it
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1487,3 +1487,143 @@ def test_q2_opening_the_workbook_waits_out_the_quota(monkeypatch, capsys, modnam
     assert code == 2 and calls["n"] == 3 and naps == [65.0, 65.0]               # three tries, two waits into new minutes
     assert "Sheets quota reached while opening the workbook: waiting 65 s, then try 1 of 2" in out
     assert "cannot open workbook: _Quota [429]" in out
+
+
+# ----------------------------------------------------------------------------- R (1.11.0, the ranker)
+def _syms(items):
+    return [c["symbol"] for c in items]
+
+
+def _labels(p, prefix):
+    return {c["symbol"]: [x for x in c["labels"] if x.startswith(prefix)] for c in p["picks"] + p["pipeline"]}
+
+
+def test_r1_the_ranker_knob_and_the_pure_helpers(monkeypatch):
+    assert dp.ranker_mode() == "engine" and K()["ranker"] == "engine" and K()["ranker_ccy"] == ["USD"]
+    for word, want in (("observe", "observe"), ("UPSIDE", "upside"), ("engine", "engine"), ("on", "engine"),
+                       ("", "engine")):
+        monkeypatch.setenv("TFB_PLAN_RANKER", word)
+        assert dp.ranker_mode() == want, word
+    monkeypatch.setenv("TFB_PLAN_RANKER_CCY", " usd , sar ")
+    assert dp.knobs()["ranker_ccy"] == ["USD", "SAR"]
+    monkeypatch.setenv("TFB_PLAN_RANKER_CCY", " , ")
+    assert dp.knobs()["ranker_ccy"] == ["USD"]
+    up = dp.analyst_upside
+    assert up({"price": 80.0, "target": 101.5}) == 26.875 and up({"price": "51.82", "target": "74.5"}) == 43.7669
+    for src in ({}, {"price": 10.0}, {"target": 12.0}, {"price": 0, "target": 12.0}, {"price": 10.0, "target": 0},
+                {"price": -1.0, "target": 12.0}):
+        assert up(src) is None, src
+    c = lambda sym, rank, ccy, u, sec="S": {"symbol": sym, "rank": rank, "ccy": ccy, "upside": u, "sector": sec}
+    order = dp.upside_order([c("A", 1, "USD", 5.0), c("B", 2, "SAR", 90.0), c("C", 3, "USD", 30.0),
+                             c("D", 4, "USD", None), c("E", 5, "USD", 30.0)], ["USD"])
+    assert [x["symbol"] for x in order] == ["C", "E", "A", "B", "D"]       # ties by engine rank; the rest by rank
+    picks = dp.would_pick([c("A", 1, "USD", 9, "Energy"), c("B", 2, "USD", 8, "Energy"), c("C", 3, "USD", 7, "Energy"),
+                           c("D", 4, "USD", 6, "Banks")], 3, 2)
+    assert [x["symbol"] for x in picks] == ["A", "B", "D"]                   # the day's sector cap, no other check
+
+
+def test_r2_engine_is_the_default_and_adds_nothing(monkeypatch):
+    p = plan(src=SRC_EV, cal=CAL_EV)
+    assert _syms(p["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]
+    assert all(not x.startswith("[observe] analyst") and not x.startswith("ranked by analyst")
+               for c in p["picks"] + p["pipeline"] for x in c["labels"])
+    assert p["ranker"] == {"mode": "engine", "candidates": 7, "with_upside": 6, "alt": []}   # counted, not used
+    nxt = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert nxt["SBLK.US"] == "next in line (rank 5)" and nxt["NMM.US"] == "next in line (rank 4)"
+
+
+def test_r3_observe_changes_no_pick_and_labels_every_candidate(monkeypatch):
+    base = plan(src=SRC_EV, cal=CAL_EV)
+    monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+    p = plan(src=SRC_EV, cal=CAL_EV)
+    assert _syms(p["picks"]) == _syms(base["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]
+    for key in ("qty", "entry", "stop", "alloc_sar"):
+        assert [c[key] for c in p["picks"]] == [c[key] for c in base["picks"]], key
+    lab = _labels(p, "[observe]")
+    assert lab["ITRN.US"] == ["[observe] analyst upside +44% - upside order 1 of 7",
+                              "[observe] the upside ranker would pick this (before the cash and held-sector checks)"]
+    assert lab["TEN.US"][0] == "[observe] analyst upside +40% - upside order 2 of 7" and len(lab["TEN.US"]) == 2
+    assert lab["NMM.US"][0] == "[observe] analyst upside +28% - upside order 3 of 7" and len(lab["NMM.US"]) == 2
+    assert lab["ZTO.US"] == ["[observe] analyst upside +6% - upside order 6 of 7"]          # picked, but not by upside
+    assert lab["LADR.US"] == ["[observe] no analyst upside (no target price on its source page)"]
+    assert lab["BBOX.L"] == []                                       # stopped earlier by its currency: not a candidate
+    assert p["ranker"] == {"mode": "observe", "candidates": 7, "with_upside": 6, "alt": ["ITRN.US", "TEN.US", "NMM.US"]}
+
+
+def test_r4_upside_orders_the_us_candidates_by_the_analyst_target(monkeypatch):
+    monkeypatch.setenv("TFB_PLAN_RANKER", "upside")
+    p = plan(src=SRC_EV, cal=CAL_EV)
+    assert _syms(p["picks"]) == ["ITRN.US", "TEN.US", "NMM.US"]
+    lab = _labels(p, "ranked by analyst upside")
+    assert lab["ITRN.US"] == ["ranked by analyst upside +44% (engine rank 1)"]
+    assert lab["NMM.US"] == ["ranked by analyst upside +28% (engine rank 4)"]
+    assert all(not v for s, v in lab.items() if s not in _syms(p["picks"]))   # only picks carry it
+    wait = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
+    assert wait["SBLK.US"] == "next in line (upside order 4; engine rank 5)"
+    assert wait["ZTO.US"] == "next in line (upside order 6; engine rank 3)"     # engine rank 3, upside +6%: demoted
+    assert wait["LADR.US"] == "next in line (upside order 7; engine rank 6)"     # no upside: after the ranked names
+    assert wait["BBOX.L"].startswith("currency GBX")                            # earlier gates keep their own reason
+    assert all(c["qty"] > 0 and c["stop"] < c["entry"] for c in p["picks"])
+    assert p["ranker"]["mode"] == "upside" and p["ranker"]["alt"] == []
+
+
+def test_r5_upside_keeps_the_plans_own_rules(monkeypatch):
+    monkeypatch.setenv("TFB_PLAN_RANKER", "upside")
+    kept = plan(src=SRC_EV, cal=CAL_EV, prior=("ZTO.US",))                     # yesterday's pick keeps its place
+    assert _syms(kept["picks"])[0] == "ZTO.US" and "kept from the previous plan" in kept["picks"][0]["labels"]
+    k = K(ranker="upside", ranker_ccy=["SAR"])                                  # no USD name is ranked by upside
+    sar = plan(src=SRC_EV, cal=CAL_EV, k=k)
+    assert _syms(sar["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"] and sar["ranker"]["with_upside"] == 0
+    assert not any(x.startswith("ranked by analyst") for c in sar["picks"] for x in c["labels"])
+    assert {c["symbol"]: c["waiting"] for c in sar["pipeline"]}["NMM.US"] == "next in line (upside order 4; engine rank 4)"
+    k = K(ranker="upside", regime=dp.regime_rule(STRESS, "enforce", BLOCK, ["USD"]))
+    blocked = plan(src=SRC_EV, cal=CAL_EV, k=k)                                 # the regime gate still holds US buys
+    assert blocked["picks"] == [] and all(c["waiting"] for c in blocked["pipeline"])
+
+
+
+def test_r8_observe_previews_the_switch_in_its_own_order(monkeypatch):
+    """Codex P2 on #1112: the would-pick labels follow the upside switch's priorities, not the bare upside order."""
+    def both(**kw):
+        monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+        obs = plan(src=SRC_EV, cal=CAL_EV, **kw)
+        monkeypatch.setenv("TFB_PLAN_RANKER", "upside")
+        up = plan(src=SRC_EV, cal=CAL_EV, **kw)
+        would = [c["symbol"] for c in obs["picks"] + obs["pipeline"]
+                 if any(x.startswith("[observe] the upside ranker would pick") for x in c["labels"])]
+        return obs["ranker"]["alt"], sorted(would), _syms(up["picks"])
+
+    alt, would, up = both(prior=("ZTO.US",))                       # yesterday's pick keeps its place under upside
+    assert alt == up == ["ZTO.US", "ITRN.US", "TEN.US"] and would == sorted(up)
+    k = lambda r: K(ranker=r, stable="prefer", stable_enter=77)      # scores 79-72: ranks 4+ are under the entry level
+    monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+    obs = plan(src=SRC_EV, cal=CAL_EV, k=k("observe"))
+    upn = plan(src=SRC_EV, cal=CAL_EV, k=k("upside"))
+    assert obs["ranker"]["alt"] == _syms(upn["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]   # not +28% NMM: under 77
+
+
+def test_r6_the_run_log_gives_counts_only(monkeypatch, capsys):
+    monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
+    monkeypatch.setenv("TFB_PLAN_LOG_DETAIL", "off")
+    b = book(Global_Markets=Sheet(SRC_EV), Calendar_Events=Sheet(CAL_EV))
+    assert dp.main([], book=b, now=NOW) == 0
+    out = capsys.readouterr().out
+    line = [x for x in out.splitlines() if "ranker observe:" in x]
+    assert len(line) == 1 and line[0].endswith(
+        "ranker observe: 6 of 7 candidate(s) carry an analyst upside; the upside order would pick 3 name(s), 2 of them "
+        "among today's 3 pick(s)")
+    for sym in ("ITRN", "TEN", "ZTO", "NMM", "SBLK", "LADR"):
+        assert sym not in line[0], sym
+    monkeypatch.setenv("TFB_PLAN_RANKER", "engine")
+    assert dp.main([], book=book(Global_Markets=Sheet(SRC_EV), Calendar_Events=Sheet(CAL_EV)), now=NOW) == 0
+    assert "ranker" not in capsys.readouterr().out
+
+
+def test_r7_the_workflow_arms_observe_and_the_header_says_why():
+    wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert env["TFB_PLAN_RANKER"] == "${{ vars.TFB_PLAN_RANKER || 'observe' }}"
+    assert env["TFB_PLAN_RANKER_CCY"] == "${{ vars.TFB_PLAN_RANKER_CCY || 'USD' }}"
+    src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
+    assert dp.__version__ == "1.11.0" and "1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE" in src
+    assert '("daily_plan", "1.11.0", "daily plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
