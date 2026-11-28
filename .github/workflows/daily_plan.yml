@@ -1,7 +1,13 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.10.0 (2026-11-28)
+# VERSION 1.11.0 (2026-11-28)
+#
+# 1.11.0: THE RECORD HOLDS WHAT LOST AND PUTS THE BEST THIRD FIRST (daily_plan
+# 1.14.0, owner 28 Nov 21:40 Riyadh: apply what was found). TFB_PLAN_HONEST
+# is enforce here: a candidate whose one-month record reads 'lost money' is
+# not picked, and the highest third of promises comes first. observe = labels
+# only (1.10.0). Rollback: repository variable TFB_PLAN_HONEST=observe.
 #
 # 1.10.0: EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED (daily_plan 1.12.0,
 # owner 28 Nov: at least 5 % a month, "looking for better results").
@@ -201,7 +207,7 @@ jobs:
           TFB_PLAN_RANKER_CCY: ${{ vars.TFB_PLAN_RANKER_CCY || 'USD' }}
           # 1.12.0 [HONEST]: observe labels each name with what calls like it delivered (the Forecast_Record tab);
           # it changes no pick, order or size. Rollback: off.
-          TFB_PLAN_HONEST: ${{ vars.TFB_PLAN_HONEST || 'observe' }}
+          TFB_PLAN_HONEST: ${{ vars.TFB_PLAN_HONEST || 'enforce' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |

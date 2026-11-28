@@ -223,6 +223,19 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.14.0 (2026-11-28): THE RECORD HOLDS WHAT LOST AND PUTS THE BEST THIRD FIRST (owner, 28 Nov 2026 21:40 Riyadh, in
+Arabic: apply what was found, so the recommendations improve directly; he approves and executes). The record of the
+scored buy calls (Forecast_Record, cuts fixed on 28 Nov): the US one-month calls of the lowest third of promises
+lost 1.28 % on average (38 % rose), the middle third made 1.42 %, the highest third 3.26 % (72 % rose); every third
+of the Saudi calls lost money. TFB_PLAN_HONEST gains a third word, enforce. In enforce (1) a candidate whose
+one-month record reads 'lost money' - its own third, or its whole market when the third has too few calls - is not
+picked: it waits with "the record: US buy calls like it lost money over 1M (-1.3% on 153 calls)"; (2) among the
+others the highest third of promises comes first, then the middle third, then a name not measured, the engine's
+rank (or the upside order) inside each - after a kept pick and before a name under the entry level, as before.
+A name the record cannot measure is never held. observe and off are 1.13.0 to the word. The evidence is the record
+the cuts were drawn from, not a test on later calls: the forward rows (calls from 29 Nov) and the paper book judge
+it. Rollback: repository variable TFB_PLAN_HONEST=observe.
+
 1.13.0 (2026-11-28): THE UPSIDE ARM IS PAID FOR LIKE THE PLAN (external audit of 28 Nov 2026, finding 04; owner,
 28 Nov 18:30 Riyadh, in Arabic: a full review to improve the return and the recommendations). 1.11.0's observe read
 the upside order under the day's sector cap alone and said so ("before the cash and held-sector checks"): the names
@@ -329,7 +342,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -440,8 +453,10 @@ def ranker_mode() -> str:
 
 
 def honest_mode() -> str:
-    """1.12.0 [HONEST]: observe (default) | off; any other word is observe (the mode only adds labels)."""
-    return "off" if _env("TFB_PLAN_HONEST", "observe").lower() == "off" else "observe"
+    """1.12.0 [HONEST]: observe (default) | off; any other word is observe (the mode only adds labels).
+    1.14.0 [RECORD-RULE]: enforce - the record also holds and orders the candidates (record_hold, band_rank)."""
+    word = _env("TFB_PLAN_HONEST", "observe").lower()
+    return word if word in ("off", "enforce") else "observe"
 
 
 def regime_mode() -> str:
@@ -894,6 +909,23 @@ def honest_label(r: Dict[str, Any]) -> str:
         row["calls"])
 
 
+def record_hold(reads: Sequence[Dict[str, Any]]) -> str:
+    """1.14.0 [RECORD-RULE] PURE: why the record holds a name - the scored buy calls like it lost money at the plan's
+    own horizon (the first of HONEST_HORIZONS, one month); '' when they made money or the name is not measured."""
+    r = reads[0] if reads else None
+    if not r or r.get("honest") is None or text((r.get("row") or {}).get("reading")) != "lost money":
+        return ""
+    like = ("%s buy calls like it" % r["market"]) if r["band"] != "all" else ("all %s buy calls" % r["market"])
+    return "the record: %s lost money over %s (%+.1f%% on %d calls)" % (like, r["h"], r["honest"], r["row"]["calls"])
+
+
+def band_rank(reads: Sequence[Dict[str, Any]]) -> int:
+    """1.14.0 [RECORD-RULE] PURE: the order the record gives a candidate at one month - the highest third of
+    promises first (0), the middle third (1), then a name with no third of its own or not measured (2)."""
+    r = reads[0] if reads else None
+    return {"high": 0, "mid": 1}.get((r or {}).get("band") if r and r.get("honest") is not None else None, 2)
+
+
 def honest_line(names: Sequence[Dict[str, Any]], record: Dict[str, Any], mode: str) -> str:
     """1.12.0 [HONEST] PURE: the run-log line - counts only."""
     if not record:
@@ -903,8 +935,10 @@ def honest_line(names: Sequence[Dict[str, Any]], record: Dict[str, Any], mode: s
     for i, (h, _) in enumerate(HONEST_HORIZONS):
         got = [r[i]["honest"] for r in reads if len(r) > i and r[i]["honest"] is not None]
         parts.append("%s measured for %d (%d under 0)" % (h, len(got), sum(1 for x in got if x < 0)))
-    return "honest %s: %d name(s) labelled; %s | record scored through %s" % (
-        mode, len(reads), ", ".join(parts), record.get("through") or "?")
+    held = sum(1 for c in names if text(c.get("waiting")).startswith("the record: "))
+    return "honest %s: %d name(s) labelled; %s%s | record scored through %s" % (
+        mode, len(reads), ", ".join(parts), ("; %d held by the record" % held) if mode == "enforce" else "",
+        record.get("through") or "?")
 
 
 def upside_order(cands: Sequence[Dict[str, Any]], ccy: Sequence[str]) -> List[Dict[str, Any]]:
@@ -1101,6 +1135,8 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         if k.get("honest", "off") != "off" and k.get("record"):                   # 1.12.0 [HONEST]: labels only
             c["honest"] = [honest_read(q["symbol"], src, k["record"], h) for h, _ in HONEST_HORIZONS]
             c["labels"].extend(honest_label(r) for r in c["honest"])
+            if k["honest"] == "enforce" and not reason:                           # 1.14.0 [RECORD-RULE]
+                reason = record_hold(c["honest"])
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -1129,14 +1165,20 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     order = upside_order(cands, rccy) if rmode != "engine" else []
     upos = {id(c): i + 1 for i, c in enumerate(order)}
 
-    def by_upside(c: Dict[str, Any]) -> Tuple[int, int, int]:
+    hmode = k.get("honest", "off") if k.get("record") else "off"
+
+    def band(c: Dict[str, Any]) -> int:
+        """1.14.0 [RECORD-RULE]: enforce puts the highest third of promises first; any other mode orders nothing."""
+        return band_rank(c.get("honest") or ()) if hmode == "enforce" else 0
+
+    def by_upside(c: Dict[str, Any]) -> Tuple[int, int, int, int]:
         """1.11.0 [RANKER]: the upside switch's order - a kept pick first, a name under the entry level last."""
-        return (0 if kept(c) else 1, 1 if low(c) else 0, upos[id(c)])
+        return (0 if kept(c) else 1, 1 if low(c) else 0, band(c), upos[id(c)])
 
     if rmode == "upside":
         cands.sort(key=by_upside)
     else:
-        cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
+        cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, band(c), c["rank"]))
     if rmode == "observe":
         for c in cands:
             if c.get("ccy") not in rccy:

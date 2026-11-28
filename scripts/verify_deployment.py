@@ -523,7 +523,8 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # delivered past its grace (TFB_COLLECTOR_CATCHUP, workflow default observe).
     ("collector_catchup", "1.0.0", "collector catch-up"),
     # 2026-11-28 (pin only): 1.12.0 -> 1.13.0 (the upside arm goes through the plan's own cash and sector checks).
-    ("daily_plan", "1.13.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER); 1.12.0 the honest forecast (TFB_PLAN_HONEST)
+    # 2026-11-28 (pin only): 1.13.0 -> 1.14.0 (TFB_PLAN_HONEST enforce: the record holds what lost, the best third first).
+    ("daily_plan", "1.14.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER); 1.12.0 the honest forecast (TFB_PLAN_HONEST)
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own
