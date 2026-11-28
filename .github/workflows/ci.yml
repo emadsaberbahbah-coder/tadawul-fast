@@ -2,7 +2,17 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
-# VERSION 1.1.108 (2026-11-28) -- THE SHADOW REGIME RULE, FROZEN DAILY
+# VERSION 1.1.109 (2026-11-28) -- THE HONEST FORECAST
+#
+# v1.1.109: run tests/test_forecast_record.py (scripts/forecast_record.py
+# 1.0.0, .github/workflows/forecast_record.yml, views 1.39.0's
+# v_forecast_record and daily_plan 1.12.0's honest forecast labels: what the
+# scored buy calls of a name's market and promise third delivered, beside the
+# page's promise; observe only) right after tests/test_regime_shadow.py. It is
+# also collected by the whole-suite job. Nothing is removed and no existing
+# entry moves.
+#
+# (1.1.108, 2026-11-28: THE SHADOW REGIME RULE, FROZEN DAILY)
 #
 # v1.1.108: run tests/test_regime_shadow.py (scripts/regime_shadow.py 1.0.0,
 # .github/workflows/regime_shadow.yml and views 1.38.0's v_regime_shadow and
@@ -1357,6 +1367,7 @@ jobs:
             tests/test_bq_snapshots.py \
             tests/test_challenger_books.py \
             tests/test_regime_shadow.py \
+            tests/test_forecast_record.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \

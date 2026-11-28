@@ -414,6 +414,9 @@ PENDING = {
     # 200-close trend, the breadth, the volatility percentile and the US adverse count) and its in-sample record
     "v_regime_shadow": "e184564c679048f513a79dcb2da50c966615c5b12fc2a0fd163bab391814bf3a",
     "v_regime_shadow_insample": "25c44ff7d8d46e4f0cc1d2a4e10d9d5ccd2cd1a1bb85b5a37044eaad617aecc2",
+    # apply_bq_views 1.39.0 (28 Nov 2026): the forecast record - what the scored buy calls promised and delivered, per
+    # market, horizon and promise third (cut once, on the calls scored by 27 Nov 2026), against their own index
+    "v_forecast_record": "142caee5b170571135476b3ce3ba0203d32a2738426893df7b5c0386c0cd9ec2",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -458,9 +461,11 @@ EXPECTED_ORDER = [
     "v_challenger_v0_features", "v_challenger_v0_ranks", "v_challenger_v0_walkforward", "v_challenger_v0_scorecard",
     # views 1.38.0: the shadow regime rule and its in-sample record
     "v_regime_shadow", "v_regime_shadow_insample",
+    # views 1.39.0: the forecast record behind the Daily Plan's honest forecast
+    "v_forecast_record",
 ]
 EXPECTED_KINDS = (["FUNCTION"] * 6 + ["VIEW"] * 11 + ["TABLE FUNCTION"] * 2 + ["VIEW"] * 5
-                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 89)
+                  + ["TABLE FUNCTION"] + ["VIEW"] * 5 + ["TABLE FUNCTION"] + ["VIEW"] * 90)
 # view -> the archive table whose header row its f_cell calls read
 VIEW_SOURCE = {
     "v_board_episodes": "board_scorecard",
@@ -3246,10 +3251,10 @@ def case_v44():
 def case_v45():
     """apply_bq_views 1.18.0 (kept in 1.32.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.38.0"
+    assert bv.__version__ == "1.39.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
-    assert files[-51:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
+    assert files[-52:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
                            "102_v_market_trial_summary.sql", "103_v_ready_list.sql", "104_v_ready_trial.sql",
                            "105_v_market_news.sql", "106_v_people_news.sql", "107_v_news_trial.sql",
                            "108_v_news_trial_summary.sql", "109_v_event_calendar.sql", "110_v_event_reactions.sql",
@@ -3271,8 +3276,9 @@ def case_v45():
                            "142_v_news_llm_eval.sql", "143_v_news_llm_duel.sql",
                            "144_v_challenger_v0_features.sql", "145_v_challenger_v0_ranks.sql",
                            "146_v_challenger_v0_walkforward.sql", "147_v_challenger_v0_scorecard.sql",
-                           "150_v_regime_shadow.sql", "151_v_regime_shadow_insample.sql"]
-    assert files[:-50] == sorted(files[:-50])                                       # the two-digit order is unchanged
+                           "150_v_regime_shadow.sql", "151_v_regime_shadow_insample.sql",
+                           "152_v_forecast_record.sql"]
+    assert files[:-51] == sorted(files[:-51])                                       # the two-digit order is unchanged
     assert [bv.file_order(Path(n)) for n in ("99_a.sql", "100_b.sql", "x.sql")] == [(99, "99_a.sql"), (100, "100_b.sql"),
                                                                                    (10 ** 9, "x.sql")]
     later = GOOD_VIEW.replace("`{{DS}}.v_a`", "`{{DS}}.v_b`", 1).replace("`{{DS}}.run_log`", "`{{DS}}.v_a`")
@@ -3552,7 +3558,7 @@ def case_v51():
     names = [o.name for o in bv.load_objects()]
     v = objs["v_news_trial_summary"]
     assert v.path.name == "108_v_news_trial_summary.sql" and v.kind == "VIEW"
-    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 42
+    assert names.index("v_news_trial_summary") == names.index("v_news_trial") + 1 == len(names) - 43
     code = bv._code(v.template)
     assert set(bv._REF.findall(code)) - {"v_news_trial_summary"} == {"v_news_trial"}
     assert code.count("`{{DS}}.v_news_trial`") == 1
@@ -3845,7 +3851,7 @@ def case_v58():
     assert bv.OPTIONS_TABLES == {op.TABLE} == {"options_daily"} and bv.OPTIONS_TABLES <= bv.SOURCE_TABLES
     objs, code = _driver_view("v_options_reading", 115, {"options_daily"})
     names = [o.name for o in bv.load_objects()]
-    assert names[-35:-30] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
+    assert names[-36:-31] == ["v_options_reading", "v_market_drivers", "v_market_driver_learning", "v_price_drivers",
                             "v_driver_learning"]
     for frag in ("IF(h.iv_days >= 20, ROUND(h.iv_pctile, 0), NULL) AS iv_pctile_1y",
                  "ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS short_mean_20",
@@ -3925,7 +3931,7 @@ def case_v61():
     no look-ahead (the state and the volatility of the last close BEFORE the call), a within-day lift for the stock
     rule and a between-days lift for the market rules, read only at 20 call days and 40 forward calls."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-30:-28] == ["v_projection_context", "v_projection_scorecard"]
+    assert names[-31:-29] == ["v_projection_context", "v_projection_scorecard"]
     _, pc = _driver_view("v_projection_context", 120, {"v_universe_latest", "v_options_reading", "v_market_drivers"},
                          "1.24.0")
     for frag in ("COALESCE(o.iv30, u.volatility_30d_pct) AS vol",
@@ -3974,7 +3980,7 @@ def case_v62():
     was read; the outcome starts at the close AFTER the reaction window (no look-ahead); every t is overlap-adjusted;
     only sessions from 24 Nov 2026 are evidence; today's reading sits beside TFB's own view."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-28:-25] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
+    assert names[-29:-26] == ["v_news_trend_daily", "v_news_trend_learning", "v_news_understanding"]
     _, nd = _driver_view("v_news_trend_daily", 122,
                          {"market_series_daily", "v_symbol_news_class", "v_news_items", "symbol_bars_daily"}, "1.25.0")
     _, nl = _driver_view("v_news_trend_learning", 123, {"v_news_trend_daily"}, "1.25.0")
@@ -4032,7 +4038,7 @@ def case_v63():
     the shock-drop shadow rule on the 100 largest US equities with bars, two ways of entering fixed before reading,
     the outcome from the signal close only, the history read as in-sample (survivorship), forward from 24 Nov 2026."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-25:-22] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
+    assert names[-26:-23] == ["v_confidence_calibration", "v_shock_drop_events", "v_shock_drop_learning"]
     _, cc = _driver_view("v_confidence_calibration", 125, {"v_performance_log", "market_series_daily"}, "1.26.0")
     _, se = _driver_view("v_shock_drop_events", 126, {"v_universe", "market_series_daily", "symbol_bars_daily"},
                          "1.26.0")
@@ -4095,7 +4101,7 @@ def case_v64():
     assert bv.NOW_TABLES <= bv.SOURCE_TABLES and not (bv.NOW_TABLES & bv.DEEP_TABLES)
     assert nn.SCHEMA_NEWS is asd.SCHEMA_NEWS                                  # the same columns as the nightly feed
     objs = {o.name: o for o in bv.load_objects()}
-    assert [o.name for o in bv.load_objects()][-22] == "v_symbol_news_class_now"
+    assert [o.name for o in bv.load_objects()][-23] == "v_symbol_news_class_now"
     _, now = _driver_view("v_symbol_news_class_now", 128, {"symbol_news_intraday", "snap_universe_latest"}, "1.29.0")
     night = bv._code(objs["v_symbol_news_class"].template)
     desc = re.compile(r'OPTIONS \(description = "[^"]*"\)')
@@ -4117,7 +4123,7 @@ def case_v65():
     v_news_trend_learning does, with the reading fixed before any outcome was seen."""
     import news_now as nn
     names = [o.name for o in bv.load_objects()]
-    assert names[-21:-19] == ["v_news_now_eval", "v_news_now_learning"]
+    assert names[-22:-20] == ["v_news_now_eval", "v_news_now_learning"]
     _, ev = _driver_view("v_news_now_eval", 129, {"news_now_log", "symbol_bars_daily", "market_series_daily"}, "1.28.0")
     _, le = _driver_view("v_news_now_learning", 130, {"v_news_now_eval"}, "1.28.0")
     log_cols = {f["name"] for f in nn.SCHEMA_LOG}
@@ -4158,7 +4164,7 @@ def case_v67():
     signal against the benchmark of its own market net of a stated cost, the names the gates kept out beside the
     names they let in, and the ledger's counts held to the outcome engine's."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-13:-10] == ["v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon"]
+    assert names[-14:-11] == ["v_forward_signals", "v_forward_signal_gates", "v_forward_signal_recon"]
     objs, fs = _driver_view("v_forward_signals", 137,
                             {"v_outcome_engine", "symbol_bars_daily", "v_universe", "market_series_daily"}, "1.31.0")
     _, fg = _driver_view("v_forward_signal_gates", 138, {"v_forward_signals"}, "1.31.0")
@@ -4271,7 +4277,7 @@ def case_v66():
     the engine's labels, cash entered after a not-calm reading. Each rule is fixed on 26 Nov 2026, every earlier row
     is in-sample, and the outcome is the only look forward."""
     names = [o.name for o in bv.load_objects()]
-    assert names[-19:-13] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
+    assert names[-20:-14] == ["v_stop_cause_events", "v_stop_cause_learning", "v_value_screen", "v_trial_value_screen",
                             "v_cash_entry_events", "v_cash_entry_trial"]
     _, se = _driver_view("v_stop_cause_events", 131, {"market_series_daily", "symbol_bars_daily"}, "1.30.0")
     _, sl = _driver_view("v_stop_cause_learning", 132, {"v_stop_cause_events"}, "1.30.0")
@@ -4429,7 +4435,7 @@ def case_v68():
     import archive_to_bigquery as arc
     import news_llm_reader as llm
     names = [o.name for o in bv.load_objects()]
-    assert names[-10:-6] == ["v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel"]
+    assert names[-11:-7] == ["v_news_llm", "v_news_llm_days", "v_news_llm_eval", "v_news_llm_duel"]
     # the source: the reader's tab, copied nightly by archive 1.2.0 with header row 1
     assert arc.TABS[-1] == ("_News_LLM", 1) and arc.table_name("_News_LLM") == "news_llm" == llm.TAB.strip("_").lower()
     assert "news_llm" in bv.ARCHIVE_TABLES and "news_llm" in bv.SOURCE_TABLES
@@ -4507,7 +4513,7 @@ def case_v69():
     names = [o.name for o in objs]
     chain = ["v_challenger_v0_features", "v_challenger_v0_ranks", "v_challenger_v0_walkforward",
              "v_challenger_v0_scorecard"]
-    assert names[-6:-2] == chain
+    assert names[-7:-3] == chain
     by, fe = _driver_view("v_challenger_v0_features", 144, {"v_bars_clean", "v_symbol_sector"}, "1.34.0")
     _, rk = _driver_view("v_challenger_v0_ranks", 145, {"v_challenger_v0_features", "market_series_daily"}, "1.34.0")
     _, wf = _driver_view("v_challenger_v0_walkforward", 146, {"v_challenger_v0_ranks"}, "1.34.0")

@@ -61,6 +61,10 @@ class WorksheetNotFound(Exception):
     pass
 
 
+def _ver(v):
+    return tuple(int(x) for x in v.split("."))
+
+
 def _colnum(letters):
     n = 0
     for ch in letters:
@@ -979,7 +983,7 @@ def test_w1_the_reader_and_its_default(monkeypatch):
     wf = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
     env = [s for s in wf["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
     assert env["TFB_PLAN_IBKR_WAIT_UNTIL_H"] == "${{ vars.TFB_PLAN_IBKR_WAIT_UNTIL_H || '11' }}"
-    assert dp.__version__ == "1.11.0"                                 # 1.11.0 [RANKER] bumped it
+    assert _ver(dp.__version__) >= (1, 11, 0)                         # 1.11.0 [RANKER] bumped it
 
 
 def test_w2_sunday_15_nov_a_capture_too_old_at_the_cut_waits_and_the_next_capture_is_used(monkeypatch, capsys):
@@ -1625,5 +1629,6 @@ def test_r7_the_workflow_arms_observe_and_the_header_says_why():
     assert env["TFB_PLAN_RANKER"] == "${{ vars.TFB_PLAN_RANKER || 'observe' }}"
     assert env["TFB_PLAN_RANKER_CCY"] == "${{ vars.TFB_PLAN_RANKER_CCY || 'USD' }}"
     src = (ROOT / "scripts/daily_plan.py").read_text(encoding="utf-8")
-    assert dp.__version__ == "1.11.0" and "1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE" in src
-    assert '("daily_plan", "1.11.0", "daily plan")' in (ROOT / "scripts/verify_deployment.py").read_text(encoding="utf-8")
+    assert _ver(dp.__version__) >= (1, 11, 0) and "1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE" in src
+    assert '("daily_plan", "%s", "daily plan")' % dp.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
+        encoding="utf-8")

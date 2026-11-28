@@ -2,8 +2,27 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.38.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.39.0 (program register C8, Phase 2)
 ================================================================================
+v1.39.0 (28 Nov 2026, the forecast record). WHY (owner, 28 Nov 2026 01:02
+Riyadh, in Arabic: at least 5 % a month on the capital, in all cases. 01:30:
+"make full review and engening restructured looking for better results"):
+the pages show each name's promise, and the record says what such promises
+delivered - the US one-month buy calls promised +3.66 % and delivered
++1.13 %, the Saudi ones promised +4.64 % and delivered -4.37 %. One new view,
+research only. v_forecast_record (152): per market, horizon and promise third
+(the thirds cut once, on the calls scored by 27 Nov 2026, so they do not move)
+and for all calls and the calls from 29 Nov 2026, the scored INVESTABLE buy
+calls' mean promise and result, the share of the promise, how often they rose
+and how often they beat their own index (SPY, ^TASI.SR, ^HSI, ^STOXX, ^FTSE,
+^N225, 000300.SS, else ACWI) over the same dates, and a fixed reading. Read
+on 28 Nov: the US one-month calls of the highest third of promises (4.24 %
+and up) made +3.26 % on average, 72 % rose and 71 % beat SPY, those of the
+lowest third (2.67 % and under) lost 1.28 %, and every Saudi third lost money.
+scripts/forecast_record.py 1.0.0 copies the view into the Forecast_Record tab,
+and scripts/daily_plan.py 1.12.0 shows each name's honest forecast from it
+(observe). No existing view changes.
+
 v1.38.0 (28 Nov 2026, one shadow regime rule). WHY (week plan of 23 Nov
 2026, package 6: "the audit's bull / choppy / risk-off regime and our
 adverse-state count become one shadow rule", exit test "regime labels are
@@ -782,7 +801,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.38.0"
+__version__ = "1.39.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

@@ -403,7 +403,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (pin only): 1.34.0 -> 1.35.0 (v_outcome_sector: 'beats' / 'loses' need t_adj of 2 or more).
     # 2026-11-27 (pin only): 1.35.0 -> 1.36.0 (the bar archive check: v_bar_jumps, v_bar_jump_symbols; research only).
     # 2026-11-27 (pin only): 1.36.0 -> 1.37.0 (v_bars_clean; the challenger's inputs and results inside one price basis).
-    ("apply_bq_views", "1.38.0", "bigquery looker views"),
+    # 2026-11-28 (pin only): 1.37.0 -> 1.38.0 (the shadow regime rule: v_regime_shadow, v_regime_shadow_insample).
+    # 2026-11-28 (pin only): 1.38.0 -> 1.39.0 (the forecast record: v_forecast_record, the honest forecast's source).
+    ("apply_bq_views", "1.39.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -483,6 +485,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-28 (new module, pinned on arrival): the shadow regime rule's labels, each final close frozen once into
     # BigQuery regime_shadow_log (append-only; research only, nothing reads it).
     ("regime_shadow", "1.0.0", "regime shadow"),
+    # 2026-11-28 (new script, pinned on arrival): the Forecast_Record tab - v_forecast_record copied into the
+    # workbook, where the Daily Plan (1.12.0) reads each name's honest forecast (observe; markets only, no symbol).
+    ("forecast_record", "1.0.0", "forecast record"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
@@ -514,7 +519,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # dispatch for a BigQuery collector whose cron slot GitHub missed or
     # delivered past its grace (TFB_COLLECTOR_CATCHUP, workflow default observe).
     ("collector_catchup", "1.0.0", "collector catch-up"),
-    ("daily_plan", "1.11.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER)
+    ("daily_plan", "1.12.0", "daily plan"),   # 2026-11-23: 1.10.2 the quota waited out; no pick in the run log; 1.10.3 the open too; 2026-11-28: 1.11.0 the ranker (TFB_PLAN_RANKER); 1.12.0 the honest forecast (TFB_PLAN_HONEST)
     # 2026-11-18 (new module, pinned on arrival): the US market regime for the live plan (daily_plan 1.10.0).
     ("market_regime", "1.0.0", "market regime"),
     # 2026-11-26 (pin only): 1.6.3 -> 1.7.0 ([OFFER] a holding under a standing cash offer is read on the offer's own

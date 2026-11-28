@@ -1,7 +1,15 @@
 # =============================================================================
 # 🗓️ Daily Plan - one decision a day, frozen
 # -----------------------------------------------------------------------------
-# VERSION 1.9.0 (2026-11-18)
+# VERSION 1.10.0 (2026-11-28)
+#
+# 1.10.0: EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED (daily_plan 1.12.0,
+# owner 28 Nov: at least 5 % a month, "looking for better results").
+# TFB_PLAN_HONEST observe (here) | off: the cut reads the Forecast_Record tab
+# (scripts/forecast_record.py) and labels every name with its honest 1M and
+# 3M forecast - what the scored buy calls of its market and promise third
+# delivered - beside the page's promise. Labels only. Rollback: repository
+# variable TFB_PLAN_HONEST=off.
 #
 # 1.9.0: NO NEW US BUY IN A WEAK MARKET, AND A SECTOR LIMIT THAT COUNTS WHAT IS
 # HELD (daily_plan 1.10.0, owner 18 Nov: "let's start building and
@@ -191,6 +199,9 @@ jobs:
           # would make; upside orders the US candidates by it (the owner's switch). Rollback: engine.
           TFB_PLAN_RANKER: ${{ vars.TFB_PLAN_RANKER || 'observe' }}
           TFB_PLAN_RANKER_CCY: ${{ vars.TFB_PLAN_RANKER_CCY || 'USD' }}
+          # 1.12.0 [HONEST]: observe labels each name with what calls like it delivered (the Forecast_Record tab);
+          # it changes no pick, order or size. Rollback: off.
+          TFB_PLAN_HONEST: ${{ vars.TFB_PLAN_HONEST || 'observe' }}
           TFB_PLAN_ROI_CAP: ${{ vars.TFB_PLAN_ROI_CAP || 'on' }}
           TFB_PLAN_ROI_CAP_PCT: ${{ vars.TFB_PLAN_ROI_CAP_PCT || '34' }}
         run: |
