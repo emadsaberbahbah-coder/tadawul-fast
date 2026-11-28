@@ -403,7 +403,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (pin only): 1.34.0 -> 1.35.0 (v_outcome_sector: 'beats' / 'loses' need t_adj of 2 or more).
     # 2026-11-27 (pin only): 1.35.0 -> 1.36.0 (the bar archive check: v_bar_jumps, v_bar_jump_symbols; research only).
     # 2026-11-27 (pin only): 1.36.0 -> 1.37.0 (v_bars_clean; the challenger's inputs and results inside one price basis).
-    ("apply_bq_views", "1.37.0", "bigquery looker views"),
+    ("apply_bq_views", "1.38.0", "bigquery looker views"),
     # 2026-10-29 (same rule): 1.0.0 -> 1.1.0 (a series Yahoo serves with one
     # daily bar - ^TASI.SR, 000300.SS - is rebuilt from hourly bars; a history
     # still shorter than MIN_BARS fails and keeps its rows).
@@ -480,6 +480,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     # 2026-11-27 (new script, pinned on arrival): each forward book of the shadow challenger frozen once into
     # BigQuery challenger_books, the day it is final (append-only; research only, nothing reads it yet).
     ("challenger_books", "1.0.0", "challenger books"),
+    # 2026-11-28 (new module, pinned on arrival): the shadow regime rule's labels, each final close frozen once into
+    # BigQuery regime_shadow_log (append-only; research only, nothing reads it).
+    ("regime_shadow", "1.0.0", "regime shadow"),
     # 2026-11-19 (new script, pinned on arrival): the Trial_Labels tab - what trial C-2 and the news
     # overlay would do with each stock, observe-only, for the columns of 31_Final_Decision_Column 1.4.0.
     ("trial_labels", "1.0.0", "trial labels"),
