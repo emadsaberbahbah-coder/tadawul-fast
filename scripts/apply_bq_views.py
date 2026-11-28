@@ -2,8 +2,33 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.37.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.38.0 (program register C8, Phase 2)
 ================================================================================
+v1.38.0 (28 Nov 2026, one shadow regime rule). WHY (week plan of 23 Nov
+2026, package 6: "the audit's bull / choppy / risk-off regime and our
+adverse-state count become one shadow rule", exit test "regime labels are
+logged daily"; the market-state count was folded into it): the live gate
+reads one test per market (v_market_condition's five labels), and nothing
+says whether a market's trend, breadth and volatility agree. Two new views,
+research only. v_regime_shadow (150): per equity market (us, sa, eu, jp,
+cn) and close - the index against its rising or falling 200-close average,
+the share of TFB's followed names over their own 50-close average (their
+archived closes up to that day only; Codex P2 on #1113), the volatility
+percentile over 252 closes, the US adverse-state count (as
+v_projection_scorecard counts it) and one label, rule_version 1 fixed on
+28 Nov before any forward close: RISK_OFF (trend down, volatility
+percentile 80+, breadth under 30, or 3+ adverse US states), BULL (trend up,
+volatility percentile under 60, breadth 50+ or unknown, at most 1 adverse
+US state), CHOPPY otherwise. No later close is read. scripts/
+regime_shadow.py 1.0.0 freezes each final close's row once into
+regime_shadow_log, the forward record. v_regime_shadow_insample (151):
+each shadow label and each condition label against the index 5 and 21
+closes later, per market, on the closes before 29 Nov - labelled in-sample,
+not evidence. Read on 28 Nov: no label sorts the next month the expected
+way with a t of 1 or more; the US RISK_OFF closes were followed by +2.62 %
+(BULL +0.47 %), and the condition labels stress, drawdown and crash_day by
++6.11, +4.10 and +4.85 % (weak -0.42 %). No existing view changes.
+
 v1.37.0 (27 Nov 2026, clean bars for the return maths). WHY (the same plan
 item as 1.36.0, whose exit test reads "the challenger re-read"): v_bar_jumps
 found the jumps; nothing kept them out of a return. 27 of the 29 symbols are
@@ -757,7 +782,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.37.0"
+__version__ = "1.38.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

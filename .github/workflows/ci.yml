@@ -2,6 +2,15 @@
 # ============================================================================
 # TFB UNIVERSAL CI -- every production-critical file, every push
 # ============================================================================
+# VERSION 1.1.108 (2026-11-28) -- THE SHADOW REGIME RULE, FROZEN DAILY
+#
+# v1.1.108: run tests/test_regime_shadow.py (scripts/regime_shadow.py 1.0.0,
+# .github/workflows/regime_shadow.yml and views 1.38.0's v_regime_shadow and
+# v_regime_shadow_insample: one shadow BULL / CHOPPY / RISK_OFF label per
+# market and close, each final close frozen once into BigQuery; research
+# only) right after tests/test_challenger_books.py. It is also collected by
+# the whole-suite job. Nothing is removed and no existing entry moves.
+#
 # VERSION 1.1.107 (2026-11-27) -- GBp STATIC FX DISCLOSED
 #
 # v1.1.107: run tests/test_pf_fx_static_minor.py (portfolio_actions 1.20.1:
@@ -1347,6 +1356,7 @@ jobs:
             tests/test_learning_watch.py \
             tests/test_bq_snapshots.py \
             tests/test_challenger_books.py \
+            tests/test_regime_shadow.py \
             tests/test_trial_labels.py \
             tests/test_page_chains.py \
             tests/test_markets_board.py \
