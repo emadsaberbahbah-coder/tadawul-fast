@@ -322,8 +322,9 @@ def test_m1b_the_live_rule_is_said_as_configured(monkeypatch):
     assert mb.us_words("drawdown", rule).endswith("today the US reads drawdown - held")
     assert mb.live_rule_line(day, rule) == (
         "hold on drawdown, crash_day",
-        "new buys held today: Saudi Arabia (drawdown), Japan (drawdown), China / Hong Kong (drawdown); allowed: United "
-        "States (stress), Europe (calm) - the main page and the Daily Plan")              # gold is no stock market
+        "the main page's market gate - new buys held today: Saudi Arabia (drawdown), Japan (drawdown), China / Hong "
+        "Kong (drawdown); allowed: United States (stress), Europe (calm) (the Daily Plan's own rule reads the US only: "
+        "the US line)")                     # gold is no stock market; the plan's rule is not said per market (#1115 P2)
     obs = dict(rule, mode="observe")
     assert mb.us_words("drawdown", obs).endswith("- would be held (observe)")
     assert mb.live_rule_line(day, obs)[0] == "hold on drawdown, crash_day (observe)"
@@ -428,9 +429,9 @@ def test_m5_a_full_run_writes_one_tab(monkeypatch, capsys):
     assert page[3][:3] == ["US", "crash_day", "the Daily Plan holds a new US buy on weak, stress, drawdown, crash_day "
                                               "(TFB_PLAN_REGIME_BLOCK): today the US reads crash_day - held"]   # 1.3.0
     assert page[4][:3] == ["LIVE RULE", "hold on weak, stress, drawdown, crash_day",                     # 1.3.0
-                           "new buys held today: United States (crash_day), Saudi Arabia (drawdown), Europe (crash_day), "
-                           "Japan (crash_day), China / Hong Kong (drawdown); allowed: none - the main page and the Daily "
-                           "Plan"]
+                           "the main page's market gate - new buys held today: United States (crash_day), Saudi Arabia "
+                           "(drawdown), Europe (crash_day), Japan (crash_day), China / Hong Kong (drawdown); allowed: none "
+                           "(the Daily Plan's own rule reads the US only: the US line)"]
     assert page[5][:3] == ["NEXT EVENT", "US core PCE prices (m/m) - Oct, Wed 25 Nov 16:30 Riyadh",     # 1.2.0
                            "on its 24 earlier event(s) the US moved a median +0.12 % (middle 80 %: -0.90 .. +1.05) and "
                            "oil moved a median +0.30 % (middle 80 %: -2.20 .. +2.40) - section 7 has the next 14 days"]

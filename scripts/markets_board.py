@@ -14,8 +14,9 @@ v1.3.0 (2026-11-28) - THE LIVE BUY RULE, SAID AS CONFIGURED. Owner, 28 Nov 2026
     US        names the Daily Plan's rule as configured (its hold labels and
               whether today's US label is held);
     LIVE RULE (new, under it) the hold labels and, for the five stock markets
-              the main page's market gate covers, which are held today and
-              which are open;
+              the main page's market gate covers, which it holds today and
+              which are open (the Daily Plan's own rule reads the US label
+              only, for its currencies: the US line - Codex P2 on #1115);
     VERDICT   and the last days' verdicts are named as this page's market test
               (calm only: the market trial fixed on 21 Nov), never as the
               live rule; the How to read line says so.
@@ -303,9 +304,9 @@ def us_words(us: str, rule: Dict[str, Any]) -> str:
 
 
 def live_rule_line(rows: Sequence[Dict[str, Any]], rule: Dict[str, Any]) -> Tuple[str, str]:
-    """1.3.0 PURE: the live buy rule today, market by market - a market is held when its label is one of the Daily
-    Plan's hold labels (the main page's market gate holds the same list on Render; Consistency_Check C16 compares
-    the two)."""
+    """1.3.0 PURE: the main page's market gate today, market by market - a market is held when its label is one of
+    the hold labels. The gate holds the Daily Plan's list on Render (Consistency_Check C16 compares the two); the
+    Daily Plan's own rule reads the US label only, for the currencies it covers - the US line (Codex P2 on #1115)."""
     if rule["mode"] == "off":
         return "off", "the Daily Plan's market rule is off: no market is held for its condition"
     labels = {text(r.get("market_id")): text(r.get("label")) for r in rows}
@@ -315,8 +316,8 @@ def live_rule_line(rows: Sequence[Dict[str, Any]], rule: Dict[str, Any]) -> Tupl
         if lab:
             (held if lab in rule["block"] else allowed).append("%s (%s)" % (name, lab))
     head = "hold on %s%s" % (", ".join(rule["block"]) or "no label", " (observe)" if rule["mode"] == "observe" else "")
-    return head, "new buys held today: %s; allowed: %s - the main page and the Daily Plan" % (
-        ", ".join(held) or "none", ", ".join(allowed) or "none")
+    return head, ("the main page's market gate - new buys held today: %s; allowed: %s (the Daily Plan's own rule reads "
+                  "the US only: the US line)" % (", ".join(held) or "none", ", ".join(allowed) or "none"))
 
 
 def day_facts(d: _dt.date, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
