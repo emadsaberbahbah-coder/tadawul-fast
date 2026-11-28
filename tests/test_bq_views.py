@@ -412,7 +412,7 @@ PENDING = {
     "v_bars_clean": "48090d1c66997868cb71969337460bf2a1a052b0f7f8a53e6debd9405e4e2c6a",
     # apply_bq_views 1.38.0 (28 Nov 2026): one shadow regime rule per market (BULL / CHOPPY / RISK_OFF from the
     # 200-close trend, the breadth, the volatility percentile and the US adverse count) and its in-sample record
-    "v_regime_shadow": "1b5653f3e4ca59d71505fd54bcd8ced4408d95bdb1b2181b9ac49c6fcc0259f2",
+    "v_regime_shadow": "e184564c679048f513a79dcb2da50c966615c5b12fc2a0fd163bab391814bf3a",
     "v_regime_shadow_insample": "25c44ff7d8d46e4f0cc1d2a4e10d9d5ccd2cd1a1bb85b5a37044eaad617aecc2",
 }
 EXPECTED_ORDER = [
@@ -1036,12 +1036,16 @@ def case_v18():
         # v1.34.0: the challenger's price inputs - from v1.37.0 through v_bars_clean, so it reads no deep table itself
         "v_bar_jumps": {"symbol_bars_daily"},                  # v1.36.0: the archive's own closes, checked for jumps
         "v_bar_jump_symbols": {"symbol_bars_daily"},           # v1.36.0: the archive's newest bar, for 'is_new'
-        "v_bars_clean": {"symbol_bars_daily"}}, used           # v1.37.0: the archive less its spikes, with a basis
+        "v_bars_clean": {"symbol_bars_daily"},                 # v1.37.0: the archive less its spikes, with a basis
+        # v1.38.0: the regime breadth reads the archive's own closes up to each day (v_bars_clean decides with
+        # later bars; Codex P2 on #1113)
+        "v_regime_shadow": {"symbol_bars_daily"}}, used
     assert {"symbol", "date", "close", "volume", "source"} <= cols["symbol_bars_daily"]            # what v_bar_jumps reads
     assert set(re.findall(r"\bb\.([a-z_]+)", code["v_outcome_engine"])) <= cols["symbol_bars_daily"]
     assert set(re.findall(r"\bs\.([a-z_]+)", code["v_trial_c1"])) <= cols["symbol_bars_daily"]
     assert {"symbol", "date", "close", "adj_close"} <= cols["symbol_bars_daily"]          # what v_news_signal_eval reads
     assert {"symbol", "date", "close", "captured_at"} <= cols["symbol_bars_daily"]        # what v_projection_scorecard reads
+    assert {"symbol", "date", "close", "adj_close", "captured_at"} <= cols["symbol_bars_daily"]  # what v_regime_shadow reads
     # every picker view carries symbol_label
     for n in ("v_symbol_candles", "v_symbol_analyst", "v_symbol_news", "v_symbol_rating",
               "v_dive_signals", "v_dive_board", "v_dive_events", "v_top10_insight", "v_portfolio_insight"):

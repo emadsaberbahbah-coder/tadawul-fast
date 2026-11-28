@@ -12,8 +12,9 @@ reads one test per market (v_market_condition's five labels), and nothing
 says whether a market's trend, breadth and volatility agree. Two new views,
 research only. v_regime_shadow (150): per equity market (us, sa, eu, jp,
 cn) and close - the index against its rising or falling 200-close average,
-the share of TFB's followed names over their own 50-close average, the
-volatility percentile over 252 closes, the US adverse-state count (as
+the share of TFB's followed names over their own 50-close average (their
+archived closes up to that day only; Codex P2 on #1113), the volatility
+percentile over 252 closes, the US adverse-state count (as
 v_projection_scorecard counts it) and one label, rule_version 1 fixed on
 28 Nov before any forward close: RISK_OFF (trend down, volatility
 percentile 80+, breadth under 30, or 3+ adverse US states), BULL (trend up,
@@ -24,7 +25,7 @@ regime_shadow_log, the forward record. v_regime_shadow_insample (151):
 each shadow label and each condition label against the index 5 and 21
 closes later, per market, on the closes before 29 Nov - labelled in-sample,
 not evidence. Read on 28 Nov: no label sorts the next month the expected
-way with a t of 1 or more; the US RISK_OFF closes were followed by +2.58 %
+way with a t of 1 or more; the US RISK_OFF closes were followed by +2.62 %
 (BULL +0.47 %), and the condition labels stress, drawdown and crash_day by
 +6.11, +4.10 and +4.85 % (weak -0.42 %). No existing view changes.
 

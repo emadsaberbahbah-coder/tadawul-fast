@@ -7,15 +7,18 @@
 -- five labels, the engine's market_gate); nothing says whether a market's trend, its breadth and its volatility
 -- agree. Observe only: no page, gate, pick or count reads this view.
 -- THE MARKETS (v_market_condition's index readings): us SPY (price close), sa ^TASI.SR, eu ^STOXX, jp ^N225,
---   cn ^HSI. Breadth from TFB's followed names of the same market (v_bars_clean, by exchange suffix: us .US,
+--   cn ^HSI. Breadth from TFB's followed names of the same market (symbol_bars_daily, by exchange suffix: us .US,
 --   sa .SR, jp .T, cn .HK, eu the European exchanges .L .PA .DE .MC .MI .AS .BR .LS .OL .ST .CO .HE .SW .VI .IR
 --   .AT .WA).
 -- THE INPUTS at a close (from that close and the closes before it; no later one):
 --   sma200, sma200_prev20   the 200-close average (200 closes present) and the same 20 closes earlier
 --   trend                   up = close over a rising average (sma200 > sma200_prev20); down = close under a
 --                           falling one; mixed otherwise; NULL before 220 closes
---   breadth50_pct           the share of the market's names whose close is over their own 50-close average (50
---                           closes inside one price basis of v_bars_clean); NULL under 20 such names
+--   breadth50_pct           the share of the market's names whose close is over their own 50-close average (the
+--                           archive's dividend-adjusted closes, the last 50 present); a name whose last 50 closes
+--                           hold a jump of 1.5 times or two thirds or less is left out that day - a test that reads
+--                           only those closes (v_bars_clean decides with later bars, so it is not used here: Codex
+--                           P2 on #1113); NULL under 20 such names
 --   vol20_pct               v_market_condition's annualised deviation of the last 20 daily changes
 --   vol_pct_rank            the share of the last 252 closes' vol20_pct at or under today's, 0-100 (200 present)
 --   adverse                 the US only: the count of adverse US states that day, 0-6, exactly as
@@ -58,29 +61,36 @@ trend_in AS (
   FROM avg200 AS a
 ),
 names AS (
-  SELECT symbol, date, basis, COALESCE(adj_close, close) AS p,
+  SELECT symbol, date, COALESCE(adj_close, close) AS p,
     CASE REGEXP_EXTRACT(symbol, r'\.([A-Z]+)$')
       WHEN 'US' THEN 'us' WHEN 'SR' THEN 'sa' WHEN 'T' THEN 'jp' WHEN 'HK' THEN 'cn'
       WHEN 'L' THEN 'eu' WHEN 'PA' THEN 'eu' WHEN 'DE' THEN 'eu' WHEN 'MC' THEN 'eu' WHEN 'MI' THEN 'eu'
       WHEN 'AS' THEN 'eu' WHEN 'BR' THEN 'eu' WHEN 'LS' THEN 'eu' WHEN 'OL' THEN 'eu' WHEN 'ST' THEN 'eu'
       WHEN 'CO' THEN 'eu' WHEN 'HE' THEN 'eu' WHEN 'SW' THEN 'eu' WHEN 'VI' THEN 'eu' WHEN 'IR' THEN 'eu'
       WHEN 'AT' THEN 'eu' WHEN 'WA' THEN 'eu' END AS market_id
-  FROM `{{DS}}.v_bars_clean`
+  FROM `{{DS}}.symbol_bars_daily`
   WHERE close > 0 AND REGEXP_CONTAINS(symbol, r'\.[A-Z]+$')
   QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, date ORDER BY captured_at DESC) = 1
 ),
-name50 AS (
+jumps AS (
   SELECT n.*,
-    AVG(n.p) OVER (PARTITION BY n.symbol, n.basis ORDER BY n.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS a50,
-    COUNT(n.p) OVER (PARTITION BY n.symbol, n.basis ORDER BY n.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS n50
+    IF(SAFE_DIVIDE(n.p, LAG(n.p) OVER (PARTITION BY n.symbol ORDER BY n.date)) >= 1.5
+       OR SAFE_DIVIDE(n.p, LAG(n.p) OVER (PARTITION BY n.symbol ORDER BY n.date)) <= 2 / 3, 1, 0) AS jump
   FROM names AS n
-  WHERE n.market_id IS NOT NULL
+  WHERE n.market_id IS NOT NULL AND n.p > 0
+),
+name50 AS (
+  SELECT j.*,
+    AVG(j.p) OVER (PARTITION BY j.symbol ORDER BY j.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS a50,
+    COUNT(j.p) OVER (PARTITION BY j.symbol ORDER BY j.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS n50,
+    SUM(j.jump) OVER (PARTITION BY j.symbol ORDER BY j.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS jumps50
+  FROM jumps AS j
 ),
 breadth AS (
   SELECT market_id, date, COUNT(*) AS breadth_names,
     ROUND(100 * COUNTIF(p > a50) / COUNT(*), 1) AS breadth50_pct
   FROM name50
-  WHERE n50 = 50
+  WHERE n50 = 50 AND jumps50 = 0
   GROUP BY market_id, date
 ),
 adv AS (

@@ -9,7 +9,7 @@ v1.0.0 (2026-11-28)
   WHY: week plan of 23 Nov 2026, package 6 ("the audit's bull / choppy / risk-off regime and our adverse-state
        count become one shadow rule"; exit test "regime labels are logged daily"; owner, 23 Nov 2026: "go and Start
        build"). v_regime_shadow (views 1.38.0) labels every close of the five equity markets from the archive, and
-       the archive is reloaded every night (Yahoo's bars, v_bars_clean, the market series), so a label read in
+       the archive is reloaded every night (Yahoo's bars and the market series), so a label read in
        January can differ from the label the rule gave on the day. A rule is judged forward on the labels as they
        were given. The rule was fixed on 28 Nov 2026; the forward record starts with the next close (Sun 29 Nov
        on Tadawul, Mon 30 Nov elsewhere).
@@ -51,7 +51,7 @@ __version__ = "1.0.0"
 
 TABLE = "regime_shadow_log"
 VIEW = "v_regime_shadow"
-CHAIN = ("v_market_condition", "v_bar_jumps", "v_bars_clean", "v_market_drivers", VIEW)
+CHAIN = ("v_market_condition", "v_market_drivers", VIEW)    # the views a label is read through
 MARKETS = ("us", "sa", "eu", "jp", "cn")
 FORWARD_START = _dt.date(2026, 11, 29)          # the first close after the rule was fixed (28 Nov 2026)
 LOOKBACK_DAYS = 21                               # a close not frozen within three weeks is left out (a late freeze

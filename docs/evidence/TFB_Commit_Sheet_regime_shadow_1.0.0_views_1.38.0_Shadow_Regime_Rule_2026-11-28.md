@@ -10,7 +10,7 @@ The live gate reads one test per market: v_market_condition's five labels, which
 ## What
 **`sql/bigquery/150_v_regime_shadow.sql` (new):** one row per equity market (us, sa, eu, jp, cn) and close. Every input uses that close and earlier ones only.
 - **Trend:** the index against its 200-close average. Up means the close is over a rising average (above its level 20 closes back); down means under a falling one.
-- **Breadth:** the share of TFB's followed names of that market over their own 50-close average, measured inside one price basis of `v_bars_clean`. It needs at least 20 names.
+- **Breadth:** the share of TFB's followed names of that market over their own 50-close average, from the archive's dividend-adjusted closes up to that day. A name whose last 50 closes hold a jump of 1.5 times, or of two thirds or less, is left out that day. `v_bars_clean` is not used because it decides with later bars (Codex P2 on #1113). It needs at least 20 names.
 - **Volatility percentile:** today's 20-close volatility against the last 252 closes (at least 200 known).
 - **Adverse count (US only):** counted exactly as `v_projection_scorecard` counts it.
 - **TFB's own condition label** that close.
@@ -43,7 +43,7 @@ Labelled closes from October 2024 to 27 November 2026. Results are the index's o
 
 | Market | BULL | CHOPPY | RISK_OFF |
 |---|---|---|---|
-| US | +0.47 % (225 days) | +0.32 % (135) | **+2.58 %** (176) |
+| US | +0.47 % (225 days) | +0.29 % (136) | **+2.62 %** (175) |
 | Saudi | −2.02 % (31) | −2.39 % (129) | +0.21 % (345) |
 | Europe | +0.20 % (232) | +1.84 % (159) | +1.45 % (143) |
 | Japan | +2.77 % (135) | +1.06 % (161) | +2.44 % (218) |

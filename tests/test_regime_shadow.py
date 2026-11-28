@@ -119,7 +119,6 @@ def test_the_views_install_in_order_after_the_challenger():
     assert names[-2:] == ["v_regime_shadow", "v_regime_shadow_insample"]
     assert names.index("v_market_condition") < names.index("v_regime_shadow")
     assert names.index("v_market_drivers") < names.index("v_regime_shadow")
-    assert names.index("v_bars_clean") < names.index("v_regime_shadow")
     assert bv.check_objects(objs) == [] and bv.__version__ == "1.38.0"
 
 
@@ -131,8 +130,13 @@ def test_the_label_view_reads_no_later_close():
     assert "ROWS BETWEEN 251 PRECEDING AND CURRENT ROW" in code               # 252 closes of volatility
     assert "ROWS BETWEEN 49 PRECEDING AND CURRENT ROW" in code                # each name's 50-close average
     assert "LAG(IF(a.n200 = 200, a.a200, NULL), 20)" in code                  # the average 20 closes back
-    assert "PARTITION BY n.symbol, n.basis" in code                           # inside one price basis
-    assert "FROM `{{DS}}.v_bars_clean`" in code and "symbol_bars_daily" not in code
+    # the breadth reads the archive's own closes up to that day: v_bars_clean decides with later bars (Codex P2 on
+    # #1113), so a name whose last 50 closes hold a jump is left out that day instead
+    assert "FROM `{{DS}}.symbol_bars_daily`" in code and "v_bars_clean" not in code and "basis" not in code
+    assert "SAFE_DIVIDE(n.p, LAG(n.p) OVER (PARTITION BY n.symbol ORDER BY n.date)) >= 1.5" in code
+    assert "SAFE_DIVIDE(n.p, LAG(n.p) OVER (PARTITION BY n.symbol ORDER BY n.date)) <= 2 / 3, 1, 0) AS jump" in code
+    assert ("SUM(j.jump) OVER (PARTITION BY j.symbol ORDER BY j.date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) "
+            "AS jumps50") in code and "WHERE n50 = 50 AND jumps50 = 0" in code
 
 
 def test_the_rule_is_written_down_once_and_fixed():
@@ -224,8 +228,7 @@ def test_sessions_and_views_queries():
     sql = rs.sql_sessions("p.d", dt.date(2026, 11, 11))
     assert "FROM `p.d.v_market_condition`" in sql and "date >= DATE '2026-11-11'" in sql and "close > 0" in sql
     sql = rs.sql_views("p.d")
-    assert sql.endswith(" WHERE table_name IN ('v_market_condition', 'v_bar_jumps', 'v_bars_clean', "
-                        "'v_market_drivers', 'v_regime_shadow')")
+    assert sql.endswith(" WHERE table_name IN ('v_market_condition', 'v_market_drivers', 'v_regime_shadow')")
     assert rs.sql_frozen("p.d") == "SELECT market_id, date FROM `p.d.regime_shadow_log` GROUP BY market_id, date"
 
 
