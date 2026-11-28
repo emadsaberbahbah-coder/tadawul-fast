@@ -1,7 +1,15 @@
 # =============================================================================
 # 🧮 Consistency Check - the same figure on every page
 # -----------------------------------------------------------------------------
-# VERSION 1.4.0 (2026-11-20)
+# VERSION 1.5.0 (2026-11-28)
+#
+# 1.5.0: C16 GATE RULES (consistency_check 1.6.0; owner, 28 Nov 14:24: the
+# pages agree and do not contradict each other). The check reads the main
+# page's market gate from Render's /health (TFB_BACKEND_URL, the BACKEND_BASE_URL
+# variable) and compares its list of held market states with the Daily Plan's
+# (TFB_PLAN_REGIME_BLOCK) and the Exit Plan's sell note
+# (TFB_EXIT_MARKET_TURN_LABELS) - each passed here with its own workflow's
+# expression, so the check reads exactly what those workflows run with.
 #
 # 1.4.0: THE BROKER IN THE COMPARISON (owner, 20 Nov 22:40: full review of the
 # file against the market). On 20 Nov IBKR sold all NMM shares by the stop
@@ -135,6 +143,12 @@ jobs:
           TFB_IBKR_CAPTURE: ${{ vars.TFB_IBKR_CAPTURE || 'on' }}
           TFB_IBKR_CAPTURE_FOLDER_ID: ${{ vars.TFB_IBKR_CAPTURE_FOLDER_ID || '1WbO2y3xMzPU0lKQ3gHJQ28L19IIAQdNH' }}
           TFB_PLAN_EARN_DAYS: ${{ vars.TFB_PLAN_EARN_DAYS || '7' }}
+          # 1.5.0 C16: the gate lists exactly as daily_plan.yml and exit_plan.yml pass them, and the engine's URL
+          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          TFB_PLAN_REGIME: ${{ vars.TFB_PLAN_REGIME || 'enforce' }}
+          TFB_PLAN_REGIME_BLOCK: ${{ vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
+          TFB_EXIT_MARKET_TURN: ${{ vars.TFB_EXIT_MARKET_TURN || 'observe' }}
+          TFB_EXIT_MARKET_TURN_LABELS: ${{ vars.TFB_EXIT_MARKET_TURN_LABELS || vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
           EVENT_NAME: ${{ github.event_name }}
           IN_DRY_RUN: ${{ inputs.dry_run }}
         run: |

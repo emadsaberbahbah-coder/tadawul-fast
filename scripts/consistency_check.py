@@ -2,7 +2,23 @@
 """
 scripts/consistency_check.py - TFB cross-page consistency check
 ===============================================================
-VERSION 1.5.0 (2026-11-21) - first written 2026-11-11 (1.0.0)
+VERSION 1.6.0 (2026-11-28) - first written 2026-11-11 (1.0.0)
+
+1.6.0: C16 GATE RULES - ONE LIST OF MARKET STATES ON EVERY PAGE (owner, 28 Nov
+2026 14:24 Riyadh, in Arabic: the important thing is that the pages agree and
+do not contradict each other). That day the owner narrowed the buy hold to
+drawdown and crash_day in two places by hand: TFB_MARKET_GATE_HOLD on Render
+(the main page's market gate) and the repository variable
+TFB_PLAN_REGIME_BLOCK (the Daily Plan; the Markets_Board and, from
+exit_plan.yml 1.8.0, the Exit Plan's sell note read the same variable). Two
+settings on two systems drift apart unseen: a market the main page holds and
+the plan buys, or the reverse. C16 reads the engine's own list from Render's
+/health (engine_gates.market_gate_hold and .market_gate) and compares it with
+TFB_PLAN_REGIME_BLOCK and TFB_EXIT_MARKET_TURN_LABELS as this run receives
+them: MATCH when the three are the same set of states; MISMATCH naming each
+list; INFO when /health cannot be read (TFB_BACKEND_URL, 20 s; without the URL - a run outside the
+workflow - C16 is not run). No figure of
+the account is involved, so the run log shows the detail.
 
 1.5.0: C15 READS THE TABS THE PAGE ACTUALLY USES (owner, 20 Nov 23:34 Riyadh:
 "Keep review the file for coming 3 hours and give me next update and
@@ -72,6 +88,9 @@ and the pages they come from. It changes no other page and decides nothing.
   C13 broker       the ledger's shares vs the newest IBKR capture (1.4.0)
   C14 S-1 gate     the Evidence Board's copy of the S-1 gate vs S1_Gate (1.4.0)
   C15 broker tabs  the age of _IBKR_NAV_History and _IBKR_Trades (1.4.0, 1.5.0)
+  C16 gate rules   the market states that hold a new buy: the main page's market
+                   gate (Render /health) vs the Daily Plan vs the Exit Plan's sell
+                   note (1.6.0)
   C9 stops         Portfolio_Decision stop vs the Exit Plan's stop per holding
   C10 actions      Portfolio_Decision action vs the Exit Plan's action
 
@@ -139,7 +158,7 @@ if __package__ in (None, ""):
 
 from scripts.daily_plan import _read, cell, fmt, num, read_calendar, riyadh_str, text, write_grid  # noqa: E402
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -408,6 +427,86 @@ def broker_tabs_check(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[st
                pages=pages)
 
 
+GATE_LABELS = ("crash_day", "drawdown", "stress", "weak")         # 1.6.0: the states a gate can hold on (calm never)
+GATE_DEFAULT = "weak,stress,drawdown,crash_day"                     # every rule's own default
+
+
+def gate_set(raw: Any) -> Tuple[str, ...]:
+    """1.6.0: a comma list of states as an ordered tuple of the known holdable ones (calm and unknown words skipped)."""
+    words = {w.strip().lower() for w in text(raw).split(",")}
+    return tuple(w for w in GATE_LABELS if w in words)
+
+
+def gate_rules(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """1.6.0: the Daily Plan's and the Exit Plan's lists as this run receives them (each rule's own defaults)."""
+    env = os.environ if env is None else env
+    plan = env.get("TFB_PLAN_REGIME_BLOCK")
+    plan = GATE_DEFAULT if plan is None else plan
+    sell = env.get("TFB_EXIT_MARKET_TURN_LABELS")
+    return {"plan_mode": (env.get("TFB_PLAN_REGIME") or "off").strip().lower(), "plan": gate_set(plan),
+            "sell_mode": (env.get("TFB_EXIT_MARKET_TURN") or "observe").strip().lower(),
+            "sell": gate_set(plan if sell is None else sell)}
+
+
+def find_engine_gates(payload: Any) -> Dict[str, Any]:
+    """1.6.0: the engine_gates block of a /health payload (top level or one level down); {} without one."""
+    if isinstance(payload, dict):
+        if isinstance(payload.get("engine_gates"), dict):
+            return payload["engine_gates"]
+        for v in payload.values():
+            if isinstance(v, dict) and isinstance(v.get("engine_gates"), dict):
+                return v["engine_gates"]
+    return {}
+
+
+def gate_rules_check(engine: Optional[Dict[str, Any]], rules: Dict[str, Any], why: str = "") -> List[str]:
+    """1.6.0 C16 PURE: the main page's market gate (engine_gates from /health), the Daily Plan's hold and the Exit
+    Plan's sell note - the same set of market states, or a MISMATCH naming each."""
+    pages = "Render /health (main page) / Daily_Plan / Exit_Plan / Markets_Board"
+    words = lambda t: ", ".join(t) or "no state"                                       # noqa: E731
+    if not engine or "market_gate_hold" not in engine:
+        return row("C16 gate rules", "INFO", "the main page's market gate was not read (%s); the Daily Plan holds a buy "
+                   "on %s, the Exit Plan's sell note reads %s" % (why or "no engine_gates in /health",
+                                                                  words(rules["plan"]), words(rules["sell"])),
+                   pages=pages)
+    mode = text(engine.get("market_gate")).lower() or "off"
+    main = gate_set(engine.get("market_gate_hold"))
+    a = "main page (%s): %s" % (mode, words(main))
+    b = "Daily Plan (%s): %s; Exit Plan sell note (%s): %s" % (rules["plan_mode"], words(rules["plan"]),
+                                                               rules["sell_mode"], words(rules["sell"]))
+    if main == rules["plan"] == rules["sell"]:
+        return row("C16 gate rules", "MATCH", "every page holds a new buy on the same states: %s (main page %s, Daily "
+                   "Plan %s, sell note %s)" % (words(main), mode, rules["plan_mode"], rules["sell_mode"]), a, b, pages)
+    return row("C16 gate rules", "MISMATCH", "the pages hold on different market states - %s; %s. Set TFB_MARKET_GATE_HOLD "
+               "on Render and the repository variable TFB_PLAN_REGIME_BLOCK to the same list (the sell note follows the "
+               "plan unless TFB_EXIT_MARKET_TURN_LABELS is set)" % (a, b), a, b, pages)
+
+
+def _get_json(url: str, timeout: float) -> Tuple[int, Any]:
+    """1.6.0: (HTTP status, decoded JSON) of one GET - the standard library only."""
+    import json  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "tfb-consistency-check"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:              # noqa: S310 - https only, checked below
+        return int(getattr(resp, "status", 200)), json.loads(resp.read().decode("utf-8"))
+
+
+def read_engine_gates(base_url: str, get: Any = None, timeout: float = 20.0) -> Tuple[Optional[Dict[str, Any]], str]:
+    """1.6.0: (engine_gates, '') from GET <base_url>/health, or (None, why); never raises. `get(url, timeout)` ->
+    (status, payload)."""
+    url = text(base_url).rstrip("/")
+    if not url.startswith("https://"):
+        return None, "no https TFB_BACKEND_URL"
+    try:
+        status, payload = (get or _get_json)(url + "/health", timeout)
+        if status != 200:
+            return None, "/health answered HTTP %s" % status
+        gates = find_engine_gates(payload)
+        return (gates, "") if gates else (None, "no engine_gates in /health")
+    except Exception as e:  # noqa: BLE001
+        return None, "/health not read (%s)" % type(e).__name__
+
+
 def run_checks(g: Dict[str, List[List[Any]]], today: _dt.date, k: Dict[str, float],
                now: Optional[_dt.datetime] = None, cap: Optional[Dict[str, Any]] = None) -> List[List[str]]:
     out: List[List[str]] = []
@@ -621,12 +720,14 @@ CONTROLS = {
     "C13": "The share count is the broker's. A holding the broker no longer holds is recorded as sold in the ledger; "
            "a position the ledger lacks is added.",
     "C14": "S1_Gate rules. A page that copies the gate shows its newest reading; an older copy is rebuilt.",
+    "C16": "One list of market states holds a new buy everywhere: the main page's market gate (Render "
+           "TFB_MARKET_GATE_HOLD) and the Daily Plan (TFB_PLAN_REGIME_BLOCK) are set to the same list by the owner.",
     "C15": "The account's return and trade record are the broker's. A broker tab older than the limit is refreshed "
            "(the IBKR History workflow writes them from the daily IBKR history file), or the figures read from it are "
            "not used.",
 }
 
-LOG_DETAIL = ("C1", "C2", "C3", "C11", "C14", "C15")                             # names and times only; nothing of the account
+LOG_DETAIL = ("C1", "C2", "C3", "C11", "C14", "C15", "C16")                             # names and times only; nothing of the account
 
 
 def log_detail(r: Sequence[str]) -> str:
@@ -669,7 +770,8 @@ def broker_capture(now: _dt.datetime) -> Dict[str, Any]:
         return {"ok": False, "reason": "capture not read (%s)" % type(e).__name__}
 
 
-def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None, capture: Optional[Dict[str, Any]] = None) -> int:
+def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None, capture: Optional[Dict[str, Any]] = None,
+        gates: Optional[Tuple[Optional[Dict[str, Any]], str]] = None) -> int:
     write = mode() == "on" and not dry_run
     now = now or _dt.datetime.now(UTC)
     today = now.astimezone(RIYADH).date()
@@ -693,6 +795,11 @@ def run(dry_run: bool, book=None, now: Optional[_dt.datetime] = None, capture: O
             _SLEEP(READ_RETRY_S)
     cap = capture if capture is not None else broker_capture(now)
     results = run_checks(grids, today, knobs(), now, cap)
+    url = text(os.environ.get("TFB_BACKEND_URL"))
+    if gates is None and url:                                       # 1.6.0 C16: the engine's own list, from Render
+        gates = read_engine_gates(url)                              # (the workflow always passes the URL)
+    if gates is not None:
+        results.append(gate_rules_check(gates[0], gate_rules(), gates[1]))
     for r in results:
         _out("%-16s %-8s %s" % (r[0], r[1], log_detail(r)))
     if not write:

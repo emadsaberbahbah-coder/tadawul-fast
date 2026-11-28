@@ -4,6 +4,22 @@ scripts/markets_board.py
 ================================================================================
 TFB Markets Board - the condition of every market, their order, and the score
 --------------------------------------------------------------------------------
+v1.3.0 (2026-11-28) - THE LIVE BUY RULE, SAID AS CONFIGURED. Owner, 28 Nov 2026
+    14:24 Riyadh, in Arabic: the important thing is that the pages agree and
+    do not contradict each other. That day the owner narrowed the buy hold to
+    drawdown and crash_day (TFB_PLAN_REGIME_BLOCK, and TFB_MARKET_GATE_HOLD on
+    Render), while this page still said "the Daily Plan holds a new US buy
+    unless the US is calm" and "cash stays cash" on a day the plan could buy.
+    Now:
+    US        names the Daily Plan's rule as configured (its hold labels and
+              whether today's US label is held);
+    LIVE RULE (new, under it) the hold labels and, for the five stock markets
+              the main page's market gate covers, which are held today and
+              which are open;
+    VERDICT   and the last days' verdicts are named as this page's market test
+              (calm only: the market trial fixed on 21 Nov), never as the
+              live rule; the How to read line says so.
+    The views, the trial and every section below are unchanged.
 v1.2.0 (2026-11-21) - THE EVENTS AHEAD AND THEIR SCORECARD. Owner, 21 Nov 2026
     11:03 Riyadh, item 5 of the build list: "News: a news reading per market;
     forward event scenarios; momentum/surprise; influential figures of 19 Nov;
@@ -115,7 +131,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts import news_board as nb
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 _SLEEP = time.sleep                                     # the wait after a Sheets quota answer
 
 UTC = _dt.timezone.utc
@@ -262,12 +278,53 @@ def by_day(rows: Sequence[Dict[str, Any]]) -> List[Tuple[_dt.date, List[Dict[str
     return [(d, sorted(days[d], key=lambda r: (num(r.get("rank")) or 99))) for d in sorted(days, reverse=True)]
 
 
+TEST_WORDS = "market test: calm only"                   # 1.3.0: this page's test, never the live rule
+LIVE_MARKETS = (("us", "United States"), ("sa", "Saudi Arabia"), ("eu", "Europe"), ("jp", "Japan"),
+                ("cn", "China / Hong Kong"))           # the stock markets the main page's market gate covers
+
+
+def test_verdict(v: Any) -> str:
+    """1.3.0: the view's verdict of a day named as this page's market test (calm only), not as the live buy rule."""
+    t = text(v)
+    if not t:
+        return t
+    return ("ALL ON HOLD (%s)" % TEST_WORDS) if t.startswith("ALL ON HOLD") else "%s (%s)" % (t, TEST_WORDS)
+
+
+def us_words(us: str, rule: Dict[str, Any]) -> str:
+    """1.3.0 PURE: the Daily Plan's US rule as configured, and what it does with today's US label."""
+    if rule["mode"] == "off":
+        return "the Daily Plan's US rule is off: a new US buy is not held for the market"
+    labels = ", ".join(rule["block"]) or "no label"
+    held = us in rule["block"]
+    today = ("held" if rule["mode"] == "enforce" else "would be held (observe)") if held else "not held"
+    return "the Daily Plan holds a new US buy on %s (TFB_PLAN_REGIME_BLOCK): today the US reads %s - %s" % (
+        labels, us or "not read", today)
+
+
+def live_rule_line(rows: Sequence[Dict[str, Any]], rule: Dict[str, Any]) -> Tuple[str, str]:
+    """1.3.0 PURE: the live buy rule today, market by market - a market is held when its label is one of the Daily
+    Plan's hold labels (the main page's market gate holds the same list on Render; Consistency_Check C16 compares
+    the two)."""
+    if rule["mode"] == "off":
+        return "off", "the Daily Plan's market rule is off: no market is held for its condition"
+    labels = {text(r.get("market_id")): text(r.get("label")) for r in rows}
+    held, allowed = [], []
+    for mid, name in LIVE_MARKETS:
+        lab = labels.get(mid)
+        if lab:
+            (held if lab in rule["block"] else allowed).append("%s (%s)" % (name, lab))
+    head = "hold on %s%s" % (", ".join(rule["block"]) or "no label", " (observe)" if rule["mode"] == "observe" else "")
+    return head, "new buys held today: %s; allowed: %s - the main page and the Daily Plan" % (
+        ", ".join(held) or "none", ", ".join(allowed) or "none")
+
+
 def day_facts(d: _dt.date, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     first = rows[0] if rows else {}
     us = [r for r in rows if text(r.get("market_id")) == "us"]
     opened = [r for r in rows if text(r.get("state")) == "open" and flag(r.get("buyable"))]
     return {"day": d, "open": int(num(first.get("open_markets")) or 0),
-            "buyable": int(num(first.get("buyable_markets")) or 0), "verdict": text(first.get("verdict")),
+            "buyable": int(num(first.get("buyable_markets")) or 0), "verdict": test_verdict(first.get("verdict")),
             "open_names": [text(r.get("market")) for r in opened], "first": text(first.get("market")),
             "first_state": text(first.get("state")), "us": text(us[0].get("label")) if us else "not read",
             "read": len(rows)}
@@ -291,11 +348,11 @@ def verdict_lines(f: Dict[str, Any], rows: Sequence[Dict[str, Any]], streak: Tup
     n, start, capped = streak
     if f["open"] == 0:
         how_long = ("%s%d day(s) in a row, since %s" % ("at least " if capped else "", n, short_day(start))) if n else ""
-        return ("ALL ON HOLD - cash stays cash",
-                "none of the %d markets with a fund is calm (oil is a reading only)%s" % (
-                    f["buyable"], "; every market on hold for " + how_long if how_long else ""))
+        return ("ALL ON HOLD (%s)" % TEST_WORDS,
+                "none of the %d markets with a fund is calm (oil is a reading only)%s - the live buy rule is the "
+                "LIVE RULE line" % (f["buyable"], "; every market on hold for " + how_long if how_long else ""))
     first = [r for r in rows if text(r.get("state")) == "open" and flag(r.get("buyable"))][0]
-    return ("%d of %d OPEN" % (f["open"], f["buyable"]),
+    return ("%d of %d OPEN (%s)" % (f["open"], f["buyable"], TEST_WORDS),
             "open: %s; first: %s - a buy would use %s" % (
                 ", ".join(f["open_names"]), text(first.get("market")), fund_word(first.get("fund_symbol"))))
 
@@ -806,9 +863,10 @@ HOW_TO = (
     "k = the market's normal yearly volatility / 16 (16 % is the S&P 500's normal level, on which the US limits were "
     "set): a quiet bond fund and a wild oil price are held to the same standard against their own movement. The US "
     "keeps k = 1, exactly the Daily Plan's rule.",
-    "State: OPEN = calm; HOLD = any other label - the Daily Plan holds a new US buy unless the US is calm, and this "
-    "page reads the same test market by market. Trend score = the mean of the 20- and 60-close change, each in units "
-    "of the market's normal move over that span; it orders the open markets first, then the held ones.",
+    "State: OPEN = calm; HOLD = any other label - this page's market test, the one the market trial was fixed on "
+    "(21 Nov); the VERDICT says it. The live buy rule is set apart from it and can differ: the LIVE RULE line names "
+    "its hold labels and the markets it holds today. Trend score = the mean of the 20- and 60-close change, each in "
+    "units of the market's normal move over that span; it orders the open markets first, then the held ones.",
     "Read on = the index or price the market is read on; Fund = what a buy would use (Saudi Arabia KSA, Europe VGK, "
     "Japan EWJ, China / Hong Kong MCHI, gold GLD, bonds IEF, sukuk SPSK, US REITs VNQ; the Saudi REITs are bought on "
     "Tadawul). A fund can move apart from its market (currency, make-up). Oil is a reading only.",
@@ -845,7 +903,8 @@ def page_rows(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Se
             line("Built %s | markets_board %s | as of %s (each market's latest close, 6 days at most) | BigQuery "
                  "v_market_rank | only the Today Action Plan gives orders" % (built, __version__, short_day(latest))),
             line("VERDICT", head, detail),
-            line("US", us, "the Daily Plan holds a new US buy unless the US is calm (its own rule, unchanged)"),
+            line("US", us, us_words(us, rule or plan_rule())),                               # 1.3.0
+            line("LIVE RULE", *live_rule_line(today_rows, rule or plan_rule())),            # 1.3.0
         ]
         nxt = next_event_line(events or ())                                                     # 1.2.0
         if nxt:
@@ -942,8 +1001,10 @@ def counts(days: Sequence[Tuple[_dt.date, List[Dict[str, Any]]]], summary: Seque
     for r in rows:
         by_label[text(r.get("label"))] = by_label.get(text(r.get("label")), 0) + 1
     idx = score_index(summary)
-    return ("as of %s: %d of %d market(s) read, %d of %d open (%s); labels %s; scorecard rows: backtest %d, forward %d"
-            % (d.isoformat(), len(rows), len(MARKETS), f["open"], f["buyable"], f["verdict"] or "none",
+    return ("as of %s: %d of %d market(s) read, %d of %d open by the market test (%s); labels %s; scorecard rows: "
+            "backtest %d, forward %d"
+            % (d.isoformat(), len(rows), len(MARKETS), f["open"], f["buyable"],
+               f["verdict"].replace(" (%s)" % TEST_WORDS, "") or "none",
                ", ".join("%s %d" % kv for kv in sorted(by_label.items())),
                sum(1 for k in idx if k[0] == "backtest"), sum(1 for k in idx if k[0] == "forward")))
 

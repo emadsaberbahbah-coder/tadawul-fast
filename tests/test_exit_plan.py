@@ -1141,8 +1141,12 @@ def test_x19_workflow_knobs():
     wf = yaml.safe_load((ROOT / ".github/workflows/exit_plan.yml").read_text(encoding="utf-8"))
     step = [s for s in wf["jobs"]["exit_plan"]["steps"] if "exit_plan.py" in str(s.get("run", ""))][0]
     assert step["env"]["TFB_EXIT_MARKET_TURN"] == "${{ vars.TFB_EXIT_MARKET_TURN || 'observe' }}"
+    # exit_plan.yml 1.8.0: the sell note falls back to the buy hold's states (TFB_PLAN_REGIME_BLOCK), so the two agree
     assert step["env"]["TFB_EXIT_MARKET_TURN_LABELS"] == \
-        "${{ vars.TFB_EXIT_MARKET_TURN_LABELS || 'weak,stress,drawdown,crash_day' }}"
+        "${{ vars.TFB_EXIT_MARKET_TURN_LABELS || vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}"
+    plan = yaml.safe_load((ROOT / ".github/workflows/daily_plan.yml").read_text(encoding="utf-8"))
+    penv = [s for s in plan["jobs"]["daily_plan"]["steps"] if "daily_plan.py" in str(s.get("run", ""))][0]["env"]
+    assert penv["TFB_PLAN_REGIME_BLOCK"].endswith("|| 'weak,stress,drawdown,crash_day' }}")   # the same last default
     assert ep.MARKET_TURN_LABELS_DEFAULT == "weak,stress,drawdown,crash_day"
 
 

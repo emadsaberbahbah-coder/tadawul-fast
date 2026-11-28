@@ -1,7 +1,17 @@
 # =============================================================================
 # 🎯 Exit Plan - the stop and the target of every holding, reviewed every morning
 # -----------------------------------------------------------------------------
-# VERSION 1.7.0 (2026-11-26)
+# VERSION 1.8.0 (2026-11-28)
+#
+# 1.8.0: ONE LIST OF MARKET STATES FOR THE BUY AND THE SELL NOTES (owner, 28 Nov
+# 2026 14:24 Riyadh, in Arabic: the important thing is that the pages agree and
+# do not contradict each other). That day the owner narrowed the buy hold to
+# drawdown and crash_day (TFB_PLAN_REGIME_BLOCK, and TFB_MARKET_GATE_HOLD on
+# Render), while this page still noted "the market-turn rule would sell" on
+# every US holding in a stressed market - a sell note on the day the plan may
+# buy. TFB_EXIT_MARKET_TURN_LABELS now falls back to TFB_PLAN_REGIME_BLOCK when
+# it is not set, so the sell note and the buy hold read the same states. Set
+# TFB_EXIT_MARKET_TURN_LABELS to give the sell rule its own list.
 #
 # 1.7.0: a holding under a standing cash offer is read on the offer's own terms
 # (exit_plan 1.7.0; config/corporate_offers.json; TFB_EXIT_OFFERS on, off = the
@@ -144,7 +154,8 @@ jobs:
           TFB_EXIT_DIV_NET: ${{ vars.TFB_EXIT_DIV_NET || 'on' }}
           TFB_EXIT_BROKER_FLOOR: ${{ vars.TFB_EXIT_BROKER_FLOOR || 'on' }}
           TFB_EXIT_MARKET_TURN: ${{ vars.TFB_EXIT_MARKET_TURN || 'observe' }}
-          TFB_EXIT_MARKET_TURN_LABELS: ${{ vars.TFB_EXIT_MARKET_TURN_LABELS || 'weak,stress,drawdown,crash_day' }}
+          # 1.8.0: the sell note reads the buy hold's states unless it has its own list
+          TFB_EXIT_MARKET_TURN_LABELS: ${{ vars.TFB_EXIT_MARKET_TURN_LABELS || vars.TFB_PLAN_REGIME_BLOCK || 'weak,stress,drawdown,crash_day' }}
           TFB_EXIT_IBKR_MAX_AGE_H: ${{ vars.TFB_EXIT_IBKR_MAX_AGE_H || '30' }}
           TFB_EXIT_OFFERS: ${{ vars.TFB_EXIT_OFFERS || 'on' }}
           TFB_EXIT_STOP_JUDGMENT: ${{ vars.TFB_EXIT_STOP_JUDGMENT || 'observe' }}
