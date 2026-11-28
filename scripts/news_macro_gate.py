@@ -2,8 +2,20 @@
 # scripts/news_macro_gate.py
 """
 ================================================================================
-TFB News & Macro Gate - v1.13.1 (observe-only; program register A7 / news layer)
+TFB News & Macro Gate - v1.13.2 (observe-only; program register A7 / news layer)
 ================================================================================
+v1.13.2 (2026-11-28) -- [SCOPE-STATE] A LIST OF NAMES THAT WAS NOT READ IS NOT "NO FLAGS"
+WHY (external audit of 28 Nov 2026, finding 01, confirmed in run 46150899640, 28 Nov 13:42 UTC): the read of
+  My_Portfolio was refused with HTTP 429 (the workbook's per-minute read quota). The run went on with a scope of
+  0 names, collected 1,374 macro items, and wrote "Names: no flags" - the words of a run that checked the
+  holdings and found nothing. No company news was collected for the holdings in that hour, and the page said
+  the opposite. The memory read has waited and asked again since v1.9.0; the scope read never did.
+WHAT: (1) the scope read is asked again after a 429, on the memory read's waits (SCOPE_RETRY_S: at once, after
+  20 s, after 40 s); any other failure is not asked again. (2) A scope that could not be read is said: the
+  _News_Gate row's Names Flagged cell, the digest's Names line and the run-log line read "NOT CHECKED - the
+  list of names was not read (<why>)", before any flag on a name given by TFB_NEWS_GATE_SYMBOLS. The macro
+  verdict is written as before (it does not depend on the names). No verdict rule, tab or column changes.
+Rollback: git revert (the gate is observe-only).
 v1.13.1 (2026-11-27) -- [FEEDS-PRUNE] THE TWO GULF FEEDS THE RUNNER CANNOT READ ARE TAKEN OUT
 WHY: the first run of 1.13.0 on main (dry run 45968251004, 27 Nov 08:4x UTC) read Argaam's two Arabic feeds
   (gulf_rss rose from 83-85 to 92 items, newest 0 min old), so the gate has an Arabic Saudi feed again; Asharq
@@ -491,7 +503,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
-__version__ = "1.13.1"
+__version__ = "1.13.2"
 
 UTC = _dt.timezone.utc
 RIYADH = _dt.timezone(_dt.timedelta(hours=3))
@@ -532,6 +544,9 @@ SAUDI_SITES = ("argaam.com", "mubasher.info", "aleqt.com", "alarabiya.net")
 CONTACT_DOMAINS = frozenset(["sec.gov", "bls.gov"])
 # v1.9.0: waits before each try of the memory read (the first is immediate; a refusal with HTTP 429 gets the next)
 MEMORY_RETRY_S = (0.0, 20.0, 40.0)
+# v1.13.2: the same waits for the scope read (the list of names the run checks)
+SCOPE_RETRY_S = (0.0, 20.0, 40.0)
+SCOPE_NOT_READ = "NOT CHECKED - the list of names was not read"
 SOURCE_BUDGET_S = {"gdelt": 240.0, "google_news": 120.0, "edgar": 150.0,
                    "fed_rss": 45.0, "econ": 60.0, "market": 45.0,
                    "bing_news": 90.0, "yahoo_rss": 60.0, "press_rss": 75.0,
@@ -2739,9 +2754,15 @@ def econ_row(e: Dict[str, Any], now: _dt.datetime) -> List[Any]:
             v(e["surprise"]), v(e["surprise_pct"]), fmt_riyadh(now)]
 
 
+def scope_words(rep: Dict[str, Any]) -> str:
+    """v1.13.2 PURE: '' when the list of names was read, else the words that say the names were not checked."""
+    why = str(rep.get("scope_state") or "")
+    return f"{SCOPE_NOT_READ} ({why})" if why else ""
+
+
 def gate_row(rep: Dict[str, Any]) -> List[Any]:
     g = rep["gate"]
-    names = "; ".join(f"{s} {f['level']}: {f['why']}" for s, f in _flags(g))
+    names = "; ".join(x for x in [scope_words(rep)] + [f"{s} {f['level']}: {f['why']}" for s, f in _flags(g)] if x)
     sched = "; ".join(f"{s['event']} {fmt_riyadh(s['when'])[5:16]}" for s in g["scheduled"])
     mk = g["market"]
     market = ", ".join(x for x in [
@@ -2770,7 +2791,12 @@ def render_digest(rep: Dict[str, Any], public: bool = False) -> str:
         lines.append("**Easing:** " + "; ".join(g["positives"]))
     flagged = _flags(g)
     lines.append("")
-    if public and flagged:
+    not_read = scope_words(rep)                       # v1.13.2: said before any flag, and never as "no flags"
+    if not_read:
+        lines.append(f"**Names:** {not_read}")
+    if not_read and not flagged:
+        pass
+    elif public and flagged:
         lines.append(f"**Names:** {len(flagged)} flag(s) on {len({s for s, _ in flagged})} name(s) - kept out "
                      "of the public log (the _News_Gate tab has them)")
     else:
@@ -2865,7 +2891,8 @@ def public_report(rep: Dict[str, Any]) -> Dict[str, Any]:
 
 def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
         sources: Sequence[str], scope: List[Dict[str, str]], sleep: Callable[[float], None],
-        run_id: str, mode: str, tax: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+        run_id: str, mode: str, tax: Optional[Dict[str, Any]] = None,
+        scope_state: str = "") -> Tuple[int, Dict[str, Any]]:
     tax = tax or load_taxonomy()
     clf = Classifier(tax)
     col = Collector(http, sleep, now)
@@ -2990,6 +3017,7 @@ def run(*, http: Any, sheets: Any, sid: str, now: _dt.datetime, write: bool,
     gate = evaluate(clusters, econ, market, now)
     rep: Dict[str, Any] = {
         "version": __version__, "now": now, "run_id": run_id, "mode": mode, "wrote": False,
+        "scope_state": scope_state,
         "scope": scope, "gate": gate, "clusters": clusters,
         "sources_ok": dict(col.ok), "sources_failed": dict(col.failed),
         "counts": {"collected": len(fresh_items), "classified": len(classified) - len(carried),
@@ -3148,11 +3176,23 @@ def _main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any
         return 2
     max_names = _int_env("TFB_NEWS_GATE_MAX_NAMES", 15, 0, 60)
     scope: List[Dict[str, str]] = []
+    scope_state = ""                     # v1.13.2: '' = the list of names was read; else why it was not
     if sheets is not None and sid:
-        try:
-            scope = read_scope(sheets, sid, max_names)
-        except Exception as exc:
-            _out(f"[news_gate v{__version__}] scope read failed ({exc}); continuing with env symbols")
+        nap = sleep or time.sleep
+        for wait in SCOPE_RETRY_S:       # a busy workbook (HTTP 429, a per-minute quota) is asked again
+            if wait:
+                nap(wait)
+            try:
+                scope = read_scope(sheets, sid, max_names)
+                scope_state = ""
+                break
+            except Exception as exc:
+                scope_state = str(exc)[:80] or type(exc).__name__
+                if "HTTP 429" not in str(exc):
+                    break
+        if scope_state:
+            _out(f"[news_gate v{__version__}] scope read failed ({scope_state}): the names are NOT CHECKED in "
+                 "this run; continuing with env symbols")
     for s in parse_symbols_env(_env("TFB_NEWS_GATE_SYMBOLS")):
         if s["symbol"] not in {x["symbol"] for x in scope}:
             scope.append(s)
@@ -3162,7 +3202,8 @@ def _main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any
     sources = selected_sources(_env("TFB_NEWS_GATE_SOURCES"))
     run_id = _env("GITHUB_RUN_ID") or now.strftime("local-%Y%m%dT%H%M%S")
     rc, rep = run(http=http, sheets=sheets, sid=sid, now=now, write=bool(args.write),
-                  sources=sources, scope=scope, sleep=sleep or time.sleep, run_id=run_id, mode=mode)
+                  sources=sources, scope=scope, sleep=sleep or time.sleep, run_id=run_id, mode=mode,
+                  scope_state=scope_state)
     digest = render_digest(rep, public=public)
     _out(digest)
     write_evidence(rep, _env("TFB_NEWS_GATE_EVIDENCE_DIR"), public=public)
@@ -3175,7 +3216,8 @@ def _main(argv: Optional[Sequence[str]] = None, *, http: Any = None, sheets: Any
             pass
     g = rep["gate"]
     _out(f"[news_gate v{__version__}] verdict={g['verdict']} drivers={len(g['drivers'])} "
-         f"names_flagged={len(g['names'])} scope={len(scope)} carried={rep['counts'].get('carried', 0)} "
+         f"names_flagged={len(g['names'])} scope={len(scope)}"
+         + (" scope_state=not-read" if rep.get("scope_state") else "") + f" carried={rep['counts'].get('carried', 0)} "
          f"sources_ok={sorted(rep['sources_ok'])} sources_failed={sorted(rep['sources_failed'])} "
          f"wrote={rep['wrote']}" + (f" write_error={rep['write_error']}" if rep.get("write_error") else ""))
     return rc

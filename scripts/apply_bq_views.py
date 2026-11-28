@@ -2,8 +2,21 @@
 # scripts/apply_bq_views.py
 """
 ================================================================================
-TFB BigQuery Looker views - v1.39.0 (program register C8, Phase 2)
+TFB BigQuery Looker views - v1.40.0 (program register C8, Phase 2)
 ================================================================================
+v1.40.0 (28 Nov 2026, the thirds are constants). WHY (external audit of 28 Nov
+2026, finding 08; owner, 28 Nov 18:30 Riyadh, in Arabic: a full review to
+improve the return and the recommendations): v_forecast_record 1.39.0 worked
+out the cuts of its thirds again on every read, from the calls scored by
+27 Nov. A late correction of one old record (a duplicate expired, a bar
+restated) could move a cut, and with it the band of every call - after the
+forward test of the thirds began on 29 Nov. The same day the owner switched
+TRACK_DEDUP_MATURED to enforce and 27 old records were expired. The cuts held
+(US one-month 2.6724 and 4.2143), by luck. WHAT: the 37 pairs of cuts
+1.39.0 read on 28 Nov at 18:30 Riyadh are written into the view as constants.
+The view's 133 rows are unchanged, row for row (compared in BigQuery before the
+change). No other object changes. Rollback: git revert, then bq_views write.
+
 v1.39.0 (28 Nov 2026, the forecast record). WHY (owner, 28 Nov 2026 01:02
 Riyadh, in Arabic: at least 5 % a month on the capital, in all cases. 01:30:
 "make full review and engening restructured looking for better results"):
@@ -801,7 +814,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.39.0"
+__version__ = "1.40.0"
 
 PLACEHOLDER = "{{DS}}"
 DEFAULT_PROJECT = "project-2e3530e6-2311-4aa3-b36"

@@ -223,6 +223,17 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.13.0 (2026-11-28): THE UPSIDE ARM IS PAID FOR LIKE THE PLAN (external audit of 28 Nov 2026, finding 04; owner,
+28 Nov 18:30 Riyadh, in Arabic: a full review to improve the return and the recommendations). 1.11.0's observe read
+the upside order under the day's sector cap alone and said so ("before the cash and held-sector checks"): the names
+it listed were not the names the switch would buy, so the two orders could not be compared as portfolios. Now one
+rule (choose) takes an order and returns what it buys - the picks count, the day's sector cap, the sector limit with
+holdings, then the cash - and the plan and the upside arm both go through it. In observe each name the arm would buy
+carries "[observe] upside arm: N share(s) at P (the plan's cash, sector and holdings checks)", frozen in the ledger
+with the plan, and the run log counts them. The arm's list is, by construction, what TFB_PLAN_RANKER=upside would
+pick with the same cash. No pick, size, stop, order or page of the plan changes (the 91 tests of 1.12.0 pass
+unchanged); ranker engine and upside add nothing new. Rollback: git revert.
+
 1.12.0 (2026-11-28): EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED (owner, 28 Nov 2026 01:02 Riyadh, in Arabic: a
 return of at least 5 % a month on the capital, in all cases, or stop before the losses grow. 01:30: "Try to make full
 review and engening restructured looking for better results"). The pages show each name's promise - the forecast
@@ -318,7 +329,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -1126,8 +1137,6 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
         cands.sort(key=by_upside)
     else:
         cands.sort(key=lambda c: (0 if kept(c) else 1, 1 if low(c) else 0, c["rank"]))
-    # observe previews the switch in its own order, kept and entry-level priorities included (Codex P2 on #1112)
-    alt = would_pick(sorted(cands, key=by_upside), k["picks"], max_per_sector) if rmode == "observe" else []
     if rmode == "observe":
         for c in cands:
             if c.get("ccy") not in rccy:
@@ -1137,11 +1146,6 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             else:
                 c["labels"].append("[observe] analyst upside %+.0f%% - upside order %d of %d" % (
                     c["upside"], upos[id(c)], len(order)))
-            if any(a is c for a in alt):
-                c["labels"].append("[observe] the upside ranker would pick this (before the cash and held-sector "
-                                   "checks)")
-    picks: List[Dict[str, Any]] = []
-    per_sector: Dict[str, int] = {}
     held_max = int(k.get("sector_held_max", 0) or 0)                              # 1.10.0 [SECTOR-HELD]
     held_sec: Dict[str, int] = {}
     if held_max > 0:
@@ -1149,51 +1153,83 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
             hs = sector_key(text((sources.get(sym) or {}).get("sector")))           # 1.10.1: GICS name
             if hs:
                 held_sec[hs] = held_sec.get(hs, 0) + 1
-    for c in cands:
-        shown = c["sector"] or "?"
-        sec = sector_key(c["sector"]) or "?"                                        # 1.10.1: counted under GICS
-        if len(picks) >= k["picks"]:
-            c["waiting"] = ("next in line (upside order %d; engine rank %d)" % (upos[id(c)], c["rank"])
-                            if rmode == "upside" else "next in line (rank %d)" % c["rank"])
-            pipeline.append(c)
-        elif per_sector.get(sec, 0) >= max(1, max_per_sector):
-            c["waiting"] = "sector cap (%s already has %d)" % (shown, per_sector[sec])
-            pipeline.append(c)
-        elif held_max > 0 and held_sec.get(sec, 0) + per_sector.get(sec, 0) >= held_max:
-            c["waiting"] = "sector limit with holdings (%s: %d held + %d picked; the limit is %d)" % (
-                shown, held_sec.get(sec, 0), per_sector.get(sec, 0), held_max)
-            pipeline.append(c)
-        else:
-            if rmode == "upside" and c.get("ccy") in rccy and c.get("upside") is not None:
-                c["labels"].append("ranked by analyst upside %+.0f%% (engine rank %d)" % (c["upside"], c["rank"]))
-            if kept(c):
-                c["labels"].append("kept from the previous plan")
-            elif low(c):
-                c["labels"].append("score %s is under the entry level %s" % (fmt(c["score"], 1), fmt(s_in, 0)))
-            per_sector[sec] = per_sector.get(sec, 0) + 1
-            picks.append(c)
     deployable = max(0.0, cash_sar - k["floor_pct"] / 100.0 * nav)
     cap = min(k["weight_pct"] / 100.0 * nav, k["risk_pct"] / 100.0 * nav / (k["stop_pct"] / 100.0))
+
     def whole(p: Dict[str, Any], a: float) -> float:
         """What `a` SAR buys of p in whole shares, in SAR."""
         px = p["price"] * FX_TO_SAR[p["ccy"]]
         return (a // px) * px
 
-    while picks:
-        alloc = min(cap, deployable / len(picks))
-        # the ticket that is published is whole shares, so the minimum is tested on that amount
-        under = [p for p in picks if whole(p, alloc) <= 0 or whole(p, alloc) < k["min_ticket"]]
-        if alloc < k["min_ticket"]:
-            drop, what = picks[-1], "the minimum ticket"
-        elif under:
-            drop = under[-1]
-            what = "one share" if whole(drop, alloc) <= 0 else "the minimum ticket in whole shares"
-        else:
-            break
-        drop["waiting"] = "cash: %s SAR per pick is below %s" % ("{:,.0f}".format(alloc), what)
-        picks.remove(drop)
-        pipeline.append(drop)
-    alloc = min(cap, deployable / len(picks)) if picks else 0.0
+    def choose(names: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], Tuple]],
+                                                         float, List[Dict[str, Any]]]:
+        """1.13.0 [ARMS] PURE (changes no candidate): the names bought from `names` in their order - the picks count,
+        the day's sector cap, the sector limit with holdings, then the cash - with (the picks, the names left out
+        and why, SAR per pick, the names that passed the sector checks before the cash). One rule for the plan's
+        order and for the upside arm's, so the two differ by the order alone (audit of 28 Nov 2026, finding 04)."""
+        chosen: List[Dict[str, Any]] = []
+        left: List[Tuple[Dict[str, Any], Tuple]] = []
+        per: Dict[str, int] = {}
+        for c in names:
+            shown = c["sector"] or "?"
+            sec = sector_key(c["sector"]) or "?"                                    # 1.10.1: counted under GICS
+            if len(chosen) >= k["picks"]:
+                left.append((c, ("next",)))
+            elif per.get(sec, 0) >= max(1, max_per_sector):
+                left.append((c, ("sector", shown, per[sec])))
+            elif held_max > 0 and held_sec.get(sec, 0) + per.get(sec, 0) >= held_max:
+                left.append((c, ("held", shown, held_sec.get(sec, 0), per.get(sec, 0))))
+            else:
+                per[sec] = per.get(sec, 0) + 1
+                chosen.append(c)
+        first = list(chosen)
+        while chosen:
+            a = min(cap, deployable / len(chosen))
+            # the ticket that is published is whole shares, so the minimum is tested on that amount
+            under = [p for p in chosen if whole(p, a) <= 0 or whole(p, a) < k["min_ticket"]]
+            if a < k["min_ticket"]:
+                drop, what = chosen[-1], "the minimum ticket"
+            elif under:
+                drop = under[-1]
+                what = "one share" if whole(drop, a) <= 0 else "the minimum ticket in whole shares"
+            else:
+                break
+            left.append((drop, ("cash", a, what)))
+            chosen.remove(drop)
+        return chosen, left, (min(cap, deployable / len(chosen)) if chosen else 0.0), first
+
+    def why_not(c: Dict[str, Any], why: Tuple) -> str:
+        if why[0] == "next":
+            return ("next in line (upside order %d; engine rank %d)" % (upos[id(c)], c["rank"])
+                    if rmode == "upside" else "next in line (rank %d)" % c["rank"])
+        if why[0] == "sector":
+            return "sector cap (%s already has %d)" % (why[1], why[2])
+        if why[0] == "held":
+            return "sector limit with holdings (%s: %d held + %d picked; the limit is %d)" % (
+                why[1], why[2], why[3], held_max)
+        return "cash: %s SAR per pick is below %s" % ("{:,.0f}".format(why[1]), why[2])
+
+    # 1.13.0 [ARMS]: observe runs the upside order through the plan's own checks (kept and entry-level priorities
+    # included - Codex P2 on #1112) and records what it would buy, so the two arms can be paid for alike
+    arm: List[Dict[str, Any]] = []
+    if rmode == "observe":
+        b_picks, _left, b_alloc, _first = choose(sorted(cands, key=by_upside))
+        for c in b_picks:
+            qty = int(b_alloc // (c["price"] * FX_TO_SAR[c["ccy"]]))
+            arm.append({"symbol": c["symbol"], "qty": qty, "entry": c["price"]})
+            c["labels"].append("[observe] upside arm: %d share(s) at %s (the plan's cash, sector and holdings "
+                               "checks)" % (qty, fmt(c["price"])))
+    picks, left, alloc, first = choose(cands)
+    for c in first:
+        if rmode == "upside" and c.get("ccy") in rccy and c.get("upside") is not None:
+            c["labels"].append("ranked by analyst upside %+.0f%% (engine rank %d)" % (c["upside"], c["rank"]))
+        if kept(c):
+            c["labels"].append("kept from the previous plan")
+        elif low(c):
+            c["labels"].append("score %s is under the entry level %s" % (fmt(c["score"], 1), fmt(s_in, 0)))
+    for c, why in left:
+        c["waiting"] = why_not(c, why)
+        pipeline.append(c)
     for p in picks:
         fx = FX_TO_SAR[p["ccy"]]
         qty = int(alloc // (p["price"] * fx))
@@ -1210,7 +1246,7 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
     pipeline.sort(key=lambda c: c["rank"])
     ranker = {"mode": rmode, "candidates": len(cands),
               "with_upside": sum(1 for c in cands if c.get("ccy") in rccy and c.get("upside") is not None),
-              "alt": [c["symbol"] for c in alt]}
+              "alt": [a["symbol"] for a in arm], "arm": arm}
     return {"picks": picks, "pipeline": pipeline, "nav": nav, "cash": cash_sar, "deployable": deployable,
             "per_pick": alloc, "ranker": ranker}
 
@@ -1574,7 +1610,8 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                         rk["mode"], rk["with_upside"], rk["candidates"])
                     if rk["mode"] == "observe":
                         same = len(set(rk["alt"]) & {c["symbol"] for c in plan["picks"]})
-                        line += "; the upside order would pick %d name(s), %d of them among today's %d pick(s)" % (
+                        line += ("; the upside arm would buy %d name(s) under the plan's cash and sector checks, "
+                                 "%d of them among today's %d pick(s)") % (
                             len(rk["alt"]), same, len(plan["picks"]))
                     _out(line)
                 if text((k.get("regime") or {}).get("note")).startswith("market regime not read"):

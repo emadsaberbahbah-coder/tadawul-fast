@@ -1531,7 +1531,7 @@ def test_r2_engine_is_the_default_and_adds_nothing(monkeypatch):
     assert _syms(p["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]
     assert all(not x.startswith("[observe] analyst") and not x.startswith("ranked by analyst")
                for c in p["picks"] + p["pipeline"] for x in c["labels"])
-    assert p["ranker"] == {"mode": "engine", "candidates": 7, "with_upside": 6, "alt": []}   # counted, not used
+    assert p["ranker"] == {"mode": "engine", "candidates": 7, "with_upside": 6, "alt": [], "arm": []}   # counted, not used
     nxt = {c["symbol"]: c["waiting"] for c in p["pipeline"]}
     assert nxt["SBLK.US"] == "next in line (rank 5)" and nxt["NMM.US"] == "next in line (rank 4)"
 
@@ -1544,14 +1544,19 @@ def test_r3_observe_changes_no_pick_and_labels_every_candidate(monkeypatch):
     for key in ("qty", "entry", "stop", "alloc_sar"):
         assert [c[key] for c in p["picks"]] == [c[key] for c in base["picks"]], key
     lab = _labels(p, "[observe]")
+    arm = {a["symbol"]: a for a in p["ranker"]["arm"]}
     assert lab["ITRN.US"] == ["[observe] analyst upside +44% - upside order 1 of 7",
-                              "[observe] the upside ranker would pick this (before the cash and held-sector checks)"]
+                              "[observe] upside arm: %d share(s) at %s (the plan's cash, sector and holdings checks)"
+                              % (arm["ITRN.US"]["qty"], dp.fmt(arm["ITRN.US"]["entry"]))]
     assert lab["TEN.US"][0] == "[observe] analyst upside +40% - upside order 2 of 7" and len(lab["TEN.US"]) == 2
     assert lab["NMM.US"][0] == "[observe] analyst upside +28% - upside order 3 of 7" and len(lab["NMM.US"]) == 2
     assert lab["ZTO.US"] == ["[observe] analyst upside +6% - upside order 6 of 7"]          # picked, but not by upside
     assert lab["LADR.US"] == ["[observe] no analyst upside (no target price on its source page)"]
     assert lab["BBOX.L"] == []                                       # stopped earlier by its currency: not a candidate
-    assert p["ranker"] == {"mode": "observe", "candidates": 7, "with_upside": 6, "alt": ["ITRN.US", "TEN.US", "NMM.US"]}
+    assert p["ranker"] == {"mode": "observe", "candidates": 7, "with_upside": 6, "alt": ["ITRN.US", "TEN.US", "NMM.US"],
+                           "arm": [{"symbol": "ITRN.US", "qty": 41, "entry": 51.82},
+                                   {"symbol": "TEN.US", "qty": 85, "entry": 25.0},
+                                   {"symbol": "NMM.US", "qty": 35, "entry": 60.0}]}
 
 
 def test_r4_upside_orders_the_us_candidates_by_the_analyst_target(monkeypatch):
@@ -1594,7 +1599,7 @@ def test_r8_observe_previews_the_switch_in_its_own_order(monkeypatch):
         monkeypatch.setenv("TFB_PLAN_RANKER", "upside")
         up = plan(src=SRC_EV, cal=CAL_EV, **kw)
         would = [c["symbol"] for c in obs["picks"] + obs["pipeline"]
-                 if any(x.startswith("[observe] the upside ranker would pick") for x in c["labels"])]
+                 if any(x.startswith("[observe] upside arm: ") for x in c["labels"])]
         return obs["ranker"]["alt"], sorted(would), _syms(up["picks"])
 
     alt, would, up = both(prior=("ZTO.US",))                       # yesterday's pick keeps its place under upside
@@ -1606,6 +1611,42 @@ def test_r8_observe_previews_the_switch_in_its_own_order(monkeypatch):
     assert obs["ranker"]["alt"] == _syms(upn["picks"]) == ["ITRN.US", "TEN.US", "ZTO.US"]   # not +28% NMM: under 77
 
 
+def test_r9_the_upside_arm_is_paid_for_like_the_plan(monkeypatch):
+    """1.13.0 [ARMS] (external audit of 28 Nov 2026, finding 04): the arm goes through the plan's own cash, sector and
+    holdings checks, so it is what the upside switch would buy with the same cash, share for share - and the plan
+    itself stays the engine's."""
+    def arms(**kw):
+        got = []
+        for mode in ("observe", "upside", "engine"):
+            monkeypatch.setenv("TFB_PLAN_RANKER", mode)
+            over = dict(kw)
+            if "k_over" in over:                                   # the knobs are read after the mode is set
+                over["k"] = K(**over.pop("k_over"))
+            got.append(plan(src=SRC_EV, cal=CAL_EV, **over))
+        return got
+
+    sizes = {}
+    for name, kw in (("full", {}), ("less", {"cash": 12000.0}), ("little", {"cash": 9000.0}), ("none", {"cash": 5000.0}),
+                     ("one a sector", {"mps": 1}), ("kept", {"prior": ("ZTO.US",)}),
+                     ("held", {"k_over": {"sector_held_max": 1}})):
+        obs, up, eng = arms(**kw)
+        arm = obs["ranker"]["arm"]
+        assert arm == [{"symbol": c["symbol"], "qty": c["qty"], "entry": c["entry"]} for c in up["picks"]], name
+        assert obs["ranker"]["alt"] == _syms(up["picks"]), name
+        assert all(a["qty"] > 0 for a in arm), name
+        said = sorted(c["symbol"] for c in obs["picks"] + obs["pipeline"]
+                      if any(x.startswith("[observe] upside arm: %d share(s) at " % a["qty"])
+                             for a in arm if a["symbol"] == c["symbol"] for x in c["labels"]))
+        assert said == sorted(a["symbol"] for a in arm), name                     # the ledger freezes each arm buy
+        for key in ("symbol", "qty", "entry", "stop", "alloc_sar"):
+            assert [c[key] for c in obs["picks"]] == [c[key] for c in eng["picks"]], (name, key)
+        assert {c["symbol"]: c["waiting"] for c in obs["pipeline"]} == {c["symbol"]: c["waiting"] for c in eng["pipeline"]}
+        assert eng["ranker"]["arm"] == up["ranker"]["arm"] == [], name            # only observe records an arm
+        sizes[name] = len(arm)
+    # the cash check is real: 1.11.0 listed three names whatever the cash (the day's sector cap alone)
+    assert sizes["full"] == 3 and sizes["none"] == 0 and sizes["little"] <= sizes["less"] < sizes["full"]
+
+
 def test_r6_the_run_log_gives_counts_only(monkeypatch, capsys):
     monkeypatch.setenv("TFB_PLAN_RANKER", "observe")
     monkeypatch.setenv("TFB_PLAN_LOG_DETAIL", "off")
@@ -1614,8 +1655,8 @@ def test_r6_the_run_log_gives_counts_only(monkeypatch, capsys):
     out = capsys.readouterr().out
     line = [x for x in out.splitlines() if "ranker observe:" in x]
     assert len(line) == 1 and line[0].endswith(
-        "ranker observe: 6 of 7 candidate(s) carry an analyst upside; the upside order would pick 3 name(s), 2 of them "
-        "among today's 3 pick(s)")
+        "ranker observe: 6 of 7 candidate(s) carry an analyst upside; the upside arm would buy 3 name(s) under the "
+        "plan's cash and sector checks, 2 of them among today's 3 pick(s)")
     for sym in ("ITRN", "TEN", "ZTO", "NMM", "SBLK", "LADR"):
         assert sym not in line[0], sym
     monkeypatch.setenv("TFB_PLAN_RANKER", "engine")
@@ -1632,3 +1673,13 @@ def test_r7_the_workflow_arms_observe_and_the_header_says_why():
     assert _ver(dp.__version__) >= (1, 11, 0) and "1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE" in src
     assert '("daily_plan", "%s", "daily plan")' % dp.__version__ in (ROOT / "scripts/verify_deployment.py").read_text(
         encoding="utf-8")
+
+
+def test_r10_a_name_dropped_for_cash_keeps_the_labels_it_earned():
+    """1.13.0 [ARMS]: the labels of 1.12.0, to the word - a kept pick that passes the sector checks and is then
+    dropped for cash still says it was kept (the labels are given before the cash is counted)."""
+    p = plan(src=SRC_EV, cal=CAL_EV, cash=5000.0, prior=("ZTO.US",))
+    z = [c for c in p["pipeline"] if c["symbol"] == "ZTO.US"][0]
+    assert p["picks"] == [] and z["waiting"].startswith("cash: ") and "kept from the previous plan" in z["labels"]
+    others = [c for c in p["pipeline"] if c["symbol"] != "ZTO.US"]
+    assert others and all("kept from the previous plan" not in c["labels"] for c in others)

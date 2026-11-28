@@ -12,12 +12,15 @@
 -- (in_engine_cohort), with entry investability INVESTABLE and stance bullish (the population of v_projection_scorecard
 -- and v_learning_scorecard), every market, horizons 1W, 2W, 1M and 3M. 1W and 2W promises are the one-month thesis
 -- scaled to the window (track_performance), so only 1M and 3M carry the page's own forecast.
--- THE THIRDS, FIXED ON 28 NOV 2026: per market and horizon, the calls recorded up to 28 Nov 2026 and scored by 27 Nov 2026
--- are cut into thirds by their promise (target_roi_pp, NTILE(3), lowest first, ties by symbol and day). low_to_pp and
--- mid_to_pp are the highest promise of the first and second third, unrounded (a reader places a promise exactly as
--- this view does - Codex P2 on #1114), and they do not move as new calls are scored: a call
--- is 'low' at or under low_to_pp, 'mid' at or under mid_to_pp, else 'high' (no band where the market and horizon had no
--- such call). 'all' is the whole market and horizon.
+-- THE THIRDS, WRITTEN INTO THIS VIEW (views 1.40.0): per market and horizon, the calls recorded up to 28 Nov 2026 and
+-- scored by 27 Nov 2026 were cut into thirds by their promise (target_roi_pp, NTILE(3), lowest first, ties by symbol and
+-- day). low_to_pp and mid_to_pp are the highest promise of the first and second third. 1.39.0 worked them out again on
+-- every read, so a late correction of an old record (a duplicate expired, a bar restated) could move a cut and with it
+-- the band of every call - after the forward test had begun (external audit of 28 Nov 2026, finding 08). The 37 pairs
+-- below are the values 1.39.0 read on 28 Nov 2026 at 18:30 Riyadh, after that day's duplicate clean-up
+-- (TRACK_DEDUP_MATURED enforce, 27 records): they are constants now. A call is 'low' at or under low_to_pp, 'mid' at
+-- or under mid_to_pp, else 'high'. A market and horizon outside the list has no band ('all' only). A NULL mid_to (a
+-- pair that had one call) leaves 'low' and 'mid'. 'all' is the whole market and horizon.
 -- THE PERIODS: 'all' (every scored call) and 'forward' (calls recorded from 29 Nov 2026, after the thirds were fixed):
 -- the forward rows say whether the thirds keep their order on calls that did not shape them.
 -- THE MEASURE per (market, horizon, band, period), all in percent points:
@@ -47,7 +50,7 @@
 -- Research view: the live system never reads BigQuery (the Daily Plan reads the Forecast_Record tab that
 -- scripts/forecast_record.py writes from this view), and no decision, gate, count or order depends on it.
 CREATE OR REPLACE VIEW `{{DS}}.v_forecast_record`
-OPTIONS (description = "TFB forecast record (views 1.39.0): per market, horizon and promise third (cut once, on the calls scored by 27 Nov 2026) and for all calls and the calls from 29 Nov 2026, what TFB's scored INVESTABLE buy calls promised and delivered, the share of the promise, how often they rose and beat their own index, with a fixed reading - the record behind the honest forecast the Daily Plan shows in observe - research only")
+OPTIONS (description = "TFB forecast record (views 1.40.0): per market, horizon and promise third (cuts fixed as constants, read on the calls scored by 27 Nov 2026) and for all calls and the calls from 29 Nov 2026, what TFB's scored INVESTABLE buy calls promised and delivered, the share of the promise, how often they rose and beat their own index, with a fixed reading - the record behind the honest forecast the Daily Plan shows in observe - research only")
 AS
 WITH c AS (
   SELECT symbol, market, horizon, recorded_date, target_bar_date,
@@ -61,16 +64,47 @@ WITH c AS (
     AND horizon IN ('1W', '2W', '1M', '3M')
     AND target_roi_pp IS NOT NULL AND engine_roi_pp IS NOT NULL AND target_bar_date IS NOT NULL
 ),
-fixed AS (
-  SELECT market, horizon, p,
-    NTILE(3) OVER (PARTITION BY market, horizon ORDER BY p, symbol, recorded_date) AS third
-  FROM c
-  WHERE recorded_date <= DATE '2026-11-28' AND target_bar_date <= DATE '2026-11-27'
-),
 cuts AS (
-  SELECT market, horizon, MAX(IF(third = 1, p, NULL)) AS low_to, MAX(IF(third = 2, p, NULL)) AS mid_to
-  FROM fixed
-  GROUP BY market, horizon
+  SELECT market, horizon, low_to, mid_to
+  FROM UNNEST([
+    STRUCT('Canada' AS market, '1W' AS horizon, 0.6851 AS low_to, 0.8377 AS mid_to),
+    ('Canada', '2W', 1.3701, 1.6755),
+    ('Europe', '1M', 5.1307, 6.0414),
+    ('Europe', '1W', 1.2923, 1.3644),
+    ('Europe', '2W', 2.5845, 2.7287),
+    ('Europe', '3M', 13.4784, 14.2909),
+    ('Hong Kong', '1M', 2.0639, 3.3083),
+    ('Hong Kong', '1W', 0.0064, 0.5214),
+    ('Hong Kong', '2W', 0.0127, 1.0427),
+    ('Hong Kong', '3M', 10.8987, 14.2538),
+    ('India', '1M', 6.2783, CAST(NULL AS FLOAT64)),
+    ('India', '3M', 14.6494, CAST(NULL AS FLOAT64)),
+    ('London', '1M', 2.789, 5.9998),
+    ('London', '1W', 0.9761, 1.3113),
+    ('London', '2W', 1.9438, 2.6225),
+    ('London', '3M', 13.9994, 14.2349),
+    ('Malaysia', '1M', 6.12, 6.12),
+    ('Malaysia', '3M', 14.28, 14.28),
+    ('Mexico', '1M', 3.6, CAST(NULL AS FLOAT64)),
+    ('Mexico', '1W', 0.0084, CAST(NULL AS FLOAT64)),
+    ('Mexico', '2W', 0.0168, CAST(NULL AS FLOAT64)),
+    ('Singapore', '1M', 1.6714, 4.1504),
+    ('Singapore', '1W', 0.3686, 0.429),
+    ('Singapore', '2W', 0.0196, 0.78),
+    ('Singapore', '3M', 9.7867, 9.82),
+    ('Tadawul', '1M', 4.1929, 5.4891),
+    ('Tadawul', '1W', 0.0107, 0.0147),
+    ('Tadawul', '2W', 0.0212, 0.0294),
+    ('Tadawul', '3M', 10.3032, 12.0912),
+    ('Tokyo', '1M', 6.2948, 6.2988),
+    ('Tokyo', '1W', 0.0147, 1.4233),
+    ('Tokyo', '2W', 0.0294, 2.8466),
+    ('Tokyo', '3M', 14.69, 14.6973),
+    ('US', '1M', 2.6724, 4.2143),
+    ('US', '1W', 0.4547, 0.9752),
+    ('US', '2W', 0.7969, 1.8286),
+    ('US', '3M', 6.0638, 10.5)
+  ])
 ),
 ix_day AS (
   SELECT symbol, date, COALESCE(adj_close, close) AS px

@@ -416,7 +416,8 @@ PENDING = {
     "v_regime_shadow_insample": "25c44ff7d8d46e4f0cc1d2a4e10d9d5ccd2cd1a1bb85b5a37044eaad617aecc2",
     # apply_bq_views 1.39.0 (28 Nov 2026): the forecast record - what the scored buy calls promised and delivered, per
     # market, horizon and promise third (cut once, on the calls scored by 27 Nov 2026), against their own index
-    "v_forecast_record": "142caee5b170571135476b3ce3ba0203d32a2738426893df7b5c0386c0cd9ec2",
+    # (was 142caee5b170 in 1.39.0; 1.40.0 writes the 37 pairs of cuts into the view as constants - same 133 rows)
+    "v_forecast_record": "367300190fdf3a53190676eaed0e80752373b19ebbf28fef57ca271b2c48d031",
 }
 EXPECTED_ORDER = [
     "f_cell", "f_num", "f_ts", "f_col", "f_at", "f_ts_utc",
@@ -3251,7 +3252,7 @@ def case_v44():
 def case_v45():
     """apply_bq_views 1.18.0 (kept in 1.32.0): a file number may have three digits, and the files are applied in number
     order (99 before 100); every two-digit file keeps its place."""
-    assert bv.__version__ == "1.39.0"
+    assert bv.__version__ == "1.40.0"
     objs = bv.load_objects()
     files = [o.path.name for o in objs]
     assert files[-52:] == ["99_v_market_condition.sql", "100_v_market_rank.sql", "101_v_market_trial.sql",
