@@ -223,6 +223,24 @@ let's start building and activating"). Measured that day on the archive:
 Both are measured every week against outcomes (v_regime_outcomes); the words
 of each rule are on the page, so a blocked name always says why.
 
+1.12.0 (2026-11-28): EACH NAME SHOWS WHAT CALLS LIKE IT DELIVERED (owner, 28 Nov 2026 01:02 Riyadh, in Arabic: a
+return of at least 5 % a month on the capital, in all cases, or stop before the losses grow. 01:30: "Try to make full
+review and engening restructured looking for better results"). The pages show each name's promise - the forecast
+price over the price - and the record says what such promises delivered (v_forecast_record, the INVESTABLE buy calls
+scored to 27 Nov 2026): the US one-month calls promised +3.66 % and delivered +1.13 %, and what they delivered rose
+with the promise (the lowest third -1.28 %, the highest third +3.26 %, 72 % rose, 71 % beat SPY); every third of the
+Saudi calls lost money (the highest third -8.53 %).
+TFB_PLAN_HONEST = observe (default) | off. In observe the cut reads the Forecast_Record tab once (written nightly
+by scripts/forecast_record.py from v_forecast_record) and every name it judges - pick or waiting - gets two labels,
+one per horizon (1M, 3M): "[observe] honest 1M +3.3% vs page +5.6% (US buy calls like it: 72% rose, 71% beat SPY,
+153 calls)". The promise is the source page's Forecast Price over its Current Price; "like it" is the band of the
+record whose fixed range holds that promise (its third of the market's promises), or all the market's calls when the
+third has too few; with neither, or no forecast price, or a listing with no scored call, the label says "not
+measured" and why. The labels change no pick, order, size or level: the Today Action Plan shows them in a pick's
+"why", as every Daily Plan label. A tab that cannot be read leaves the labels out and the cut goes on. The run log
+gives counts only (how many names were measured and how many read under 0).
+Rollback: repository variable TFB_PLAN_HONEST=off.
+
 1.11.0 (2026-11-28): THE RANKER CAN BE THE ANALYST UPSIDE (owner, 28 Nov 2026 01:30 Riyadh: "Try to make
 full review and engine restructured looking for better results"). Measured that night (v_signal_edge, signal days
 to 26 Oct, US, 1 month, about 24-32 names a day, overlap-adjusted t): the engine's overall score, which orders the
@@ -300,7 +318,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 # 1.10.1: the provider's six sector spellings that differ from GICS, folded to GICS before any sector is counted
 # (the same six as core/sectors.py YAHOO_TO_GICS_SECTOR; tests/test_daily_plan.py keeps the two equal).
@@ -339,6 +357,9 @@ QUAL_TITLE = "ALL QUALIFIED"
 READ_ATTEMPTS = 3      # the workbook answers slowly under load; a transient read error is retried
 READ_RETRY_S = 20
 OK_OUTPUTS = ("EXECUTABLE", "QUALIFIED_UNFUNDED", "HELD", "WITHHELD", "NO_TRADE", "EMPTY")
+RECORD_TAB = "Forecast_Record"                                                   # 1.12.0 [HONEST]
+RECORD_NEED = ("Market", "Horizon", "Band", "Period", "Calls", "Days", "Delivered %", "Reading")
+HONEST_HORIZONS = (("1M", "fp1m"), ("3M", "fp3m"))
 
 
 _SLEEP = time.sleep
@@ -405,6 +426,11 @@ def ranker_mode() -> str:
     """1.11.0 [RANKER]: engine (default) | observe | upside; any other word is engine."""
     v = _env("TFB_PLAN_RANKER", "engine").lower()
     return v if v in RANKERS else "engine"
+
+
+def honest_mode() -> str:
+    """1.12.0 [HONEST]: observe (default) | off; any other word is observe (the mode only adds labels)."""
+    return "off" if _env("TFB_PLAN_HONEST", "observe").lower() == "off" else "observe"
 
 
 def regime_mode() -> str:
@@ -495,6 +521,7 @@ def knobs() -> Dict[str, Any]:
         "ranker": ranker_mode(),                                                  # 1.11.0 [RANKER]
         "ranker_ccy": [c.strip().upper() for c in _env("TFB_PLAN_RANKER_CCY", "USD").split(",") if c.strip()]
         or ["USD"],
+        "honest": honest_mode(),                                                  # 1.12.0 [HONEST]
         "sector_held_max": int(_env_num("TFB_PLAN_SECTOR_HELD_MAX", 0, 0, 20)),   # 1.10.0: 0 = off
         "roi_cap_pct": _env_num("TFB_PLAN_ROI_CAP_PCT", 34, 20, 100),
     }
@@ -731,6 +758,8 @@ def read_sources(grids: Sequence[Sequence[Sequence[Any]]]) -> Dict[str, Dict[str
                         "warnings": text(cell(r, col.get("Warnings"))),
                         "risk": num(cell(r, col.get("Risk Score"))),
                         "target": num(cell(r, col.get("Target Price"))),
+                        "fp1m": num(cell(r, col.get("Forecast Price 1M"))),             # 1.12.0 [HONEST]
+                        "fp3m": num(cell(r, col.get("Forecast Price 3M"))),
                         "quote_at": parse_utc(cell(r, col.get("Last Updated (UTC)")))}   # 1.5.0: the row's sync time
     return out
 
@@ -763,6 +792,108 @@ def analyst_upside(src: Dict[str, Any]) -> Optional[float]:
     if price is None or target is None or price <= 0 or target <= 0:
         return None
     return round((target / price - 1.0) * 100.0, 4)
+
+
+def read_record(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
+    """1.12.0 [HONEST] PURE: the Forecast_Record tab's rows of period 'all' - {"rows": {(market, horizon, band): row},
+    "cuts": {(market, horizon): (low_to, mid_to)}, "suffix": {listing suffix: market}, "through": the last scored
+    outcome day}; {} when the tab holds no such table."""
+    h, col = table_index(values, RECORD_NEED)
+    if h is None:
+        return {}
+    rows: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    cuts: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
+    suffix: Dict[str, str] = {}
+    through = ""
+    for r in list(values)[h + 1:]:
+        market, hz = text(cell(r, col.get("Market"))), text(cell(r, col.get("Horizon"))).upper()
+        band, period = text(cell(r, col.get("Band"))).lower(), text(cell(r, col.get("Period"))).lower()
+        if not market or not hz:
+            break
+        if period != "all" or band not in ("all", "low", "mid", "high"):
+            continue
+        calls = num(cell(r, col.get("Calls")))
+        rows[(market, hz, band)] = {
+            "market": market, "horizon": hz, "band": band, "calls": int(calls or 0),
+            "days": int(num(cell(r, col.get("Days"))) or 0), "delivered": num(cell(r, col.get("Delivered %"))),
+            "promised": num(cell(r, col.get("Promised %"))), "rose": num(cell(r, col.get("Rose %"))),
+            "beat": num(cell(r, col.get("Beat %"))), "index": text(cell(r, col.get("Index"))),
+            "reading": text(cell(r, col.get("Reading")))}
+        if band == "all":
+            cuts[(market, hz)] = (num(cell(r, col.get("Low To %"))), num(cell(r, col.get("Mid To %"))))
+            for sfx in text(cell(r, col.get("Suffixes"))).upper().split():
+                suffix.setdefault(sfx, market)
+            through = max(through, text(cell(r, col.get("Scored Through"))))
+    return {"rows": rows, "cuts": cuts, "suffix": suffix, "through": through} if rows else {}
+
+
+def market_of(symbol: str, suffix: Dict[str, str]) -> Optional[str]:
+    """1.12.0 [HONEST] PURE: the record's market of a symbol by its listing suffix; a bare ticker lists in the US
+    (as v_outcome_engine reads it). None for a suffix the record has no scored call of."""
+    s = text(symbol).upper()
+    return suffix.get(s.rsplit(".", 1)[1] if "." in s else "US")
+
+
+def band_of(p: float, low_to: Optional[float], mid_to: Optional[float]) -> Optional[str]:
+    """1.12.0 [HONEST] PURE: the fixed third of the record that holds a promise p (v_forecast_record's own rule)."""
+    if low_to is None:
+        return None
+    if p <= low_to:
+        return "low"
+    return "mid" if mid_to is None or p <= mid_to else "high"
+
+
+def honest_read(symbol: str, src: Dict[str, Any], record: Dict[str, Any], h: str) -> Dict[str, Any]:
+    """1.12.0 [HONEST] PURE: what the scored buy calls like this one delivered at horizon h -
+    {"h", "market", "promise", "honest", "band", "row", "why"}; honest is None, and why says why, when not measured."""
+    out: Dict[str, Any] = {"h": h, "market": None, "promise": None, "honest": None, "band": None, "row": None, "why": ""}
+    market = market_of(symbol, record.get("suffix") or {})
+    price, fp = num(src.get("price")), num(src.get(dict(HONEST_HORIZONS).get(h, "")))
+    if market is None:
+        out["why"] = "no scored buy call of this listing"
+        return out
+    out["market"] = market
+    if not price or price <= 0 or fp is None or fp <= 0:
+        out["why"] = "no %s forecast price on its source page" % h
+        return out
+    p = round((fp / price - 1.0) * 100.0, 4)
+    out["promise"] = p
+    band = band_of(p, *((record.get("cuts") or {}).get((market, h)) or (None, None)))
+    for b in ([band] if band else []) + ["all"]:
+        row = (record.get("rows") or {}).get((market, h, b))
+        if row and row["reading"] != "too few calls" and row["calls"] > 0 and row["delivered"] is not None:
+            out.update(honest=row["delivered"], band=b, row=row)
+            return out
+    out["why"] = "too few scored %s %s buy calls" % (market, h)
+    return out
+
+
+def _pct0(v: Optional[float]) -> str:
+    return "?" if v is None else "%.0f%%" % v
+
+
+def honest_label(r: Dict[str, Any]) -> str:
+    """1.12.0 [HONEST] PURE: one name's label for one horizon."""
+    if r["honest"] is None:
+        return "[observe] honest %s: not measured (%s)" % (r["h"], r["why"])
+    row = r["row"]
+    like = ("%s buy calls like it" % r["market"]) if r["band"] != "all" else ("all %s buy calls" % r["market"])
+    return "[observe] honest %s %+.1f%% vs page %+.1f%% (%s: %s rose, %s beat %s, %d calls)" % (
+        r["h"], r["honest"], r["promise"], like, _pct0(row["rose"]), _pct0(row["beat"]), row["index"] or "its index",
+        row["calls"])
+
+
+def honest_line(names: Sequence[Dict[str, Any]], record: Dict[str, Any], mode: str) -> str:
+    """1.12.0 [HONEST] PURE: the run-log line - counts only."""
+    if not record:
+        return "honest %s: the %s tab holds no record - no honest label" % (mode, RECORD_TAB)
+    reads = [c["honest"] for c in names if c.get("honest")]
+    parts = []
+    for i, (h, _) in enumerate(HONEST_HORIZONS):
+        got = [r[i]["honest"] for r in reads if len(r) > i and r[i]["honest"] is not None]
+        parts.append("%s measured for %d (%d under 0)" % (h, len(got), sum(1 for x in got if x < 0)))
+    return "honest %s: %d name(s) labelled; %s | record scored through %s" % (
+        mode, len(reads), ", ".join(parts), record.get("through") or "?")
 
 
 def upside_order(cands: Sequence[Dict[str, Any]], ccy: Sequence[str]) -> List[Dict[str, Any]]:
@@ -956,6 +1087,9 @@ def decide(qualified: List[Dict[str, Any]], sources: Dict[str, Dict[str, Any]], 
                 reason = rg["words"]
             elif rg.get("mode") == "observe":
                 c["labels"].append("[observe] " + rg["words"])
+        if k.get("honest", "off") != "off" and k.get("record"):                   # 1.12.0 [HONEST]: labels only
+            c["honest"] = [honest_read(q["symbol"], src, k["record"], h) for h, _ in HONEST_HORIZONS]
+            c["labels"].extend(honest_label(r) for r in c["honest"])
         if reason:
             c["waiting"] = reason
             pipeline.append(c)
@@ -1265,7 +1399,8 @@ def read_source_page(book, tab: str) -> List[List[Any]]:
     if h is None:
         return []
     names = [n for n in ("Symbol", "Current Price", "Currency", "Sector", "Warnings", "Risk Score", "Target Price",
-                         "Last Updated (UTC)")       # 1.5.0: the row's sync time feeds the quote-age check
+                         "Last Updated (UTC)",       # 1.5.0: the row's sync time feeds the quote-age check
+                         "Forecast Price 1M", "Forecast Price 3M")       # 1.12.0 [HONEST]: the page's promise
              if n in col]
     ranges = ["%s%d:%s" % (_col(col[n] + 1), h + 1, _col(col[n] + 1)) for n in names]
     cols = ws.batch_get(ranges)
@@ -1423,7 +1558,16 @@ def run_once(dry_run: bool, book=None, now: Optional[_dt.datetime] = None,
                     reg = regime if regime is not None else _read_regime(now)
                     k["regime"] = regime_rule(reg, k["regime_mode"], k["regime_block"], k["regime_ccy"])
                     _out(k["regime"]["note"] + (" - %s" % k["regime_mode"] if k["regime"]["blocks"] else ""))
+                if k.get("honest", "off") != "off":                      # 1.12.0 [HONEST]: one read per cut
+                    try:
+                        k["record"] = read_record(_read(book, RECORD_TAB, "A1:Z400"))
+                    except Exception as e:  # noqa: BLE001 - the labels are left out; the cut goes on
+                        k["record"] = {}
+                        _out("honest %s: the %s tab was not read (%s%s)" % (k["honest"], RECORD_TAB,
+                                                                          type(e).__name__, _status_of(e)))
                 plan = decide(qualified, sources, cal, lots, cash, mps, k, prior_picks=prev_picks)
+                if k.get("honest", "off") != "off":
+                    _out(honest_line(plan["picks"] + plan["pipeline"], k.get("record") or {}, k["honest"]))
                 rk = plan.get("ranker") or {}
                 if rk.get("mode", "engine") != "engine":                 # 1.11.0 [RANKER]: counts only
                     line = "ranker %s: %d of %d candidate(s) carry an analyst upside" % (

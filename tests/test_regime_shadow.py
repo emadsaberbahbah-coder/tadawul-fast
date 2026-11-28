@@ -116,10 +116,12 @@ def _code(sql):
 def test_the_views_install_in_order_after_the_challenger():
     objs = bv.load_objects()
     names = [o.name for o in objs]
-    assert names[-2:] == ["v_regime_shadow", "v_regime_shadow_insample"]
+    # views 1.39.0 adds v_forecast_record after the two regime views (they stay in place)
+    assert names[names.index("v_regime_shadow"):][:2] == ["v_regime_shadow", "v_regime_shadow_insample"]
+    assert names.index("v_challenger_v0_scorecard") < names.index("v_regime_shadow")
     assert names.index("v_market_condition") < names.index("v_regime_shadow")
     assert names.index("v_market_drivers") < names.index("v_regime_shadow")
-    assert bv.check_objects(objs) == [] and bv.__version__ == "1.38.0"
+    assert bv.check_objects(objs) == [] and tuple(int(x) for x in bv.__version__.split(".")) >= (1, 38, 0)
 
 
 def test_the_label_view_reads_no_later_close():
@@ -437,7 +439,7 @@ def test_source_is_ascii_and_versioned():
     assert src.count("print(") == 1                                          # one log writer
     pins = Path("scripts/verify_deployment.py").read_text(encoding="utf-8")
     assert '("regime_shadow", "1.0.0", "regime shadow")' in pins
-    assert '("apply_bq_views", "1.38.0", "bigquery looker views")' in pins
+    assert '("apply_bq_views", "%s", "bigquery looker views")' % bv.__version__ in pins      # 1.38.0 or later
     assert "tests/test_regime_shadow.py" in Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
 
